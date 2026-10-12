@@ -705,7 +705,7 @@ def get_channels_settings_menu_rows(db, app_state):
 
 def get_games_sub_menu_rows(db, app_state, console_key, is_on):
     if console_key == "MENU":
-        return ["controller_map", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores",
+        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores",
                 "menu_bg_select_image", "multitap_toggle", "scroll_style", "text_color",
                 "game_screen_mode"]
 
@@ -5821,7 +5821,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             sub_rows = get_games_sub_menu_rows(db, app_state, console_key, is_on)
             full_rows = sub_rows + ["close"] if console_key == "MENU" else ["status"] + sub_rows + ["close"]
 
-            grid_row_ids = [r for r in sub_rows if r in ("core_select", "controller_map", "multitap_toggle",
+            grid_row_ids = [r for r in sub_rows if r in ("core_select", "controller_map", "stick_deadzone", "multitap_toggle",
                                                            "menu_bg_select_image", "scroll_style", "text_color",
                                                            "scan_for_roms", "scan_for_cores", "clear_roms",
                                                            "clear_cores", "game_screen_mode")]
@@ -5841,6 +5841,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             row_labels = {
                 "core_select":    "SELECT LIBRETRO CORE (.DLL)",
                 "controller_map": "CONTROLLER MAPPING",
+                "stick_deadzone": "STICK DEADZONE",
                 "multitap_toggle": "MULTITAP (ALL CONSOLES)",
                 "menu_bg_select_image": "SET MENU BACKGROUND IMAGE",
                 "scroll_style": f"SCROLL STYLE:  {CONSOLE_SCROLL_STYLE_LABELS.get(_cur_scroll_style, 'CAROUSEL')}",
@@ -5853,7 +5854,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             }
 
             if console_key == "MENU":
-                _menu_left_order  = ["controller_map", "game_screen_mode",
+                _menu_left_order  = ["controller_map", "stick_deadzone", "game_screen_mode",
                                       "scan_for_cores", "clear_cores"]
                 _menu_right_order = ["menu_bg_select_image", "multitap_toggle", "scroll_style",
                                      "scan_for_roms", "clear_roms"]

@@ -15,6 +15,7 @@ import subprocess
 import zipfile
 import logging
 import collections
+import math
 import pygame
 import pygame.gfxdraw
 import menu_nav as _nav
@@ -803,7 +804,7 @@ def _is_running_under_wine():
 
 class _GPState:
     __slots__ = (
-        "wButtons", "bLT", "bRT", "sLX", "sLY", "sRX", "sRY",
+        "wButtons", "bLT", "bRT", "sLX", "sLY", "sRX", "sRY", "rawLX", "rawLY", "rawRX", "rawRY",
         "source", "raw_buttons", "raw_button_count",
     )
 
@@ -815,6 +816,10 @@ class _GPState:
         self.sLY = 0
         self.sRX = 0
         self.sRY = 0
+        self.rawLX = 0
+        self.rawLY = 0
+        self.rawRX = 0
+        self.rawRY = 0
         self.source = "xinput"
         self.raw_buttons = 0
         self.raw_button_count = 0
@@ -878,6 +883,7 @@ def _try_xinput_read():
                 g.sLY = state.Gamepad.sLY
                 g.sRX = state.Gamepad.sRX
                 g.sRY = state.Gamepad.sRY
+                apply_stick_correction(g)
                 if idx not in _xinput_seen_logged:
                     _xinput_seen_logged.add(idx)
                 snap = (g.wButtons, g.bLT, g.bRT, g.sLX, g.sLY, g.sRX, g.sRY)
@@ -910,6 +916,7 @@ def _try_xinput_read_all():
                 g.sLY = state.Gamepad.sLY
                 g.sRX = state.Gamepad.sRX
                 g.sRY = state.Gamepad.sRY
+                apply_stick_correction(g)
                 out[idx] = g
         except Exception:
             continue
@@ -1270,6 +1277,7 @@ def _try_dinput_read_all_impl():
             g.sRX = _norm_axis(info.dwZpos, caps.wZmin, caps.wZmax)
         if caps.wRmax > caps.wRmin:
             g.sRY = -_norm_axis(info.dwRpos, caps.wRmin, caps.wRmax)
+        apply_stick_correction(g)
 
         _di_btn_count = caps.wNumButtons if caps.wNumButtons else len(_DI_BUTTON_ORDER)
         g.raw_button_count = min(int(_di_btn_count), 32)
@@ -1302,7 +1310,7 @@ def _try_dinput_read_all_impl():
             if 22500 <= pov <= 31500:
                 g.wButtons |= _XI_LEFT
 
-        _DPAD_AXIS_THRESH = 24000
+        _DPAD_AXIS_THRESH = stick_dinput_threshold_raw()
         _di_latch = _dinput_dpad_latch.setdefault(jid, {})
         _di_up, _di_down, _di_left, _di_right = _stick_to_dpad_hysteresis(
             g.sLX, g.sLY, _DPAD_AXIS_THRESH, _di_latch)
@@ -1930,7 +1938,10 @@ class _LinuxJoystickReader:
         except Exception as e:
             _log_warn_throttled("linux_joystick_read", f"[GAMEPAD] Linux joystick fallback read error: {e}")
             return None
-        return self._state
+        corrected = _GPState()
+        for name in _GPState.__slots__:
+            setattr(corrected, name, getattr(self._state, name))
+        return apply_stick_correction(corrected)
 
 
 _linux_joystick_readers    = {}
@@ -1973,23 +1984,306 @@ def _get_linux_joystick_reader():
 
 
 # ============================================================================
+# SECTION: Stick deadzone settings & maths
+# ============================================================================
+
+STICK_MAX = 32767.0
+STICK_SETTING_NAMES = ("deadzone", "sensitivity", "axis_threshold")
+
+
+class StickSettings(collections.namedtuple("StickSettings", "enabled deadzone sensitivity axis_threshold")):
+    """The stick settings in use: the switch, then the deadzone, sensitivity and axis threshold as fractions (1.0 = 100 percent)."""
+
+
+def _stick_percent(config, name, enabled):
+    key, default, low, high, _step = _gov.STICK_DZ_SPECS[name]
+    if not enabled:
+        return default
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
+
+
+def stick_settings_from_config(config):
+    """Returns the StickSettings a config holds; with the switch off every value is its default."""
+    enabled = bool(config.get(_gov.STICK_DZ_ENABLED_KEY, _gov.STICK_DZ_ENABLED_DEFAULT))
+    return StickSettings(
+        enabled,
+        _stick_percent(config, "deadzone", enabled) / 100.0,
+        _stick_percent(config, "sensitivity", enabled) / 100.0,
+        _stick_percent(config, "axis_threshold", enabled) / 100.0,
+    )
+
+
+_stick_current = stick_settings_from_config({})
+
+
+def apply_stick_config(config):
+    """Makes the settings of a config the ones every pad read uses, and returns them."""
+    global _stick_current
+    _stick_current = stick_settings_from_config(config)
+    return _stick_current
+
+
+def current_stick_settings():
+    """Returns the StickSettings in use."""
+    return _stick_current
+
+
+def reset_stick_defaults(config):
+    """Writes every stick setting's default into the config; the switch is left as it is."""
+    for name in STICK_SETTING_NAMES:
+        key, default, _low, _high, _step = _gov.STICK_DZ_SPECS[name]
+        config[key] = default
+
+
+def correct_stick_pair(x, y, deadzone, sensitivity):
+    """Returns the raw (x, y) of one stick after the circular deadzone with rescale and then the sensitivity, each kept inside -32767..32767."""
+    limit = int(STICK_MAX)
+    if deadzone <= 0.0 and sensitivity == 1.0:
+        return max(-limit, min(limit, int(x))), max(-limit, min(limit, int(y)))
+    fx = max(-1.0, min(1.0, x / STICK_MAX))
+    fy = max(-1.0, min(1.0, y / STICK_MAX))
+    magnitude = math.hypot(fx, fy)
+    if deadzone > 0.0:
+        if magnitude <= deadzone:
+            return 0, 0
+        scaled = min(1.0, (magnitude - deadzone) / (1.0 - deadzone))
+        factor = scaled / magnitude
+        fx *= factor
+        fy *= factor
+    rx = int(fx * STICK_MAX)
+    ry = int(fy * STICK_MAX)
+    if sensitivity != 1.0:
+        rx = int(rx * sensitivity)
+        ry = int(ry * sensitivity)
+    return max(-limit, min(limit, rx)), max(-limit, min(limit, ry))
+
+
+def correct_stick_with_current(x, y):
+    """Returns the raw (x, y) of one stick after the settings in use."""
+    settings = _stick_current
+    return correct_stick_pair(x, y, settings.deadzone, settings.sensitivity)
+
+
+def apply_stick_correction(g):
+    """Keeps a pad state's raw stick values in rawLX to rawRY and replaces its sticks with the values after the stick settings in use; with the switch off the sticks are left as read."""
+    g.rawLX, g.rawLY, g.rawRX, g.rawRY = g.sLX, g.sLY, g.sRX, g.sRY
+    if _stick_current.enabled:
+        g.sLX, g.sLY = correct_stick_with_current(g.sLX, g.sLY)
+        g.sRX, g.sRY = correct_stick_with_current(g.sRX, g.sRY)
+    return g
+
+
+def stick_dinput_threshold_raw():
+    """Returns the stick-to-D-pad threshold of a DirectInput pad in raw stick units; with the switch off it is the fixed value the app used before the menu."""
+    if not _stick_current.enabled:
+        return int(_gov.STICK_DZ_OFF_DINPUT_THRESHOLD)
+    return stick_axis_threshold_raw()
+
+
+def stick_axis_threshold_raw():
+    """Returns the stick-to-D-pad threshold in raw stick units; with the switch off it is the fixed value the app used before the menu."""
+    if not _stick_current.enabled:
+        return int(_gov.STICK_DZ_OFF_DPAD_THRESHOLD)
+    return int(_stick_current.axis_threshold * STICK_MAX)
+
+
+def stick_switch_on(config):
+    """Returns True when the stick deadzone switch is on in the config."""
+    return bool(config.get(_gov.STICK_DZ_ENABLED_KEY, _gov.STICK_DZ_ENABLED_DEFAULT))
+
+
+def toggle_stick_switch(config):
+    """Flips the stick deadzone switch in the config and returns the new state."""
+    config[_gov.STICK_DZ_ENABLED_KEY] = not stick_switch_on(config)
+    return config[_gov.STICK_DZ_ENABLED_KEY]
+
+
+def stick_setting_percent(config, name):
+    """Returns the saved percent of one stick setting, repaired and clamped, whatever the switch says."""
+    return _stick_percent(config, name, True)
+
+
+def adjust_stick_setting(config, name, direction):
+    """Moves one stick setting a step down (direction -1) or up (direction 1) inside its range, saves it in the config and returns the new percent."""
+    key, _default, low, high, step = _gov.STICK_DZ_SPECS[name]
+    value = max(low, min(high, stick_setting_percent(config, name) + step * (1 if direction > 0 else -1)))
+    config[key] = value
+    return value
+
+
+_stick_test_until = 0.0
+
+
+def mark_stick_test_open():
+    """Marks the Stick Deadzone screen as open for the next few frames; the menu-nav thread ignores the sticks while it is."""
+    global _stick_test_until
+    _stick_test_until = time.monotonic() + _gov.STICK_DZ_TEST_HOLD_SECONDS
+
+
+def stick_test_open():
+    """Returns True while the Stick Deadzone screen is open."""
+    return time.monotonic() < _stick_test_until
+
+
+def stick_test_sticks():
+    """Returns ((left x, left y), (right x, right y)) of player 1's pad, or None when there is no pad."""
+    try:
+        gp = player1_gpstate()
+    except Exception:
+        return None
+    if gp is None:
+        return None
+    return (gp.rawLX, gp.rawLY), (gp.rawRX, gp.rawRY)
+
+
+def stick_direction_names(x, y, threshold):
+    """Returns the names of the D-pad directions a stick pair fires at a threshold."""
+    names = []
+    if y > threshold:
+        names.append("UP")
+    if y < -threshold:
+        names.append("DOWN")
+    if x < -threshold:
+        names.append("LEFT")
+    if x > threshold:
+        names.append("RIGHT")
+    return names
+
+
+# ============================================================================
+# SECTION: Stick deadzone screen
+# ============================================================================
+
+
+def _draw_stick_test(panel, center_x, center_y, sticks, ui_color, font, config):
+    radius = int(_gov.STICK_DZ_TEST_RADIUS)
+    settings = stick_settings_from_config(config)
+    threshold = settings.axis_threshold * STICK_MAX if settings.enabled else float(_gov.STICK_DZ_OFF_DPAD_THRESHOLD)
+    for index, title in enumerate(("LEFT", "RIGHT")):
+        cx = center_x - 350 + radius + index * 360
+        raw = sticks[index] if sticks else (0, 0)
+        out = correct_stick_pair(raw[0], raw[1], settings.deadzone, settings.sensitivity)
+        pygame.draw.circle(panel, (25, 38, 62), (cx, center_y), radius)
+        pygame.draw.circle(panel, (90, 90, 110), (cx, center_y), radius, 1)
+        if settings.deadzone > 0.0:
+            pygame.draw.circle(panel, (200, 160, 40), (cx, center_y), max(1, int(radius * settings.deadzone)), 1)
+        line = int(radius * threshold / STICK_MAX)
+        pygame.draw.line(panel, (70, 110, 160), (cx - line, center_y - radius), (cx - line, center_y + radius), 1)
+        pygame.draw.line(panel, (70, 110, 160), (cx + line, center_y - radius), (cx + line, center_y + radius), 1)
+        pygame.draw.line(panel, (70, 110, 160), (cx - radius, center_y - line), (cx + radius, center_y - line), 1)
+        pygame.draw.line(panel, (70, 110, 160), (cx - radius, center_y + line), (cx + radius, center_y + line), 1)
+        for pair, color, size in ((raw, (150, 150, 165), 4), (out, ui_color, 5)):
+            fx, fy = pair[0] / STICK_MAX, pair[1] / STICK_MAX
+            magnitude = math.hypot(fx, fy)
+            if magnitude > 1.0:
+                fx, fy = fx / magnitude, fy / magnitude
+            pygame.draw.circle(panel, color, (cx + int(fx * radius), center_y - int(fy * radius)), size)
+        text_x = cx + radius + 14
+        names = " ".join(stick_direction_names(out[0], out[1], threshold)) or "-"
+        for row, (text, color) in enumerate((
+                ("%s STICK" % title, (180, 180, 180)),
+                ("RAW  %6d %6d" % raw, (150, 150, 165)),
+                ("OUT  %6d %6d" % out, ui_color),
+                ("FIRES  %s" % names, (180, 180, 180)))):
+            panel.blit(font.render(text, True, color), (text_x, center_y - radius + 6 + row * 22))
+
+
+def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=None):
+    """Draws the Stick Deadzone screen into rect: the switch, the setting rows and Reset to Defaults while the switch is on, and the Close button; cursor is the index into rows and sticks the pair from stick_test_sticks."""
+    import colorsys
+    target_x, target_y, target_w, target_h = rect
+    base_w, base_h = 996, 525
+    panel = pygame.Surface((base_w, base_h), pygame.SRCALPHA)
+    config = db.config if db is not None else {}
+    hue = config.get("theme_bg_hue", 220) / 360.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.6, 0.15)
+    opacity = int((config.get("menu_opacity", 50) / 100.0) * 255)
+    bg_layer = pygame.Surface((base_w, base_h), pygame.SRCALPHA)
+    bg_layer.fill((int(r * 255), int(g * 255), int(b * 255), opacity))
+    panel.blit(bg_layer, (0, 0))
+
+    f_title = _cached_font("Courier New", 24, bold=True)
+    f_opt = _cached_font("Courier New", 19, bold=True)
+    f_small = _cached_font("Courier New", 14, bold=True)
+    center_x = base_w // 2
+    enabled = stick_switch_on(config)
+    labels = {
+        _nav.STICK_DZ_DEADZONE: "ANALOG DEADZONE",
+        _nav.STICK_DZ_SENSITIVITY: "ANALOG SENSITIVITY",
+        _nav.STICK_DZ_AXIS: "BUTTON AXIS THRESHOLD",
+    }
+    selected = _nav.stick_dz_cell(rows, cursor)
+
+    def option_color(cell):
+        return ui_color if selected == cell else (180, 180, 180)
+
+    title = f_title.render("STICK DEADZONE", True, ui_color)
+    panel.blit(title, (center_x - title.get_width() // 2, 20))
+
+    row_y = 90
+    row_gap = 56
+    lbl = f_opt.render("STICK DEADZONE", True, option_color(_nav.STICK_DZ_SWITCH))
+    sw_w, sw_h = 55, 24
+    group_w = lbl.get_width() + 14 + sw_w
+    left = center_x - group_w // 2
+    panel.blit(lbl, (left, row_y))
+    sw_x, sw_y = left + lbl.get_width() + 14, row_y + lbl.get_height() // 2 - sw_h // 2
+    pygame.draw.rect(panel, (40, 167, 69) if enabled else (45, 65, 100), (sw_x, sw_y, sw_w, sw_h), border_radius=12)
+    pygame.draw.circle(panel, (255, 255, 255), (sw_x + sw_w - 14 if enabled else sw_x + 14, sw_y + sw_h // 2), 9)
+    if selected == _nav.STICK_DZ_SWITCH:
+        pygame.draw.rect(panel, ui_color, (sw_x, sw_y, sw_w, sw_h), SELECTION_BORDER_WIDTH, border_radius=12)
+
+    if enabled:
+        bar_w, bar_h = 260, 10
+        label_x = center_x - 330
+        bar_x = center_x + 10
+        for i, name in enumerate(_nav.STICK_DZ_SETTINGS):
+            y_pos = row_y + row_gap * (i + 1)
+            _key, _default, low, high, _step = _gov.STICK_DZ_SPECS[name]
+            value = stick_setting_percent(config, name)
+            text = f_opt.render(labels[name], True, option_color(name))
+            panel.blit(text, (label_x, y_pos))
+            bar_y = y_pos + text.get_height() // 2 - bar_h // 2
+            pygame.draw.rect(panel, (45, 65, 100), (bar_x, bar_y, bar_w, bar_h), border_radius=5)
+            fill = int(bar_w * (value - low) / float(high - low))
+            pygame.draw.rect(panel, (40, 167, 69), (bar_x, bar_y, fill, bar_h), border_radius=5)
+            pygame.draw.circle(panel, (255, 255, 255), (bar_x + fill, bar_y + bar_h // 2), 9)
+            if selected == name:
+                pygame.draw.circle(panel, ui_color, (bar_x + fill, bar_y + bar_h // 2), 9, SELECTION_BORDER_WIDTH)
+            number = f_opt.render("%d%%" % value, True, option_color(name))
+            panel.blit(number, (bar_x + bar_w + 22, y_pos))
+        reset = f_opt.render("[ RESET TO DEFAULTS ]", True, option_color(_nav.STICK_DZ_RESET))
+        panel.blit(reset, (center_x - reset.get_width() // 2, row_y + row_gap * (len(_nav.STICK_DZ_SETTINGS) + 1)))
+        hint = f_small.render("LEFT / RIGHT change the highlighted value", True, (120, 120, 140))
+        panel.blit(hint, (center_x - hint.get_width() // 2, 54))
+        _draw_stick_test(panel, center_x, 408, sticks, ui_color, f_small, config)
+
+    off_red = (220, 53, 69)
+    close_w, close_h = 110, 40
+    close_x = base_w - close_w - 25
+    close_y = base_h - 52
+    pygame.draw.rect(panel, off_red, (close_x, close_y, close_w, close_h), border_radius=4)
+    if selected == _nav.CLOSE:
+        pygame.draw.rect(panel, ui_color, (close_x, close_y, close_w, close_h), SELECTION_BORDER_WIDTH, border_radius=4)
+    close_lbl = f_opt.render("Close", True, (255, 255, 255))
+    panel.blit(close_lbl, (close_x + close_w // 2 - close_lbl.get_width() // 2, close_y + close_h // 2 - close_lbl.get_height() // 2))
+
+    if target_w > 0 and target_h > 0:
+        surface.blit(pygame.transform.smoothscale(panel, (target_w, target_h)), (target_x, target_y))
+
+
+# ============================================================================
 # SECTION: Stick deadzone & unified gamepad read
 # ============================================================================
 
 
-# VALUES CHANGE HERE
-DEFAULT_STICK_DEADZONE = 8000
-
-def _get_stick_deadzone():
-    return DEFAULT_STICK_DEADZONE
-
-
-_STICK_DPAD_RELEASE_FRAC = 0.75
-
-
 def _stick_to_dpad_hysteresis(sLX, sLY, dead, latch):
     """Convert raw stick X/Y values into up/down/left/right booleans with hysteresis."""
-    release = dead * _STICK_DPAD_RELEASE_FRAC
+    release = dead * _gov.STICK_DZ_DPAD_RELEASE_FRACTION
     up    = (sLY >  dead) or (latch.get("up", False)    and sLY >  release)
     down  = (sLY < -dead) or (latch.get("down", False)  and sLY < -release)
     left  = (sLX < -dead) or (latch.get("left", False)  and sLX < -release)
@@ -2681,13 +2975,14 @@ def _xi_nav_worker():
         buttons = 0
         gp = _menu_nav_gpstate()
         if gp is not None:
-            DEAD = _get_stick_deadzone()
+            DEAD = stick_axis_threshold_raw()
             buttons = gp.wButtons
-            up, down, left, right = _stick_to_dpad_hysteresis(gp.sLX, gp.sLY, DEAD, stick_dpad_latch)
-            if up:    buttons |= _XI_UP
-            if down:  buttons |= _XI_DOWN
-            if left:  buttons |= _XI_LEFT
-            if right: buttons |= _XI_RIGHT
+            if not stick_test_open():
+                up, down, left, right = _stick_to_dpad_hysteresis(gp.sLX, gp.sLY, DEAD, stick_dpad_latch)
+                if up:    buttons |= _XI_UP
+                if down:  buttons |= _XI_DOWN
+                if left:  buttons |= _XI_LEFT
+                if right: buttons |= _XI_RIGHT
 
         now = time.monotonic()
 
@@ -3825,6 +4120,7 @@ class ExternalGameDeck:
         return _nav.dvd_translate(getattr(self, "dvd_bindings", None), key)
 
     def refresh_from_config(self, db_config):
+        apply_stick_config(db_config)
         self.console_rom_dir = dict(db_config.get("console_rom_dir", {}) or {})
         manual_cfg = db_config.setdefault("console_roms_manual", {})
 
@@ -5816,7 +6112,7 @@ class ExternalGameDeck:
             if gp is not None:
                 buttons = gp.wButtons
                 if self.ctrl_mapping.get("stick_as_dpad", False):
-                    DEAD = _get_stick_deadzone()
+                    DEAD = stick_axis_threshold_raw()
                     if not hasattr(self, "_ctrl_test_dpad_latch"):
                         self._ctrl_test_dpad_latch = {}
                     up, down, left, right = _stick_to_dpad_hysteresis(
@@ -6365,7 +6661,7 @@ class ExternalGameDeck:
         if gp.bRT >= TRIGGER_PRESS_THRESHOLD:
             pressed_bits.add(_XI_RT)
 
-        STICK_LIGHT_THRESH = _get_stick_deadzone()
+        STICK_LIGHT_THRESH = stick_axis_threshold_raw()
         joy_lit = set()
         if not hasattr(self, "_ctrl_test_lit_dpad_latch"):
             self._ctrl_test_lit_dpad_latch = {}
@@ -9138,7 +9434,7 @@ class ExternalGameDeck:
 
             player_ctrl_mapping = self._gameplay_ctrl_mapping_for_player(_active_console_for_input, player_num)
             if _active_console_for_input != "N64" and player_ctrl_mapping.get("stick_as_dpad", False):
-                DZ = _get_stick_deadzone()
+                DZ = stick_axis_threshold_raw()
                 if not hasattr(self, "_gameplay_dpad_latch"):
                     self._gameplay_dpad_latch = {}
                 _latch = self._gameplay_dpad_latch.setdefault(player_num, {})
@@ -9151,7 +9447,7 @@ class ExternalGameDeck:
             core._input.set_buttons(port, libretro_state)
 
             if _active_console_for_input == "N64":
-                DZ = _get_stick_deadzone()
+                DZ = stick_axis_threshold_raw()
                 if abs(gp.sRX) > DZ or abs(gp.sRY) > DZ:
                     stick_x, stick_y = gp.sRX, gp.sRY
                 else:
@@ -9381,7 +9677,7 @@ class ExternalGameDeck:
             gp = _read_gamepad_state()
             if gp is not None:
                 btns = gp.wButtons
-                DZ   = _get_stick_deadzone()
+                DZ   = stick_axis_threshold_raw()
                 left  = left  or bool(btns & _XI_LEFT)  or gp.sLX < -DZ
                 right = right or bool(btns & _XI_RIGHT) or gp.sLX >  DZ
                 a_btn = a_btn or bool(btns & _XI_A)
@@ -9660,7 +9956,6 @@ __all__ = [
     "CONSOLE_SCROLL_STYLE_LABELS",
     "CORE_NAME_TO_CONSOLES",
     "DEFAULT_GBA_MAPPING",
-    "DEFAULT_STICK_DEADZONE",
     "DVD_SPLASH_IMAGE_EXTS",
     "DVD_SPLASH_VIDEO_EXTS",
     "ExternalGameDeck",

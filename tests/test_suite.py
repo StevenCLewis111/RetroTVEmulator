@@ -5730,6 +5730,13 @@ def main_function_code(name):
     return _CODE_CACHE[("f", name)]
 
 
+def main_function_source(name):
+    for node in MAIN_TREE.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(MAIN_SRC, node)
+    raise KeyError(name)
+
+
 def main_assignment_code(name):
     if ("a", name) not in _CODE_CACHE:
         for node in MAIN_TREE.body:
@@ -5860,6 +5867,201 @@ def suite_explorer_rect():
     check(new_vs_menu_bad == 0, "explorer rect differs from the menu rect on %d of %d configurations" % (new_vs_menu_bad, runs))
 
 
+def suite_video_mode_rect():
+    def build(config, mode_name):
+        ns = {"pygame": pygame, "db": FakeDbConfig(config), "_active_screen_mode": lambda: mode_name,
+              "_package_pillarbox_active": lambda w, h: True,
+              "_bezel_video_wants_tube_fit": lambda source_aspect, mode=None: False,
+              "_apply_pixel_orbiter": lambda rect: rect,
+              "_selected_package_aspect": lambda: 16.0 / 9.0,
+              "_video_screen_mode_rect_log_state": {"key": None},
+              "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
+        exec(main_function_code("_full_tv_43_outer_rect"), ns)
+        exec(main_function_code("_video_screen_mode_rect"), ns)
+        ns["package_box"] = lambda w, h: ns["_full_tv_43_outer_rect"](w, h, aspect=16.0 / 9.0)
+        return ns["_video_screen_mode_rect"]
+
+    def package_box(w, h):
+        return build({"fake_43_border_enabled": False}, "normal").__globals__["package_box"](w, h)
+
+    def build_blit():
+        ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
+              "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
+              "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
+        exec(main_function_code("_blit_video_with_screen_mode"), ns)
+        return ns["_blit_video_with_screen_mode"]
+
+    box = pygame.Rect(0, 60, 1024, 576)
+    for name in ("normal", "stretch", "crop", "panscan"):
+        fn = build({"fake_43_border_enabled": False}, name)
+        check(tuple(fn(box, 1024, 768, mode=name)) == (0, 0, 1024, 768), "%s gets the whole window with Bezel off" % name)
+        check(tuple(fn(box, 1280, 720, mode=name)) == (0, 0, 1280, 720), "%s gets the whole window on a 16:9 screen" % name)
+        fn = build({"fake_43_border_enabled": True}, name)
+        check(tuple(fn(box, 1024, 768, mode=name)) == (128, 60, 768, 576), "with Bezel on %s keeps the 4:3 box inside the content rect" % name)
+
+    blit = build_blit()
+    rect_fn = build({"fake_43_border_enabled": False}, "normal")
+    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
+    pictures = ((16, 9), (4, 3), (9, 16), (21, 9), (5, 4))
+    for win_w, win_h in screens:
+        for pic_w, pic_h in pictures:
+            surf = pygame.Surface((pic_w * 40, pic_h * 40))
+            screen = pygame.Surface((win_w, win_h))
+            target = rect_fn(package_box(win_w, win_h), win_w, win_h)
+            geom = {}
+            blit(screen, surf, target, mode="normal", geom_out=geom, fit_aspect=pic_w / pic_h)
+            side_bars = geom["dest_x"] > 1 or win_w - (geom["dest_x"] + geom["draw_w"]) > 1
+            top_bars = geom["dest_y"] > 1 or win_h - (geom["dest_y"] + geom["draw_h"]) > 1
+            check(not (side_bars and top_bars), "%dx%d screen, %d:%d picture has bars on both axes: %s" % (win_w, win_h, pic_w, pic_h, geom))
+            check(abs(geom["draw_w"] / geom["draw_h"] - pic_w / pic_h) < 0.02, "%dx%d screen, %d:%d picture is distorted: %s" % (win_w, win_h, pic_w, pic_h, geom))
+            for name in ("stretch", "crop"):
+                geom = {}
+                blit(screen, surf, target, mode=name, geom_out=geom, fit_aspect=pic_w / pic_h)
+                covered = geom["draw_w"] >= win_w and geom["draw_h"] >= win_h
+                check(covered, "%dx%d screen, %d:%d picture in %s does not fill the screen: %s" % (win_w, win_h, pic_w, pic_h, name, geom))
+
+
+def suite_one_picture_path():
+    class Gov:
+        VIDEO_DECODE_CANVAS_SD = (854, 480)
+        VIDEO_DECODE_CANVAS_HD = (1280, 720)
+
+    ns = {"performance_governor": Gov}
+    exec(main_function_code("_video_decode_canvas_size"), ns)
+    size = ns["_video_decode_canvas_size"]
+    check(size("sd") == (854, 480) and size("hd") == (1280, 720), "decode canvas sizes are %s and %s" % (size("sd"), size("hd")))
+    ns_no_gov = {"performance_governor": None}
+    exec(main_function_code("_video_decode_canvas_size"), ns_no_gov)
+    check(ns_no_gov["_video_decode_canvas_size"]("sd") == size("sd") and ns_no_gov["_video_decode_canvas_size"]("hd") == size("hd"),
+          "the fallback canvas sizes must equal the governor table")
+
+    for gone in ("_canvas_is_genuinely_4_3", "genuine_4:3_fastpath", "_bezel_off_fit_aspect", "_filled_canvas_aspect_state", "canvas_genuinely_4_3"):
+        check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
+    check(len(re.findall(r"= _video_decode_canvas_size\(", MAIN_SRC)) == 2, "the engine start and resize_canvas must both use _video_decode_canvas_size")
+    check("(960, 720) if" not in MAIN_SRC and "(640, 480) if" not in MAIN_SRC, "a 4:3 decode canvas branch is still in the main script")
+
+    import performance_governor as _pg
+    check(tuple(_pg.VIDEO_DECODE_CANVAS_SD) == size("sd") and tuple(_pg.VIDEO_DECODE_CANVAS_HD) == size("hd"), "governor canvas table does not match")
+
+    ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
+          "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
+          "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
+    exec(main_function_code("_blit_video_with_screen_mode"), ns)
+    blit = ns["_blit_video_with_screen_mode"]
+    pictures = ((1280, 720), (640, 480), (1080, 1920), (1920, 804), (1280, 1024))
+    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
+    bars = {}
+    for win_w, win_h in screens:
+        for pw, ph in pictures:
+            surf = pygame.Surface((pw, ph))
+            geom = {}
+            blit(pygame.Surface((win_w, win_h)), surf, pygame.Rect(0, 0, win_w, win_h), mode="normal", geom_out=geom)
+            label = "%dx%d screen, %dx%d picture: %s" % (win_w, win_h, pw, ph, geom)
+            check(abs(geom["draw_w"] / geom["draw_h"] - pw / float(ph)) < 0.02, "distorted, " + label)
+            check(geom["draw_w"] >= win_w - 1 or geom["draw_h"] >= win_h - 1, "bars on both axes, " + label)
+            bars[(win_w, win_h, pw, ph)] = (geom["dest_x"], geom["dest_y"])
+            stretch = {}
+            blit(pygame.Surface((win_w, win_h)), surf, pygame.Rect(0, 0, win_w, win_h), mode="stretch", geom_out=stretch)
+            check((stretch["draw_w"], stretch["draw_h"]) == (win_w, win_h), "stretch does not fill, " + label)
+    for win_w, win_h in screens:
+        for pw, ph in pictures:
+            for other_w, other_h in screens:
+                if (other_w, other_h) != (win_w, win_h) and (other_w / float(other_h) == win_w / float(win_h)):
+                    x1, y1 = bars[(win_w, win_h, pw, ph)]
+                    x2, y2 = bars[(other_w, other_h, pw, ph)]
+                    check(abs(x1 / float(win_w) - x2 / float(other_w)) < 0.01 and abs(y1 / float(win_h) - y2 / float(other_h)) < 0.01,
+                          "same-shape screens must have proportional bars")
+
+
+def suite_caption_memory_guard():
+    saved_read = gov._read_ram_gb
+    try:
+        gov._read_ram_gb = lambda: (8.0, 0.5)
+        ok, total, avail, need = gov.caption_memory_check()
+        check(not ok and need == gov.CAPTION_MODEL_MIN_AVAILABLE_RAM_GB, "0.5 GB free must be refused: %s" % ((ok, total, avail, need),))
+        gov._read_ram_gb = lambda: (8.0, gov.CAPTION_MODEL_MIN_AVAILABLE_RAM_GB + 0.5)
+        check(gov.caption_memory_check()[0], "enough free memory must be allowed")
+        gov._read_ram_gb = lambda: (0.0, 0.0)
+        check(gov.caption_memory_check()[0], "memory that cannot be read must not block captions")
+
+        calls = []
+        saved_gov, saved_handler = media._perf_governor, media._caption_memory_refusal_handler
+        saved_model, saved_failed = media._whisper_model, media._whisper_model_load_failed
+        try:
+            media._perf_governor = gov
+            media._whisper_model, media._whisper_model_load_failed = None, False
+            media.set_caption_memory_refusal_handler(lambda t, a, n: calls.append((t, a, n)))
+            gov._read_ram_gb = lambda: (4.0, 0.4)
+            check(media._get_whisper_model() is None, "a refused load must return no model")
+            check(len(calls) == 1 and calls[0][2] == gov.CAPTION_MODEL_MIN_AVAILABLE_RAM_GB, "the handler must be told once: %s" % calls)
+            check(media._whisper_model_load_failed is False, "a memory refusal must not mark the model permanently failed")
+            gov._read_ram_gb = lambda: (16.0, 8.0)
+            check(media._caption_memory_allows_load() is True and len(calls) == 1, "enough memory must load without telling the handler")
+        finally:
+            media._perf_governor, media._caption_memory_refusal_handler = saved_gov, saved_handler
+            media._whisper_model, media._whisper_model_load_failed = saved_model, saved_failed
+    finally:
+        gov._read_ram_gb = saved_read
+
+    class Db:
+        def __init__(self, config):
+            self.config = config
+            self.saves = 0
+
+        def save_settings(self):
+            self.saves += 1
+
+    class Deck:
+        refreshed = 0
+
+        def refresh_from_config(self, config):
+            Deck.refreshed += 1
+
+    logs = []
+    ns = {"performance_governor": gov, "log": type("L", (), {"info": staticmethod(lambda *a, **k: None),
+                                                             "warning": staticmethod(lambda *a, **k: logs.append(a))})(),
+          "STATUS_BANNER_DURATION_MS": 30000, "_caption_prewarm_started": True, "_caption_prewarm_lock": threading.Lock(),
+          "_caption_memory_refusal_pending": False, "_caption_memory_banner_pending": False, "game_deck": Deck(),
+          "released": []}
+    ns["_release_tv_caption_state_when_off"] = lambda reason="": ns["released"].append(reason)
+    for name in ("_on_caption_memory_refused", "_apply_caption_memory_refusal", "_status_banner_is_active", "_status_banner_is_consumed",
+                 "_mark_status_banner_consumed", "_status_banner_label", "_status_banner_duration_ms"):
+        exec(main_function_code(name), ns)
+    for const in ("CAPTION_MEMORY_BANNER_MS", "CAPTION_MEMORY_BANNER_LABEL"):
+        exec(main_assignment_code(const), ns)
+    ns["_drive_streak_signature"] = ns["_server_streak_signature"] = ns["_gamepad_streak_signature"] = ns["_missing_media_streak_signature"] = None
+    ns["_server_streak_consumed"] = ns["_drive_streak_consumed"] = ns["_gamepad_streak_consumed"] = ns["_missing_media_streak_consumed"] = False
+    ns["pygame"] = pygame
+
+    check(ns["CAPTION_MEMORY_BANNER_MS"] == 5000, "banner is %s ms, want 5000" % ns["CAPTION_MEMORY_BANNER_MS"])
+    check(ns["_status_banner_duration_ms"]("captions_memory") == 5000 and ns["_status_banner_duration_ms"]("drive") == 30000,
+          "only the memory banner is 5 seconds")
+    check("LACK OF MEMORY" in ns["_status_banner_label"]("captions_memory"), "banner text must say memory")
+
+    db = Db({"tv_captions_enabled": True, "dvd_captions_enabled": True})
+    ns["db"] = db
+    ns["_apply_caption_memory_refusal"]()
+    check(db.saves == 0 and not ns["_caption_memory_banner_pending"], "nothing happens before a refusal")
+    ns["_on_caption_memory_refused"](4.0, 0.4, 1.5)
+    ns["_apply_caption_memory_refusal"]()
+    check(db.config == {"tv_captions_enabled": False, "dvd_captions_enabled": False} and db.saves == 1, "captions must be switched off and saved: %s" % db.config)
+    check(ns["_caption_memory_banner_pending"] and ns["_status_banner_is_active"]("captions_memory"), "the banner must be raised")
+    check(ns["_caption_prewarm_started"] is False and ns["released"], "the pre-warm must be re-armed and the caption state cleared")
+    check(Deck.refreshed == 1, "the game deck must be refreshed")
+    ns["_mark_status_banner_consumed"]("captions_memory")
+    check(not ns["_status_banner_is_active"]("captions_memory"), "the banner ends once it has been shown")
+
+    db2 = Db({"tv_captions_enabled": False})
+    ns["db"] = db2
+    ns["_on_caption_memory_refused"](4.0, 0.4, 1.5)
+    ns["_apply_caption_memory_refusal"]()
+    check(not ns["_caption_memory_banner_pending"], "no banner when captions were already off")
+
+    check("_apply_caption_memory_refusal()" in main_function_source("_advance_status_banner_streaks"), "the refusal must be applied every frame")
+    check('"captions_memory"' in main_function_source("_draw_status_banners"), "the draw loop must know the memory banner")
+    check("set_caption_memory_refusal_handler(" in MAIN_SRC, "the main script must register the refusal handler")
+
+
 def suite_real_menu_build():
     db = FakeDbConfig({"menu_opacity": 50, "fake_43_border_enabled": True, "bezel_style": 1})
     app_state = {"menu_layer": "TAB_SELECTION", "menu_tab_index": 0, "menu_selection_index": 0}
@@ -5882,6 +6084,15 @@ class TestMenuNavNameEntryAndExplorerRect(_SectionCase):
 
     def test_explorer_rect(self):
         self.run_section(suite_explorer_rect)
+
+    def test_video_mode_rect(self):
+        self.run_section(suite_video_mode_rect)
+
+    def test_one_picture_path(self):
+        self.run_section(suite_one_picture_path)
+
+    def test_caption_memory_guard(self):
+        self.run_section(suite_caption_memory_guard)
 
     def test_real_menu_build(self):
         self.run_section(suite_real_menu_build)
@@ -6274,6 +6485,187 @@ class TestCommentRule(_SectionCase):
 
     def test_comments(self):
         self.run_section(r4_case_comments)
+
+
+# ============================================================================
+# SECTION: Stick deadzone settings and maths
+# ============================================================================
+
+
+def stick_case_maths_and_settings():
+    import game_deck as gd
+    key_on = gov.STICK_DZ_ENABLED_KEY
+    check(gd.correct_stick_pair(0, 0, 0.0, 1.0) == (0, 0), "centre stays centre")
+    check(gd.correct_stick_pair(20000, -12345, 0.0, 1.0) == (20000, -12345), "no deadzone and sensitivity 1 leaves a stick as it is")
+    check(gd.correct_stick_pair(3000, 3000, 0.2, 1.0) == (0, 0), "inside the circle gives zero")
+    check(gd.correct_stick_pair(32767, 0, 0.2, 1.0) == (32767, 0), "full push still reaches full range")
+    check(gd.correct_stick_pair(-32767, 0, 0.2, 1.0) == (-32767, 0), "full push left still reaches full range")
+    x, y = gd.correct_stick_pair(20000, 20000, 0.2, 1.0)
+    check(x == y and 0 < x < 20000, "diagonal keeps its angle and is rescaled")
+    check(gd.correct_stick_pair(10000, 0, 0.0, 2.0) == (20000, 0), "sensitivity 2 doubles")
+    check(gd.correct_stick_pair(30000, 0, 0.0, 2.0) == (32767, 0), "sensitivity result is clamped")
+    check(gd.correct_stick_pair(99999, -99999, 0.0, 1.0) == (32767, -32767), "input past full range is clamped to each axis limit")
+
+    default = gd.stick_settings_from_config({})
+    check(default == gd.StickSettings(True, 0.0, 1.0, 0.5), "with nothing saved the switch is on with the default values")
+    check(gd.stick_switch_on({}) is True, "the switch is on by default")
+    off = gd.stick_settings_from_config({key_on: False})
+    check(off.enabled is False and off.deadzone == 0.0 and off.sensitivity == 1.0, "switch off gives neutral values")
+    off_with_values = gd.stick_settings_from_config({key_on: False, gov.STICK_DZ_SPECS["deadzone"][0]: 50})
+    check(off_with_values.deadzone == 0.0, "switch off ignores saved values")
+    on = gd.stick_settings_from_config({key_on: True, gov.STICK_DZ_SPECS["deadzone"][0]: 30,
+                                        gov.STICK_DZ_SPECS["sensitivity"][0]: 150,
+                                        gov.STICK_DZ_SPECS["axis_threshold"][0]: 40})
+    check(on == gd.StickSettings(True, 0.30, 1.5, 0.40), "switch on reads the saved values")
+    bad = gd.stick_settings_from_config({key_on: True, gov.STICK_DZ_SPECS["deadzone"][0]: "junk",
+                                         gov.STICK_DZ_SPECS["sensitivity"][0]: 9999,
+                                         gov.STICK_DZ_SPECS["axis_threshold"][0]: -4})
+    check(bad.deadzone == 0.0 and bad.sensitivity == 2.0 and bad.axis_threshold == 0.05, "bad values are defaulted or clamped")
+
+    previous = gd.current_stick_settings()
+    try:
+        gd.apply_stick_config({key_on: False})
+        check(gd.stick_axis_threshold_raw() == gov.STICK_DZ_OFF_DPAD_THRESHOLD, "off uses the old fixed threshold")
+        check(gd.correct_stick_with_current(5000, 5000) == (5000, 5000), "off corrects nothing")
+        gd.apply_stick_config({key_on: True, gov.STICK_DZ_SPECS["axis_threshold"][0]: 50})
+        check(gd.stick_axis_threshold_raw() == int(0.5 * gd.STICK_MAX), "on uses the menu threshold")
+    finally:
+        gd.apply_stick_config({key_on: previous.enabled})
+
+    cfg = {key_on: True}
+    for name in gd.STICK_SETTING_NAMES:
+        cfg[gov.STICK_DZ_SPECS[name][0]] = gov.STICK_DZ_SPECS[name][2]
+    gd.reset_stick_defaults(cfg)
+    check(all(cfg[gov.STICK_DZ_SPECS[n][0]] == gov.STICK_DZ_SPECS[n][1] for n in gd.STICK_SETTING_NAMES), "reset writes every default")
+    check(cfg[key_on] is True, "reset leaves the switch")
+    for name, (_key, default, low, high, step) in gov.STICK_DZ_SPECS.items():
+        check(low <= default <= high and step > 0, "spec for %s is consistent" % name)
+
+
+def stick_case_screen():
+    import game_deck as gd
+    key_on = gov.STICK_DZ_ENABLED_KEY
+    check(mn.stick_dz_rows(False) == [mn.STICK_DZ_SWITCH, mn.CLOSE], "off shows only the switch and Close")
+    check(mn.stick_dz_rows(True) == [mn.STICK_DZ_SWITCH, mn.STICK_DZ_DEADZONE, mn.STICK_DZ_SENSITIVITY, mn.STICK_DZ_AXIS, mn.STICK_DZ_RESET, mn.CLOSE], "on shows the settings and Reset")
+    check(mn.stick_dz_cell(mn.stick_dz_rows(True), 99) == mn.CLOSE, "a number outside the rows is Close")
+    for enabled in (False, True):
+        rows = mn.stick_dz_rows(enabled)
+        table = mn.stick_dz_table(enabled)
+        down = [rows[0]]
+        while True:
+            nxt = table.cells[down[-1]].get(mn.DOWN)
+            if nxt is None:
+                break
+            down.append(nxt)
+        check(down == rows, "down walks every row in order (switch %s)" % enabled)
+        check(table.cells[mn.CLOSE].get(mn.UP) == rows[-2], "up from Close reaches the row above it (switch %s)" % enabled)
+    check("stick_deadzone" in mn.GAMES_SUB_MENU_LEFT, "the MENU page has the Stick Deadzone row")
+    check(mn.GAMES_SUB_MENU_LEFT.index("stick_deadzone") == mn.GAMES_SUB_MENU_LEFT.index("controller_map") + 1, "the row sits under Controller Mapping")
+    rows = ui.get_games_sub_menu_rows(None, {}, "MENU", True)
+    check("stick_deadzone" in rows, "the MENU console lists the row")
+    table = mn.games_sub_table(rows + [mn.CLOSE], False)
+    check(table.cells["controller_map"].get(mn.DOWN) == "stick_deadzone", "down from Controller Mapping reaches Stick Deadzone")
+
+    cfg = {key_on: True}
+    check(gd.adjust_stick_setting(cfg, "deadzone", 1) == 1, "deadzone steps up by 1")
+    check(gd.adjust_stick_setting(cfg, "deadzone", -1) == 0 and gd.adjust_stick_setting(cfg, "deadzone", -1) == 0, "deadzone stops at its low end")
+    check(gd.adjust_stick_setting(cfg, "sensitivity", 1) == 105, "sensitivity steps up by 5")
+    cfg[gov.STICK_DZ_SPECS["axis_threshold"][0]] = 95
+    check(gd.adjust_stick_setting(cfg, "axis_threshold", 1) == 95, "threshold stops at its high end")
+    check(gd.toggle_stick_switch(cfg) is False and gd.stick_switch_on(cfg) is False, "toggle turns the switch off")
+    check(gd.toggle_stick_switch(cfg) is True, "toggle turns the switch on")
+
+    check(gd.stick_direction_names(9000, 0, 8000) == ["RIGHT"] and gd.stick_direction_names(-9000, 9000, 8000) == ["UP", "LEFT"], "direction names follow the threshold")
+    check(gd.stick_direction_names(8000, -8000, 8000) == [], "exactly at the threshold fires nothing")
+    check(gd.stick_test_open() is False, "the screen is not open before it is drawn")
+    gd.mark_stick_test_open()
+    check(gd.stick_test_open() is True, "drawing the screen marks it open")
+    check(gd.stick_test_sticks() is None or len(gd.stick_test_sticks()) == 2, "stick read gives nothing or two pairs")
+
+    class _Db:
+        config = {key_on: True, "menu_opacity": 50}
+    for enabled in (False, True):
+        _Db.config[key_on] = enabled
+        surface = pygame.Surface((1036, 680), pygame.SRCALPHA)
+        rows = mn.stick_dz_rows(enabled)
+        for cursor in range(len(rows)):
+            gd.render_stick_deadzone_ui(surface, (20, 138, 996, 525), (0, 255, 128), _Db, cursor, rows, ((20000, -5000), (-32767, 32767)))
+        check(surface.get_at((20 + 996 - 60, 138 + 525 - 30))[:3] != (0, 0, 0), "the Close button is drawn (switch %s)" % enabled)
+
+
+def stick_case_wiring():
+    import game_deck as gd
+    key_on = gov.STICK_DZ_ENABLED_KEY
+    for old in ("DEFAULT_STICK_DEADZONE", "_get_stick_deadzone", "_STICK_DPAD_RELEASE_FRAC"):
+        check(not hasattr(gd, old), "%s is gone" % old)
+
+    def pad(lx, ly, rx, ry):
+        g = gd._GPState()
+        g.sLX, g.sLY, g.sRX, g.sRY = lx, ly, rx, ry
+        return g
+
+    previous = gd.current_stick_settings()
+    try:
+        gd.apply_stick_config({key_on: False})
+        g = gd.apply_stick_correction(pad(-32768, 5000, 123, -4567))
+        check((g.sLX, g.sLY, g.sRX, g.sRY) == (-32768, 5000, 123, -4567), "off leaves every stick value exactly as read")
+        check((g.rawLX, g.rawLY, g.rawRX, g.rawRY) == (-32768, 5000, 123, -4567), "off still keeps the raw values")
+        check(gd.stick_dinput_threshold_raw() == gov.STICK_DZ_OFF_DINPUT_THRESHOLD, "off keeps the old DirectInput threshold")
+        check(gd.stick_axis_threshold_raw() == gov.STICK_DZ_OFF_DPAD_THRESHOLD, "off keeps the old D-pad threshold")
+
+        gd.apply_stick_config({key_on: True, gov.STICK_DZ_SPECS["deadzone"][0]: 20, gov.STICK_DZ_SPECS["axis_threshold"][0]: 40})
+        g = gd.apply_stick_correction(pad(3000, 3000, 32767, 0))
+        check((g.sLX, g.sLY) == (0, 0), "on zeroes a stick inside the deadzone")
+        check(g.sRX == 32767 and g.sRY == 0, "on keeps full push at full range")
+        check((g.rawLX, g.rawLY, g.rawRX) == (3000, 3000, 32767), "on keeps the raw values beside the corrected ones")
+        check(gd.stick_dinput_threshold_raw() == gd.stick_axis_threshold_raw() == int(0.4 * gd.STICK_MAX), "on, both thresholds follow the menu setting")
+        check(gd.stick_test_sticks() is None or gd.stick_test_sticks()[0] == (gd.player1_gpstate().rawLX, gd.player1_gpstate().rawLY), "the test panel reads the raw values")
+    finally:
+        gd.apply_stick_config({key_on: previous.enabled})
+
+
+def stick_case_main_script_calls():
+    import game_deck as gd
+    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    module_defs = {n.name for n in ast.parse(open(gd.__file__, encoding="utf-8").read()).body if isinstance(n, ast.FunctionDef)}
+    deck_names = set()
+    for node in ast.walk(ast.parse(open(gd.__file__, encoding="utf-8").read())):
+        if isinstance(node, ast.ClassDef) and node.name == "ExternalGameDeck":
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.FunctionDef):
+                    deck_names.add(sub.name)
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id == "self" and isinstance(sub.ctx, ast.Store):
+                    deck_names.add(sub.attr)
+    stick_names = {name for name in module_defs if "stick" in name and name not in deck_names}
+    bad = sorted({node.attr for node in ast.walk(tree)
+                  if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                  and node.value.id == "game_deck" and node.attr in stick_names})
+    check(not bad, "the main script calls module-level stick helpers on the game deck object: %s" % bad)
+    check(len(stick_names) >= 8, "the stick helpers were found")
+    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
+        text = handle.read()
+    start = text.index('app_state.get("menu_layer") == "GAMES_STICK_DZ" and game_deck is not None')
+    block = text[start:text.index('app_state.get("menu_layer") == "GAMES_CTRL_MAP" and game_deck is not None', start)]
+    check("menu_panel_rect(" in block and "_overlay_target_for_menu(screen)" in block,
+          "the stick screen takes its place from the same surface and rectangle the menu uses")
+    check("fit_design_canvas" not in block, "the stick screen does not size itself with a separate canvas")
+
+
+class TestStickDeadzone(_SectionCase):
+    """Stick deadzone settings, config handling and maths"""
+
+    def test_stick_settings_and_maths(self):
+        self.run_section(stick_case_maths_and_settings)
+
+    def test_stick_screen(self):
+        self.run_section(stick_case_screen)
+
+    def test_stick_wiring(self):
+        self.run_section(stick_case_wiring)
+
+    def test_stick_main_script_calls(self):
+        self.run_section(stick_case_main_script_calls)
 
 
 # ============================================================================

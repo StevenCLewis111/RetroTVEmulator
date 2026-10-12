@@ -679,6 +679,49 @@ def gpu_gate_values():
 
 
 # ============================================================================
+# SECTION: Stick deadzone values
+# ============================================================================
+# VALUES CHANGE HERE
+STICK_DZ_ENABLED_KEY = "stick_deadzone_enabled"
+STICK_DZ_ENABLED_DEFAULT = True
+STICK_DZ_SPECS = {
+    "deadzone": ("stick_deadzone_percent", 0, 0, 95, 1),
+    "sensitivity": ("stick_sensitivity_percent", 100, 10, 200, 5),
+    "axis_threshold": ("stick_axis_threshold_percent", 50, 5, 95, 1),
+}
+STICK_DZ_DPAD_RELEASE_FRACTION = 0.75
+STICK_DZ_OFF_DPAD_THRESHOLD = 0
+STICK_DZ_OFF_DINPUT_THRESHOLD = 0
+STICK_DZ_TEST_HOLD_SECONDS = 0.25
+STICK_DZ_TEST_RADIUS = 50
+
+
+# ============================================================================
+# SECTION: Video decode canvas
+# ============================================================================
+# VALUES CHANGE HERE
+VIDEO_DECODE_CANVAS_SD = (854, 480)
+VIDEO_DECODE_CANVAS_HD = (1280, 720)
+
+
+# ============================================================================
+# SECTION: Caption memory check
+# ============================================================================
+# VALUES CHANGE HERE (free RAM in GB the caption model needs before it may load; seconds the red "no memory" banner stays up)
+CAPTION_MODEL_MIN_AVAILABLE_RAM_GB = 1.5
+CAPTION_MEMORY_BANNER_SECONDS = 5.0
+
+
+def caption_memory_check():
+    """Returns (ok, total_gb, available_gb, needed_gb) for loading the caption model now; ok is True when memory cannot be read, so an unknown machine is never blocked."""
+    total_gb, avail_gb = _read_ram_gb()
+    needed_gb = float(CAPTION_MODEL_MIN_AVAILABLE_RAM_GB)
+    if total_gb <= 0.0 or avail_gb <= 0.0:
+        return True, total_gb, avail_gb, needed_gb
+    return avail_gb >= needed_gb, total_gb, avail_gb, needed_gb
+
+
+# ============================================================================
 # SECTION: Smart throttle
 # ============================================================================
 

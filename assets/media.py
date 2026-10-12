@@ -3662,6 +3662,38 @@ def _whisper_gate_hold_seconds(lead, expected_chunk_sec):
         return 0.0
 
 
+_caption_memory_refusal_handler = None
+
+
+def set_caption_memory_refusal_handler(handler):
+    """Registers handler(total_gb, available_gb, needed_gb), called when the caption model is refused for lack of free memory."""
+    global _caption_memory_refusal_handler
+    _caption_memory_refusal_handler = handler
+
+
+def _caption_memory_allows_load():
+    """True when there is enough free memory to load the caption model; otherwise logs it, tells the registered handler and returns False."""
+    # WARNING: loading the model with too little free memory kills the whole program with no crash log; this check must stay in front of every load.
+    if _perf_governor is None:
+        return True
+    try:
+        ok, total_gb, avail_gb, needed_gb = _perf_governor.caption_memory_check()
+    except Exception as e:
+        log.warning("[ASR MEMORY] memory check failed, allowing the load: %s", e)
+        return True
+    log.info("[ASR MEMORY] total=%.1fGB available=%.1fGB needed=%.1fGB -> %s",
+             total_gb, avail_gb, needed_gb, "ok" if ok else "REFUSED")
+    if ok:
+        return True
+    handler = _caption_memory_refusal_handler
+    if handler is not None:
+        try:
+            handler(total_gb, avail_gb, needed_gb)
+        except Exception as e:
+            log.warning("[ASR MEMORY] refusal handler failed: %s", e)
+    return False
+
+
 def _get_whisper_model():
     """Lazily load the faster-whisper model once and reuse it; returns None (one warning logged) when it isn't installed."""
     global _whisper_model, _whisper_model_load_failed
@@ -3672,6 +3704,8 @@ def _get_whisper_model():
     with _whisper_model_lock:
         if _whisper_model is not None or _whisper_model_load_failed:
             return _whisper_model
+        if not _caption_memory_allows_load():
+            return None
         try:
             from faster_whisper import WhisperModel
         except ImportError:
@@ -7153,6 +7187,6 @@ __all__ = [
     "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_caption_source",
     "resolve_captions_dir", "resolve_dir_entry", "resolve_loudness_dir", "resolve_main_dir",
     "resolve_shortcut_chain", "resolve_shortcut_target", "resolve_track_duration",
-    "resolve_whisper_model_dir", "set_live_playback_priority", "split_movies_and_series",
+    "resolve_whisper_model_dir", "set_caption_memory_refusal_handler", "set_live_playback_priority", "split_movies_and_series",
     "stable_series_id", "strip_shortcut_display_suffix", "track_duration_is_estimated",
 ]

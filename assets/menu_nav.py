@@ -772,7 +772,7 @@ def _build_games_table(page, total, kiosk):
 # ============================================================================
 
 # WARNING: these lists must match the column split in the Games sub-menu drawing in ui.py (_menu_left_order, _menu_right_order, and the splash panel that fills the right column), or the table and the picture disagree about which cell is where.
-GAMES_SUB_MENU_LEFT = ("controller_map", "game_screen_mode", "scan_for_cores", "clear_cores")
+GAMES_SUB_MENU_LEFT = ("controller_map", "stick_deadzone", "game_screen_mode", "scan_for_cores", "clear_cores")
 GAMES_SUB_MENU_RIGHT = ("menu_bg_select_image", "multitap_toggle", "scroll_style", "scan_for_roms", "clear_roms")
 GAMES_SUB_RIGHT_COLUMN = ("dvd_captions_toggle", "dvd_resume_toggle", "splash_toggle", "splash_select_image", "splash_select_video",
                           "add_bios", "relocate_roms_folder", "clear_console_roms")
@@ -1052,6 +1052,56 @@ def _build_save_profile_table(rows):
     t.link(CLOSE, UP, Remember("bezel_style" if "bezel_style" in rows else left[-1]))
     t.remember[CLOSE] = {UP: exits}
     return t
+
+
+# ============================================================================
+# SECTION: Stick deadzone screen
+# ============================================================================
+
+# WARNING: these cells and their order must match the cursor numbers of render_stick_deadzone_ui in game_deck.py (the switch, then the three setting rows and Reset to Defaults only while the switch is on, then Close).
+STICK_DZ_SWITCH = "switch"
+STICK_DZ_DEADZONE = "deadzone"
+STICK_DZ_SENSITIVITY = "sensitivity"
+STICK_DZ_AXIS = "axis_threshold"
+STICK_DZ_RESET = "reset"
+STICK_DZ_SETTINGS = (STICK_DZ_DEADZONE, STICK_DZ_SENSITIVITY, STICK_DZ_AXIS)
+
+_stick_dz_tables = {}
+
+
+def stick_dz_rows(enabled):
+    """Returns the cell names of the Stick Deadzone screen in cursor-number order."""
+    rows = [STICK_DZ_SWITCH]
+    if enabled:
+        rows.extend(STICK_DZ_SETTINGS)
+        rows.append(STICK_DZ_RESET)
+    rows.append(CLOSE)
+    return rows
+
+
+def stick_dz_cell(rows, selection):
+    """Returns the cell name for a Stick Deadzone cursor value; a number outside the rows is Close."""
+    if isinstance(selection, int) and 0 <= selection < len(rows):
+        return rows[selection]
+    return CLOSE
+
+
+def stick_dz_index(rows, cell):
+    """Returns the Stick Deadzone cursor value for a cell name."""
+    return list(rows).index(cell)
+
+
+def stick_dz_table(enabled):
+    """Returns the cached NavTable of the Stick Deadzone screen."""
+    key = bool(enabled)
+    table = _stick_dz_tables.get(key)
+    if table is None:
+        rows = stick_dz_rows(key)
+        table = NavTable()
+        table.known(*rows)
+        _chain(table, rows, None, None)
+        _stick_dz_tables[key] = table
+    return table
 
 
 # ============================================================================
@@ -2080,6 +2130,7 @@ __all__ = [
     "GAMES_SUB_MENU_LEFT", "GAMES_SUB_MENU_RIGHT", "GAMES_SUB_RIGHT_COLUMN", "games_sub_cell", "games_sub_index", "games_sub_table",
     "DVD_MAP_BUTTONS", "dvd_map_cell", "dvd_map_index", "dvd_map_table",
     "SAVE_PROFILE_ACTIVE", "SAVE_PROFILE_LEFT", "SAVE_PROFILE_RIGHT", "save_profile_rows", "save_profile_cell", "save_profile_index", "save_profile_table",
+    "STICK_DZ_SWITCH", "STICK_DZ_DEADZONE", "STICK_DZ_SENSITIVITY", "STICK_DZ_AXIS", "STICK_DZ_RESET", "STICK_DZ_SETTINGS", "stick_dz_rows", "stick_dz_cell", "stick_dz_index", "stick_dz_table",
     "CTRL_MAP_SQUARES", "CTRL_MAP_BUTTONS", "CTRL_MAP_STICK", "ctrl_map_rows", "ctrl_map_cell", "ctrl_map_index", "ctrl_map_table", "ctrl_map_squares_step",
     "GAMES_COLS", "GAMES_ROWS_PER_PAGE", "GAMES_PAGE_SIZE", "games_cell", "games_index", "games_table", "games_page_of", "games_page_count",
     "CHANNELS_COLS", "CHANNELS_ROWS_PER_PAGE", "CHANNELS_TOTAL", "CHANNELS_PAGE_SIZE", "CHANNELS_NUM_PAGES",

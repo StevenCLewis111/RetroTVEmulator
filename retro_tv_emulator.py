@@ -101,6 +101,7 @@ if performance_governor is not None:
 # WARNING: the 400 fallback must match MENU_NAV_REPEAT_DELAY_MS in performance_governor.py; it is used only when that module fails to import.
 _MENU_NAV_REPEAT_DELAY_MS = performance_governor.MENU_NAV_REPEAT_DELAY_MS if performance_governor is not None else 400
 from media import resolve_main_dir, resolve_loudness_dir, resolve_bezel_dir, discover_bezel_style_files, LOUDNESS_PROBE_MAX_CONCURRENT, get_music_loudness_gain
+media.set_caption_memory_refusal_handler(lambda total_gb, available_gb, needed_gb: _on_caption_memory_refused(total_gb, available_gb, needed_gb))
 
 def _write_crash_log(exc_type, exc_value, exc_tb):
     try:
@@ -2361,14 +2362,16 @@ def _video_pixel_aspect(win_w, win_h, source_aspect, mode=None):
 
 
 def _video_screen_mode_rect(content_rect, win_w, win_h, source_aspect=None, mode=None):
-    """Return the rect real TV video is fit into by _blit_video_with_screen_mode, as opposed to the raw content_rect."""
+    """Return the rect real TV video is fit into by _blit_video_with_screen_mode, as opposed to the raw content_rect; with Bezel off it is the whole window for every Screen Mode, and Normal fits the picture's own shape inside it."""
     if _bezel_video_wants_tube_fit(source_aspect, mode=mode):
         return pygame.Rect(content_rect)
+    if db is not None and not db.config.get("fake_43_border_enabled", False):
+        return _apply_pixel_orbiter(pygame.Rect(0, 0, win_w, win_h))
     if db is not None and db.config.get("fake_43_border_enabled", False):
         aspect = 4.0 / 3.0
     else:
         aspect = _selected_package_aspect()
-    # WARNING: with Bezel off, content_rect is already boxed to this aspect, so boxing here must stay a no-op.
+    # WARNING: only Bezel on and a missing database reach this box; Bezel off returns the whole window above.
     _box_w, _box_h = content_rect.width, content_rect.height
     boxed = _full_tv_43_outer_rect(_box_w, _box_h, aspect=aspect)
     _result = pygame.Rect(content_rect.x + boxed.x, content_rect.y + boxed.y,
@@ -2473,10 +2476,22 @@ def _active_screen_mode():
     return db.config.get("screen_mode", "normal") if db is not None else "normal"
 
 
-def _screen_mode_geometry_branch(screen_mode, canvas_is_4_3):
-    """Identify the VLC decode-geometry branch _apply_screen_mode_geometry() picks for a Screen Mode and canvas shape, without a live engine."""
-    if screen_mode not in ("crop", "panscan") and canvas_is_4_3:
-        return "full_canvas"
+# ============================================================================
+# SECTION: Video decode canvas
+# ============================================================================
+
+
+def _video_decode_canvas_size(decode_res):
+    """Return the (width, height) of the VLC decode canvas for the Decode Resolution setting; the same for every screen resolution."""
+    # WARNING: the fallback numbers must match VIDEO_DECODE_CANVAS_SD / _HD in performance_governor.py; they are used only when that module fails to import.
+    if performance_governor is None:
+        return (1280, 720) if decode_res == "hd" else (854, 480)
+    size = performance_governor.VIDEO_DECODE_CANVAS_HD if decode_res == "hd" else performance_governor.VIDEO_DECODE_CANVAS_SD
+    return int(size[0]), int(size[1])
+
+
+def _screen_mode_geometry_branch(screen_mode):
+    """Identify the VLC decode-geometry branch _apply_screen_mode_geometry() picks for a Screen Mode, without a live engine."""
     return "true_source_padded"
 
 
@@ -2488,13 +2503,7 @@ def _screen_mode_change_needs_reopen(engine, old_mode, new_mode):
         return False
     if not getattr(engine, "current_filepath", None):
         return False
-    try:
-        canvas_4_3 = engine._canvas_is_genuinely_4_3()
-    except Exception as e:
-        log.warning("_screen_mode_change_needs_reopen: canvas check failed, forcing reopen: %s", e)
-        return True
-    return (_screen_mode_geometry_branch(old_mode, canvas_4_3)
-            != _screen_mode_geometry_branch(new_mode, canvas_4_3))
+    return _screen_mode_geometry_branch(old_mode) != _screen_mode_geometry_branch(new_mode)
 
 
 def _dvd_screen_mode_geometry_branch(screen_mode, target_aspect, has_src_dims):
@@ -2531,11 +2540,7 @@ def _true_content_surf(surf, vlc_engine):
         _log_key = (dw, dh, cw, ch)
         if _true_content_surf_log_state.get("key") != _log_key:
             _true_content_surf_log_state["key"] = _log_key
-            try:
-                _canvas_4_3 = vlc_engine._canvas_is_genuinely_4_3()
-            except Exception:
-                _canvas_4_3 = "?"
-            log.info("[TRUE CONTENT SURF] decode=%sx%s canvas=%sx%s canvas_genuinely_4_3=%s -> %s", dw, dh, cw, ch, _canvas_4_3,
+            log.info("[TRUE CONTENT SURF] decode=%sx%s canvas=%sx%s -> %s", dw, dh, cw, ch,
                      "no_crop(matches_canvas)" if (dw <= 0 or dh <= 0 or (dw == cw and dh == ch)) else "will_crop")
         if dw <= 0 or dh <= 0 or (dw == cw and dh == ch):
             return surf
@@ -4803,6 +4808,9 @@ def _cached_sys_font(name, size, bold=False):
 
 # VALUES CHANGE HERE
 STATUS_BANNER_DURATION_MS = 30000
+# WARNING: the 5000 fallback must match CAPTION_MEMORY_BANNER_SECONDS in performance_governor.py; it is used only when that module fails to import.
+CAPTION_MEMORY_BANNER_MS = int(performance_governor.CAPTION_MEMORY_BANNER_SECONDS * 1000) if performance_governor is not None else 5000
+CAPTION_MEMORY_BANNER_LABEL = "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
 
 _drive_streak_signature = None
 _drive_streak_consumed  = False
@@ -4843,6 +4851,45 @@ def _report_missing_media(signature, label):
 
 _status_banner_current    = None
 _status_banner_started_at = None
+_caption_memory_refusal_pending = False
+_caption_memory_banner_pending = False
+
+
+def _on_caption_memory_refused(total_gb, available_gb, needed_gb):
+    """Called from any thread when the caption model is refused for lack of memory; the main loop does the rest."""
+    global _caption_memory_refusal_pending
+    _caption_memory_refusal_pending = True
+
+
+def _apply_caption_memory_refusal():
+    """Main thread: switches Live Captions off and starts the red banner after the caption model was refused for lack of memory."""
+    global _caption_memory_refusal_pending, _caption_memory_banner_pending, _caption_prewarm_started
+    if not _caption_memory_refusal_pending:
+        return
+    _caption_memory_refusal_pending = False
+    if db is not None:
+        _was_on = bool(db.config.get("tv_captions_enabled", False)) or bool(db.config.get("dvd_captions_enabled", False))
+        db.config["tv_captions_enabled"] = False
+        db.config["dvd_captions_enabled"] = False
+        try:
+            db.save_settings()
+        except Exception as e:
+            log.warning("[ASR MEMORY] could not save the captions-off setting: %s", e)
+        if game_deck is not None:
+            try:
+                game_deck.refresh_from_config(db.config)
+            except Exception as e:
+                log.warning("[ASR MEMORY] game deck refresh failed: %s", e)
+        if not _was_on:
+            return
+    with _caption_prewarm_lock:
+        _caption_prewarm_started = False
+    try:
+        _release_tv_caption_state_when_off("not enough memory for live captions")
+    except Exception as e:
+        log.warning("[ASR MEMORY] could not clear the caption state: %s", e)
+    _caption_memory_banner_pending = True
+    log.warning("[ASR MEMORY] Live Captions switched off: not enough free memory to load the caption model")
 
 
 def _active_playback_drive_roots():
@@ -4954,6 +5001,7 @@ def _channel_failure_is_drive_wide(ch_key, entry):
 
 
 def _advance_status_banner_streaks():
+    _apply_caption_memory_refusal()
     global _drive_streak_signature, _drive_streak_consumed, _drive_streak_consumed_at
     global _gamepad_streak_signature, _gamepad_streak_consumed
     global _missing_media_streak_signature, _missing_media_streak_consumed
@@ -5055,6 +5103,8 @@ def _advance_status_banner_streaks():
 
 
 def _status_banner_is_active(name):
+    if name == "captions_memory":
+        return _caption_memory_banner_pending
     if name == "server":
         return _server_streak_signature is not None
     if name == "drive":
@@ -5067,6 +5117,8 @@ def _status_banner_is_active(name):
 
 
 def _status_banner_is_consumed(name):
+    if name == "captions_memory":
+        return False
     if name == "server":
         return _server_streak_consumed
     if name == "drive":
@@ -5081,8 +5133,10 @@ def _status_banner_is_consumed(name):
 def _mark_status_banner_consumed(name):
     global _drive_streak_consumed, _drive_streak_consumed_at, _gamepad_streak_consumed
     global _missing_media_streak_consumed, _missing_media_streak_consumed_at
-    global _server_streak_consumed, _server_streak_consumed_at
-    if name == "server":
+    global _server_streak_consumed, _server_streak_consumed_at, _caption_memory_banner_pending
+    if name == "captions_memory":
+        _caption_memory_banner_pending = False
+    elif name == "server":
         _server_streak_consumed = True
         _server_streak_consumed_at = pygame.time.get_ticks()
     elif name == "drive":
@@ -5100,7 +5154,14 @@ def _drive_banner_label(roots):
     return "CHECK YOUR DRIVE — " + ", ".join(r.rstrip("\\") for r in sorted(roots)) + " isn't responding"
 
 
+def _status_banner_duration_ms(name):
+    """How long a shared status banner stays up."""
+    return CAPTION_MEMORY_BANNER_MS if name == "captions_memory" else STATUS_BANNER_DURATION_MS
+
+
 def _status_banner_label(name):
+    if name == "captions_memory":
+        return CAPTION_MEMORY_BANNER_LABEL
     if name == "server" and _server_streak_signature is not None:
         server_name = _server_streak_signature[0]
         return f"SERVER OFFLINE — {server_name}"
@@ -5147,13 +5208,17 @@ def _draw_status_banners(screen):
     try:
         _advance_status_banner_streaks()
         now = pygame.time.get_ticks()
-        order = ("server", "drive", "gamepad", "missing_media")
+        order = ("captions_memory", "server", "drive", "gamepad", "missing_media")
+
+        if _caption_memory_banner_pending and _status_banner_current != "captions_memory":
+            _status_banner_current = "captions_memory"
+            _status_banner_started_at = now
 
         if _status_banner_current is not None:
             if not _status_banner_is_active(_status_banner_current):
                 _status_banner_current = None
                 _status_banner_started_at = None
-            elif now - _status_banner_started_at >= STATUS_BANNER_DURATION_MS:
+            elif now - _status_banner_started_at >= _status_banner_duration_ms(_status_banner_current):
                 _mark_status_banner_consumed(_status_banner_current)
                 _status_banner_current = None
                 _status_banner_started_at = None
@@ -10766,16 +10831,7 @@ def initialize_vlc_on_demand():
                         self.target_aspect = db.config.get("dvd_aspect_ratio", "16:9") if db else "16:9"
                     else:
                         self.target_aspect = db.config.get("aspect_ratio", "16:9") if db else "16:9"
-                    # WARNING: the VLC callback surface must keep the physical display's native aspect.
-                    _native_aspect = (
-                        getattr(db, "_detected_aspect_ratio", DETECTED_ASPECT_RATIO)
-                        if db else DETECTED_ASPECT_RATIO
-                    )
-                    _is_4_3 = (_native_aspect == "4:3")
-                    if _decode_res == "hd":
-                        self.width, self.height = (960, 720) if _is_4_3 else (1280, 720)
-                    else:
-                        self.width, self.height = (640, 480) if _is_4_3 else (854, 480)
+                    self.width, self.height = _video_decode_canvas_size(_decode_res)
 
                     self.buf_size = self.width * self.height * 4
                     self.raw_buffer = (ctypes.c_ubyte * self.buf_size)()
@@ -10974,16 +11030,7 @@ def initialize_vlc_on_demand():
 
                 def resize_canvas(self, new_aspect):
                     _decode_res = db.config.get("vlc_decode_res", "sd") if db else "sd"
-                    # WARNING: keep the decode canvas at the physical display's native aspect.
-                    _native_aspect = (
-                        getattr(db, "_detected_aspect_ratio", DETECTED_ASPECT_RATIO)
-                        if db else DETECTED_ASPECT_RATIO
-                    )
-                    _is_4_3 = (_native_aspect == "4:3")
-                    if _decode_res == "hd":
-                        new_w, new_h = (960, 720) if _is_4_3 else (1280, 720)
-                    else:
-                        new_w, new_h = (640, 480) if _is_4_3 else (854, 480)
+                    new_w, new_h = _video_decode_canvas_size(_decode_res)
 
                     if new_aspect == self.target_aspect:
                         return
@@ -11107,16 +11154,6 @@ def initialize_vlc_on_demand():
                         self._letterbox_offset_x = 0
                         self._letterbox_offset_y = 0
 
-                def _canvas_is_genuinely_4_3(self):
-                    """True only when the VLC decode canvas itself (self.width x self.height) is shaped 4:3."""
-                    # WARNING: do not use target_aspect == "4:3" here; it is also set on 16:9 hardware in 4:3 Test Mode.
-                    try:
-                        if not self.height:
-                            return False
-                        return abs((self.width / float(self.height)) - (4.0 / 3.0)) < 0.02
-                    except Exception:
-                        return False
-
                 def _apply_screen_mode_geometry(self, is_dvd_iso, src_dims=None):
                     """Applies the VLC-level crop/letterbox geometry for the current target_aspect and Screen Mode to an already-open player without reopening it."""
                     if is_dvd_iso:
@@ -11137,22 +11174,16 @@ def initialize_vlc_on_demand():
 
                     _screen_mode = self._configured_screen_mode()
 
-                    if _screen_mode not in ("crop", "panscan") and self._canvas_is_genuinely_4_3():
-                        self._fill_full_canvas()
-                        self._set_crop_geometry(None)
+                    self._set_crop_geometry(None)
+                    if src_dims:
+                        self._configure_letterbox_for_source(*src_dims)
                         self._native_dims_pending = False
-                        log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=genuine_4:3_fastpath canvas=%sx%s decode=%sx%s src_dims=%s", self.engine_label, _screen_mode, self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None), src_dims)
+                        log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=letterbox_for_source(%s,%s) canvas=%sx%s decode=%sx%s offset=(%s,%s)", self.engine_label, _screen_mode, src_dims[0], src_dims[1], self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None), getattr(self, "_letterbox_offset_x", None), getattr(self, "_letterbox_offset_y", None))
                     else:
-                        self._set_crop_geometry(None)
-                        if src_dims:
-                            self._configure_letterbox_for_source(*src_dims)
-                            self._native_dims_pending = False
-                            log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=letterbox_for_source(%s,%s) canvas=%sx%s decode=%sx%s offset=(%s,%s)", self.engine_label, _screen_mode, src_dims[0], src_dims[1], self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None), getattr(self, "_letterbox_offset_x", None), getattr(self, "_letterbox_offset_y", None))
-                        else:
-                            self._fill_full_canvas()
-                            self._native_dims_pending = True
-                            self._native_dims_deadline_ms = pygame.time.get_ticks() + 1500
-                            log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=letterbox_no_src_dims->fill_full_canvas canvas=%sx%s decode=%sx%s", self.engine_label, _screen_mode, self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None))
+                        self._fill_full_canvas()
+                        self._native_dims_pending = True
+                        self._native_dims_deadline_ms = pygame.time.get_ticks() + 1500
+                        log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=letterbox_no_src_dims->fill_full_canvas canvas=%sx%s decode=%sx%s", self.engine_label, _screen_mode, self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None))
 
                 def refresh_screen_mode_geometry(self):
                     """Re-applies Screen Mode's VLC-side crop/letterbox geometry to whatever is playing, keeping the position."""
@@ -11303,8 +11334,7 @@ def initialize_vlc_on_demand():
                                             and _cur_norm == _np
                                             and not getattr(self, "is_dvd_iso", False)
                                             and db is not None
-                                            and self._configured_screen_mode() in ("normal", "crop", "panscan")
-                                            and not self._canvas_is_genuinely_4_3()):
+                                            and self._configured_screen_mode() in ("normal", "crop", "panscan")):
                                         log.info("[GEOMETRY REFRESH TRIGGER:%s] source=slow_ffmpeg_probe file=%s gen=%s", self.engine_label, _fp, _gen)
                                         self.refresh_screen_mode_geometry()
                                 except Exception as e:
@@ -11600,19 +11630,17 @@ def initialize_vlc_on_demand():
                                             and getattr(self, "_seek_generation", None) == generation
                                             and not getattr(self, "is_dvd_iso", False)
                                             and db is not None
-                                            and self._configured_screen_mode() in ("normal", "crop", "panscan")
-                                            and not self._canvas_is_genuinely_4_3())
+                                            and self._configured_screen_mode() in ("normal", "crop", "panscan"))
                                     if _refresh_gate:
                                         log.info("[GEOMETRY REFRESH TRIGGER:%s] source=native_dims_poll file=%s gen=%s dims=%sx%s", self.engine_label, filepath, generation, w, h)
                                         self.refresh_screen_mode_geometry()
                                     else:
-                                        log.info("[NATIVE DIMS POLL:%s] dims found but refresh SKIPPED (gate failed) file=%s gen=%s current_filepath_match=%s current_gen_match=%s is_dvd_iso=%s screen_mode=%s canvas_genuinely_4_3=%s",
+                                        log.info("[NATIVE DIMS POLL:%s] dims found but refresh SKIPPED (gate failed) file=%s gen=%s current_filepath_match=%s current_gen_match=%s is_dvd_iso=%s screen_mode=%s",
                                                  self.engine_label, filepath, generation,
                                                  getattr(self, "current_filepath", None) == filepath,
                                                  getattr(self, "_seek_generation", None) == generation,
                                                  getattr(self, "is_dvd_iso", False),
-                                                 self._configured_screen_mode(),
-                                                 self._canvas_is_genuinely_4_3())
+                                                 self._configured_screen_mode())
                                 except Exception as e:
                                     log.warning("_apply_native_dims_when_ready: geometry refresh failed for %s: %s", filepath, e)
                                 return
@@ -12498,8 +12526,6 @@ def initialize_vlc_on_demand():
                     if w <= 0 or h <= 0:
                         return
                     self._native_dims_pending = False
-                    if self._canvas_is_genuinely_4_3():
-                        return
                     filepath = getattr(self, "current_filepath", None)
                     if filepath:
                         try:
@@ -22259,6 +22285,44 @@ while True:
                     continue
 
             if (app_state.get("show_menu") and
+                    app_state.get("menu_layer") == "GAMES_STICK_DZ" and
+                    game_deck is not None):
+                import game_deck as _sz_mod
+                _sz_on = _sz_mod.stick_switch_on(db.config)
+                _sz_rows = menu_nav.stick_dz_rows(_sz_on)
+                _sz_from = menu_nav.stick_dz_cell(_sz_rows, app_state.get("stick_dz_cursor", 0))
+                _sz_dir = menu_nav.key_to_direction(event.key, arrows=True)
+                if _sz_dir in (menu_nav.UP, menu_nav.DOWN):
+                    _sz_to = menu_nav.navigate(app_state, "GAMES_STICK_DZ", menu_nav.stick_dz_table(_sz_on), _sz_from, _sz_dir)
+                    if _sz_to is not None:
+                        app_state["stick_dz_cursor"] = menu_nav.stick_dz_index(_sz_rows, _sz_to)
+                    continue
+                if _sz_dir in (menu_nav.LEFT, menu_nav.RIGHT):
+                    if _sz_from in menu_nav.STICK_DZ_SETTINGS:
+                        _sz_mod.adjust_stick_setting(db.config, _sz_from, 1 if _sz_dir == menu_nav.RIGHT else -1)
+                        _sz_mod.apply_stick_config(db.config)
+                        db.save_settings()
+                    continue
+                if menu_nav.is_accept(event.key):
+                    if _sz_from == menu_nav.STICK_DZ_SWITCH:
+                        _sz_mod.toggle_stick_switch(db.config)
+                        _sz_mod.apply_stick_config(db.config)
+                        db.save_settings()
+                        if not _sz_mod.stick_switch_on(db.config):
+                            app_state["stick_dz_cursor"] = 0
+                    elif _sz_from == menu_nav.STICK_DZ_RESET:
+                        _sz_mod.reset_stick_defaults(db.config)
+                        _sz_mod.apply_stick_config(db.config)
+                        db.save_settings()
+                    elif _sz_from == menu_nav.CLOSE:
+                        app_state["menu_layer"] = "GAMES_SUB_MENU"
+                    continue
+                if menu_nav.is_back(event.key):
+                    pass
+                else:
+                    continue
+
+            if (app_state.get("show_menu") and
                     app_state.get("menu_layer") == "GAMES_CTRL_MAP" and
                     game_deck is not None):
 
@@ -22763,6 +22827,7 @@ while True:
                     "AUDIO_TRACK_PICKER":   "CHANNEL_SUB_MENU",
                     "GAMES_SUB_MENU":       "GAMES_LIST",
                     "GAMES_CTRL_MAP":       "GAMES_SUB_MENU",
+                    "GAMES_STICK_DZ":       "GAMES_SUB_MENU",
                     "GAMES_SAVE_PROFILE":   "GAMES_SUB_MENU",
                     "REMOTE_REMAP_LIST":    "SYSTEM_ADVANCED_SUB_MENU",
                     "SERVER_MENU":          "SYSTEM_ADVANCED_SUB_MENU",
@@ -24237,6 +24302,10 @@ while True:
                                     game_deck._libretro_osd_msg   = "MULTITAP NOT SUPPORTED THIS SESSION"
                                     game_deck._libretro_osd_until = pygame.time.get_ticks() + 2500
                             print(f"[GAMES] Multitap (all consoles) = {enabled}")
+                        elif row_id == "stick_deadzone":
+                            app_state["menu_layer"] = "GAMES_STICK_DZ"
+                            app_state["stick_dz_cursor"] = 0
+                            print("[GAMES] Opening stick deadzone screen")
                         elif row_id == "controller_map":
                             app_state["menu_layer"]  = "GAMES_CTRL_MAP"
                             app_state["games_ctrl_console"] = console_key
@@ -27031,6 +27100,22 @@ while True:
         _menu_surf = _overlay_target(screen)
         app_state["dvd_audio_track_count"] = _get_dvd_audio_track_count(dvd_engine)
         render_settings_overlay_menu(_overlay_target_for_menu(screen), active_theme, app_state, db)
+
+        if app_state.get("menu_layer") == "GAMES_STICK_DZ" and game_deck is not None:
+            import colorsys as _szcs
+            _sz_h = db.config.get("theme_ui_hue", 140) / 360.0 if db else 0.39
+            _sz_r, _sz_g, _sz_b = _szcs.hsv_to_rgb(_sz_h, 0.88, 1.0)
+            _sz_surf = _overlay_target_for_menu(screen)
+            _sz_x, _sz_y, _sz_w, _sz_h2 = menu_panel_rect(_sz_surf.get_width(), _sz_surf.get_height(), db)
+            _sz_scale = _sz_w / 1036.0
+            import game_deck as _sz_mod
+            _sz_rows = menu_nav.stick_dz_rows(_sz_mod.stick_switch_on(db.config))
+            _sz_mod.mark_stick_test_open()
+            _sz_mod.render_stick_deadzone_ui(
+                _sz_surf,
+                (_sz_x + int(20 * _sz_scale), _sz_y + int(138 * _sz_scale), int(996 * _sz_scale), int(525 * _sz_scale)),
+                (int(_sz_r * 255), int(_sz_g * 255), int(_sz_b * 255)), db, app_state.get("stick_dz_cursor", 0), _sz_rows,
+                _sz_mod.stick_test_sticks())
 
         if app_state.get("menu_layer") == "GAMES_CTRL_MAP" and game_deck is not None:
             game_deck._ctrl_map_cursor = app_state.get("ctrl_map_cursor", 1)
