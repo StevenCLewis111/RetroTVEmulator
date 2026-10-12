@@ -470,16 +470,22 @@ def _pb_run_sample(file_path: str, ffmpeg: str, t: float, timeout: float):
 def detect_picture_box(file_path: str, duration: Optional[float] = None,
                         ffmpeg_path: Optional[str] = None,
                         sample_timeout: float = _PB_SAMPLE_TIMEOUT_S,
-                        diag: Optional[dict] = None) -> Optional[dict]:
-    """Find the real picture inside the frame: ffmpeg cropdetect at several points, widest box wins; diag, if given, receives the timeout count and the stderr of a file ffmpeg would not open."""
+                        diag: Optional[dict] = None, parallel: int = 1) -> Optional[dict]:
+    """Find the real picture inside the frame: ffmpeg cropdetect at several points, widest box wins; parallel above 1 decodes the sample points at the same time; diag, if given, receives the timeout count and the stderr of a file ffmpeg would not open."""
     ffmpeg = _resolve_ffmpeg(ffmpeg_path)
     frame_w = frame_h = None
     pixel_aspect = 1.0
     boxes = []
     timeouts = 0
 
-    for t in _pb_sample_times(duration):
-        text = _pb_run_sample(file_path, ffmpeg, t, sample_timeout)
+    _times = _pb_sample_times(duration)
+    if parallel > 1 and len(_times) > 1:
+        from concurrent.futures import ThreadPoolExecutor as _Pool
+        _texts = _Pool(max_workers=min(int(parallel), len(_times))).map(
+            lambda _t: _pb_run_sample(file_path, ffmpeg, _t, sample_timeout), _times)
+    else:
+        _texts = (_pb_run_sample(file_path, ffmpeg, _t, sample_timeout) for _t in _times)
+    for text in _texts:
         if text is None:
             timeouts += 1
             continue
@@ -894,7 +900,7 @@ class ProbeLibrary:
             header_probed_at=time.time(),
         )
 
-    def detect_picture_box_if_needed(self, file_path: str, diag: Optional[dict] = None) -> Optional[dict]:
+    def detect_picture_box_if_needed(self, file_path: str, diag: Optional[dict] = None, parallel: int = 1) -> Optional[dict]:
         """The picture-box hook for any caller that wants the answer now; diag, if given, receives why there was no answer."""
         content_key = self.keys.resolve(file_path)
         if content_key is None:
@@ -908,7 +914,7 @@ class ProbeLibrary:
         if entry is None or not entry.get("header_probed_at"):
             entry = self.get_or_probe_sync(file_path)
         duration = (entry or {}).get("duration")
-        box = detect_picture_box(file_path, duration=duration, ffmpeg_path=self.ffmpeg_path, diag=diag)
+        box = detect_picture_box(file_path, duration=duration, ffmpeg_path=self.ffmpeg_path, diag=diag, parallel=parallel)
         if box is None:
             return None
         self.library.upsert_fields(

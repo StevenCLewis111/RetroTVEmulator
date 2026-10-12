@@ -2024,7 +2024,8 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
                          episode_order_mode="sequential",
                          fixed_show_order=None,
                          block_duration_seconds=None,
-                         channel_id=None):
+                         channel_id=None,
+                         order_seed=None):
     import random as _random
 
     show_pos = dict(show_pos or {})
@@ -2115,7 +2116,7 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
         _placed = set(order)
         order.extend(sorted(sn for sn in show_names if sn not in _placed))
     else:
-        rng = _random.Random(day_seed)
+        rng = _random.Random(order_seed if order_seed is not None else day_seed)
         order = list(show_names)
         rng.shuffle(order)
     show_order_used = order
@@ -2160,7 +2161,8 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
             series_total_runtime_seconds=series_runtime,
         )
         _ordered_pool = sorted(movie_pool, key=lambda t: t.get("path", ""))
-        picked_movies = _rotation_take_random(show_pos, MOVIE_ROTATION_KEY, n_movie_pick, _ordered_pool, day_seed)
+        _movie_seed = order_seed if (order_seed is not None and show_pos.get(MOVIE_ROTATION_KEY) is None) else day_seed
+        picked_movies = _rotation_take_random(show_pos, MOVIE_ROTATION_KEY, n_movie_pick, _ordered_pool, _movie_seed)
         movie_budget = _movie_runtime_budget(
             movie_pool, _bds, series_total, series_runtime
         )
@@ -2206,7 +2208,7 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
                            episode_order_mode="sequential", pair_threshold_seconds=900,
                            fixed_show_order=None, block_duration_seconds=None,
                            movies_per_block=MOVIES_PER_BLOCK, max_simulated_blocks=21900,
-                           channel_id=None):
+                           channel_id=None, order_seed=None):
     show_pos = dict(show_pos or {})
     if not day_seeds:
         return show_pos, fixed_show_order, {}
@@ -2270,6 +2272,7 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
             block_duration_seconds=block_duration_seconds,
             movies_per_block=movies_per_block,
             channel_id=channel_id,
+            order_seed=order_seed,
         )
         order = order or used_order
 

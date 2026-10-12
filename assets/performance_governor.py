@@ -705,6 +705,21 @@ VIDEO_DECODE_CANVAS_HD = (1280, 720)
 
 
 # ============================================================================
+# SECTION: Picture shapes
+# ============================================================================
+# VALUES CHANGE HERE
+PICTURE_STANDARD_ASPECTS = (16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0)
+
+
+# ============================================================================
+# SECTION: Picture box before the show
+# ============================================================================
+# VALUES CHANGE HERE
+PICTURE_BOX_PRE_SHOW_BUDGET_S = 8.0
+PICTURE_BOX_PRE_SHOW_PARALLEL = 6
+
+
+# ============================================================================
 # SECTION: Caption memory check
 # ============================================================================
 # VALUES CHANGE HERE (free RAM in GB the caption model needs before it may load; seconds the red "no memory" banner stays up)

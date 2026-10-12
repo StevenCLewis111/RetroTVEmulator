@@ -5973,6 +5973,223 @@ def suite_one_picture_path():
                           "same-shape screens must have proportional bars")
 
 
+def suite_one_shape_per_label():
+    import performance_governor as _pg
+    ns = {"performance_governor": _pg, "math": math}
+    exec(main_function_code("_snap_standard_aspect"), {"_PICTURE_STANDARD_ASPECTS": tuple(_pg.PICTURE_STANDARD_ASPECTS), "math": math}, ns)
+    snap = ns["_snap_standard_aspect"]
+    wide, std, tall = 16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0
+    expected = ((2.39, wide), (2.35, wide), (2.0, wide), (1.85, wide), (16.0 / 9.0, wide), (1.6, wide),
+                (1.5, std), (4.0 / 3.0, std), (1.25, std), (1.0, std),
+                (0.75, tall), (0.5625, tall), (0.5, tall), (0.4, tall))
+    for aspect, want in expected:
+        got = snap(aspect)
+        check(abs(got - want) < 1e-9, "aspect %s snapped to %s, expected %s" % (aspect, got, want))
+    check(snap(None) is None and snap(0) == 0, "no shape must pass through untouched")
+    check(tuple(_pg.PICTURE_STANDARD_ASPECTS) == (wide, std, tall), "the governor table must hold 16:9, 4:3 and 9:16")
+    for gone in ("_PICTURE_FIT_NEAR_169_MIN", "_PICTURE_FIT_NEAR_169_MAX", "_PICTURE_FIT_NEAR_43_MIN", "_PICTURE_FIT_NEAR_916_MIN", "_PICTURE_FIT_NEAR_916_MAX"):
+        check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
+    check("performance_governor.PICTURE_STANDARD_ASPECTS" in MAIN_SRC, "the main script must read the governor table")
+
+    blit_ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
+               "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
+               "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
+    exec(main_function_code("_blit_video_with_screen_mode"), blit_ns)
+    blit = blit_ns["_blit_video_with_screen_mode"]
+    groups = {"16:9": ((1280, 720), (1920, 804), (1920, 1040), (1280, 534)), "4:3": ((640, 480), (720, 540), (1024, 768)), "9:16": ((1080, 1920), (720, 1280))}
+    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
+    for win_w, win_h in screens:
+        rect = pygame.Rect(0, 0, win_w, win_h)
+        for label, sizes in groups.items():
+            seen = set()
+            for pw, ph in sizes:
+                geom = {}
+                blit(pygame.Surface((win_w, win_h)), pygame.Surface((pw, ph)), rect, mode="normal", geom_out=geom, fit_aspect=snap(pw / float(ph)))
+                seen.add((geom["dest_x"], geom["dest_y"], geom["draw_w"], geom["draw_h"]))
+                check(geom["draw_w"] >= win_w - 1 or geom["draw_h"] >= win_h - 1, "bars on both axes, %s on %dx%d" % (label, win_w, win_h))
+            check(len(seen) == 1, "%s pictures got different boxes on %dx%d: %s" % (label, win_w, win_h, sorted(seen)))
+            stretch = {}
+            blit(pygame.Surface((win_w, win_h)), pygame.Surface(sizes[0]), rect, mode="stretch", geom_out=stretch, fit_aspect=snap(sizes[0][0] / float(sizes[0][1])))
+            check((stretch["draw_w"], stretch["draw_h"]) == (win_w, win_h), "stretch must still fill %dx%d" % (win_w, win_h))
+    for site in ("_video_sa = _snap_standard_aspect(", "_pv_fit_aspect = _snap_standard_aspect("):
+        check(site in MAIN_SRC, "draw site missing: " + site)
+
+
+def suite_picture_box_before_show():
+    check(gov.PICTURE_BOX_PRE_SHOW_BUDGET_S == 8.0 and gov.PICTURE_BOX_PRE_SHOW_PARALLEL == 6, "the governor must hold the pre-show budget and parallel count")
+
+    def fake_text(w, h, crop, dar=None):
+        dar_text = (", DAR %d:%d" % dar) if dar else ""
+        return "Input #0, matroska\n  Stream #0:0: Video: h264, yuv420p, %dx%d%s\n[Parsed_cropdetect_0] crop=%d:%d:%d:%d\n" % (w, h, dar_text, crop[0], crop[1], crop[2], crop[3])
+
+    answers = {}
+
+    def fake_sample(file_path, ffmpeg, t, timeout):
+        time.sleep(0.05)
+        return answers["text"]
+
+    answers["text"] = fake_text(1920, 1080, (1440, 1080, 240, 0))
+    with mock.patch.object(ml, "_pb_run_sample", side_effect=fake_sample), mock.patch.object(ml, "_resolve_ffmpeg", return_value="ffmpeg"):
+        started = time.monotonic()
+        serial = ml.detect_picture_box("a.mkv", duration=3000.0, parallel=1)
+        serial_s = time.monotonic() - started
+        started = time.monotonic()
+        parallel = ml.detect_picture_box("a.mkv", duration=3000.0, parallel=6)
+        parallel_s = time.monotonic() - started
+    check(serial is not None and serial == parallel, "parallel scan must give the same box as the serial scan")
+    check(serial["reason"] == "pillarbox" and abs(serial["picture_aspect"] - 4.0 / 3.0) < 0.01, "a 4:3 picture inside 16:9 must read as a pillarbox of 4:3: %s" % serial)
+    check(parallel_s < serial_s * 0.7, "parallel samples must be faster: %.2f vs %.2f" % (parallel_s, serial_s))
+
+    ns = {"os": os, "time": time, "threading": threading, "media": media, "ml_box": None}
+    log_stub = type("L", (), {"info": staticmethod(lambda *a, **k: None), "warning": staticmethod(lambda *a, **k: None)})()
+    store = {}
+
+    class FakeLib:
+        def get_cached(self, path):
+            box = store.get(path)
+            return {"picture_box": box, "picture_box_detector_version": ml.PICTURE_BOX_DETECTOR_VERSION} if box else None
+
+    scans = []
+    delay = {"s": 0.0}
+
+    def fake_scan(lib, mlmod, path, parallel=1):
+        scans.append(parallel)
+        time.sleep(delay["s"])
+        store[path] = {"reason": "letterbox", "frame": [1920, 1080], "pixel_aspect": 1.0, "picture_aspect": 1.78}
+        return True
+
+    ns.update({"log": log_stub, "_cached_path_exists": lambda p: True, "_get_probe_library": lambda: FakeLib(),
+               "_picture_box_failures": {}, "_PICTURE_BOX_RETRY_BACKOFF_S": (600, 1800, 7200),
+               "_is_drive_degraded": lambda p: False, "_picture_box_scan_one": fake_scan,
+               "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 0.5, "_PICTURE_BOX_PRE_SHOW_PARALLEL": 6})
+    exec(main_function_code("_decide_picture_box_before_show"), ns)
+    decide = ns["_decide_picture_box_before_show"]
+    path = os.path.normpath(os.path.abspath("show.mkv"))
+
+    box = decide("show.mkv")
+    check(box is not None and scans == [6], "an unscanned file must be scanned with all samples at once before the show: %s" % scans)
+    scans.clear()
+    check(decide("show.mkv") == box and scans == [], "a file with a stored box must not be scanned again")
+    store.clear()
+    delay["s"] = 1.5
+    started = time.monotonic()
+    check(decide("show.mkv") is None, "a scan that misses the budget must give no box")
+    check(time.monotonic() - started < 1.2, "the pre-show wait must stop at the budget")
+    time.sleep(1.5)
+    ns["_picture_box_failures"][path] = (3, 0.0)
+    store.clear()
+    scans.clear()
+    check(decide("show.mkv") is None and scans == [], "a file out of retries must be played without a scan")
+    check(decide("song.mp3") is None, "a non-video file must be skipped")
+
+    play_src = MAIN_SRC
+    gate_at = play_src.index("_pre_show_box = _decide_picture_box_before_show(filepath)")
+    probe_at = play_src.index("if _src_dims is None and _norm_fp not in self._dim_probe_inflight:")
+    geom_at = play_src.index("self._apply_screen_mode_geometry(False, _src_dims)")
+    check(gate_at < probe_at < geom_at, "the picture box must be decided before the size probe and before the geometry is applied")
+    frame_src = play_src[play_src.index("def get_display_frame(self):"):]
+    check(frame_src.index("self._native_dims_pending and not self.is_dvd_iso") < frame_src.index("self.player.get_state()"),
+          "frames must be withheld while the picture size is unknown")
+
+
+def suite_random_start():
+    import collections as _col
+    raw = []
+    for show in ("Rugrats", "Ben 10", "Real Monsters", "Hey Arnold"):
+        for ep in range(1, 9):
+            raw.append({"path": "/tv/%s/Season 1/%s S01E%02d.mkv" % (show, show, ep), "duration": 1320})
+    shows = ("Rugrats", "Ben 10", "Real Monsters", "Hey Arnold")
+
+    def build(order_seed, day_seed=20261012 + 105, fixed=None, pool=raw, mode="random_slots", pos=None):
+        return media.build_show_rotation(pool, mode, dict(pos or {}), day_seed, episode_order_mode="sequential",
+                                         fixed_show_order=fixed, block_duration_seconds=8 * 3600, channel_id="05",
+                                         order_seed=order_seed)
+
+    firsts = _col.Counter()
+    for k in range(300):
+        tracks, _pos, order = build("%d:100" % k)
+        firsts[order[0]] += 1
+    check(set(firsts) == set(shows) and min(firsts.values()) >= 40, "every show must start about equally often across fresh starts: %s" % dict(firsts))
+
+    _t1, _p1, order_a = build("777:100", day_seed=1)
+    _t2, _p2, order_b = build("777:100", day_seed=999999)
+    check(order_a == order_b, "one start number must give the same order on every day")
+    _t3, _p3, order_fixed = build("777:100", fixed=["Hey Arnold", "Rugrats"])
+    check(order_fixed[:2] == ["Hey Arnold", "Rugrats"], "a saved show order must win over the start number")
+
+    names = ["Rugrats", "Ben 10", "Real Monsters", "Hey Arnold"]
+    expected = list(media.split_movies_and_series(raw, channel_id="05")[1])
+    import random as _r
+    _r.Random(12345).shuffle(expected)
+    _t4, _p4, order_old = build(None, day_seed=12345)
+    check(order_old == expected, "without a start number the date seed must behave as before")
+
+    seq_a, _pa, _oa = build("1:100", fixed=names)
+    seq_b, _pb, _ob = build("2:100", fixed=names)
+    check([t["path"] for t in seq_a] == [t["path"] for t in seq_b], "the start number must not change episodes or slot counts once the order is fixed")
+    counts_a = _col.Counter(os.path.basename(os.path.dirname(os.path.dirname(t["path"]))) for t in build("1:100")[0])
+    counts_b = _col.Counter(os.path.basename(os.path.dirname(os.path.dirname(t["path"]))) for t in build("2:100")[0])
+    check(counts_a == counts_b, "episodes per series in a block must not depend on the start number")
+
+    movies = [{"path": "/movies/Movie%s.mkv" % c, "duration": 6000} for c in "ABCDE"]
+    first_movies = set()
+    for k in range(100):
+        tracks, _pos, _order = build("%d:100" % k, pool=movies)
+        first_movies.add(tracks[0]["path"])
+    check(len(first_movies) >= 4, "the first movie must vary across fresh starts: %s" % sorted(first_movies))
+    t_a = build("42:100", pool=movies)[0]
+    t_b = build("42:100", pool=movies)[0]
+    check([x["path"] for x in t_a] == [x["path"] for x in t_b], "one start number must give the same movies")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        items = []
+        for show in ("Alpha", "Bravo", "Charlie"):
+            os.makedirs(os.path.join(tmp, show), exist_ok=True)
+            for ep in range(1, 5):
+                p = os.path.join(tmp, show, "%s S01E%02d.mkv" % (show, ep))
+                open(p, "wb").close()
+                items.append({"path": p, "duration": 1500})
+        starters = _col.Counter()
+        for k in range(60):
+            lineup = media.build_ordered_tracks(items, "marathon", "%d:marathon" % k)
+            names_in_order = [os.path.basename(os.path.dirname(x["path"])) for x in lineup]
+            starters[names_in_order[0]] += 1
+            runs = [key for key, _g in __import__("itertools").groupby(names_in_order)]
+            check(len(runs) == 3 and len(lineup) == 12, "marathon must play each series through once, together")
+            for show in ("Alpha", "Bravo", "Charlie"):
+                eps = [os.path.basename(x["path"]) for x in lineup if os.path.basename(os.path.dirname(x["path"])) == show]
+                check(eps == sorted(eps), "marathon episodes must stay in order")
+        check(set(starters) == {"Alpha", "Bravo", "Charlie"}, "every series must start a marathon across fresh starts: %s" % dict(starters))
+        fixed_seed = [media.build_ordered_tracks(items, "marathon", "9:marathon") for _ in range(3)]
+        check(all([x["path"] for x in l] == [x["path"] for x in fixed_seed[0]] for l in fixed_seed), "one start number must give one marathon order")
+
+    saved = []
+    ns = {"threading": threading, "random": random, "isinstance": isinstance, "int": int, "bool": bool,
+          "_intro_seed_lock": threading.Lock(),
+          "db": type("D", (), {"save_settings_async": staticmethod(lambda: saved.append(1))})(),
+          "log": type("L", (), {"warning": staticmethod(lambda *a, **k: None)})()}
+    for name in ("_channel_intro_seed", "_start_order_seed", "_marathon_start_seed"):
+        exec(main_function_code(name), ns)
+    ch = {}
+    first = ns["_channel_intro_seed"](ch)
+    check(isinstance(first, int) and ch["playback_log"]["intro_seed"] == first and saved, "the start number must be saved with the channel")
+    check(ns["_channel_intro_seed"](ch) == first, "the saved start number must be reused")
+    check(ns["_start_order_seed"](ch, 100) != ns["_start_order_seed"](ch, 200), "blocks must not share one order seed")
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(ns["_channel_intro_seed"]({"playback_log": ch["playback_log"]}))) for _ in range(8)]
+    for th in threads: th.start()
+    for th in threads: th.join()
+    check(set(results) == {first}, "every reader must get the same start number")
+    ch.pop("playback_log")
+    check(ns["_channel_intro_seed"](ch) != first, "clearing the channel must draw a new start number")
+    check(len({ns["_channel_intro_seed"]({}) for _ in range(50)}) == 50, "fresh channels must draw different start numbers")
+
+    for node in ast.walk(MAIN_TREE):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("build_show_rotation", "fast_forward_show_pos"):
+            check(any(k.arg == "order_seed" for k in node.keywords), "%s at line %d must pass order_seed" % (node.func.id, node.lineno))
+    check('"marathon", int(' not in MAIN_SRC, "marathon must not be seeded by the channel number")
+
+
 def suite_caption_memory_guard():
     saved_read = gov._read_ram_gb
     try:
@@ -6090,6 +6307,15 @@ class TestMenuNavNameEntryAndExplorerRect(_SectionCase):
 
     def test_one_picture_path(self):
         self.run_section(suite_one_picture_path)
+
+    def test_one_shape_per_label(self):
+        self.run_section(suite_one_shape_per_label)
+
+    def test_picture_box_before_show(self):
+        self.run_section(suite_picture_box_before_show)
+
+    def test_random_start(self):
+        self.run_section(suite_random_start)
 
     def test_caption_memory_guard(self):
         self.run_section(suite_caption_memory_guard)

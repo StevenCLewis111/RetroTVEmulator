@@ -2612,24 +2612,17 @@ PICTURE_BOX_FIT_RETRY_SECONDS = 2.0
 
 _PICTURE_BOX_FIT_REASONS = {"letterbox", "pillarbox", "windowbox"}
 
-_PICTURE_FIT_NEAR_169_MIN = 1.5
-_PICTURE_FIT_NEAR_169_MAX = 1.96
-_PICTURE_FIT_NEAR_43_MIN = 1.2
-_PICTURE_FIT_NEAR_916_MIN = 0.53
-_PICTURE_FIT_NEAR_916_MAX = 0.60
+# WARNING: the fallback shapes must match PICTURE_STANDARD_ASPECTS in performance_governor.py; they are used only when that module fails to import.
+_PICTURE_STANDARD_ASPECTS = (tuple(performance_governor.PICTURE_STANDARD_ASPECTS) if performance_governor is not None
+                             else (16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0))
 
 
 def _snap_standard_aspect(aspect):
-    """The shape Normal (Fit to Screen) lays a picture out as."""
+    """The one of 16:9, 4:3 or 9:16 nearest to the picture's shape, which is the shape Normal (Fit to Screen) lays it out as."""
+    # WARNING: every shape snaps, with no pass-through; DVD and all three picture draw sites rely on one box size per standard shape.
     if not aspect or aspect <= 0:
         return aspect
-    if _PICTURE_FIT_NEAR_916_MIN <= aspect <= _PICTURE_FIT_NEAR_916_MAX:
-        return 9.0 / 16.0
-    if _PICTURE_FIT_NEAR_169_MIN <= aspect <= _PICTURE_FIT_NEAR_169_MAX:
-        return 16.0 / 9.0
-    if _PICTURE_FIT_NEAR_43_MIN <= aspect < _PICTURE_FIT_NEAR_169_MIN:
-        return 4.0 / 3.0
-    return aspect
+    return min(_PICTURE_STANDARD_ASPECTS, key=lambda std: abs(math.log(aspect / std)))
 
 
 def _picture_box_set_content(path):
@@ -11310,6 +11303,12 @@ def initialize_vlc_on_demand():
                             if _persisted_dims and len(_persisted_dims) == 2:
                                 _src_dims = tuple(_persisted_dims)
                                 self._dim_probe_cache[_norm_fp] = _src_dims
+                        _pre_show_box = _decide_picture_box_before_show(filepath)
+                        if _pre_show_box and _pre_show_box.get("frame") and _pre_show_box.get("pixel_aspect"):
+                            _box_w, _box_h = _pre_show_box["frame"]
+                            if _box_w and _box_h:
+                                _src_dims = (max(2, int(round(_box_w * float(_pre_show_box["pixel_aspect"])))), int(_box_h))
+                                self._dim_probe_cache[_norm_fp] = _src_dims
                         if _src_dims is None and _norm_fp not in self._dim_probe_inflight:
                             self._dim_probe_inflight.add(_norm_fp)
                             _probe_gen = self._seek_generation
@@ -12545,6 +12544,9 @@ def initialize_vlc_on_demand():
                 def get_display_frame(self):
                     import vlc as _vlc
                     self._self_heal_native_dims()
+                    if self._native_dims_pending and not self.is_dvd_iso:
+                        self._frame_ready = False
+                        return None
                     s = self.player.get_state()
                     live = (_vlc.State.Playing, _vlc.State.Paused)
                     if s in live and self._frame_ready and self.raw_buffer is not None:
@@ -13104,7 +13106,7 @@ def _get_channel_ordered_content(ch_key, ch_info):
 
     if is_marathon:
         folder_items = ch_info.get("schedules", {}).get("Marathon", [])
-        ordered = build_ordered_tracks(folder_items, "marathon", int(str(ch_key).zfill(2)))
+        ordered = build_ordered_tracks(folder_items, "marathon", _marathon_start_seed(ch_info) if folder_items else 0)
         if not ordered:
             return [], None
         return ordered, "Marathon"
@@ -13143,6 +13145,7 @@ def _get_channel_ordered_content(ch_key, ch_info):
         _peek_offsets[_pbn] = 600 + _pbi * 100
     block_offset = _peek_offsets.get(block_name, 400)
     day_seed = _seed_now.year * 1000 + _seed_now.timetuple().tm_yday + int(str(ch_key).zfill(2)) + block_offset
+    _order_seed = _start_order_seed(ch_info, block_offset)
     playback_log = ch_info.get("playback_log", {})
     pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
 
@@ -13178,9 +13181,42 @@ def _get_channel_ordered_content(ch_key, ch_info):
         fixed_show_order=fixed_order,
          block_duration_seconds=block_duration_seconds,
          channel_id=ch_key,
+        order_seed=_order_seed,
     )
     _ORDERED_CONTENT_CACHE[_occ_key] = (_occ_now_ms, video_tracks, block_name)
     return video_tracks, block_name
+
+
+_intro_seed_lock = threading.Lock()
+
+
+def _channel_intro_seed(ch_info):
+    """The channel's saved random start number, drawn from the operating system the first time the channel is scheduled with media; clearing the channel's media or settings removes it, so the next start is drawn fresh."""
+    # WARNING: every reader of a channel's starting order must take the seed from here so the scheduler, guide and next-up lists never disagree.
+    with _intro_seed_lock:
+        _plog = ch_info.get("playback_log")
+        if not isinstance(_plog, dict):
+            _plog = ch_info["playback_log"] = {}
+        _seed = _plog.get("intro_seed")
+        if not isinstance(_seed, int) or isinstance(_seed, bool):
+            _seed = random.SystemRandom().getrandbits(48)
+            _plog["intro_seed"] = _seed
+            try:
+                if db is not None:
+                    db.save_settings_async()
+            except Exception as e:
+                log.warning("_channel_intro_seed: failed to persist the start number: %s", e)
+    return _seed
+
+
+def _start_order_seed(ch_info, block_offset):
+    """The seed for a block's first show order and first movie draw: the channel's saved start number plus the block, never the date."""
+    return "%d:%d" % (_channel_intro_seed(ch_info), int(block_offset))
+
+
+def _marathon_start_seed(ch_info):
+    """The seed for a marathon channel's series order: the channel's saved start number, never the channel number or the date."""
+    return "%d:marathon" % _channel_intro_seed(ch_info)
 
 
 def _next_n_from_ordered(ordered, current_file, n=4):
@@ -17139,10 +17175,10 @@ class _picture_box_path_lock:
         return False
 
 
-def _picture_box_scan_one(lib, ml, path):
+def _picture_box_scan_one(lib, ml, path, parallel=1):
     """Scan one file into the library if it has no current picture box; serialised per file."""
     with _picture_box_path_lock(path):
-        return _picture_box_scan_one_locked(lib, ml, path)
+        return _picture_box_scan_one_locked(lib, ml, path, parallel)
 
 
 def _picture_box_before_loudness(norm_p):
@@ -17203,6 +17239,57 @@ def _pipeline_stage_picture_box(norm_p):
     return norm_p in _picture_box_done
 
 
+_PICTURE_BOX_PRE_SHOW_BUDGET_S = performance_governor.PICTURE_BOX_PRE_SHOW_BUDGET_S if performance_governor is not None else 8.0
+_PICTURE_BOX_PRE_SHOW_PARALLEL = performance_governor.PICTURE_BOX_PRE_SHOW_PARALLEL if performance_governor is not None else 6
+
+
+def _decide_picture_box_before_show(path):
+    """Returns the file's stored picture box for the play path, scanning it first when it has none and waiting up to the pre-show budget; None for non-video, unreadable or held-back files, or when the scan has no answer in time."""
+    # WARNING: this runs before the first frame of a play; it must never wait longer than _PICTURE_BOX_PRE_SHOW_BUDGET_S.
+    if not path or os.path.splitext(path)[1].lower() not in media.VIDEO_DISPLAY_EXTS:
+        return None
+    try:
+        norm_p = os.path.normpath(os.path.abspath(path))
+        if not _cached_path_exists(norm_p):
+            return None
+        import media_library as _ml
+        lib = _get_probe_library()
+        if lib is None:
+            return None
+
+        def _stored():
+            entry = lib.get_cached(norm_p)
+            box = entry.get("picture_box") if entry else None
+            if box and (entry.get("picture_box_detector_version") or 0) >= _ml.PICTURE_BOX_DETECTOR_VERSION:
+                return box
+            return None
+
+        box = _stored()
+        if box is not None:
+            return box
+        _fails, _retry_after = _picture_box_failures.get(norm_p, (0, 0.0))
+        if _fails >= len(_PICTURE_BOX_RETRY_BACKOFF_S) or _retry_after > time.monotonic() or _is_drive_degraded(norm_p):
+            log.info("[PICTURE BOX] pre-show: %s is on hold (failures=%s), played with its full frame", os.path.basename(norm_p), _fails)
+            return None
+        _t0 = time.monotonic()
+        _worker = threading.Thread(target=_picture_box_scan_one, args=(lib, _ml, norm_p, _PICTURE_BOX_PRE_SHOW_PARALLEL),
+                                   daemon=True, name="pre-show-picbox")
+        _worker.start()
+        _worker.join(timeout=_PICTURE_BOX_PRE_SHOW_BUDGET_S)
+        box = _stored()
+        _took = time.monotonic() - _t0
+        if box is None:
+            log.info("[PICTURE BOX] pre-show: no answer for %s within %.1fs, played with its full frame until the scan lands",
+                     os.path.basename(norm_p), _took)
+        else:
+            log.info("[PICTURE BOX] pre-show: %s decided before the show in %.1fs: %s picture_aspect=%s",
+                     os.path.basename(norm_p), _took, box.get("reason"), box.get("picture_aspect"))
+        return box
+    except Exception as e:
+        log.warning("[PICTURE BOX] pre-show decision for %s failed: %s", os.path.basename(str(path)), e)
+        return None
+
+
 SCAN_CLASS_NOW = 0
 SCAN_CLASS_COMMERCIAL = 1
 SCAN_CLASS_NEXT = 2
@@ -17233,7 +17320,7 @@ def _order_scan_pipeline(tiers, deep_items):
     return out
 
 
-def _picture_box_scan_one_locked(lib, ml, path):
+def _picture_box_scan_one_locked(lib, ml, path, parallel=1):
     """Scan one file into the library if it has no current picture box."""
     try:
         entry = lib.get_cached(path)
@@ -17243,7 +17330,7 @@ def _picture_box_scan_one_locked(lib, ml, path):
             return False
         diag = {}
         t0 = time.monotonic()
-        box = lib.detect_picture_box_if_needed(path, diag=diag)
+        box = lib.detect_picture_box_if_needed(path, diag=diag, parallel=parallel)
         took = time.monotonic() - t0
     except Exception as e:
         verdict = _scan_handle_failure(path, "picture box", "scan crashed: %s" % e)
@@ -17752,6 +17839,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
 
               h_day_seed = (now.year * 1000 + now.timetuple().tm_yday + int(target_clean_key)
                             + 9000 + (sum(ord(c) for c in holiday_key) % 1000))
+              _h_order_seed = _start_order_seed(ch_info, 9000 + (sum(ord(c) for c in holiday_key) % 1000))
 
               _prev_h_block_key = h_log.get("block_key")
               h_is_new_block = _prev_h_block_key != h_block_key
@@ -17779,6 +17867,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                           fixed_show_order=h_log.get("show_order"),
                            block_duration_seconds=86400,
                            channel_id=target_clean_key,
+                          order_seed=_h_order_seed,
                       )
                       h_show_pos.clear()
                       h_show_pos.update(_fwd_h_show_pos)
@@ -17802,6 +17891,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                       fixed_show_order=h_log.get("show_order"),
                            block_duration_seconds=86400,
                            channel_id=target_clean_key,
+                      order_seed=_h_order_seed,
                   )
                   h_log["show_pos"] = h_new_show_pos
                   h_log["show_order"] = h_new_show_order
@@ -17834,6 +17924,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                           fixed_show_order=h_log.get("show_order"),
                           block_duration_seconds=86400,
                           channel_id=target_clean_key,
+                          order_seed=_h_order_seed,
                       )
                       h_log["show_pos"] = h_new_show_pos
                       h_log["show_order"] = h_new_show_order
@@ -18129,6 +18220,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       
       block_offset = _block_seed_offsets.get(current_block, 0)
       day_seed = now.year * 1000 + now.timetuple().tm_yday + int(target_clean_key) + block_offset
+      _order_seed = _start_order_seed(ch_info, block_offset)
 
       playback_log = ch_info.setdefault("playback_log", {})
       _show_pos = playback_log.setdefault("show_pos", {})
@@ -18163,7 +18255,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                   commercial_tracks.append({"path": path, "duration": int(duration)})
 
       if _marathon_mode:
-        _marathon_ordered = build_ordered_tracks(raw_tracks, "marathon", int(target_clean_key))
+        _marathon_ordered = build_ordered_tracks(raw_tracks, "marathon", _marathon_start_seed(ch_info) if raw_tracks else 0)
         _mara_log = ch_info.setdefault("playback_log", {})
         _mara_cached_paths = _mara_log.get("marathon_cached_tracks")
         _mara_cached_durs  = _mara_log.get("marathon_cached_durations", {})
@@ -18293,6 +18385,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                         fixed_show_order=_show_order_by_block.get(current_block),
                         block_duration_seconds=block_duration_seconds,
                         channel_id=target_clean_key,
+                        order_seed=_order_seed,
                     )
                     playback_log["show_pos"] = _new_show_pos
                     _show_order_by_block[current_block] = _new_show_order
@@ -18359,7 +18452,8 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                   episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
                   fixed_show_order=_show_order_by_block.get(current_block),
                    block_duration_seconds=block_duration_seconds,
-                   channel_id=target_clean_key
+                   channel_id=target_clean_key,
+                  order_seed=_order_seed,
               )
               _show_pos.clear()
               _show_pos.update(_fwd_show_pos)
@@ -18384,6 +18478,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
               fixed_show_order=_show_order_by_block.get(current_block),
               block_duration_seconds=block_duration_seconds,
               channel_id=target_clean_key,
+              order_seed=_order_seed,
           )
           playback_log["show_pos"] = _new_show_pos
           _show_order_by_block[current_block] = _new_show_order
@@ -18501,6 +18596,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                   fixed_show_order=_show_order_by_block2.get(current_block),
                   block_duration_seconds=block_duration_seconds,
                   channel_id=target_clean_key,
+                  order_seed=_order_seed,
               )
               _try_timeline, _try_total, _try_cp2 = build_block_timeline(
                   _try_video_tracks, commercial_tracks, commercial_placement, day_seed,
@@ -21871,6 +21967,7 @@ while True:
                                     + int(str(target_ch).lstrip("0") or "0")
                                     + _boff_add
                                 )
+                                _order_seed_add = _start_order_seed(_ch_info_add, _boff_add)
                                 _sp_snap_add = dict(_plog_add.get("show_pos", {}))
                                 _pt_add  = max(0, _ch_info_add.get(
                                     "pair_threshold_minutes", 15)) * 60
@@ -21895,6 +21992,7 @@ while True:
                                     fixed_show_order=_so_add,
                                     block_duration_seconds=_bdur_add,
                                     channel_id=target_ch,
+                                    order_seed=_order_seed_add,
                                 )
                                 if _vt_add:
                                     _day_add  = _now_add.timetuple().tm_yday
