@@ -1,22 +1,30 @@
 """Schedule-only server transport for Retro TV networking.
 
-The protocol deliberately sends channel/schedule JSON only. Media files, ROMs,
-cores, BIOS files, and general application settings never cross this boundary.
+Owns: the length-prefixed JSON protocol, ScheduleBroadcaster (server) and
+ScheduleClient (user).
+Does not own: discovery (server_discovery.py) or slot file writing.
+
+WARNING: the protocol deliberately sends channel/schedule JSON only. Media
+files, ROMs, cores, BIOS files, and general application settings must never
+cross this boundary.
 """
 from __future__ import annotations
 
 import copy
 import json
 import logging
-import os
 import socket
 import struct
 import threading
-import time
 from typing import Callable, Mapping
 
-log = logging.getLogger(__name__)
 from server_diagnostics import breadcrumb as _server_breadcrumb
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# SECTION: Protocol constants & payload shaping
+# ============================================================================
 PROTOCOL = "retro-tv-schedule-v1"
 MAX_FRAME = 16 * 1024 * 1024
 
@@ -42,14 +50,8 @@ def sanitize_channels(channels: Mapping, remote_id: str = "") -> dict:
     return safe
 
 
-def build_file_listing_message(slot_id: str, relative_path: str, entries: list) -> dict:
-    """Build a safe SERVER-drive directory response; paths stay relative."""
-    return {"protocol": PROTOCOL, "type": "file_listing", "slot_id": str(slot_id),
-            "path": str(relative_path or "."), "entries": entries}
-
-
-# Server-owned playback settings that DO cross the wire, alongside the
-# schedule. Everything else in the server's config still stays home.
+# NOTE: server-owned playback settings that DO cross the wire, alongside the
+# schedule. Everything else in the server's config stays home.
 VALID_SCREEN_MODES = ("normal", "stretch", "crop", "panscan")
 
 
@@ -73,6 +75,11 @@ def build_schedule_message(slot_id: str, channels: Mapping, revision: int,
         "revision": int(revision),
         "channels": sanitize_channels(channels, remote_id),
     }
+
+
+# ============================================================================
+# SECTION: Wire framing
+# ============================================================================
 
 
 def _send_message(sock: socket.socket, message: dict) -> None:
@@ -103,6 +110,11 @@ def recv_message(sock: socket.socket) -> dict:
     return message
 
 
+# ============================================================================
+# SECTION: Broadcaster (server side)
+# ============================================================================
+
+
 class ScheduleBroadcaster:
     """Polls slot files and pushes changed schedules to subscribed clients."""
     def __init__(self, slots: Callable[[], Mapping[str, str]], *, host="0.0.0.0",
@@ -115,10 +127,10 @@ class ScheduleBroadcaster:
         self._stop = threading.Event()
         self._thread = None
         self._clients = set()
-        # A client that connects after the first poll still needs the current
-        # snapshot even when the slot has not changed since the previous poll.
-        # Keep this separate from _last_payloads so a long-lived service can
-        # serve late User connections without requiring a server-side edit.
+        # NOTE: a client that connects after the first poll still needs the
+        # current snapshot even when the slot has not changed. Kept separate
+        # from _last_payloads so late User connections get served without a
+        # server-side edit.
         self._pending_snapshot_clients = set()
         self._lock = threading.Lock()
         self._revisions = {}
@@ -148,54 +160,6 @@ class ScheduleBroadcaster:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         return data.get("channels", {})
-
-    @staticmethod
-    def list_directory(root, relative_path=".", valid_extensions=()):
-        """Return metadata only, rejecting traversal outside the shared root."""
-        try:
-            base = os.path.realpath(root)
-            requested = os.path.realpath(os.path.join(base, relative_path or "."))
-            inside_root = os.path.commonpath((base, requested)) == base
-        except (OSError, ValueError, TypeError) as exc:
-            _server_breadcrumb(
-                log, logging.WARNING, f"server-drive-path:{root}:{relative_path}",
-                "[SERVER DIAG] SERVER-drive path validation failed root=%s "
-                "relative=%s: %s", root, relative_path, exc,
-            )
-            return []
-        if not inside_root:
-            _server_breadcrumb(
-                log, logging.WARNING, f"server-drive-traversal:{root}:{relative_path}",
-                "[SERVER DIAG] SERVER-drive traversal rejected root=%s "
-                "relative=%s", root, relative_path,
-            )
-            return []
-        if not os.path.isdir(requested):
-            _server_breadcrumb(
-                log, logging.WARNING, f"server-drive-missing:{requested}",
-                "[SERVER DIAG] SERVER-drive directory unavailable path=%s",
-                requested,
-            )
-            return []
-        allowed = {str(ext).lower() for ext in valid_extensions}
-        result = []
-        try:
-            entries = sorted(os.scandir(requested), key=lambda item: item.name.lower())
-            for entry in entries:
-                if entry.name.startswith("."):
-                    continue
-                if entry.is_dir():
-                    result.append({"name": entry.name, "type": "dir"})
-                elif not allowed or os.path.splitext(entry.name)[1].lower() in allowed:
-                    result.append({"name": entry.name, "type": "file", "size": entry.stat().st_size})
-        except OSError as exc:
-            _server_breadcrumb(
-                log, logging.WARNING, f"server-drive-scan:{requested}",
-                "[SERVER DIAG] SERVER-drive directory read failed path=%s: %s",
-                requested, exc,
-            )
-            return []
-        return result
 
     def _broadcast(self, message, clients=None):
         dead = []
@@ -304,13 +268,17 @@ class ScheduleBroadcaster:
                 server.close()
 
 
+# ============================================================================
+# SECTION: Client (user side)
+# ============================================================================
+
+
 class ScheduleClient:
     def __init__(self, host, *, port=47532, slot_id=None, on_schedule=None,
                  on_status=None, timeout=4.0, retry_interval=3.0):
         self.host, self.port = host, int(port)
-        # One physical server may advertise several named slots.  The picker
-        # identifies the selected slot, so do not let another slot's schedule
-        # overwrite the connection's live overlay.
+        # NOTE: one physical server may advertise several named slots. Only the
+        # picked slot's schedule may update this connection's live overlay.
         self.slot_id = str(slot_id) if slot_id is not None else None
         self.on_schedule, self.on_status = on_schedule, on_status
         self.timeout, self.retry_interval = float(timeout), float(retry_interval)
@@ -331,8 +299,8 @@ class ScheduleClient:
 
     def stop(self):
         self._stop.set()
-        # Snapshot the socket before shutdown, since the worker's finally
-        # block can clear self.sock between this check and the close call.
+        # NOTE: snapshot the socket first -- the worker's finally block can
+        # clear self.sock between this check and the close call.
         sock = self.sock
         if sock is not None:
             try: sock.shutdown(socket.SHUT_RDWR)
@@ -381,4 +349,7 @@ class ScheduleClient:
                  self.host, self.port, self.slot_id)
 
 
-__all__ = ["ScheduleBroadcaster", "ScheduleClient", "build_schedule_message", "build_file_listing_message", "sanitize_channels", "sanitize_playback", "recv_message"]
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = ["ScheduleBroadcaster", "ScheduleClient", "build_schedule_message", "sanitize_channels", "sanitize_playback", "recv_message"]

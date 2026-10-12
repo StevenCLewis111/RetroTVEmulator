@@ -1,4 +1,9 @@
-"""Small, dependency-free LAN discovery for Retro TV server slots."""
+"""Small, dependency-free LAN discovery for Retro TV server slots.
+
+Owns: UDP broadcast announce/listen of named server slots and the persisted
+device id.
+Does not own: the schedule transport (server_sync.py) or slot storage.
+"""
 from __future__ import annotations
 
 import json
@@ -10,13 +15,22 @@ import time
 import uuid
 from typing import Callable, Iterable
 
-log = logging.getLogger(__name__)
 from server_diagnostics import breadcrumb as _server_breadcrumb
 
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# SECTION: Constants
+# ============================================================================
 DISCOVERY_PORT = 47531
 ANNOUNCE_INTERVAL = 2.0
 ENTRY_TIMEOUT = 6.0
 _MAGIC = "retro-tv-discovery-v1"
+
+
+# ============================================================================
+# SECTION: Device identity
+# ============================================================================
 
 
 def get_or_create_device_id(state_dir: str) -> str:
@@ -52,6 +66,11 @@ def get_or_create_device_id(state_dir: str) -> str:
 
 def slot_provider_from_db(db) -> Callable[[], list[tuple[str, str]]]:
     return lambda: list(db.list_server_slots()) if db is not None else []
+
+
+# ============================================================================
+# SECTION: Announcer (server side)
+# ============================================================================
 
 
 class ServerAnnouncer:
@@ -127,6 +146,11 @@ class ServerAnnouncer:
                 sock.close()
 
 
+# ============================================================================
+# SECTION: Listener (client side)
+# ============================================================================
+
+
 class ServerListener:
     def __init__(self, *, device_id=None, port=DISCOVERY_PORT, entry_timeout=ENTRY_TIMEOUT):
         self.device_id = device_id
@@ -179,8 +203,8 @@ class ServerListener:
                         and str(s.get("slot_id", "")).strip()
                     ]
                     with self._lock:
-                        self._entries[data["device_id"]] = {"host": str(data.get("host") or address[0]),
-                                                              "slots": slots, "last_seen": now}
+                        self._entries[data["device_id"]] = {"host": host, "slots": slots,
+                                                              "last_seen": now}
                 except socket.timeout:
                     pass
                 except (OSError, ValueError, UnicodeError, KeyError, TypeError,
@@ -221,5 +245,8 @@ class ServerListener:
         return result
 
 
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
 __all__ = ["ServerAnnouncer", "ServerListener", "get_or_create_device_id", "slot_provider_from_db"]
 

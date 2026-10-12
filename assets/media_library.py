@@ -1,82 +1,22 @@
-"""Persistent Probe Library -- item B of the 2026-09-19 handoff.
+"""Persistent Probe Library: a SQLite-backed cache of what is known about each media file.
 
-A SQLite-backed, content-addressed library that replaces the role of
-db.config["media_probe_cache"] / ["dvd_gain_cache"] / ["caption_cache"] /
-["pan_scan_library"] going forward, without deleting or depending on any of
-them: this module reads none of the app's live state and writes nothing
-into retro_config.json. It is a new, separate store the rest of the app can
-be wired up to in a later, separately-reviewed pass -- see the module
-docstring at the bottom ("INTEGRATION STATUS") for exactly what is and
-isn't connected yet.
-
-Design points implemented here, numbered to match the handoff doc's
-"Agreed design" list under item B:
-
-  1. Storage       -- MediaLibrary, a SQLite file in its own project
-                       folder (resolve_media_library_dir(), same pattern as
-                       media.resolve_loudness_dir()), WAL mode, one commit
-                       per finished file.
-  2. Identity key   -- compute_identity_key() / PathKeyCache: file size
-                       plus a SHA-1 of three 64 KB samples (start, middle,
-                       end). A path/size/mtime -> key table avoids
-                       re-hashing an unchanged file. Growing files
-                       (partial downloads) are skipped.
-  3. Per-file fields -- the `library` table: duration, dimensions, DAR,
-                       audio/subtitle streams, a picture-box (item D --
-                       detect_picture_box() fills it), a loudness-gain slot
-                       (tagged with target LUFS + scan version), a
-                       captions slot (compressed cue text + source/
-                       reason), and an optional pan-scan shot-memory slot.
-  4. Combined probe -- combined_header_probe(): ONE `ffmpeg -i` parse ->
-                       duration, dimensions, DAR, audio streams, subtitle
-                       streams, replacing four separate subprocess calls
-                       (media.get_media_video_dimensions,
-                       media._probe_embedded_subtitle_streams,
-                       media._asr_probe_media's duration read, and
-                       media._probe_duration_seconds_fast) with one. VLC
-                       duration (media.get_media_duration) stays available
-                       as an explicit fallback via
-                       probe_duration_with_fallback(), gated by the
-                       existing media._duration_looks_implausible() check.
-  5. Pre-caching    -- PrecachePool: a 2-thread low-priority pool with a
-                       5-tier queue (now-playing+2, guide-highlighted,
-                       scheduled-by-air-time, commercial pool, everything
-                       else), then picture-box, then loudness at the
-                       lowest priority sharing the same 2-thread cap.
-  6. On-demand fallback -- get_or_probe_sync(): probes synchronously
-                       (milliseconds, not the 1800 s placeholder) when a
-                       needed file has no library entry yet.
-  7. Migration      -- migrate_legacy_cache(): throttled, incremental
-                       import of the existing media_probe_cache and
-                       dvd_gain_cache dicts. Never deletes from the
-                       source dicts -- they remain a valid read fallback
-                       for any entry this module hasn't (yet) migrated,
-                       e.g. because the file was missing at migration
-                       time.
-  8. Re-key on re-encode -- rekey_after_reencode(): call this when the
-                       renormalization sweep finishes rewriting a file in
-                       place. Content changed, so the identity key
-                       changes; this carries the existing library row
-                       (now-correct gain, in particular) forward onto the
-                       new key instead of losing it.
-
-None of this module's own probing logic re-implements measurement work
-that already exists and is correct elsewhere in the app (VLC duration
-parsing, LUFS loudness scanning, ASR transcription): those stay exactly
-where they are in media.py / retro_tv_emulator.py. Picture-box detection
-had no existing implementation anywhere (the handoff confirms there is no
-crop-detection code), so detect_picture_box() lives here, next to the
-header probe it shares a library row and a worker pass with. This module is
-the storage + combined-header-probe + picture-box + scheduling layer around
-the rest.
+Owns: the library database and its storage location, content-identity keys,
+the combined ffmpeg header probe, picture-box (baked-in bars) detection and
+storage, and migration from the legacy config-dict caches.
+Does not own: playback, scheduling, or applying a stored picture box to the
+video (the app reads the stored result).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
-import queue
-import sqlite3
+import re as _re
+try:
+    import sqlite3
+except ImportError:
+    sqlite3 = None
 import subprocess
 import threading
 import time
@@ -84,29 +24,17 @@ import zlib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-# ---------------------------------------------------------------------------
-# 1. Storage location
-# ---------------------------------------------------------------------------
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# SECTION: Storage location & database
+# ============================================================================
 
 _library_dir_ready = False
 
 
 def resolve_media_library_dir(main_dir_resolver: Optional[Callable[[], str]] = None) -> str:
-    """Return the program's own folder for the persistent probe library.
-
-    Same reasoning/pattern as media.resolve_loudness_dir() and
-    media.resolve_captions_dir(): this is an app-owned working file, not
-    programming, and must not live inside a user's media folders (the
-    folder scanner would pick it up) or be touched by "Reset All
-    Settings" (which only resets db.config / retro_config.json -- this
-    file is outside that entirely, by construction, matching the doc's
-    "Never auto-pruned and never touched by Reset").
-
-    main_dir_resolver defaults to media.resolve_main_dir so this follows
-    the packaged .exe the same way the loudness/captions folders do;
-    callers (or tests) may pass their own to avoid importing the full
-    media module.
-    """
+    """Return the program's own folder for the persistent probe library."""
     global _library_dir_ready
     if main_dir_resolver is None:
         import media as _media
@@ -168,16 +96,11 @@ CREATE INDEX IF NOT EXISTS idx_library_updated ON library(updated_at);
 
 
 class MediaLibrary:
-    """Thin synchronous wrapper around the sqlite3 connection.
-
-    One MediaLibrary per db file is expected to be shared across threads;
-    sqlite3 connections aren't thread-safe by default, so this class
-    takes its own lock around every statement rather than trusting
-    callers to serialize access themselves (the pre-cache pool below
-    runs multiple worker threads against the same MediaLibrary).
-    """
+    """Thin synchronous wrapper around the sqlite3 connection."""
 
     def __init__(self, db_path: str):
+        if sqlite3 is None:
+            raise ImportError("No module named 'sqlite3' (the persistent media library needs it; add sqlite3 to the build)")
         self.db_path = db_path
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -190,12 +113,12 @@ class MediaLibrary:
         with self._lock:
             self._conn.close()
 
-    # -- path -> content key -------------------------------------------------
+    # ========================================================================
+    # SECTION: Path -> content key
+    # ========================================================================
 
     def lookup_path_key(self, norm_path: str, size: int, mtime: float) -> Optional[str]:
-        """Return the cached content_key for norm_path IF its recorded
-        size/mtime still match what's on disk right now -- i.e. we can
-        skip re-hashing. None if there's no entry or it's stale."""
+        """Return the cached content_key for norm_path if its recorded size/mtime still match the file on disk."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT size, mtime, content_key FROM path_keys WHERE norm_path=?",
@@ -220,12 +143,9 @@ class MediaLibrary:
             )
             self._conn.commit()
 
-    def drop_path_key(self, norm_path: str):
-        with self._lock:
-            self._conn.execute("DELETE FROM path_keys WHERE norm_path=?", (norm_path,))
-            self._conn.commit()
-
-    # -- library rows ---------------------------------------------------------
+    # ========================================================================
+    # SECTION: Library rows
+    # ========================================================================
 
     def get_entry(self, content_key: str) -> Optional[dict]:
         with self._lock:
@@ -246,9 +166,7 @@ class MediaLibrary:
         return d
 
     def upsert_fields(self, content_key: str, size: Optional[int] = None, **fields):
-        """Merge `fields` (column_name -> value) into the row for
-        content_key, creating it if it doesn't exist yet. JSON-encodes
-        list/dict values for the JSON-typed columns automatically."""
+        """Merges `fields` (column_name -> value) into the row for content_key, creating it if missing."""
         if not fields and size is None:
             return
         now = time.time()
@@ -283,40 +201,17 @@ class MediaLibrary:
                 )
             self._conn.commit()
 
-    def copy_entry(self, from_key: str, to_key: str, overwrite_fields: Optional[dict] = None):
-        """Used by rekey_after_reencode(): duplicate from_key's row onto
-        to_key (which may not exist yet), applying overwrite_fields on
-        top, then leaves from_key's row alone (caller decides whether to
-        delete it)."""
-        entry = self.get_entry(from_key)
-        if entry is None:
-            entry = {}
-        entry.pop("content_key", None)
-        entry.pop("created_at", None)
-        entry.pop("updated_at", None)
-        if overwrite_fields:
-            entry.update(overwrite_fields)
-        entry = {k: v for k, v in entry.items() if v is not None}
-        self.upsert_fields(to_key, **entry)
 
-    def delete_entry(self, content_key: str):
-        with self._lock:
-            self._conn.execute("DELETE FROM library WHERE content_key=?", (content_key,))
-            self._conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# 2. Identity key
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Identity keys
+# ============================================================================
 
 _SAMPLE_SIZE = 64 * 1024
 _GROWING_FILE_CHECK_DELAY_S = 0.05
 
 
 def _sample_offsets(size: int):
-    """Start/middle/end 64 KB windows, clamped and de-duplicated for
-    files smaller than 3x the sample size so nothing reads past EOF or
-    hashes the same bytes twice."""
+    """Return start/middle/end 64 KB sample windows, clamped and de-duplicated for small files."""
     if size <= 0:
         return []
     if size <= _SAMPLE_SIZE:
@@ -326,11 +221,7 @@ def _sample_offsets(size: int):
 
 
 def compute_identity_key(file_path: str, growing_check_delay: float = _GROWING_FILE_CHECK_DELAY_S) -> Optional[str]:
-    """File size plus a SHA-1 of up to three 64 KB samples (start, middle,
-    end). Returns None (skip) for a file that's still growing -- caught
-    by comparing size across a short delay, since a partial download's
-    size is the one thing guaranteed to keep changing while active
-    reads to it are actively landing."""
+    """File size plus a SHA-1 of up to three 64 KB samples (start, middle, end)."""
     try:
         size_before = os.path.getsize(file_path)
     except OSError:
@@ -350,20 +241,20 @@ def compute_identity_key(file_path: str, growing_check_delay: float = _GROWING_F
     h = hashlib.sha1()
     h.update(str(size).encode("ascii"))
     try:
-        with open(file_path, "rb") as f:
-            for offset in _sample_offsets(size):
-                f.seek(offset)
-                h.update(f.read(_SAMPLE_SIZE))
+        # WARNING: the disk read must stay inside _fast_disk_io_slot so it yields to live playback.
+        import media as _media
+        with _media._fast_disk_io_slot(f"identity_key({os.path.basename(file_path)})"):
+            with open(file_path, "rb") as f:
+                for offset in _sample_offsets(size):
+                    f.seek(offset)
+                    h.update(f.read(_SAMPLE_SIZE))
     except OSError:
         return None
     return f"{size:x}-{h.hexdigest()}"
 
 
 class PathKeyResolver:
-    """Wraps MediaLibrary.lookup_path_key/store_path_key so callers get a
-    stable content_key for a path without re-hashing on every call --
-    only when the path's (size, mtime) has actually changed since the
-    last time this resolver saw it."""
+    """Return a stable content_key for a path, re-hashing only when its size or mtime changed."""
 
     def __init__(self, library: MediaLibrary):
         self.library = library
@@ -379,10 +270,7 @@ class PathKeyResolver:
             return cached
         content_key = compute_identity_key(file_path)
         if content_key is None:
-            return None  # growing file, or became unreadable mid-check
-        # Re-stat: a growing-file check sleeps briefly, so use the freshest
-        # size/mtime available for the path_keys row rather than the one
-        # taken before compute_identity_key's own settle check.
+            return None
         try:
             st = os.stat(file_path)
         except OSError:
@@ -391,11 +279,9 @@ class PathKeyResolver:
         return content_key
 
 
-# ---------------------------------------------------------------------------
-# 4. Combined header probe
-# ---------------------------------------------------------------------------
-
-import re as _re
+# ============================================================================
+# SECTION: Combined header probe
+# ============================================================================
 
 _DURATION_RE = _re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 _VIDEO_DIMS_RE = _re.compile(r"Video:.*?(\d{2,5})x(\d{2,5})")
@@ -416,6 +302,7 @@ class HeaderProbeResult:
     subtitle_streams: list = field(default_factory=list)
     has_audio: bool = False
     error: Optional[str] = None
+    stderr: Optional[str] = None
 
 
 def _resolve_ffmpeg(ffmpeg_path: Optional[str]) -> str:
@@ -427,29 +314,22 @@ def _resolve_ffmpeg(ffmpeg_path: Optional[str]) -> str:
 
 def combined_header_probe(file_path: str, ffmpeg_path: Optional[str] = None,
                            timeout: float = 15.0) -> HeaderProbeResult:
-    """One `ffmpeg -i` header read, parsed for everything the four
-    separate probes it replaces each pulled out of the identical stderr
-    text: duration (was _probe_duration_seconds_fast /
-    _asr_probe_media's own duration read), video dimensions + DAR (was
-    get_media_video_dimensions), and subtitle streams (was
-    _probe_embedded_subtitle_streams) -- plus an audio-stream list,
-    which none of the four individually returned as structured data.
-
-    No decode happens here (container/header metadata only), so this is
-    the same, cheap cost tier the four originals were, just paid once
-    instead of up to four times per file.
-    """
+    """One `ffmpeg -i` header read, parsed into duration, video dimensions + DAR, subtitle streams and the audio-stream list."""
+    import media as _media
+    if not file_path or not _media._cached_path_exists(file_path):
+        return HeaderProbeResult(ok=False, error="path_missing")
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
             subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
         )
     try:
-        result = subprocess.run(
-            [_resolve_ffmpeg(ffmpeg_path), "-nostdin", "-hide_banner", "-i", file_path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
-        )
+        with _media._fast_disk_io_slot(f"header_probe({os.path.basename(file_path)})"):
+            result = subprocess.run(
+                [_resolve_ffmpeg(ffmpeg_path), "-nostdin", "-hide_banner", "-i", file_path],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
+            )
     except subprocess.TimeoutExpired:
         return HeaderProbeResult(ok=False, error="timeout")
     except Exception as e:
@@ -457,7 +337,7 @@ def combined_header_probe(file_path: str, ffmpeg_path: Optional[str] = None,
 
     err = result.stderr or ""
     if "Input #0" not in err:
-        return HeaderProbeResult(ok=False, error="no_input_stream")
+        return HeaderProbeResult(ok=False, error="no_input_stream", stderr=err[-2000:])
 
     out = HeaderProbeResult(ok=True)
 
@@ -495,16 +375,14 @@ def combined_header_probe(file_path: str, ffmpeg_path: Optional[str] = None,
         for idx, lang, codec in _AUDIO_STREAM_RE.findall(err)
     ]
     out.has_audio = bool(out.audio_streams) or bool(_re.search(r"Stream #\d+:\d+[^\n]*:\s*Audio:", err))
+    if out.has_audio and not out.audio_streams:
+        # WARNING: the stored audio_streams list is what says "this file has audio"; keep it non-empty whenever the header shows an audio stream, even one the strict pattern missed.
+        out.audio_streams = [{"index": -1, "lang": None, "codec": "unknown"}]
     return out
 
 
 def probe_duration_with_fallback(file_path: str, header_result: HeaderProbeResult) -> tuple:
-    """Returns (duration_seconds_or_None, source_str). Uses the ffmpeg
-    header duration when it's present and plausible; falls back to a
-    full VLC parse (media.get_media_duration -- slower, but authoritative)
-    only when ffmpeg's number looks implausible for the file's size, per
-    the existing media._duration_looks_implausible() sanity check, or
-    when ffmpeg found no duration at all."""
+    """Returns (duration_seconds_or_None, source_str)."""
     import media as _media
     if header_result.duration and not _media._duration_looks_implausible(file_path, header_result.duration):
         return header_result.duration, "ffmpeg"
@@ -514,47 +392,26 @@ def probe_duration_with_fallback(file_path: str, header_result: HeaderProbeResul
     return None, None
 
 
-# ---------------------------------------------------------------------------
-# 4b. Picture-box detection (item D -- detection and storage ONLY)
-# ---------------------------------------------------------------------------
-#
-# Finds the real picture inside the frame, ignoring the pure-black bars a
-# file carries baked in. Nothing here decides how the picture is FITTED to
-# the screen (the 16:9 rule, Screen Mode, bezel on/off) -- that is the rule
-# table item D still needs approved. This only measures and records.
-
+# ============================================================================
+# SECTION: Picture-box detection
+# ============================================================================
 PICTURE_BOX_DETECTOR_VERSION = 1
 
 _CROPDETECT_RE = _re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 
-# Sample points as fractions of the runtime. 10%..85% skips studio logos and
-# title cards at the start and the credits at the end, which are the two
-# places a full-frame graphic is most likely to widen the box wrongly.
 _PB_SAMPLE_FRACTIONS = (0.10, 0.25, 0.40, 0.55, 0.70, 0.85)
-# Used only when the runtime is unknown (seconds from the start).
 _PB_FALLBACK_OFFSETS_S = (30.0, 120.0, 300.0)
 _PB_SAMPLE_SECONDS = 2.0
 _PB_SAMPLE_TIMEOUT_S = 25.0
 _PB_MIN_GOOD_SAMPLES = 3
-# cropdetect luma threshold. 16 is video black; 32 leaves headroom for the
-# noisy bars analogue-capture rips have. Dark scenes only make a sample's box
-# too SMALL, and taking the widest box across samples absorbs that.
 _PB_LIMIT = 32
-# A bar counts only if it is at least this fraction of its axis (and >= 4 px),
-# and the two sides of an axis must match within this fraction of the larger.
 _PB_MIN_BAR_FRACTION = 0.015
 _PB_MIN_BAR_PX = 4
 _PB_SYMMETRY_TOLERANCE = 0.25
 
 
 def _pb_axis(start: int, length: int, frame: int):
-    """Decide one axis (vertical or horizontal) from a detected span.
-
-    Returns (new_start, new_length, kind) where kind is "bars", "none" or
-    "asymmetric". Asymmetric or insubstantial bars leave the axis at full
-    frame: cropping one side only would shift the picture, and a burnt-in
-    subtitle sitting in one bar looks exactly like that.
-    """
+    """Decide one axis (vertical or horizontal) from a detected span."""
     lead = max(0, start)
     trail = max(0, frame - (start + length))
     min_bar = max(_PB_MIN_BAR_PX, int(round(frame * _PB_MIN_BAR_FRACTION)))
@@ -574,26 +431,35 @@ def _pb_sample_times(duration: Optional[float]) -> list:
     return list(_PB_FALLBACK_OFFSETS_S)
 
 
+def _pb_cropdetect_threads() -> int:
+    """ffmpeg thread count for the picture-box scan, from the current performance mode (2 when the governor is unavailable)."""
+    try:
+        import performance_governor as _pg
+        return max(1, int(_pg.lane_ceiling("cropdetect_threads")))
+    except Exception:
+        return 2
+
+
 def _pb_run_sample(file_path: str, ffmpeg: str, t: float, timeout: float):
-    """One short decode with cropdetect. Returns ffmpeg's stderr text, or
-    None on timeout/launch failure. -threads 2 keeps it inside the same
-    two-thread background cap the other ffmpeg scans use."""
+    """One short cropdetect decode."""
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
             subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
         )
     cmd = [
-        ffmpeg, "-nostdin", "-hide_banner", "-threads", "2",
+        ffmpeg, "-nostdin", "-hide_banner", "-threads", str(_pb_cropdetect_threads()),
         "-ss", f"{t:.3f}", "-i", file_path, "-t", f"{_PB_SAMPLE_SECONDS:g}",
         "-map", "0:v:0", "-vf", f"cropdetect=limit={_PB_LIMIT}:round=2:reset=0",
         "-an", "-sn", "-dn", "-f", "null", "-",
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
-        )
+        import media as _media
+        with _media._fast_disk_io_slot(f"picture_box({os.path.basename(file_path)})"):
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
+            )
     except subprocess.TimeoutExpired:
         return None
     except Exception:
@@ -603,52 +469,28 @@ def _pb_run_sample(file_path: str, ffmpeg: str, t: float, timeout: float):
 
 def detect_picture_box(file_path: str, duration: Optional[float] = None,
                         ffmpeg_path: Optional[str] = None,
-                        sample_timeout: float = _PB_SAMPLE_TIMEOUT_S) -> Optional[dict]:
-    """Find the real picture inside the frame.
-
-    Runs ffmpeg cropdetect at several points through the file and takes the
-    WIDEST box across them (a dark scene can only make one sample's box too
-    small, never too big). Each axis is then accepted as "bars" only if the
-    bars are substantial and symmetric; otherwise that axis stays full
-    frame.
-
-    Returns a dict, or None when no answer could be reached (timeouts, too
-    few readable samples) -- None is never stored, so it is retried later
-    rather than recorded as "no bars".
-
-      rect            [x, y, w, h] of the picture in the frame's own pixels
-      frame           [w, h] of the frame those pixels belong to
-      norm            rect as fractions of the frame, so it survives any
-                      decode-time rescale
-      has_bars        True if the rect is smaller than the frame
-      reason          "letterbox" | "pillarbox" | "windowbox" | "no_bars" |
-                      "asymmetric_vertical" | "asymmetric_horizontal" |
-                      "asymmetric_both" | "no_video"
-      pixel_aspect    display aspect / stored aspect from the file's DAR
-                      (1.0 when the file declares none)
-      picture_aspect  rect w/h times pixel_aspect -- the picture's shape as
-                      it should be displayed. Measured, not classified: what
-                      counts as "16:9" is the owner's rule-table decision.
-      samples         number of samples that produced a box
-      sample_boxes    each sample's own box, for diagnosing a bad result
-      detector_version
-    """
+                        sample_timeout: float = _PB_SAMPLE_TIMEOUT_S,
+                        diag: Optional[dict] = None) -> Optional[dict]:
+    """Find the real picture inside the frame: ffmpeg cropdetect at several points, widest box wins; diag, if given, receives the timeout count and the stderr of a file ffmpeg would not open."""
     ffmpeg = _resolve_ffmpeg(ffmpeg_path)
     frame_w = frame_h = None
     pixel_aspect = 1.0
     boxes = []
+    timeouts = 0
 
     for t in _pb_sample_times(duration):
         text = _pb_run_sample(file_path, ffmpeg, t, sample_timeout)
         if text is None:
+            timeouts += 1
             continue
         if frame_w is None:
             if "Input #0" not in text:
+                if diag is not None:
+                    diag["stderr"] = text[-2000:]
                 return None
             vm = _VIDEO_DIMS_RE.search(text)
             if not vm:
                 return _pb_no_video()
-            # A cover-art picture inside an audio file is not video.
             line_end = text.find("\n", vm.end())
             video_line = text[vm.start():line_end if line_end != -1 else len(text)]
             if "attached pic" in video_line:
@@ -663,33 +505,41 @@ def detect_picture_box(file_path: str, duration: Optional[float] = None,
         found = _CROPDETECT_RE.findall(text)
         if not found:
             continue
-        w, h, x, y = (int(v) for v in found[-1])  # last line = running widest box
+        w, h, x, y = (int(v) for v in found[-1])
         if w > 0 and h > 0:
             boxes.append((x, y, w, h))
 
-    if frame_w is None or len(boxes) < _PB_MIN_GOOD_SAMPLES:
+    if diag is not None:
+        diag["timeouts"] = timeouts
+    if frame_w is None:
         return None
-
-    left = min(b[0] for b in boxes)
-    top = min(b[1] for b in boxes)
-    right = max(b[0] + b[2] for b in boxes)
-    bottom = max(b[1] + b[3] for b in boxes)
-    right, bottom = min(right, frame_w), min(bottom, frame_h)
-
-    y0, ph, vkind = _pb_axis(top, bottom - top, frame_h)
-    x0, pw, hkind = _pb_axis(left, right - left, frame_w)
-
-    if vkind == "bars" and hkind == "bars":
-        reason = "windowbox"
-    elif vkind == "bars":
-        reason = "letterbox"
-    elif hkind == "bars":
-        reason = "pillarbox"
+    if len(boxes) < _PB_MIN_GOOD_SAMPLES:
+        # WARNING: thin samples with no timeout mean the file opened fine (very short or mostly black); it still gets a label. Samples lost to timeouts mean a struggling drive, which must not be stored as "no bars".
+        if timeouts:
+            return None
+        x0, y0, pw, ph = 0, 0, frame_w, frame_h
+        reason = "thin_samples_full_frame"
     else:
-        bad_v, bad_h = vkind == "asymmetric", hkind == "asymmetric"
-        reason = ("asymmetric_both" if bad_v and bad_h else
-                  "asymmetric_vertical" if bad_v else
-                  "asymmetric_horizontal" if bad_h else "no_bars")
+        left = min(b[0] for b in boxes)
+        top = min(b[1] for b in boxes)
+        right = max(b[0] + b[2] for b in boxes)
+        bottom = max(b[1] + b[3] for b in boxes)
+        right, bottom = min(right, frame_w), min(bottom, frame_h)
+
+        y0, ph, vkind = _pb_axis(top, bottom - top, frame_h)
+        x0, pw, hkind = _pb_axis(left, right - left, frame_w)
+
+        if vkind == "bars" and hkind == "bars":
+            reason = "windowbox"
+        elif vkind == "bars":
+            reason = "letterbox"
+        elif hkind == "bars":
+            reason = "pillarbox"
+        else:
+            bad_v, bad_h = vkind == "asymmetric", hkind == "asymmetric"
+            reason = ("asymmetric_both" if bad_v and bad_h else
+                      "asymmetric_vertical" if bad_v else
+                      "asymmetric_horizontal" if bad_h else "no_bars")
 
     return {
         "rect": [x0, y0, pw, ph],
@@ -707,20 +557,242 @@ def detect_picture_box(file_path: str, duration: Optional[float] = None,
 
 
 def _pb_no_video() -> dict:
-    """Definitive answer for audio-only files and cover-art-only files, so
-    they are recorded once instead of being re-scanned every pass."""
+    """Returns the definitive answer for audio-only and cover-art-only files."""
     return {"rect": None, "frame": None, "norm": None, "has_bars": False,
             "reason": "no_video", "detector_version": PICTURE_BOX_DETECTOR_VERSION}
 
 
-# ---------------------------------------------------------------------------
-# 3 + 4 combined: probing into the library
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Burned-in (hard-coded) caption detection
+# ============================================================================
+BURNED_IN_DETECTOR_VERSION = 1
+_BI_SOURCE_BAKED = "baked"
+_BI_SOURCE_CLEAN = "clean"
+
+# VALUES CHANGE HERE
+_BI_FRAME_W = 480
+_BI_FRAME_H = 270
+_BI_SAMPLE_FRACTIONS = (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
+_BI_FALLBACK_OFFSETS_S = (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+_BI_FRAME_TIMEOUT_S = 20.0
+_BI_REGION_TOP_FRAC = 0.55
+_BI_BRIGHT_MIN = 205
+_BI_DARK_MAX = 75
+_BI_OUTLINE_REACH_PX = 2
+_BI_ROW_MIN_TEXT_FRAC = 0.025
+_BI_ROW_MIN_TRANSITIONS = 10
+_BI_BAND_MIN_H_FRAC = 0.018
+_BI_BAND_MAX_H_FRAC = 0.10
+_BI_BAND_MIN_WIDTH_FRAC = 0.12
+_BI_BAND_CENTER_RANGE = (0.25, 0.75)
+_BI_BAND_MIN_GLYPH_CLUSTERS = 6
+_BI_BAND_MAX_FILL = 0.50
+_BI_BAND_CONTRAST_RATIO = 4.0
+_BI_POSITION_TOLERANCE_FRAC = 0.05
+_BI_MIN_POSITIVE_FRAMES = 3
+_BI_MAX_BANDS_PER_FRAME = 3
+_BI_EARLY_STOP_FRAMES = 4
+_BI_MIN_AGREEING_SHARE = 0.6
+
+
+def _bi_dilate(mask, reach):
+    """Boolean dilation by a square of +-reach pixels (numpy only)."""
+    import numpy as np
+    out = mask.copy()
+    h, w = mask.shape
+    for dy in range(-reach, reach + 1):
+        for dx in range(-reach, reach + 1):
+            if dx == 0 and dy == 0:
+                continue
+            ys0, ys1 = max(0, dy), h + min(0, dy)
+            xs0, xs1 = max(0, dx), w + min(0, dx)
+            out[ys0 - dy:ys1 - dy, xs0 - dx:xs1 - dx] |= mask[ys0:ys1, xs0:xs1]
+    return out
+
+
+def _bi_frame_text_bottoms(gray):
+    """Returns the bottom edge, as a fraction of frame height, of every band in one 8-bit gray frame that looks like a subtitle line."""
+    import numpy as np
+    frame_h, frame_w = gray.shape
+    y0 = int(frame_h * _BI_REGION_TOP_FRAC)
+    crop = gray[y0:, :]
+    bright = crop >= _BI_BRIGHT_MIN
+    dark = crop <= _BI_DARK_MAX
+    text = bright & _bi_dilate(dark, _BI_OUTLINE_REACH_PX)
+
+    row_count = text.sum(axis=1)
+    row_trans = (bright[:, 1:] != bright[:, :-1]).sum(axis=1)
+    cand = (row_count >= _BI_ROW_MIN_TEXT_FRAC * frame_w) & (row_trans >= _BI_ROW_MIN_TRANSITIONS)
+    if not cand.any():
+        return []
+
+    bands = []
+    rows = np.flatnonzero(cand)
+    start = prev = int(rows[0])
+    for r in rows[1:]:
+        r = int(r)
+        if r - prev > 2:
+            bands.append((start, prev))
+            start = r
+        prev = r
+    bands.append((start, prev))
+
+    min_h = max(3, int(round(frame_h * _BI_BAND_MIN_H_FRAC)))
+    max_h = int(round(frame_h * _BI_BAND_MAX_H_FRAC))
+    in_band = np.zeros(len(row_count), dtype=bool)
+    for a, b in bands:
+        in_band[a:b + 1] = True
+    outside = row_count[~in_band]
+    background = float(np.median(outside)) if outside.size else 0.0
+
+    bottoms = []
+    for a, b in bands:
+        height = b - a + 1
+        if height < min_h or height > max_h:
+            continue
+        cols = text[a:b + 1].any(axis=0)
+        hit = np.flatnonzero(cols)
+        if hit.size == 0:
+            continue
+        left, right = int(hit[0]), int(hit[-1])
+        extent = right - left + 1
+        if extent < _BI_BAND_MIN_WIDTH_FRAC * frame_w:
+            continue
+        centre = (left + right) / 2.0 / frame_w
+        if not (_BI_BAND_CENTER_RANGE[0] <= centre <= _BI_BAND_CENTER_RANGE[1]):
+            continue
+        clusters = int(((cols[1:].astype(np.int8) - cols[:-1].astype(np.int8)) == 1).sum()) + int(bool(cols[0]))
+        if clusters < _BI_BAND_MIN_GLYPH_CLUSTERS:
+            continue
+        box = bright[a:b + 1, left:right + 1]
+        if box.mean() > _BI_BAND_MAX_FILL:
+            continue
+        band_mean = float(row_count[a:b + 1].mean())
+        if band_mean < _BI_BAND_CONTRAST_RATIO * max(background, 1.0):
+            continue
+        bottoms.append((y0 + b + 1) / float(frame_h))
+    if len(bottoms) > _BI_MAX_BANDS_PER_FRAME:
+        return []
+    return bottoms
+
+
+def _bi_grab_frame(file_path, ffmpeg, t, timeout):
+    """One scaled gray frame as a numpy array, or None when ffmpeg timed out or produced nothing."""
+    import numpy as np
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
+        )
+    cmd = [
+        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{t:.3f}", "-i", file_path, "-map", "0:v:0", "-frames:v", "1",
+        "-an", "-sn", "-dn",
+        "-vf", f"scale={_BI_FRAME_W}:{_BI_FRAME_H}:flags=area,format=gray",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ]
+    try:
+        import media as _media
+        with _media._fast_disk_io_slot(f"burned_in({os.path.basename(file_path)})"):
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                                    stdin=subprocess.DEVNULL, **popen_kwargs)
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except Exception:
+        return None
+    data = result.stdout or b""
+    if len(data) != _BI_FRAME_W * _BI_FRAME_H:
+        return None
+    return np.frombuffer(data, dtype=np.uint8).reshape(_BI_FRAME_H, _BI_FRAME_W)
+
+
+def _bi_positions_agree(bottoms_per_positive_frame, early=False):
+    """True when enough positive frames put their lowest text band at the same height (the same spot, frame after frame, is what separates subtitles from scrolling credits or a one-off graphic)."""
+    lows = [max(b) for b in bottoms_per_positive_frame]
+    best = 0
+    for ref in lows:
+        near = sum(1 for v in lows if abs(v - ref) <= _BI_POSITION_TOLERANCE_FRAC)
+        best = max(best, near)
+    need = _BI_EARLY_STOP_FRAMES if early else _BI_MIN_POSITIVE_FRAMES
+    return best >= need and best >= _BI_MIN_AGREEING_SHARE * len(lows)
+
+
+def _bi_sample_times(duration, extra=False):
+    if duration and duration > 0:
+        latest = max(0.0, duration - 1.0)
+        fractions = _BI_SAMPLE_FRACTIONS
+        if extra:
+            fractions = tuple(f + 0.04 for f in _BI_SAMPLE_FRACTIONS)
+        return [round(min(duration * f, latest), 3) for f in fractions]
+    base = _BI_FALLBACK_OFFSETS_S
+    return [t + 10.0 for t in base] if extra else list(base)
+
+
+def detect_burned_in_captions(file_path, duration=None, ffmpeg_path=None,
+                              frame_timeout=_BI_FRAME_TIMEOUT_S, diag=None):
+    """Returns True when subtitle text is part of the picture, False when it is not, None when it could not tell."""
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        if diag is not None:
+            diag["reason"] = "numpy_unavailable"
+        return None
+    ffmpeg = _resolve_ffmpeg(ffmpeg_path)
+
+    positives = []
+    decoded = 0
+    timeouts = 0
+    planned = 0
+    for extra in (False, True):
+        if extra and not positives:
+            break
+        times = _bi_sample_times(duration, extra=extra)
+        planned += len(times)
+        for t in times:
+            frame = _bi_grab_frame(file_path, ffmpeg, t, frame_timeout)
+            if isinstance(frame, str):
+                timeouts += 1
+                continue
+            if frame is None:
+                continue
+            decoded += 1
+            bottoms = _bi_frame_text_bands_safe(frame)
+            if bottoms:
+                positives.append(bottoms)
+                if _bi_positions_agree(positives, early=True):
+                    if diag is not None:
+                        diag.update(positive_frames=len(positives), decoded=decoded, reason="text_band_found")
+                    return True
+        if _bi_positions_agree(positives):
+            if diag is not None:
+                diag.update(positive_frames=len(positives), decoded=decoded, reason="text_band_found")
+            return True
+    if diag is not None:
+        diag.update(positive_frames=len(positives), decoded=decoded, timeouts=timeouts)
+    if decoded == 0:
+        if diag is not None:
+            diag["reason"] = "no_frames"
+        return None
+    # WARNING: samples lost to timeouts mean a struggling drive; that must not be stored as "clean".
+    if timeouts and decoded < planned // 2:
+        return None
+    return False
+
+
+def _bi_frame_text_bands_safe(frame):
+    try:
+        return _bi_frame_text_bottoms(frame)
+    except Exception as e:
+        log.warning("[MEDIA LIBRARY] burned-in frame analysis failed: %s", e)
+        return []
+
+
+# ============================================================================
+# SECTION: Probing into the library
+# ============================================================================
 
 class ProbeLibrary:
-    """The main entry point: ties PathKeyResolver + MediaLibrary +
-    combined_header_probe together into get_or_probe_sync() /
-    get_cached(), and hosts the pre-cache pool and migration helpers."""
+    """Entry point: ties PathKeyResolver, MediaLibrary and combined_header_probe together (get_or_probe_sync / get_cached) and hosts the migration helpers."""
 
     def __init__(self, library: MediaLibrary, ffmpeg_path: Optional[str] = None,
                  use_vlc_fallback: bool = True):
@@ -728,22 +800,60 @@ class ProbeLibrary:
         self.keys = PathKeyResolver(library)
         self.ffmpeg_path = ffmpeg_path
         self.use_vlc_fallback = use_vlc_fallback
+        self._header_locks = {}
+        self._header_locks_guard = threading.Lock()
+
+    def ensure_header(self, file_path: str) -> Optional[dict]:
+        """Returns the library entry with its header facts stored, reading the header once if it has never been read. Concurrent callers for one file wait on a per-file lock and reuse the stored result, so a file's header is opened once however many lanes ask."""
+        content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return None
+        entry = self.library.get_entry(content_key)
+        if entry is not None and entry.get("header_probed_at"):
+            return entry
+        with self._header_locks_guard:
+            slot = self._header_locks.get(content_key)
+            if slot is None:
+                slot = [threading.Lock(), 0]
+                self._header_locks[content_key] = slot
+            slot[1] += 1
+        try:
+            with slot[0]:
+                entry = self.library.get_entry(content_key)
+                if entry is None or not entry.get("header_probed_at"):
+                    self._probe_header_into(file_path, content_key)
+                    entry = self.library.get_entry(content_key)
+        finally:
+            with self._header_locks_guard:
+                slot[1] -= 1
+                if slot[1] == 0:
+                    self._header_locks.pop(content_key, None)
+        return entry
+
+    def header_facts(self, file_path: str) -> Optional[dict]:
+        """The shared header read as {ok, duration, width, height, has_audio}. None when the library cannot key the file; ok False when the header read failed."""
+        entry = self.ensure_header(file_path)
+        if entry is None:
+            return None
+        if not entry.get("header_probed_at"):
+            return {"ok": False}
+        return {
+            "ok": True,
+            "duration": entry.get("duration") or None,
+            "width": entry.get("width") or None,
+            "height": entry.get("height") or None,
+            "has_audio": bool(entry.get("audio_streams")),
+        }
 
     def get_cached(self, file_path: str) -> Optional[dict]:
-        """Read-only: returns the library entry if one already exists for
-        this path's current content, else None. Never probes."""
+        """Read-only: returns the library entry if one already exists for this path's current content, else None."""
         content_key = self.keys.resolve(file_path)
         if content_key is None:
             return None
         return self.library.get_entry(content_key)
 
     def get_or_probe_sync(self, file_path: str, max_age_s: Optional[float] = None) -> Optional[dict]:
-        """Item 6, on-demand fallback: return a fresh-enough library
-        entry, probing synchronously right now if there isn't one (or
-        it's older than max_age_s). This is meant to replace a 1800 s
-        placeholder-duration default with a real, few-hundred-ms probe
-        the caller can afford to wait on -- see item C's "closes a hole
-        behind item C" in the handoff doc."""
+        """Return a library entry no older than max_age_s, probing synchronously if there isn't one."""
         content_key = self.keys.resolve(file_path)
         if content_key is None:
             return None
@@ -759,6 +869,8 @@ class ProbeLibrary:
     def _probe_header_into(self, file_path: str, content_key: str):
         result = combined_header_probe(file_path, ffmpeg_path=self.ffmpeg_path)
         if not result.ok:
+            log.warning("[MEDIA LIBRARY] header probe failed for %s: %s",
+                        os.path.basename(file_path), result.error)
             return
         try:
             size = os.path.getsize(file_path)
@@ -782,16 +894,12 @@ class ProbeLibrary:
             header_probed_at=time.time(),
         )
 
-    def detect_picture_box_if_needed(self, file_path: str) -> Optional[dict]:
-        """The picture-box hook for PrecachePool (and any caller that wants
-        the answer now). Reads the library first; scans only when the file
-        has no picture box yet or the stored one came from an older
-        detector version, then stores the result on the same library row
-        the header probe filled in. Returns the stored picture box, or None
-        if the scan couldn't reach an answer (nothing is stored then, so a
-        later pass tries again)."""
+    def detect_picture_box_if_needed(self, file_path: str, diag: Optional[dict] = None) -> Optional[dict]:
+        """The picture-box hook for any caller that wants the answer now; diag, if given, receives why there was no answer."""
         content_key = self.keys.resolve(file_path)
         if content_key is None:
+            if diag is not None:
+                diag["unkeyable"] = True
             return None
         entry = self.library.get_entry(content_key)
         if (entry and entry.get("picture_box")
@@ -800,7 +908,7 @@ class ProbeLibrary:
         if entry is None or not entry.get("header_probed_at"):
             entry = self.get_or_probe_sync(file_path)
         duration = (entry or {}).get("duration")
-        box = detect_picture_box(file_path, duration=duration, ffmpeg_path=self.ffmpeg_path)
+        box = detect_picture_box(file_path, duration=duration, ffmpeg_path=self.ffmpeg_path, diag=diag)
         if box is None:
             return None
         self.library.upsert_fields(
@@ -809,11 +917,25 @@ class ProbeLibrary:
         )
         return box
 
-    # -- storage APIs for the other data types item 3 calls for --------------
-    # These are plain storage; the actual measurement logic (picture-box
-    # detection for item D, LUFS scanning, ASR transcription) lives where
-    # it already does in media.py / retro_tv_emulator.py and is expected
-    # to call these once it has a result, not be reimplemented here.
+    def store_full_frame_picture_box(self, file_path: str) -> Optional[dict]:
+        """Labels a file whose cropdetect keeps timing out from its stored frame size, with no bars; None when the frame size is unknown."""
+        content_key = self.keys.resolve(file_path)
+        entry = self.library.get_entry(content_key) if content_key is not None else None
+        w, h = (entry or {}).get("width"), (entry or {}).get("height")
+        if not w or not h:
+            return None
+        box = {
+            "rect": [0, 0, int(w), int(h)], "frame": [int(w), int(h)], "norm": [0.0, 0.0, 1.0, 1.0],
+            "has_bars": False, "reason": "timeout_full_frame", "pixel_aspect": 1.0,
+            "picture_aspect": round(int(w) / float(int(h)), 4), "samples": 0, "sample_boxes": [],
+            "detector_version": PICTURE_BOX_DETECTOR_VERSION,
+        }
+        self.library.upsert_fields(
+            content_key, picture_box=box,
+            picture_box_detector_version=PICTURE_BOX_DETECTOR_VERSION,
+        )
+        return box
+
 
     def store_picture_box(self, file_path: str, rect, detector_version: int):
         content_key = self.keys.resolve(file_path)
@@ -852,8 +974,50 @@ class ProbeLibrary:
             return None
         try:
             return zlib.decompress(entry["captions_blob"]).decode("utf-8")
-        except (zlib.error, UnicodeDecodeError):
+        except (zlib.error, UnicodeDecodeError) as e:
+            log.warning("[MEDIA LIBRARY] stored captions for %s failed to decompress "
+                        "(%s) -- treating as no captions on file", os.path.basename(file_path), e)
             return None
+
+    def get_burned_in_verdict(self, file_path: str) -> Optional[bool]:
+        """Read-only: the stored burned-in verdict for this file's current content (True / False), or None when it has never been scanned by the current detector."""
+        entry = self.get_cached(file_path)
+        if not entry:
+            return None
+        if entry.get("captions_reason") != f"burned_in_v{BURNED_IN_DETECTOR_VERSION}":
+            return None
+        source = entry.get("captions_source")
+        if source == _BI_SOURCE_BAKED:
+            return True
+        if source == _BI_SOURCE_CLEAN:
+            return False
+        return None
+
+    def detect_burned_in_if_needed(self, file_path: str, diag: Optional[dict] = None) -> Optional[bool]:
+        """Stored burned-in verdict if there is one, otherwise scan the file once and store the answer; None when the scan could not decide (nothing is stored then, so a later pass retries)."""
+        content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return None
+        stored = self.get_burned_in_verdict(file_path)
+        if stored is not None:
+            return stored
+        entry = self.library.get_entry(content_key)
+        if entry is None or not entry.get("header_probed_at"):
+            entry = self.get_or_probe_sync(file_path)
+        if entry is not None and entry.get("width") is None and entry.get("header_probed_at"):
+            verdict = False
+        else:
+            verdict = detect_burned_in_captions(
+                file_path, duration=(entry or {}).get("duration"),
+                ffmpeg_path=self.ffmpeg_path, diag=diag)
+        if verdict is None:
+            return None
+        self.library.upsert_fields(
+            content_key,
+            captions_source=_BI_SOURCE_BAKED if verdict else _BI_SOURCE_CLEAN,
+            captions_reason=f"burned_in_v{BURNED_IN_DETECTOR_VERSION}",
+        )
+        return verdict
 
     def store_pan_scan_memory(self, file_path: str, memory: dict):
         content_key = self.keys.resolve(file_path)
@@ -862,168 +1026,24 @@ class ProbeLibrary:
         self.library.upsert_fields(content_key, pan_scan_memory=memory)
         return True
 
-    # -- 8. re-key on re-encode ----------------------------------------------
 
-    def rekey_after_reencode(self, file_path: str, preserve_fields: Optional[dict] = None):
-        """Call once the renormalization sweep finishes rewriting
-        `file_path` in place. The file's bytes changed, so its identity
-        key changes -- this looks up whatever key it had BEFORE the
-        rewrite (from path_keys, which still has the stale size/mtime
-        pointing at the old content), copies that row's data onto the
-        new, freshly-hashed key (so, e.g., the OLD gain measurement --
-        now wrong for the renormalized audio -- doesn't silently keep
-        being served under the new content), and drops the stale
-        path_keys row so the next resolve() re-hashes for real.
-
-        preserve_fields lets the caller pass the renorm sweep's own
-        freshly-known-correct fields (typically the new gain/duration it
-        just computed) to be written onto the new key directly, rather
-        than copied stale from the old one.
-        """
-        norm_path = os.path.normpath(os.path.abspath(file_path)).lower()
-        with self.library._lock:
-            row = self.library._conn.execute(
-                "SELECT content_key FROM path_keys WHERE norm_path=?", (norm_path,)
-            ).fetchone()
-        old_key = row[0] if row else None
-
-        self.library.drop_path_key(norm_path)
-        new_key = self.keys.resolve(file_path)
-        if new_key is None:
-            return None  # file vanished or is mid-write; nothing to carry forward yet
-
-        if old_key and old_key != new_key:
-            self.library.copy_entry(old_key, new_key, overwrite_fields=preserve_fields)
-            self.library.delete_entry(old_key)
-        elif preserve_fields:
-            self.library.upsert_fields(new_key, **preserve_fields)
-        return new_key
+_shared_probe_library = None
+_shared_probe_library_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# 5. Pre-caching pool
-# ---------------------------------------------------------------------------
-
-# Lower number = higher priority, matching the doc's ordered list exactly.
-TIER_NOW_PLAYING = 1        # now playing plus the next 2 items
-TIER_GUIDE_HIGHLIGHT = 2    # the guide's highlighted channels
-TIER_SCHEDULED = 3          # all scheduled tracks, by how soon they air
-TIER_COMMERCIAL_POOL = 4    # the commercial pool
-TIER_EVERYTHING_ELSE = 5    # everything else
-TIER_LOUDNESS = 6           # lowest priority, shares the same 2-thread cap
+def shared_probe_library() -> "ProbeLibrary":
+    """The one process-wide ProbeLibrary on the default database, built on first use."""
+    global _shared_probe_library
+    if _shared_probe_library is None:
+        with _shared_probe_library_lock:
+            if _shared_probe_library is None:
+                _shared_probe_library = ProbeLibrary(MediaLibrary(default_db_path()))
+    return _shared_probe_library
 
 
-@dataclass(order=True)
-class _QueueItem:
-    tier: int
-    seq: int
-    path: str = field(compare=False)
-    picture_box_fn: Optional[Callable] = field(compare=False, default=None)
-
-
-class PrecachePool:
-    """2 low-priority worker threads draining a 5(+1)-tier priority
-    queue. Item 5 in the doc: header probe first (this module), then
-    picture-box detection (item D hook, no-op unless a detector is
-    injected), then loudness at the lowest tier, sharing the same
-    2-thread cap rather than getting its own pool."""
-
-    def __init__(self, probe_library: ProbeLibrary, thread_count: int = 2,
-                 loudness_fn: Optional[Callable[[str], None]] = None,
-                 picture_box_fn: Optional[Callable[[str], None]] = None,
-                 picture_box_current_version: Optional[int] = None):
-        self.probe_library = probe_library
-        self.thread_count = thread_count
-        self.loudness_fn = loudness_fn
-        self.picture_box_fn = picture_box_fn
-        # When set, an entry whose stored detector version is older is
-        # re-scanned (only that field), not just entries with no box yet.
-        self.picture_box_current_version = picture_box_current_version
-        self._q: "queue.PriorityQueue[_QueueItem]" = queue.PriorityQueue()
-        self._seq = 0
-        self._seq_lock = threading.Lock()
-        self._threads: list[threading.Thread] = []
-        self._stop = threading.Event()
-        self._enqueued = set()  # (tier, path) currently in-flight/queued, avoids dup work
-        self._enqueued_lock = threading.Lock()
-
-    def enqueue(self, path: str, tier: int = TIER_EVERYTHING_ELSE):
-        key = (tier, path)
-        with self._enqueued_lock:
-            if key in self._enqueued:
-                return
-            self._enqueued.add(key)
-        with self._seq_lock:
-            self._seq += 1
-            seq = self._seq
-        self._q.put(_QueueItem(tier=tier, seq=seq, path=path))
-
-    def enqueue_many(self, paths, tier: int = TIER_EVERYTHING_ELSE):
-        for p in paths:
-            self.enqueue(p, tier)
-
-    def start(self):
-        if self._threads:
-            return
-        self._stop.clear()
-        for i in range(self.thread_count):
-            t = threading.Thread(target=self._worker_loop, name=f"precache-{i}", daemon=True)
-            t.start()
-            self._threads.append(t)
-
-    def stop(self, join_timeout: Optional[float] = 2.0):
-        self._stop.set()
-        for _ in self._threads:
-            self._q.put(None)  # wake blocked workers
-        for t in self._threads:
-            t.join(timeout=join_timeout)
-        self._threads = []
-
-    def qsize(self) -> int:
-        return self._q.qsize()
-
-    def _worker_loop(self):
-        while not self._stop.is_set():
-            item = self._q.get()
-            if item is None:
-                continue
-            try:
-                self._process(item)
-            except Exception:
-                pass
-            finally:
-                with self._enqueued_lock:
-                    self._enqueued.discard((item.tier, item.path))
-
-    def _picture_box_needed(self, entry: dict) -> bool:
-        if not entry.get("picture_box"):
-            return True
-        current = self.picture_box_current_version
-        return current is not None and (entry.get("picture_box_detector_version") or 0) < current
-
-    def _process(self, item: _QueueItem):
-        entry = self.probe_library.get_cached(item.path)
-        if entry is None or not entry.get("header_probed_at"):
-            self.probe_library.get_or_probe_sync(item.path)
-            entry = self.probe_library.get_cached(item.path)
-
-        picture_box_fn = item.picture_box_fn or self.picture_box_fn
-        if picture_box_fn is not None and entry is not None and self._picture_box_needed(entry):
-            try:
-                picture_box_fn(item.path)
-            except Exception:
-                pass
-
-        if item.tier == TIER_LOUDNESS and self.loudness_fn is not None:
-            try:
-                self.loudness_fn(item.path)
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# 7. Migration from the legacy config-dict caches
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Legacy cache migration
+# ============================================================================
 
 @dataclass
 class MigrationProgress:
@@ -1032,26 +1052,12 @@ class MigrationProgress:
     skipped_missing: int = 0
     skipped_growing: int = 0
     done: bool = False
-    skipped_stale: int = 0      # legacy entry measured a different version of the file
-    newly_written: int = 0      # entries that actually added something to the library
+    skipped_stale: int = 0
+    newly_written: int = 0
 
 
 class LegacyCacheMigrator:
-    """Throttled, resumable import of db.config["media_probe_cache"] and
-    db.config["dvd_gain_cache"] into the new library. Call step()
-    periodically (e.g. from the same kind of timer the app already uses
-    for _orphan_cache_prune_loop) rather than all at once -- each call
-    processes at most `batch_size` entries and returns.
-
-    Never mutates or deletes from the source dicts: they keep serving as
-    a valid read fallback (per the doc: "The old cache stays as a read
-    fallback") for anything not yet migrated, most commonly because the
-    file was missing on disk at migration time -- per the doc,
-    "Entries for currently missing files are kept" in the legacy cache
-    rather than migrated, since there's nothing on disk to hash into a
-    content key yet. A later step() call will pick them up once/if the
-    file reappears (e.g. a removable drive gets reconnected).
-    """
+    """Throttled, resumable import of db.config["media_probe_cache"] and db.config["dvd_gain_cache"] into the library."""
 
     def __init__(self, probe_library: ProbeLibrary, batch_size: int = 25):
         self.probe_library = probe_library
@@ -1065,9 +1071,6 @@ class LegacyCacheMigrator:
 
     def start(self, media_probe_cache: dict, dvd_gain_cache: dict,
               gain_target_lufs: Optional[float] = None):
-        # The legacy cache clears every gain whenever the loudness target
-        # changes, so whatever gains it still holds were measured against
-        # the current target -- pass it here to tag migrated gains with it.
         self.gain_target_lufs = gain_target_lufs
         self._media_probe_cache_iter = iter(list(media_probe_cache.items()))
         self._dvd_gain_cache_iter = iter(list((dvd_gain_cache or {}).items()))
@@ -1079,9 +1082,10 @@ class LegacyCacheMigrator:
         if self._media_probe_cache_iter is None:
             return self.progress
         budget = self.batch_size
-        budget = self._drain(self._media_probe_cache_iter, self._migrate_probe_entry, budget, "media_probe_cache")
+        # WARNING: dvd_gain_cache must drain BEFORE media_probe_cache; fields are never overwritten once written, so the order decides which gain a file keeps.
+        budget = self._drain(self._dvd_gain_cache_iter, self._migrate_gain_entry, budget, "dvd_gain_cache")
         if budget > 0:
-            budget = self._drain(self._dvd_gain_cache_iter, self._migrate_gain_entry, budget, "dvd_gain_cache")
+            budget = self._drain(self._media_probe_cache_iter, self._migrate_probe_entry, budget, "media_probe_cache")
         if self._media_probe_cache_exhausted and self._dvd_gain_cache_exhausted:
             self.progress.done = True
         return self.progress
@@ -1103,12 +1107,7 @@ class LegacyCacheMigrator:
 
     @staticmethod
     def _legacy_entry_is_stale(norm_path: str, entry: dict) -> bool:
-        """True if the legacy entry carries the size/mtime it was measured
-        at and the file on disk no longer matches -- the path now holds a
-        different file, and its old numbers must not be filed under the
-        new content's key. Same rule as the app's
-        _media_probe_fingerprint_stale. An entry with no fingerprint is
-        trusted, as everywhere else in the app."""
+        """True if the legacy entry's recorded size/mtime no longer match the file on disk."""
         mtime = entry.get("measured_mtime")
         size = entry.get("measured_size")
         if mtime is None or size is None:
@@ -1120,16 +1119,13 @@ class LegacyCacheMigrator:
         return st.st_mtime != mtime or st.st_size != size
 
     def _write_missing_fields(self, content_key: str, fields: dict) -> bool:
-        """Add only what the library row doesn't already have. The library
-        row can be newer than the legacy entry (a fresh probe, a later
-        scan), so a re-run of the migration must never overwrite it.
-        Returns True if anything was written."""
+        """Add only the fields the library row doesn't already have."""
         existing = self.probe_library.library.get_entry(content_key) or {}
         to_write = {k: v for k, v in fields.items() if existing.get(k) is None}
         if "duration" in fields and existing.get("duration") is not None:
-            to_write.pop("duration_source", None)   # source belongs with its duration
+            to_write.pop("duration_source", None)
         if "gain" not in to_write:
-            to_write.pop("gain_target_lufs", None)  # target belongs with its gain
+            to_write.pop("gain_target_lufs", None)
         if not to_write:
             return False
         self.probe_library.library.upsert_fields(content_key, **to_write)
@@ -1181,47 +1177,13 @@ class LegacyCacheMigrator:
             self.progress.migrated += 1
 
 
-# ---------------------------------------------------------------------------
-# INTEGRATION STATUS (read this before wiring anything else to this module)
-# ---------------------------------------------------------------------------
-#
-# Built and covered by tests (test_media_library.py):
-#   - MediaLibrary schema/storage, WAL mode, upsert/copy/delete semantics.
-#   - compute_identity_key(): stable across rename/move, distinguishes
-#     changed content, skips a still-growing file.
-#   - PathKeyResolver: re-hashes only when (size, mtime) changed.
-#   - combined_header_probe(): parses duration/dims/DAR/audio/subtitle
-#     streams from synthetic ffmpeg stderr text matching each of the four
-#     original functions' own test fixtures.
-#   - PrecachePool: tier ordering, de-duplication of in-flight items.
-#   - LegacyCacheMigrator: batch/throttle behavior, missing-file skip,
-#     growing-file skip, idempotent re-run.
-#   - rekey_after_reencode(): old-key data lands on the new key, old key
-#     is removed, preserve_fields overrides stale copied data.
-#
-# Deliberately NOT done in this pass, and not silently assumed:
-#   - No call site in retro_tv_emulator.py or media.py has been changed.
-#     The five duplicate header-probe functions the doc lists (item B,
-#     "Five separate header probes") are all still in place and still
-#     being called exactly as before. This module does not run yet
-#     during normal app operation.
-#   - Picture-box DETECTION exists (detect_picture_box(),
-#     ProbeLibrary.detect_picture_box_if_needed()) and is stored, but
-#     nothing in the app reads it. How a picture is FITTED to the screen
-#     (the 16:9 rule, Screen Mode, bezel on/off, the +/-10% band) is the
-#     item D rule table, still unapproved and not built. The watermark
-#     needs no scan of its own: it follows the rectangle the video is
-#     actually drawn into.
-#   - No LUFS/ASR measurement logic was duplicated; store_gain() /
-#     store_captions() are storage-only, meant to be called BY the
-#     existing measurement code once it has a result, not to replace it.
-#   - The pre-cache pool's tier-2/3/4 sources (guide highlighted
-#     channels, the schedule, the commercial pool) aren't wired to real
-#     app state yet -- PrecachePool.enqueue()/enqueue_many() are ready to
-#     be called from wherever that state already lives in
-#     retro_tv_emulator.py, but that call hasn't been added.
-#
-# Recommended next step, once this foundation itself is signed off: wire
-# ONE read path at a time (duration is the natural first target, since
-# item C's fix depends on get_or_probe_sync() replacing the 1800 s
-# default) rather than swapping all ~40 call sites in one pass.
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = [
+    "resolve_media_library_dir", "default_db_path", "MediaLibrary", "PathKeyResolver",
+    "compute_identity_key", "HeaderProbeResult", "combined_header_probe",
+    "probe_duration_with_fallback", "PICTURE_BOX_DETECTOR_VERSION", "detect_picture_box",
+    "ProbeLibrary", "MigrationProgress", "LegacyCacheMigrator",
+    "BURNED_IN_DETECTOR_VERSION", "detect_burned_in_captions", "shared_probe_library",
+]

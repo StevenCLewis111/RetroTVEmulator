@@ -1,38 +1,39 @@
+"""Media helpers and the RetroDatabase for the Retro TV Emulator.
 
+WARNING: this module must import cleanly with dummy SDL drivers; the tests rely on it.
+"""
 import os
 import re
 import sys
 import json
+import contextlib
 import copy
 import ctypes
 import difflib
 import threading
 import shutil
+import concurrent.futures
 import time
 import types
+import zlib
 import logging
 import math
 import subprocess
 import numpy as np
 import pygame
 try:
-    # Optional. Only used by apply_video_effects() below to run the Video-tab
-    # Brightness/Contrast/Tint LUT and Color blend as SIMD passes straight on
-    # the frame's own pixels instead of several full-frame NumPy temporaries.
-    # Without it everything still works, through the original NumPy path.
     import cv2 as _cv2_fx
-except Exception:  # ImportError, or a broken native install
+except Exception:
     _cv2_fx = None
+
+
+# ============================================================================
+# SECTION: Logging & shared helpers
+# ============================================================================
+
 
 log = logging.getLogger(__name__)
 
-# Single shared control for how thick a focus/selection highlight border is
-# drawn everywhere in the UI (menus, submenus, toggles, buttons, yes/no
-# dialogs, etc). Bump this one value to make every highlight border thicker
-# across the whole app instead of hunting down each draw call individually.
-# (Does not affect the TV guide's selected time slot, which is indicated by
-# a filled background color rather than a border, or static/decorative
-# panel outlines that aren't tied to selection state.)
 SELECTION_BORDER_WIDTH = 3
 
 def _media_warning(_key, message, *args):
@@ -40,30 +41,15 @@ def _media_warning(_key, message, *args):
     log.warning(message, *args)
 
 
-# ---------------------------------------------------------------------------
-# Shortcut (Windows .lnk / .url, and POSIX symlink) recognition + resolution.
-#
-# Project folders (channel content, ROM folders, splash/menu asset folders,
-# etc.) are sometimes organized with shortcuts instead of real files/folders
-# -- e.g. keeping one show's episodes in a single place on disk but wanting
-# it to also appear under a second channel's folder, without duplicating the
-# files. Every folder walk/listing in the app that's meant to discover
-# "content someone put in this project folder" should recognize a shortcut
-# entry, follow it to whatever it actually points at, and use that target
-# (not the shortcut file itself) as the thing that gets listed/scanned/
-# added. This section is the single shared implementation of that so the
-# file explorer, the channel content scanner, and the ROM/BIOS/splash
-# scanners all treat shortcuts identically instead of three subtly
-# different one-off implementations.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Shortcut resolution
+# ============================================================================
 
 SHORTCUT_EXTENSIONS = {".lnk", ".url"}
 
 
 def is_shortcut_path(path):
-    """True if `path` names a Windows shortcut file (.lnk/.url) or a
-    symlink -- i.e. something that points at other content rather than
-    being that content itself."""
+    """True if `path` is a Windows shortcut (.lnk/.url) or a symlink."""
     try:
         if os.path.islink(path):
             return True
@@ -73,20 +59,13 @@ def is_shortcut_path(path):
 
 
 def _read_lnk_target(path):
-    """Pull the target path out of a Windows .lnk (Shell Link) file with no
-    external dependency. Minimal parser for the MS-SHLLINK binary format:
-    reads the LinkInfo block's LocalBasePath, which covers a normal
-    "shortcut to a local file or folder" link. Anything this can't
-    confidently parse (corrupt link, network-only target, unrecognized
-    layout) returns None rather than guessing at a path."""
+    """Pull the target path out of a Windows .lnk (Shell Link) file with no external dependency."""
     try:
         with open(path, "rb") as f:
             data = f.read()
     except OSError:
         return None
 
-    # Header is a fixed 0x4C bytes, and starts with the Shell Link class
-    # GUID's first 4 bytes as a fixed literal signature.
     if len(data) < 0x4C or data[:4] != b"\x4C\x00\x00\x00":
         return None
 
@@ -112,7 +91,7 @@ def _read_lnk_target(path):
     li_flags = int.from_bytes(li[8:12], "little")
     VOLUME_ID_AND_LOCAL_BASE_PATH = 0x01
     if not (li_flags & VOLUME_ID_AND_LOCAL_BASE_PATH):
-        return None  # network-share-only target (CommonNetworkRelativeLink)
+        return None
 
     local_base_off = int.from_bytes(li[16:20], "little")
     if not local_base_off or local_base_off >= len(li):
@@ -129,9 +108,7 @@ def _read_lnk_target(path):
 
 
 def resolve_shortcut_target(path):
-    """Return the local path a shortcut points at, or None if it can't be
-    resolved (broken link, unreadable file, or a shortcut that doesn't
-    point at a local file/folder at all -- e.g. a web URL)."""
+    """Return the local path a shortcut points at, or None if it can't be resolved."""
     try:
         if os.path.islink(path):
             target = os.readlink(path)
@@ -157,7 +134,7 @@ def resolve_shortcut_target(path):
                             from urllib.parse import unquote
                             local = unquote(raw[8:]).replace("/", os.sep)
                             return os.path.normpath(local)
-                        return None  # a real web URL, not a local shortcut
+                        return None
         except OSError:
             return None
 
@@ -165,11 +142,7 @@ def resolve_shortcut_target(path):
 
 
 def resolve_shortcut_chain(path, max_hops=8):
-    """Follow a shortcut (or a shortcut pointing at another shortcut) down
-    to a real file/folder path. Returns `path` unchanged if it isn't a
-    shortcut at all, or the last path reached if a link in the chain can't
-    be resolved / the chain loops back on itself -- callers should still
-    check the result actually exists before trusting it."""
+    """Follow a shortcut (or a shortcut pointing at another shortcut) down to a real file/folder path."""
     current = path
     seen = set()
     for _ in range(max_hops):
@@ -186,32 +159,16 @@ def resolve_shortcut_chain(path, max_hops=8):
 
 
 def strip_shortcut_display_suffix(name):
-    """Clean a shortcut's raw filename for display: drop the .lnk/.url
-    extension and Windows' auto-appended ' - Shortcut' suffix (what a
-    copied shortcut, or a freshly-created one, is named by default) so a
-    shortcut is shown under the same name as whatever it points to,
-    instead of an extra '<name>.lnk' / '<name> - Shortcut' label."""
-    import re as _re
+    """Drop the .lnk/.url extension and Windows' ' - Shortcut' suffix from a shortcut's filename for display."""
     base, ext = os.path.splitext(name)
     if ext.lower() in SHORTCUT_EXTENSIONS:
         name = base
-    name = _re.sub(r'(?i)\s*-\s*shortcut(?:\s*\(\d+\))?\s*$', '', name).strip()
+    name = re.sub(r'(?i)\s*-\s*shortcut(?:\s*\(\d+\))?\s*$', '', name).strip()
     return name or base
 
 
 def resolve_dir_entry(entry_path, entry_name):
-    """Resolve one os.scandir() entry (by path/name) to what it should
-    actually be treated as: follows a shortcut/symlink to its real
-    target so callers list/scan/play the thing it points at instead of
-    the shortcut file itself.
-
-    Returns (kind, real_path, display_name) where kind is "dir", "file",
-    or None (broken/unresolvable shortcut, or a shortcut that doesn't
-    point at anything reachable -- caller should skip the entry).
-    display_name already has the shortcut suffix stripped (see
-    strip_shortcut_display_suffix) so a shortcut named "Show - Shortcut"
-    or "Show.lnk" reads the same as the real folder/file it points to.
-    """
+    """Resolve one os.scandir() entry, following a shortcut or symlink to its real target."""
     target = entry_path
     if is_shortcut_path(entry_path):
         resolved = resolve_shortcut_chain(entry_path)
@@ -232,28 +189,7 @@ def resolve_dir_entry(entry_path, entry_name):
 
 def iter_files_resolving_shortcuts(root, ignored_dir_names=None, valid_exts=None,
                                     is_drive_responsive=None):
-    """Recursively yield real file paths under `root`, the way os.walk()
-    would, except a directory entry that's a shortcut (.lnk/.url) or a
-    symlink is followed to whatever real folder it points at and that
-    folder's contents are walked too -- so a channel's project folder can
-    pull in another folder's shows via a shortcut instead of duplicating
-    files on disk, exactly like a normal sub-folder would.
-
-    `ignored_dir_names`: optional set of lowercase folder names to skip
-    entirely (not descended into), matching the existing plain os.walk
-    scanners' ignore lists.
-    `valid_exts`: optional set of lowercase extensions -- only matching
-    files are yielded; None yields every file.
-    `is_drive_responsive`: optional callable(path) -> bool so a caller
-    that already skips unresponsive drives on a plain os.walk can apply
-    the same guard here (an unresponsive drive is skipped rather than
-    walked, same reasoning as the non-shortcut-aware scanners).
-
-    Guards against shortcut loops -- a folder that, through some chain of
-    shortcuts, ends up pointing back at one of its own ancestors -- by
-    tracking the real (canonical) path of every directory already walked
-    in this call and never entering the same one twice.
-    """
+    """Recursively yield real file paths under `root`, following shortcut and symlink folders into their targets."""
     ignored_dir_names = ignored_dir_names or set()
     seen_dirs = set()
 
@@ -296,17 +232,9 @@ def iter_files_resolving_shortcuts(root, ignored_dir_names=None, valid_exts=None
     yield from _walk(root)
 
 
-# ---------------------------------------------------------------------------
-# Shared "hide extra text" display-title cleanup.
-#
-# Every surface that shows a video's name (TV Guide rows, the file explorer/
-# DVD-splash-picker's video rows) shares clean_video_display_title, and
-# every surface that shows a music track's name (the visualizer's now-
-# playing card, the file explorer's audio rows) shares
-# clean_music_display_title -- one implementation per media type instead of
-# a slightly different regex list on each screen that happens to show that
-# type of title.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Display-title cleanup
+# ============================================================================
 
 VIDEO_DISPLAY_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv",
@@ -316,69 +244,51 @@ AUDIO_DISPLAY_EXTS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma"}
 
 
 def clean_video_display_title(raw_title):
-    """Canonical 'hide extra text' cleanup for a video's display name --
-    strips season/episode markers, resolution, codec/rip-group tags, and
-    the folder path/file extension, leaving just the show/movie title.
-    e.g. "Show.Name.S01E02.1080p.WEB-DL.x264-GROUP.mkv" becomes
-    "Show Name"."""
-    import re as _re
+    """Clean a video's display name: strips season/episode markers, resolution, codec and rip tags, folder path and extension."""
 
     def _strip_markers(text):
         t = text.replace("_", " ")
-        t = _re.sub(r'[\[\(][^\]\)]*[\]\)]', ' ', t)
+        t = re.sub(r'[\[\(][^\]\)]*[\]\)]', ' ', t)
 
         _CUT_PATTERNS = [
             r's\d{1,2}[\.\s_-]*[ex]\d{1,3}\b',
-            r'\bseason[\.\s_-]*\d+\b',              # Season 1 / Season.1 / Season_1
+            r'\bseason[\.\s_-]*\d+\b',
             r'\b\d{1,2}x\d{2,3}\b',
             r'\bepisode[\.\s_-]*\d+\b',
-            r'\bep[\.\s_-]*\d+\b',          # Ep15 / Ep 15 / Ep.15 / Ep_15
+            r'\bep[\.\s_-]*\d+\b',
             r'\bpart[\.\s_-]*\d+\b',
             r'\bpt\.?[\.\s_-]*\d+\b',
-            r'\b(?:19|20)\d{2}\b',                  # a bare year: 1999 / 2020
+            r'\b(?:19|20)\d{2}\b',
             r'\b(?:1080p|720p|480p|2160p|4k)\b',
             r'\b(?:dvdrip|webrip|web-?dl|blu-?ray|hdtv|xvid|divx|x264|x265|h26[45]|hevc|aac|ac3|dts|remux|repack|proper|extended|unrated)\b',
         ]
-        # Marker-FIRST names ("S01E15 - Show Name", "1x15.Show.Name",
-        # "Episode 15 Show Name"): everything is cut at the earliest marker
-        # below, so a leading marker used to cut the name down to nothing.
-        # Drop leading episode markers (and the separators after them) first
-        # so the name that FOLLOWS the marker is what gets kept. Only the
-        # episode-style markers are stripped here -- a leading year/part
-        # number/etc. is left to the original behavior.
-        # A bare "E15" (no season) is only stripped when it LEADS the name,
-        # never mid-string, so a real title ending in a letter+number is
-        # left alone.
+        # WARNING: a bare "E15" is stripped only when it leads the name; stripping it mid-string eats real titles.
         _LEADING_EP_PATTERNS = _CUT_PATTERNS[:5] + [r'e\d{1,3}\b']
         for _ in range(4):
             _lead = None
             for pat in _LEADING_EP_PATTERNS:
-                _lead = _re.match(r'^[\s\.\-\u2013\u2014:]*(?:' + pat + r')', t, _re.IGNORECASE)
+                _lead = re.match(r'^[\s\.\-\u2013\u2014:]*(?:' + pat + r')', t, re.IGNORECASE)
                 if _lead:
                     break
             if not _lead:
                 break
             t = t[_lead.end():]
-            t = _re.sub(r'^[\s\.\-\u2013\u2014:]+', '', t)
+            t = re.sub(r'^[\s\.\-\u2013\u2014:]+', '', t)
 
         cut_at = len(t)
         for pat in _CUT_PATTERNS:
-            m = _re.search(pat, t, _re.IGNORECASE)
+            m = re.search(pat, t, re.IGNORECASE)
             if m and m.start() < cut_at:
                 cut_at = m.start()
 
         t = t[:cut_at]
         t = t.replace(".", " ").replace("-", " ")
-        t = _re.sub(r'\s+', ' ', t).strip()
+        t = re.sub(r'\s+', ' ', t).strip()
         return t
 
     s = raw_title if isinstance(raw_title, str) else str(raw_title)
     _original_raw = s
-    _folder_fallback = ""
     if "/" in s or "\\" in s:
-        _parent = os.path.dirname(s)
-        if _parent:
-            _folder_fallback = os.path.basename(_parent)
         s = os.path.basename(s)
     if "." in s:
         s = os.path.splitext(s)[0]
@@ -387,9 +297,6 @@ def clean_video_display_title(raw_title):
     if cleaned:
         return cleaned
 
-    # Filename cleaned down to nothing -- try the folder name instead. A
-    # bare season folder ("Season 1", "S01") cleans to nothing too, so keep
-    # walking up to the enclosing show folder.
     if "/" in _original_raw or "\\" in _original_raw:
         _folder = os.path.dirname(_original_raw)
         for _ in range(3):
@@ -408,14 +315,6 @@ def clean_video_display_title(raw_title):
 
 
 _MUSIC_TITLE_JUNK_PATTERNS = [
-    # Album/compilation branding that rides along in a lot of ripped
-    # filenames but isn't part of the actual song name -- same complaint
-    # class as clean_video_display_title, just a different junk
-    # vocabulary (album repackaging blurbs instead of season/codec tags).
-    # Longer/more specific phrases are listed before the shorter phrases
-    # they contain (e.g. "the complete greatest hits" before "greatest
-    # hits") so re.sub's first-match-wins per phrase can't leave a stray
-    # "the complete" behind after "greatest hits" alone matched.
     r'\bthe\s+complete\s+greatest\s+hits\b',
     r'\bcomplete\s+greatest\s+hits\b',
     r'\bgreatest\s+hits\b',
@@ -429,61 +328,35 @@ _MUSIC_TITLE_JUNK_PATTERNS = [
     r'\bessential\s+collection\b',
     r'\banthology\b',
     r'\bbox\s*set\b',
-    # Disc/track code shorthand ("D1T15", "DISC 2", "CD1", "(CD)") --
-    # tells you where the track sits in a multi-disc rip, nothing about
-    # the song itself.
     r'\bd\d{1,2}t\d{1,3}\b',
     r'\bdisc\s*\d+\b',
     r'\bcd\s*\d+\b',
     r'[\[\(]\s*cd\s*[\]\)]',
-    # Site watermarks some rip sources stamp into the filename.
     r'_?www\.[a-z0-9\-]+\.[a-z]{2,}',
     r'\b[a-z0-9\-]+\.(?:com|net|org|info)\b',
-    # Remaster / re-issue notes, optionally led by the remaster's own year
-    # ("2009 Remaster", "1999 Digitally Remastered") -- the year-led forms
-    # go first so the bare "remaster(ed)" pattern below doesn't leave the
-    # year sitting on its own afterward.
     r'\b(?:19|20)\d{2}\s+digitally\s+remastered\b',
     r'\b(?:19|20)\d{2}\s+remaster(?:ed)?\b',
     r'\bdigitally\s+remastered\b',
     r'\bremaster(?:ed)?\b',
-    # Bonus/exclusive-track notes.
     r'\bbonus\s+track\b',
     r'\bappended\s+track\b',
-    # Reissue/repackaging edition labels.
     r'\bdeluxe\s+edition\b',
     r'\bexpanded\s+edition\b',
     r'\bspecial\s+edition\b',
-    # "Live"/"Live Acoustic" -- bracket/paren-scoped only (unlike the
-    # album-branding phrases above, "live" alone is a common English word
-    # that can legitimately appear inside a real song title, e.g. "Live
-    # and Let Die" or "Stayin' Alive" -- so this only strips it when it's
-    # clearly set off as its own tag, not wherever the word shows up).
     r'[\[\(]\s*live\s+acoustic\s*[\]\)]',
     r'[\[\(]\s*live\s*[\]\)]',
-    # Track number / side notes some rippers add alongside the disc/CD
-    # numbering already handled above.
     r'\btrack\s*\d+\b',
     r'\btk\s*\d+\b',
     r'\bside\s*[ab]\b',
-    # Source/rip notes. "CD Rip"/"Vinyl Rip" are unambiguous phrases, but
-    # bare "Rip" is, like "live" above, an ordinary word that can appear
-    # in a real title -- only stripped when set off in brackets/parens.
     r'\bvinyl\s+rip\b',
     r'\bcd\s+rip\b',
     r'[\[\(]\s*rip\s*[\]\)]',
-    # Quality-claim labels. "High Quality" is unambiguous; the two-letter
-    # "HQ"/"HD" abbreviations are bracket/paren-scoped for the same
-    # false-positive reason as "live"/"rip".
     r'\bhigh\s+quality\b',
     r'[\[\(]\s*hq\s*[\]\)]',
     r'[\[\(]\s*hd\s*[\]\)]',
-    # Uploader/sharing spam tags.
     r'[\[\(]\s*free\s+download\s*[\]\)]',
     r'\buploaded\s+by\s+\S+',
     r'[\[\(]\s*exclusive\s*[\]\)]',
-    # Audio format/codec and bitrate/quality notes -- technical metadata,
-    # not part of the song name.
     r'\bmp3\b',
     r'\bwav\b',
     r'\bflac\b',
@@ -495,54 +368,23 @@ _MUSIC_TITLE_JUNK_PATTERNS = [
 
 
 def clean_music_display_title(raw_title):
-    """Canonical 'hide extra text' cleanup for a music track's display
-    name -- strips album/compilation branding, disc-track codes, and site
-    watermarks out of a music filename, e.g. "EAGLES - THE COMPLETE
-    GREATEST HITS - D1T15 - TAKE IT TO THE LIMIT" becomes "EAGLES - TAKE
-    IT TO THE LIMIT". Mirrors clean_video_display_title in spirit (regex-
-    driven junk removal instead of trusting the raw filename), but music
-    junk usually sits in the MIDDLE of the string (between artist and
-    song), not just the end, so this substitutes each pattern out
-    wherever it appears rather than cutting the string short at the
-    first match."""
-    import re as _re
+    """Clean a music track's display name: strips album branding, disc-track codes and site watermarks."""
     t = raw_title if isinstance(raw_title, str) else str(raw_title)
     if "/" in t or "\\" in t:
         t = os.path.basename(t)
     if "." in t:
         t = os.path.splitext(t)[0]
     for pat in _MUSIC_TITLE_JUNK_PATTERNS:
-        t = _re.sub(pat, ' ', t, flags=_re.IGNORECASE)
-    # Several of the patterns above (year/remaster, edition, track/side,
-    # rip, kbps, etc.) aren't bracket-scoped in the pattern itself, so a
-    # source like "Song Name (2009 Remaster)" or "Song Name [Deluxe
-    # Edition]" is left with an empty, now-meaningless bracket/paren pair
-    # once the junk text inside it is gone -- strip those out too.
-    t = _re.sub(r'[\(\[]\s*-?\s*[\)\]]', ' ', t)
-    # Junk removal above can leave a run of now-empty " - " separators
-    # behind (e.g. "EAGLES -  - TAKE IT TO THE LIMIT") -- collapse any
-    # separator that has nothing but whitespace on both sides down to a
-    # single space, then let the final whitespace collapse merge that
-    # into the surviving " - " on either side.
-    t = _re.sub(r'\s*-\s*(?=(?:-\s*)*(?:$|-))', ' ', t)
-    t = _re.sub(r'\s+', ' ', t)
-    # Same leftover-debris problem as the empty-bracket case above, just
-    # punctuation instead of brackets: a mid-string tag like ".mp3" or
-    # "Appended Track:" leaves a stray period/colon/comma stranded at the
-    # edge of the string once the tag text itself is gone (e.g. "Song
-    # Name.mp3" -> "Song Name." after "mp3" is stripped). Trim those
-    # alongside the existing dash/space trim rather than leaving them.
+        t = re.sub(pat, ' ', t, flags=re.IGNORECASE)
+    t = re.sub(r'[\(\[]\s*-?\s*[\)\]]', ' ', t)
+    t = re.sub(r'\s*-\s*(?=(?:-\s*)*(?:$|-))', ' ', t)
+    t = re.sub(r'\s+', ' ', t)
     t = t.strip(' -:.,')
     return t
 
 
 def clean_display_title_for_ext(name, ext):
-    """Route a file's display-name cleanup to the right cleaner based on
-    its extension: clean_video_display_title for video,
-    clean_music_display_title for audio, or just the shortcut-stripped/
-    extension-stripped name for anything else (ROMs, BIOS dumps, cores,
-    images, etc. have their own dedicated naming elsewhere and shouldn't
-    have video/music junk-word removal applied to them)."""
+    """Route display-name cleanup by extension: video cleaner, music cleaner, or plain shortcut/extension stripping for anything else."""
     ext = (ext or "").lower()
     if ext in VIDEO_DISPLAY_EXTS:
         return clean_video_display_title(name)
@@ -552,32 +394,22 @@ def clean_display_title_for_ext(name, ext):
     return base
 
 
-# ---------------------------------------------------------------------------
-# Shared Video-tab image effects (Brightness/Contrast/Color/Sharpness/Tint).
-# Lives here (not in retro_tv_emulator.py) so both retro_tv_emulator.py's TV
-# channel/visualizer rendering AND game_deck.py's DVD player rendering can
-# apply the exact same filter to whatever VLC frame they're blitting, without
-# a circular import between those two modules.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Shared video effects
+# ============================================================================
 
 _video_effects_cache = {
     "params":      None,
-    "channel_lut": None,   # np.uint8 (3, 256): [R_lut, G_lut, B_lut]
+    "channel_lut": None,
     "sat_factor":  1.0,
-    # cv2 fast path (see _apply_video_effects_cv2): tables laid out in the
-    # scratch surface's own BYTE order, rebuilt only when the sliders or the
-    # byte order change.
     "cv2_key":     None,
-    "cv2_lut":     None,   # np.uint8 (256, 1, 3) for cv2.LUT
-    "cv2_mat":     None,   # np.float32 (3, 4) for cv2.transform
+    "cv2_lut":     None,
+    "cv2_mat":     None,
 }
-# Flips to True (once, with one warning) if the cv2 path ever raises, so a
-# broken cv2 build costs one frame of retry and then permanently uses the
-# NumPy path instead of failing every frame.
 _video_effects_cv2_state = {"disabled": False}
 _effect_scratch = {
-    "surf":      None,   # reusable pygame.Surface (downscaled work buffer) — avoids per-frame allocation
-    "float_buf": None,   # reusable float32 ndarray for saturation pass
+    "surf":      None,
+    "float_buf": None,
 }
 
 
@@ -593,12 +425,7 @@ def _get_video_effects(db):
 
 
 def _fx_channel_offsets(surf):
-    """Byte offset of the R, G and B channels within each pixel of a 24-bit
-    pygame surface, as (r_off, g_off, b_off), or None when the layout is
-    anything the cv2 path doesn't handle (big-endian, non-24-bit, odd masks).
-    Read from the surface itself rather than assumed, because pygame's
-    default 24-bit layout is B,G,R in memory (its pixels3d() view hides that
-    behind a negative channel stride, which cv2 can't consume)."""
+    """Return (r_off, g_off, b_off), the channel byte offsets in a 24-bit pygame surface, or None for layouts the cv2 path can't handle."""
     try:
         if sys.byteorder != "little" or surf.get_bytesize() != 3:
             return None
@@ -612,29 +439,7 @@ def _fx_channel_offsets(surf):
 
 
 def _apply_video_effects_cv2(cached_surf, offs, current_params, channel_lut, color):
-    """In-place Brightness/Contrast/Tint LUT + Color blend + Sharpness on the
-    24-bit scratch surface using cv2.
-
-    Same math as the NumPy path in apply_video_effects(): per-channel LUT
-    first, then pull each channel toward/away from Rec.601 luma by
-    color/50. The blend is a single 3x3 matrix per pixel
-    (out = sat*c + (1-sat)*luma), so cv2.transform does it in one pass with
-    no float copy of the frame. A -0.5 offset makes cv2's round-to-nearest
-    behave like the NumPy path's truncating float->uint8 cast; results match
-    the NumPy path to within 1/255 on the few pixels where the two float
-    pipelines round differently.
-
-    Sharpness runs last, after color grading (the order a normal video
-    pipeline sharpens in), via a standard unsharp mask: blur the frame,
-    then add back (or subtract) the blurred/original difference scaled by
-    how far the slider sits from its neutral midpoint of 50 -- >50
-    sharpens, <50 softens, 50 is a no-op, matching every other slider's
-    convention in this app. cv2.addWeighted saturates to uint8 on write, so
-    no separate clip is needed.
-
-    Works on the surface's own bytes (no copy, honours row padding), so the
-    surface stays locked only inside this function -- the view objects are
-    always released before returning, even on error."""
+    """In-place Brightness/Contrast/Tint LUT + Color blend + Sharpness on the 24-bit scratch surface using cv2."""
     brightness, contrast, color_p, tint, sharpness = current_params
     key = (current_params, offs)
     cache = _video_effects_cache
@@ -659,17 +464,13 @@ def _apply_video_effects_cv2(cached_surf, offs, current_params, channel_lut, col
     view = None
     try:
         view = np.frombuffer(buf, dtype=np.uint8, count=pitch * h).reshape(h, pitch)[:, :w * 3].reshape(h, w, 3)
-        # An all-50 Brightness/Contrast/Tint LUT is exactly the identity, so
-        # skip that pass when only Color/Sharpness is being adjusted.
         if not (brightness == 50 and contrast == 50 and tint == 50):
             _cv2_fx.LUT(view, cache["cv2_lut"], dst=view)
         if color_p != 50:
             _cv2_fx.transform(view, cache["cv2_mat"], dst=view)
         if sharpness != 50:
-            _sharp_strength = (sharpness - 50) / 50.0  # -1.0 (soften) .. +1.0 (sharpen)
+            _sharp_strength = (sharpness - 50) / 50.0
             _blurred = _cv2_fx.GaussianBlur(view, (0, 0), 1.0)
-            # out = view + strength*(view - blurred), done in one pass:
-            # addWeighted(view, 1+strength, blurred, -strength, 0).
             _cv2_fx.addWeighted(view, 1.0 + _sharp_strength, _blurred, -_sharp_strength, 0, dst=view)
     finally:
         view = None
@@ -677,7 +478,6 @@ def _apply_video_effects_cv2(cached_surf, offs, current_params, channel_lut, col
 
 
 def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness=50, tint=50):
-    global _video_effects_cache, _effect_scratch
 
     if brightness == 50 and contrast == 50 and color == 50 and tint == 50 and sharpness == 50:
         return surface
@@ -686,7 +486,6 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
         current_params = (brightness, contrast, color, tint, sharpness)
 
         if _video_effects_cache["params"] != current_params:
-            # Rebuild LUT only when a slider value changes (not every frame).
             brightness_offset = (brightness - 50) * 2.55
             contrast_factor   = contrast / 50.0
 
@@ -711,17 +510,11 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
         cached_surf = _effect_scratch["surf"]
         if cached_surf is None or cached_surf.get_width() != w or cached_surf.get_height() != h:
             _effect_scratch["surf"]      = pygame.Surface((w, h), 0, 24)
-            _effect_scratch["float_buf"] = None   # size changed — invalidate float buf
+            _effect_scratch["float_buf"] = None
             cached_surf = _effect_scratch["surf"]
 
-        # Blit into 24-bit scratch so SDL handles BGRA→RGB conversion cleanly.
         cached_surf.blit(surface, (0, 0))
 
-        # Fast path: cv2 LUT + one-pass color matrix + Gaussian unsharp
-        # mask, in place on the scratch surface's own bytes. Measured ~10x
-        # faster than the NumPy path below at 1080p (which spends most of
-        # its time in fancy-index LUT gathers and full-frame float
-        # temporaries).
         _cv2_fx_failed = False
         if _cv2_fx is not None and not _video_effects_cv2_state["disabled"]:
             _offs = _fx_channel_offsets(cached_surf)
@@ -735,19 +528,10 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
                     _media_warning(
                         "video_effects_cv2_error",
                         "[VIDEO EFFECTS] cv2 fast path failed; using the NumPy path from now on: %s",
-                        # str(), not the exception object: a log handler that
-                        # buffers records would otherwise keep the traceback
-                        # (and through it the locked pixel view) alive.
+                        # WARNING: log str(e), not the exception; a buffering log handler would keep the traceback and the locked pixel view alive.
                         str(_cv2_fx_error),
                     )
         if _cv2_fx_failed:
-            # Recovery happens OUTSIDE the except block on purpose: while it
-            # is running, the exception's traceback can still be holding
-            # references to the pixel view, which keeps the scratch surface
-            # locked and would make the blit below raise. The failed attempt
-            # may also have already edited pixels in place -- start over
-            # from the untouched source so the NumPy path below can't
-            # double-apply anything.
             import gc
             gc.collect()
             cached_surf.blit(surface, (0, 0))
@@ -761,16 +545,13 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
         if color != 50:
             shape = arr.shape
 
-            # Reuse pre-allocated float32 scratch buffer; never allocate mid-frame
             fb = _effect_scratch["float_buf"]
             if fb is None or fb.shape != shape:
                 fb = np.empty(shape, dtype=np.float32)
                 _effect_scratch["float_buf"] = fb
 
-            # Copy uint8 pixels into float32 buffer in-place (no new allocation)
             np.copyto(fb, arr, casting="unsafe")
 
-            # Luminance-weighted grayscale, then blend toward/away from gray
             gray = (0.299 * fb[:, :, 0] +
                     0.587 * fb[:, :, 1] +
                     0.114 * fb[:, :, 2])[:, :, None]
@@ -779,17 +560,10 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
             fb += gray
             np.clip(fb, 0, 255, out=fb)
 
-            # Write back into the uint8 surface array in-place
             np.copyto(arr, fb, casting="unsafe")
 
         if sharpness != 50:
-            # Pure-NumPy unsharp mask -- this path only runs when cv2 is
-            # unavailable or its own fast path just failed, so it doesn't
-            # need cv2.GaussianBlur. A 3x3 edge-padded box blur stands in
-            # for the Gaussian the cv2 path uses; visually close enough at
-            # this radius and cheap relative to the rest of this fallback,
-            # which is already the slow path.
-            strength = (sharpness - 50) / 50.0  # -1.0 (soften) .. +1.0 (sharpen)
+            strength = (sharpness - 50) / 50.0
 
             fb = _effect_scratch["float_buf"]
             if fb is None or fb.shape != arr.shape:
@@ -804,7 +578,6 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
                 padded[2:,   0:-2] + padded[2:,   1:-1] + padded[2:,   2:]
             ) * (1.0 / 9.0)
 
-            # out = view + strength*(view - blurred)
             fb += strength * (fb - blurred)
             np.clip(fb, 0, 255, out=fb)
             np.copyto(arr, fb, casting="unsafe")
@@ -822,6 +595,11 @@ def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness
         return surface
 
 
+# ============================================================================
+# SECTION: Path-exists cache & disk I/O throttling
+# ============================================================================
+
+
 def _now_ms():
     return time.time() * 1000.0
 
@@ -829,79 +607,39 @@ def _now_ms():
 _path_exists_cache = {}
 _path_exists_cache_lock = threading.Lock()
 
-# The per-read TTL check in _cached_path_exists only refreshes/evicts a key
-# when that exact path is looked up again. A path checked once and never
-# again (e.g. an episode played once in a large library) would otherwise
-# keep its small (bool, float) tuple entry in the dict forever, since
-# nothing else ever sweeps the dict itself. Periodically sweep out anything
-# past its TTL regardless of whether it's been re-read, and also cap the
-# dict's raw size as a cheap backstop in case sweeps fall behind a burst of
-# distinct one-off paths.
 _PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS = 60000
 _PATH_EXISTS_CACHE_MAX_ENTRIES = 20000
 _last_path_exists_cache_sweep_ms = 0.0
 
 _PATH_NOT_FOUND_TTL_MS = 5000
-# Positive hits use a longer TTL than not-found results so deleted files are eventually rechecked.
 _PATH_FOUND_TTL_MS = 30000
-# UNKNOWN (drive unresponsive, or the bounded probe itself timed out) is
-# inherently a "we don't actually know" result -- caching it anywhere near
-# as long as a confirmed PRESENT would mean a file that's merely going
-# through a rough patch gets treated as confirmed-good for up to 30s. Give
-# it its own short TTL so the next schedule build re-checks it soon,
-# without re-probing on literally every single frame.
 _PATH_UNKNOWN_TTL_MS = 1500
 
-# Tri-state path status. PRESENT/MISSING come from a bounded os.path.exists()
-# that actually completed; UNKNOWN means the drive is known-unresponsive or
-# the bounded probe itself timed out -- i.e. genuinely "don't know", not
-# "confirmed either way". Scheduling code should treat UNKNOWN like PRESENT
-# for *eligibility* (never silently drop a file just because its drive had a
-# rough moment) but is free to log/surface it differently, which a plain
-# bool can't express. _cached_path_exists() below stays the boolean
-# fail-open-compatible wrapper every existing caller already expects;
-# _path_status() is the new tri-state entry point for callers -- like the
-# schedule builder -- that need to tell "confirmed gone" apart from
-# "temporarily couldn't tell".
+# WARNING: treat PATH_UNKNOWN like PRESENT for eligibility; never drop a file because its drive had a rough moment.
 PATH_PRESENT = "present"
 PATH_MISSING = "missing"
 PATH_UNKNOWN = "unknown"
 
-# Limit background disk reads and keep fast metadata probes separate from
-# long-running loudness analysis.
 FAST_DISK_IO_MAX_CONCURRENT = 3
 _FAST_DISK_IO_SEMAPHORE = threading.BoundedSemaphore(FAST_DISK_IO_MAX_CONCURRENT)
 
-# App-wide hard ceiling on simultaneous loudness-analysis ffmpeg processes
-# (shared by the regular probe pass and the two-pass renorm sweep). This is
-# the one number to change to raise/lower total loudness-scan concurrency
-# app-wide.
 LOUDNESS_PROBE_MAX_CONCURRENT = 2
 _LOUDNESS_PROBE_SEMAPHORE = threading.BoundedSemaphore(LOUDNESS_PROBE_MAX_CONCURRENT)
 
-# Separate, dedicated ceiling for music-track loudness scans (ch03 menu
-# music, visualizer songs) -- its own semaphore, not a slice of the video
-# one above. Music tracks are short (a single whole-file scan each, see
-# _sample_lufs_readings' no-bracket path) so a dedicated slot lets the
-# music queue's own worker thread (retro_tv_emulator.py's
-# _music_precache_worker) clear its backlog quickly, running concurrently
-# with whatever movie/show scan the main probe pass is in the middle of,
-# instead of queueing up behind it for a shared slot. Kept at 1: music
-# scans are cheap and quick regardless, and this only needs to guarantee
-# music never has to wait on video, not to add a second music process.
+_LOUDNESS_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(1)
+_LOUDNESS_PARALLEL_SEMAPHORE = threading.BoundedSemaphore(8)
+
+# VALUES CHANGE HERE
 MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT = 1
 _MUSIC_LOUDNESS_PROBE_SEMAPHORE = threading.BoundedSemaphore(MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT)
 
-# Delay new background reads while a live channel change opens its media file.
-# Existing reads continue, and the wait is bounded so probing cannot starve.
 _LIVE_PLAYBACK_PRIORITY = threading.Event()
 _LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = 2.5
 
 
 def set_live_playback_priority(active):
-    """Call with True right before opening a new file for live playback,
-    and False (in a finally) once that open attempt has finished, whether
-    it succeeded or failed."""
+    """Mark live playback as opening (True) or finished opening (False) so background work yields."""
+    # WARNING: pair every True with a False in a finally.
     if active:
         _LIVE_PLAYBACK_PRIORITY.set()
     else:
@@ -909,44 +647,58 @@ def set_live_playback_priority(active):
 
 
 def _yield_to_live_playback(label=""):
-    """Best-effort wait for a live channel change to finish opening its
-    file before this background op starts its own disk read. Bounded so
-    background work is delayed, never starved."""
+    """Wait, bounded, for a live channel change to finish opening its file before a background disk read starts."""
     if not _LIVE_PLAYBACK_PRIORITY.is_set():
         return
     _wait_start = _now_ms()
-    # threading.Event.wait() blocks until the flag becomes SET -- it
-    # returns immediately if the flag is already set, which it is here.
-    # There's no built-in "wait until cleared" on Event, so poll for it
-    # instead. 20ms granularity is fine: it reacts promptly once the
-    # channel-change file-open finishes and clears the flag, without
-    # burning CPU on a background thread that's supposed to be idling.
     _deadline_ms = _wait_start + (_LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S * 1000)
     while _LIVE_PLAYBACK_PRIORITY.is_set():
         if _now_ms() >= _deadline_ms:
-            # Flag is still set after the cap -- proceed anyway rather
-            # than risk background probing stalling indefinitely behind
-            # a stuck flag.
             break
         time.sleep(0.02)
-    _waited_ms = _now_ms() - _wait_start
 
-import contextlib
+@contextlib.contextmanager
+def _gov_gate(lane, priority=False, timeout=None, label=""):
+    """Asks the performance governor to admit one unit of background work; True when admitted, False if the caller's timeout expired; admits everything if the governor is missing or errors."""
+    gate = None
+    if _perf_governor is not None:
+        try:
+            gate = _perf_governor.gate(lane, priority=priority, timeout=timeout, label=label)
+        except Exception as _gate_err:
+            log.warning("[GOVERNOR] gate unavailable, admitting: %s", _gate_err)
+    if gate is None:
+        yield True
+        return
+    with gate as _admitted:
+        yield _admitted
+
+
+def _fast_disk_lane(label):
+    """Map a job kind to its governor lane: picture_box to cropdetect, asr_extract to none, everything else to probe_and_duration."""
+    if label.startswith("asr_extract"):
+        return None
+    if label.startswith("picture_box"):
+        return "cropdetect_threads"
+    return "probe_and_duration"
 
 
 @contextlib.contextmanager
 def _fast_disk_io_slot(label=""):
-    """Like `with _FAST_DISK_IO_SEMAPHORE:`, but logs slot-wait contention."""
+    """Like `with _FAST_DISK_IO_SEMAPHORE:` but first yields to live playback, then asks the governor to admit the job."""
     _yield_to_live_playback(label)
-    _wait_start = _now_ms()
-    with _FAST_DISK_IO_SEMAPHORE:
-        _waited_ms = _now_ms() - _wait_start
-        yield
+    _lane = _fast_disk_lane(label)
+    if _lane is None:
+        with _FAST_DISK_IO_SEMAPHORE:
+            yield
+        return
+    with _gov_gate(_lane, label=label):
+        with _FAST_DISK_IO_SEMAPHORE:
+            yield
 
 
 def _sweep_path_exists_cache(now_ms):
-    """Drop entries whose TTL has expired, regardless of whether they've
-    been re-read. Must be called with _path_exists_cache_lock held."""
+    """Drop entries whose TTL has expired."""
+    # WARNING: call with _path_exists_cache_lock held.
     expired = []
     for path, (status, cached_at) in _path_exists_cache.items():
         if status == PATH_MISSING:
@@ -962,9 +714,7 @@ def _sweep_path_exists_cache(now_ms):
 
 
 def _maybe_sweep_path_exists_cache(now_ms):
-    """Best-effort periodic + size-triggered sweep. Called opportunistically
-    from _cached_path_exists rather than a dedicated thread, so it only does
-    work while the cache is actually being used."""
+    """Best-effort periodic + size-triggered sweep."""
     global _last_path_exists_cache_sweep_ms
     due_by_time = (now_ms - _last_path_exists_cache_sweep_ms) >= _PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS
     due_by_size = len(_path_exists_cache) > _PATH_EXISTS_CACHE_MAX_ENTRIES
@@ -974,29 +724,12 @@ def _maybe_sweep_path_exists_cache(now_ms):
     _last_path_exists_cache_sweep_ms = now_ms
 
 
-_PATH_EXISTS_PROBE_TIMEOUT_MS = 2500  # matches _DRIVE_CHECK_TIMEOUT_MS below
+# WARNING: must match _DRIVE_CHECK_TIMEOUT_MS below.
+_PATH_EXISTS_PROBE_TIMEOUT_MS = 2500
 
 
 def _bounded_os_path_exists(p, timeout_ms=_PATH_EXISTS_PROBE_TIMEOUT_MS):
-    """os.path.exists(p), but run on a background thread and bounded to
-    timeout_ms -- so a hung filesystem call (a dropped network share, a
-    yanked USB/external drive, a disc that's stopped responding, etc.) can
-    never block the CALLING thread indefinitely, including the main
-    thread.
-
-    This is what protects a brand-new drive root that has no responsiveness
-    history yet in _is_drive_responsive() below -- that check only guards
-    paths on a drive already known to be unresponsive, so the first-ever
-    check against a new drive still needs its own bound.
-
-    Python threads can't be forcibly killed, so a probe that never returns
-    leaves one daemon thread parked forever -- harmless, and vastly better
-    than freezing the caller. If the probe doesn't finish in time, the
-    whole drive is immediately marked unresponsive (not just this one
-    path) so every other in-flight or future check on that drive fails
-    open right away too, instead of each one separately re-discovering the
-    same hang the hard way, or waiting on the health-monitor loop's own
-    separate polling cycle to notice."""
+    """os.path.exists(p) run on a background thread and bounded to timeout_ms, so a hung drive can't block the caller."""
     _box = []
     _done = threading.Event()
 
@@ -1029,14 +762,7 @@ def _bounded_os_path_exists(p, timeout_ms=_PATH_EXISTS_PROBE_TIMEOUT_MS):
 
 
 def _path_status(p):
-    """Tri-state existence check: PATH_PRESENT / PATH_MISSING / PATH_UNKNOWN.
-
-    Single source of truth for path existence -- _cached_path_exists() below
-    is a thin boolean wrapper over this, so every existing caller keeps its
-    exact current fail-open behavior. New callers that need to tell
-    "confirmed gone" apart from "couldn't tell right now" (the schedule
-    builder, episode-substitution lookup) should call this directly instead.
-    """
+    """Tri-state existence check: PATH_PRESENT / PATH_MISSING / PATH_UNKNOWN."""
     if not p:
         return PATH_MISSING
     now_ms = _now_ms()
@@ -1044,7 +770,6 @@ def _path_status(p):
         _maybe_sweep_path_exists_cache(now_ms)
         cached = _path_exists_cache.get(p)
     if cached is not None:
-        # cached is a (status, cached_at_ms) tuple -- still fresh?
         _cached_status, _cached_at = cached
         if _cached_status == PATH_MISSING:
             _ttl = _PATH_NOT_FOUND_TTL_MS
@@ -1054,17 +779,10 @@ def _path_status(p):
             _ttl = _PATH_UNKNOWN_TTL_MS
         if now_ms - _cached_at < _ttl:
             return _cached_status
-        # TTL expired -- treat as unknown again and fall through to a real check.
 
     if not _is_drive_responsive(p):
-        # Drive responsiveness alone isn't evidence this file is missing --
-        # it's evidence we don't know. Report that honestly instead of
-        # quietly claiming PRESENT; a genuinely broken file is still caught
-        # by the normal playback-failure path (_mark_file_broken).
         status = PATH_UNKNOWN
     else:
-        # Bounded, not a raw os.path.exists(p) call -- see _bounded_os_path_exists
-        # for why the unbounded version was able to wedge the main loop.
         status = _bounded_os_path_exists(p)
 
     with _path_exists_cache_lock:
@@ -1073,30 +791,30 @@ def _path_status(p):
 
 
 def _cached_path_exists(p):
-    """Boolean, fail-open-compatible view of _path_status(): PRESENT and
-    UNKNOWN both read as True (matches every existing caller's current
-    expectation -- an uncertain drive was never treated as "file gone"
-    here), only a confirmed MISSING reads as False."""
+    """Boolean view of _path_status(): PRESENT and UNKNOWN read True, only a confirmed MISSING reads False."""
     return _path_status(p) != PATH_MISSING
+
+
+# ============================================================================
+# SECTION: Drive health monitoring
+# ============================================================================
 
 
 _drive_health = {}
 _drive_health_lock = threading.Lock()
 _watched_drive_roots = set()
 
-# The monitor stops when request_media_shutdown() sets this event.
 _media_shutting_down = threading.Event()
 
 
 def request_media_shutdown():
-    """Call once, from the main app's quit handler, so media.py's own
-    background loops (currently just the drive health monitor) wind down
-    instead of being left spinning until the process exits."""
+    """Stop media.py's background loops (the drive health monitor); call once from the quit handler."""
     _media_shutting_down.set()
 
 
 _DRIVE_CHECK_TIMEOUT_MS         = 2500
-_DRIVE_RECHECK_INTERVAL_MS      = 4000  # how often a currently-healthy root gets re-probed
+# VALUES CHANGE HERE
+_DRIVE_RECHECK_INTERVAL_MS      = 4000
 _DRIVE_UNRESPONSIVE_RECHECK_MS  = 3000
 
 
@@ -1110,15 +828,7 @@ def _drive_root_of(path):
 
 
 def _purge_stale_negative_cache_for_root(root):
-    """Drop cached "not found" verdicts for every path on `root`.
-
-    Called when a drive transitions back to responsive. Negative cache
-    entries normally self-heal after _PATH_NOT_FOUND_TTL_MS (5s), but
-    there's no reason to make playback wait that out once we already know
-    the drive answered -- clearing them immediately lets the next schedule
-    build re-verify (and recover) those paths right away instead of
-    continuing to treat them as missing for up to another 5 seconds.
-    """
+    """Drop cached "not found" verdicts for every path on `root`."""
     with _path_exists_cache_lock:
         stale = [p for p, v in _path_exists_cache.items()
                  if isinstance(v, tuple) and v[0] in (PATH_MISSING, PATH_UNKNOWN)
@@ -1211,43 +921,25 @@ def _unresponsive_drive_roots():
 
 import collections
 
+
+# ============================================================================
+# SECTION: Drive latency tracking
+# ============================================================================
+
+
 _drive_op_latency = {}
 _drive_op_latency_lock = threading.Lock()
-_DRIVE_LATENCY_SAMPLE_WINDOW = 6   # how many recent real-read samples to keep per drive root
-# A loudness window's ffmpeg run scales with how much audio it decodes (up to
-# 900 s per window, see LOUDNESS_SCAN_BRACKETS), so raw wall time says nothing
-# about the drive. Each sample is stored as ffmpeg milliseconds per second of
-# audio scanned, after allowing a fixed per-run overhead (process start,
-# container open, seek) that would otherwise dominate short clips.
-# Measured on this machine with video playing and every prober running,
-# healthy whole-episode scans cost 24-34 ms per audio second; 100 is ~3x the
-# worst healthy figure (decoding slower than ~10x realtime).
+# VALUES CHANGE HERE
+_DRIVE_LATENCY_SAMPLE_WINDOW = 6
 _DRIVE_LATENCY_FIXED_OVERHEAD_MS = 2000
-_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = 100.0  # recent-sample average at/above this flags the drive as degraded
-_DRIVE_LATENCY_MIN_SAMPLES = 3     # don't flag off 1-2 slow samples -- could be one-off live-playback contention, not the drive itself
-_DRIVE_LATENCY_SAMPLE_MAX_AGE_MS = 120_000  # samples older than this stop counting toward "degraded" (see _is_drive_degraded)
+# VALUES CHANGE HERE
+_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = 100.0
+_DRIVE_LATENCY_MIN_SAMPLES = 3
+_DRIVE_LATENCY_SAMPLE_MAX_AGE_MS = 120_000
 
 
 def _record_drive_op_latency(path, elapsed_ms, audio_sec=None):
-    """Feed a real disk-touching operation's wall time (currently: each
-    ffmpeg loudness-window pass in _lufs_window_ffmpeg, including timeouts)
-    into a per-drive rolling latency tracker.
-
-    audio_sec is how much audio that run was asked to scan. The sample is
-    normalized to ffmpeg milliseconds per audio second so a long window is
-    not mistaken for a slow drive. A run whose audio length is unknown is
-    not recorded: raw wall time cannot be judged without it.
-
-    Deliberately separate from _drive_health above: that only checks
-    whether a drive ROOT still answers os.path.exists() at all, which
-    stays fast even on a drive that's failing to read actual file data --
-    a physically degrading drive (slow, retrying, silently failing reads
-    on specific files/sectors) can sail through that check while every
-    real read against it crawls. This tracks the thing that actually
-    matters for "should background work back off": how long real media
-    reads from this drive have actually been taking lately, not whether
-    the drive letter itself still exists.
-    """
+    """Record a real disk operation's wall time in the per-drive rolling latency tracker."""
     root = _drive_root_of(path)
     if root is None:
         return
@@ -1265,22 +957,19 @@ def _record_drive_op_latency(path, elapsed_ms, audio_sec=None):
 
 
 def _is_drive_degraded(path):
-    """True if this drive's recent real media-read operations have been
-    running slow enough that background work should back off it. See
-    _record_drive_op_latency for why this is a different (and for a
-    physically failing drive, a more meaningful) signal than
-    _is_drive_responsive().
-    """
+    """True if this drive is not responding, or its recent real reads are slow enough that background work should back off."""
     root = _drive_root_of(path)
     if root is None:
         return False
+    with _drive_health_lock:
+        _health = _drive_health.get(root)
+    if _health is not None and not _health.get("responsive", True):
+        return True
     with _drive_op_latency_lock:
         dq = _drive_op_latency.get(root)
         if not dq:
             return False
-        # Only recent samples count. Without an age limit the flag could
-        # lock itself on: a "degraded" drive gets skipped, skipped drives
-        # produce no new samples, so the old slow samples never rotate out.
+        # WARNING: samples need an age limit; without one a degraded flag locks itself on because skipped drives add no new samples.
         _cutoff = _now_ms() - _DRIVE_LATENCY_SAMPLE_MAX_AGE_MS
         samples = [ms for t, ms in dq if t >= _cutoff]
         if len(samples) < _DRIVE_LATENCY_MIN_SAMPLES:
@@ -1289,11 +978,14 @@ def _is_drive_degraded(path):
 
 
 def _drive_latency_summary(path):
-    """Human-readable snippet for a log line, or None if there's not
-    enough data yet to say anything."""
+    """Human-readable snippet for a log line, or None if there's not enough data yet to say anything."""
     root = _drive_root_of(path)
     if root is None:
         return None
+    with _drive_health_lock:
+        _health = _drive_health.get(root)
+    if _health is not None and not _health.get("responsive", True):
+        return f"{root} is not responding"
     with _drive_op_latency_lock:
         dq = _drive_op_latency.get(root)
         if not dq:
@@ -1307,28 +999,16 @@ def _drive_latency_summary(path):
             f"{_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC:.0f})")
 
 
-# --- File-level drive recovery probe ---------------------------------------
-#
-# Everything above (_is_drive_responsive / _unresponsive_drive_roots) only
-# proves whether a drive ROOT still answers os.path.exists(). For the boot/
-# system drive in particular, that answers near-instantly almost always --
-# even while an individual file on it is failing every open/read. That kind
-# of failure (fast rejection, not a slow hang) never sets the root
-# unresponsive in the first place, so it can never be seen "recovering"
-# either: nothing keyed off _unresponsive_drive_roots() can ever clear a
-# latch caused by this failure mode, and the caller is left stuck until the
-# app restarts. That gap is explicitly called out in
-# retro_tv_emulator.py's _drive_confirmed_recovered() docstring.
-#
-# This is the missing signal: a real, bounded open+read against an actual
-# file that is known to have failed on that drive. A confirmed successful
-# read of real bytes from that exact file is direct evidence the drive
-# itself is readable again -- much stronger than a root ping, and the only
-# way to ever self-heal the fast-rejection failure mode above.
+# ============================================================================
+# SECTION: File-level recovery probe
+# ============================================================================
+
+
 _file_probe_state = {}
 _file_probe_lock = threading.Lock()
-_FILE_PROBE_RECHECK_MS   = 5000   # don't hammer a struggling drive with retries
-_FILE_PROBE_TIMEOUT_MS   = 3000   # a real read that takes longer than this is treated as failed, not "still checking" forever
+# VALUES CHANGE HERE
+_FILE_PROBE_RECHECK_MS   = 5000
+_FILE_PROBE_TIMEOUT_MS   = 3000
 _FILE_PROBE_READ_BYTES   = 65536
 
 
@@ -1343,10 +1023,6 @@ def _file_probe_worker(root, path):
     now_ms = _now_ms()
     with _file_probe_lock:
         entry = _file_probe_state.get(root)
-        # Only accept this result if it's still the probe that's currently
-        # in flight for this root/path pair -- a slow read that finally
-        # returns after a newer probe (different path, or a fresher retry)
-        # was already started must not clobber that newer state.
         if entry is not None and entry.get("path") == path and entry.get("checking_since") is not None:
             _was_ok = entry.get("last_result")
             _file_probe_state[root] = {
@@ -1365,37 +1041,17 @@ def _file_probe_worker(root, path):
 
 
 def probe_file_level_recovery(root, candidate_path):
-    """Return the most recent confirmed result of a real open+read against
-    `candidate_path` -- normally the exact file whose failure got a channel
-    latched dead on `root` -- as True (a real read has succeeded recently),
-    False (the most recent real read failed or timed out), or None (no
-    result yet, or too long since the last check to say).
-
-    Never blocks: the actual read always happens on a background thread,
-    at most once every _FILE_PROBE_RECHECK_MS per root, so a genuinely dead
-    drive isn't hammered with retries every frame.
-    """
+    """Return the latest result of a real open+read of `candidate_path`: True (succeeded recently), False (failed or timed out), or None (no recent result)."""
     if root is None or not candidate_path:
         return None
     now_ms = _now_ms()
     with _file_probe_lock:
         entry = _file_probe_state.get(root)
         if entry is not None and entry.get("path") != candidate_path:
-            # The remembered failing file for this root has changed since
-            # the last probe (a different file on the same drive has since
-            # failed) -- a stale result for the OLD file says nothing about
-            # whether THIS file/drive is readable, so drop it and start
-            # fresh rather than reporting recovery based on the wrong file.
             entry = None
         checking_since = entry.get("checking_since") if entry else None
         if checking_since is not None:
             if now_ms - checking_since > _FILE_PROBE_TIMEOUT_MS:
-                # The in-flight read has been running longer than a real
-                # file read reasonably should -- treat it as a fresh
-                # negative result (not a permanent hang) so this can be
-                # retried again after the recheck interval below, rather
-                # than reporting "no result" forever while a stuck worker
-                # thread never comes back.
                 _file_probe_state[root] = {
                     "last_result": False, "checked_at": now_ms,
                     "checking_since": None, "path": candidate_path,
@@ -1416,8 +1072,12 @@ def probe_file_level_recovery(root, candidate_path):
         return entry.get("last_result")
 
 
+# ============================================================================
+# SECTION: Optical disc sources
+# ============================================================================
 
-DRIVE_CDROM = 5  # Windows GetDriveTypeW() return value for CD/DVD/BD drives
+
+DRIVE_CDROM = 5
 
 _disc_info_cache = {}
 _disc_info_lock  = threading.Lock()
@@ -1520,16 +1180,33 @@ def dvd_disc_mrl(path):
         return "dvdnav:///" + os.path.abspath(disc_root).replace("\\", "/")
     drive_letter = str(path).rstrip("\\/")
     if len(drive_letter) == 2 and drive_letter[1] == ":":
-        # Physical drive root -- MRL format required for menu-capable playback.
         return "dvd:///" + drive_letter + "\\"
     return "dvdnav://" + drive_letter
 
-_loudness_inflight      = set()
-_loudness_inflight_lock = threading.Lock()
-_duration_inflight      = set()
-_duration_inflight_lock = threading.Lock()
-_dims_inflight          = set()
-_dims_inflight_lock     = threading.Lock()
+# ============================================================================
+# SECTION: In-flight guard & probe slots
+# ============================================================================
+class _InFlightGuard:
+    """Prevents duplicate concurrent work on the same key(s). try_claim() is all-or-nothing."""
+    def __init__(self):
+        self._keys = set()
+        self._lock = threading.Lock()
+
+    def try_claim(self, *keys):
+        with self._lock:
+            if any(k in self._keys for k in keys):
+                return False
+            self._keys.update(keys)
+            return True
+
+    def release(self, *keys):
+        with self._lock:
+            self._keys.difference_update(keys)
+
+
+_loudness_inflight = _InFlightGuard()
+_duration_inflight = _InFlightGuard()
+_dims_inflight = _InFlightGuard()
 
 try:
     _cpu_n = os.cpu_count() or 4
@@ -1554,17 +1231,22 @@ def _get_duration_probe_slot():
         _duration_pool_rr += 1
     return slot
 
+
+# ============================================================================
+# SECTION: Track ordering & show grouping
+# ============================================================================
+
+
 def _natural_ep_key(item):
-    import re as _re
     p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
     name = os.path.splitext(os.path.basename(p))[0].lower()
-    m = _re.search(r's(\d+)[\s._-]*[ex][\s._-]*(\d+)', name)
+    m = re.search(r's(\d+)[\s._-]*[ex][\s._-]*(\d+)', name)
     if m: return (0, int(m.group(1)), int(m.group(2)), name)
-    m = _re.search(r'season[\s._-]*(\d+).*?episode[\s._-]*(\d+)', name)
+    m = re.search(r'season[\s._-]*(\d+).*?episode[\s._-]*(\d+)', name)
     if m: return (0, int(m.group(1)), int(m.group(2)), name)
-    m = _re.search(r'ep(?:isode)?\W*(\d+)', name)
+    m = re.search(r'ep(?:isode)?\W*(\d+)', name)
     if m: return (0, 0, int(m.group(1)), name)
-    parts = _re.split(r'(\d+)', name)
+    parts = re.split(r'(\d+)', name)
     norm = tuple((0, int(x)) if x.isdigit() else (1, x) for x in parts)
     return (1, norm)
 
@@ -1603,44 +1285,36 @@ def build_ordered_tracks(items, sched_mode="natural", seed=0):
 
 
 def _flex_path_parts(path):
-    import re as _re
-    parts = [p for p in _re.split(r"[\\/]+", str(path)) if p and p not in (".", "..")]
-    # A Windows drive root ("C:") is a location, not a show folder. Without
-    # this it survives the generic-folder filter below, so a file sitting
-    # under a generic wrapper ("C:\TV\Cartoons\S01E15 - Show Name.mkv")
-    # gets titled "C:" and the filename fallback never runs.
-    if parts and _re.fullmatch(r"[A-Za-z]:", parts[0]):
+    parts = [p for p in re.split(r"[\\/]+", str(path)) if p and p not in (".", "..")]
+    # WARNING: strip the drive letter here or a file under a generic wrapper folder gets titled "C:" and the filename fallback never runs.
+    if parts and re.fullmatch(r"[A-Za-z]:", parts[0]):
         parts = parts[1:]
     return parts
 
 
 def _flex_episode_marker(text):
-    import re as _re
     low = str(text).lower()
-    m = _re.search(r"\bs(\d+)[\s._-]*[ex][\s._-]*(\d+)\b", low)
+    m = re.search(r"\bs(\d+)[\s._-]*[ex][\s._-]*(\d+)\b", low)
     if m:
         return int(m.group(1)), int(m.group(2))
-    m = _re.search(r"\b(\d{1,2})[\s._-]*x[\s._-]*(\d{1,3})\b", low)
+    m = re.search(r"\b(\d{1,2})[\s._-]*x[\s._-]*(\d{1,3})\b", low)
     if m:
         return int(m.group(1)), int(m.group(2))
-    m = _re.search(r"\bseason[\s._-]*(\d+).*?\bepisode[\s._-]*(\d+)\b", low)
+    m = re.search(r"\bseason[\s._-]*(\d+).*?\bepisode[\s._-]*(\d+)\b", low)
     if m:
         return int(m.group(1)), int(m.group(2))
-    m = _re.search(r"\bep(?:isode)?[\s._-]*(\d+)\b", low)
+    m = re.search(r"\bep(?:isode)?[\s._-]*(\d+)\b", low)
     if m:
         return 0, int(m.group(1))
     return None
 
 
 def _flex_clean_series_title(name):
-    import re as _re
     s = _strip_leading_index(str(name)).strip()
-    s = _re.sub(r"(?i)[\s._\-(]+seasons?[\s._-]*\d+(?:[\s._-]*to[\s._-]*\d+)?\b.*$", "", s)
-    s = _re.sub(r"(?i)[\s._\-(]+s\d{1,2}(?:[\s._-]*-[\s._-]*s?\d{1,2})?\b.*$", "", s)
-    # Keep meaningful punctuation such as the hyphen in "SG-1"; only
-    # release-style separators are normalized for the display title.
-    s = _re.sub(r"[._]+", " ", s)
-    s = _re.sub(r"\s+", " ", s).strip(" -_.()")
+    s = re.sub(r"(?i)[\s._\-(]+seasons?[\s._-]*\d+(?:[\s._-]*to[\s._-]*\d+)?\b.*$", "", s)
+    s = re.sub(r"(?i)[\s._\-(]+s\d{1,2}(?:[\s._-]*-[\s._-]*s?\d{1,2})?\b.*$", "", s)
+    s = re.sub(r"[._]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" -_.()")
     return s
 
 
@@ -1655,17 +1329,15 @@ def _flex_is_generic_folder(name):
 
 def _flex_is_non_episode_track(track):
     """Exclude obvious extras while preserving normal and aired pilots."""
-    import re as _re
     path = track.get("path", track.get("file", "")) if isinstance(track, dict) else str(track)
     stem = os.path.splitext(os.path.basename(str(path)))[0]
-    return bool(_re.search(
+    return bool(re.search(
         r"(?i)(?:^|[ ._()\[\]-])(?:unaired[ ._-]*pilot|unaired|bonus|extras?|featurette|trailer|sample)(?:$|[ ._()\[\]-])",
         stem,
     ))
 
 
 def _flex_series_and_season(track):
-    import re as _re
     path = track.get("path", track.get("file", "")) if isinstance(track, dict) else str(track)
     parts = _flex_path_parts(path)
     if not parts:
@@ -1677,8 +1349,6 @@ def _flex_series_and_season(track):
     season_number = marker[0] if marker else None
 
     title = None
-    # Prefer the nearest folder explicitly identifying a season.  Its parent
-    # is the series unless the folder itself contains the title.
     for idx in range(len(folders) - 1, -1, -1):
         folder = folders[idx]
         bare = _bare_season_number(folder)
@@ -1700,17 +1370,12 @@ def _flex_series_and_season(track):
                 title = cleaned
                 break
 
-    # A generic wrapper can be resolved from the filename title before its
-    # episode marker, but only when the filename contains a reliable marker.
     if (not title or _flex_is_generic_folder(title)) and marker:
-        before = _re.split(r"(?i)\bs\d+[\s._-]*e\d+\b|\b\d{1,2}[\s._-]*x[\s._-]*\d+\b",
+        before = re.split(r"(?i)\bs\d+[\s._-]*e\d+\b|\b\d{1,2}[\s._-]*x[\s._-]*\d+\b",
                            filename_stem, maxsplit=1)[0]
         cleaned = _flex_clean_series_title(before)
-        if not cleaned and _re.search(r"[A-Za-z]", _re.sub(
+        if not cleaned and re.search(r"[A-Za-z]", re.sub(
                 r"(?i)\bs\d+[\s._-]*e\d+\b|\b\d{1,2}[\s._-]*x[\s._-]*\d+\b", " ", filename_stem)):
-            # Marker-FIRST filename ("S01E15 - Show Name.mkv"): nothing
-            # precedes the marker, so take the name that follows it --
-            # same rule the guide's display cleaner uses.
             cleaned = clean_video_display_title(filename)
         if cleaned:
             title = cleaned
@@ -1722,7 +1387,6 @@ def _flex_series_and_season(track):
 def group_shows_flexible(raw_tracks):
     """Resolve arbitrary layouts into stable series/season/episode groups."""
     import collections as _col
-    import re as _re
     groups = _col.defaultdict(list)
     display_names = {}
     for track in raw_tracks:
@@ -1739,8 +1403,7 @@ def group_shows_flexible(raw_tracks):
         item = dict(track)
         item["_series_key"] = key
         item["_series_title"] = title
-        # Keep the resolved folder-aware title available to the TV Guide.  The
-        # guide must not reconstruct a show name from an episode filename.
+        # WARNING: the guide must not reconstruct a show name from an episode filename.
         item["title"] = title
         item["_season_number"] = season if season is not None else 0
         item["_episode_number"] = episode if episode is not None else 0
@@ -1749,14 +1412,12 @@ def group_shows_flexible(raw_tracks):
 
     result = {}
     for key, items in groups.items():
-        # Semantic duplicate key catches .ia, Copy, and alternate-release
-        # twins when they identify the same series/season/episode.
         best = {}
         order = []
         for item in items:
             path = item.get("path", item.get("file", ""))
             stem = os.path.splitext(os.path.basename(str(path)))[0]
-            stem = _re.sub(r"(?i)(?:\.ia|[\s._-]+copy(?:[\s._-]+\d+)?|\s*\(\d+\))+$", "", stem)
+            stem = re.sub(r"(?i)(?:\.ia|[\s._-]+copy(?:[\s._-]+\d+)?|\s*\(\d+\))+$", "", stem)
             identity = (key, item["_season_number"], item["_episode_number"],
                         _normalize_show_key(stem) if not item["_episode_number"] else "")
             if identity not in best:
@@ -1765,10 +1426,8 @@ def group_shows_flexible(raw_tracks):
             else:
                 old = best[identity]
                 old_path = str(old.get("path", ""))
-                # Prefer the unmarked/non-copy file; otherwise retain the
-                # first deterministic scanner result.
-                old_marked = bool(_re.search(r"(?i)(\.ia\.|- copy|\(\d+\))", old_path))
-                new_marked = bool(_re.search(r"(?i)(\.ia\.|- copy|\(\d+\))", str(path)))
+                old_marked = bool(re.search(r"(?i)(\.ia\.|- copy|\(\d+\))", old_path))
+                new_marked = bool(re.search(r"(?i)(\.ia\.|- copy|\(\d+\))", str(path)))
                 if old_marked and not new_marked:
                     best[identity] = item
         clean = [best[k] for k in order]
@@ -1783,40 +1442,40 @@ def group_shows_flexible(raw_tracks):
 
 
 def _strip_leading_index(name):
-    import re as _re
-    return _re.sub(r'^\s*\d+\s*[.)\-_]\s+', '', name).strip()
+    return re.sub(r'^\s*\d+\s*[.)\-_]\s+', '', name).strip()
 
 
 def _normalize_show_key(s):
-    import re as _re3
-    s = _re3.sub(r'[._\-]+', ' ', s)
-    s = _re3.sub(r'\s+', ' ', s)
+    s = re.sub(r'[._\-]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s)
     return s.strip().lower()
 
 
 def _bare_season_number(dirname):
-    import re as _re
     name = dirname.strip()
-    m = _re.match(r'^seasons?[\s._-]*(\d+)(?!\s*-\s*\d)\b', name, _re.IGNORECASE)
+    m = re.match(r'^seasons?[\s._-]*(\d+)(?!\s*-\s*\d)\b', name, re.IGNORECASE)
     if not m:
-        # Exactly 1-2 digits, same as _season_folder_base's S01-style check.
-        m = _re.match(r'^s(\d{1,2})(?:[\s._-]|$)', name, _re.IGNORECASE)
+        m = re.match(r'^s(\d{1,2})(?:[\s._-]|$)', name, re.IGNORECASE)
     if not m:
         return None
     return int(m.group(1))
 
 
 def _season_folder_base(show_name):
-    import re as _re
-    m = _re.match(r'^(.*?)[\s._\-(]+seasons?[\s._-]*(\d+)(?!\s*-\s*\d)\b', show_name, _re.IGNORECASE)
+    m = re.match(r'^(.*?)[\s._\-(]+seasons?[\s._-]*(\d+)(?!\s*-\s*\d)\b', show_name, re.IGNORECASE)
     if not m:
-        m = _re.match(r'^(.*?)[\s._\-(]+s(\d{2})(?:[\s._-]|$)', show_name, _re.IGNORECASE)
+        m = re.match(r'^(.*?)[\s._\-(]+s(\d{2})(?:[\s._-]|$)', show_name, re.IGNORECASE)
     if not m:
         return None
     base_raw = m.group(1).strip(' ._-(')
     if not base_raw:
         return None
     return base_raw, _normalize_show_key(base_raw), int(m.group(2))
+
+
+# ============================================================================
+# SECTION: Track durations, movie detection & de-duplication
+# ============================================================================
 
 
 MOVIE_LENGTH_THRESHOLD_SECONDS = 4800
@@ -1848,13 +1507,7 @@ def resolve_track_duration(media_probe_cache, path, stored_duration, default=180
 
 
 def track_duration_is_estimated(media_probe_cache, path, stored_duration):
-    """Report whether a resolved duration still came from the fallback.
-
-    ``resolve_track_duration`` intentionally returns a usable value for an
-    unprobed entry, but that value must not erase the distinction between an
-    actual 30-minute file and a ``-1``/missing-duration placeholder.  Callers
-    attach this provenance to the track before the schedule builder sees it.
-    """
+    """Report whether a resolved duration still came from the fallback."""
     try:
         if path:
             cached = (media_probe_cache or {}).get(os.path.normpath(str(path)))
@@ -1869,18 +1522,8 @@ def track_duration_is_estimated(media_probe_cache, path, stored_duration):
 def _cached_lineup_durations_stale(cached_durations, media_probe_cache,
                                     movie_threshold_seconds=None,
                                     material_diff_seconds=60):
-    """Report whether a {path: duration} snapshot frozen onto a schedule
-    (e.g. playback_log["sched_cached_durations"]) has drifted from what
-    the live media probe cache now knows for those same paths -- either
-    a real probe result crossing the movie-length line relative to the
-    frozen value, or differing from it by more than
-    ``material_diff_seconds``. Used to decide whether a cached lineup can
-    keep being reused as-is or needs to be rebuilt with fresh durations.
-
-    Mirrors the identically-named helper in retro_tv_emulator.py (kept
-    here too so callers that only import media, like ui.py's TV guide
-    renderer, don't need the main module).
-    """
+    """True if a frozen {path: duration} schedule snapshot has drifted from the live probe cache."""
+    # WARNING: mirrors the same-named helper in retro_tv_emulator.py; keep both in step.
     if not cached_durations or not isinstance(media_probe_cache, dict):
         return False
     if movie_threshold_seconds is None:
@@ -1917,29 +1560,19 @@ def is_movie_track(track, threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECONDS):
 
 
 def stable_series_id(series_title, channel_id=None):
-    """Return a filesystem-independent identity for playback state.
-
-    Channel scope prevents the same series on two channels from sharing a
-    playback cursor.  Omitting channel_id preserves compatibility with old
-    callers and old configuration keys.
-    """
-    import re as _re
+    """Return a filesystem-independent identity for playback state."""
     value = _normalize_show_key(series_title)
-    value = _re.sub(r"[^a-z0-9]+", "-", value).strip("-")
+    value = re.sub(r"[^a-z0-9]+", "-", value).strip("-")
     value = value or "unknown-series"
     if channel_id is not None and str(channel_id).strip():
-        channel = _re.sub(r"[^a-z0-9]+", "-", _normalize_show_key(channel_id)).strip("-")
+        channel = re.sub(r"[^a-z0-9]+", "-", _normalize_show_key(channel_id)).strip("-")
         if channel:
             return f"{channel}:{value}"
     return value
 
 
 def migrate_show_positions(show_pos, show_names, channel_id=None):
-    """Copy legacy title-keyed positions to channel-scoped keys.
-
-    Existing stable keys win.  Legacy keys are retained for rollback and
-    compatibility, while the returned report makes the migration auditable.
-    """
+    """Copy legacy title-keyed positions to channel-scoped keys."""
     migrated = dict(show_pos or {})
     report = {"migrated": [], "already_scoped": [], "unmatched": []}
     for title in show_names or []:
@@ -1957,10 +1590,6 @@ def migrate_show_positions(show_pos, show_names, channel_id=None):
         else:
             report["unmatched"].append(old_key)
     return migrated, report
-
-
-
-
 
 
 def _looks_like_episode_filename(stem):
@@ -2034,9 +1663,7 @@ def pair_movie_parts(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECOND
     return result
 
 
-import re as _re_dedupe
-
-_DUPLICATE_FILE_MARKER_RE = _re_dedupe.compile(r'\.(?:ia)(\.[^.\\/]+)$', _re_dedupe.IGNORECASE)
+_DUPLICATE_FILE_MARKER_RE = re.compile(r'\.(?:ia)(\.[^.\\/]+)$', re.IGNORECASE)
 
 
 def _dedupe_key_for_path(path):
@@ -2068,17 +1695,15 @@ def _dedupe_key_ignore_extension(path):
     return os.path.join(d, base).lower()
 
 
-# Preference order when the same episode/movie exists in more than one
-# container -- earlier entries are the more stable/robust format and win.
 _EXTENSION_STABILITY_PRIORITY = [
-    ".mkv",   # most robust container -- resilient to incomplete/corrupt writes, no size ceiling
-    ".mp4",   # widely compatible, well-standardized
-    ".m4v",   # mp4 variant, same stability profile
-    ".mov",   # stable but more codec-restrictive / Apple-oriented
-    ".webm",  # solid open format, mainly web-targeted
-    ".avi",   # older container, known indexing/subtitle/codec quirks
-    ".wmv",   # proprietary, limited modern tooling support
-    ".flv",   # Flash video format.
+    ".mkv",
+    ".mp4",
+    ".m4v",
+    ".mov",
+    ".webm",
+    ".avi",
+    ".wmv",
+    ".flv",
 ]
 _EXTENSION_STABILITY_RANK = {ext: i for i, ext in enumerate(_EXTENSION_STABILITY_PRIORITY)}
 
@@ -2089,10 +1714,7 @@ def _extension_stability_rank(path):
 
 
 def dedupe_same_name_different_extension(episodes):
-    """Same folder + same filename but a different container (e.g.
-    'Show.S01E01.mp4' next to 'Show.S01E01.mkv') is the same episode encoded
-    twice -- keep only the most stable container (see
-    _EXTENSION_STABILITY_PRIORITY) and drop the rest from scheduling."""
+    """Same folder and filename but a different container."""
     best_by_key = {}
     order = []
     for ep in episodes:
@@ -2110,23 +1732,8 @@ def dedupe_same_name_different_extension(episodes):
     return [best_by_key[k] for k in order]
 
 
-# split_movies_and_series() does several O(N) passes of regex-based parsing
-# per file (dedupe key extraction, part-number matching, season/episode
-# extraction in group_shows_flexible, etc). For a normal-sized library this
-# is invisible, but a channel with thousands of files in one schedule block
-# turns "several regex substitutions per file" into real, main-thread-blocking
-# work if it's redone on every tune-in to that channel (build_show_rotation
-# is called from several places in
-# calculate_slotted_playback_state/_get_channel_ordered_content per channel
-# change). The actual movie/series grouping only needs to be redone when the
-# underlying file set (or a resolved duration that flips a movie/episode
-# classification) actually changes, so we memoize the result per channel,
-# keyed on a cheap fingerprint of (path, duration) pairs -- building that
-# fingerprint is plain attribute access + tuple construction (no regex), so
-# even the cache-key computation itself is far cheaper than the work it lets
-# us skip.
 _split_movies_cache_lock = threading.Lock()
-_split_movies_cache = {}  # channel_id -> (fingerprint, (movie_pool, show_names, show_episodes))
+_split_movies_cache = {}
 
 
 def _split_movies_fingerprint(raw_tracks, threshold_seconds):
@@ -2150,8 +1757,6 @@ def split_movies_and_series(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD
             return (list(_c_movie_pool), list(_c_show_names),
                     {sn: list(eps) for sn, eps in _c_show_episodes.items()})
 
-    # Remove exact/marker twins before combining short episodes or movie
-    # parts.  Otherwise two copies can become an apparently intentional pair.
     raw_tracks = dedupe_duplicate_episode_files(raw_tracks)
     raw_tracks = dedupe_same_name_different_extension(raw_tracks)
     raw_tracks = pair_movie_parts(raw_tracks, threshold_seconds)
@@ -2179,19 +1784,18 @@ def split_movies_and_series(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD
     return movie_pool, show_names, show_episodes
 
 
+# ============================================================================
+# SECTION: Short-episode pairing & movie placement
+# ============================================================================
+
 
 SHORT_EPISODE_PAIRING_VERSION = 3
 LEFTOVERS_TITLE = "The Leftovers"
 
 
 def _episode_series_key(episode):
-    """Return the series identity used by short-episode pairing.
-
-    build_show_rotation() normally calls pair_short_episodes() on one
-    show-group at a time, but cached schedules are flattened and can contain
-    several shows.  Do not let two unrelated short files become a pair just
-    because they happen to be adjacent in that flattened list.
-    """
+    """Return the series identity used by short-episode pairing."""
+    # WARNING: two unrelated short files must not pair just because they are adjacent in the flattened list.
     if isinstance(episode, dict):
         explicit = episode.get("_series_key")
         if explicit:
@@ -2272,65 +1876,18 @@ def _movie_runtime_budget(movie_pool, block_duration_seconds,
 
 
 def _fit_movies_to_runtime(candidates, target_seconds, max_movies):
-    """Play whatever the rotation drew -- don't drop candidates for a
-    tighter runtime fit.
-
-
-    enough. But `candidates` always arrives already sized to `max_movies`
-    from the shuffle bag (the caller draws exactly n_movie_pick candidates
-    and passes n_movie_pick here too) -- so "closest fit" was never trimming
-    overflow, only second-guessing a fair draw and skipping movies whose
-    duration didn't combine well, over and over, no matter how the shuffle
-    bag ordered them. Since a movie can't be skipped forever or replayed
-    ahead of others in the rotation, and any resulting over/under vs. the
-    half-hour target already gets absorbed by the commercial-break flex
-    rules downstream, there's no need to be precise here: just play the
-    draw, capped at max_movies as a safety bound.
-    """
+    """Play whatever the rotation drew -- don't drop candidates for a tighter runtime fit."""
     if not candidates or max_movies <= 0:
         return []
     return list(candidates[:max_movies])
 
 
-RANDOM_REPEAT_HOLD_BACK = 10  # default "don't repeat until N others have played" window
+# VALUES CHANGE HERE
+RANDOM_REPEAT_HOLD_BACK = 10
 
 
 def _draw_from_shuffle_bag(state, n, count, seed_prefix, hold_back=RANDOM_REPEAT_HOLD_BACK):
-    """Draw `count` indices from a persistent, per-cycle shuffle bag.
-
-    Old approach (still visible in git history) called `random.Random(seed)`
-    fresh on *every* draw with a seed that only changes once a day, then
-    pulled one item at a time from a shrinking "remaining" list. Because the
-    RNG always restarted from the same point and the remaining list barely
-    changed call to call, consecutive draws landed on nearly the same index
-    every time -- so a full lap looked like a few long runs of in-order
-    episodes reshuffled in big chunks, and the next lap replayed almost the
-    same sequence.
-
-    This version builds one full shuffled permutation of the whole pool at
-    the start of each cycle (a proper Fisher-Yates over all n indices, not a
-    sequence of independent single picks) and hands them out one at a time.
-    A `cycle` counter, persisted alongside the bag, is folded into the seed
-    for each new bag, so lap 2 gets a different shuffle than lap 1, lap 3
-    a different one again, and so on -- while remaining fully deterministic
-    and reconstructable from persisted state (day_seed + name + cycle), same
-    as everything else in this scheduler.
-
-    `hold_back` additionally keeps the most recently played items out of
-    circulation across the cycle boundary: whatever's still in the "last
-    `hold_back` played" history gets pushed to the back of the new bag, so
-    those items don't come back around until `hold_back` *other* items have
-    played first. This is the same idea as the single-item "don't repeat the
-    very last one" check, generalized to a whole window instead of one item.
-    It self-scales down for small pools -- e.g. a 6-item pool never tries to
-    hold back 10 things, which would leave nothing eligible to pick -- so it
-    never deadlocks and never blocks a 1-item pool from "repeating" itself,
-    since there's nothing else it could possibly play.
-
-    `state` is the show_pos entry for this rotation (a dict with "bag" /
-    "cycle" / "last" / "recent", a legacy {"played": [...], "last": ...}
-    dict, a bare legacy int, or None). Returns (picked_indices, new_state).
-    """
+    """Draw `count` indices from a persistent per-cycle shuffle bag with a don't-repeat window."""
     import random as _random
 
     if isinstance(state, dict) and "bag" in state:
@@ -2339,8 +1896,6 @@ def _draw_from_shuffle_bag(state, n, count, seed_prefix, hold_back=RANDOM_REPEAT
         last = state.get("last")
         recent = [i for i in state.get("recent", []) if 0 <= i < n]
     else:
-        # Unsupported persisted state starts a fresh cycle while preserving
-        # any available last-played value.
         bag = []
         cycle = 0
         if isinstance(state, dict):
@@ -2349,9 +1904,6 @@ def _draw_from_shuffle_bag(state, n, count, seed_prefix, hold_back=RANDOM_REPEAT
             last = state if isinstance(state, int) else None
         recent = [last] if isinstance(last, int) else []
 
-    # Never hold back more than roughly half the pool -- a small pool (say
-    # 6 commercials) still needs most of itself eligible on every lap, it
-    # just can't support a 10-deep memory the way a 200-item pool can.
     eff_hold_back = min(hold_back, max(0, (n - 1) // 2)) if n > 1 else 0
 
     picked = []
@@ -2369,7 +1921,7 @@ def _draw_from_shuffle_bag(state, n, count, seed_prefix, hold_back=RANDOM_REPEAT
                     if blocked and len(blocked) < len(bag):
                         allowed = [i for i in bag if i not in blocked]
                         held = [i for i in bag if i in blocked]
-                        bag = allowed + held  # held-back items wait at the tail
+                        bag = allowed + held
                 elif len(bag) > 1 and bag[0] == last:
                     j = bag_rng.randrange(1, len(bag))
                     bag[0], bag[j] = bag[j], bag[0]
@@ -2400,7 +1952,7 @@ def _movie_slot_count(movie_pool, block_duration_seconds, series_total_episodes,
 
     durations = [t.get("duration", 0) for t in movie_pool if isinstance(t, dict) and t.get("duration", 0) > 0]
     avg_dur = (sum(durations) / len(durations)) if durations else _MOVIE_DURATION_FALLBACK_SECONDS
-    avg_dur = max(avg_dur, 60)  # guard against a stray near-zero duration skewing the divide
+    avg_dur = max(avg_dur, 60)
 
     budget = _movie_runtime_budget(
         movie_pool, block_duration_seconds, series_total_episodes,
@@ -2413,7 +1965,7 @@ def _movie_slot_count(movie_pool, block_duration_seconds, series_total_episodes,
     if scheduling_mode == "two_slots" and 1 < n_pick < len(movie_pool) and n_pick % 2:
         n_pick += 1
     elif scheduling_mode == "two_slots" and n_pick % 2 and n_pick == len(movie_pool) and n_pick > 1:
-        n_pick -= 1  # can't round up past the whole pool — drop to the nearest even count instead
+        n_pick -= 1
 
     return n_pick
 
@@ -2433,9 +1985,6 @@ def _place_movies_in_block(video_tracks, picked_movies, day_seed, movie_heavy,
     if not result:
         return [item for unit in units for item in unit]
 
-    # Place each movie unit at an evenly distributed target in the available
-    # series runtime, rather than treating a 20-minute episode and a
-    # 60-minute episode as equal-sized schedule positions.
     series_runtime = sum(
         float(item.get("duration", 0) or 0)
         for item in result if isinstance(item, dict)
@@ -2462,6 +2011,11 @@ def _place_movies_in_block(video_tracks, picked_movies, day_seed, movie_heavy,
         result[idx:idx] = u
 
     return result
+
+
+# ============================================================================
+# SECTION: Show rotation
+# ============================================================================
 
 
 def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_threshold_seconds=900,
@@ -2513,13 +2067,7 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
         return _take_sequential(show_name, count, eps)
 
     def _fair_show_order(order, requested_counts):
-        """Skip over-visited small shows without creating empty schedules.
-
-        The requested count remains authoritative: one_slot still means one
-        episode and two_slots still means two.  Fairness only decides whether
-        a show participates in this build.  State also accepts the existing
-        integer show_pos values.
-        """
+        """Skip over-visited small shows without creating empty schedules."""
         fairness = show_pos.get("__FAIRNESS__")
         if not isinstance(fairness, dict):
             fairness = {}
@@ -2550,8 +2098,6 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
             if projected <= pressure_limit:
                 eligible.append(sn)
 
-        # Never allow fairness to remove the entire channel.  If all shows
-        # have reached the same relative usage, start another balanced pass.
         if not eligible:
             eligible = usable
 
@@ -2629,15 +2175,14 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
 
 
 def _episode_label(path):
-    import re as _re
     name = os.path.splitext(os.path.basename(str(path)))[0]
-    m = _re.search(r's(\d+)[\s._-]*[ex][\s._-]*(\d+)', name, _re.IGNORECASE)
+    m = re.search(r's(\d+)[\s._-]*[ex][\s._-]*(\d+)', name, re.IGNORECASE)
     if m:
         return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
-    m = _re.search(r'season[\s._-]*(\d+).*?episode[\s._-]*(\d+)', name, _re.IGNORECASE)
+    m = re.search(r'season[\s._-]*(\d+).*?episode[\s._-]*(\d+)', name, re.IGNORECASE)
     if m:
         return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
-    m = _re.search(r'ep(?:isode)?\W*(\d+)', name, _re.IGNORECASE)
+    m = re.search(r'ep(?:isode)?\W*(\d+)', name, re.IGNORECASE)
     if m:
         return f"Episode {int(m.group(1))}"
     return None
@@ -2673,10 +2218,7 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
         raw_tracks, channel_id=channel_id
     )
     if pair_threshold_seconds > 0:
-        # Keep catch-up accounting in the same episode-unit space as
-        # build_show_rotation().  Without this, a show with two short pairs
-        # reports four raw episodes here while normal scheduling reports two
-        # paired slots, shifting its saved position on a block catch-up.
+        # WARNING: count paired short episodes the same way normal scheduling does or a block catch-up shifts the saved position.
         show_episodes = {
             sn: pair_short_episodes(eps, threshold_seconds=pair_threshold_seconds)
             for sn, eps in show_episodes.items()
@@ -2747,8 +2289,6 @@ def note_random_episode_played(show_pos, show_name, episode_count, played_index,
     state_key = stable_series_id(show_name, channel_id)
     state = show_pos.get(state_key, show_pos.get(show_name))
     if isinstance(state, dict) and "bag" in state:
-        # Pull the substituted episode out of the current cycle's bag so it
-        # doesn't turn around and get drawn again before the bag empties.
         bag = [i for i in state.get("bag", []) if 0 <= i < episode_count and i != played_index]
         cycle = int(state.get("cycle", 0) or 0)
         recent = [i for i in state.get("recent", []) if 0 <= i < episode_count]
@@ -2760,46 +2300,16 @@ def note_random_episode_played(show_pos, show_name, episode_count, played_index,
     show_pos[state_key] = {"bag": bag, "cycle": cycle, "last": played_index, "recent": recent}
 
 
-# ---------------------------------------------------------------------------
-# Commercial duration bundles
-# ---------------------------------------------------------------------------
-# Real ad libraries cluster hard around a handful of standard broadcast
-# lengths (15s/30s/60s spots) with a thin tail of longer "infomercial"-style
-# pieces. Treating the whole library as one shuffled pool -- first-fit
-# whatever comes up next into whatever gap needs filling -- lets that
-# clustering warp playback: a 15s spot fits almost any leftover budget and
-# gets pulled disproportionately often, while a 3-minute piece only fits the
-# rare big gap and can go long stretches without airing, or clump up the few
-# times a big gap does show up.
-#
-# Splitting the pool into duration bundles fixes both ends: each bundle gets
-# its own independent "everyone plays once before anyone repeats" rotation,
-# and a break gets filled with the closest-fitting bundle for its remaining
-# budget instead of a single mixed pool's random walk.
-#
-# Ceilings sit close together at the common lengths (15/30/45/60s), where a
-# real library is usually dense enough that a tight bundle still has plenty
-# of variety, then widen out for the rarer long-form lengths (90s/2min/3min/
-# 5min) where a tight ceiling would leave a bundle with only one or two ads
-# in it -- too thin, and it just repeats itself constantly. Go too coarse
-# instead (say, one giant "under 5 minutes" bucket) and gap-filling loses
-# the whole point of bundling: a 20s gap could get handed a bundle full of
-# 4-minute pieces that don't actually fit well, right back to the original
-# problem. This spacing is a starting point, not a hard rule -- if a
-# particular library's mix of lengths wants different boundaries, adjust
-# COMMERCIAL_BUNDLE_CEILINGS.
-#
-# COMMERCIAL_MAX_SECONDS mirrors the "too long to be a commercial" cutoff
-# already enforced wherever commercials get probed/added to a channel; it's
-# also the ceiling of the last (catch-all) bundle here.
+# ============================================================================
+# SECTION: Commercial bundles & block timeline
+# ============================================================================
 COMMERCIAL_MAX_SECONDS = 5 * 60
 COMMERCIAL_BUNDLE_CEILINGS = (15, 30, 45, 60, 90, 120, 180, COMMERCIAL_MAX_SECONDS)
 
 
 def commercial_bundle_ceiling(duration):
-    """Round a commercial's duration UP to the ceiling of the bundle it
-    belongs in. Rounding up (never down) guarantees every ad placed into a
-    bundle actually fits any break budget that bundle gets chosen to fill."""
+    """Round a commercial's duration up to its bundle's ceiling."""
+    # WARNING: round up, never down, so every ad fits any break budget its bundle fills.
     for ceiling in COMMERCIAL_BUNDLE_CEILINGS:
         if duration <= ceiling:
             return ceiling
@@ -2815,9 +2325,10 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     import random as _random
 
     HALF_HOUR         = 1800
-    MAX_CATCHUP       = 180   # max 3 min for a single catch-up fill break
-    MIN_BREAK_GAP     = 300   # at least 5 min of show between any two breaks
-    MIN_BREAK_SECONDS = 120   # no aired commercial break may be shorter than this
+    # VALUES CHANGE HERE
+    MAX_CATCHUP       = 180
+    MIN_BREAK_GAP     = 300
+    MIN_BREAK_SECONDS = 120
 
     def _dur_is_estimated(show):
         try:
@@ -2831,19 +2342,12 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             cached = media_probe_cache.get(os.path.normpath(str(p)))
             cdur = cached.get("duration") if isinstance(cached, dict) else None
             if cdur and cdur > 0:
-                return False   # real length known -> not an estimate
+                return False
             stored = show.get("duration") if isinstance(show, dict) else None
             return not (stored and stored > 0 and stored != HALF_HOUR)
         except Exception:
             return False
 
-    # Split the flat commercial list into duration bundles (see
-    # commercial_bundle_ceiling / COMMERCIAL_BUNDLE_CEILINGS above), each
-    # with its own persisted cycle counter and its own "recently played"
-    # hold-back -- so one bundle's rotation never bleeds into another's.
-    # An older, pre-bundle commercial_state has no "bundles" key, so every
-    # bundle just starts on a fresh first lap; that costs nothing beyond one
-    # extra lap of "no repeats yet" and self-corrects on the very next save.
     _bundles = {}
     for _com in (commercial_tracks or []):
         _cdur = _com.get("duration", 0) if isinstance(_com, dict) else 0
@@ -2864,21 +2368,12 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         _bundle_recent[_ceiling] = [p for p in _saved.get("recent", []) if p]
 
     def _shuffled_ad_lap(pool_items, ceiling):
-        nonlocal _bundle_cycle
         _bundle_cycle[ceiling] = _bundle_cycle.get(ceiling, 0) + 1
         n = len(pool_items)
         order = list(range(n))
         lap_rng = _random.Random(f"{day_seed}:__commercials__:{ceiling}:{_bundle_cycle[ceiling]}")
         lap_rng.shuffle(order)
         recent = _bundle_recent.get(ceiling, [])
-        # Hold back as many recently-played items as the pool can spare --
-        # up to n-1, leaving exactly one guaranteed-different pick rather
-        # than only ever protecting half the pool. That's the strongest
-        # no-repeat guarantee this bundle's size can support: a commercial
-        # can't come back around until every other item in its duration
-        # class has had a turn, for however many breaks that buys. Still
-        # capped by RANDOM_REPEAT_HOLD_BACK overall so a big pool doesn't
-        # hold back more than the "recent" history we actually track.
         hold_back = min(RANDOM_REPEAT_HOLD_BACK, n - 1) if n > 1 else 0
         if hold_back > 0:
             blocked_paths = set(recent[-hold_back:])
@@ -2895,48 +2390,22 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         _bundle_pools[_ceiling] = _shuffled_ad_lap(_items, _ceiling)
         _bundle_idx[_ceiling]   = 0
 
-    # Which bundle gets tried *first* for a given slot rotates through every
-    # bundle in turn, rather than always picking whichever bundle best-fits
-    # the remaining budget. Always-best-fit would hand almost every slot to
-    # whichever bundle's ceiling happens to divide evenly into most breaks'
-    # budgets, starving the other duration classes. Round-robin instead:
-    # try the bundle whose turn it is, and only skip to the next one in
-    # rotation if it doesn't fit the remaining budget (or is fully used up
-    # already within this break) -- so every duration class gets a turn
-    # roughly as often as any other, while a slot still only ever gets
-    # filled by something that actually fits it.
     _bundle_order = sorted(_bundle_pools.keys())
     _saved_turn_ceiling = (commercial_state or {}).get("turn_ceiling")
     _bundle_turn = _bundle_order.index(_saved_turn_ceiling) if _saved_turn_ceiling in _bundle_order else 0
 
-    # Kept around only for the handful of "is there anything to work with at
-    # all" truthiness checks below -- actual selection always goes through
-    # the bundles above now.
     commercial_pool = list(commercial_tracks or [])
 
     timeline = []
     total_block_content = 0
 
-    # Shared mutable state (modified by the closures below via nonlocal)
-    _deferred_fill  = 0               # fill seconds owed but not yet placed
-    _last_break_end = -MIN_BREAK_GAP  # position where the last break ended
+    # WARNING: modified by the closures below via nonlocal.
+    _deferred_fill  = 0
+    _last_break_end = -MIN_BREAK_GAP
     _last_played_path = (commercial_state or {}).get("last")
 
-    # Hard "at most 2 breaks per half-hour" cap for the short-show chain
-    # case: several different short shows (each under interrupt_floor_
-    # seconds) landing in the same half hour would otherwise each get their
-    # own end break, which respects each show's own budget but not the
-    # half-hour as a whole. Once 2 breaks have aired in the current half-hour
-    # bucket, a short show's end break is skipped entirely -- not
-    # capped-and-deferred like elsewhere, fully skipped -- and its owed
-    # commercial time carries forward to combine with the NEXT show's own
-    # end break instead (not the generic top-of-loop
-    # _maybe_flush_deferred_fill/_snap_to_mark catch-up, which fires
-    # *before* the next show's content and would glue a break onto the
-    # front of it -- this carries into that show's own end-of-show break
-    # so the merged break plays after it).
     MAX_BREAKS_PER_HALF_HOUR = 2
-    _half_hour_bucket        = 0      # which HALF_HOUR-sized window we're in
+    _half_hour_bucket        = 0
     _breaks_this_half_hour   = 0
 
     def _register_half_hour(t):
@@ -2947,13 +2416,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             _breaks_this_half_hour = 0
 
     def _half_hour_capped(t):
-        """True once MAX_BREAKS_PER_HALF_HOUR breaks have already aired in
-        t's half-hour window -- checked by every break-triggering path
-        (short-show end breaks, _snap_to_mark, _maybe_flush_deferred_fill)
-        so none of them can sneak a 3rd break in independently. Whatever
-        gets blocked stays in _deferred_fill and pays out once the window
-        rolls over (or, for the short-show branch specifically, gets folded
-        straight into a later show's own end break)."""
+        """True once MAX_BREAKS_PER_HALF_HOUR breaks have aired in t's half-hour window."""
+        # WARNING: every break-triggering path must check this so none adds a 3rd break.
         _register_half_hour(t)
         return _breaks_this_half_hour >= MAX_BREAKS_PER_HALF_HOUR
 
@@ -2966,10 +2430,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             _bundle_recent[ceiling] = recent[-RANDOM_REPEAT_HOLD_BACK:]
 
     def _next_from_bundle(ceiling, exclude_paths):
-        """Pull the next not-already-used-in-this-break item out of
-        `ceiling`'s own rotation, starting a fresh reshuffled lap once the
-        current one runs out. Returns None only if every item in the bundle
-        is already spoken for by this break (exclude_paths)."""
+        """Pull the next unused-in-this-break item from `ceiling`'s rotation, reshuffling when a lap ends."""
         pool = _bundle_pools.get(ceiling)
         if not pool:
             return None
@@ -2988,10 +2449,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         return None
 
     def _pick_one(budget_seconds, exclude_paths):
-        """Pick a single commercial that fits `budget_seconds`, trying
-        bundles in round-robin order starting from whichever bundle's turn
-        it is (see _bundle_order/_bundle_turn above). Returns (item,
-        ceiling) or (None, None) if nothing in any bundle fits/qualifies."""
+        """Pick one commercial that fits `budget_seconds`, trying bundles in round-robin order."""
         nonlocal _bundle_turn
         n = len(_bundle_order)
         for offset in range(n):
@@ -3022,20 +2480,11 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             e["pair_ep2_duration"] = show.get("pair_ep2_duration", 0)
         return e
 
-    def _pack_break(budget_seconds, pool=None, start_idx=None):
-        # `pool`/`start_idx` are accepted-but-unused so every call site
-        # below keeps working unchanged (the returned "index" is likewise a
-        # meaningless placeholder, only ever fed back into another call
-        # here). Selection runs against the duration bundles built above,
-        # one slot at a time via _pick_one's round-robin -- so a break gets
-        # filled with ads that actually fit, spread fairly across every
-        # duration class, instead of a single flat pool's random first-fit
-        # walk (which is what let short ads dominate every gap they always
-        # happened to fit).
+    def _pack_break(budget_seconds):
         picked = []
         used = 0
         if budget_seconds <= 0 or not _bundle_pools:
-            return picked, 0, 0
+            return picked, 0
         break_paths = set()
         while True:
             remaining = budget_seconds - used
@@ -3048,17 +2497,10 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             used += com["duration"]
             break_paths.add(com["path"])
             _note_ad_played(ceiling, com["path"])
-        return picked, used, 0
+        return picked, used
 
     def _append_break(picked, t_block_content):
-        """Append picked commercial entries to timeline and update _last_break_end.
-
-        Single chokepoint for every actual break insertion (_pack_and_round,
-        _pack_even_interior_breaks, the deferred-fill flush), so it's also
-        the one place that counts against MAX_BREAKS_PER_HALF_HOUR -- any
-        break placed here, however it got triggered, uses up part of the
-        half-hour's quota.
-        """
+        """Append picked commercial entries to timeline and update _last_break_end."""
         nonlocal _last_break_end, _breaks_this_half_hour
         t = t_block_content
         for com in picked:
@@ -3072,46 +2514,26 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             _breaks_this_half_hour += 1
         return t
 
-    def _pack_and_round(budget_seconds, pool, start_idx, t_block_content, max_seconds=None):
-        # `pool`/`start_idx` accepted-but-unused -- see _pack_break.
-        nonlocal _deferred_fill, _last_break_end
+    def _pack_and_round(budget_seconds, t_block_content, max_seconds=None):
+        nonlocal _deferred_fill
         if budget_seconds <= 0 or not _bundle_pools:
-            return t_block_content, 0
-        # Apply per-break cap and defer any overage for later catch-up
+            return t_block_content
         capped = min(budget_seconds, max_seconds) if max_seconds is not None else budget_seconds
         if capped < budget_seconds:
             _deferred_fill += budget_seconds - capped
-        picked, used, _ = _pack_break(capped)
+        picked, used = _pack_break(capped)
         t = _append_break(picked, t_block_content)
         leftover = int(capped) - used
         if leftover > 0:
-            # Nothing left in any bundle can close this last stretch
-            # without either repeating a commercial already used earlier
-            # in this same break, or reaching for one that overshoots it --
-            # and a commercial must never repeat within one break. Rather
-            # than force either of those, the break just ends here: the
-            # leftover carries forward as owed time through the same
-            # _deferred_fill catch-up system every other capped/skipped
-            # break already uses (see _maybe_flush_deferred_fill), and
-            # gets paid back once a later break has room, instead of an
-            # unnatural trim, a forced repeat, or dead air. This means the
-            # next show can start a little early relative to the :00/:30
-            # mark on breaks where the pool runs thin -- by design, not a
-            # bug -- and a future break simply runs a bit longer (or, if
-            # a later break happens to overshoot its own cap for the same
-            # reason, a bit shorter) to pay the difference back and keep
-            # the schedule drifting back toward the marks over time.
             _deferred_fill += leftover
-        return t, 0
+        return t
 
-    def _pack_even_interior_breaks(show, show_dur, gap, num_breaks, t_block_content, cidx, next_mark):
+    def _pack_even_interior_breaks(show, show_dur, gap, num_breaks, t_block_content, next_mark):
         nonlocal _deferred_fill
         per_break  = gap / float(num_breaks)
         capped_per = min(per_break, max_interrupt_break_seconds) if max_interrupt_break_seconds else per_break
         if per_break > capped_per:
             _deferred_fill += (per_break - capped_per) * (num_breaks - 1)
-        # Symmetric floor: dividing gap across many breaks can land under
-        # MIN_BREAK_SECONDS just as easily as it can land over the max.
         capped_per = max(capped_per, MIN_BREAK_SECONDS)
 
         base_seg    = int(show_dur) // num_breaks
@@ -3126,20 +2548,15 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             if is_last:
                 end_budget = next_mark - t_block_content
                 if 0 < end_budget < MIN_BREAK_SECONDS:
-                    # Too small a remainder to air on its own -- defer it
-                    # instead of forcing a sub-floor break just to land
-                    # exactly on this mark; the next show's snap-to-mark
-                    # (floor-aware) realigns properly, and the deferred
-                    # amount gets paid back by _maybe_flush_deferred_fill.
                     _deferred_fill += end_budget
                 else:
-                    t_block_content, cidx = _pack_and_round(
-                        end_budget, commercial_pool, cidx, t_block_content,
+                    t_block_content = _pack_and_round(
+                        end_budget, t_block_content,
                         max_seconds=max_interrupt_break_seconds)
             else:
-                picked, used, cidx = _pack_break(capped_per, commercial_pool, cidx)
+                picked, used = _pack_break(capped_per)
                 t_block_content = _append_break(picked, t_block_content)
-        return t_block_content, cidx
+        return t_block_content
 
     def _ceil_div(a, b):
         """Integer ceiling division, safe on a non-positive divisor."""
@@ -3147,66 +2564,42 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             return 1
         return int(-(-a // b))
 
-    def _maybe_flush_deferred_fill(t, cidx):
-        # Pays back ad time that got deferred elsewhere (capped-down breaks,
-        # or a break skipped for being under MIN_BREAK_SECONDS) by inserting
-        # a real bonus break once enough owed time has piled up and enough
-        # show has played since the last break.
+    def _maybe_flush_deferred_fill(t):
         nonlocal _deferred_fill
         if _deferred_fill <= 0 or not commercial_pool:
-            return t, cidx
+            return t
         if t - _last_break_end < MIN_BREAK_GAP:
-            return t, cidx
+            return t
         if _half_hour_capped(t):
-            return t, cidx   # already at the 2-per-half-hour cap -- stays owed
+            return t
         insert_amt = min(MAX_CATCHUP, _deferred_fill)
         if insert_amt < MIN_BREAK_SECONDS:
-            return t, cidx   # not enough owed yet to make a floor-sized break
-        picked, used, new_cidx = _pack_break(insert_amt, commercial_pool, cidx)
+            return t
+        picked, used = _pack_break(insert_amt)
         if picked:
             t = _append_break(picked, t)
             _deferred_fill -= used
-            cidx = new_cidx
-        return t, cidx
+        return t
 
-    def _snap_to_mark(t, cidx, cap_seconds):
+    def _snap_to_mark(t, cap_seconds):
         nonlocal _deferred_fill
         if t % HALF_HOUR == 0:
-            return t, cidx          # already on a :00/:30 mark — no-op
+            return t
         snap_budget = HALF_HOUR - (t % HALF_HOUR)
         if snap_budget < MIN_BREAK_SECONDS:
-            # Landing on the very next mark would mean a sub-floor break --
-            # push one more half hour out so there's room to do it properly.
             snap_budget += HALF_HOUR
-        # This only fires a break here if there's been enough real show
-        # time since the last break (same MIN_BREAK_GAP gate
-        # _maybe_flush_deferred_fill uses) -- otherwise it just adds the
-        # whole snap budget to _deferred_fill and leaves the schedule
-        # off-mark for now. It gets paid back (respecting the floor and
-        # cap) once _maybe_flush_deferred_fill sees enough real gap, same
-        # as any other deferred overage.
         if t - _last_break_end < MIN_BREAK_GAP:
             _deferred_fill += snap_budget
-            return t, cidx
+            return t
         if _half_hour_capped(t):
-            # Same idea as the MIN_BREAK_GAP gate above, but for the
-            # 2-per-half-hour cap: don't sneak a break in here just because
-            # enough show-gap has passed -- stays owed until the window
-            # rolls over.
             _deferred_fill += snap_budget
-            return t, cidx
-        return _pack_and_round(snap_budget, commercial_pool, cidx, t,
+            return t
+        return _pack_and_round(snap_budget, t,
                                max_seconds=cap_seconds)
 
     def _resolved_show_duration(show):
-        # Resolve probe results before using stored durations so sentinel
-        # values cannot enter schedule calculations.
+        # WARNING: resolve probe results before using stored durations so sentinel values never enter schedule math.
         if isinstance(show, dict) and show.get("is_pair"):
-            # A pair's path is the first episode for playback identity, but
-            # its schedule duration is the sum of both episodes.  Resolving
-            # only the first path through media_probe_cache would collapse a
-            # 14:32 pair back to (for example) 7:32 and make the guide draw
-            # the pair and a standalone short at the same width.
             p1 = show.get("pair_ep1_path", show.get("path", ""))
             p2 = show.get("pair_ep2_path", "")
             d1 = resolve_track_duration(
@@ -3222,16 +2615,6 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         return resolve_track_duration(media_probe_cache, p, stored, default=HALF_HOUR)
 
     def _mid_split_point(show, show_dur):
-        # Where to cut a block in two for a single interior commercial
-        # break. For a paired two-episode block, the arithmetic midpoint of
-        # the *combined* runtime (show_dur // 2) has nothing to do with
-        # where episode 1 actually ends -- a 650s+618s pair's true seam is
-        # at 650s, but show_dur // 2 lands at 634s, 16s before it, so the
-        # break fires while episode 1 is still playing. Snap to the real
-        # seam (episode 1's resolved duration) whenever this is a pair and
-        # that duration is known and falls inside the block; otherwise fall
-        # back to the plain midpoint (non-paired shows, or a pair whose
-        # ep1 duration hasn't been probed yet).
         if isinstance(show, dict) and show.get("is_pair"):
             p1 = show.get("pair_ep1_path", show.get("path", ""))
             d1 = resolve_track_duration(
@@ -3248,24 +2631,19 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         return show_dur // 2
 
     if commercial_tracks and commercial_placement == "interrupt_half_hour":
-        com_idx = 0
         for show in video_tracks:
             show_dur = _resolved_show_duration(show)
             _est = _dur_is_estimated(show)
 
-            total_block_content, com_idx = _snap_to_mark(total_block_content, com_idx, max_interrupt_break_seconds)
-            total_block_content, com_idx = _maybe_flush_deferred_fill(total_block_content, com_idx)
+            total_block_content = _snap_to_mark(total_block_content, max_interrupt_break_seconds)
+            total_block_content = _maybe_flush_deferred_fill(total_block_content)
             _register_half_hour(total_block_content)
 
             natural_end = total_block_content + show_dur
             next_mark = ((natural_end // HALF_HOUR) + (1 if natural_end % HALF_HOUR != 0 else 0)) * HALF_HOUR
             gap = next_mark - natural_end
             if _est and gap <= 0:
-                # An unprobed entry resolves to HALF_HOUR only so it can
-                # occupy a stable broadcast slot while VLC catches up.  Do
-                # not turn that placeholder into a long-form program with a
-                # full fallback commercial break; the next probe will rebuild
-                # this lineup using the real runtime.
+                # WARNING: do not turn an estimated placeholder into a long-form program with a full fallback break; the next probe rebuilds it.
                 if show_dur == HALF_HOUR:
                     timeline.append(_show_entry(show, show_dur,
                                                  total_block_content, 0))
@@ -3274,59 +2652,38 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
-            # A gap that's positive but too small to hold a real break would
-            # otherwise force a sub-floor break just to land exactly on the
-            # next :00/:30 mark. Push the target out one more half hour so
-            # there's room to do it properly -- same idea as the estimated-
-            # duration case just above.
             if 0 < gap < MIN_BREAK_SECONDS:
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
             if gap <= 0:
-                # An exact half-hour landing still receives its normal
-                # commercial breaks, sized from max_interrupt_break_seconds.
                 _fallback_break_len = max_interrupt_break_seconds if max_interrupt_break_seconds else MIN_BREAK_SECONDS
 
                 if show_dur < interrupt_floor_seconds:
-                    # Short show: same one-end-break shape as its normal
-                    # branch below, sized off the cap directly and still
-                    # subject to the same 2-per-half-hour cap check.
                     timeline.append(_show_entry(show, show_dur, total_block_content, 0))
                     total_block_content += show_dur
                     if _half_hour_capped(total_block_content):
                         _deferred_fill += _fallback_break_len
                     else:
-                        total_block_content, com_idx = _pack_and_round(
-                            _fallback_break_len, commercial_pool, com_idx, total_block_content,
+                        total_block_content = _pack_and_round(
+                            _fallback_break_len, total_block_content,
                             max_seconds=max_interrupt_break_seconds)
 
                 elif show_dur < HALF_HOUR:
-                    # Same mid-break + end-break shape as the normal branch
-                    # below, each sized off the cap directly.
                     mid_point = _mid_split_point(show, show_dur)
                     timeline.append(_show_entry(show, mid_point, total_block_content, 0,
                                                 interior_cut=True))
                     total_block_content += mid_point
-                    picked, used, com_idx = _pack_break(_fallback_break_len, commercial_pool, com_idx)
+                    picked, used = _pack_break(_fallback_break_len)
                     total_block_content = _append_break(picked, total_block_content)
                     remaining_half = show_dur - mid_point
                     timeline.append(_show_entry(show, remaining_half, total_block_content, mid_point))
                     total_block_content += remaining_half
-                    total_block_content, com_idx = _pack_and_round(
-                        _fallback_break_len, commercial_pool, com_idx, total_block_content,
+                    total_block_content = _pack_and_round(
+                        _fallback_break_len, total_block_content,
                         max_seconds=max_interrupt_break_seconds)
 
                 else:
-                    # Movie: one break every half hour straight through the
-                    # runtime -- e.g. a 90-minute movie landing exactly on
-                    # the mark gets 3 breaks at max_interrupt_break_seconds
-                    # each (30/30/30), 18 minutes of commercial total for
-                    # the default 6-minute cap, instead of the zero it used
-                    # to get. Same "no gap to close" shape as elsewhere in
-                    # this branch, and (like the rest of the long-form
-                    # path) not subject to the 2-per-half-hour cap that
-                    # only governs chained short shows.
                     num_interior_breaks = max(1, int(show_dur // HALF_HOUR))
                     seek_offset    = 0
                     remaining_show = show_dur
@@ -3338,30 +2695,18 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                         total_block_content += seg
                         seek_offset         += seg
                         remaining_show      -= seg
-                        picked, used, com_idx = _pack_break(_fallback_break_len, commercial_pool, com_idx)
+                        picked, used = _pack_break(_fallback_break_len)
                         total_block_content   = _append_break(picked, total_block_content)
 
                     if remaining_show > 0:
                         timeline.append(_show_entry(show, remaining_show, total_block_content, seek_offset))
                         total_block_content += remaining_show
-                        total_block_content, com_idx = _pack_and_round(
-                            _fallback_break_len, commercial_pool, com_idx, total_block_content,
+                        total_block_content = _pack_and_round(
+                            _fallback_break_len, total_block_content,
                             max_seconds=max_interrupt_break_seconds)
                 continue
 
             if show_dur < interrupt_floor_seconds:
-                # Short show: no mid-show split; one end break only. Always
-                # capped at max_interrupt_break_seconds like everywhere else,
-                # including when we just pushed the mark out to satisfy the
-                # floor -- an uncapped break here can wildly overshoot the
-                # max against a run of sub-floor shows. Capping and deferring the
-                # overage does NOT create a "glued-on" second break: the
-                # deferred amount only gets paid back once
-                # _maybe_flush_deferred_fill sees real show-gap (>=
-                # MIN_BREAK_GAP) since the last break, which a run of
-                # back-to-back short shows won't have yet -- it naturally
-                # waits until there's room, then pays back up to
-                # MAX_CATCHUP at a time.
                 timeline.append(_show_entry(show, show_dur, total_block_content, 0))
                 total_block_content += show_dur
                 end_budget = next_mark - total_block_content
@@ -3369,36 +2714,22 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                     end_budget += _deferred_fill
                     _deferred_fill = 0
                 if end_budget > 0 and _half_hour_capped(total_block_content):
-                    # Already at the 2-per-half-hour cap -- skip this show's
-                    # break entirely (not capped-and-aired, not flushed
-                    # early -- fully skipped) and carry the owed time
-                    # forward as deferred fill, to combine with whichever
-                    # show's end break next has room in a fresh half hour.
                     _deferred_fill += end_budget
                 elif end_budget > 0:
-                    total_block_content, com_idx = _pack_and_round(
-                        end_budget, commercial_pool, com_idx, total_block_content,
+                    total_block_content = _pack_and_round(
+                        end_budget, total_block_content,
                         max_seconds=max_interrupt_break_seconds)
 
             elif show_dur < HALF_HOUR:
                 if gap < 2 * MIN_BREAK_SECONDS:
-                    # Not enough gap to split into a mid-break AND an end
-                    # break that are each floor-sized -- one single break
-                    # at the end instead (same shape as the short-show path).
                     timeline.append(_show_entry(show, show_dur, total_block_content, 0))
                     total_block_content += show_dur
                     end_budget = next_mark - total_block_content
-                    total_block_content, com_idx = _pack_and_round(
-                        end_budget, commercial_pool, com_idx, total_block_content,
+                    total_block_content = _pack_and_round(
+                        end_budget, total_block_content,
                         max_seconds=max_interrupt_break_seconds)
                 else:
-                    # Hard rule: at most 2 breaks per half-hour slot, each
-                    # capped at max_interrupt_break_seconds (so up to 12 min
-                    # combined at the default 6-min cap). If the natural gap
-                    # needs more than that, we do NOT spill into a 3rd break
-                    # to close it precisely -- the excess is deferred and
-                    # paid back later (or not) via _maybe_flush_deferred_fill,
-                    # same best-effort philosophy as the short-show path.
+                    # WARNING: at most 2 breaks per half-hour slot, each capped at max_interrupt_break_seconds.
                     mid_budget = gap / 2.0
                     if max_interrupt_break_seconds:
                         mid_budget = min(mid_budget, max_interrupt_break_seconds)
@@ -3408,22 +2739,16 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                                                 interior_cut=True))
                     total_block_content += mid_point
 
-                    picked, used, com_idx = _pack_break(mid_budget, commercial_pool, com_idx)
+                    picked, used = _pack_break(mid_budget)
                     total_block_content = _append_break(picked, total_block_content)
 
                     remaining_half = show_dur - mid_point
                     timeline.append(_show_entry(show, remaining_half, total_block_content, mid_point))
                     total_block_content += remaining_half
 
-                    # end_budget is computed fresh from the actual position
-                    # after the (possibly capped) mid break, so whatever the
-                    # mid break didn't cover naturally shows up here -- and
-                    # this call's own max_seconds cap defers anything still
-                    # left over beyond the 2nd break's 6-min allowance,
-                    # rather than inventing a 3rd break.
                     end_budget = next_mark - total_block_content
-                    total_block_content, com_idx = _pack_and_round(
-                        end_budget, commercial_pool, com_idx, total_block_content,
+                    total_block_content = _pack_and_round(
+                        end_budget, total_block_content,
                         max_seconds=max_interrupt_break_seconds)
 
             else:
@@ -3433,13 +2758,10 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
 
                 if max_interrupt_break_seconds and baseline_per_break > max_interrupt_break_seconds:
                     num_breaks = max(baseline_breaks, _ceil_div(gap, max_interrupt_break_seconds))
-                    total_block_content, com_idx = _pack_even_interior_breaks(
-                        show, show_dur, gap, num_breaks, total_block_content, com_idx, next_mark)
+                    total_block_content = _pack_even_interior_breaks(
+                        show, show_dur, gap, num_breaks, total_block_content, next_mark)
                 else:
                     capped_per = min(baseline_per_break, max_interrupt_break_seconds) if max_interrupt_break_seconds else baseline_per_break
-                    # Same symmetric floor as _pack_even_interior_breaks --
-                    # dividing the tail gap across several interior breaks
-                    # can land any of them under MIN_BREAK_SECONDS.
                     capped_per = max(capped_per, MIN_BREAK_SECONDS)
 
                     seek_offset    = 0
@@ -3453,7 +2775,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                         seek_offset         += seg
                         remaining_show      -= seg
 
-                        picked, used, com_idx = _pack_break(capped_per, commercial_pool, com_idx)
+                        picked, used = _pack_break(capped_per)
                         total_block_content   = _append_break(picked, total_block_content)
 
                     if remaining_show > 0:
@@ -3462,20 +2784,16 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
 
                     end_budget = next_mark - total_block_content
                     if 0 < end_budget < MIN_BREAK_SECONDS:
-                        # Defer rather than force a sub-floor break to close
-                        # out this mark -- see the matching comment in
-                        # _pack_even_interior_breaks.
                         _deferred_fill += end_budget
                     else:
-                        total_block_content, com_idx = _pack_and_round(
-                            end_budget, commercial_pool, com_idx, total_block_content,
+                        total_block_content = _pack_and_round(
+                            end_budget, total_block_content,
                             max_seconds=max_interrupt_break_seconds)
 
     elif commercial_tracks and commercial_placement == "end_of_show":
-        com_idx = 0
         for show in video_tracks:
-            total_block_content, com_idx = _snap_to_mark(total_block_content, com_idx, max_end_break_seconds)
-            total_block_content, com_idx = _maybe_flush_deferred_fill(total_block_content, com_idx)
+            total_block_content = _snap_to_mark(total_block_content, max_end_break_seconds)
+            total_block_content = _maybe_flush_deferred_fill(total_block_content)
 
             _dur = _resolved_show_duration(show)
             if _dur_is_estimated(show) and _dur == HALF_HOUR:
@@ -3491,10 +2809,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             if 0 < end_budget < MIN_BREAK_SECONDS:
                 next_mark += HALF_HOUR
                 end_budget = next_mark - total_block_content
-            # End-of-show mode has exactly one break per show, capped at
-            # max_end_break_seconds.
-            total_block_content, com_idx = _pack_and_round(
-                end_budget, commercial_pool, com_idx, total_block_content,
+            total_block_content = _pack_and_round(
+                end_budget, total_block_content,
                 max_seconds=max_end_break_seconds)
 
     else:
@@ -3515,24 +2831,17 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     return timeline, total_block_content, new_commercial_state
 
 
-# A generous ceiling on plausible bitrate for a real consumer video file.
-# Even high-bitrate 4K HEVC / ProRes rarely exceeds this. Used only to
-# catch a duration that's wildly too *short* for the file's size (e.g. a
-# VLC parse that reports "done" early with a partial/garbage duration) --
-# never to second-guess a duration that looks normal or long.
+# ============================================================================
+# SECTION: Duration & dimension probing
+# ============================================================================
+
+
+# VALUES CHANGE HERE
 _DURATION_SANITY_MAX_PLAUSIBLE_MBPS = 60
 
 
 def _duration_looks_implausible(file_path, duration_sec):
-    """True if file_size / duration implies a bitrate no real video would
-    have -- i.e. the probe almost certainly returned a truncated/bogus
-    duration rather than the file's actual runtime. This is what catches a
-    22-minute episode that gets reported as 41 seconds: at that file's
-    size, 41 seconds would mean an absurd instantaneous bitrate, so the
-    number gets rejected instead of cached. A genuinely short clip (a
-    5-second bumper, a 30-second commercial) still passes fine, because a
-    short clip's *file size* is small too -- the ratio is what matters,
-    not the duration alone."""
+    """True if file_size / duration implies an impossible bitrate, so the probed duration is probably truncated or bogus."""
     try:
         if not duration_sec or duration_sec <= 0:
             return False
@@ -3544,33 +2853,17 @@ def _duration_looks_implausible(file_path, duration_sec):
 
 
 def get_media_duration(file_path):
-    # Polls get_parsed_status() at 10Hz (100ms). None of this function's
-    # callers sit on the path that starts visible playback, so a slower
-    # poll rate costs nothing the user can see while cutting GIL-contending
-    # checks/sec on background probe threads.
     if not file_path or not _cached_path_exists(file_path):
         return None
 
     norm_p = os.path.normpath(os.path.abspath(file_path))
-    with _duration_inflight_lock:
-        if norm_p in _duration_inflight:
-            return None
-        _duration_inflight.add(norm_p)
+    if not _duration_inflight.try_claim(norm_p):
+        return None
 
     try:
         import vlc
         _slot = _get_duration_probe_slot()
         instance, _slot_lock = _slot[0], _slot[1]
-        # Back off briefly if a channel change is actively opening a file
-        # right now (see _LIVE_PLAYBACK_PRIORITY / set_live_playback_priority).
-        # Without this, a background probe run (e.g. catching up on a large
-        # batch of never-probed files) can be mid-parse on the same physical
-        # drive the instant the user changes channels -- the new file's own
-        # open then queues up behind this one at the OS/drive level, and
-        # since change_channel() runs synchronously on the main thread, that
-        # stalls the main loop (and the next pygame.event.get() call) right
-        # along with it. Bounded wait, so a steady stream of channel changes
-        # can't starve probing indefinitely -- see _yield_to_live_playback.
         _yield_to_live_playback(f"media_duration_probe({os.path.basename(file_path)})")
         with _slot_lock:
             media = instance.media_new(file_path)
@@ -3640,19 +2933,42 @@ def get_media_duration(file_path):
         )
         return None
     finally:
-        with _duration_inflight_lock:
-            _duration_inflight.discard(norm_p)
+        _duration_inflight.release(norm_p)
+
+
+_header_facts_provider = None
+
+
+def set_header_facts_provider(fn):
+    """Registers the shared header read (one ffmpeg -i per file, stored in the media library) that duration, size and audio checks draw from."""
+    global _header_facts_provider
+    _header_facts_provider = fn
+
+
+def _get_header_facts(file_path):
+    """{ok, duration, width, height, has_audio} from the shared header read; {"ok": False} when that read failed; None when no shared read is available."""
+    fn = _header_facts_provider
+    if fn is None:
+        return None
+    try:
+        return fn(file_path)
+    except Exception:
+        return None
 
 
 def get_media_video_dimensions(file_path):
+    # WARNING: the fallback ffmpeg call below must stay separate from the picture-box scan and the loudness decodes; do not fold them together.
     if not file_path or not _cached_path_exists(file_path):
+        return None
+    _facts = _get_header_facts(file_path)
+    if _facts is not None:
+        if _facts.get("ok") and _facts.get("width") and _facts.get("height"):
+            return int(_facts["width"]), int(_facts["height"])
         return None
 
     norm_p = os.path.normpath(os.path.abspath(file_path))
-    with _dims_inflight_lock:
-        if norm_p in _dims_inflight:
-            return None
-        _dims_inflight.add(norm_p)
+    if not _dims_inflight.try_claim(norm_p):
+        return None
 
     try:
         import subprocess, re
@@ -3672,13 +2988,6 @@ def get_media_video_dimensions(file_path):
             )
         match = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", result.stderr)
         if not match:
-            # The dimensions probe is shared by the media preloader and the
-            # VLC playback path, so it also sees audio-only files.  An MP3
-            # having no video stream is expected and should not look like a
-            # recoverable video-probe failure in the application log.  Keep
-            # the warning for inputs that have neither a recognizable video
-            # nor an audio stream, since those may still be corrupt or
-            # unsupported media.
             audio_stream = re.search(
                 r"(?im)^\s*Stream #\d+:\d+.*\bAudio:",
                 result.stderr,
@@ -3730,8 +3039,12 @@ def get_media_video_dimensions(file_path):
         )
         return None
     finally:
-        with _dims_inflight_lock:
-            _dims_inflight.discard(norm_p)
+        _dims_inflight.release(norm_p)
+
+
+# ============================================================================
+# SECTION: FFmpeg & main-directory resolution
+# ============================================================================
 
 
 _ffmpeg_exe_path = None
@@ -3746,18 +3059,13 @@ def _resolve_ffmpeg_path():
 
     exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
 
-    # 1) PyInstaller onefile: extracted next to the rest of the bundle.
     meipass = getattr(sys, "_MEIPASS", None)
-    # 2) PyInstaller onedir / a frozen exe generally: next to the .exe itself.
     exe_dir = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else None
-    # 3) Running from source: next to this .py file's parent, i.e. the
-    # project root -- this file now lives in assets/, not root.
     src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     for base_dir in (meipass, exe_dir, src_dir):
         if not base_dir:
             continue
-        # Bundled directly next to the app...
         candidate = os.path.join(base_dir, exe_name)
         if os.path.exists(candidate):
             _ffmpeg_exe_path = candidate
@@ -3778,7 +3086,7 @@ def _resolve_ffmpeg_path():
     log.warning("[FFMPEG] No bundled binary and none found on PATH -- "
                 "loudness normalization will stay disabled (gain=1.0) until "
                 "one is available.")
-    _ffmpeg_exe_path = exe_name  # let subprocess raise its normal FileNotFoundError
+    _ffmpeg_exe_path = exe_name
     return _ffmpeg_exe_path
 
 
@@ -3806,41 +3114,21 @@ def resolve_main_dir():
                     "location; defaulting to %s", _resolved_main_dir)
         return _resolved_main_dir
 
-    # Not frozen -- plain source checkout. This file now lives in assets/,
-    # so go up one level to the project root before looking for main/.
     _resolved_main_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main")
     return _resolved_main_dir
 
 
-# Set once per frame by retro_tv_emulator.py, before any menu/dialog UI is
-# drawn, to whatever _apply_crt_shader's own gating will evaluate to for
-# that same frame (Bezel active + CRT shader enabled + not true 4:3). Read
-# by ui.py's _aa_rounded_rect so it only pays for anti-aliasing supersample
-# work when the warp that would otherwise re-jaggy a plain pygame.draw.rect
-# edge is actually going to run this frame.
+# ============================================================================
+# SECTION: Bezel discovery
+# ============================================================================
+
+
+# WARNING: read by ui.py's _aa_rounded_rect.
 CRT_WARP_ACTIVE = False
 
 _bezel_style_files_cache = {"key": None, "files": [], "checked_at": 0.0}
 _BEZEL_STYLE_DISCOVERY_TTL_SEC = 2.0
 
-# resolve_bezel_dir() sits on the same hot per-frame path as
-# discover_bezel_style_files() -- both are reached via
-# _resolve_current_bezel_path -> _load_full_tv_border_surface, which
-# geometry, CRT-shader gating, aspect-boxing checks, OSD placement, and
-# the border draw itself each call independently: 6-10+ times per
-# rendered frame while Bezel is on. discover_bezel_style_files() already
-# throttles its own directory-fingerprint recheck (see
-# _BEZEL_STYLE_DISCOVERY_TTL_SEC above), but every one of those 6-10+
-# calls -- cache hit or not -- was still paying for THIS function's own
-# os.path.isdir() stat first, since it ran unconditionally before any
-# cache check, both here and again inside discover_bezel_style_files
-# (which also calls resolve_bezel_dir() itself). That's up to ~20 stat
-# syscalls a frame, 60 times a second, just to pick between
-# "images/bezel" and "images/border" -- a choice that's fixed for the
-# entire run unless the user manually renames the folder on disk. Same
-# fix as discover_bezel_style_files: throttle the recheck itself, not
-# just cache the answer, using the same TTL so a renamed folder is still
-# picked up within a couple seconds without a restart.
 _bezel_dir_cache = {"dir": None, "checked_at": 0.0}
 _BEZEL_DIR_RECHECK_TTL_SEC = _BEZEL_STYLE_DISCOVERY_TTL_SEC
 
@@ -3859,43 +3147,7 @@ def resolve_bezel_dir():
 
 
 def discover_bezel_style_files():
-    """Bezel images available for the user to pick between via the
-    Channels-menu Bezel style selector, in style order.
-
-    An unnumbered bezel.png (or border.png) counts as style 1 if present,
-    since that's the original single-bezel naming and it should stay the
-    default without needing to be renamed. Any numbered files (bezel1.png,
-    bezel2.png, ... or border1.png, border2.png, ...) are appended after
-    it in ascending numeric order, regardless of what number they carry --
-    the number only controls sort order among themselves, not the final
-    style index. So a folder with just bezel.png + bezel1.png yields two
-    styles: [bezel.png, bezel1.png] -> style 1, style 2.
-
-    Returns an empty list if the folder has nothing usable -- callers
-    fall back to their old single-image lookup in that case.
-
-    Lives here (rather than in retro_tv_emulator.py, which owns the actual
-    bezel rendering) so both it and ui.py -- which retro_tv_emulator.py
-    imports, so it can't import back -- can reach this without a circular
-    import.
-
-    This is called several times per rendered frame while Bezel is on
-    (border geometry, CRT-shader gating, aspect-boxing checks, the
-    border draw itself all route through it), so the directory
-    "fingerprint" check below (mtime + entry count, so a bezel<N>.png
-    dropped in mid-session is picked up without a restart) is throttled
-    to run at most once every _BEZEL_STYLE_DISCOVERY_TTL_SEC of wall
-    time, not on every call. The previous version recomputed
-    os.path.isdir + os.path.getmtime + os.listdir on the bezel folder
-    on EVERY call just to check whether the cached file list was still
-    valid -- i.e. a real directory listing 6-10+ times per frame, 60
-    times a second, for as long as Bezel was on, regardless of which
-    console/core was running. That's real per-frame filesystem I/O this
-    function has no business doing that often for a folder that
-    essentially never changes mid-session; throttling the *check itself*
-    (not just caching its result) is what actually removes it.
-    """
-    import re as _re_bezel
+    """Bezel images available for the Channels-menu Bezel style selector, in style order."""
     import time as _time_bezel
     b_dir = resolve_bezel_dir()
     cached = _bezel_style_files_cache
@@ -3927,7 +3179,7 @@ def discover_bezel_style_files():
                 if stem.lower() in ("bezel", "border") and unnumbered_path is None:
                     unnumbered_path = os.path.join(b_dir, f)
                     continue
-                m = _re_bezel.match(r"^(?:bezel|border)(\d+)$", stem, _re_bezel.IGNORECASE)
+                m = re.match(r"^(?:bezel|border)(\d+)$", stem, re.IGNORECASE)
                 if m:
                     numbered[int(m.group(1))] = os.path.join(b_dir, f)
         except Exception as e:
@@ -3945,28 +3197,20 @@ def discover_bezel_style_files():
 
 
 def bezel_style_count():
-    """How many selectable bezel styles are available. Always >= 1 so
-    caller code can safely check `> 1` to decide whether to show a cycle
-    control."""
+    """How many selectable bezel styles are available."""
     return max(1, len(discover_bezel_style_files()))
+
+
+# ============================================================================
+# SECTION: Data-folder resolution
+# ============================================================================
 
 
 _loudness_dir_ready = False
 
 
 def resolve_loudness_dir():
-    """Return the program's own folder for renormalization work files.
-
-    Two-pass loudness normalization needs a temp/backup copy of whatever
-    file it's fixing. Those must never live inside a user's media folders
-    -- they aren't programming, they get picked up by the folder scanner
-    as if they were, and nothing in this codebase ever reads them back
-    to restore anything, so leaving them scattered next to media serves
-    no purpose. This folder lives next to the program's other owned
-    assets (images/, videos/, roms/, cores/) and follows the app -- same
-    resolve_main_dir() used everywhere else, so it still resolves
-    correctly after the app is packaged into an .exe and moved.
-    """
+    """Return the program's own folder for loudness work files."""
     global _loudness_dir_ready
     path = os.path.join(resolve_main_dir(), "loudness")
     if not _loudness_dir_ready:
@@ -3982,18 +3226,7 @@ _captions_dir_ready = False
 
 
 def resolve_captions_dir():
-    """Return the program's own folder for generated/extracted caption
-    files (.srt).
-
-    Same reasoning as resolve_loudness_dir(): files THIS app produces
-    must never land next to a user's media -- a stray .srt dropped into
-    their folder would get picked up by the folder scanner and nothing
-    here ever reads it back from there. Sidecar caption files the user
-    already placed next to a video are only ever READ from wherever they
-    are; this folder is only for what gets WRITTEN -- a subtitle stream
-    pulled out of a container, or an auto-generated ASR transcript --
-    so it stays contained and can be wiped/rebuilt freely.
-    """
+    """Return the program's own folder for generated/extracted caption files (.srt)."""
     global _captions_dir_ready
     path = os.path.join(resolve_main_dir(), "captions")
     if not _captions_dir_ready:
@@ -4005,105 +3238,147 @@ def resolve_captions_dir():
     return path
 
 
-# Sidecar caption files are only ever looked for next to a video using one
-# of these extensions, checked in this priority order -- text-based
-# formats first (usable directly by both the DVD engine's add_slave and
-# the TV/visualizer cue parser below), .sub/.smi last since they're the
-# least common and sometimes ambiguous with DVD-style .sub/.idx pairs.
+# ============================================================================
+# SECTION: Caption sources & cue parsing
+# ============================================================================
+
+
 CAPTION_SIDECAR_EXTS = (".srt", ".vtt", ".ass", ".ssa", ".sub", ".smi")
 
-# Subtitle codecs ffmpeg can losslessly remux straight to .srt with no
-# re-encode (near-instant, same cost tier as the duration probe below).
-# PGS/VOBSUB/DVD-subtitle are bitmap formats -- ffmpeg can't turn those
-# into text without OCR, so an embedded stream in one of those codecs is
-# treated the same as "no usable embedded track" for the plain-text
-# overlay and the waterfall falls through to sidecar/ASR instead. (The
-# DVD engine's own VLC-native SPU path is unaffected by this distinction
-# -- it renders bitmap subtitle tracks fine on its own; this only matters
-# for the paths that need actual text data to draw, not a burned-in
-# picture VLC composites for you.)
 _TEXT_SUBTITLE_CODECS = ("subrip", "ass", "ssa", "webvtt", "mov_text", "text")
 _BITMAP_SUBTITLE_CODECS = ("dvd_subtitle", "hdmv_pgs_subtitle", "xsub", "dvb_subtitle")
 
 
+# ============================================================================
+# SECTION: Caption start-up helpers
+# ============================================================================
+# VALUES CHANGE HERE
+_HEADER_PROBE_SHARE_SECONDS = 120.0
+_HEADER_PROBE_SHARE_MAX_ENTRIES = 64
+_header_probe_share = {}
+_header_probe_share_lock = threading.Lock()
+
+
+def _playing_file_scope(active):
+    """Priority scope for the playing file's caption start-up; a no-op for background callers."""
+    if active and _perf_governor is not None:
+        return _perf_governor.priority_scope()
+    return contextlib.nullcontext()
+
+
+def _shared_header_probe(file_path, timeout):
+    """combined_header_probe(), reusing a successful result for the same unchanged file for a short time."""
+    import media_library as _ml
+    try:
+        st = os.stat(file_path)
+        key = (os.path.normpath(file_path).lower(), st.st_mtime, st.st_size)
+    except OSError:
+        return _ml.combined_header_probe(file_path, timeout=timeout)
+    now = time.monotonic()
+    with _header_probe_share_lock:
+        hit = _header_probe_share.get(key)
+        if hit is not None and now - hit[0] <= _HEADER_PROBE_SHARE_SECONDS:
+            return hit[1]
+    result = _ml.combined_header_probe(file_path, timeout=timeout)
+    if result.ok:
+        with _header_probe_share_lock:
+            _header_probe_share[key] = (time.monotonic(), result)
+            if len(_header_probe_share) > _HEADER_PROBE_SHARE_MAX_ENTRIES:
+                for stale in sorted(_header_probe_share, key=lambda k: _header_probe_share[k][0])[
+                        :len(_header_probe_share) - _HEADER_PROBE_SHARE_MAX_ENTRIES]:
+                    _header_probe_share.pop(stale, None)
+    return result
+
+
+_subtitle_probe_import_warned = False
+
+
 def _probe_embedded_subtitle_streams(file_path):
-    """List the subtitle streams a plain video file's container reports.
-
-    Uses the exact same lightweight `ffmpeg -i` header read
-    _probe_duration_seconds_fast() already does elsewhere in this file --
-    reads container metadata only, no decode -- so this is the same cost
-    tier as the duration probe (a few milliseconds), not the loudness
-    probe's full-audio-decode cost. It's a separate subprocess call today
-    rather than reusing duration's own result (the two aren't currently
-    threaded together); see the caption precache worker for where that
-    could be fused later if it's ever worth the coupling.
-
-    Returns a list of dicts: {"index": int, "lang": str|None,
-    "codec": str|None, "is_text": bool}, in stream order. Empty list on
-    any probe failure or if there's nothing found -- including, by
-    design, for dvdnav:// / physical-disc paths, which plain ffmpeg -i
-    can't inspect. That's expected: the DVD engine already handles
-    embedded-track discovery for real discs/ISOs itself, live, via VLC's
-    video_get_spu_description(). This function only serves the paths
-    nothing else already answers -- ordinary video files on TV-station/
-    visualizer channels, and the DVD player's own plain-file (non-disc)
-    case as an extra fallback source.
-    """
+    """List the subtitle streams in a video file's container (header read only)."""
     if not file_path or not _cached_path_exists(file_path):
         return []
     try:
-        import subprocess, re
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
-            )
-        with _fast_disk_io_slot(f"ffprobe_subs({os.path.basename(file_path)})"):
-            result = subprocess.run(
-                [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner", "-i", file_path],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=15, stdin=subprocess.DEVNULL,
-                **popen_kwargs
-            )
-        streams = []
-        for m in re.finditer(
-            r"Stream #\d+:(\d+)(?:\((\w+)\))?[^\n]*:\s*Subtitle:\s*(\w+)",
-            result.stderr,
-        ):
-            idx, lang, codec = m.groups()
-            streams.append({
-                "index": int(idx),
-                "lang": lang,
-                "codec": codec,
-                "is_text": codec in _TEXT_SUBTITLE_CODECS,
-            })
-        return streams
+        import media_library as _ml
     except Exception as e:
-        log.warning("_probe_embedded_subtitle_streams: failed for %s: %s", file_path, e)
+        global _subtitle_probe_import_warned
+        if not _subtitle_probe_import_warned:
+            _subtitle_probe_import_warned = True
+            log.warning("_probe_embedded_subtitle_streams: media_library import failed (%s) -- "
+                        "embedded subtitle detection is unavailable (logged once)", e)
         return []
+    result = _shared_header_probe(file_path, 15)
+    if not result.ok:
+        if result.error not in ("path_missing",):
+            log.warning("_probe_embedded_subtitle_streams: failed for %s: %s",
+                        file_path, result.error)
+        return []
+    return result.subtitle_streams
+
+
+_ENGLISH_LABELS = {"en", "eng", "english", "en-us", "en-gb", "en_us", "en_gb"}
+_IGNORED_SIDECAR_LABELS = {"forced", "commentary", "signs", "songs"}
+_SIDECAR_LABEL_NOISE = {"sdh", "cc", "hi", "default", "captions", "caption", "subs", "sub"}
+_BAKED_NAME_RE = re.compile(
+    r"(?<![a-z0-9])(hard[\W_]*sub(?:s|bed)?|hard[\W_]*coded|burn(?:ed|t)?[\W_]*in|open[\W_]*captions?)(?![a-z0-9])",
+    re.I)
+
+
+def _sidecar_rank(stem_lower, candidate_name_lower):
+    """Ranks a directory entry as a caption sidecar of the video named stem_lower; None when it is not one, else a sortable tuple where lower is better."""
+    root, ext = os.path.splitext(candidate_name_lower)
+    if ext not in CAPTION_SIDECAR_EXTS:
+        return None
+    if root == stem_lower:
+        return (0, CAPTION_SIDECAR_EXTS.index(ext), "")
+    if not root.startswith(stem_lower + "."):
+        return None
+    labels = [t for t in root[len(stem_lower) + 1:].split(".") if t]
+    if not labels or any(t in _IGNORED_SIDECAR_LABELS for t in labels):
+        return None
+    language = [t for t in labels if t not in _SIDECAR_LABEL_NOISE]
+    if len(language) > 1:
+        return None
+    if not language or language[0] in _ENGLISH_LABELS:
+        return (1, CAPTION_SIDECAR_EXTS.index(ext), "")
+    if re.fullmatch(r"[a-z]{2,3}(?:[-_][a-z0-9]{2,4})?", language[0]):
+        return (2, CAPTION_SIDECAR_EXTS.index(ext), language[0])
+    return None
 
 
 def _find_sidecar_caption_file(file_path):
-    """Look for a same-named caption file next to `file_path`, trying
-    CAPTION_SIDECAR_EXTS in priority order. Returns the first match's
-    full path, or None."""
+    """Look next to `file_path` for its caption file: same name plus .srt/.vtt/etc., or with a language label (movie.en.srt)."""
     if not file_path:
         return None
+    folder, name = os.path.split(file_path)
+    stem_lower = os.path.splitext(name)[0].lower()
     base, _ = os.path.splitext(file_path)
     for ext in CAPTION_SIDECAR_EXTS:
         candidate = base + ext
         if _cached_path_exists(candidate):
             return candidate
-    return None
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        return None
+    best = None
+    for entry in names:
+        rank = _sidecar_rank(stem_lower, entry.lower())
+        if rank is None:
+            continue
+        if best is None or rank < best[0]:
+            best = (rank, entry)
+    if best is None:
+        return None
+    return os.path.join(folder, best[1])
+
+
+def filename_says_captions_baked_in(file_path):
+    """True when the file's own name says the subtitles are part of the picture (hardsub, hardcoded, burned-in, open captions)."""
+    return bool(file_path) and bool(_BAKED_NAME_RE.search(os.path.basename(file_path)))
 
 
 def _extract_embedded_subtitle_to_file(file_path, stream_index, out_path, timeout=30):
-    """Remux one text-based embedded subtitle stream straight to a
-    standalone .srt -- no re-encode, no audio/video decode, so this stays
-    fast regardless of the source file's length. Only call this for a
-    stream _probe_embedded_subtitle_streams() reported as is_text=True;
-    a bitmap codec will simply fail to produce readable output here (by
-    design -- see _BITMAP_SUBTITLE_CODECS above)."""
+    """Remux one text-based embedded subtitle stream to a standalone .srt with no re-encode."""
     try:
         import subprocess
         popen_kwargs = {}
@@ -4112,7 +3387,7 @@ def _extract_embedded_subtitle_to_file(file_path, stream_index, out_path, timeou
                 subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
             )
         with _fast_disk_io_slot(f"extract_subs({os.path.basename(file_path)})"):
-            result = subprocess.run(
+            subprocess.run(
                 [_resolve_ffmpeg_path(), "-nostdin", "-y", "-i", file_path,
                  "-map", f"0:{stream_index}", "-c:s", "srt", out_path],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -4125,45 +3400,22 @@ def _extract_embedded_subtitle_to_file(file_path, stream_index, out_path, timeou
         return False
 
 
+def _burned_in_verdict(file_path, allow_scan=True):
+    """Stored burned-in verdict (True/False) for the file, scanning it once if allowed; None when unknown."""
+    try:
+        import media_library as _ml
+        lib = _ml.shared_probe_library()
+        verdict = lib.get_burned_in_verdict(file_path)
+        if verdict is None and allow_scan:
+            verdict = lib.detect_burned_in_if_needed(file_path)
+        return verdict
+    except Exception as e:
+        log.warning("_burned_in_verdict: failed for %s: %s", file_path, e)
+        return None
+
+
 def resolve_caption_source(file_path, cache_entry=None):
-    """The shared embedded -> sidecar waterfall used ahead of ASR, for
-    both caption consumers (the DVD/media player's VLC-native path, via
-    its own separate live SPU check, and the TV-station/visualizer
-    plain-text overlay, via this function). Everything here is a static,
-    no-playback-required check -- cheap enough to run from a background
-    precache pass. ASR is deliberately NOT attempted here; callers decide
-    whether to fall back to it (a genuinely expensive step) when this
-    returns kind=None.
-
-    Checks embedded before sidecar -- same priority order the DVD
-    engine's own _apply_dvd_captions_state already uses (checks
-    video_get_spu_description before a sidecar file via add_slave), kept
-    consistent here so a video with both an embedded track and a stray
-    sidecar file behaves the same way in both places.
-
-    `cache_entry`, if given, is the caption_cache[norm_path] dict already
-    on file for this path (see db.config["caption_cache"], wired up by
-    the caller) -- if its stored mtime/size still match the file on disk
-    and its srt_path still exists, it's trusted and returned immediately
-    without re-probing anything.
-
-    Returns a dict:
-      {"kind": "cache"|"embedded"|"sidecar"|None,
-       "srt_path": str|None,       # ready to parse, or to add_slave
-       "stream_index": int|None,   # only set for a fresh "embedded" hit
-                                    # (caller must extract it before this
-                                    # is usable by the TV/visualizer cue
-                                    # parser -- see
-                                    # _extract_embedded_subtitle_to_file)
-       "mtime": float|None, "size": int|None}  # of file_path, for caching
-    kind=None means nothing usable was found (no embedded track, no
-    sidecar file) -- for the TV/visualizer overlay, this is exactly the
-    signal to start a live, in-memory-only ASR pass instead (see
-    LiveCaptionSession below); this function never resolves ASR results
-    itself, on disk or otherwise, so a caller never needs to distinguish
-    "no captions" from "captions not generated yet" here the way the old
-    "asr"/"asr_partial" kinds used to.
-    """
+    """Looks up the caption source of a file ahead of ASR and returns a dict whose "kind" says where the captions come from, or None when live transcription may take over."""
     result = {"kind": None, "srt_path": None, "stream_index": None,
               "mtime": None, "size": None}
     if not file_path or not _cached_path_exists(file_path):
@@ -4174,12 +3426,27 @@ def resolve_caption_source(file_path, cache_entry=None):
     except OSError:
         return result
 
+    if filename_says_captions_baked_in(file_path):
+        result["kind"] = "baked"
+        return result
+
     if (cache_entry and cache_entry.get("mtime") == result["mtime"]
-            and cache_entry.get("size") == result["size"]
-            and cache_entry.get("srt_path")
-            and _cached_path_exists(cache_entry["srt_path"])):
-        result["kind"] = "cache"
-        result["srt_path"] = cache_entry["srt_path"]
+            and cache_entry.get("size") == result["size"]):
+        if cache_entry.get("source") == "baked":
+            result["kind"] = "baked"
+            return result
+        if cache_entry.get("srt_path") and _cached_path_exists(cache_entry["srt_path"]):
+            cached_is_sidecar = cache_entry.get("source") == "sidecar"
+            newer_sidecar = None if cached_is_sidecar else _find_sidecar_caption_file(file_path)
+            if not newer_sidecar:
+                result["kind"] = "cache"
+                result["srt_path"] = cache_entry["srt_path"]
+                return result
+
+    sidecar = _find_sidecar_caption_file(file_path)
+    if sidecar:
+        result["kind"] = "sidecar"
+        result["srt_path"] = sidecar
         return result
 
     for stream in _probe_embedded_subtitle_streams(file_path):
@@ -4188,41 +3455,43 @@ def resolve_caption_source(file_path, cache_entry=None):
             result["stream_index"] = stream["index"]
             return result
 
-    sidecar = _find_sidecar_caption_file(file_path)
-    if sidecar:
-        result["kind"] = "sidecar"
-        result["srt_path"] = sidecar
+    if _burned_in_verdict(file_path):
+        result["kind"] = "baked"
         return result
 
-    # No embedded track, no sidecar file: kind stays None. Unlike the old
-    # code, ASR is not resolved here anymore for the TV/visualizer overlay
-    # -- see LiveCaptionSession below. Those captions run live, in memory
-    # only, and are never written to (or read back from) disk, so there is
-    # nothing for a static resolve like this one to find. (The DVD
-    # player's own ASR fallback in game_deck.py does not go through this
-    # function at all -- it calls generate_captions_via_asr_chunked
-    # directly -- so this change doesn't affect it.)
     return result
+
+
+def _convert_sidecar_to_srt(sidecar_path, timeout=30):
+    """Convert an .ass/.ssa/.smi/.sub text sidecar to a cached .srt with ffmpeg; None when it cannot be converted (for example a bitmap VobSub .sub)."""
+    try:
+        import subprocess, hashlib
+        st = os.stat(sidecar_path)
+        digest = hashlib.sha1(f"{os.path.normpath(sidecar_path).lower()}|{st.st_size}|{st.st_mtime}".encode("utf-8", "replace")).hexdigest()[:16]
+        out_path = os.path.join(resolve_captions_dir(), f"sidecar_{digest}.srt")
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+        popen_kwargs = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = (
+                subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
+            )
+        subprocess.run(
+            [_resolve_ffmpeg_path(), "-nostdin", "-y", "-i", sidecar_path, "-c:s", "srt", out_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs)
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+    except Exception as e:
+        log.warning("_convert_sidecar_to_srt: failed for %s: %s", sidecar_path, e)
+    return None
 
 
 _CUE_TAG_RE = None
 
 
 def parse_caption_cues(srt_or_vtt_path):
-    """Parse a .srt or .vtt file into a flat, time-sorted cue list:
-    [(start_ms, end_ms, text), ...].
-
-    Used only by the TV-station/visualizer plain-text overlay -- the DVD
-    engine never calls this, it hands sidecar/extracted files straight to
-    VLC's add_slave and lets VLC's own renderer handle timing and
-    compositing.
-
-    Multi-line cues are joined with a space (the overlay draws one line
-    at a time, centered) and basic markup (SRT's {\\an8}-style tags,
-    <i>/<b>/<font> HTML-ish tags VTT/SRT both sometimes carry) is
-    stripped, since the overlay is always plain, single-colored text --
-    there's nothing here to render styling info with.
-    """
+    """Parse a .srt or .vtt file into a flat, time-sorted cue list: [(start_ms, end_ms, text), ...]."""
     import re
     global _CUE_TAG_RE
     if _CUE_TAG_RE is None:
@@ -4230,6 +3499,10 @@ def parse_caption_cues(srt_or_vtt_path):
 
     if not srt_or_vtt_path or not _cached_path_exists(srt_or_vtt_path):
         return []
+    if os.path.splitext(srt_or_vtt_path)[1].lower() not in (".srt", ".vtt"):
+        srt_or_vtt_path = _convert_sidecar_to_srt(srt_or_vtt_path)
+        if not srt_or_vtt_path:
+            return []
     try:
         with open(srt_or_vtt_path, "r", encoding="utf-8-sig", errors="replace") as f:
             raw = f.read()
@@ -4237,9 +3510,6 @@ def parse_caption_cues(srt_or_vtt_path):
         log.warning("parse_caption_cues: could not read %s: %s", srt_or_vtt_path, e)
         return []
 
-    # SRT and VTT share the same "HH:MM:SS,mmm --> HH:MM:SS,mmm" timing
-    # line shape -- VTT just allows '.' instead of ',' and sometimes
-    # omits the hours digit. One regex covers both formats.
     time_re = re.compile(
         r"(\d{1,2}:)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[.,](\d{3})"
     )
@@ -4260,7 +3530,7 @@ def parse_caption_cues(srt_or_vtt_path):
                 time_line_idx = i
                 break
         if time_line_idx is None:
-            continue  # e.g. the leading "WEBVTT" header block, or a stray index-only block
+            continue
         m = time_re.search(lines[time_line_idx])
         start_ms = _to_ms(m.group(1), m.group(2), m.group(3), m.group(4))
         end_ms   = _to_ms(m.group(5), m.group(6), m.group(7), m.group(8))
@@ -4275,102 +3545,125 @@ def parse_caption_cues(srt_or_vtt_path):
     return cues
 
 
+# ============================================================================
+# SECTION: ASR model & settings
+# ============================================================================
+
+
 _asr_model_dir_ready = False
 
 
+def _whisper_dir_has_model(path):
+    """True when `path` holds a faster-whisper model (a Hugging Face cache folder or a plain model.bin)."""
+    try:
+        if not os.path.isdir(path):
+            return False
+        if os.path.isfile(os.path.join(path, "model.bin")):
+            return True
+        for entry in os.listdir(path):
+            if entry.startswith("models--") and os.path.isdir(os.path.join(path, entry)):
+                return True
+            if os.path.isfile(os.path.join(path, entry, "model.bin")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def resolve_whisper_model_dir():
-    """Where the faster-whisper model weights live -- same app-owned-
-    folder reasoning as resolve_captions_dir()/resolve_loudness_dir()
-    (see those docstrings), so the model can be bundled at packaging time
-    and still resolve correctly after the app is frozen and moved. If
-    nothing's bundled here, WhisperModel() falls back to its own default
-    cache dir and downloads on first use -- this is only a preferred
-    location, not a hard requirement.
-    """
-    global _asr_model_dir_ready
-    path = os.path.join(resolve_main_dir(), "models", "whisper")
-    if not _asr_model_dir_ready:
-        try:
-            os.makedirs(path, exist_ok=True)
-            _asr_model_dir_ready = True
-        except OSError as e:
-            log.warning("[ASR MODEL DIR] could not create %s: %s", path, e)
-    return path
+    """Return the folder holding the faster-whisper model weights; in a packaged build it looks beside the .exe first, because the bundle's temp folder is thrown away on exit."""
+    global _asr_model_dir_ready, _asr_model_dir_choice
+    if _asr_model_dir_choice is not None:
+        return _asr_model_dir_choice
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        meipass = getattr(sys, "_MEIPASS", None)
+        candidates.append(os.path.join(exe_dir, "models", "whisper"))
+        candidates.append(os.path.join(exe_dir, "main", "models", "whisper"))
+        candidates.append(os.path.join(exe_dir, "_internal", "models", "whisper"))
+        if meipass:
+            candidates.append(os.path.join(meipass, "models", "whisper"))
+            candidates.append(os.path.join(meipass, "main", "models", "whisper"))
+    candidates.append(os.path.join(resolve_main_dir(), "models", "whisper"))
+    chosen = next((c for c in candidates if _whisper_dir_has_model(c)), None)
+    if chosen is None:
+        chosen = candidates[0]
+        log.warning("[ASR MODEL DIR] no Whisper model found in any of: %s -- captions need the '%s' model in one of these folders (or a one-time download into %s)",
+                    "; ".join(candidates), _ASR_MODEL_SIZE, chosen)
+    else:
+        log.info("[ASR MODEL DIR] using Whisper model folder %s", chosen)
+    try:
+        os.makedirs(chosen, exist_ok=True)
+        _asr_model_dir_ready = True
+    except OSError as e:
+        log.warning("[ASR MODEL DIR] could not create %s: %s", chosen, e)
+    _asr_model_dir_choice = chosen
+    return chosen
 
 
-# Auto-captioning is the one genuinely expensive step in the whole
-# captions feature (full audio decode + speech-to-text inference), so
-# it's capped at exactly one job at a time -- unlike duration probing
-# (parallel, up to 6 workers) or even loudness probing (2 concurrent
-# slots). Running two whisper jobs at once would fight each other for
-# the same CPU cores with no throughput win.
+_asr_model_dir_choice = None
+
+
 _ASR_SEMAPHORE = threading.BoundedSemaphore(1)
 
-# English-only "small.en" is both faster and more accurate for English than
-# the multilingual "small" at the same size. Every title on this app's
-# channels is English; if that ever changes, set _ASR_MODEL_SIZE = "small"
-# and _ASR_LANGUAGE = None to go back to multilingual auto-detect.
-#
-# ACCURACY PASS: was "base.en". base.en's word-error-rate is noticeably
-# worse than small.en's on any speech that isn't clean/neutral-accent
-# studio audio -- exactly the "missed a line, strung two people's
-# sentences together, got words wrong on an accent" complaint. small.en
-# is the standard step up (roughly 2-3x base's compute, well within the
-# headroom this app has: even base.en beam=1 was transcribing several
-# 15-18s chunks per second of wall time -- see LIVE_CAPTION_MAX_LEAD_SEC's
-# comment on why that was actually a problem on its own). If a slower
-# machine can't keep small.en comfortably ahead of real-time playback
-# (watch for "chunk N/M ... in Xs" taking close to or over the chunk's own
-# length in the log), drop this back to "base.en" first before touching
-# beam size or VAD below.
 _ASR_MODEL_SIZE = "small.en"
-# Fixed language: skips per-chunk language detection (extra work on every
-# 5-minute chunk, and it can flip languages on a quiet or musical stretch).
 _ASR_LANGUAGE = "en"
-# ACCURACY PASS: was 1 (greedy decoding -- fastest, but the least accurate
-# search faster-whisper supports, and the first thing to fall over on an
-# unfamiliar accent since it never reconsiders an early wrong guess).
-# Whisper's own upstream default is 5; this trades some of the CPU
-# headroom above for meaningfully fewer wrong-word substitutions.
 _ASR_BEAM_SIZE = 5
-# ACCURACY PASS ("strung two people's sentences together"): faster-whisper's
-# VAD (Silero) defaults to a long min_silence_duration_ms, so a quick
-# back-and-forth between two speakers with less than ~2s of dead air
-# between them reads as one continuous speech span and gets handed to
-# Whisper as a single segment to transcribe -- Whisper then has to guess
-# where one utterance ends and the next begins, and often doesn't put a
-# break in at all. A much shorter minimum silence lets the VAD actually
-# split on the gap between speakers (or between sentences generally),
-# giving Whisper more, shorter, correctly-bounded segments instead of one
-# long run-on. Passed as vad_parameters to model.transcribe() below.
 _ASR_VAD_PARAMETERS = {"min_silence_duration_ms": 500}
-# Transcription is CPU-only (ctranslate2 has no Intel Arc path). Use a
-# healthy share of the cores so a chunk finishes quickly, but never all of
-# them -- the render loop and VLC need headroom while a title is playing.
+# VALUES CHANGE HERE (fallback only; used when performance_governor is missing or fails)
 _ASR_CPU_THREADS = max(4, min(8, (os.cpu_count() or 8) // 2))
+try:
+    import performance_governor as _perf_governor
+except Exception:
+    _perf_governor = None
 _whisper_model = None
 _whisper_model_load_failed = False
 _whisper_model_lock = threading.Lock()
 
 
+# WARNING: the thread count is fixed when the model loads; a performance-mode change applies on the next launch.
+def _asr_thread_count():
+    if _perf_governor is not None:
+        try:
+            return max(1, int(_perf_governor.whisper_threads(_perf_governor.get_profile())))
+        except Exception:
+            pass
+    return _ASR_CPU_THREADS
+
+
 @contextlib.contextmanager
-def _asr_slot(label=""):
-    """Like `with _ASR_SEMAPHORE:`, but yields to live playback first
-    (same courtesy _fast_disk_io_slot gives channel changes -- see
-    _yield_to_live_playback) and logs real contention."""
+def _asr_slot(label="", hold_sec=0.0, skip_if_held=False):
+    """Context manager like `with _ASR_SEMAPHORE:` that yields to live playback, then asks the governor's whisper lane to admit the job; yields True when the job may run, False when skip_if_held is set and the hold expired."""
     _yield_to_live_playback(label)
-    _wait_start = _now_ms()
-    with _ASR_SEMAPHORE:
-        _waited_ms = _now_ms() - _wait_start
-        yield
+    _hold = max(0.0, float(hold_sec or 0.0))
+    with _gov_gate("whisper_slots", priority=(_hold <= 0.0), timeout=(_hold if _hold > 0.0 else None),
+                   label=label) as _admitted:
+        if _admitted:
+            with _ASR_SEMAPHORE:
+                yield True
+            return
+        if skip_if_held:
+            yield False
+            return
+        with _gov_gate("whisper_slots", priority=True, label=label):
+            with _ASR_SEMAPHORE:
+                yield True
+
+
+def _whisper_gate_hold_seconds(lead, expected_chunk_sec):
+    """How long the governor may hold the next live chunk back while the caption lead stays safe; 0 when the lead is too small to wait."""
+    if _perf_governor is None:
+        return 0.0
+    try:
+        spare = lead - expected_chunk_sec - _perf_governor.WHISPER_GATE_KEEP_LEAD_SECONDS
+        return max(0.0, min(spare, _perf_governor.WHISPER_GATE_MAX_HOLD_SECONDS))
+    except Exception:
+        return 0.0
 
 
 def _get_whisper_model():
-    """Lazily load the faster-whisper model once and reuse it for every
-    subsequent call. faster-whisper is an optional dependency -- if it
-    isn't installed, this logs one warning (not one per file) and every
-    caller treats a None return the same as "ASR unavailable right now",
-    falling back to no captions rather than crashing."""
+    """Lazily load the faster-whisper model once and reuse it; returns None (one warning logged) when it isn't installed."""
     global _whisper_model, _whisper_model_load_failed
     if _whisper_model is not None:
         return _whisper_model
@@ -4389,129 +3682,272 @@ def _get_whisper_model():
                 "Install with: pip install faster-whisper"
             )
             return None
+        _threads = _asr_thread_count()
         try:
             try:
-                # Already downloaded? Load straight from disk. Without this,
-                # faster-whisper phones huggingface.co on every launch first
-                # (visible in the logs as a GET .../revision/main right before
-                # "model ready"), adding network latency to the first tune-in.
+                # WARNING: keep offline mode on or faster-whisper contacts huggingface.co on every launch and delays the first tune-in.
                 _whisper_model = WhisperModel(
                     _ASR_MODEL_SIZE, device="cpu", compute_type="int8",
-                    cpu_threads=_ASR_CPU_THREADS,
+                    cpu_threads=_threads,
                     download_root=resolve_whisper_model_dir(),
                     local_files_only=True,
                 )
             except Exception:
-                _whisper_model = WhisperModel(   # not on disk yet: normal download path
+                _whisper_model = WhisperModel(
                     _ASR_MODEL_SIZE, device="cpu", compute_type="int8",
-                    cpu_threads=_ASR_CPU_THREADS,
+                    cpu_threads=_threads,
                     download_root=resolve_whisper_model_dir(),
                 )
             log.info("[ASR] faster-whisper '%s' model ready (CPU, int8, %d threads).",
-                     _ASR_MODEL_SIZE, _ASR_CPU_THREADS)
+                     _ASR_MODEL_SIZE, _threads)
         except Exception as e:
             _whisper_model_load_failed = True
             log.warning("[ASR] failed to load whisper model: %s", e)
             return None
-        # BUG FIX (live captions' first chunk runs at ~1x real-time instead
-        # of faster): a freshly loaded ctranslate2 model pays real one-time
-        # setup cost (thread pool spin-up, buffer allocation, kernel
-        # selection) on its FIRST transcribe() call, not on WhisperModel()
-        # construction. Left alone, that cost lands on whichever chunk
-        # happens to be first -- almost always a live caption session's
-        # opening chunk right after someone turns captions on or changes
-        # channel, which is exactly when there's no lead built yet to
-        # absorb it. Paying it here instead, on a throwaway 1s silent
-        # buffer immediately after load (once per app run, off the
-        # critical path of any real chunk), means the first real chunk
-        # transcribes at the same speed every later chunk does. Best
-        # effort: if this fails for any reason, fall through and let the
-        # first real chunk pay the cost the old way rather than treating
-        # a warm-up failure as a load failure.
         try:
             import numpy as _np
-            _silence = _np.zeros(16000, dtype="float32")  # 1s @ 16kHz
+            _silence = _np.zeros(16000, dtype="float32")
             _segs, _ = _whisper_model.transcribe(
                 _silence, language=_ASR_LANGUAGE, beam_size=1)
-            list(_segs)  # force the generator to actually run inference
+            list(_segs)
         except Exception as e:
             log.warning("[ASR] model warm-up skipped: %s", e)
     return _whisper_model
 
 
-# ---------------------------------------------------------------------------
-# Speech-to-text core shared by the DVD player's disk-cached captions
-# (generate_captions_via_asr_chunked) and the TV overlay's live captions
-# (LiveCaptionSession).
-#
-# Pipeline for one chunk WAV:
-#   1. Silero VAD finds the speech islands (in the chunk's OWN timeline, so
-#      every timestamp below is something measured here, not remapped by
-#      faster-whisper's internal vad_filter bookkeeping -- that remap drifted
-#      on chunks with a lot of silence).
-#   2. Islands separated by a short pause are merged into one clip, so
-#      Whisper hears whole sentences (context = correct spelling) and pays its
-#      fixed per-call cost once instead of once per fragment.
-#   3. Each clip is transcribed with word timestamps.
-#   4. Every Whisper segment is split into short, caption-sized cues.
-# ---------------------------------------------------------------------------
+def _live_asr_running():
+    """True while any live caption session has been started and not stopped."""
+    for sess in list(_LIVE_RUNNING_SESSIONS):
+        if not sess._stopped():
+            return True
+    return False
+
+
+_whisper_unload_thread = None
+_whisper_unload_lock = threading.Lock()
+
+
+def release_whisper_model(reason):
+    """Frees the Whisper model once no live caption session is running and no transcription holds the slot; returns True when an unload was scheduled."""
+    global _whisper_unload_thread
+    if _whisper_model is None:
+        return False
+    with _whisper_unload_lock:
+        if _whisper_unload_thread is not None and _whisper_unload_thread.is_alive():
+            return True
+        wait_s = 20.0
+        if _perf_governor is not None:
+            wait_s = float(getattr(_perf_governor, "WHISPER_UNLOAD_WAIT_SECONDS", wait_s))
+
+        def _job():
+            global _whisper_model
+            if not _ASR_SEMAPHORE.acquire(timeout=wait_s):
+                log.info("[ASR] model unload skipped (%s): a transcription still holds the slot", reason)
+                return
+            try:
+                if _live_asr_running():
+                    return
+                with _whisper_model_lock:
+                    if _whisper_model is None:
+                        return
+                    _whisper_model = None
+                import gc as _gc
+                _gc.collect()
+                log.info("[ASR] whisper model unloaded (%s)", reason)
+            finally:
+                _ASR_SEMAPHORE.release()
+
+        _whisper_unload_thread = threading.Thread(target=_job, daemon=True, name="whisper-unload")
+        _whisper_unload_thread.start()
+    return True
+
+
+# ============================================================================
+# SECTION: Speech-to-text core
+# ============================================================================
+# WARNING: shared by the DVD player's disk-cached captions and the TV overlay's live captions; a change here affects both.
 _asr_vad_utils_load_failed = False
 
-# Silero VAD sensitivity. The library default (0.5) is tuned for clean speech;
-# dialogue under music/effects scores lower and whole chunks came back with no
-# speech at all. The no-speech/logprob guard in _asr_filter_cues still removes
-# hallucinations over pure music. Raise toward 0.5 if captions appear over
-# non-speech.
-_ASR_VAD_THRESHOLD = 0.35
-_ASR_VAD_MIN_SPEECH_MS = 150       # library default 250 drops short exclamations ("No!")
-# Speech islands closer together than this become one clip (the pause stays in
-# the clip, so timestamps remain exact); a merged clip never exceeds
-# _ASR_MAX_CLIP_SEC (Whisper's own window is 30s).
+_ASR_VAD_THRESHOLD = 0.25
+# VALUES CHANGE HERE
+_ASR_VAD_MIN_SPEECH_MS = 150
+# VALUES CHANGE HERE
 _ASR_MERGE_GAP_SEC = 1.5
-# Live captions only: the extract used to hear the file's RAW audio (no gain,
-# no leveling), so a quieter second speaker (e.g. a kid answering an adult)
-# could fall under the VAD threshold and never reach Whisper. Local dynamic
-# leveling lifts quiet voices without touching playback audio.
 _ASR_LIVE_AUDIO_FILTER = "dynaudnorm=f=150:g=15:p=0.9:m=20"
 _ASR_MAX_CLIP_SEC = 25.0
 
-# Caption-sized cues. Whisper segments can run 10-20s across several
-# sentences; the overlay only holds a cue on screen for a few seconds from its
-# START, and _asr_merge_cues treats a short cue inside a long one as a
-# duplicate and drops it. So every segment is split at sentence ends / pauses /
-# a length cap using its word timestamps.
 _ASR_CUE_MAX_SEC = 5.0
-_ASR_CUE_MAX_CHARS = 84            # two lines of ~42
+# VALUES CHANGE HERE
+_ASR_CUE_MAX_CHARS = 84
 _ASR_CUE_GAP_BREAK_SEC = 0.8
 _ASR_CUE_MIN_SHOW_SEC = 1.2
 _ASR_CUE_TRAIL_HOLD_SEC = 0.3
 _ASR_SENTENCE_END = (".", "?", "!", "\u2026")
 
-# Hallucination guard: Whisper's own "this is silence" signal.
+# VALUES CHANGE HERE (hallucination guard)
 _ASR_NO_SPEECH_PROB_MAX = 0.75
 _ASR_AVG_LOGPROB_MIN = -1.5
 
-import re as _re_asr
+# VALUES CHANGE HERE (prompt-echo guard)
+_ASR_ECHO_MAX_WORD_PROB = 0.5
+_ASR_ECHO_REPEAT_MIN = 3
+_ASR_ECHO_REPEAT_MAX_WORD_PROB = 0.75
+_ASR_STOCK_PHRASE_RE = re.compile(
+    r"^(thanks for watching|thank you for watching|please subscribe( to (my|the) channel)?|"
+    r"subtitles by .*|captions by .*|amara\.org.*|www\..*)[.! ]*$", re.I)
 
-_ASR_PROMPT_JUNK_RE = _re_asr.compile(
+# VALUES CHANGE HERE (gap recovery)
+_ASR_RECOVER_ENABLED = True
+_ASR_RECOVER_MIN_GAP_SEC = 0.9
+_ASR_RECOVER_PAD_SEC = 0.3
+_ASR_RECOVER_MAX_WINDOWS = 2
+_ASR_RECOVER_JOIN_SEC = 3.0
+_ASR_RECOVER_MAX_WINDOW_SEC = 14.0
+_ASR_RECOVER_BEAM = 3
+_ASR_RECOVER_MAX_SEC = 6.0
+_ASR_RECOVER_MAX_FRAC_OF_CHUNK = 0.5
+_ASR_RECOVER_KEEP_LEAD_SEC = 8.0
+_ASR_RECOVER_MIN_WORD_PROB = 0.55
+_ASR_RECOVER_MIN_AVG_LOGPROB = -0.95
+_ASR_RECOVER_MAX_NO_SPEECH = 0.5
+_ASR_RECOVER_MAX_WORDS_PER_SEC = 5.0
+_ASR_RECOVER_MAX_OVERLAP_FRAC = 0.3
+_ASR_RUNAWAY_CHAR_RUN = 12
+_ASR_RUNAWAY_WORD_RUN = 6
+
+# VALUES CHANGE HERE (repetition-loop guard)
+_ASR_LOOP_MIN_CHARS = 24
+_ASR_LOOP_COMPRESSION_MAX = 2.4
+
+# VALUES CHANGE HERE (music marking)
+_ASR_MUSIC_CAPTION_TEXT = "\u266a"
+_ASR_MUSIC_MIN_SEC = 2.0
+_ASR_MUSIC_BRIDGE_SEC = 1.0
+_ASR_MUSIC_PIECE_SEC = 6.0
+_ASR_MUSIC_MIN_RMS_DB = -38.0
+_ASR_MUSIC_PEAK_PERSIST_MIN = 0.60
+_ASR_MUSIC_ENVELOPE_CV_MAX = 0.35
+_ASR_MUSIC_REPLACE_FRAC = 0.7
+_ASR_MUSIC_REPLACE_MAX_WORD_PROB = 0.5
+
+# VALUES CHANGE HERE (name hint)
+_ASR_NAME_MIN_WORD_PROB = 0.85
+_ASR_NAME_MIN_CUES = 2
+_ASR_NAME_MIN_LEN = 3
+_ASR_NAME_MAX_LEARNED = 6
+_ASR_NAME_SIMILAR_MIN = 0.75
+
+# VALUES CHANGE HERE (chunk-boundary carry-over)
+_ASR_CARRY_COVER_FRAC = 0.4
+_ASR_CARRY_NEAR_SEC = 1.5
+
+
+def _asr_words(text):
+    return re.findall(r"[a-z0-9']+", (text or "").lower())
+
+
+def _asr_prompt_vocab(prompt):
+    return frozenset(_asr_words(prompt))
+
+
+def _asr_max_sentence_repeat(text):
+    """Longest run of identical consecutive sentences ("Prisoners of Love. Prisoners of Love. ...")."""
+    sents = [" ".join(_asr_words(x)) for x in re.split(r"(?<=[.!?])\s+", (text or "").strip())]
+    sents = [x for x in sents if x]
+    best = run = 0
+    prev = None
+    for x in sents:
+        run = run + 1 if x == prev else 1
+        prev = x
+        best = max(best, run)
+    return best
+
+
+def _asr_longest_word_run(words):
+    best = run = 0
+    prev = None
+    for w in words:
+        run = run + 1 if w == prev else 1
+        prev = w
+        best = max(best, run)
+    return best
+
+
+def _asr_loop_reason(text):
+    """Why a segment's own text is a decoder loop (a few characters repeated over and over), or None."""
+    t = (text or "").strip()
+    if len(t) < _ASR_LOOP_MIN_CHARS:
+        return None
+    raw = t.encode("utf-8", "ignore")
+    ratio = len(raw) / float(max(1, len(zlib.compress(raw))))
+    if ratio >= _ASR_LOOP_COMPRESSION_MAX:
+        return "repetition loop: the segment's own text compresses %.1fx (limit %.1fx)" % (
+            ratio, _ASR_LOOP_COMPRESSION_MAX)
+    return None
+
+
+def _asr_cue_reject_reason(text, word_prob, vocab):
+    """Why a cue is a hallucination (stock phrase or an echo of the title hint), or None to keep it."""
+    words = _asr_words(text)
+    if not words:
+        return None
+    if _ASR_STOCK_PHRASE_RE.match((text or "").strip()):
+        return "stock phrase Whisper invents over silence/noise"
+    if vocab and word_prob is not None and all(w in vocab for w in words):
+        if word_prob < _ASR_ECHO_MAX_WORD_PROB:
+            return "title echo: only title words, word confidence %.2f < %.2f" % (
+                word_prob, _ASR_ECHO_MAX_WORD_PROB)
+        if (_asr_max_sentence_repeat(text) >= _ASR_ECHO_REPEAT_MIN
+                and word_prob < _ASR_ECHO_REPEAT_MAX_WORD_PROB):
+            return "repeated title echo: only title words said %d+ times, word confidence %.2f < %.2f" % (
+                _ASR_ECHO_REPEAT_MIN, word_prob, _ASR_ECHO_REPEAT_MAX_WORD_PROB)
+    return None
+
+
+def _asr_recovery_reject_reason(text, word_prob, avg_logprob, no_speech_prob, gap_sec, vocab):
+    """The strict gate for text found by gap recovery; None means accept."""
+    base = _asr_cue_reject_reason(text, word_prob, vocab)
+    if base:
+        return base
+    words = _asr_words(text)
+    if not words:
+        return "no words"
+    if word_prob is None or word_prob < _ASR_RECOVER_MIN_WORD_PROB:
+        return "word confidence %s < %.2f" % (
+            "n/a" if word_prob is None else "%.2f" % word_prob, _ASR_RECOVER_MIN_WORD_PROB)
+    if avg_logprob is not None and avg_logprob < _ASR_RECOVER_MIN_AVG_LOGPROB:
+        return "avg_logprob %.2f < %.2f" % (avg_logprob, _ASR_RECOVER_MIN_AVG_LOGPROB)
+    if no_speech_prob is not None and no_speech_prob > _ASR_RECOVER_MAX_NO_SPEECH:
+        return "no_speech %.2f > %.2f" % (no_speech_prob, _ASR_RECOVER_MAX_NO_SPEECH)
+    if (re.search(r"(.)\1{%d,}" % (_ASR_RUNAWAY_CHAR_RUN - 1), text or "")
+            or _asr_longest_word_run(words) >= _ASR_RUNAWAY_WORD_RUN):
+        return "runaway repetition"
+    if len(words) > gap_sec * _ASR_RECOVER_MAX_WORDS_PER_SEC + 1:
+        return "%d words cannot fit in %.1fs" % (len(words), gap_sec)
+    return None
+
+
+_ASR_PROMPT_TAG_RE = re.compile(
+    r"\bs\d{1,2}\s*e\d{1,3}(?:\s*[-\u2013]?\s*e?\d{1,3})*\b"
+    r"|\b\d{1,2}x\d{1,3}(?:\s*[-\u2013]\s*\d{1,3})*\b"
+    r"|\bseason\s*\d+\b|\bepisode\s*\d+\b|\bepisodes?\s*\d+\b",
+    re.I)
+_ASR_PROMPT_JUNK_RE = re.compile(
     r"^(s\d{1,2}\s*e\d{1,3}|e\d{1,3}|\d{1,4}|\d{1,2}x\d{1,3}|season\s*\d+|episode\s*\d+)$",
-    _re_asr.I)
+    re.I)
 
 
 def _asr_prompt_for(file_path):
-    """Short vocabulary hint for Whisper built from the file's own names, e.g.
-    ".../Aladdin - 101 - Air Feathered Friends.mkv" -> "Aladdin. Air Feathered
-    Friends." Biases spelling of character names and title words. None if
-    nothing useful can be derived."""
+    """Short vocabulary hint for Whisper built from the file's own names."""
     try:
         stem = os.path.splitext(os.path.basename(file_path))[0]
-        stem = _re_asr.sub(r"[\(\[][^\)\]]*[\)\]]", " ", stem)          # (480p - DVDRip), [YIFY]
-        stem = _re_asr.sub(r"[._]+", " ", stem)
+        stem = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", stem)
+        stem = re.sub(r"[._]+", " ", stem)
+        stem = _ASR_PROMPT_TAG_RE.sub(" ", stem)
         parts = [p.strip() for p in stem.split(" - ")]
         parts = [p for p in parts if p and not _ASR_PROMPT_JUNK_RE.match(p)]
         if len(parts) == 1:
-            # "Ace Ventura Pet Detective 1994 1080p ..." -- cut at the year/quality tag
-            parts = [_re_asr.split(r"\b(19|20)\d{2}\b|\b(480|720|1080|2160)p\b", parts[0])[0].strip()]
+            parts = [re.split(r"\b(19|20)\d{2}\b|\b(480|720|1080|2160)p\b", parts[0])[0].strip()]
         parts = [p for p in parts if p]
         if not parts:
             return None
@@ -4521,8 +3957,7 @@ def _asr_prompt_for(file_path):
 
 
 def _asr_merge_spans(spans, sampling_rate):
-    """Merge VAD spans (dicts of sample indices) whose gap is under
-    _ASR_MERGE_GAP_SEC, without letting a merged clip exceed _ASR_MAX_CLIP_SEC."""
+    """Merge VAD spans whose gap is under _ASR_MERGE_GAP_SEC without letting a clip exceed _ASR_MAX_CLIP_SEC."""
     merged = []
     max_gap = int(_ASR_MERGE_GAP_SEC * sampling_rate)
     max_len = int(_ASR_MAX_CLIP_SEC * sampling_rate)
@@ -4537,17 +3972,23 @@ def _asr_merge_spans(spans, sampling_rate):
 
 
 def _asr_split_segment(seg, offset=0.0):
-    """One Whisper segment -> list of short caption cues (SimpleNamespace with
-    start/end/text/no_speech_prob/avg_logprob), times shifted by `offset`."""
+    """Split one Whisper segment into short caption cues, with times shifted by `offset`."""
     nsp = getattr(seg, "no_speech_prob", None)
     alp = getattr(seg, "avg_logprob", None)
+    loop = _asr_loop_reason(getattr(seg, "text", None))
 
-    def mk(a, b, text):
+    def _mean_prob(ws):
+        ps = [w.probability for w in ws if getattr(w, "probability", None) is not None]
+        return (sum(ps) / len(ps)) if ps else None
+
+    def mk(a, b, text, ws=()):
         return types.SimpleNamespace(start=a, end=b, text=text,
-                                     no_speech_prob=nsp, avg_logprob=alp)
+                                     no_speech_prob=nsp, avg_logprob=alp,
+                                     word_prob=_mean_prob(ws), recovered=False, runaway=loop,
+                                     word_list=[(w.word, getattr(w, "probability", None)) for w in ws])
 
-    whole = [mk(offset + float(seg.start), offset + float(seg.end), (seg.text or "").strip())]
     words = getattr(seg, "words", None) or []
+    whole = [mk(offset + float(seg.start), offset + float(seg.end), (seg.text or "").strip(), words)]
     if not words or any(getattr(w, "start", None) is None or getattr(w, "end", None) is None
                         for w in words):
         return whole
@@ -4557,7 +3998,7 @@ def _asr_split_segment(seg, offset=0.0):
         if cur:
             text = "".join((w.word or "") for w in cur).strip()
             if text:
-                cues.append(mk(offset + float(cur[0].start), offset + float(cur[-1].end), text))
+                cues.append(mk(offset + float(cur[0].start), offset + float(cur[-1].end), text, list(cur)))
             del cur[:]
 
     for w in words:
@@ -4580,8 +4021,7 @@ def _asr_split_segment(seg, offset=0.0):
 
 
 def _asr_finalize_cue_timing(cues):
-    """Give each cue a readable minimum on-screen time and a short trailing
-    hold, without ever running into the next cue."""
+    """Give each cue a readable minimum on-screen time and a short trailing hold without running into the next cue."""
     cues.sort(key=lambda c: c.start)
     for i, c in enumerate(cues):
         end = max(c.end + _ASR_CUE_TRAIL_HOLD_SEC, c.start + _ASR_CUE_MIN_SHOW_SEC)
@@ -4594,26 +4034,118 @@ class _SegList(list):
     """list of cue-like objects plus VAD stats for the per-chunk log line."""
     vad_islands = 0
     vad_speech_sec = 0.0
+    recover_tried = 0
+    recover_ok = 0
+    recover_sec = 0.0
+    music_secs = ()
+    audio_secs = 0.0
+
+
+def _asr_uncovered_ranges(a, b, intervals):
+    """Parts of [a, b] not covered by any (start, end) in `intervals`."""
+    out, cur = [], a
+    for s, e in sorted(intervals):
+        if e <= cur:
+            continue
+        if s >= b:
+            break
+        if s > cur:
+            out.append((cur, s))
+        cur = max(cur, e)
+    if cur < b:
+        out.append((cur, b))
+    return out
+
+
+def _asr_recover_gaps(model, audio, sampling_rate, raw_spans, out, own_len, language, prompt,
+                      budget_sec, should_stop):
+    """Re-read VAD-detected speech the first pass left uncaptioned and append accepted cues to `out`. Never raises."""
+    t_start = time.monotonic()
+    deadline = t_start + budget_sec
+    vocab = _asr_prompt_vocab(prompt)
+    secs = len(audio) / float(sampling_rate)
+    try:
+        cue_iv = [(float(c.start), float(c.end)) for c in out]
+        gaps = []
+        for sp in raw_spans:
+            a = sp["start"] / float(sampling_rate)
+            b = min(sp["end"] / float(sampling_rate), own_len)
+            if a >= own_len:
+                continue
+            for ga, gb in _asr_uncovered_ranges(a, b, cue_iv):
+                if (gb - ga >= _ASR_RECOVER_MIN_GAP_SEC
+                        and _asr_music_fraction(getattr(out, "music_secs", ()), ga, gb) < _ASR_MUSIC_REPLACE_FRAC):
+                    gaps.append((ga, gb))
+        gaps = sorted(gaps)
+    except Exception as e:
+        log.warning("[ASR] gap recovery could not analyse the chunk: %s", e)
+        return
+    windows = []
+    for ga, gb in sorted(gaps):
+        if (windows and ga - windows[-1]["gaps"][-1][1] <= _ASR_RECOVER_JOIN_SEC
+                and gb - windows[-1]["gaps"][0][0] <= _ASR_RECOVER_MAX_WINDOW_SEC):
+            windows[-1]["gaps"].append((ga, gb))
+        else:
+            windows.append({"gaps": [(ga, gb)]})
+    for w in windows:
+        w["lo"], w["hi"] = w["gaps"][0][0], w["gaps"][-1][1]
+        w["sec"] = sum(b - a for a, b in w["gaps"])
+    windows = sorted(sorted(windows, key=lambda w: -w["sec"])[:_ASR_RECOVER_MAX_WINDOWS], key=lambda w: w["lo"])
+    for w in windows:
+        ga, gb = w["lo"], w["hi"]
+        try:
+            if (should_stop and should_stop()) or time.monotonic() >= deadline:
+                break
+            s0 = max(0.0, ga - _ASR_RECOVER_PAD_SEC)
+            s1 = min(secs, gb + _ASR_RECOVER_PAD_SEC)
+            clip = audio[int(s0 * sampling_rate):int(s1 * sampling_rate)]
+            if clip.size == 0:
+                continue
+            out.recover_tried += 1
+            segs, _info = model.transcribe(
+                clip, language=language, beam_size=_ASR_RECOVER_BEAM, vad_filter=False,
+                condition_on_previous_text=False, initial_prompt=None, word_timestamps=True,
+                temperature=0.0, no_speech_threshold=None, log_prob_threshold=None,
+                compression_ratio_threshold=None)
+            for seg in segs:
+                for c in _asr_split_segment(seg, s0):
+                    text = (c.text or "").strip()
+                    mid = (float(c.start) + float(c.end)) / 2.0
+                    home = next(((a, b) for a, b in w["gaps"] if a - 0.15 <= mid <= b + 0.15), None)
+                    reason = getattr(c, "runaway", None) or _asr_recovery_reject_reason(
+                        text, c.word_prob, c.avg_logprob, c.no_speech_prob,
+                        ((home[1] - home[0]) if home else (gb - ga)) + 2 * _ASR_RECOVER_PAD_SEC, vocab)
+                    if not reason and home is None:
+                        reason = "lies outside the gaps (%.2f-%.2f)" % (ga, gb)
+                    if not reason:
+                        dur = max(0.001, float(c.end) - float(c.start))
+                        ov = sum(max(0.0, min(float(c.end), e) - max(float(c.start), s)) for s, e in cue_iv)
+                        if ov > _ASR_RECOVER_MAX_OVERLAP_FRAC * dur:
+                            reason = "overlaps cues that already exist"
+                    if not reason:
+                        _w = set(_asr_words(text))
+                        if len(_asr_words(text)) >= 3:
+                            for nc in out:
+                                if nc is c or max(0.0, float(c.start) - float(nc.end),
+                                                  float(nc.start) - float(c.end)) > 1.5:
+                                    continue
+                                if _w and _w <= set(_asr_words(nc.text)):
+                                    reason = "repeats the words of a neighbouring cue"
+                                    break
+                    if reason:
+                        continue
+                    c.recovered = True
+                    out.append(c)
+                    cue_iv.append((float(c.start), float(c.end)))
+                    out.recover_ok += 1
+        except Exception as e:
+            log.warning("[ASR] gap recovery window %.2f-%.2f failed: %s", ga, gb, e)
+    out.recover_sec = time.monotonic() - t_start
 
 
 def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=None,
-                          temperature=None, should_stop=None):
-    """Transcribe one already-extracted chunk WAV. Returns a list of cue-like
-    objects (.start/.end/.text/.no_speech_prob/.avg_logprob) whose times are
-    chunk-relative seconds in wav_path's own timeline, so callers just add the
-    chunk's absolute file position.
-
-    temperature=None keeps faster-whisper's default fallback ladder (re-decode
-    up to 5 more times, sampling, when a decode looks bad). Live captions pass
-    0.0 = one decode pass: a single bad clip (screaming, effects) was observed
-    taking ~50s through that ladder, which put captions 30s+ behind playback.
-
-    should_stop: optional zero-arg callable polled between clips and between
-    segments so a channel change doesn't wait out a long decode.
-
-    Falls back to faster-whisper's built-in vad_filter (same 500ms silence
-    split) if its VAD utilities can't be imported.
-    """
+                          temperature=None, should_stop=None, own_len=None, recover_budget_sec=0.0):
+    """Transcribe one extracted chunk WAV; when `own_len` and a positive `recover_budget_sec` are given, re-read missed speech afterwards."""
     global _asr_vad_utils_load_failed
 
     def _stopped():
@@ -4646,19 +4178,22 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
         _asr_finalize_cue_timing(out)
         return out
 
-    audio = decode_audio(wav_path)  # mono float32 @ 16 kHz
+    audio = decode_audio(wav_path)
     sampling_rate = 16000
     min_silence = _ASR_VAD_PARAMETERS["min_silence_duration_ms"]
     try:
         vad_opts = VadOptions(threshold=_ASR_VAD_THRESHOLD, min_silence_duration_ms=min_silence,
                               min_speech_duration_ms=_ASR_VAD_MIN_SPEECH_MS)
-    except TypeError:  # older faster-whisper without these fields
+    except TypeError:
         vad_opts = VadOptions(min_silence_duration_ms=min_silence)
     raw_spans = get_speech_timestamps(audio, vad_opts)
     out = _SegList()
     out.vad_islands = len(raw_spans)
     out.vad_speech_sec = sum((sp["end"] - sp["start"]) for sp in raw_spans) / sampling_rate
-    for span in _asr_merge_spans(raw_spans, sampling_rate):
+    _merged_spans = _asr_merge_spans(raw_spans, sampling_rate)
+    out.audio_secs = len(audio) / float(sampling_rate)
+    out.music_secs = _asr_music_seconds(audio, sampling_rate)
+    for span in _merged_spans:
         if _stopped():
             break
         clip = audio[span["start"]:span["end"]]
@@ -4671,33 +4206,207 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
             condition_on_previous_text=False, initial_prompt=initial_prompt,
             word_timestamps=True, **temp_kw,
         )
+        _n_raw = 0
         for seg in segments_iter:
             if _stopped():
                 break
+            _n_raw += 1
             out.extend(_asr_split_segment(seg, span_start_sec))
         t_clip = time.monotonic() - t_clip
+        if _n_raw == 0 and not _stopped():
+            log.warning("[ASR] speech was detected in %.1fs of audio starting %.1fs into the chunk, "
+                        "but Whisper returned nothing for it", clip.size / float(sampling_rate), span_start_sec)
         if t_clip > 8.0:
             log.warning("[ASR SLOW] %.1fs of speech took %.1fs to transcribe (beam=%s)",
                         clip.size / float(sampling_rate), t_clip, beam_size)
+    if (_ASR_RECOVER_ENABLED and own_len is not None and recover_budget_sec > 0.0 and not _stopped()):
+        _asr_recover_gaps(model, audio, sampling_rate, raw_spans, out, float(own_len), language,
+                          initial_prompt, float(recover_budget_sec), should_stop)
     _asr_finalize_cue_timing(out)
     return out
 
 
-def _asr_filter_cues(cues, chunk_start, chunk_end, at_file_end):
-    """Turn a chunk's cue-like objects into absolute [start, end, text] cues,
-    dropping the ones that don't belong to this chunk or aren't speech.
-    Returns (kept, drops) where drops counts each reason.
+_ASR_NAME_TOKEN_RE = re.compile(r"^[^A-Za-z]*([A-Za-z][A-Za-z\-]*)(?:['\u2019]s)?[^A-Za-z]*$")
 
-    A cue that STARTS at or after chunk_end (audio only present as overlap)
-    belongs to the next chunk, which transcribes it from its own start.
-    """
-    kept = []
-    drops = {"next_chunk": 0, "empty": 0, "not_speech": 0}
+
+def _asr_name_hits(word_list):
+    """Capitalised words in one cue heard at high confidence: {word: True if heard in the middle of a sentence}."""
+    hits = {}
+    at_start = True
+    for raw, prob in word_list:
+        tok = (raw or "").strip()
+        starts_sentence = at_start
+        at_start = tok.rstrip("\"'\u201d\u2019)").endswith(_ASR_SENTENCE_END)
+        m = _ASR_NAME_TOKEN_RE.match(tok)
+        if not m or prob is None or prob < _ASR_NAME_MIN_WORD_PROB:
+            continue
+        name = m.group(1)
+        if len(name) < _ASR_NAME_MIN_LEN or not name[0].isupper() or not any(ch.islower() for ch in name[1:]):
+            continue
+        hits[name] = hits.get(name, False) or not starts_sentence
+    return hits
+
+
+def _asr_learn_names(stats, word_lists):
+    """Counts, per capitalised word, the cues it was heard clearly in and how many had it mid-sentence."""
+    for wl in word_lists:
+        if not wl:
+            continue
+        for name, mid in _asr_name_hits(wl).items():
+            e = stats.setdefault(name, {"cues": 0, "mid": 0, "order": len(stats)})
+            e["cues"] += 1
+            if mid:
+                e["mid"] += 1
+
+
+def _asr_learned_names(stats):
+    """Names worth hinting: heard clearly in several cues and capitalised mid-sentence at least once, most-heard first."""
+    ok = [(n, e) for n, e in stats.items() if e["cues"] >= _ASR_NAME_MIN_CUES and e["mid"] >= 1]
+    ok.sort(key=lambda ne: (-ne[1]["cues"], ne[1]["order"]))
+    names = []
+    for n, _ in ok:
+        # WARNING: a near-identical spelling of a name already chosen (Bongo next to Pongo) is the same misheard word, not a second name.
+        if any(difflib.SequenceMatcher(None, n.lower(), k.lower()).ratio() >= _ASR_NAME_SIMILAR_MIN for k in names):
+            continue
+        names.append(n)
+        if len(names) >= _ASR_NAME_MAX_LEARNED:
+            break
+    return names
+
+
+def _asr_prompt_with_names(base, names):
+    if not names:
+        return base
+    return ((base + " ") if base else "") + ", ".join(names) + "."
+
+
+def _asr_music_seconds(audio, sampling_rate=16000):
+    """Per-second music flags for decoded audio: loud, with spectral peaks that hold their place and a steady loudness."""
+    n_fft, hop, per_peak = 512, 256, 6
+    flags = []
+    try:
+        win = np.hanning(n_fft).astype(np.float32)
+        lag = 4
+        for sec in range(int(len(audio) // sampling_rate)):
+            seg = np.asarray(audio[sec * sampling_rate:(sec + 1) * sampling_rate], dtype=np.float32)
+            rms = float(np.sqrt(np.mean(seg * seg)) + 1e-9)
+            db = 20.0 * math.log10(rms)
+            n_frames = (len(seg) - n_fft) // hop + 1
+            if db < _ASR_MUSIC_MIN_RMS_DB or n_frames <= lag + 1:
+                flags.append({"db": db, "persist": 0.0, "cv": 0.0, "music": False})
+                continue
+            idx = np.arange(n_fft)[None, :] + hop * np.arange(n_frames)[:, None]
+            frames = seg[idx] * win
+            mag = np.abs(np.fft.rfft(frames, axis=1))[:, 6:129]
+            energy = np.sqrt(np.mean(frames * frames, axis=1))
+            cv = float(np.std(energy) / (np.mean(energy) + 1e-9))
+            peaks = np.zeros(mag.shape, dtype=bool)
+            inner = (mag[:, 1:-1] > mag[:, :-2]) & (mag[:, 1:-1] >= mag[:, 2:])
+            order = np.argsort(-np.where(inner, mag[:, 1:-1], 0.0), axis=1)[:, :per_peak]
+            rows = np.arange(n_frames)[:, None]
+            keep = inner[rows, order] & (mag[:, 1:-1][rows, order] > 0.1 * mag.max(axis=1, keepdims=True))
+            peaks[:, 1:-1][rows, order] = keep
+            wide = peaks.copy()
+            wide[:, 1:] |= peaks[:, :-1]
+            wide[:, :-1] |= peaks[:, 1:]
+            held = (peaks[:-lag] & wide[lag:]).sum()
+            total = peaks[:-lag].sum()
+            persist = float(held) / float(total) if total else 0.0
+            flags.append({"db": db, "persist": persist, "cv": cv,
+                          "music": persist >= _ASR_MUSIC_PEAK_PERSIST_MIN and cv <= _ASR_MUSIC_ENVELOPE_CV_MAX})
+    except Exception as e:
+        log.warning("[ASR] music analysis failed: %s", e)
+        return []
+    return flags
+
+
+def _asr_music_runs(flags, own_len):
+    """(start, end) second ranges inside own_len where music-flagged seconds run for _ASR_MUSIC_MIN_SEC or more, bridging short gaps."""
+    runs, start, last = [], None, None
+    limit = int(own_len)
+    for i, f in enumerate(flags[:limit]):
+        if f["music"]:
+            if start is None:
+                start = i
+            elif i - last - 1 > _ASR_MUSIC_BRIDGE_SEC:
+                runs.append((start, last + 1))
+                start = i
+            last = i
+    if start is not None:
+        runs.append((start, last + 1))
+    return [(a, b) for a, b in runs if b - a >= _ASR_MUSIC_MIN_SEC]
+
+
+def _asr_music_fraction(flags, a, b):
+    """Share of the seconds between a and b (chunk-relative) that are music-flagged."""
+    lo, hi = int(max(0.0, a)), int(math.ceil(max(a, b)))
+    window = flags[lo:hi]
+    if not window:
+        return 0.0
+    return sum(1 for f in window if f["music"]) / float(len(window))
+
+
+def _asr_music_cues(flags, chunk_start, own_len, existing):
+    """[start, end, text] music-sign cues for music stretches no existing cue covers, split into short pieces."""
+    cues = []
+    intervals = [(float(c[0]), float(c[1])) for c in existing]
+    for a, b in _asr_music_runs(flags, own_len):
+        for ua, ub in _asr_uncovered_ranges(chunk_start + a, chunk_start + b, intervals):
+            if ub - ua < _ASR_MUSIC_MIN_SEC:
+                continue
+            t = ua
+            while t < ub - 1e-6:
+                piece_end = min(ub, t + _ASR_MUSIC_PIECE_SEC)
+                if ub - piece_end <= 1.0:
+                    piece_end = ub
+                cues.append([t, piece_end, _ASR_MUSIC_CAPTION_TEXT])
+                t = piece_end
+    return cues
+
+
+class _CueList(list):
+    """Kept [start, end, text] cues plus `carry`: valid cues that start inside the next chunk's range."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.carry = []
+        self.words = []
+
+
+def _asr_carry_is_covered(cue, new_cues):
+    """True when the chunk after a boundary already produced this cue (same time, or the same words just beside it)."""
+    cs, ce, ct = cue
+    span = max(0.001, ce - cs)
+    a = (ct or "").strip().lower()
+    for ns, ne, nt in new_cues:
+        if min(ce, ne) - max(cs, ns) >= _ASR_CARRY_COVER_FRAC * span:
+            return True
+        b = (nt or "").strip().lower()
+        if (a and b and ns <= ce + _ASR_CARRY_NEAR_SEC and ne >= cs - _ASR_CARRY_NEAR_SEC
+                and (a in b or b in a
+                     or difflib.SequenceMatcher(None, a, b).ratio() >= _ASR_DUP_TEXT_SIMILARITY_MIN)):
+            return True
+    return False
+
+
+def _asr_filter_cues(cues, chunk_start, chunk_end, at_file_end, prompt=None, music_secs=None):
+    """Turn a chunk's cue-like objects into absolute [start, end, text] cues, dropping out-of-chunk, non-speech and hallucinated ones."""
+    kept = _CueList()
+    drops = {"next_chunk": 0, "empty": 0, "not_speech": 0, "hallucination": 0}
+    vocab = _asr_prompt_vocab(prompt)
     for c in cues:
         s_abs = chunk_start + float(c.start)
         e_abs = chunk_start + float(c.end)
         if not at_file_end and s_abs >= chunk_end:
             drops["next_chunk"] += 1
+            _ctext = (c.text or "").strip()
+            _cnsp = getattr(c, "no_speech_prob", None)
+            _calp = getattr(c, "avg_logprob", None)
+            if (_ctext and e_abs > s_abs and not getattr(c, "runaway", None)
+                    and not (_cnsp is not None and _calp is not None
+                             and _cnsp > _ASR_NO_SPEECH_PROB_MAX and _calp < _ASR_AVG_LOGPROB_MIN)
+                    and not _asr_cue_reject_reason(_ctext, getattr(c, "word_prob", None), vocab)):
+                kept.carry.append([s_abs, e_abs, _ctext])
             continue
         text = (c.text or "").strip()
         if not text or e_abs <= s_abs:
@@ -4709,15 +4418,23 @@ def _asr_filter_cues(cues, chunk_start, chunk_end, at_file_end):
                 and nsp > _ASR_NO_SPEECH_PROB_MAX and alp < _ASR_AVG_LOGPROB_MIN):
             drops["not_speech"] += 1
             continue
+        _why = getattr(c, "runaway", None) or _asr_cue_reject_reason(text, getattr(c, "word_prob", None), vocab)
+        if _why:
+            drops["hallucination"] += 1
+            continue
+        _wp = getattr(c, "word_prob", None)
+        if (music_secs and _wp is not None and _wp < _ASR_MUSIC_REPLACE_MAX_WORD_PROB
+                and _asr_music_fraction(music_secs, s_abs - chunk_start, e_abs - chunk_start) >= _ASR_MUSIC_REPLACE_FRAC):
+            text = _ASR_MUSIC_CAPTION_TEXT
+            kept.words.append(None)
+        else:
+            kept.words.append(getattr(c, "word_list", None))
         kept.append([s_abs, e_abs, text])
     return kept, drops
 
 
 def asr_known_unavailable():
-    """True once this run has found faster-whisper missing or its model
-    unloadable. Cheap (no I/O, no model load), so background workers can
-    skip ASR-only work entirely instead of pacing themselves through a whole
-    backlog just to be told "unavailable" on every file."""
+    """True once this run has found faster-whisper missing or its model unloadable."""
     return bool(_whisper_model_load_failed)
 
 
@@ -4729,46 +4446,27 @@ def _srt_timestamp(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-# ---------------------------------------------------------------------------
-# ASR result reasons.
-#
-# generate_captions_via_asr() / generate_captions_via_asr_chunked() return
-# (srt_path_or_None, reason). The reason is what lets the caller tell
-# "this file genuinely has nothing to caption" (permanent -- safe to cache as
-# "no captions" forever) apart from "we couldn't do it right now" (ASR not
-# installed, a crashed ffmpeg, a shutdown mid-job -- must be retried, never
-# cached as "none"). Caching the second kind as "none" is what used to
-# poison every title the first time this ran without faster-whisper.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Chunked ASR captions (disk-cached)
+# ============================================================================
 ASR_REASON_SUCCESS = "ok"
-ASR_REASON_UNAVAILABLE = "unavailable"            # faster-whisper missing / model failed to load
-ASR_REASON_NO_AUDIO = "no_audio"                  # file has no audio stream       (permanent)
-ASR_REASON_NO_SPEECH = "no_speech"                # whole file transcribed, no speech (permanent)
-ASR_REASON_EXTRACT_FAILED = "extract_failed"      # ffmpeg couldn't read/extract the audio
+ASR_REASON_UNAVAILABLE = "unavailable"
+ASR_REASON_NO_AUDIO = "no_audio"
+ASR_REASON_NO_SPEECH = "no_speech"
+ASR_REASON_EXTRACT_FAILED = "extract_failed"
 ASR_REASON_TRANSCRIBE_FAILED = "transcribe_failed"
-ASR_REASON_INTERRUPTED = "interrupted"            # should_stop() fired; partial progress kept
+ASR_REASON_INTERRUPTED = "interrupted"
 
-# Chunking. The first chunk is deliberately short so the first cues show up
-# within seconds of the job starting; after that, 5-minute chunks keep the
-# per-chunk overhead (audio extract + VAD warm-up) small relative to the
-# transcription itself.
 _ASR_FIRST_CHUNK_SEC = 60.0
 _ASR_CHUNK_SEC = 300.0
-# Each chunk's audio runs this far past its nominal end so a sentence that
-# starts inside the chunk can be finished by it. Cues that START in the overlap
-# are left for the next chunk (see _asr_filter_cues). Cues are split to <=5s
-# (see _ASR_CUE_MAX_SEC), so 8s always covers the tail of the last cue.
 _ASR_CHUNK_OVERLAP_SEC = 8.0
-# A leftover shorter than this is folded into the previous chunk instead of
-# becoming its own tiny job.
+# VALUES CHANGE HERE
 _ASR_MIN_TAIL_SEC = 15.0
 _ASR_META_VERSION = 1
 
 
 def _asr_paths(file_path):
-    """(srt_path, meta_path) for a plain media file. The .srt keeps the same
-    digest-based name the old whole-file ASR used; the .asr.json beside it is
-    the resume record (which time ranges are already transcribed)."""
+    """(srt_path, meta_path) for a plain media file."""
     import hashlib
     norm_path = os.path.normpath(os.path.abspath(file_path))
     digest = hashlib.sha1(norm_path.encode("utf-8", "replace")).hexdigest()[:16]
@@ -4778,11 +4476,7 @@ def _asr_paths(file_path):
 
 
 def _atomic_write_text(path, text):
-    """Write `text` to `path` so a concurrent reader (the on-screen overlay
-    re-parsing a growing .srt) sees either the old complete file or the new
-    complete file, never a half-written one. Retries the final rename a few
-    times because on Windows os.replace() fails while a reader still has the
-    destination open -- and the reader only holds it for a moment."""
+    """Write `text` to `path` so a reader sees either the old or the new complete file, never a partial one."""
     tmp_path = f"{path}.tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
@@ -4815,9 +4509,7 @@ def _asr_serialize_srt(cues):
 
 
 def _asr_read_valid(file_path, mtime, size):
-    """Return {"srt_path", "meta", "srt_exists"} for an existing ASR resume
-    record that still belongs to this exact file (same mtime/size) and is
-    internally consistent, else None. Never raises."""
+    """Return {"srt_path", "meta", "srt_exists"} for a valid ASR resume record matching this exact file, else None."""
     try:
         srt_path, meta_path = _asr_paths(file_path)
         if not os.path.isfile(meta_path):
@@ -4830,7 +4522,7 @@ def _asr_read_valid(file_path, mtime, size):
             return None
         srt_exists = os.path.isfile(srt_path) and os.path.getsize(srt_path) > 0
         if int(meta.get("cue_count", 0) or 0) > 0 and not srt_exists:
-            return None  # transcript was deleted out from under the record
+            return None
         return {"srt_path": srt_path, "meta": meta, "srt_exists": srt_exists}
     except Exception:
         return None
@@ -4862,8 +4554,7 @@ def _asr_merge_ranges(ranges):
 
 
 def _asr_subtract_ranges(lo, hi, done):
-    """The pieces of [lo, hi) not covered by `done` (merged + sorted),
-    in ascending order."""
+    """The pieces of [lo, hi) not covered by `done` (merged + sorted), in ascending order."""
     out = []
     pos = lo
     for a, b in done:
@@ -4882,11 +4573,7 @@ def _asr_subtract_ranges(lo, hi, done):
 
 
 def _asr_plan_chunks(duration, start_sec, done):
-    """Ordered list of (start, end) chunks still to transcribe: forward from
-    start_sec to the end of the file first (that's the part about to air),
-    then wrap around and fill 0 -> start_sec so the whole file is eventually
-    covered. Ranges already in `done` are skipped, which is what makes an
-    interrupted job resume instead of restart."""
+    """Return the ordered (start, end) chunks still to transcribe: start_sec to end of file first, then 0 to start_sec."""
     start = min(max(0.0, float(start_sec or 0.0)), float(duration))
     out = []
     first = True
@@ -4902,48 +4589,19 @@ def _asr_plan_chunks(duration, start_sec, done):
                 pos = end
                 first = False
     if not out and not done and duration > 0.1:
-        # A very short file can split into two slivers, both below the
-        # "worth a chunk" threshold -- never plan nothing for a file that
-        # has had nothing done yet.
+        # WARNING: never plan nothing for a file that has had nothing done yet.
         out.append((0.0, float(duration)))
     return out
 
 
 _ASR_DUP_TEXT_SIMILARITY_MIN = 0.6
 
-# Below this length, text-only matching is too easy to satisfy by accident
-# (see _asr_cues_are_same_speech) -- a real second "No!" a beat after the
-# first is a false duplicate under text matching alone.
 _ASR_SHORT_TEXT_CHARS = 6
 _ASR_SHORT_TEXT_OVERLAP_MIN = 0.85
 
 
 def _asr_cues_are_same_speech(new_text, old_text, overlap_frac=None):
-    """True only if two overlapping-in-time cues are actually the same
-    utterance re-transcribed (a sentence straddling a chunk boundary, or a
-    chunk redone after an interrupted run) rather than two different
-    sentences that merely landed in overlapping windows.
-
-    Two independent extractions of the same audio (this happens on purpose
-    -- see _ASR_CHUNK_OVERLAP_SEC) can disagree slightly on where a segment
-    starts/ends, especially right after a quieter or fast reply from a
-    second speaker. When that happens, a genuinely new sentence can overlap
-    an existing cue's timestamps by more than half its span while
-    containing completely different words. Requiring the text to actually
-    match (not just the timing) is what stops that new sentence from being
-    silently discarded as a "duplicate" of the old one.
-
-    Short exclamations break that logic, though: "No!" trivially "matches"
-    any other "No!" by text no matter which two utterances they actually
-    are, so a genuine second "No!" spoken shortly after the first looks
-    identical to a re-transcription of the same one. For text at or under
-    _ASR_SHORT_TEXT_CHARS, text matching alone is not enough evidence --
-    also require the two cues' timestamps to overlap almost completely
-    (>= _ASR_SHORT_TEXT_OVERLAP_MIN of the shorter span), which a
-    re-transcription of the same audio will do and two distinct spoken
-    instants generally won't. overlap_frac is that fraction, precomputed
-    by the caller (which already has both cues' spans on hand).
-    """
+    """True only if two time-overlapping cues are the same utterance re-transcribed, not two different sentences."""
     a = (new_text or "").strip().lower()
     b = (old_text or "").strip().lower()
     if not a or not b:
@@ -4968,17 +4626,7 @@ def _asr_cues_are_same_speech(new_text, old_text, overlap_frac=None):
 
 
 def _asr_merge_cues(cues, new_cues):
-    """Add new_cues ([start, end, text] lists) into `cues` in place. A new
-    cue that mostly overlaps one already there AND reads as the same speech
-    (see _asr_cues_are_same_speech) is a duplicate take -- a sentence
-    straddling a chunk boundary or the wrap-around point, or a chunk redone
-    after an interrupted run -- so it is not added as a second cue; if the
-    new take is the more complete one (noticeably longer, e.g. a whole
-    sentence replacing a cut-off fragment) it replaces the old one instead.
-    A new cue that overlaps in time but does NOT match the old cue's text is
-    a second, distinct utterance (e.g. a quick reply that landed inside the
-    first speaker's mistimed window) and is kept as its own cue rather than
-    dropped. Returns how many brand-new cues were added."""
+    """Add new_cues ([start, end, text] lists) into `cues` in place."""
     added = 0
     for s, e, t in new_cues:
         span = max(0.001, e - s)
@@ -5007,81 +4655,27 @@ def _asr_merge_cues(cues, new_cues):
 
 
 def _asr_probe_media(file_path, timeout=30):
-    """One ffmpeg header read -> {"duration": float|None, "has_audio": bool},
-    or None if the file couldn't be read at all."""
-    import re
+    """One ffmpeg header read returning {"duration": float|None, "has_audio": bool}, or None if unreadable."""
     try:
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
-            )
-        with _fast_disk_io_slot(f"asr_probe({os.path.basename(file_path)})"):
-            result = subprocess.run(
-                [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner", "-i", file_path],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs
-            )
+        import media_library as _ml
     except Exception as e:
-        log.warning("[ASR] probe failed for %s: %s", os.path.basename(file_path), e)
+        log.warning("[ASR] probe failed for %s: %s (media_library import)",
+                    os.path.basename(file_path), e)
         return None
-    err = result.stderr or ""
-    if "Input #0" not in err:
+    result = _shared_header_probe(file_path, timeout)
+    if not result.ok:
+        if result.error != "path_missing":
+            log.warning("[ASR] probe failed for %s: %s", os.path.basename(file_path), result.error)
         return None
-    duration = None
-    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err)
-    if m:
-        h, mi, sec = m.groups()
-        total = int(h) * 3600 + int(mi) * 60 + float(sec)
-        duration = total if total > 0 else None
-    return {"duration": duration, "has_audio": _stderr_has_audio_stream(err)}
+    return {"duration": result.duration, "has_audio": result.has_audio}
 
 
-# How far before the real target to land with the fast (input-side) seek,
-# before switching to accurate (output-side) seeking for the remainder --
-# see _asr_extract_chunk's docstring for why this two-stage approach exists.
-# Old/loosely-indexed containers (a plain "-ss before -i" fast seek is only
-# keyframe/sync-point accurate, not sample-accurate) can be off by several
-# seconds on a single-stage fast seek -- every cue built from that chunk
-# then inherits the same offset, since every cue's absolute time is
-# `chunk_start_sec + seg.start` and that arithmetic assumes the extracted
-# audio really began at chunk_start_sec. 15s comfortably covers the keyframe
-# intervals seen on older AVI rips; the accurate second-stage seek is cheap
-# (well under the whisper transcription time for the chunk) regardless of
-# how large this margin is, so there's no real cost to being generous here.
 _ASR_ACCURATE_SEEK_MARGIN_SEC = 15.0
 
 
 def _asr_extract_chunk(file_path, start_sec, length_sec, out_wav_path, timeout=120,
                         accurate_seek_margin_sec=None, audio_filter=None):
-    """Extract mono 16 kHz PCM for just [start, start+length] of the file.
-    Returns "ok", "empty" (ffmpeg succeeded but there was no audio in that
-    span -- e.g. the tail past where the audio actually ends), or "failed"
-    (ffmpeg error/timeout -- transient, worth retrying).
-
-    Two-stage ("fast-then-accurate") seek: a first -ss BEFORE -i does a
-    cheap demuxer-level seek to comfortably before the real target (fast,
-    but only keyframe/sync-point accurate -- can land several seconds off
-    on a loosely-indexed container), then a second -ss AFTER -i decodes
-    forward from there sample-accurately to close the remaining gap. A
-    single-stage "-ss before -i" (the old approach) is fast but every cue
-    computed from its output silently inherits however far off that one
-    seek landed -- on affected files this showed up as captions running a
-    consistent several-to-teens-of-seconds ahead of (or behind) the actual
-    dialogue, despite the ASR pass itself transcribing correctly. The
-    accurate second stage only has to decode `accurate_seek_margin_sec`
-    worth of audio, not the whole file up to that point, so this stays
-    cheap even deep into a long file.
-
-    `accurate_seek_margin_sec` defaults to _ASR_ACCURATE_SEEK_MARGIN_SEC
-    (the disk-cached path's value -- generous, since that pass runs once
-    and its .srt is kept). LiveCaptionSession passes a smaller value: this
-    decode is a FIXED tax paid on every single live chunk (not just the
-    first), competing for the same CPU that's simultaneously decoding
-    video for actual playback -- see the BUG FIX note on
-    _ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC for why shaving it there matters
-    more than it does for a background one-shot job.
-    """
+    """Extract mono 16 kHz PCM for just [start, start+length] of the file."""
     if accurate_seek_margin_sec is None:
         accurate_seek_margin_sec = _ASR_ACCURATE_SEEK_MARGIN_SEC
     start_sec = max(0.0, start_sec)
@@ -5137,39 +4731,7 @@ def _asr_cleanup_orphan_wavs(out_dir, max_age_sec=3600):
 
 def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
                                       should_stop=None, timeout_extract=120):
-    """Last-resort caption source: transcribe a plain video/audio file with
-    the local faster-whisper model, in chunks, and return (srt_path, reason).
-
-    Why chunked: the old version decoded and transcribed the WHOLE file
-    before a single cue existed, so a feature-length title had no captions
-    for many minutes. Here the file is transcribed in ~5 minute chunks
-    (the first only 60 s) starting at `start_sec` -- the playback position --
-    and running to the end, then wrapping around to fill 0 -> start_sec.
-    After every chunk the .srt is rewritten atomically, and resolve_caption_
-    source() reports the growing file (kind "asr_partial"), so the on-screen
-    overlay picks up new cues as they land instead of waiting for the end.
-
-    Resume: alongside the .srt is a small .asr.json record of which time
-    ranges are done. If the app is closed mid-job (or should_stop fires), the
-    next call for the same unchanged file skips every finished range and
-    continues -- it never restarts from scratch. A changed file (mtime/size)
-    discards the old partial.
-
-    Return contract: srt_path is set ONLY when the whole file is done.
-    Anything else returns (None, reason) with the partial progress kept on
-    disk; see the ASR_REASON_* notes above for which reasons are permanent.
-
-    should_stop: optional zero-arg callable, polled between chunks and
-    while a chunk is being transcribed. When it returns True the job stops
-    promptly (a chunk in flight is discarded, finished ones are kept) and
-    returns (None, ASR_REASON_INTERRUPTED).
-
-    Scope: plain file paths only. Real discs/ISOs opened as dvdnav:// have
-    no single audio file to decode -- callers don't route those here.
-
-    Call inside `with _asr_slot(...)` from a background worker so the
-    one-job-at-a-time cap and live-playback yield apply to the whole job.
-    """
+    """Transcribes a video or audio file in chunks with local faster-whisper and returns (srt_path, reason); an unchanged file resumes where it stopped."""
     def _stopped():
         try:
             return bool(should_stop and should_stop())
@@ -5185,7 +4747,6 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     srt_path, meta_path = _asr_paths(file_path)
     base_name = os.path.basename(file_path)
 
-    # A finished transcript for this exact file needs no model at all.
     state = _asr_read_valid(file_path, st.st_mtime, st.st_size)
     if state and state["meta"].get("complete"):
         if state["srt_exists"]:
@@ -5204,7 +4765,7 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     duration = probe["duration"]
 
     if state is None:
-        _asr_discard_state(file_path)   # stale record for an older version of this file
+        _asr_discard_state(file_path)
         done, cues, audio_chunks = [], [], 0
     else:
         meta = state["meta"]
@@ -5234,10 +4795,22 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     plan = _asr_plan_chunks(duration, start_sec, done)
     total = len(plan)
     import tempfile
+    _prev_chunk_end = None
     for idx, (a, b) in enumerate(plan, 1):
         if _stopped():
             return None, ASR_REASON_INTERRUPTED
         _yield_to_live_playback(f"asr_chunk({base_name})")
+
+        if _prev_chunk_end is not None and abs(a - _prev_chunk_end) > 0.05:
+            _is_wrap = a < _prev_chunk_end - 0.05
+            _is_resume_skip = any(d_a - 0.05 <= _prev_chunk_end and a <= d_b + 0.05 for d_a, d_b in done)
+            if not _is_wrap and not _is_resume_skip:
+                log.warning(
+                    "[CAPTION SAMPLE GAP] %s %.2fs of show audio between %.2fs and %.2fs "
+                    "was never sampled by any chunk -- any speech in that stretch cannot "
+                    "appear in captions.", base_name, a - _prev_chunk_end, _prev_chunk_end, a,
+                )
+        _prev_chunk_end = b
 
         at_file_end = b >= duration - 0.5
         audio_end = duration if at_file_end else min(duration, b + _ASR_CHUNK_OVERLAP_SEC)
@@ -5253,17 +4826,16 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
             if status == "ok":
                 audio_chunks += 1
                 try:
+                    _disk_prompt = _asr_prompt_for(file_path)
                     segments = _asr_transcribe_chunk(model, wav_path, lang, _ASR_BEAM_SIZE,
-                                                     initial_prompt=_asr_prompt_for(file_path),
+                                                     initial_prompt=_disk_prompt,
                                                      should_stop=_stopped)
                     if _stopped():
                         return None, ASR_REASON_INTERRUPTED
-                    new_cues, _drops = _asr_filter_cues(segments, a, b, at_file_end)
+                    new_cues, _drops = _asr_filter_cues(segments, a, b, at_file_end, prompt=_disk_prompt)
                 except Exception as e:
                     log.warning("[ASR] transcription failed for %s: %s", base_name, e)
                     return None, ASR_REASON_TRANSCRIBE_FAILED
-            # status == "empty": no audio in this span (past the real end of
-            # the audio) -- counts as done, contributes no cues.
         finally:
             try:
                 if os.path.isfile(wav_path):
@@ -5275,12 +4847,11 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
         done = _asr_merge_ranges(done + [[a, b]])
         if not _save(complete=False):
             return None, ASR_REASON_TRANSCRIBE_FAILED
-        log.info("[ASR] %s chunk %d/%d (%.0f-%.0fs): +%d cues (%d total) in %.1fs",
-                 base_name, idx, total, a, b, len(new_cues), len(cues), time.monotonic() - t0)
+        log.info(
+            "[ASR] %s chunk %d/%d (%.0f-%.0fs): +%d cues (%d total) in %.1fs",
+            base_name, idx, total, a, b, len(new_cues), len(cues), time.monotonic() - t0)
 
     if audio_chunks == 0:
-        # Every span came back empty -- the audio stream is unreadable, which
-        # is not the same as "no speech". Leave it retryable.
         return None, ASR_REASON_EXTRACT_FAILED
     if not _save(complete=True):
         return None, ASR_REASON_TRANSCRIBE_FAILED
@@ -5291,82 +4862,39 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     return srt_path, ASR_REASON_SUCCESS
 
 
-# ---------------------------------------------------------------------------
-# Live, in-memory-only ASR captions (TV-station / visualizer overlay only).
-#
-# LiveCaptionSession transcribes forward from the current playback position in
-# small chunks and keeps the cues in a plain in-memory list; nothing is written
-# to disk. (The DVD player's captions don't use this -- they go through
-# generate_captions_via_asr_chunked above.)
-#
-# Timing: everything is measured against the PLAYER'S OWN clock -- the
-# position_fn the app passes in (VLC's get_time(), the same clock the overlay
-# compares cue times against). A wall-clock estimate anchored at session start
-# is only the fallback for when that clock is missing or not yet trustworthy
-# (VLC reports ~0 until a seek lands). If transcription ever falls behind
-# playback (slow chunk, CPU contention) the session skips ahead to the current
-# position instead of grinding through audio that has already been heard.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Live captions
+# ============================================================================
 
-# The overlay stays blank until the session is this far ahead of playback...
+# VALUES CHANGE HERE
 LIVE_CAPTION_LEAD_SEC = 5.0
-# ...or this long after tune-in, whichever comes first (checked between chunks,
-# so a slow chunk can overshoot it by up to one small chunk's time).
 LIVE_CAPTION_READY_DEADLINE_SEC = 10.0
-# Chunk length once comfortably ahead, and the short chunk used while building
-# the initial lead or recovering from a stall (bounds worst-case latency).
-# Long chunks (this LIVE_CAPTION_CHUNK_SEC=30s) mean fewer chunk *boundaries*
-# per minute of audio -- and boundaries are exactly where the merge logic
-# (_asr_merge_cues / _asr_cues_are_same_speech) has to guess whether an
-# overlapping cue is a duplicate re-transcription or a genuinely new line,
-# which is where both the dropped-line and duplicate-line bugs live. Fewer
-# boundaries, fewer chances for that guess to go wrong. But a 30s chunk's
-# cues only become visible to the overlay all at once, the moment the whole
-# chunk finishes transcribing -- risking one this long before there's a
-# comfortable lead banked would mean a long, avoidable stretch of dead air
-# on tune-in. So a session starts on short _LIVE_CAPTION_STARTUP_CHUNK_SEC
-# chunks (gets *something* on screen fast) and only moves up to full
-# LIVE_CAPTION_CHUNK_SEC chunks once it has measured (from its own recent
-# chunks, not a guess) that it's comfortably ahead enough for a chunk that
-# size to finish before its audio is due on screen -- see
-# _live_caption_use_big_chunk() in _run_locked. If it ever falls behind
-# again (a stall, a dense-dialogue slowdown), it drops back to short chunks
-# to rebuild lead, then climbs back to long ones once it's earned it again.
 LIVE_CAPTION_CHUNK_SEC = 30.0
+# VALUES CHANGE HERE (fallback only; used when performance_governor is missing or fails; the live values are CAPTION_CADENCE in performance_governor.py)
 _LIVE_CAPTION_STARTUP_CHUNK_SEC = 10.0
-# The very FIRST chunk of a tune-in is shorter still. It has to be extracted +
-# transcribed while playback keeps moving, so a 10s first chunk (~4.5s of compute
-# measured in the logs) lands after most of its own audio has already played --
-# real logs showed every cue in it already 5-10s stale on arrival. 5s finishes
-# in roughly half the time, so its text lands while still (mostly) ahead of
-# playback. Only used for an attached (actually playing) session's first chunk.
 _LIVE_CAPTION_FIRST_CHUNK_SEC = 5.0
-# Every live chunk also transcribes extra audio PAST its end (_ASR_CHUNK_OVERLAP_SEC,
-# 8s) so a sentence straddling the boundary isn't cut off -- but cues that start in
-# that tail are thrown away (the next chunk redoes them). On a 5s first chunk that
-# meant transcribing 13s of audio and discarding most of the extra. For the short
-# startup chunks, where latency matters most, use a smaller tail; long chunks keep
-# the full 8s (the tail is a small fraction of their length there).
 _LIVE_CAPTION_FIRST_CHUNK_OVERLAP_SEC = 3.0
 _LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC = 5.0
-# The first chunk starts this far AHEAD of playback, not at it. Extract + transcribe
-# takes ~3s, during which playback moves on, so a chunk that starts at "now" lands
-# with its cues already expired (measured: 2-6s stale on arrival). Starting ~3s
-# ahead means its cues land right as they're due -- the first ~3s of dialogue after
-# tune-in can't be captioned in time either way.
 _LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC = 3.0
-# --- Live session vs. next-file prefetch fairness -------------------------
-# There is ONE transcription slot (_asr_slot). A next-file prefetch session
-# running 30s chunks can hold it for 20+ seconds on dense dialogue (measured:
-# 22s), and the live session's next chunk then waits behind it and lands
-# seconds late -- that is missing text on screen. So a prefetch session:
-#   * only starts a chunk while every attached (actually playing) session is
-#     comfortably ahead (>= _LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC) and idle, and
-#   * uses short chunks so it can never hold the slot for long.
 _LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC = 15.0
 _LIVE_CAPTION_PREFETCH_CHUNK_SEC = 10.0
 _LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC = 120.0
+# VALUES CHANGE HERE (next-file prefetch cap)
+_LIVE_CAPTION_PREFETCH_CAP_SEC = 60.0
 _LIVE_ATTACHED_SESSIONS = set()
+_LIVE_RUNNING_SESSIONS = set()
+
+
+def _live_caption_cadence():
+    """First-scan chunk sizes (first chunk, its overlap, startup chunk) for the current performance mode."""
+    if _perf_governor is not None:
+        try:
+            cadence = _perf_governor.caption_cadence()
+            return (float(cadence["first_chunk_sec"]), float(cadence["first_overlap_sec"]),
+                    float(cadence["startup_chunk_sec"]))
+        except Exception:
+            pass
+    return (_LIVE_CAPTION_FIRST_CHUNK_SEC, _LIVE_CAPTION_FIRST_CHUNK_OVERLAP_SEC, _LIVE_CAPTION_STARTUP_CHUNK_SEC)
 
 
 def _prefetch_may_run():
@@ -5378,112 +4906,59 @@ def _prefetch_may_run():
         if sess._busy or sess._last_lead < _LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC:
             return False
     return True
-# Extra cushion added on top of the *measured* time the session's own
-# chunks have been taking, before trusting that a full LIVE_CAPTION_CHUNK_SEC
-# chunk will finish before playback needs its text -- guards against the
-# next chunk being slower than the last few (denser dialogue, a momentary
-# CPU spike) rather than betting the exact average will hold.
 _LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC = 3.0
-# Conservative up-front guess for how long a full LIVE_CAPTION_CHUNK_SEC
-# chunk will take, used only until the session has actually measured one
-# of its own chunks (see self._chunk_rtf_ema) -- deliberately on the high
-# side (real production timings on 8s chunks ranged as high as 14.4s on
-# dense dialogue; 30s of denser content could run well past that) so nothing
-# gambles on an untested chunk size before there's real data to trust.
 _LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC = 15.0
-# Don't transcribe further ahead of playback than this (idle instead).
-LIVE_CAPTION_MAX_LEAD_SEC = 90.0
+# VALUES CHANGE HERE (lead cap)
+LIVE_CAPTION_MAX_LEAD_SEC = 60.0
+# VALUES CHANGE HERE (jump-back detection)
+_LIVE_CAPTION_JUMP_BACK_LEAD_SEC = 120.0
 _LIVE_CAPTION_PACE_POLL_SEC = 1.0
-# If playback has passed our position by more than SKIP_BEHIND, give up on
-# transcribing the untranscribed stretch in between and resume RESUME_AHEAD
-# seconds in front of playback instead (enough for the next chunk to land in
-# time). This is a deliberate, PERMANENT loss of whatever dialogue fell in
-# that stretch -- it is never transcribed, so it can never appear -- so the
-# threshold has to be well above the lag a single slow chunk can produce on
-# its own, or it fires on ordinary transcription hiccups and eats real,
-# audible speech for no reason. Logged first-chunk times up to ~12-17s
-# (system load, model warm-up, a busy CPU moment) were measured pushing lead
-# to -3s to -7s on nothing more than a normal 5-8s chunk -- comfortably past
-# the old 1.0s threshold, so those chunks' dialogue was being discarded
-# outright even though the session was never more than a few seconds off.
-# This diagnosed the "same speaker's lines cut in and out" symptom: it
-# wasn't the speech going undetected, it was already-heard-fine audio being
-# thrown away before it was ever given the chance to transcribe. 15s gives
-# real transient slowdowns room to catch up on their own (the small-chunk
-# pacing below already biases toward that once lead < LIVE_CAPTION_LEAD_SEC)
-# while still catching genuine fell-way-behind cases (tuning into a show
-# already deep in, a multi-minute stall) that can never be shown in sync
-# again regardless.
 _LIVE_CAPTION_SKIP_BEHIND_SEC = 15.0
 _LIVE_CAPTION_RESUME_AHEAD_SEC = 2.0
-# Cues are dropped this long after they've been shown; hard cap as a safety net.
+# VALUES CHANGE HERE
 _LIVE_CAPTION_KEEP_PAST_SEC = 20.0
 _LIVE_CAPTION_MAX_CUES = 500
-# Consecutive extract/transcribe failures tolerated before the session gives up.
+# VALUES CHANGE HERE
 _LIVE_CAPTION_MAX_FAILURES = 3
-# Live-only speed choices (the disk-cached path keeps _ASR_BEAM_SIZE and the
-# larger seek margin, since it runs once in the background and is kept).
 _ASR_LIVE_BEAM_SIZE = 3
 _ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC = 4.0
-# A player-clock reading is trusted once it has advanced in step with real time
-# between two polls at least this far apart (within this tolerance).
 _LIVE_CAPTION_CLOCK_MIN_DT = 0.75
 _LIVE_CAPTION_CLOCK_TOLERANCE = 0.4
 
 
 class LiveCaptionSession:
-    """Transcribes `file_path` forward from `start_sec` on a background thread.
-
-    Call `.start()` once, `.stop()` on channel change, and read `.ready` /
-    `.snapshot()` from any thread. `cues` is only mutated under `.lock`.
-    `.ready` flips True once the session is LIVE_CAPTION_LEAD_SEC ahead of
-    playback (or LIVE_CAPTION_READY_DEADLINE_SEC after tune-in with at least
-    one chunk done); before that the overlay should show nothing.
-
-    position_fn: optional zero-arg callable returning the player's current
-    position in file seconds (or None). See the module comment above.
-    """
+    """Transcribes `file_path` forward from `start_sec` on a background thread."""
 
     def __init__(self, file_path, start_sec=0.0, language=None, position_fn=None):
         self.file_path = file_path
         self.start_sec = max(0.0, float(start_sec or 0.0))
         self.language = language if language is not None else _ASR_LANGUAGE
         self.position_fn = position_fn
-        self.cues = []          # [[start_sec, end_sec, text], ...], absolute file time, sorted
+        self.cues = []
         self.lock = threading.Lock()
         self.ready = False
-        self.status = None      # ASR_REASON_* once the job ends/gives up, else None
+        self.status = None
         self._stop = threading.Event()
         self._thread = None
         self._created = time.monotonic()
-        # Wall-clock estimate of playback position: anchor_pos at anchor_mono.
         self._anchor_mono = self._created
         self._anchor_pos = self.start_sec
-        self._clock_probe = None    # (monotonic, position) of the last spaced-out poll
+        self._clock_probe = None
         self._clock_trusted = False
-        # True once this session is tied to a file that's actually playing
-        # (position_fn given at construction, or attach_playback() called
-        # later for a prefetched session once its file goes live). Before
-        # that there is no real playback to be "behind" or "ahead" of --
-        # see _run_locked's lead calculation and _trim_cues.
         self._attached = position_fn is not None
-        # One-shot: set by attach_playback so the loop below doesn't mistake
-        # a prefetch session's legitimately large built-up lead, right at
-        # the moment it's promoted to real playback, for a backward seek.
         self._just_attached = False
-        # Rolling estimate of seconds-of-compute per second-of-audio,
-        # updated after each completed chunk (see _run_locked) -- used to
-        # decide when there's enough measured throughput to safely move up
-        # to LIVE_CAPTION_CHUNK_SEC chunks. None until the session has a
-        # real measurement to go on (the very first chunk is excluded from
-        # ever updating this -- see _run_locked -- since its timing is
-        # confounded by one-time model warm-up, not steady-state speed).
         self._chunk_rtf_ema = None
-        # Fairness bookkeeping read by _prefetch_may_run() (see above).
-        self._busy = False              # True from "about to take the ASR slot" to "chunk done"
-        self._last_lead = 0.0           # lead over playback at the top of the last loop pass
+        # WARNING: read by _prefetch_may_run().
+        self._busy = False
+        self._last_lead = 0.0
+        self._last_sample_end = None
+        self._prefetch_capped = False
+        self._chunks_done = 0
+        self._late_cues = 0
+        self._partial_late = 0
 
     def start(self):
+        _LIVE_RUNNING_SESSIONS.add(self)
         if self._attached:
             _LIVE_ATTACHED_SESSIONS.add(self)
         self._thread = threading.Thread(target=self._run, daemon=True, name="LiveCaptionASR")
@@ -5492,17 +4967,16 @@ class LiveCaptionSession:
 
     def stop(self):
         self._stop.set()
+        with self.lock:
+            self.cues = []
 
     def snapshot(self):
-        """Cues in MILLISECONDS ([start_ms, end_ms, text]), the unit the overlay
-        and parse_caption_cues use; internally they are kept in seconds."""
+        """Return cues in milliseconds as [start_ms, end_ms, text]."""
         with self.lock:
             return [[s * 1000.0, e * 1000.0, t] for s, e, t in self.cues]
 
     def attach_playback(self, position_fn, file_pos=0.0):
-        """Give a session that was started ahead of time (next-file prefetch) the
-        player clock once its file actually goes live, re-anchoring the
-        wall-clock estimate to `file_pos`."""
+        """Give a prefetched session the player clock when its file goes live, re-anchoring the wall-clock estimate to `file_pos`."""
         self.position_fn = position_fn
         self._anchor_mono = time.monotonic()
         self._anchor_pos = max(0.0, float(file_pos or 0.0))
@@ -5516,9 +4990,7 @@ class LiveCaptionSession:
         return self._stop.is_set()
 
     def _playback_sec(self):
-        """Current playback position in file seconds. Uses position_fn once its
-        readings advance in step with real time; otherwise the wall-clock
-        estimate (which also covers VLC reporting ~0 before a seek lands)."""
+        """Current playback position in file seconds, from position_fn when it advances in step with real time, else the wall-clock estimate."""
         mono = time.monotonic()
         est = self._anchor_pos + (mono - self._anchor_mono)
         fn = self.position_fn
@@ -5545,8 +5017,6 @@ class LiveCaptionSession:
 
     def _trim_cues(self):
         if not self._attached:
-            # Prefetching ahead of a file that isn't live yet -- nothing has
-            # been shown, so nothing is "stale". Just keep memory bounded.
             with self.lock:
                 if len(self.cues) > _LIVE_CAPTION_MAX_CUES:
                     del self.cues[:len(self.cues) - _LIVE_CAPTION_MAX_CUES]
@@ -5566,6 +5036,10 @@ class LiveCaptionSession:
             self.status = ASR_REASON_TRANSCRIBE_FAILED
         finally:
             _LIVE_ATTACHED_SESSIONS.discard(self)
+            _LIVE_RUNNING_SESSIONS.discard(self)
+            log.info("[LIVE ASR] %s session ended: status=%s chunks=%d late_cues=%d partial_late_cues=%d",
+                     os.path.basename(self.file_path), self.status, self._chunks_done, self._late_cues,
+                     self._partial_late)
 
     def _run_locked(self):
         import tempfile
@@ -5576,7 +5050,8 @@ class LiveCaptionSession:
         if model is None:
             self.status = ASR_REASON_UNAVAILABLE
             return
-        probe = _asr_probe_media(self.file_path)
+        with _playing_file_scope(self._attached):
+            probe = _asr_probe_media(self.file_path)
         if probe is None or not probe["duration"]:
             self.status = ASR_REASON_EXTRACT_FAILED
             return
@@ -5585,46 +5060,46 @@ class LiveCaptionSession:
             return
         duration = probe["duration"]
         base_name = os.path.basename(self.file_path)
-        prompt = _asr_prompt_for(self.file_path)
+        base_prompt = _asr_prompt_for(self.file_path)
+        prompt = base_prompt
+        name_stats = {}
+        learned_names = []
 
         pos = min(self.start_sec, duration)
         chunks_done = 0
         failures = 0
+        carry_prev = []
+        carry_end = None
         while not self._stopped() and pos < duration:
             _yield_to_live_playback(f"live_caption({base_name})")
 
+            if not self._attached and pos - self.start_sec >= _LIVE_CAPTION_PREFETCH_CAP_SEC:
+                if not self._prefetch_capped:
+                    self._prefetch_capped = True
+                    log.info("[LIVE ASR] %s prefetch reached its %.0fs cap (transcribed up to %.1fs) -- "
+                             "idle until this file goes live", base_name, _LIVE_CAPTION_PREFETCH_CAP_SEC, pos)
+                self._stop.wait(_LIVE_CAPTION_PACE_POLL_SEC)
+                continue
+
             if not self._attached:
-                # Prefetching ahead of a file that isn't live yet -- there is
-                # no real playback to be behind or ahead of, so just keep
-                # transcribing forward (the sentinel below reads as "plenty
-                # of lead" for the ready-flag and small-chunk checks further
-                # down). Real lead bookkeeping resumes once attach_playback()
-                # ties this session to the file that's actually playing.
                 now, lead = None, LIVE_CAPTION_MAX_LEAD_SEC
             else:
                 now = self._playback_sec()
                 lead = pos - now
                 just_attached, self._just_attached = self._just_attached, False
-                # Only treat the session as genuinely behind once it has done
-                # at least one chunk of real work -- on the very first chunk,
-                # `lead` reflects startup latency (model load, or waiting for
-                # the single ASR job slot to free up), not a throughput
-                # problem, and skipping ahead here would discard speech
-                # nothing has even tried to transcribe yet.
                 if chunks_done > 0 and lead < -_LIVE_CAPTION_SKIP_BEHIND_SEC:
-                    # Behind playback: the audio before `now` has already been heard.
                     new_pos = min(duration, now + _LIVE_CAPTION_RESUME_AHEAD_SEC)
-                    log.info("[LIVE ASR] %s behind playback by %.1fs -- skipping ahead to %.1fs",
-                             base_name, -lead, new_pos)
+                    log.warning("[LIVE ASR] %s behind playback by %.1fs -- skipping ahead to %.1fs; "
+                                "the audio from %.1fs to %.1fs gets no captions",
+                                base_name, -lead, new_pos, pos, new_pos)
                     pos = new_pos
                     if pos >= duration:
                         break
                     lead = pos - now
-                elif chunks_done > 0 and not just_attached and lead > LIVE_CAPTION_MAX_LEAD_SEC + 30.0:
-                    pos, lead = now, 0.0   # playback jumped backward -- restart from it
-                    # (a big lead right after attach_playback() is a prefetch
-                    # session's legitimate head start, not a backward seek --
-                    # just_attached suppresses this check for that one check.)
+                elif chunks_done > 0 and not just_attached and lead > _LIVE_CAPTION_JUMP_BACK_LEAD_SEC:
+                    log.warning("[LIVE ASR] %s playback is %.1fs behind the transcription position -- "
+                                "restarting from %.1fs", base_name, lead, now)
+                    pos, lead = now, 0.0
 
             if chunks_done == 0 and self._attached and now is not None:
                 _first_pos = min(duration, now + _LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC)
@@ -5645,10 +5120,6 @@ class LiveCaptionSession:
                     or lead >= LIVE_CAPTION_LEAD_SEC
                     or (chunks_done > 0
                         and time.monotonic() - self._created >= LIVE_CAPTION_READY_DEADLINE_SEC)):
-                # chunks_done > 0: go live the moment the first chunk has landed.
-                # Waiting for a 5s lead (or the 10s deadline, which is only checked
-                # between chunks) held captions back ~10-15s after every tune-in even
-                # though cues that arrive in time display correctly on their own.
                 self.ready = True
                 log.info("[LIVE ASR READY] %s captions live %.1fs after session start "
                          "(chunks_done=%d lead=%s)", base_name,
@@ -5662,28 +5133,21 @@ class LiveCaptionSession:
                     break
 
             small = (not self.ready) or lead < LIVE_CAPTION_LEAD_SEC
-            # Chunk-size decision, independent of the display-readiness
-            # decision just above: even once captions are showing, don't
-            # jump to a full LIVE_CAPTION_CHUNK_SEC chunk until the
-            # session's own measured throughput says one will finish with
-            # room to spare before playback needs it. est_big_chunk_sec is
-            # that measurement (or the conservative default before any
-            # chunk has been measured); use_big_chunk is the actual
-            # go/no-go for *this* chunk.
             est_big_chunk_sec = (self._chunk_rtf_ema * LIVE_CAPTION_CHUNK_SEC
                                   if self._chunk_rtf_ema is not None
                                   else _LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC)
             use_big_chunk = (not small) and lead >= (
                 est_big_chunk_sec + _LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC)
-            _target_len = LIVE_CAPTION_CHUNK_SEC if use_big_chunk else _LIVE_CAPTION_STARTUP_CHUNK_SEC
+            _first_len, _first_overlap, _startup_len = _live_caption_cadence()
+            _target_len = LIVE_CAPTION_CHUNK_SEC if use_big_chunk else _startup_len
             if chunks_done == 0 and self._attached:
-                _target_len = _LIVE_CAPTION_FIRST_CHUNK_SEC
+                _target_len = _first_len
             elif not self._attached:
-                _target_len = _LIVE_CAPTION_PREFETCH_CHUNK_SEC   # never hog the slot
+                _target_len = _LIVE_CAPTION_PREFETCH_CHUNK_SEC
             length = min(_target_len, duration - pos)
             at_file_end = (pos + length) >= duration - 0.5
             if chunks_done == 0 and self._attached:
-                _overlap = _LIVE_CAPTION_FIRST_CHUNK_OVERLAP_SEC
+                _overlap = _first_overlap
             elif not self._attached or not use_big_chunk:
                 _overlap = _LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC
             else:
@@ -5691,30 +5155,52 @@ class LiveCaptionSession:
             audio_end = duration if at_file_end else min(duration, pos + length + _overlap)
 
             if not self._attached:
-                # Next-file prefetch: wait until no playing session needs the slot.
                 _pf_deadline = time.monotonic() + _LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC
                 while (not self._stopped() and not _prefetch_may_run()
                        and time.monotonic() < _pf_deadline):
                     self._stop.wait(0.25)
                 if self._stopped():
                     break
+            # WARNING: recovery must never leave less than _ASR_RECOVER_KEEP_LEAD_SEC of lead over playback.
+            if self._attached:
+                # WARNING: no recovery until this session has measured its own chunk speed; tune-in chunks must stay short and fast.
+                if self._chunk_rtf_ema is None:
+                    _slack = 0.0
+                else:
+                    _slack = lead + length - self._chunk_rtf_ema * length - _ASR_RECOVER_KEEP_LEAD_SEC
+            else:
+                _slack = _ASR_RECOVER_MAX_SEC
+            _recover_budget = max(0.0, min(_ASR_RECOVER_MAX_SEC,
+                                           _ASR_RECOVER_MAX_FRAC_OF_CHUNK * length, _slack))
             self._busy = True
             t0 = time.monotonic()
-            _slot_t0 = t0   # reset once the slot is actually held
-            took = None  # set once actual work happens; guards the EMA update below
+            _slot_t0 = t0
+            took = None
             wav_fd, wav_path = tempfile.mkstemp(prefix="live_asr_", suffix=".wav")
             os.close(wav_fd)
+            if self._attached and self.ready and chunks_done > 0:
+                _gate_hold = _whisper_gate_hold_seconds(
+                    lead, (self._chunk_rtf_ema * length) if self._chunk_rtf_ema is not None
+                    else _LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC)
+                _gate_skip = False
+            elif not self._attached and _perf_governor is not None:
+                _gate_hold = _perf_governor.WHISPER_PREFETCH_GATE_WAIT_SECONDS
+                _gate_skip = True
+            else:
+                _gate_hold, _gate_skip = 0.0, False
             try:
-                # The ASR job slot is held only for this one chunk's actual
-                # extract+transcribe work -- not for the idle pacing wait
-                # above. A session that's comfortably ahead and just waiting
-                # for playback to need more shouldn't keep another session
-                # (e.g. a next-file prefetch) from using that CPU meanwhile.
-                with _asr_slot(f"live_caption({base_name})"):
+                with _asr_slot(f"live_caption({base_name})", hold_sec=_gate_hold, skip_if_held=_gate_skip) as _may_run:
+                    if not _may_run:
+                        continue
+                    if self._stopped():
+                        return
                     _slot_t0 = time.monotonic()
                     status = _asr_extract_chunk(self.file_path, pos, audio_end - pos, wav_path,
                                                 accurate_seek_margin_sec=_ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC,
                                                 audio_filter=_ASR_LIVE_AUDIO_FILTER)
+                    if status != "ok":
+                        log.warning("[LIVE ASR] %s ffmpeg returned %r for the audio at %.1f-%.1fs; "
+                                    "that window was not captioned", base_name, status, pos, audio_end)
                     if status == "failed":
                         failures += 1
                         if failures >= _LIVE_CAPTION_MAX_FAILURES:
@@ -5726,7 +5212,8 @@ class LiveCaptionSession:
                         try:
                             segments = _asr_transcribe_chunk(
                                 model, wav_path, self.language, _ASR_LIVE_BEAM_SIZE,
-                                initial_prompt=prompt, temperature=0.0, should_stop=self._stopped)
+                                initial_prompt=prompt, temperature=0.0, should_stop=self._stopped,
+                                own_len=length, recover_budget_sec=_recover_budget)
                         except Exception as e:
                             log.warning("[LIVE ASR] transcription failed for %s: %s", base_name, e)
                             failures += 1
@@ -5738,40 +5225,73 @@ class LiveCaptionSession:
                         if self._stopped():
                             return
                         failures = 0
-                        new_cues, drops = _asr_filter_cues(segments, pos, pos + length, at_file_end)
+                        new_cues, drops = _asr_filter_cues(segments, pos, pos + length, at_file_end, prompt=prompt,
+                                                           music_secs=getattr(segments, "music_secs", None))
+                        _asr_learn_names(name_stats, new_cues.words)
+                        _names_now = _asr_learned_names(name_stats)
+                        if _names_now != learned_names:
+                            learned_names = _names_now
+                            prompt = _asr_prompt_with_names(base_prompt, learned_names)
+                            log.info("[LIVE ASR] %s name hint for the next chunks: %s", base_name, prompt)
+                        _next_carry = list(new_cues.carry)
+                        if carry_prev and carry_end is not None and abs(pos - carry_end) < 0.05:
+                            _rescued = [c for c in carry_prev if not _asr_carry_is_covered(c, new_cues)]
+                            if _rescued:
+                                log.info("[LIVE ASR] %s carried %d cue(s) over the chunk boundary at %.1fs that the "
+                                         "next chunk did not hear: %s", base_name, len(_rescued), pos,
+                                         " | ".join("%.2f-%.2f %r" % (s, e, t) for s, e, t in _rescued))
+                                new_cues = list(new_cues) + _rescued
+                        carry_prev, carry_end = _next_carry, pos + length
+                        if self._last_sample_end is not None:
+                            _gap_amt = pos - self._last_sample_end
+                            if abs(_gap_amt) > 0.05 and _gap_amt > 0:
+                                log.warning(
+                                    "[CAPTION SAMPLE GAP] %s %.2fs of show audio between %.2fs and %.2fs "
+                                    "was never sampled by either chunk -- any speech in that stretch "
+                                    "cannot appear in captions.",
+                                    base_name, _gap_amt, self._last_sample_end, pos,
+                                )
+                        self._last_sample_end = pos + length
                         if new_cues:
                             with self.lock:
                                 _asr_merge_cues(self.cues, new_cues)
-                            # Diagnostic for the "flashes then gets overtaken" symptom:
-                            # a cue's start/end timestamps are exact (they come straight
-                            # from Whisper's own word timing), but they're only checked
-                            # against the on-screen clock once this whole chunk has
-                            # finished transcribing and landed here. If real playback has
-                            # already moved past a cue's start by the time it arrives,
-                            # that cue's on-screen window is already partly or fully gone
-                            # -- this measures exactly how much, in real seconds, per cue.
-                            if self._attached:
-                                arrival = self._playback_sec()
-                                stale = [max(0.0, arrival - c[0]) for c in new_cues]
-                                log.info(
-                                    "[LIVE ASR STALE] %s %d cue(s) landed %.1fs into playback; "
-                                    "already-elapsed-on-arrival min=%.1fs max=%.1fs avg=%.1fs",
-                                    base_name, len(new_cues), arrival,
-                                    min(stale), max(stale), sum(stale) / len(stale))
-                        # took = compute time only. Time spent WAITING for the slot
-                        # (behind another session) is reported separately so it can't
-                        # inflate the throughput estimate that picks chunk sizes.
+                        _music_flags = getattr(segments, "music_secs", None)
+                        if _music_flags:
+                            with self.lock:
+                                _music_new = _asr_music_cues(_music_flags, pos, length, self.cues)
+                                if _music_new:
+                                    _asr_merge_cues(self.cues, _music_new)
+                            if _music_new:
+                                log.info("[LIVE ASR] %s music sign added for %.1fs of music-like audio with no speech "
+                                         "(%d cue(s)) at %.1f-%.1fs", base_name,
+                                         sum(c[1] - c[0] for c in _music_new), len(_music_new),
+                                         _music_new[0][0], _music_new[-1][1])
                         took = time.monotonic() - _slot_t0
                         _slot_wait = _slot_t0 - t0
                         log.info(
                             "[LIVE ASR] %s pos=%.1fs len=%.1fs audio=%.1fs took=%.1fs wait=%.1fs lead=%s ready=%s "
                             "chunk=%s(est_30s=%.1fs) vad=%s islands/%.1fs speech cues=+%d "
-                            "dropped(next=%d empty=%d not_speech=%d)",
+                            "dropped(next=%d empty=%d not_speech=%d hallucination=%d) "
+                            "recovered=%d/%d(%.1fs)",
                             base_name, pos, length, (audio_end - pos), took, _slot_wait,
                             ("n/a" if now is None else f"{lead:.1f}s"), self.ready,
                             ("BIG" if use_big_chunk else ("first" if (chunks_done == 0 and self._attached) else "startup")), est_big_chunk_sec,
                             getattr(segments, "vad_islands", "?"), getattr(segments, "vad_speech_sec", 0.0),
-                            len(new_cues), drops["next_chunk"], drops["empty"], drops["not_speech"])
+                            len(new_cues), drops["next_chunk"], drops["empty"], drops["not_speech"],
+                            drops["hallucination"], getattr(segments, "recover_ok", 0),
+                            getattr(segments, "recover_tried", 0), getattr(segments, "recover_sec", 0.0))
+                        if self._attached:
+                            _pb = self._playback_sec()
+                            for _s, _e, _t in new_cues:
+                                if _e < _pb:
+                                    self._late_cues += 1
+                                elif _s < _pb:
+                                    self._partial_late += 1
+                        _short = (audio_end - pos) - (getattr(segments, "audio_secs", 0.0) or (audio_end - pos))
+                        if _short > 0.5:
+                            log.warning("[LIVE ASR] %s the audio for %.1f-%.1fs came back %.1fs short; "
+                                        "the end of that window cannot be captioned",
+                                        base_name, pos, audio_end, _short)
             finally:
                 self._busy = False
                 try:
@@ -5780,16 +5300,6 @@ class LiveCaptionSession:
                 except OSError:
                     pass
 
-            # Fold this chunk's throughput into the rolling estimate used
-            # to decide when it's safe to move up to LIVE_CAPTION_CHUNK_SEC
-            # chunks -- but not from the very first chunk (chunks_done==0
-            # here, before the increment below), whose timing is skewed by
-            # one-time model warm-up rather than steady-state speed (see
-            # the _LIVE_CAPTION_SKIP_BEHIND_SEC comment above for the same
-            # 12-17s warm-up effect measured elsewhere). An EMA (rather
-            # than a running average) so the estimate can still track a
-            # real, sustained slowdown instead of being permanently
-            # anchored to however fast the first few chunks happened to be.
             if took is not None and chunks_done > 0 and length > 0:
                 _measured_ratio = took / length
                 self._chunk_rtf_ema = (
@@ -5797,11 +5307,17 @@ class LiveCaptionSession:
                     else 0.4 * _measured_ratio + 0.6 * self._chunk_rtf_ema)
 
             chunks_done += 1
+            self._chunks_done = chunks_done
             pos += length
             self._trim_cues()
 
         if not self._stopped():
             self.status = ASR_REASON_SUCCESS
+
+
+# ============================================================================
+# SECTION: Media errors
+# ============================================================================
 
 
 class NoAudioStreamError(Exception):
@@ -5824,40 +5340,9 @@ class LoudnessProbeTimeoutError(Exception):
         self.file_path = file_path
 
 
-# ---------------------------------------------------------------------------
-# check_media_truly_ended() -- shared debounce + duration-proximity guard
-# against premature/spurious end-of-media reads.
-#
-# Shared "has this file actually finished?" check, usable by any VLC-backed
-# engine (main TV playback today; DVD/other engines later) instead of each
-# one duplicating the same debounce/proximity logic. media.py never imports
-# vlc, so this function takes a plain state string plus the two numbers it
-# actually needs (position/length) rather than a vlc.State or a player
-# handle -- see VLCEngineWrapper.get_current_time() and
-# .get_playback_state() in retro_tv_emulator.py for the two thin reads that
-# feed it.
-#
-# Why this exists (the bug it fixes): VLC can report State.Ended/Stopped for
-# a single frame as a momentary glitch (very common right around a channel-
-# switch/guide-preview transition), and separately can report a terminal
-# state spuriously while the file is still genuinely mid-playback. Trusting
-# either blip immediately triggers a full reload/advance -- which is what
-# shows up on screen as a brief flash to static and back ("the flicker").
-# Two independent guards, applied in order, are what actually suppress that:
-#   1. Debounce -- require the terminal state to persist across a short
-#      real-time window (debounce_ms) before it's trusted at all, so a
-#      single-frame glitch resolves itself with no action taken.
-#   2. Duration-proximity cross-check -- once the debounce passes, compare
-#      the engine's OWN reported position against its OWN reported length
-#      (not the scheduler's separate duration estimate) and only treat the
-#      terminal state as a real finish if playback is actually near the end.
-#      If the length isn't known yet, there's nothing to cross-check against,
-#      so this step is skipped and the debounce-only result stands.
-# A real State.Error is treated as reliable on its own (no proximity check
-# makes sense for a decode failure), but still waits out min_play_time_ms so
-# a file doesn't get marked broken before VLC has even had a chance to open
-# it.
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: End-of-media detection
+# ============================================================================
 def check_media_truly_ended(
     state,
     pos_ms,
@@ -5869,55 +5354,8 @@ def check_media_truly_ended(
     debounce_ms=200,
     proximity_ms=2000,
 ):
-    """Decide whether a terminal engine read really means the current file
-    has finished, vs. a spurious mid-playback state glitch.
-
-    Args:
-        state: one of "playing", "paused", "ended", "stopped", "error",
-            "opening", "buffering", "other" -- see
-            VLCEngineWrapper.get_playback_state().
-        pos_ms: current playback position in ms, or None if unknown -- see
-            VLCEngineWrapper.get_current_time().
-        length_ms: known media length in ms, or None if not yet known.
-        now_ms: current tick clock (e.g. pygame.time.get_ticks()); just
-            needs to be monotonic and in the same units as
-            last_play_started_at_ms.
-        last_play_started_at_ms: tick time this file started playing.
-        tracking: dict the CALLER owns and persists across calls for this
-            one engine/player (e.g. VLCEngineWrapper._media_end_tracking) --
-            mutated in place. A fresh {} is a valid starting point. Keys:
-              _media_end_check_start_time -- tick when the current terminal-
-                  state streak began; 0 while not currently debouncing.
-              _media_end_confirmed -- True once the current streak has been
-                  confirmed a real finish (lets a caller polling every frame
-                  tell "just confirmed this frame" apart from "already
-                  handled").
-              _media_end_debounce_time -- the debounce_ms value in effect,
-                  recorded for inspection/testing.
-        min_play_time_ms: a file must have been playing at least this long
-            before ANY terminal read (including Error) is trusted -- guards
-            against acting on a state read from before playback genuinely
-            started.
-        debounce_ms: how long an Ended/Stopped read must persist, in real
-            time, before it's cross-checked at all.
-        proximity_ms: how close to the end (in ms) playback position must be
-            for a debounced Ended/Stopped read to be trusted as a real
-            finish. If length or position isn't known yet, proximity can't
-            be evaluated and is treated as NOT near the end -- unknown is
-            never assumed to mean "about to finish". In that case a finish
-            can still be confirmed, but only via the separate stuck-streak
-            fallback (a terminal read held continuously for well over a
-            couple of debounce/retry cycles), not from min_play_time_ms
-            alone.
-
-    Returns:
-        (is_finished, reason) -- reason is "ended", "error", or None.
-        "stalled" is deliberately never returned here: Opening/Buffering
-        stall detection is a separate, much-longer-timeout watchdog that
-        stays with the caller (this function only clears the debounce for
-        those states so a later, unrelated terminal read starts its own
-        fresh window).
-    """
+    """Decide whether a terminal engine read really means the file finished rather than a spurious state glitch."""
+    # WARNING: unknown length or position counts as NOT near the end, never as about to finish.
     tracking["_media_end_debounce_time"] = debounce_ms
 
     if state == "error":
@@ -5930,23 +5368,6 @@ def check_media_truly_ended(
 
     if state in ("ended", "stopped"):
         _start = tracking.get("_media_end_check_start_time", 0)
-        # _media_end_glitch_since_ms tracks how long the engine has been
-        # continuously sitting in a terminal (ended/stopped) read, INCLUDING
-        # across the "not near end -> reset and retry" branch below. That
-        # branch's own reset of _media_end_check_start_time used to also
-        # wipe this history, so a file whose recorded/probed duration is
-        # simply wrong (longer than the file actually plays -- exactly what
-        # the commercial-pool duration correction exists to fix) could never
-        # be trusted as finished: every debounce window would see "not near
-        # the (wrong) known length" and reset, forever, even though the
-        # underlying engine event is a perfectly real, one-time Ended read
-        # with nothing left to decode. That silently starved the fast
-        # internal-advance path (change_channel's internal_advance flag,
-        # which suppresses the transition burst) of ever firing for such
-        # files, leaving only the much slower wall-clock schedule-vs-loaded
-        # -file mismatch check to eventually notice and reload -- a real,
-        # visible black/frozen gap between this file ending and the next
-        # one starting.
         if not _start:
             tracking["_media_end_check_start_time"] = now_ms
             tracking.setdefault("_media_end_glitch_since_ms", now_ms)
@@ -5954,208 +5375,69 @@ def check_media_truly_ended(
             return False, None
         if now_ms - _start >= debounce_ms:
             if now_ms - last_play_started_at_ms > min_play_time_ms:
-                # Default to False, not True, when length/position aren't
-                # known yet. "Unknown" must never be treated as "near the
-                # end" -- it means we can't verify either way, so the ONLY
-                # thing allowed to confirm a finish in that case is the
-                # _stuck_ms persistence fallback below, which requires the
-                # terminal state to hold for a real stretch of wall-clock
-                # time rather than a single min_play_time_ms window.
-                #
-                # This matters most for length-unknown loads: length_ms is
-                # populated by an async VLC LengthChanged event (see the
-                # engine's _on_length_changed), and is explicitly reset to
-                # "unknown" immediately before every play() call. A load
-                # that gets superseded/retried faster than that event can
-                # land -- e.g. under heavy concurrent thread/disk load --
-                # would otherwise have "near end" default to True and get
-                # confirmed "finished" the instant min_play_time_ms elapses,
-                # regardless of the file's real length or position. That
-                # false confirmation then triggers an immediate advance to
-                # the next file, which resets length again and repeats,
-                # producing a self-sustaining loop that "finishes" a new
-                # file every ~min_play_time_ms with nothing ever actually
-                # playing. Requiring genuine position/length data (or a
-                # sustained multi-second stuck streak) for a confirmed
-                # finish breaks that loop at the source.
+                # WARNING: a confirmed finish needs real position/length data or a sustained multi-second stuck streak.
                 _near_end = False
                 if length_ms and length_ms > 0 and pos_ms is not None and pos_ms >= 0:
                     _near_end = pos_ms >= (length_ms - proximity_ms)
                 _glitch_since = tracking.get("_media_end_glitch_since_ms") or now_ms
                 _stuck_ms = now_ms - _glitch_since
                 if _near_end or _stuck_ms >= max(1500, debounce_ms + proximity_ms):
-                    # Either genuinely near the known length, OR the engine
-                    # has now reported this same terminal state continuously
-                    # for long enough (well past a couple of debounce/retry
-                    # cycles) that it can no longer be a one-off glitch --
-                    # trust the real engine event over a stale/optimistic
-                    # recorded duration rather than looping on it forever.
                     tracking["_media_end_confirmed"] = True
                     tracking["_media_end_glitch_since_ms"] = 0
                     return True, "ended"
-                # Debounce passed but position isn't actually near the end,
-                # and we haven't been stuck here long enough yet to rule out
-                # a transient glitch -- reset the debounce (but NOT the
-                # glitch-since timer) and give the engine another window to
-                # self-recover.
                 tracking["_media_end_check_start_time"] = 0
                 tracking["_media_end_confirmed"] = False
                 return False, None
         tracking["_media_end_confirmed"] = False
         return False, None
 
-    # Opening/Buffering/Playing/Paused/other -- healthy, or a separate
-    # watchdog's concern (stall timeout on Opening/Buffering). Either way,
-    # clear any in-progress debounce (and the glitch-since timer added
-    # above) so a later, unrelated terminal read starts its own fresh
-    # window instead of inheriting this one.
     tracking["_media_end_check_start_time"] = 0
     tracking["_media_end_glitch_since_ms"] = 0
     tracking["_media_end_confirmed"] = False
     return False, None
 
 
+# ============================================================================
+# SECTION: Loudness constants & ffmpeg helpers
+# ============================================================================
+
+
 LOUDNESS_GAIN_CEILING = 10.0
-# LOUDNESS_GAIN_FLOOR (-20dB) is the absolute last-resort floor, used ONLY
-# where a cut is being driven by true-peak safety (see _peak_floor in
-# get_media_loudness_gain/get_pair_loudness_gain, and the peak-capped path
-# in _converge_clamped_gain below) -- i.e. the file would otherwise clip
-# against TRUE_PEAK_CEILING_DBTP. This is the actual safety "ceiling of
-# loudness" and is never loosened by LOUDNESS_GAIN_FLOOR_STANDARD below.
+# WARNING: this is the loudness safety ceiling; LOUDNESS_GAIN_FLOOR_STANDARD never loosens it.
 LOUDNESS_GAIN_FLOOR = 0.1
-# LOUDNESS_GAIN_FLOOR_STANDARD (-6dB) is the floor for an ordinary
-# LUFS-driven cut -- a file that simply measured louder than TARGET_LUFS,
-# with no true-peak risk involved. Deliberately looser than
-# LOUDNESS_GAIN_FLOOR: between a file ending up a little quieter than
-# target and a little louder, the app is meant to lean loud -- a file that
-# measures very hot no longer gets attenuated all the way down to
-# TARGET_LUFS, only down to this floor. True-peak safety is a completely
-# separate clamp (see LOUDNESS_GAIN_FLOOR above) and is NOT affected by
-# this constant, so raising/loosening this floor never lets a file exceed
-# TRUE_PEAK_CEILING_DBTP. Tune this number up (closer to 1.0) to lean even
-# louder, or down (closer to LOUDNESS_GAIN_FLOOR) to normalize harder --
-# it's the one knob for that trade-off.
+# WARNING: true-peak safety is a separate clamp; this floor never lets a file exceed TRUE_PEAK_CEILING_DBTP.
 LOUDNESS_GAIN_FLOOR_STANDARD = 0.5
 
-# Music-only attenuation floor (-20dB). Music is mastered far hotter than
-# TV/movie audio (typically -8 to -15 LUFS integrated, vs MUSIC_TARGET_LUFS
-# of -24), so the ordinary -6dB floor above pinned essentially every track
-# at x0.50 -- i.e. nothing was normalized, and tracks landed anywhere from
-# ~3 to ~7dB over target depending on how hot their master was. This lets
-# a loud track actually be pulled down to target. Only cuts are affected;
-# boosts, the true-peak clamp, and every non-music path are unchanged.
 MUSIC_GAIN_FLOOR = LOUDNESS_GAIN_FLOOR
-# Probing always clamps against this fixed, symmetric ceiling (+-20dB)
-# regardless of the Loudness Scan toggle -- that toggle only controls
-# whether the resulting gain gets applied at playback time (see
-# set_volume in retro_tv_emulator.py), not how probing/prep computes it.
 
-# Quiet, hot-peaked clips (commercials especially) often get their boost
-# capped short by true-peak headroom -- sometimes floored all the way back
-# to gain=1.0, i.e. no boost applied at all (see _peak_floor in
-# get_media_loudness_gain/get_pair_loudness_gain below). Meanwhile clips
-# that started out loud attenuate down to TARGET_LUFS cleanly, since
-# cutting gain never runs into the peak ceiling. Back to back, that reads
-# as an audible quiet/loud/quiet/loud alternation even though every clip
-# individually "reached" its best achievable level.
-#
-# LOUDNESS_CONVERGENCE_DB narrows that gap from both sides: a peak-capped
-# boost gets rescued a little further (a bit more true-peak risk, in
-# exchange for not being left at its original quiet level), and a clean
-# attenuation gets pulled down a little further than bare target. Neither
-# side reaches the other's level exactly, but they land closer together
-# instead of sitting at opposite edges of the target loudness.
 LOUDNESS_CONVERGENCE_DB = 1.5
 
 
 def _converge_clamped_gain(gain, clamped_gain, peak_capped, ceiling,
                            attenuation_floor=None):
-    """Nudge an already target/peak-clamped gain toward LOUDNESS_CONVERGENCE_DB
-    of extra convergence -- see the constant's comment above for why."""
+    """Nudge an already target/peak-clamped gain by up to LOUDNESS_CONVERGENCE_DB of extra convergence."""
     _factor = 10 ** (LOUDNESS_CONVERGENCE_DB / 20.0)
     if gain > 1.0 and peak_capped:
         return min(clamped_gain * _factor, ceiling)
     if gain < 1.0:
-        # Same "lean loud" floor as the primary clamp above -- this nudge
-        # only ever pulls an ordinary attenuation a little further down for
-        # consistency between clips, it never has anything to do with
-        # true-peak safety, so it must respect LOUDNESS_GAIN_FLOOR_STANDARD,
-        # not the true-peak emergency floor.
         _floor = LOUDNESS_GAIN_FLOOR_STANDARD if attenuation_floor is None else attenuation_floor
         return max(_floor, clamped_gain / _factor)
     return clamped_gain
 
-# ATSC A/85 reference level.  Keep the true-peak ceiling below 0 dBTP so
-# boosted quiet material cannot clip during playback or transcoding.
 TRUE_PEAK_CEILING_DBTP = -2.0
 
-# Raised +3.5dB from the ATSC A/85 reference (-24.0) on 2026-09-10: at -24,
-# correctly-targeted content required ~100% system volume to be comfortably
-# audible. -20.5 was picked to land that same comfort level at ~65% system
-# volume instead (100%/65% is a ~3.7dB gap; rounded down slightly here to
-# stay conservative). This raises the floor for every future probe on every
-# channel -- attenuated (too-loud) content still gets pulled down to this
-# new target, and TRUE_PEAK_CEILING_DBTP above is untouched, so boosted
-# (too-quiet) content still can't clip on the way up. One shared constant,
-# so TV/DVD (via VLC's live gain) and the pygame-backed paths (music
-# visualizer, ch03 game music, via get_media_loudness_gain/
-# get_pair_loudness_gain) all move together.
 TARGET_LUFS = -20.5
 
-# Music (ch03 menu music, visualizer songs) is mastered louder and with far
-# less dynamic range than TV/movie content, so measuring it against the
-# same -20.5 target as video pulls it down further than it needs to be for
-# a background/ambient role, and leaves less headroom before the shared
-# TRUE_PEAK_CEILING_DBTP clamp kicks in. Kept 3.5dB under TARGET_LUFS
-# rather than matching typical streaming-music targets (~-14 LUFS) -- this
-# is still meant to sit under other audio (menu narration, visualizer as
-# background), not stand out at full program loudness.
-# Raised from -24.0 to -18.5 together with MUSIC_GAIN_FLOOR below. In practice
-# the old -24 target was never reached: hot music masters (-10 to -15 LUFS)
-# needed 8-13dB of cut but the -6dB floor stopped every track at x0.50, so
-# music actually played at an average of about -18 LUFS with a ~4.5dB
-# spread between tracks. Lowering the floor alone would have normalized
-# everything to -25.5 LUFS (about 7dB quieter than what was actually being
-# heard). -18.5 keeps the overall music level close to where it really was
-# (attenuated tracks land ~1.5dB under this via _converge_clamped_gain,
-# i.e. about -20 LUFS) while making every track land at the SAME level.
-# Tune by ear: 1dB here is roughly 2% of the music volume bar.
 MUSIC_TARGET_LUFS = -18.5
 
-# Shared dynamics-compressor tuning -- single source of truth for every
-# audio path that's supposed to get this processing. VLC (TV stations +
-# DVD) reads these via retro_tv_emulator.py's _compressor_filter_args()
-# (imported from here, not redefined there) to build its live libvlc
-# `compressor` filter args. Paths that can't attach a live VLC filter --
-# ch03 game-channel menu music, the music visualizer, both pygame-backed
-# -- get an equivalent offline render via bake_compressor_pass() below,
-# using ffmpeg's `acompressor` with these exact same numbers. One set of
-# constants so every channel that touches loudness processing is
-# processed the same amount, instead of some getting compression and
-# others (silently) not.
-#
-# Loosened from the original VLC-default-derived values (threshold -11.0,
-# ratio 4.0, knee 5.0, makeup 7.0). Those defaults treated normal program
-# loudness as something to squash: -11dB is close enough to typical
-# dialog/music level that sustained, already-correctly-gained content
-# (not just rare loud surprises) was getting compressed continuously, and
-# a flat +7dB makeup gain couldn't fully undo that much sustained
-# reduction on hot material -- net quieter than the single static
-# per-file gain alone would have produced. Raising the threshold and
-# softening the ratio means the filter only reacts to genuine surprises
-# (a hot cold-open, an unexpectedly loud commercial) instead of
-# continuously working on material that was already correctly leveled by
-# the per-file gain probe.
 COMPRESSOR_ATTACK_MS = 25.0
 COMPRESSOR_RELEASE_MS = 800.0
-COMPRESSOR_THRESHOLD_DB = -18.0   # was -11.0 -- only catch real surprises
-COMPRESSOR_RATIO = 2.0            # was 4.0 -- gentle squeeze, not a squash
-COMPRESSOR_KNEE_DB = 6.0          # was 5.0 -- smoother in/out of compression
-COMPRESSOR_MAKEUP_DB = 4.0        # was 7.0 -- less reduction needs less makeup
+# VALUES CHANGE HERE
+COMPRESSOR_THRESHOLD_DB = -18.0
+COMPRESSOR_RATIO = 2.0
+COMPRESSOR_KNEE_DB = 6.0
+COMPRESSOR_MAKEUP_DB = 4.0
 
-# Bump to force every pygame-backed path to re-bake (parameter/methodology
-# change) even though the source files themselves haven't changed --
-# same pattern as GAP_SCAN_VERSION elsewhere in this file.
 COMPRESSOR_BAKE_VERSION = 1
 
 
@@ -6182,13 +5464,16 @@ def _stderr_indicates_corrupt(stderr_text):
 def _stderr_has_audio_stream(stderr_text):
     if not stderr_text:
         return False
-    import re as _re
-    return bool(_re.search(r"Stream #\d+:\d+[^\n]*:\s*Audio:", stderr_text))
+    return bool(re.search(r"Stream #\d+:\d+[^\n]*:\s*Audio:", stderr_text))
 
 
 def _probe_duration_seconds_fast(file_path):
+    # WARNING: the fallback ffmpeg call below must stay separate from the picture-box scan and the loudness decodes; do not fold them together.
     if not file_path or not _cached_path_exists(file_path):
         return None
+    _facts = _get_header_facts(file_path)
+    if _facts is not None:
+        return _facts.get("duration") if _facts.get("ok") else None
     try:
         import subprocess, re
         popen_kwargs = {}
@@ -6214,7 +5499,33 @@ def _probe_duration_seconds_fast(file_path):
 
 
 def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
-                         semaphore=None):
+                         semaphore=None, semaphore_timeout=None):
+    """Run one loudness window after the governor admits it; the work is in _lufs_window_ffmpeg_inner."""
+    _lane = "music_loudness" if semaphore is _MUSIC_LOUDNESS_PROBE_SEMAPHORE else "loudness_and_bake"
+    _prio = semaphore is _LOUDNESS_PRIORITY_SEMAPHORE or semaphore is _LOUDNESS_PARALLEL_SEMAPHORE
+    _win_t0 = time.time()
+    with _gov_gate(_lane, priority=_prio, timeout=semaphore_timeout,
+                   label=f"loudness({os.path.basename(file_path)})") as _admitted:
+        if not _admitted:
+            return None, None, None, "", True
+        _gate_wait = time.time() - _win_t0
+        _result = _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=start_sec, length_sec=length_sec,
+                                             timeout=timeout, semaphore=semaphore,
+                                             semaphore_timeout=semaphore_timeout)
+        _total = time.time() - _win_t0
+        if _prio or _total >= LOUDNESS_WINDOW_LOG_MIN_SECONDS:
+            log.info("[LOUDNESS WINDOW TIMING] %s start=%s len=%s gate_wait=%.1fs total=%.1fs reading=%s%s",
+                     os.path.basename(file_path),
+                     "whole" if start_sec is None else f"{start_sec:.0f}s",
+                     "whole" if length_sec is None else f"{length_sec:.0f}s",
+                     _gate_wait, _total,
+                     "none" if _result[0] is None else f"{_result[0]:.1f}LUFS",
+                     " TIMEOUT" if _result[4] else "")
+        return _result
+
+
+def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
+                               semaphore=None, semaphore_timeout=None):
     import subprocess, re, json
     popen_kwargs = {}
     if os.name == "nt":
@@ -6230,21 +5541,30 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
     cmd += ["-af", f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DBTP}:LRA=11:print_format=json",
             "-f", "null", "-"]
     _probe_t0 = time.time()
+    _sem = semaphore or _LOUDNESS_PROBE_SEMAPHORE
+    if semaphore_timeout is not None:
+        if not _sem.acquire(timeout=semaphore_timeout):
+            _elapsed = time.time() - _probe_t0
+            _media_warning(
+                "loudness_semaphore_timeout",
+                "[LOUDNESS PROBE WINDOW] Gave up after %.1fs waiting for a free "
+                "probe slot (limit %ss) at start_sec=%s: %s",
+                _elapsed, semaphore_timeout, start_sec, os.path.basename(file_path),
+            )
+            return None, None, None, "", True
+    else:
+        _sem.acquire()
     try:
         _yield_to_live_playback("loudness probe")
-        with (semaphore or _LOUDNESS_PROBE_SEMAPHORE):
-            # Start the drive-latency clock HERE, after the live-playback
-            # yield and after winning a probe slot, so time spent queued
-            # behind other loudness probes is not counted. The elapsed time
-            # is later normalized by length_sec (see
-            # _record_drive_op_latency): a window can cover up to 900 s of
-            # audio, so its raw run time is not a drive-speed measurement.
-            _probe_t0 = time.time()
+        _probe_t0 = time.time()
+        try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=timeout, stdin=subprocess.DEVNULL,
                 **popen_kwargs
             )
+        finally:
+            _sem.release()
     except subprocess.TimeoutExpired:
         _elapsed = time.time() - _probe_t0
         _media_warning(
@@ -6253,11 +5573,6 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
             "at start_sec=%s: %s",
             _elapsed, timeout, start_sec, os.path.basename(file_path),
         )
-        # A timeout is itself the strongest possible "this drive is
-        # struggling" signal -- feed the full elapsed wait in, not just
-        # successful reads, so a drive that's failing to finish reads at
-        # all gets flagged as degraded rather than just never contributing
-        # samples.
         _record_drive_op_latency(file_path, _elapsed * 1000.0, audio_sec=length_sec)
         return None, None, None, "", True
     _record_drive_op_latency(file_path, (time.time() - _probe_t0) * 1000.0, audio_sec=length_sec)
@@ -6271,15 +5586,6 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
             _measured_tp = float(stats.get("input_tp"))
         except (TypeError, ValueError):
             _measured_tp = None
-        # loudnorm's measurement pass already computes Loudness Range as
-        # part of the exact same analysis that gives us input_i/input_tp --
-        # this is a free field on the JSON blob we're already parsing, not
-        # a second ffmpeg call. A high LRA (wide gap between the loud and
-        # quiet parts of this window) is a cheap proxy for "this file
-        # likely has short-term moments well above its own integrated
-        # average" -- it is NOT a direct measurement of true short-term
-        # (3s) loudness, just a free signal worth surfacing instead of
-        # discarding.
         try:
             _measured_lra = float(stats.get("input_lra"))
         except (TypeError, ValueError):
@@ -6304,98 +5610,42 @@ def _combine_true_peak_readings(tp_readings):
     return max(tp_readings)
 
 
-# Mid-show scan brackets. Each entry is
-# (duration_ceiling_seconds, scan_window_seconds); the first bracket whose
-# ceiling the file's duration falls under is used. "None" ceiling = whole
-# show, scanned once (a second identical full-file scan would be pure
-# waste, so the dual-window compare below only applies to the windowed
-# brackets). A window shorter than the file's duration is positioned away
-# from 0, so scans land in normal program content instead of cold opens /
-# logos / silence.
-LOUDNESS_SCAN_BRACKETS = [
-    (900.0, None),      # under 15 min -> scan the whole show (single pass)
-    (1800.0, 300.0),    # 15-30 min -> 5 min windows
-    (3600.0, 600.0),    # 30-60 min -> 10 min windows
-    (None, 900.0),       # over 60 min -> 15 min windows
-]
+# ============================================================================
+# SECTION: Loudness scanning & gain
+# ============================================================================
 
-# If the two windowed scans disagree by more than this many LU, they're
-# not just noise -- treat it as a real split and bring in a 3rd scan (see
-# _lufs_middle_scan_window) rather than immediately picking a side. Within
-# this threshold, the two readings are close enough to just power-average
-# normally with no 3rd scan needed.
-LOUDNESS_DUAL_SCAN_LEAN_QUIET_THRESHOLD_LU = 3.0
 
-# A Loudness Range this wide on a single window is a free-riding proxy
-# (see _lufs_window_ffmpeg's input_lra extraction) for "this file likely
-# has short-term moments well above its own average" -- not a direct
-# short-term-loudness measurement, just a flag worth recording alongside
-# the gain so it's visible in logs/cache rather than silently discarded.
+# VALUES CHANGE HERE (sample windows that disagree by more than this many LU use the quieter reading)
+LOUDNESS_WINDOW_DISAGREE_LU = 3.0
+
+# VALUES CHANGE HERE (gain scan sampling: files up to the whole-file limit are scanned whole; longer files get
+LOUDNESS_WHOLE_FILE_MAX_SECONDS = 120.0
+LOUDNESS_SAMPLE_WINDOW_SECONDS = 30.0
+LOUDNESS_SAMPLE_CENTERS = (0.25, 0.5, 0.75)
+
+# VALUES CHANGE HERE (a loudness window is logged when it took at least this long, or when it belongs to the playing file's first scan)
+LOUDNESS_WINDOW_LOG_MIN_SECONDS = 5.0
+
 LOUDNESS_WIDE_LRA_FLAG_LU = 15.0
 
 
 def _lufs_scan_window(duration_sec):
-    """Return (start_sec, length_sec) for a single-scan bracket (the
-    "whole show" under-15-min case), per LOUDNESS_SCAN_BRACKETS."""
+    """Return (start_sec, length_sec) covering the whole file."""
     return 0.0, duration_sec
 
 
-def _lufs_dual_scan_windows(duration_sec, window_length):
-    """Return two (start_sec, length_sec) windows for the windowed
-    brackets: one centered around the first-third mark, one around the
-    last-third mark, so the two scans sample different parts of the file
-    rather than the same spot twice."""
-    length = min(window_length, duration_sec)
-    max_start = max(0.0, duration_sec - length)
-
-    center_a = duration_sec / 3.0
-    center_b = duration_sec * 2.0 / 3.0
-    start_a = max(0.0, min(center_a - length / 2.0, max_start))
-    start_b = max(0.0, min(center_b - length / 2.0, max_start))
-    return (start_a, length), (start_b, length)
-
-
-def _lufs_middle_scan_window(duration_sec, window_length):
-    """Return a single (start_sec, length_sec) window centered on the
-    file's midpoint -- the tie-breaker 3rd scan used only when the two
-    _lufs_dual_scan_windows readings disagree by more than
-    LOUDNESS_DUAL_SCAN_LEAN_QUIET_THRESHOLD_LU. A 3rd sample from a
-    different part of the file (rather than just re-measuring one of the
-    first two) gives the reconciliation something genuinely new to check
-    the disagreement against."""
-    length = min(window_length, duration_sec)
-    max_start = max(0.0, duration_sec - length)
-    center = duration_sec / 2.0
-    start = max(0.0, min(center - length / 2.0, max_start))
-    return start, length
-
-
 def _reconcile_lufs_readings(pass_readings):
-    """Reconcile 2 or 3 window readings into one file-level LUFS basis.
-
-    2 readings, close together: power-average as usual.
-    2 readings, far apart: lean quiet (a louder single spot is more likely
-    an atypical moment -- action beat, music swell -- than a shift in the
-    file's overall conversational level), but the caller only reaches this
-    with exactly 2 readings if the 3rd tie-breaker scan itself produced
-    nothing usable (timeout/no stats), so leaning quiet is still the best
-    available fallback.
-    3 readings (the tie-breaker fired and got a usable 3rd window): look
-    for any pair that agrees within the threshold and power-average that
-    pair -- majority agreement beats an isolated outlier. If all three
-    disagree with each other, fall back to the quietest of the three,
-    extending the same lean-quiet philosophy rather than guessing.
-    """
+    """Reconcile 2 or 3 window readings into one file-level LUFS basis."""
     if len(pass_readings) >= 3:
         r1, r2, r3 = pass_readings[0], pass_readings[1], pass_readings[2]
         pairs = [(r1, r2), (r1, r3), (r2, r3)]
         for a, b in pairs:
-            if abs(a - b) <= LOUDNESS_DUAL_SCAN_LEAN_QUIET_THRESHOLD_LU:
+            if abs(a - b) <= LOUDNESS_WINDOW_DISAGREE_LU:
                 return _combine_lufs_readings([a, b])
         return min(r1, r2, r3)
     if len(pass_readings) == 2:
         r1, r2 = pass_readings
-        if abs(r1 - r2) > LOUDNESS_DUAL_SCAN_LEAN_QUIET_THRESHOLD_LU:
+        if abs(r1 - r2) > LOUDNESS_WINDOW_DISAGREE_LU:
             return min(r1, r2)
         return _combine_lufs_readings(pass_readings)
     if len(pass_readings) == 1:
@@ -6403,106 +5653,39 @@ def _reconcile_lufs_readings(pass_readings):
     return None
 
 
-def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=180):
-    """Measure a file, returning one consistent file-level loudness basis.
+def _lufs_sample_windows(duration_sec):
+    """Return the (start_sec, length_sec) sample windows for a file, or None when the whole file is scanned."""
+    if not duration_sec or duration_sec <= LOUDNESS_WHOLE_FILE_MAX_SECONDS:
+        return None
+    length = min(LOUDNESS_SAMPLE_WINDOW_SECONDS, duration_sec)
+    max_start = max(0.0, duration_sec - length)
+    return [(max(0.0, min(duration_sec * frac - length / 2.0, max_start)), length)
+            for frac in LOUDNESS_SAMPLE_CENTERS]
 
-    Short files (under the first LOUDNESS_SCAN_BRACKETS ceiling) get a
-    single full-file scan -- there's nothing to compare against.
 
-    Longer files get two independent scans at different points in the
-    runtime (first-third and last-third), each windowed per
-    LOUDNESS_SCAN_BRACKETS so total scan time still stays capped
-    regardless of the file's length. If the two disagree by more than
-    LOUDNESS_DUAL_SCAN_LEAN_QUIET_THRESHOLD_LU, a 3rd tie-breaker scan at
-    the file's midpoint (_lufs_middle_scan_window) is added before
-    reconciling -- this only happens on the disagreement path, so the
-    common case (2 windows that already agree) costs nothing extra.
-
-    chunk_timeout: per-window ffmpeg timeout in seconds, 180 by default.
-    Callers on a real-time budget (a boot-time blocking scan the loading
-    screen is waiting on, e.g.) can pass a much shorter value -- a window
-    that doesn't finish in time is just treated the same as any other
-    timed-out window (any_timeout/no reading), not an error, so the
-    caller's own existing fallback-gain handling covers it unchanged.
-    """
+def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=180, semaphore_timeout=None,
+                          parallel_windows=False, duration_out=None):
+    """Measure a file and return one file-level loudness basis; parallel_windows runs all sample windows at once, and duration_out receives the length measured for the scan as "duration_sec"."""
     duration_sec = _probe_duration_seconds_fast(file_path)
+    if (duration_out is not None and duration_sec and duration_sec > 0
+            and not _duration_looks_implausible(file_path, duration_sec)):
+        duration_out["duration_sec"] = float(duration_sec)
     readings = []
     tp_readings = []
     lra_readings = []
     stderr_for_stream_checks = ""
     any_timeout = False
 
-    if duration_sec:
-        bracket_window = None
-        for ceiling, window in LOUDNESS_SCAN_BRACKETS:
-            if ceiling is None or duration_sec < ceiling:
-                bracket_window = window
-                break
-
-        if bracket_window is None:
-            # Whole-show bracket: one pass, nothing to compare.
+    windows = _lufs_sample_windows(duration_sec)
+    if windows is None:
+        if duration_sec:
             start, length = _lufs_scan_window(duration_sec)
-            m_i, m_tp, m_lra, chunk_stderr, timed_out = _lufs_window_ffmpeg(
-                file_path, target_lufs, start_sec=float(start),
-                length_sec=max(1.0, length), timeout=chunk_timeout,
-                semaphore=semaphore)
-            if chunk_stderr:
-                stderr_for_stream_checks = chunk_stderr
-            any_timeout = timed_out
-            if m_i is not None:
-                readings.append(m_i)
-            if m_tp is not None:
-                tp_readings.append(m_tp)
-            if m_lra is not None:
-                lra_readings.append(m_lra)
         else:
-            # Windowed bracket: two scans at different points, reconciled.
-            # A 3rd (middle) scan is only added if the first two disagree.
-            (start_a, len_a), (start_b, len_b) = _lufs_dual_scan_windows(
-                duration_sec, bracket_window)
-            windows = [(start_a, len_a), (start_b, len_b)]
-            pass_readings = []
-            timeouts = []
-            for start, length in windows:
-                m_i, m_tp, m_lra, chunk_stderr, timed_out = _lufs_window_ffmpeg(
-                    file_path, target_lufs, start_sec=float(start),
-                    length_sec=max(1.0, length), timeout=chunk_timeout,
-                    semaphore=semaphore)
-                if not stderr_for_stream_checks and chunk_stderr:
-                    stderr_for_stream_checks = chunk_stderr
-                timeouts.append(timed_out)
-                if m_i is not None:
-                    pass_readings.append(m_i)
-                if m_tp is not None:
-                    tp_readings.append(m_tp)
-                if m_lra is not None:
-                    lra_readings.append(m_lra)
-
-            if (len(pass_readings) == 2
-                    and abs(pass_readings[0] - pass_readings[1])
-                    > LOUDNESS_DUAL_SCAN_LEAN_QUIET_THRESHOLD_LU):
-                start_c, len_c = _lufs_middle_scan_window(duration_sec, bracket_window)
-                m_i, m_tp, m_lra, chunk_stderr, timed_out = _lufs_window_ffmpeg(
-                    file_path, target_lufs, start_sec=float(start_c),
-                    length_sec=max(1.0, len_c), timeout=chunk_timeout,
-                    semaphore=semaphore)
-                timeouts.append(timed_out)
-                if m_i is not None:
-                    pass_readings.append(m_i)
-                if m_tp is not None:
-                    tp_readings.append(m_tp)
-                if m_lra is not None:
-                    lra_readings.append(m_lra)
-
-            any_timeout = all(timeouts) if timeouts else False
-            _basis = _reconcile_lufs_readings(pass_readings)
-            if _basis is not None:
-                readings.append(_basis)
-            # else: no scan produced a reading; readings stays empty
-    else:
+            start, length = None, None
         m_i, m_tp, m_lra, stderr_for_stream_checks, timed_out = _lufs_window_ffmpeg(
-            file_path, target_lufs, start_sec=None, length_sec=None, timeout=chunk_timeout,
-            semaphore=semaphore)
+            file_path, target_lufs, start_sec=start,
+            length_sec=(None if length is None else max(1.0, length)), timeout=chunk_timeout,
+            semaphore=semaphore, semaphore_timeout=semaphore_timeout)
         any_timeout = timed_out
         if m_i is not None:
             readings.append(m_i)
@@ -6510,11 +5693,50 @@ def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=
             tp_readings.append(m_tp)
         if m_lra is not None:
             lra_readings.append(m_lra)
+        return readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout
 
+    def _one(window):
+        return _lufs_window_ffmpeg(
+            file_path, target_lufs, start_sec=float(window[0]), length_sec=max(1.0, window[1]),
+            timeout=chunk_timeout,
+            semaphore=(_LOUDNESS_PARALLEL_SEMAPHORE if parallel_windows else semaphore),
+            semaphore_timeout=semaphore_timeout)
+
+    if parallel_windows:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(windows), thread_name_prefix="loud-win") as pool:
+            results = list(pool.map(_one, windows))
+    else:
+        results = [_one(w) for w in windows]
+
+    pass_readings = []
+    timeouts = []
+    for m_i, m_tp, m_lra, chunk_stderr, timed_out in results:
+        if not stderr_for_stream_checks and chunk_stderr:
+            stderr_for_stream_checks = chunk_stderr
+        timeouts.append(timed_out)
+        if m_i is not None:
+            pass_readings.append(m_i)
+        if m_tp is not None:
+            tp_readings.append(m_tp)
+        if m_lra is not None:
+            lra_readings.append(m_lra)
+    any_timeout = all(timeouts) if timeouts else False
+    _basis = _reconcile_lufs_readings(pass_readings)
+    if _basis is not None:
+        readings.append(_basis)
     return readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout
 
 
-def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS,
+def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS, *args, **kwargs):
+    """Wrapper for the loudness scan: a scan on the priority semaphore is the playing file's first scan and runs in a priority scope, never held back by the throttle."""
+    if kwargs.get("semaphore") is _LOUDNESS_PRIORITY_SEMAPHORE and _perf_governor is not None:
+        with _perf_governor.priority_scope():
+            return _get_media_loudness_gain_impl(file_path, target_lufs, *args, **kwargs)
+    return _get_media_loudness_gain_impl(file_path, target_lufs, *args, **kwargs)
+
+
+def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                              raise_on_no_audio=False,
                              treat_fallback_as_unknown=False,
                              raise_on_unplayable=False,
@@ -6523,7 +5745,10 @@ def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS,
                              db=None,
                              semaphore=None,
                              chunk_timeout=180,
-                             attenuation_floor=None):
+                             semaphore_timeout=None,
+                             attenuation_floor=None,
+                             parallel_windows=False,
+                             duration_out=None):
     _fallback = None if treat_fallback_as_unknown else 1.0
     _ceiling = LOUDNESS_GAIN_CEILING
     _atten_floor = LOUDNESS_GAIN_FLOOR_STANDARD if attenuation_floor is None else attenuation_floor
@@ -6532,16 +5757,26 @@ def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS,
         return _fallback
 
     norm_p = os.path.normpath(os.path.abspath(file_path))
-    with _loudness_inflight_lock:
-        if norm_p in _loudness_inflight:
-            return _fallback
-        _loudness_inflight.add(norm_p)
+    if not _loudness_inflight.try_claim(norm_p):
+        return _fallback
 
-    _loud_t0 = time.time()
     try:
-        import subprocess, re, json
+        import subprocess
+        _facts = _get_header_facts(file_path)
+        if (_facts and _facts.get("ok") and _facts.get("width")
+                and (_facts.get("duration") or 0) > 0 and not _facts.get("has_audio")):
+            _media_warning(
+                "loudness_no_audio",
+                "[LOUDNESS PROBE] No audio stream in %s (header shows none; no scan run)",
+                os.path.basename(file_path),
+            )
+            if raise_on_no_audio:
+                raise NoAudioStreamError(file_path)
+            return _fallback
         readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout = _sample_lufs_readings(
-            file_path, target_lufs, semaphore=semaphore, chunk_timeout=chunk_timeout)
+            file_path, target_lufs, semaphore=semaphore, chunk_timeout=chunk_timeout,
+            semaphore_timeout=semaphore_timeout, parallel_windows=parallel_windows,
+            duration_out=duration_out)
 
         if not readings:
             if any_timeout:
@@ -6672,8 +5907,7 @@ def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS,
         )
         return _fallback
     finally:
-        with _loudness_inflight_lock:
-            _loudness_inflight.discard(norm_p)
+        _loudness_inflight.release(norm_p)
 
 
 def get_music_loudness_gain(file_path, raise_on_no_audio=False,
@@ -6681,18 +5915,12 @@ def get_music_loudness_gain(file_path, raise_on_no_audio=False,
                              raise_on_unplayable=False,
                              raise_on_timeout=False,
                              shortfall_out=None,
-                             db=None):
-    """Music counterpart to get_media_loudness_gain -- same measurement
-    pipeline, but targets MUSIC_TARGET_LUFS instead of TARGET_LUFS and runs
-    against _MUSIC_LOUDNESS_PROBE_SEMAPHORE instead of the shared video
-    one, so a dedicated music-scan thread (retro_tv_emulator.py's
-    _music_precache_worker) never has to wait behind whatever long movie/
-    show scan the main probe pass is in the middle of. Both semaphores are
-    real, separate BoundedSemaphores -- a music scan and a video scan can
-    genuinely run at the same time, not just get interleaved on one.
-    """
+                             db=None,
+                             duration_out=None):
+    """Music counterpart of get_media_loudness_gain: targets MUSIC_TARGET_LUFS and uses the dedicated music probe semaphore; duration_out receives the file's length from the same scan."""
     return get_media_loudness_gain(
         file_path, target_lufs=MUSIC_TARGET_LUFS,
+        duration_out=duration_out,
         raise_on_no_audio=raise_on_no_audio,
         treat_fallback_as_unknown=treat_fallback_as_unknown,
         raise_on_unplayable=raise_on_unplayable,
@@ -6719,11 +5947,8 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
 
     norm_p1 = os.path.normpath(os.path.abspath(path1))
     norm_p2 = os.path.normpath(os.path.abspath(path2))
-    with _loudness_inflight_lock:
-        if norm_p1 in _loudness_inflight or norm_p2 in _loudness_inflight:
-            return _fallback
-        _loudness_inflight.add(norm_p1)
-        _loudness_inflight.add(norm_p2)
+    if not _loudness_inflight.try_claim(norm_p1, norm_p2):
+        return _fallback
 
     try:
         import subprocess
@@ -6854,59 +6079,21 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
         )
         return _fallback
     finally:
-        with _loudness_inflight_lock:
-            _loudness_inflight.discard(norm_p1)
-            _loudness_inflight.discard(norm_p2)
+        _loudness_inflight.release(norm_p1, norm_p2)
 
 
-
-LOUDNORM_RENORM_LRA = 11.0
-LOUDNORM_RENORM_LRA_AGGRESSIVE = 7.0
-
-RENORM_DYNAMIC_LRA = 6.0
-
-RENORM_DYNAMIC_LRA_AGGRESSIVE = 4.0
-
-RENORM_DYNAMIC_MAX_DURATION_SECONDS = 600
-
-RENORM_SHORTFALL_THRESHOLD_DB = 3.0
-
-RENORM_PEAK_SHORTFALL_THRESHOLD_DB = 0.5
-
-RENORM_VERIFY_TOLERANCE_DB = 1.0
-
-
-class _FFmpegAborted(Exception):
-    """Raised by callers of _run_ffmpeg_interruptible() when should_abort()
-    started returning True mid-run (e.g. live playback began) and the
-    ffmpeg process was terminated early. Kept distinct from a genuine
-    failure/timeout so callers can quietly retry the file later instead
-    of logging it as broken or marking it permanently done."""
-    pass
+# ============================================================================
+# SECTION: Compressor bake
+# ============================================================================
 
 
 def _run_ffmpeg_interruptible(cmd, timeout, should_abort=None, poll_interval=0.4):
-    """Like subprocess.run(), but polls should_abort() (if given) roughly
-    every poll_interval seconds while ffmpeg runs and terminates the
-    process early the instant it starts returning True -- so a long
-    background scan/renorm pass can back off promptly the moment live
-    playback starts, instead of always running its current file/decode to
-    completion regardless of what's on screen.
-
-    Returns (result, aborted). On a normal finish, result behaves like a
-    subprocess.CompletedProcess (.returncode/.stdout/.stderr) and aborted
-    is False. If should_abort() fired, result is None and aborted is
-    True. A real timeout still raises subprocess.TimeoutExpired, exactly
-    like subprocess.run() would, so existing except blocks keep working
-    unchanged.
-    """
+    """Like subprocess.run() but polls should_abort() every poll_interval seconds and terminates ffmpeg early when it returns True."""
     import subprocess, collections
     _FFResult = collections.namedtuple("_FFResult", ["returncode", "stdout", "stderr"])
     popen_kwargs = {}
     if os.name == "nt":
-        popen_kwargs["creationflags"] = (
-            subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
-        )
+        popen_kwargs["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace",
@@ -6935,43 +6122,8 @@ def _run_ffmpeg_interruptible(cmd, timeout, should_abort=None, poll_interval=0.4
                 raise subprocess.TimeoutExpired(cmd, timeout)
 
 
-def _run_ffmpeg_loudnorm_json(file_path, target_lufs, target_tp, lra, timeout,
-                               measured=None, should_abort=None):
-    import re, json as _json
-    af = (f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={lra}:"
-          f"print_format=json")
-    if measured:
-        af += (f":measured_I={measured['input_i']}"
-               f":measured_TP={measured['input_tp']}"
-               f":measured_LRA={measured['input_lra']}"
-               f":measured_thresh={measured['input_thresh']}"
-               f":offset={measured.get('target_offset', 0.0)}"
-               f":linear=true")
-    result, aborted = _run_ffmpeg_interruptible(
-        [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner",
-         "-i", file_path, "-vn", "-af", af, "-f", "null", "-"],
-        timeout, should_abort=should_abort,
-    )
-    if aborted:
-        raise _FFmpegAborted(
-            f"loudnorm measure pass aborted for {os.path.basename(file_path)}")
-    matches = re.findall(r"\{[^{}]*\}", result.stderr, re.DOTALL)
-    if not matches:
-        return None
-    try:
-        return _json.loads(matches[-1])
-    except Exception:
-        return None
-
-
 def _compressor_bake_cache_path(file_path):
-    """Return the on-disk path a baked (pre-compressed) copy of file_path
-    would live at, without checking whether it exists yet. Keyed on a
-    hash of the absolute path (so two identically-named files in
-    different folders can't collide, same reasoning as
-    renormalize_file_two_pass's tmp_path) plus COMPRESSOR_BAKE_VERSION
-    (so a tuning change mints a fresh filename instead of silently
-    reusing a stale render)."""
+    """Return where the baked (pre-compressed) copy of file_path lives, whether or not it exists yet."""
     import hashlib as _hashlib
     file_path = os.path.abspath(file_path)
     stem = os.path.splitext(os.path.basename(file_path))[0]
@@ -6987,15 +6139,7 @@ def _compressor_bake_cache_path(file_path):
 
 
 def get_cached_compressor_bake(file_path):
-    """Return the baked (pre-compressed) copy of file_path if one already
-    exists on disk for the current COMPRESSOR_BAKE_VERSION, else None.
-    Never blocks on ffmpeg -- callers use this to decide whether to play
-    the cached compressed render right now or fall back to the raw file
-    (with just the existing static per-file gain) while a background bake
-    (bake_compressor_pass) catches up -- the exact same "unscanned
-    default until the background pass lands, then hot-patch" shape the
-    loudness gain probe already uses elsewhere in this module.
-    """
+    """Return the baked copy of file_path for the current COMPRESSOR_BAKE_VERSION if it exists, else None."""
     if not file_path or not _cached_path_exists(file_path):
         return None
     _out_path = _compressor_bake_cache_path(file_path)
@@ -7004,45 +6148,17 @@ def get_cached_compressor_bake(file_path):
     return None
 
 
-_compressor_bake_inflight_lock = threading.Lock()
-_compressor_bake_inflight = set()
+_compressor_bake_inflight = _InFlightGuard()
 
 
 def bake_compressor_pass(file_path, timeout=180, should_abort=None):
-    """Render a copy of file_path through the same dynamics-compressor
-    curve VLC applies live to TV-station/DVD playback (COMPRESSOR_*
-    above, kept in exact lockstep with retro_tv_emulator.py's
-    _compressor_filter_args() -- both read from the same constants
-    defined in this file), so pygame-backed audio paths that can't attach
-    a live libvlc filter -- ch03 game-channel menu music, the music
-    visualizer -- end up processed the same amount instead of playing
-    uncompressed while every VLC-driven channel isn't.
-
-    ffmpeg's `acompressor` filter is a different implementation than
-    libvlc's `compressor` module (different codebase entirely), so this
-    is a matched-parameter equivalent, not a bit-identical render -- but
-    it's driven by the exact same threshold/ratio/attack/release/knee/
-    makeup numbers, which is what actually matters for "does this get
-    the same amount of processing", not internal algorithm details
-    nobody can hear the difference of.
-
-    Gated on the same "Loudness Scan" toggle as everything else in this
-    feature -- callers check loudness_scan_enabled before calling this,
-    same as get_media_loudness_gain's callers already do.
-
-    Returns the output path on success, None on any failure. A failure
-    here should never block or fail playback -- callers just keep using
-    the raw file (with the existing static gain still applied) and can
-    retry the bake later, exactly like a failed loudness probe already
-    does.
-    """
+    """Render a copy of file_path through the same compressor curve VLC applies live."""
+    # WARNING: COMPRESSOR_* must stay in lockstep with retro_tv_emulator.py's _compressor_filter_args().
     if not file_path or not _cached_path_exists(file_path):
         return None
     norm_p = os.path.normpath(os.path.abspath(file_path))
-    with _compressor_bake_inflight_lock:
-        if norm_p in _compressor_bake_inflight:
-            return None
-        _compressor_bake_inflight.add(norm_p)
+    if not _compressor_bake_inflight.try_claim(norm_p):
+        return None
     try:
         out_path = _compressor_bake_cache_path(norm_p)
         if _cached_path_exists(out_path):
@@ -7053,10 +6169,6 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
                 os.remove(tmp_path)
             except OSError:
                 pass
-        # acompressor's threshold/makeup are linear amplitude (0-1 / 1-64),
-        # not dB -- convert from the same dB numbers VLC's compressor
-        # filter takes, so COMPRESSOR_THRESHOLD_DB/COMPRESSOR_MAKEUP_DB
-        # stay the one shared source of truth for both engines.
         _threshold_lin = 10 ** (COMPRESSOR_THRESHOLD_DB / 20.0)
         _makeup_lin = 10 ** (COMPRESSOR_MAKEUP_DB / 20.0)
         af = (
@@ -7067,22 +6179,7 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
             f"knee={COMPRESSOR_KNEE_DB}:"
             f"makeup={_makeup_lin:.6f}"
         )
-        with _LOUDNESS_PROBE_SEMAPHORE:
-            # -f wav is required here, not cosmetic: ffmpeg picks its output
-            # muxer from the OUTPUT FILENAME'S extension, and tmp_path ends
-            # in ".tmp" (the real ".wav" is in the middle of the name, from
-            # out_path + ".tmp" above) -- so without an explicit -f, ffmpeg
-            # can't tell what container to write and fails outright ("Unable
-            # to choose an output format for '...wav.tmp'"). That failure
-            # was silent to playback (callers fall back to the raw,
-            # uncompressed file on any bake failure -- see this function's
-            # docstring) but meant the bake never actually succeeded, ever,
-            # for any track: pygame-backed audio (ch03 game-channel music,
-            # the music visualizer) never got the same dynamics-compressor
-            # safety net TV/DVD playback gets live via VLC, and just played
-            # the source's full uncontrolled dynamics instead. Forcing the
-            # container format explicitly makes ffmpeg write real WAV data
-            # regardless of what the temp filename's extension looks like.
+        with _gov_gate("loudness_and_bake", label=f"compressor_bake({os.path.basename(norm_p)})"), _LOUDNESS_PROBE_SEMAPHORE:
             result, aborted = _run_ffmpeg_interruptible(
                 [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner", "-y",
                  "-i", norm_p, "-vn", "-af", af, "-f", "wav", tmp_path],
@@ -7097,14 +6194,6 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
             return None
         if (result.returncode != 0 or not os.path.exists(tmp_path)
                 or os.path.getsize(tmp_path) == 0):
-            # The exit code alone ("ffmpeg exit 4294967274" -- Windows'
-            # unsigned view of a negative return code) has never been
-            # enough to actually diagnose why this fails: the raw file
-            # keeps playing uncompressed (only the flat loudness gain
-            # applied, no peak/dynamics control) every time it's picked,
-            # with nothing but that bare number to go on. Log ffmpeg's own
-            # stderr tail too, so a repeat of this is finally debuggable
-            # instead of just a recurring mystery number in the log.
             _stderr_tail = (getattr(result, "stderr", "") or "").strip().splitlines()[-6:]
             _media_warning(
                 "compressor_bake_failed",
@@ -7119,8 +6208,7 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
                     pass
             return None
         os.replace(tmp_path, out_path)
-        print(f"[COMPRESSOR BAKE] {os.path.basename(norm_p)} -> "
-              f"{os.path.basename(out_path)}")
+        log.info("[COMPRESSOR BAKE] %s -> %s", os.path.basename(norm_p), os.path.basename(out_path))
         return out_path
     except Exception as e:
         _media_warning(
@@ -7129,228 +6217,20 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
         )
         return None
     finally:
-        with _compressor_bake_inflight_lock:
-            _compressor_bake_inflight.discard(norm_p)
+        _compressor_bake_inflight.release(norm_p)
 
 
-def renormalize_file_two_pass(file_path, target_lufs=TARGET_LUFS,
-                               target_tp_dbtp=None, lra=None, timeout=None,
-                               dynamic=False, should_abort=None):
-    if target_tp_dbtp is None:
-        target_tp_dbtp = TRUE_PEAK_CEILING_DBTP
-    if lra is None:
-        lra = RENORM_DYNAMIC_LRA if dynamic else LOUDNORM_RENORM_LRA
-
-    _result = {"status": "failed", "pre_lufs": None, "post_lufs": None,
-               "shortfall_db": None, "error": None}
-
-    if not file_path or not _cached_path_exists(file_path):
-        _result["error"] = "file not found"
-        return _result
-
-    file_path = os.path.abspath(file_path)
-    stem, ext = os.path.splitext(os.path.basename(file_path))
-    # Work files live in the program's own loudness/ folder, never next to
-    # the source media (see resolve_loudness_dir). The path is folded into
-    # a short hash so two different shows with an identically-named
-    # episode (e.g. "S01E01.mp4") can never collide in the shared folder.
-    import hashlib as _hashlib
-    _path_key = _hashlib.sha1(file_path.encode("utf-8", "ignore")).hexdigest()[:16]
-    loudness_dir = resolve_loudness_dir()
-    tmp_path = os.path.join(loudness_dir, f"{_path_key}__{stem}.renorm_tmp{ext}")
-    backup_path = os.path.join(loudness_dir, f"{_path_key}__{stem}.pre_renorm_backup{ext}")
-
-    if timeout is None:
-        _dur = _probe_duration_seconds_fast(file_path)
-        timeout = max(600, int((_dur or 3600) * 1.5))
-
-    # Renorm work competes for the same 2 global loudness-analysis
-    # slots as the regular probe pass, so it can never run as an
-    # invisible 3rd concurrent ffmpeg process.
-    with _LOUDNESS_PROBE_SEMAPHORE:
-        try:
-            measured = _run_ffmpeg_loudnorm_json(
-                file_path, target_lufs, target_tp_dbtp, lra, timeout,
-                should_abort=should_abort)
-            if not measured or "input_i" not in measured:
-                _result["status"] = "no_audio"
-                _result["error"] = "loudnorm measure pass produced no stats"
-                _media_warning(
-                    "renorm_no_stats",
-                    "[RENORM] %s: measure pass produced no usable stats -- "
-                    "leaving file untouched",
-                    os.path.basename(file_path),
-                )
-                return _result
-            try:
-                _result["pre_lufs"] = float(measured["input_i"])
-            except (TypeError, ValueError):
-                pass
-
-            _linear_str = "false" if dynamic else "true"
-            af = (f"loudnorm=I={target_lufs}:TP={target_tp_dbtp}:LRA={lra}:"
-                  f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
-                  f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
-                  f"offset={measured.get('target_offset', 0.0)}:linear={_linear_str}:print_format=json")
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)  # Remove an existing temporary output first.
-            apply_result, _apply_aborted = _run_ffmpeg_interruptible(
-                [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner", "-y",
-                 "-i", file_path, "-map", "0",
-                 "-c:v", "copy", "-c:s", "copy",
-                 "-af", af, "-c:a", "aac", "-b:a", "256k",
-                 tmp_path],
-                timeout, should_abort=should_abort,
-            )
-            if _apply_aborted:
-                raise _FFmpegAborted(
-                    f"apply pass aborted for {os.path.basename(file_path)}")
-            if apply_result.returncode != 0 or not os.path.exists(tmp_path) \
-                    or os.path.getsize(tmp_path) == 0:
-                _result["error"] = (f"ffmpeg apply pass exited "
-                                     f"{apply_result.returncode}")
-                _media_warning(
-                    "renorm_apply_failed",
-                    "[RENORM] %s: apply pass failed (%s) -- "
-                    "leaving original untouched",
-                    os.path.basename(file_path), _result["error"],
-                )
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                return _result
-
-            verify = _run_ffmpeg_loudnorm_json(
-                tmp_path, target_lufs, target_tp_dbtp, lra, min(timeout, 300),
-                should_abort=should_abort)
-            _post_lufs = None
-            if verify and "input_i" in verify:
-                try:
-                    _post_lufs = float(verify["input_i"])
-                except (TypeError, ValueError):
-                    _post_lufs = None
-            _result["post_lufs"] = _post_lufs
-
-            # The file swap below must never leave a window where file_path
-            # doesn't exist on disk. This app's own quit path calls
-            # os._exit(0) with no grace period for in-flight background
-            # work (deliberately, to avoid a worse shutdown-hang bug --
-            # see the pygame.QUIT handler), so a renorm running at the
-            # exact moment the user quits could hit any gap between
-            # "original removed" and "new file in place" and leave the
-            # user's video file missing from its expected location.
-            #
-            # Preserve the backup with a plain (non-atomic, but
-            # non-destructive) copy first -- losing/partially-writing the
-            # disposable backup is harmless -- then do the one and only
-            # operation that actually touches file_path as a single atomic
-            # os.replace(). file_path is therefore always either the
-            # original or the new file, never neither.
-            if not os.path.exists(backup_path):
-                shutil.copy2(file_path, backup_path)
-            # os.replace() is atomic, but only within a single volume --
-            # cross-drive (e.g. the loudness work folder on C:, the media
-            # library on D:) it raises WinError 17 "cannot move the file
-            # to a different disk drive" for any library that doesn't
-            # happen to live on the same drive as the app. Stage a same-
-            # drive copy right next to the real destination first -- that
-            # copy touches a brand-new filename, not file_path itself, so
-            # it can't leave file_path half-written -- then do the actual
-            # atomic swap from there. file_path is still always either the
-            # untouched original or the fully-written new file, never
-            # neither; only the source of the final os.replace() changes
-            # when the two paths aren't on one drive.
-            if os.path.splitdrive(tmp_path)[0].lower() == os.path.splitdrive(file_path)[0].lower():
-                os.replace(tmp_path, file_path)
-            else:
-                _same_drive_tmp = file_path + ".renorm_tmp_swap"
-                shutil.copy2(tmp_path, _same_drive_tmp)
-                try:
-                    os.replace(_same_drive_tmp, file_path)
-                finally:
-                    # Clean up BOTH staging artifacts, not just the C:-side
-                    # source. If os.replace() above raised (e.g. another
-                    # I/O hiccup on the same flaky drive), _same_drive_tmp
-                    # would otherwise be left sitting next to file_path
-                    # forever -- an orphaned ".renorm_tmp_swap" file that
-                    # nothing else in this codebase ever looks for or
-                    # cleans up on its own.
-                    for _leftover in (tmp_path, _same_drive_tmp):
-                        try:
-                            if os.path.exists(_leftover):
-                                os.remove(_leftover)
-                        except OSError:
-                            pass
-
-            if _post_lufs is not None and abs(_post_lufs - target_lufs) <= RENORM_VERIFY_TOLERANCE_DB:
-                _result["status"] = "fixed"
-                # Verified good -- nothing in this codebase ever reads the
-                # backup back to restore it, so keeping it around forever
-                # serves no purpose. Clean it up now rather than let it
-                # accumulate in the loudness folder indefinitely.
-                try:
-                    os.remove(backup_path)
-                except OSError:
-                    pass
-            else:
-                _result["status"] = "still_short"
-                if _post_lufs is not None:
-                    _result["shortfall_db"] = abs(target_lufs - _post_lufs)
-                    _media_warning(
-                        "renorm_still_short",
-                        "[RENORM] %s: re-encoded but still short -- lands at "
-                        "~%.1f LUFS (%.1fdB short of %.1f)",
-                        os.path.basename(file_path), _post_lufs,
-                        _result["shortfall_db"], target_lufs,
-                    )
-                else:
-                    _media_warning(
-                        "renorm_verify_failed",
-                        "[RENORM] %s: re-encoded successfully but verification "
-                        "re-measure failed -- file replaced, shortfall unknown",
-                        os.path.basename(file_path),
-                    )
-                # Keep the pre-renorm backup as a manual rollback option. It
-                # stays isolated in the loudness folder rather than the media
-                # folder.
-            return _result
-        except _FFmpegAborted:
-            # Live playback started mid-pass -- not a failure, just not a
-            # good time. Nothing has touched the original file yet (the
-            # atomic swap only happens after both apply and verify
-            # succeed), so it's safe to just bail out quietly; the
-            # sweep's own retry loop will pick this file back up once
-            # playback ends.
-            _result["status"] = "interrupted"
-            _result["error"] = "live playback started"
-            return _result
-        except subprocess.TimeoutExpired:
-            _result["error"] = "timed out"
-            _media_warning(
-                "renorm_timeout",
-                "[RENORM] %s: timed out -- leaving original untouched",
-                os.path.basename(file_path),
-            )
-            return _result
-        except Exception as e:
-            _result["error"] = str(e)
-            _media_warning(
-                "renorm_error",
-                "[RENORM ERROR] %s: %s",
-                os.path.basename(file_path), e,
-            )
-            return _result
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
+# ============================================================================
+# SECTION: Database
+# ============================================================================
 
 
 class RetroDatabase:
+
+    # ========================================================================
+    # SECTION: Setup
+    # ========================================================================
+
     def __init__(self, detected_aspect_ratio=None):
         self.base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         self.config_path = os.path.join(self.base_dir, "retro_config.json")
@@ -7371,123 +6251,46 @@ class RetroDatabase:
         self._save_request_lock = threading.Lock()
         self._save_generation = 0
 
-        # --- Server/User networking: independent channels source ---
-        # channels_path starts out equal to config_path (normal, non-server
-        # behavior: config and channels live in the same file). "Make Active"
-        # (server slot flow) repoints channels_path at a slot's own file
-        # without ever moving config_path. config_path always stays the
-        # single source of truth for db.config.
         self.channels_path = self.config_path
-        # Cache of whatever "channels" data belongs to config_path itself,
-        # kept in sync independently of which path channels_db is currently
-        # backed by. This is what lets a config-only save (while a server
-        # slot is active elsewhere) write retro_config.json without
-        # clobbering the main project's own channel data with whatever
-        # slot's data happens to be in memory right now.
         self._main_channels_cache = {}
         self._channels_lock = threading.Lock()
         self._channels_save_generation = 0
 
-        # --- Persistence split: durable vs. runtime state ---
-        # playback_anchor is, by a wide margin, the single highest-frequency
-        # write in the whole app -- it's rewritten on every confirmed play
-        # across every code path (_confirm_playback_started is the sole
-        # choke point per fix #5), which means every channel change, every
-        # commercial cut, and every watchdog in-place resume. Before this
-        # split, that single small dict change triggered save_settings_async(),
-        # which deep-copies and rewrites the ENTIRE combined config+channels
-        # file -- every channel's full schedule, rotation state, duration
-        # cache, and broken_files list -- just to persist one anchor. On a
-        # slow/failing drive that's a large, fragile disk write sitting
-        # directly in the hot path of ordinary playback confirmation.
-        # runtime_path holds ONLY per-channel playback_anchor data, written
-        # independently, under its own lock/generation, so a routine anchor
-        # update never has to serialize or write anything durable (schedules,
-        # rotation, broken_files, settings), and a durable save is never
-        # slowed down by runtime churn either. The two writers can never
-        # race on the same physical file, by construction.
+        # WARNING: the config and channels writers must never target the same physical file.
         self.runtime_path = os.path.join(self.base_dir, "playback_runtime.json")
         self._runtime_lock = threading.Lock()
         self._runtime_save_generation = 0
 
 
-        # A User temporarily overlays the locally-owned channel records with
-        # the schedule received from a selected Server.  Keep that overlay
-        # completely separate from the normal save/load path so a remote
-        # snapshot can never be persisted over the user's own channels.
+        # WARNING: keep the remote overlay separate from normal save/load so a remote snapshot is never persisted over the user's channels.
         self._remote_schedule_lock = threading.RLock()
         self._remote_schedule_active = False
         self._remote_local_channels_snapshot = None
         self._remote_locked_channels = set()
-        # Server-imposed playback settings (screen mode); empty when no Server.
         self.remote_playback = {}
 
         threading.Thread(target=self.load_settings_async, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Config / channels loading — split per SERVER_FEATURE_PLAN_1_.md §2.3.
-    #
-    # `_apply_config_defaults` and `_build_channels_db` are pure helpers
-    # (raw dict in, filled dict out) so both the normal startup load *and*
-    # a later "Make Active" channels-only reload can reuse the exact same
-    # migration/default logic without duplicating it.
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Config & channels loading
+    # ========================================================================
 
     def _apply_config_defaults(self, raw_config):
-        """Fill in defaults/migrations on top of a raw 'config' dict loaded
-        from disk. Does not touch channels_db or any file on disk."""
+        """Fill in defaults/migrations on top of a raw 'config' dict loaded from disk."""
         config = dict(raw_config)
         config["is_muted"] = False
-        # Fill missing settings without overwriting saved choices.
         if "screen_mode" not in config:
             config["screen_mode"] = "normal"
-        # DVD player gets its own independent Aspect Ratio /
-        # Screen Mode pair (set from the Games tab's DVD
-        # sub-menu) so switching it never touches -- and is
-        # never touched by -- the main Video tab's settings
-        # above, which apply to every other content type.
         if "dvd_aspect_ratio" not in config:
             config["dvd_aspect_ratio"] = "16:9"
         if "dvd_screen_mode" not in config:
             config["dvd_screen_mode"] = "normal"
-        # Launched Games (libretro) get the same independent Aspect Ratio /
-        # Screen Mode pair as DVD, set from the Games tab's MENU sub-menu.
-        # Unlike DVD's pair (which still needs a boot-lock pass), this one
-        # is force-locked to "4:3" below on real 4:3 hardware from the start.
         if "game_aspect_ratio" not in config:
             config["game_aspect_ratio"] = "16:9"
         if "game_screen_mode" not in config:
             config["game_screen_mode"] = "normal"
         if "pixel_orbiter_enabled" not in config:
             config["pixel_orbiter_enabled"] = True
-        # --- Legacy Bezel-forced-4:3 migration -----------------------
-        # Bezel (fake_43_border_enabled) used to force aspect_ratio /
-        # dvd_aspect_ratio / game_aspect_ratio to "4:3" the moment it
-        # turned on, stashing the real pre-Bezel value in
-        # _aspect_ratio_before_bezel / _dvd_aspect_ratio_before_bezel /
-        # _game_aspect_ratio_before_bezel so it could be put back once
-        # Bezel turned off again (see _restore_aspect_ratio_after_bezel_
-        # off). That forcing was removed -- Bezel's own per-axis mapping
-        # (_bezel_composite_geometry) already fits whatever aspect the
-        # content actually is edge-to-edge into the cutout, so pre-boxing
-        # to 4:3 upstream only pillarboxed the picture before Bezel ever
-        # saw it, then stretched those baked-in black bars into the
-        # cutout along with the picture.
-        #
-        # But a save made while Bezel was already on, from before that
-        # fix, still has its real values sitting forced at "4:3" with the
-        # stash keys present -- and _restore_aspect_ratio_after_bezel_off
-        # only ever runs on a Bezel ON->OFF toggle, so a save where Bezel
-        # has stayed continuously on since before the fix landed never
-        # gets it back on its own; the person would have to know to
-        # toggle Bezel off and back on themselves. Restoring here instead
-        # -- on every load, unconditionally, regardless of Bezel's
-        # current on/off state -- means it self-heals the moment the app
-        # starts, without that manual step. Safe to run every time: once
-        # the stash keys are gone this is a no-op on every later load,
-        # and if _detected_aspect_ratio is genuinely "4:3" (real 4:3
-        # hardware) the forced-back-to-"4:3" pass just below overwrites
-        # whatever this restores anyway, so it can never fight that lock.
         for _live_key, _stash_key in (
             ("aspect_ratio", "_aspect_ratio_before_bezel"),
             ("dvd_aspect_ratio", "_dvd_aspect_ratio_before_bezel"),
@@ -7499,42 +6302,14 @@ class RetroDatabase:
             if config.get("static_noise_color") == "white":
                 config["static_noise_color"] = "grey"
             config["_static_color_migrated"] = True
-        if self._detected_aspect_ratio is not None:
-            if self._detected_aspect_ratio == "4:3":
-                # Real 4:3 (CRT) hardware always wins -- the
-                # simulated 4:3 preview and Bezel are both
-                # irrelevant on it (see _full_tv_border_geometry
-                # and _package_pillarbox_active), so there is
-                # nothing meaningful to restore here.
-                config["aspect_ratio"] = "4:3"
-                # Launched Games' own Aspect Ratio locks the same way --
-                # see get_games_sub_menu_rows / the GAMES_SUB_MENU
-                # "game_aspect_ratio" row handler, which greys the row
-                # out and no-ops Select while this is true.
-                config["game_aspect_ratio"] = "4:3"
-                # DVD player's own Aspect Ratio locks the same way -- real
-                # 4:3 hardware can't show a 16:9 DVD picture any more than
-                # it can a 16:9 game or the main Video tab content, so this
-                # closes the gap where dvd_aspect_ratio could still be left
-                # at (or switched to) "16:9" on a 4:3 boot. See the DVD
-                # sub-menu's "dvd_aspect_ratio" row handler/UI, which needs
-                # the same greyed-out/no-op treatment as game_aspect_ratio
-                # above for this to be enforced end-to-end.
-                config["dvd_aspect_ratio"] = "4:3"
-            else:
-                # Ordinary (16:9) hardware: restore whatever
-                # Aspect Ratio / Bezel preview was last chosen.
-                # setdefault so a genuinely first-ever run (no
-                # saved value at all) still starts at the
-                # hardware's own aspect ratio.
-                config.setdefault("aspect_ratio", self._detected_aspect_ratio)
+        # WARNING: the Aspect Ratio settings have no controls. The picture box follows each video's own shape, a screen that is not 16:9 gets the 16:9 picture boxed inside it, and Bezel mode sets 4:3 itself at boot, so every saved value is forced back to 16:9 here (this also clears a 4:3 the old setting saved).
+        for _aspect_key in ("aspect_ratio", "dvd_aspect_ratio", "game_aspect_ratio"):
+            config[_aspect_key] = "16:9"
+        config["_aspect_screen_forcing_migrated"] = True
         return config
 
     def _build_channels_db(self, raw_channels):
-        """Build a full channels_db dict (all 40 channel slots, every field
-        defaulted) from a raw 'channels' dict loaded from disk. `raw_channels`
-        may be partial or empty -- an empty dict yields the same fresh-install
-        defaults a brand new main project or a brand new server slot gets."""
+        """Build a full channels_db dict (all 40 channel slots, every field defaulted) from a raw 'channels' dict."""
         channels_db = {}
         _VIS_STYLE_MIGRATIONS = {
             "KaleidoscopeEdge": "PrismShards",
@@ -7601,7 +6376,6 @@ class RetroDatabase:
                     "Evening":      saved_schedules.get("Evening",      []),
                     "Night":        saved_schedules.get("Night",        []),
                     "Full Day":     saved_schedules.get("Full Day",     []),
-                    # 4-HOUR ("six_block") buckets — see SIX_HOUR_BLOCKS.
                     "12-4am":       saved_schedules.get("12-4am",       []),
                     "4-8am":        saved_schedules.get("4-8am",        []),
                     "8-12pm":       saved_schedules.get("8-12pm",       []),
@@ -7632,47 +6406,11 @@ class RetroDatabase:
         return channels_db
 
     def _start_resume_probe(self, channels_db):
-        """RETIRED (see notes below) -- kept as a documented no-op so every
-        call site (normal boot, fresh install, server-slot reload,
-        remote-schedule disconnect) doesn't need to be touched.
-
-        This used to spin up a background thread that walked every channel's
-        schedules AND holiday_schedules looking for the -1 'unprobed'
-        duration placeholder and filling it in. Its per-file gate,
-        _wait_out_active_playback(), blocked in a `while True: sleep(0.5)`
-        loop until NOTHING anywhere was playing video -- on a 24/7 channel
-        sim that condition is essentially never true, so in practice this
-        thread got stuck waiting the first time it hit an unprobed file
-        while anything was on, and the rest of that channel's -1 entries
-        (and everything after it) were silently never reached. Confirmed
-        in the field: 7 files stuck at -1 on one channel, 10 tracks stuck
-        on another, no error ever logged for any of them.
-
-        retro_tv_emulator.py's _probe_upcoming_media() already does this
-        job, correctly: it primes the near-term window synchronously
-        before the first frame renders, then runs an always-on background
-        pass (_gather_deep_backlog_queue) that walks the rest of every
-        channel's current schedule on a loop, throttled down -- not
-        stopped -- while something's playing. It reads db.channels_db
-        fresh on every pass, so a server-slot switch or remote-schedule
-        disconnect needs no separate kickoff the way this method used to
-        provide; the very next pass already sees whatever channels_db is
-        now current.
-
-        The one thing this method covered that the ambient scanner
-        doesn't is holiday_schedules -- not in use on any channel here,
-        so that gap is moot. If holiday schedules are added later, the
-        ambient scanner's coverage should be extended to include them
-        instead of reviving this thread.
-        """
+        """No-op kept so existing call sites stay valid."""
         return
 
     def _load_channels_from_path(self, path):
-        """Load channels_db from `path`, independent of whatever config_path
-        is doing. Used by load_settings_async at startup (when channels_path
-        already differs from config_path -- not expected via the current UI,
-        but handled defensively) and by reload_channels_from() any time
-        'Make Active' or 'leave server mode' repoints channels_path."""
+        """Load channels_db from `path`, independent of whatever config_path is doing."""
         raw_channels = {}
         if os.path.exists(path):
             try:
@@ -7692,13 +6430,7 @@ class RetroDatabase:
         self._start_resume_probe(self.channels_db)
 
     def reload_channels_from(self, path):
-        """Core 'Make Active' / 'leave server mode' mechanic (see
-        SERVER_FEATURE_PLAN_1_.md §2.3): flush whatever's currently in
-        channels_db back to wherever channels_path currently points (the
-        main project, or a different server slot if one was already
-        active), then repoint channels_path at `path` and reload
-        channels_db from there. db.config and config_path are never
-        touched by this call."""
+        """Flushes channels_db to the current channels_path, repoints channels_path at `path` and reloads channels_db from it."""
         try:
             target_path = os.fspath(path)
         except (TypeError, ValueError):
@@ -7706,7 +6438,7 @@ class RetroDatabase:
             return False
 
         old_path = self.channels_path
-        self.save_channels(force=True)  # flush to the OLD path first
+        self.save_channels(force=True)
         self.channels_path = target_path
         self._load_channels_from_path(target_path)
         log.info(
@@ -7717,14 +6449,7 @@ class RetroDatabase:
 
     @staticmethod
     def _remote_channel_has_content(channel):
-        """Return whether a remote channel actually owns scheduled content.
-
-        Server slot files contain a full, defaulted channel shape after they
-        have been loaded once.  Presence of a channel key, or an ``active``
-        flag, therefore is not enough to lock it on the User side.  A channel
-        is server-owned when one of its broadcast/visualizer/holiday
-        schedules contains at least one item.
-        """
+        """Return whether a remote channel actually owns scheduled content."""
         if not isinstance(channel, dict):
             return False
         schedules = channel.get("schedules", {})
@@ -7740,11 +6465,8 @@ class RetroDatabase:
         return False
 
     def _fold_live_unlocked_into_snapshot_locked(self):
-        """Caller holds _remote_schedule_lock. While a Server is connected,
-        channels the Server does NOT own stay editable. Copy their live
-        records back into the saved local snapshot so a channel the User
-        creates mid-session is saved, survives the next remote update, and
-        is restored on disconnect."""
+        """Fold live unlocked channel state into the snapshot."""
+        # WARNING: caller must hold _remote_schedule_lock.
         snap = self._remote_local_channels_snapshot
         if not self._remote_schedule_active or snap is None:
             return
@@ -7756,15 +6478,7 @@ class RetroDatabase:
             snap[key] = clean
 
     def apply_remote_schedule(self, channels, playback=None):
-        """Apply a live Server schedule without destroying local ownership.
-
-        The first remote snapshot captures the exact local channel state.
-        Only channels that contain scheduled content in the Server payload are
-        overlaid and marked ``server_locked``.  Empty/unmentioned channels
-        continue to expose the User's local records.  Subsequent snapshots
-        replace the overlay, so server-side additions and removals are
-        reflected live while the saved local snapshot remains untouched.
-        """
+        """Apply a live Server schedule without destroying local ownership."""
         if not isinstance(channels, dict):
             return False
 
@@ -7797,8 +6511,6 @@ class RetroDatabase:
                     merged[channel_key] = copy.deepcopy(remote_channels[channel_key])
                     merged[channel_key]["server_locked"] = True
                 else:
-                    # Preserve the exact pre-connect local record, including
-                    # a deliberate local ``active: False`` choice.
                     local_record = local_channels.get(channel_key)
                     if local_record is None:
                         local_record = self._build_channels_db({}).get(channel_key, {})
@@ -7813,8 +6525,7 @@ class RetroDatabase:
         return True
 
     def remote_screen_mode_for(self, ch_key):
-        """Server's screen mode if ch_key is a Server-streamed channel, else None
-        (your own channels always use your own setting)."""
+        """Return the Server's screen mode if ch_key is a Server-streamed channel, else None."""
         try:
             mode = self.remote_playback.get("screen_mode") if self._remote_schedule_active else None
             if mode and str(ch_key).zfill(2) in self._remote_locked_channels:
@@ -7838,26 +6549,19 @@ class RetroDatabase:
         self._start_resume_probe(self.channels_db)
         return True
 
-    # ------------------------------------------------------------------
-    # Server slot management (SERVER_FEATURE_PLAN_1_.md §2.2, §6.1) —
-    # Build Order Step 1. Slot files are channels-only ({"schema_version":
-    # ..., "channels": {...}}); the slot_id -> display name mapping lives
-    # in db.config["server_slots"] instead, per plan §6.1, since config is
-    # never redirected and this list is small. ui.py / retro_tv_emulator.py
-    # already call these methods for the Manage Servers screen.
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Server slot management
+    # ========================================================================
 
     SERVER_SLOT_IDS = tuple(f"server{i}" for i in range(1, 7))
     SERVER_SLOT_SCHEMA_VERSION = 1
 
     def get_server_slot_path(self, slot_id):
-        """Resolve a slot_id ('server1'..'server6') to its on-disk file:
-        <base_dir>/server/.json/serverN/retro.config.json."""
+        """Resolve a slot_id ('server1'..'server6') to <base_dir>/server/.json/serverN/retro.config.json."""
         return os.path.join(self.base_dir, "server", ".json", slot_id, "retro.config.json")
 
     def list_server_slots(self):
-        """Return [(slot_id, name), ...] for every currently-named slot,
-        in db.config['server_slots'] insertion order."""
+        """Return [(slot_id, name), ...] for every named slot in insertion order."""
         server_slots = self.config.get("server_slots", {})
         return [(slot_id, name) for slot_id, name in server_slots.items()]
 
@@ -7870,11 +6574,7 @@ class RetroDatabase:
         return None
 
     def create_server_slot(self, name):
-        """Create a new named server slot: pick the next free slot, write
-        its (empty, schema-stamped) channels-only file, record the
-        name -> slot mapping in config, and save config. Returns the new
-        slot_id, or None if all 6 slots are already in use or the file
-        couldn't be written."""
+        """Create a new named server slot with an empty channels file and save the name-to-slot mapping in config."""
         slot_id = self.next_free_server_slot()
         if slot_id is None:
             return None
@@ -7899,8 +6599,7 @@ class RetroDatabase:
         return slot_id
 
     def rename_server_slot(self, slot_id, new_name):
-        """Edit a slot's display label only -- never touches its folder or
-        file. Returns True if the slot existed and was renamed."""
+        """Edit a slot's display label only -- never touches its folder or file."""
         server_slots = dict(self.config.get("server_slots", {}))
         if slot_id not in server_slots:
             return False
@@ -7910,13 +6609,7 @@ class RetroDatabase:
         return True
 
     def delete_server_slot(self, slot_id):
-        """Remove a named slot. If it's the currently-active-for-edit slot,
-        redirect channels_db back to the main project first (via
-        reload_channels_from) so nothing's left pointed at a file about to
-        disappear, then drop it from config and delete its folder (with a
-        safety check that the delete path is actually inside this
-        project's own server/.json folder). Returns True if the slot
-        existed and was deleted."""
+        """Remove a named slot."""
         server_slots = dict(self.config.get("server_slots", {}))
         if slot_id not in server_slots:
             return False
@@ -7945,23 +6638,12 @@ class RetroDatabase:
             )
         return True
 
-    # ------------------------------------------------------------------
-    # "Make Active" / "leave server mode" (Build Order Step 2, plan §2.3,
-    # §3b). db.config["active_server_slot"] (a slot_id, or None) tracks
-    # which slot -- if any -- is currently active-for-edit. It's purely a
-    # bookkeeping/UI flag so the Manage Servers screen can show which slot
-    # channels_db currently points to; the actual redirect is Step 0's
-    # reload_channels_from, which already flushes the old path before
-    # switching (so making Slot B active while Slot A is active flushes A
-    # first, satisfying the single-active-slot rule).
-    # ------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Make active / leave server mode
+    # ========================================================================
 
     def make_server_slot_active(self, slot_id):
-        """'Make Active': flush whatever's currently in channels_db back to
-        wherever channels_path currently points (main project, or a
-        different slot if one was already active), then redirect
-        channels_db to slot_id's own file. Returns True on success, False
-        if slot_id isn't a real (named) slot."""
+        """Flush channels_db to the current channels_path, then redirect channels_db to slot_id's own file."""
         server_slots = self.config.get("server_slots", {})
         if slot_id not in server_slots:
             return False
@@ -7971,15 +6653,16 @@ class RetroDatabase:
         return True
 
     def leave_server_slot(self):
-        """'Leave this mode' (switch role card to User, or turn
-        server_option off): redirect channels_db back to the main
-        project's own channel data. Safe to call even when no slot is
-        currently active (no-op in that case)."""
+        """Redirect channels_db back to the main project's channel data."""
         if self.config.get("active_server_slot") is None and self.channels_path == self.config_path:
             return
         self.reload_channels_from(self.config_path)
         self.config["active_server_slot"] = None
         self.save_config()
+
+    # ========================================================================
+    # SECTION: Settings load & save
+    # ========================================================================
 
     def load_settings_async(self):
         if os.path.exists(self.config_path):
@@ -7989,11 +6672,6 @@ class RetroDatabase:
                 self.config = self._apply_config_defaults(data.get("config", {}))
                 raw_channels = data.get("channels", {})
 
-                # The main project file's own channels are always cached
-                # here regardless of which path channels_db is currently
-                # backed by, so a config-only save while a server slot is
-                # active can't accidentally clobber the main project's real
-                # channel data with whatever slot happens to be in memory.
                 self._main_channels_cache = raw_channels
 
                 if self.channels_path == self.config_path:
@@ -8002,11 +6680,6 @@ class RetroDatabase:
                     self.ready_flag = True
                     self._start_resume_probe(self.channels_db)
                 else:
-                    # channels_path was already redirected to a server slot
-                    # before this load ran (not expected from the current
-                    # UI flow -- slot selection isn't persisted across a
-                    # restart today -- but handled defensively rather than
-                    # silently ignored).
                     self.ready_flag = True
                     self._load_channels_from_path(self.channels_path)
 
@@ -8053,24 +6726,17 @@ class RetroDatabase:
             "static_noise_color": "white",
             "_static_color_migrated": True,
             "volume_bar_style": "1",
-            "aspect_ratio": self._detected_aspect_ratio or "16:9",
+            "aspect_ratio": "16:9",
+            "_aspect_screen_forcing_migrated": True,
             "fake_43_border_enabled": False,
             "bezel_style": 1,
             "fake_43_scanlines_enabled": False,
             "fake_static_noise_enabled": False,
             "loudness_scan_enabled": True,
             "screen_mode": "normal",
-            # DVD uses independent aspect-ratio and screen-mode settings.
             "dvd_aspect_ratio": "16:9",
             "dvd_screen_mode": "normal",
             "pixel_orbiter_enabled": True,
-            # "Don't show this message again" checkboxes for the five
-            # burn-in-family Yes/No warnings (switching a music/visualizer
-            # channel off Random to a fixed style, per-console/handheld TV
-            # bezel, full-program bezel, turning off Pixel Orbiter, turning
-            # off the Games-tab Screen Saver). Off by default -- each
-            # warning shows every time it's triggered until the user
-            # explicitly checks its box.
             "burn_in_protection_skip_confirm": False,
             "console_bezel_skip_confirm": False,
             "program_bezel_skip_confirm": False,
@@ -8085,9 +6751,6 @@ class RetroDatabase:
             "remote_bindings": {},
         }
 
-        # Fresh install (no file at config_path yet): build default channels
-        # through the same helper a server slot uses, so "empty raw_channels"
-        # always yields identical results everywhere in the app.
         self._main_channels_cache = {}
         self.channels_db = self._build_channels_db({})
         if not getattr(self, "_recovered_from_load_error", False):
@@ -8132,11 +6795,7 @@ class RetroDatabase:
         """Return a stable copy of just the channels tree."""
         for attempt in range(8):
             try:
-                # While a Server is connected, channels_db is a temporary
-                # remote overlay.  Any of the many existing save_settings()
-                # call sites must continue saving the User's local records,
-                # never the streamed records or the transient
-                # server_locked flags.
+                # WARNING: save_settings() must keep saving the user's local records, never streamed records or transient server_locked flags.
                 with self._remote_schedule_lock:
                     self._fold_live_unlocked_into_snapshot_locked()
                     source = (
@@ -8165,9 +6824,7 @@ class RetroDatabase:
                 return None
 
     def _snapshot_settings(self):
-        """Return a stable copy of both mutable settings trees. Still used
-        by save_settings()/save_settings_async(), which remain the
-        'save everything' entry points every existing call site uses."""
+        """Return a stable copy of both mutable settings trees."""
         config_snapshot = self._snapshot_config()
         if config_snapshot is None:
             return None
@@ -8177,17 +6834,7 @@ class RetroDatabase:
         return {"config": config_snapshot, "channels": channels_snapshot}
 
     def _snapshot_playback_anchors(self):
-        """Return a stable copy of just the per-channel playback_anchor
-        data -- the runtime half of the persistence split. Deliberately
-        excludes everything else in channels_db (schedules, rotation,
-        broken_files, durations): those are durable state and stay on the
-        save_settings()/save_channels() path.
-
-        Uses the same retry-on-RuntimeError pattern as _snapshot_channels
-        (channels_db can be mutated by another thread mid-iteration), but
-        the result here is tiny -- one small dict per channel that actually
-        has an anchor -- so a retry is cheap even under real contention.
-        """
+        """Return a stable copy of just the per-channel playback_anchor data."""
         for attempt in range(8):
             try:
                 with self._channels_lock:
@@ -8220,11 +6867,7 @@ class RetroDatabase:
             return self._runtime_save_generation
 
     def _write_runtime_snapshot(self, anchors_snapshot, generation):
-        """Atomically write runtime_path unless this write is stale. Same
-        atomic-write primitive as the durable saves (temp file + fsync +
-        os.replace), but on its own lock/generation/file, so this can never
-        race against or block on a durable save in progress, and vice versa.
-        """
+        """Atomically write runtime_path unless this write is stale."""
         try:
             with self._runtime_lock:
                 with self._save_request_lock:
@@ -8236,15 +6879,7 @@ class RetroDatabase:
             log.error("Runtime (playback_anchor) write failed path=%s: %s", self.runtime_path, save_err)
 
     def save_playback_anchor(self, force=False):
-        """Persist just the runtime playback_anchor data. This is the
-        lightweight counterpart to save_settings_async() that
-        _confirm_playback_started and the other pure-anchor call sites use
-        instead of triggering a full durable save on every confirmed play.
-
-        Async by default, same contract as save_settings_async -- callers
-        that need the write to have landed before continuing (e.g. right
-        before a deliberate shutdown) can pass force=True.
-        """
+        """Persist just the runtime playback_anchor data."""
         if not getattr(self, "ready_flag", False):
             return
         anchors_snapshot = self._snapshot_playback_anchors()
@@ -8261,17 +6896,7 @@ class RetroDatabase:
             ).start()
 
     def _load_playback_anchors(self):
-        """Merge runtime_path's anchors back into an already-built
-        channels_db. Purely informational/diagnostic at boot -- per the
-        live-TV-only restart policy, a loaded anchor is never trusted to
-        resume playback across a restart (see calculate_slotted_playback_
-        state's cold-boot handling). It's still loaded because it's cheap,
-        harmless, and useful for crash forensics (what was last confirmed
-        playing before an unclean shutdown) -- and because the SAME anchor
-        data still drives the legitimate same-session glitch-recovery path
-        (_anchor_is_live_video) once fresh, real confirmations start
-        arriving again in the new session.
-        """
+        """Merge runtime_path's anchors back into an already-built channels_db."""
         if not os.path.exists(self.runtime_path):
             return
         try:
@@ -8292,21 +6917,7 @@ class RetroDatabase:
 
     @staticmethod
     def _atomic_write_json(tmp_path, final_path, data):
-        """Write `data` to `tmp_path` as JSON, force it to physical disk,
-        then atomically rename it onto `final_path`.
-
-        os.replace() alone only guarantees the *directory entry* swap is
-        atomic -- it says nothing about whether the tmp file's bytes have
-        actually left the OS/drive write-back cache. On a real power loss
-        (as opposed to just a process crash), Windows can journal the
-        rename before the cached file content is flushed, so a reboot can
-        come back with a `final_path` that exists but is 0 bytes or
-        truncated -- exactly the "looks like the config never existed"
-        failure mode. flush()+fsync() before the rename closes that
-        window: once fsync() returns, the tmp file's content is durable,
-        so whichever file is on disk after a crash -- old or new -- is
-        always a complete, valid one.
-        """
+        """Write `data` to `tmp_path` as JSON, fsync, then atomically rename onto `final_path`."""
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=4)
             f.flush()
@@ -8314,11 +6925,7 @@ class RetroDatabase:
         os.replace(tmp_path, final_path)
 
     def _write_config_snapshot(self, config_snapshot, generation):
-        """Atomically write config_path unless this write is stale. Always
-        writes retro_config.json as {"config": ..., "channels": ...}, using
-        _main_channels_cache for the channels half so a config-only save
-        never clobbers the main project's own channel data with whatever a
-        currently-active server slot happens to hold in memory."""
+        """Atomically write config_path unless this write is stale."""
         try:
             with self._save_lock:
                 with self._save_request_lock:
@@ -8333,17 +6940,7 @@ class RetroDatabase:
             log.error("Main config write failed path=%s: %s", self.config_path, save_err)
 
     def _write_channels_snapshot(self, channels_snapshot, path, generation):
-        """Atomically write `path` (whichever file channels_path currently
-        points at) unless this write is stale.
-
-        - If `path` is config_path (normal, non-server case): update
-          _main_channels_cache and write the *combined* retro_config.json
-          via the same lock/tmp-file path _write_config_snapshot uses, so
-          the two writers never race on the same physical file.
-        - Otherwise (`path` is a server slot's own file): write a
-          channels-only {"channels": ...} shape there instead -- slot files
-          never need the full config shape (SERVER_FEATURE_PLAN_1_.md §2.2).
-        """
+        """Atomically write `path` (whichever file channels_path currently points at) unless this write is stale."""
         try:
             with self._channels_lock:
                 with self._save_request_lock:
@@ -8367,9 +6964,7 @@ class RetroDatabase:
             log.error("Channel source write failed path=%s: %s", path, save_err)
 
     def save_config(self):
-        """Save just db.config to config_path. Never touches channels_db or
-        channels_path, so this is safe to call at any time regardless of
-        whether a server slot is currently active."""
+        """Save just db.config to config_path."""
         if not getattr(self, "ready_flag", False):
             return
         config_snapshot = self._snapshot_config()
@@ -8378,9 +6973,7 @@ class RetroDatabase:
         self._write_config_snapshot(config_snapshot, self._next_save_generation())
 
     def save_channels(self, force=False):
-        """Save just db.channels_db to wherever channels_path currently
-        points (main project file or an active server slot). Never touches
-        db.config."""
+        """Save db.channels_db to wherever channels_path currently points."""
         if not getattr(self, "ready_flag", False):
             return
         channels_snapshot = self._snapshot_channels()
@@ -8398,16 +6991,7 @@ class RetroDatabase:
             ).start()
 
     def save_settings(self):
-        """Save everything -- config AND channels. Kept as the existing
-        'save it all' entry point so the ~190 existing call sites across
-        the app that just want a full save keep working unmodified.
-
-        Normal (non-server) case: channels_path == config_path, so this
-        does exactly one combined atomic write, same as before this
-        refactor -- no extra disk I/O just because the internals are now
-        split. Only when a server slot is active (channels_path points
-        elsewhere) does this become two separate writes, because two
-        different files genuinely need updating."""
+        """Save everything -- config AND channels."""
         if not getattr(self, "ready_flag", False):
             return
         if self.channels_path == self.config_path:
@@ -8421,9 +7005,7 @@ class RetroDatabase:
             self.save_channels(force=True)
 
     def save_settings_async(self, force=False):
-        """Save everything, async by default. Same contract as before this
-        refactor -- callers don't need to know or care that config and
-        channels now travel through independent paths internally."""
+        """Save config and channels, async by default."""
         if not getattr(self, "ready_flag", False):
             return
         if self.channels_path == self.config_path:
@@ -8446,7 +7028,6 @@ class RetroDatabase:
 
     def factory_reset(self):
 
-        # Preserve flags and settings that should survive a reset
         game_ch_flag   = self.config.get("game_channel_enabled", True)
         guide_ch_flag  = self.config.get("tv_guide_enabled", True)
         theme_name     = self.config.get("current_theme", "DefaultBlueGreen")
@@ -8458,21 +7039,6 @@ class RetroDatabase:
         transition_type = self.config.get("transition_type", "black")
         remote_bindings = self.config.get("remote_bindings", {})
 
-        # This reset (System menu's "Reset All Settings", which drives the
-        # user-facing "Clear All Media" action) is scoped to the TV
-        # Station/Visualizer side of the app -- the channels_db slots
-        # below (05-44) and the system/display settings dict. The Games
-        # channel (03) is a completely separate subsystem: console
-        # selection/enablement, ROM directories, BIOS assignments, splash
-        # art, scroll style, and per-console control profiles all live in
-        # this same self.config dict but must survive untouched, same as
-        # game_ch_flag/guide_ch_flag above -- this reset must never turn
-        # off a console or undo a profile choice. ROMs, cores, BIOS files,
-        # and Game-channel Music Tracks on disk are untouched either way
-        # (nothing here deletes files), but without preserving these keys
-        # the config reassignment below would still silently drop which
-        # consoles are enabled and which profile/core/BIOS/splash each
-        # one is set to.
         consoles_enabled      = self.config.get("consoles_enabled", {})
         console_rom_dir       = self.config.get("console_rom_dir", {})
         active_bios           = self.config.get("active_bios", {})
@@ -8485,7 +7051,6 @@ class RetroDatabase:
         dvd_splash_enabled    = self.config.get("dvd_splash_enabled", False)
         dvd_splash_path       = self.config.get("dvd_splash_path", "")
 
-        # Reset all system/display settings to factory defaults
         self.config = {
             "global_volume": 70,
             "current_theme": theme_name,
@@ -8509,24 +7074,17 @@ class RetroDatabase:
             "theme_ui_hue": theme_ui_hue,
             "menu_opacity": menu_opacity,
             "transition_type": transition_type,
-            "aspect_ratio": self._detected_aspect_ratio or "16:9",
+            "aspect_ratio": "16:9",
+            "_aspect_screen_forcing_migrated": True,
             "fake_43_border_enabled": False,
             "bezel_style": 1,
             "fake_43_scanlines_enabled": False,
             "fake_static_noise_enabled": False,
             "loudness_scan_enabled": True,
             "screen_mode": "normal",
-            # DVD uses independent aspect-ratio and screen-mode settings.
             "dvd_aspect_ratio": "16:9",
             "dvd_screen_mode": "normal",
             "pixel_orbiter_enabled": True,
-            # "Don't show this message again" checkboxes for the five
-            # burn-in-family Yes/No warnings (switching a music/visualizer
-            # channel off Random to a fixed style, per-console/handheld TV
-            # bezel, full-program bezel, turning off Pixel Orbiter, turning
-            # off the Games-tab Screen Saver). Off by default -- each
-            # warning shows every time it's triggered until the user
-            # explicitly checks its box.
             "burn_in_protection_skip_confirm": False,
             "console_bezel_skip_confirm": False,
             "program_bezel_skip_confirm": False,
@@ -8539,8 +7097,6 @@ class RetroDatabase:
             "screen_edge_top": 0,
             "screen_edge_bottom": 0,
             "remote_bindings": remote_bindings,
-            # Games-channel/console state -- carried forward untouched;
-            # see the note above factory_reset's preserve-block.
             "consoles_enabled": consoles_enabled,
             "console_rom_dir": console_rom_dir,
             "active_bios": active_bios,
@@ -8554,21 +7110,49 @@ class RetroDatabase:
             "dvd_splash_path": dvd_splash_path,
         }
 
-        # Reset every TV Station/Visualizer channel slot (05-44) all the
-        # way back to factory-blank -- identity (active/is_visualizer/
-        # visualizer_style/name) included, not just schedule content.
-        # _build_channels_db({}) is the same helper a fresh install / new
-        # server slot uses, so an empty raw_channels dict here yields
-        # identical from-scratch defaults (channel 05 active, every other
-        # channel off, no channel left marked as a Visualizer) instead of
-        # hand-listing the same fields. channels_db only ever covers
-        # channels 05-44 -- the Games channel (03) and its ROMs/cores/
-        # BIOS/profiles are a separate subsystem entirely and were never
-        # part of this dict, so this line was never the source of any
-        # Games-channel/console reset behavior.
         self.channels_db = self._build_channels_db({})
 
         self.save_settings()
 
 
-
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = [
+    "ASR_REASON_EXTRACT_FAILED", "ASR_REASON_INTERRUPTED", "ASR_REASON_NO_AUDIO",
+    "ASR_REASON_NO_SPEECH", "ASR_REASON_SUCCESS", "ASR_REASON_TRANSCRIBE_FAILED",
+    "ASR_REASON_UNAVAILABLE", "AUDIO_DISPLAY_EXTS", "CAPTION_SIDECAR_EXTS",
+    "COMMERCIAL_BUNDLE_CEILINGS", "COMMERCIAL_MAX_SECONDS", "COMPRESSOR_ATTACK_MS",
+    "COMPRESSOR_BAKE_VERSION", "COMPRESSOR_KNEE_DB", "COMPRESSOR_MAKEUP_DB", "COMPRESSOR_RATIO",
+    "COMPRESSOR_RELEASE_MS", "COMPRESSOR_THRESHOLD_DB", "CRT_WARP_ACTIVE", "DRIVE_CDROM",
+    "FAST_DISK_IO_MAX_CONCURRENT", "LEFTOVERS_TITLE", "LIVE_CAPTION_CHUNK_SEC",
+    "LIVE_CAPTION_LEAD_SEC", "LIVE_CAPTION_MAX_LEAD_SEC", "LIVE_CAPTION_READY_DEADLINE_SEC",
+    "LOUDNESS_CONVERGENCE_DB", "LOUDNESS_WINDOW_DISAGREE_LU",
+    "LOUDNESS_GAIN_CEILING", "LOUDNESS_GAIN_FLOOR", "LOUDNESS_GAIN_FLOOR_STANDARD",
+    "LOUDNESS_PROBE_MAX_CONCURRENT", "LOUDNESS_WIDE_LRA_FLAG_LU",
+    "LiveCaptionSession",
+    "LoudnessProbeTimeoutError", "MOVIES_PER_BLOCK", "MOVIE_HEAVY_RATIO",
+    "MOVIE_LENGTH_THRESHOLD_SECONDS", "MOVIE_ROTATION_KEY", "MUSIC_GAIN_FLOOR",
+    "MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT", "MUSIC_TARGET_LUFS", "NoAudioStreamError",
+    "PATH_MISSING", "PATH_PRESENT", "PATH_UNKNOWN", "RANDOM_REPEAT_HOLD_BACK",
+    "RetroDatabase",
+    "SELECTION_BORDER_WIDTH", "SHORTCUT_EXTENSIONS", "SHORT_EPISODE_PAIRING_VERSION",
+    "SIX_HOUR_BLOCKS", "SIX_HOUR_BLOCK_NAMES", "TARGET_LUFS", "TRUE_PEAK_CEILING_DBTP",
+    "UnplayableMediaError", "VIDEO_DISPLAY_EXTS", "apply_video_effects",
+    "asr_known_unavailable", "bake_compressor_pass", "bezel_style_count",
+    "build_block_timeline", "build_ordered_tracks", "build_show_rotation",
+    "check_media_truly_ended", "clean_display_title_for_ext", "clean_music_display_title",
+    "clean_video_display_title", "commercial_bundle_ceiling", "dedupe_duplicate_episode_files",
+    "dedupe_same_name_different_extension", "discover_bezel_style_files", "dvd_disc_mrl",
+    "fast_forward_show_pos", "generate_captions_via_asr_chunked", "get_cached_compressor_bake",
+    "get_disc_info", "get_media_duration", "get_media_loudness_gain",
+    "get_media_video_dimensions", "get_music_loudness_gain", "get_pair_loudness_gain",
+    "group_shows_flexible", "is_dvd_disc_source", "is_movie_track", "is_optical_drive_root",
+    "is_shortcut_path", "iter_files_resolving_shortcuts", "migrate_show_positions",
+    "note_random_episode_played", "pair_movie_parts", "pair_short_episodes",
+    "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_caption_source",
+    "resolve_captions_dir", "resolve_dir_entry", "resolve_loudness_dir", "resolve_main_dir",
+    "resolve_shortcut_chain", "resolve_shortcut_target", "resolve_track_duration",
+    "resolve_whisper_model_dir", "set_live_playback_priority", "split_movies_and_series",
+    "stable_series_id", "strip_shortcut_display_suffix", "track_duration_is_estimated",
+]

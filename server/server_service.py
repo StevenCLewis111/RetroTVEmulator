@@ -5,6 +5,13 @@ discovery announcer and schedule broadcaster so closing the TV window does not
 take the server off the LAN.  The service watches the main config file, which
 is atomically written by ``RetroDatabase``; it therefore needs no database,
 pygame, VLC, or media imports.
+
+Owns: pid file, autostart registry value, tray, and the config-poll loop.
+Does not own: discovery packets (server_discovery.py) or the schedule wire
+protocol (server_sync.py).
+
+WARNING: set_autostart() must only ever touch the HKCU Run value below. The
+app's Winlogon Shell value used by kiosk boot must never be modified here.
 """
 from __future__ import annotations
 
@@ -18,13 +25,16 @@ import shlex
 import subprocess
 import sys
 import threading
-import time
 
 import server_discovery
 import server_sync
 from server_diagnostics import breadcrumb as _server_breadcrumb
 from server_tray import ServerTray
 
+
+# ============================================================================
+# SECTION: Constants & logging
+# ============================================================================
 
 SERVICE_PID_FILENAME = ".retro_tv_server_service.pid"
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -50,6 +60,11 @@ def _configure_logging(base_dir):
         log.propagate = False
     except Exception:
         logging.basicConfig(level=logging.INFO)
+
+
+# ============================================================================
+# SECTION: PID file
+# ============================================================================
 
 
 def _pid_path(base_dir):
@@ -95,6 +110,11 @@ def _remove_pid(base_dir):
         pass
 
 
+# ============================================================================
+# SECTION: Runtime config
+# ============================================================================
+
+
 def _config_path(base_dir):
     return os.path.join(base_dir, "retro_config.json")
 
@@ -102,10 +122,12 @@ def _config_path(base_dir):
 def _read_runtime_config(base_dir):
     """Return ``(config, slots)`` from the stable main config snapshot.
 
-    ``slots`` contains only named slots whose files currently exist.  A
-    malformed or temporarily unavailable file returns ``(None, None)`` so the
-    service can wait through a brief atomic-replace window instead of shutting
-    down and needlessly removing autostart.
+    ``slots`` contains only named slots whose files currently exist.
+
+    Raises OSError / ValueError (including JSONDecodeError) when the file is
+    missing or malformed. NOTE: run_service() treats that as transient and
+    retries, so a brief atomic-replace window never shuts the service down or
+    removes autostart.
     """
     with open(_config_path(base_dir), "r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -138,6 +160,11 @@ def _write_server_mode(base_dir, enabled):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=4)
     os.replace(tmp, path)
+
+
+# ============================================================================
+# SECTION: Autostart & launch
+# ============================================================================
 
 
 def _service_command(base_dir):
@@ -240,6 +267,11 @@ def ensure_running(base_dir):
         return False
 
 
+# ============================================================================
+# SECTION: Tray actions
+# ============================================================================
+
+
 def _open_server_folder(base_dir):
     path = os.path.join(base_dir, "server", ".json")
     try:
@@ -252,6 +284,11 @@ def _open_server_folder(base_dir):
     except Exception:
         log.warning("[SERVER TRAY] could not open server folder: %s",
                     path, exc_info=True)
+
+
+# ============================================================================
+# SECTION: Service loop
+# ============================================================================
 
 
 def run_service(base_dir):
@@ -389,8 +426,8 @@ def run_service(base_dir):
                 log.exception("[SERVER SERVICE] announcer stop failed")
         tray.stop()
         _remove_pid(base_dir)
-        # Explicit disable removes the Run value; a normal process exit from
-        # a transient error leaves the next app launch able to reinstall it.
+        # NOTE: explicit disable removes the Run value; an exit from a
+        # transient error leaves it so the next app launch can reinstall it.
         try:
             config, slots = _read_runtime_config(base_dir)
             if (not config.get("server_mode_enabled", False)
@@ -403,20 +440,24 @@ def run_service(base_dir):
     return 0
 
 
+# ============================================================================
+# SECTION: Entry point
+# ============================================================================
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Retro TV headless server")
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--base-dir", default=None)
     args = parser.parse_args(argv)
-    # Falls back to the project root (this file's parent folder) rather than
-    # its own folder, so a manual run without --base-dir still finds
-    # retro_config.json and the pid file in the right place.
+    # NOTE: default is the project root (this file's parent folder), so a
+    # manual run without --base-dir finds retro_config.json and the pid file.
     base_dir = args.base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return run_service(base_dir)
 
 
+__all__ = ["ensure_running", "run_service", "set_autostart", "main"]
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-__all__ = ["ensure_running", "run_service", "set_autostart", "main"]

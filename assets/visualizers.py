@@ -1,27 +1,77 @@
+"""Procedural music visualizer styles drawn onto a pygame surface.
+
+Owns: the VisualizerDeck (style list, shuffle queue, per-channel style memory,
+animation state) and the per-style drawing code.
+Does not own: audio analysis or theming. The caller passes the amplitude and
+the theme in on every render call.
+
+WARNING: the render loop fills the surface with (1, 1, 1), never pure black.
+(0, 0, 0) is the game-overlay transparency key.
+"""
 import pygame
 import random
 import colorsys
 import math
 import logging
+import time as _time
+
+try:
+    import performance_governor as _governor
+except Exception:
+    _governor = None
 
 
+# ============================================================================
+# SECTION: Logger
+# ============================================================================
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
 
 
+# ============================================================================
+# SECTION: Equalizer Grid helpers
+# ============================================================================
+
+
+def _eq_tunables():
+    """Returns the Equalizer Grid numbers (smooth seconds, peak fall per second, longest step seconds) from the governor table."""
+    # WARNING: the fallback numbers must match the EQ_GRID_* values in performance_governor.py; they are used only when that module fails to import.
+    if _governor is None:
+        return 0.12, 0.42, 0.1
+    return (_governor.EQ_GRID_SMOOTH_SECONDS, _governor.EQ_GRID_PEAK_FALL_PER_SECOND,
+            _governor.EQ_GRID_MAX_STEP_SECONDS)
+
+
+def _eq_ease(current, target, dt, smooth_seconds):
+    """Moves current toward target by the share of the gap that dt seconds cover, the same at any frame rate."""
+    if smooth_seconds <= 0.0:
+        return target
+    return current + (target - current) * (1.0 - math.exp(-dt / smooth_seconds))
+
+
+def _eq_column(level, max_dots):
+    """Splits a column level (in dots) into the whole dots to light and the fade, 0 to 1, of the next dot; always at least one dot, never past the top."""
+    level = max(1.0, min(float(max_dots), level))
+    whole = int(level)
+    if whole >= max_dots:
+        return max_dots, 0.0
+    return whole, level - whole
+
+
+# ============================================================================
+# SECTION: Visualizer deck
+# ============================================================================
+
 
 class VisualizerDeck:
+    # ========================================================================
+    # SECTION: State & setup
+    # ========================================================================
     def __init__(self):
         self.active_mode = "Random"
         self.current_running_style = "PrismShards"
         self.time_delta = 0.0
         self.smooth_amp = 50.0
-
-        self.modes_list = [
-            "Random", "PrismShards", "LiquidChrome", "PulseRings",
-            "WarpTunnel", "GlowBraid", "EqualizerGrid", "ParticleFlow", "NeonStarfield",
-            "Lightning"
-        ]
 
         self.render_styles = [
             "PrismShards", "LiquidChrome", "PulseRings",
@@ -36,12 +86,12 @@ class VisualizerDeck:
         self.particles = [{"x": random.uniform(0, 1024), "y": random.uniform(0, 768), "size": random.uniform(1, 5), "speed": random.uniform(1, 4), "color": random.uniform(0, 1), "angle": random.uniform(0, math.pi*2), "angleSpeed": random.uniform(-0.02, 0.02)} for _ in range(200)]
         self.stars = [{"x": random.uniform(-1, 1), "y": random.uniform(-1, 1), "z": random.uniform(0.1, 1.0), "color": random.uniform(0, 1)} for _ in range(200)]
 
-        # EqualizerGrid: per-bar smooth heights and peak hold
         self.eq_bars    = [0.0] * 24
         self.eq_targets = [random.uniform(0.05, 0.3) for _ in range(24)]
         self.eq_peaks   = [0.0] * 24
         self.eq_bar_phase = [random.uniform(0, math.pi * 2) for _ in range(24)]
         self.eq_bar_mult  = [random.uniform(0.75, 1.25) for _ in range(24)]
+        self._eq_last_time = None
 
         self.trail_surface = None
         self._glow_braid_fade = None
@@ -75,7 +125,6 @@ class VisualizerDeck:
                 "base_r": random.uniform(55, 110), "hue": random.uniform(0, 1),
             })
 
-        # PulseRings: active expanding-ring pool + onset-detection state
         self.pulse_active = []
         self.pulse_spawn_timer = 0.0
         self.pulse_last_amp = 50.0
@@ -84,6 +133,9 @@ class VisualizerDeck:
         self.lightning_last_amp = 50.0
         self.lightning_flash = 0.0
 
+    # ========================================================================
+    # SECTION: Style selection
+    # ========================================================================
 
     def get_next_random_style(self):
         if not self.shuffle_queue:
@@ -94,6 +146,10 @@ class VisualizerDeck:
         next_style = self.shuffle_queue.pop(0)
         self.last_random_style = next_style
         return next_style
+
+    # ========================================================================
+    # SECTION: Lightning geometry helpers
+    # ========================================================================
 
     def _jagged_path(self, p0, p1, displace, iterations):
         pts = [p0, p1]
@@ -112,7 +168,7 @@ class VisualizerDeck:
         return [(int(x), int(y)) for (x, y) in pts]
 
     def _build_lightning_bolt(self, w, h, start_x, hit):
-        segments = []  # each: (p1, p2, depth)  depth 0=main, 1=branch, 2=sub
+        segments = []
 
         end_x = start_x + random.uniform(-w * 0.12, w * 0.12)
         ground_y = h * random.uniform(0.9, 1.0)
@@ -127,7 +183,7 @@ class VisualizerDeck:
             length = random.uniform(h * 0.12, h * 0.28)
             ang = math.radians(random.uniform(35, 80))
             ex = bx + math.cos(ang) * length * random.choice([-1, 1])
-            ey = by + math.sin(ang) * length            # +y is always downward
+            ey = by + math.sin(ang) * length
             branch = self._jagged_path((bx, by), (ex, ey), w * 0.04, 3)
             for i in range(len(branch) - 1):
                 segments.append((branch[i], branch[i + 1], 1))
@@ -142,10 +198,14 @@ class VisualizerDeck:
 
         return {
             "segments": segments,
-            "life": 1.0,                          # 1.0 -> 0.0 as it fades out
+            "life": 1.0,
             "hue": random.uniform(0.55, 0.72),
-            "width": 2 + int(hit * 3),            # core 2..5px, capped (not a trunk)
+            "width": 2 + int(hit * 3),
         }
+
+    # ========================================================================
+    # SECTION: Render entry points
+    # ========================================================================
 
     def render_active_engine(self, surface, theme, mock_amplitude=None, style_override=None):
         try:
@@ -169,7 +229,8 @@ class VisualizerDeck:
         else:
             style = self.current_running_style if self.active_mode == "Random" else self.active_mode
 
-        surface.fill((1, 1, 1))  # not pure black: (0,0,0) is the game-overlay transparency key
+        # WARNING: (1, 1, 1), not pure black: (0, 0, 0) is the game-overlay transparency key.
+        surface.fill((1, 1, 1))
         t = self.time_delta
         amp_norm = amp / 256.0
 
@@ -343,7 +404,6 @@ class VisualizerDeck:
                 self.trail_surface = pygame.Surface((w, h), pygame.SRCALPHA)
                 self.trail_surface.fill((0, 0, 0, 0))
 
-            # Reuse the fade overlay for each surface size.
             if self._glow_braid_fade is None or self._glow_braid_fade.get_size() != (w, h):
                 self._glow_braid_fade = pygame.Surface((w, h), pygame.SRCALPHA)
                 self._glow_braid_fade.fill((0, 0, 0, 16))
@@ -389,21 +449,23 @@ class VisualizerDeck:
             dot_w = max(4, bar_w - 6)
             gap = 3
             cell_h = dot_h + gap
-            # Top margin gives the peak-hold cap room to breathe near the top;
-            # the bottom row is anchored flush to h itself below, with no
-            # matching margin reserved on that side.
             _EQ_TOP_MARGIN = 10
             max_dots = (h - _EQ_TOP_MARGIN) // cell_h
+
+            _eq_smooth, _eq_peak_fall, _eq_max_step = _eq_tunables()
+            _eq_now = _time.monotonic()
+            _eq_dt = (1.0 / 60.0) if self._eq_last_time is None else min(_eq_max_step, max(0.0, _eq_now - self._eq_last_time))
+            self._eq_last_time = _eq_now
 
             for i in range(num_bars):
                 center_boost = 1.0 - abs(i - num_bars/2.0) / (num_bars/2.0) * 0.35
                 wobble = 0.85 + 0.15 * math.sin(t * 1.6 + self.eq_bar_phase[i])
                 self.eq_targets[i] = min(1.0, (amp / 120.0) * center_boost * self.eq_bar_mult[i] * wobble)
-                self.eq_bars[i] += (self.eq_targets[i] - self.eq_bars[i]) * 0.18
+                self.eq_bars[i] = _eq_ease(self.eq_bars[i], self.eq_targets[i], _eq_dt, _eq_smooth)
                 if self.eq_bars[i] >= self.eq_peaks[i]:
                     self.eq_peaks[i] = self.eq_bars[i]
                 else:
-                    self.eq_peaks[i] = max(0.0, self.eq_peaks[i] - 0.007)
+                    self.eq_peaks[i] = max(0.0, self.eq_peaks[i] - _eq_peak_fall * _eq_dt)
 
             _EQ_BOTTOM = (255, 60, 170)
             _EQ_MID    = (0, 210, 220)
@@ -423,7 +485,7 @@ class VisualizerDeck:
 
             for bi in range(num_bars):
                 bar_x = bi * bar_w + (bar_w - dot_w) // 2
-                num_filled = max(1, int(self.eq_bars[bi] * max_dots))
+                num_filled, top_fade = _eq_column(self.eq_bars[bi] * max_dots, max_dots)
 
                 for di in range(num_filled):
                     dot_frac = di / float(max(1, max_dots))
@@ -432,7 +494,13 @@ class VisualizerDeck:
                     if dot_y > 0:
                         pygame.draw.rect(surface, dot_color, (bar_x, dot_y, dot_w, dot_h))
 
-                # Peak hold dot — bright yellow-white cap
+                if top_fade >= 0.04:
+                    fade_y = h - dot_h - num_filled * cell_h
+                    if fade_y > 0:
+                        fade_color = _eq_row_color(num_filled / float(max(1, max_dots)))
+                        fade_color = tuple(int(1 + (c - 1) * top_fade) for c in fade_color)
+                        pygame.draw.rect(surface, fade_color, (bar_x, fade_y, dot_w, dot_h))
+
                 peak_di = int(self.eq_peaks[bi] * max_dots)
                 peak_y = h - dot_h - peak_di * cell_h
                 if peak_y > 0 and peak_di > 2:
@@ -470,7 +538,7 @@ class VisualizerDeck:
             onset_delta = amp - self.lightning_last_amp
             self.lightning_last_amp = amp
 
-            beat = onset_delta > 7.2  # sudden jump upward = a beat hit
+            beat = onset_delta > 7.2
 
             if beat:
 
@@ -521,3 +589,9 @@ class VisualizerDeck:
             font = pygame.font.SysFont(None, 28)
             msg = font.render(f"[visualizer] unrecognized style: {style!r}", True, (255, 60, 60))
             surface.blit(msg, (20, 20))
+
+
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = ["VisualizerDeck"]

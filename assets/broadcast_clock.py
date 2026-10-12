@@ -1,65 +1,35 @@
-"""Single wall-clock authority for the TV scheduler and guide.
-
-Windows local time is sampled at boot and periodically resynchronised. Between
-samples, monotonic time keeps the displayed/scheduled clock live without
-repeatedly depending on wall-clock reads every frame.
-"""
+"""Single wall-clock authority for the TV scheduler and guide: monotonic-anchored local time, resync on clock steps and DST changes, and absorption of small backward jitter."""
 from __future__ import annotations
 
 import datetime as _datetime
 import threading as _threading
 import time as _time
 
+# ============================================================================
+# SECTION: Tunables & anchor state
+# ============================================================================
+# WARNING: every caller that needs "now" must use this module, not datetime.now(), so the scheduler and guide can never disagree.
+# VALUES CHANGE HERE
 _RESYNC_SECONDS = 60.0
-
-# time.time() is a cheap single syscall (unlike datetime.now().astimezone(),
-# which also resolves the local UTC offset), so it's checked on every now()
-# call to detect a wall-clock step -- a manual time change, an NTP
-# correction, a laptop/HTPC waking from sleep -- without adding a per-frame
-# wall-clock read.
-# When time.time() and time.monotonic() have drifted apart by more than this
-# tolerance since the last resync, now() resyncs immediately instead of
-# waiting for the periodic window below.
 _STEP_TOLERANCE_SECONDS = 2.0
+_JITTER_TOLERANCE_SECONDS = 0.25
 
 _lock = _threading.Lock()
 _wall_anchor = _datetime.datetime.now().astimezone()
 _mono_anchor = _time.monotonic()
 _last_resync = _mono_anchor
 _raw_anchor = _time.time()
-# The UTC offset (in seconds) active at the moment _wall_anchor was captured.
-# time.localtime(x).tm_gmtoff is ~3-4x cheaper than a full
-# datetime.now().astimezone() call, so -- like the time.time() step check
-# above -- it's cheap enough to check on every now() call. This is what
-# catches a DST transition (spring-forward/fall-back): the underlying epoch
-# never jumps at a DST boundary, only the local-time rendering of it does,
-# so the existing raw/mono step check above never fires for DST. Without
-# this, a DST change would only be picked up by the 60s periodic resync,
-# during which seconds_since_midnight() (and therefore schedule position
-# math) would be off by the full DST amount, then snap by a full hour in
-# one instant once the periodic resync finally caught up.
 _offset_anchor = _time.localtime(_raw_anchor).tm_gmtoff
-# The last value returned by now(). Anchors are captured as two sequential,
-# non-atomic calls (an astimezone() call, then a monotonic() call); under
-# concurrent resyncs -- two threads racing through this window at once --
-# the pairing can be misaligned by a few milliseconds, which without a
-# monotonicity guard could make now() briefly return a value earlier than
-# one it already returned. now() absorbs only that sub-second race jitter.
-# A real backward correction (operator fixes a wrong system clock, a bad NTP
-# sync gets corrected) is NOT swallowed here -- it's larger than this jitter
-# tolerance, so it passes through untouched, exactly like any other step.
-# Silently freezing on a stale time forever would be its own bug.
 _last_returned: _datetime.datetime | None = None
-_JITTER_TOLERANCE_SECONDS = 0.25
+
+
+# ============================================================================
+# SECTION: Public API
+# ============================================================================
 
 
 def now() -> _datetime.datetime:
-    """Return the current local wall time as an aware datetime.
-
-    Guaranteed to never return a value earlier than a value it has already
-    returned (monotonically non-decreasing), even under concurrent callers
-    and concurrent resyncs.
-    """
+    """Returns the current local wall time as an aware datetime; a backward step of up to _JITTER_TOLERANCE_SECONDS is absorbed, a larger one passes through."""
     global _wall_anchor, _mono_anchor, _last_resync, _raw_anchor, _offset_anchor, _last_returned
     mono = _time.monotonic()
     raw = _time.time()
@@ -77,11 +47,8 @@ def now() -> _datetime.datetime:
         if _last_returned is not None:
             regression = (_last_returned - result).total_seconds()
             if 0 < regression <= _JITTER_TOLERANCE_SECONDS:
-                # Sub-second race jitter between two anchor pairs -- absorb it.
                 result = _last_returned
             else:
-                # Either moving forward normally, or a real backward step
-                # larger than jitter -- let it through untouched.
                 _last_returned = result
         else:
             _last_returned = result
@@ -94,9 +61,7 @@ def seconds_since_midnight(value: _datetime.datetime | None = None) -> float:
 
 
 def force_resync() -> None:
-    """Resynchronise the wall-clock anchor immediately, without waiting for
-    the next now() call or the periodic resync window.
-    """
+    """Resynchronises the wall-clock anchor immediately, without waiting for the next now() call or the periodic resync window."""
     global _wall_anchor, _mono_anchor, _last_resync, _raw_anchor, _offset_anchor, _last_returned
     mono = _time.monotonic()
     raw = _time.time()
@@ -106,7 +71,6 @@ def force_resync() -> None:
         _last_resync = mono
         _raw_anchor = raw
         _offset_anchor = _time.localtime(raw).tm_gmtoff
-        # Same jitter-only absorption as now() -- see _JITTER_TOLERANCE_SECONDS.
         if _last_returned is not None:
             regression = (_last_returned - _wall_anchor).total_seconds()
             if not (0 < regression <= _JITTER_TOLERANCE_SECONDS):
@@ -127,6 +91,9 @@ def strftime(fmt: str) -> str:
     return now().strftime(fmt)
 
 
+# ============================================================================
+# SECTION: Exports & import-time init
+# ============================================================================
 __all__ = ["now", "date", "seconds_since_midnight", "force_resync", "isoformat", "strftime"]
 
 force_resync()

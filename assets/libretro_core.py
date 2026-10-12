@@ -1,4 +1,16 @@
+"""ctypes host for libretro emulator cores (.dll) used by the Game Deck.
 
+Owns: the libretro constants and C structures, per-port input state, the audio
+queue, the CRT and pixel-art filters, LibretroCore (load, run, save/state,
+disc change) and build_core_for_console().
+Does not own: the game UI, button settings, or which core a console uses
+(game_deck.py).
+
+WARNING: anything a core holds a raw pointer to must stay referenced for as
+long as the core can use it: the ctypes callback objects, the ROM and disc
+buffers (_rom_data_ref, _disc_data_ref) and the playing/queued Sound objects.
+If Python garbage-collects them the core reads freed memory.
+"""
 import os
 import sys
 import math
@@ -14,43 +26,203 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+try:
+    import performance_governor as _timing_governor
+except Exception:
+    _timing_governor = None
+
+
+# ============================================================================
+# SECTION: Game frame timing (log-only)
+# ============================================================================
+
+
+class GameFrameTimer:
+    """Collects per-stage milliseconds of the libretro game frame and logs one summary line per window; log-only, never changes drawing."""
+
+    _TOP_LEVEL = ("input", "core_run", "audio_tick", "color", "pixel", "blit", "osd")
+
+    def __init__(self):
+        self._scratch = {}
+        self._scratch_counts = {}
+        self._t0 = None
+        self._console = ""
+        self._session_t0 = time.monotonic()
+        self._phase = None
+        self._prev_t0 = None
+        self._prev_phase = None
+        self._pad_src = None
+        self._pad_base = None
+        self._reset_window()
+
+    def set_pad_stats_source(self, fn):
+        """Registers the callable that returns the background controller reader's running totals."""
+        self._pad_src = fn
+
+    def _read_pad_src(self):
+        try:
+            return self._pad_src() if self._pad_src is not None else None
+        except Exception:
+            return None
+
+    def _reset_window(self):
+        self._win = {"ticks": 0, "total": 0.0, "worst": 0.0, "runs": 0, "max_runs": 0, "catchup": 0,
+                     "cap": 0, "interval": 0.0, "interval_n": 0, "sum": {}, "count": {}}
+        self._win_start = time.monotonic()
+        self._pad_base = self._read_pad_src()
+
+    def new_session(self):
+        """Starts a fresh timing session; called when a ROM load begins."""
+        try:
+            self._flush()
+        except Exception:
+            pass
+        self._session_t0 = time.monotonic()
+        self._phase = None
+        self._prev_t0 = None
+        self._prev_phase = None
+        self._reset_window()
+
+    def add(self, stage, ms):
+        self._scratch[stage] = self._scratch.get(stage, 0.0) + ms
+
+    def count(self, stage):
+        self._scratch_counts[stage] = self._scratch_counts.get(stage, 0) + 1
+
+    def tick_start(self):
+        self._t0 = time.perf_counter()
+        self._scratch.clear()
+        self._scratch_counts.clear()
+
+    def tick_end(self, phase, console, runs, cap):
+        """Closes one drawn frame: merges its stage times into the window and logs the window when it is due."""
+        if self._t0 is None:
+            return
+        try:
+            end = time.perf_counter()
+            total = (end - self._t0) * 1000.0
+            self._console = console or self._console
+            if phase != self._phase:
+                self._flush()
+                self._phase = phase
+                self._reset_window()
+            w = self._win
+            w["ticks"] += 1
+            w["total"] += total
+            w["worst"] = max(w["worst"], total)
+            w["runs"] += runs
+            w["max_runs"] = max(w["max_runs"], runs)
+            w["cap"] = cap
+            if runs > 1:
+                w["catchup"] += 1
+            if self._prev_t0 is not None and self._prev_phase == phase:
+                w["interval"] += (self._t0 - self._prev_t0) * 1000.0
+                w["interval_n"] += 1
+            self._prev_t0 = self._t0
+            self._prev_phase = phase
+            for k, v in self._scratch.items():
+                w["sum"][k] = w["sum"].get(k, 0.0) + v
+            for k, v in self._scratch_counts.items():
+                w["count"][k] = w["count"].get(k, 0) + v
+            self._scratch.clear()
+            self._scratch_counts.clear()
+            self._t0 = None
+            if _timing_governor is None:
+                return
+            now = time.monotonic()
+            early = now - self._session_t0 < _timing_governor.GAME_FRAME_TIMING_EARLY_SECONDS
+            period = (_timing_governor.GAME_FRAME_TIMING_EARLY_LOG_SECONDS if early
+                      else _timing_governor.GAME_FRAME_TIMING_LOG_SECONDS)
+            if now - self._win_start >= period:
+                self._flush()
+                self._reset_window()
+        except Exception:
+            self._t0 = None
+
+    def _flush(self):
+        w = self._win
+        if w["ticks"] <= 0 or self._phase == "idle" or _timing_governor is None:
+            return
+        n = float(w["ticks"])
+        s = w["sum"]
+        c = w["count"]
+
+        def mean(key):
+            return s.get(key, 0.0) / n
+
+        total = w["total"] / n
+        interval = (w["interval"] / w["interval_n"]) if w["interval_n"] else 0.0
+        top = sum(mean(k) for k in self._TOP_LEVEL)
+        blit_parts = mean("cache_rebuild") + mean("scale") + mean("shader") + mean("border")
+        log.info(
+            "[GAME FRAME TIMING] %s phase=%s t=+%.1fs ticks=%d interval=%.1fms (outside the game call %.1fms) "
+            "core_runs=%d (max %d per tick, cap %d, %d tick(s) caught up) | mean per tick ms: total=%.1f "
+            "input=%.1f core_run=%.1f [video_cb=%.1f audio_cb=%.1f] audio_tick=%.1f color=%.1f pixel=%.1f "
+            "blit=%.1f [cache_rebuild=%.1f x%d scale=%.1f shader=%.1f border_art_led=%.1f other=%.1f] "
+            "osd=%.1f unaccounted=%.1f | worst tick=%.1fms",
+            self._console, self._phase, time.monotonic() - self._session_t0, w["ticks"],
+            interval, max(0.0, interval - total),
+            w["runs"], w["max_runs"], w["cap"], w["catchup"], total,
+            mean("input"), mean("core_run"), mean("video_cb"), mean("audio_cb"), mean("audio_tick"),
+            mean("color"), mean("pixel"),
+            mean("blit"), mean("cache_rebuild"), c.get("cache_rebuild", 0), mean("scale"), mean("shader"),
+            mean("border"), max(0.0, mean("blit") - blit_parts),
+            mean("osd"), max(0.0, total - top), w["worst"])
+        pad_now = self._read_pad_src()
+        pad_base = self._pad_base
+        pinned = c.get("pad_pinned", 0)
+        bg = ""
+        if pad_now is not None and pad_base is not None and pad_now["scans"] >= pad_base["scans"]:
+            scans = pad_now["scans"] - pad_base["scans"]
+            per = max(1, scans)
+            bg = (" | background reader per window: scans=%d mean=%.2fms worst=%.2fms [xinput=%.2f joystick=%.2f] "
+                  "hid_scans=%d (%.1fms) joystick_reads=%d" % (
+                      scans, (pad_now["ms"] - pad_base["ms"]) / per, pad_now["worst"],
+                      (pad_now["xinput"] - pad_base["xinput"]) / per, (pad_now["joy"] - pad_base["joy"]) / per,
+                      pad_now["hid_scans"] - pad_base["hid_scans"], pad_now["hid_ms"] - pad_base["hid_ms"],
+                      pad_now["joy_reads"] - pad_base["joy_reads"]))
+        log.info(
+            "[GAME PAD TIMING] %s phase=%s | game thread per tick: own controller read=%.2fms (x%d, newest background read "
+            "was stale x%d) snapshot age=%.1fms calls served=%.1f%s",
+            self._console, self._phase, mean("pad_scan"), c.get("pad_scan", 0), c.get("pad_stale", 0),
+            (s.get("pad_age", 0.0) / pinned) if pinned else 0.0, c.get("pad_served", 0) / n, bg)
+
+
+GAME_FRAME_TIMER = GameFrameTimer()
+
+# ============================================================================
+# SECTION: Throttled logging & DLL handle
+# ============================================================================
+_WARN_THROTTLE_INTERVAL_S = 5.0
+_warn_throttle_last = {}
+
 
 def _log_warn_throttled(_key, msg, *args, **kwargs):
-    log.error(msg, *args)
+    """Log a warning at most once per _WARN_THROTTLE_INTERVAL_S per _key."""
+    now = time.monotonic()
+    last = _warn_throttle_last.get(_key, float('-inf'))
+    if now - last < _WARN_THROTTLE_INTERVAL_S:
+        return
+    _warn_throttle_last[_key] = now
+    log.warning(msg, *args)
 
 
 def _free_dll_handle(dll):
-    """Release a loaded core .dll's OS module handle.
-
-    ctypes.CDLL(path) calls Windows LoadLibrary under the hood, but ctypes
-    never calls the matching FreeLibrary on its own. Without this, the
-    module stays mapped into the process for its entire lifetime, which
-    keeps the .dll file locked by Windows -- so deleting that core's file
-    later (Select Libretro Core -> Remove Selected) fails with a permission
-    error. Do not remove this call.
-
-    ctypes.CDLL objects expose the raw HMODULE as `._handle` on Windows,
-    which is exactly what FreeLibrary expects. Best-effort: if this ever
-    fails (non-Windows, an already-invalid handle, etc.) it's logged and
-    swallowed -- freeing the handle is a cleanup nicety, not something
-    that should ever be allowed to break actual core unload."""
+    """Release a loaded core .dll's OS module handle (FreeLibrary)."""
     if sys.platform != "win32" or dll is None:
         return
     try:
         handle = getattr(dll, "_handle", None)
         if handle:
-            # Without this, ctypes marshals `handle` using its default
-            # argument type (a 32-bit signed int) instead of a pointer,
-            # so on 64-bit Windows any HMODULE above the 32-bit signed
-            # range raises OverflowError and the call never happens --
-            # silently defeating the whole point of this function (the
-            # .dll stays mapped and locked). HMODULE is pointer-sized,
-            # so declare it explicitly every call (cheap, and safe to
-            # repeat -- ctypes caches nothing here that needs guarding).
             ctypes.windll.kernel32.FreeLibrary.argtypes = [ctypes.wintypes.HMODULE]
             ctypes.windll.kernel32.FreeLibrary(handle)
     except Exception as e:
         log.warning(f"[LIBRETRO] FreeLibrary failed (core .dll may stay locked): {e}")
+
+
+# ============================================================================
+# SECTION: Libretro API constants
+# ============================================================================
 
 
 RETRO_API_VERSION = 1
@@ -108,11 +280,16 @@ RETRO_DEVICE_MASK       = (1 << RETRO_DEVICE_TYPE_SHIFT) - 1
 
 RETRO_DEVICE_INDEX_ANALOG_LEFT  = 0
 
-# RETRO_DEVICE_ID_ANALOG_* — which axis on that stick
 RETRO_DEVICE_ID_ANALOG_X = 0
 RETRO_DEVICE_ID_ANALOG_Y = 1
 
 RETRO_LANGUAGE_ENGLISH = 0
+
+
+# ============================================================================
+# SECTION: Console button mapping
+# ============================================================================
+
 
 CONSOLE_BTN_TO_LIBRETRO = {
     "Up":     RETRO_DEVICE_ID_JOYPAD_UP,
@@ -121,7 +298,7 @@ CONSOLE_BTN_TO_LIBRETRO = {
     "Right":  RETRO_DEVICE_ID_JOYPAD_RIGHT,
     "Start":  RETRO_DEVICE_ID_JOYPAD_START,
     "Select": RETRO_DEVICE_ID_JOYPAD_SELECT,
-    "Option": RETRO_DEVICE_ID_JOYPAD_SELECT,   # NGP "Option" = Select
+    "Option": RETRO_DEVICE_ID_JOYPAD_SELECT,
     "A":      RETRO_DEVICE_ID_JOYPAD_A,
     "B":      RETRO_DEVICE_ID_JOYPAD_B,
     "X":      RETRO_DEVICE_ID_JOYPAD_X,
@@ -133,11 +310,10 @@ CONSOLE_BTN_TO_LIBRETRO = {
     "L3":     RETRO_DEVICE_ID_JOYPAD_L3,
     "R3":     RETRO_DEVICE_ID_JOYPAD_R3,
     "1":      RETRO_DEVICE_ID_JOYPAD_B,
-    "2":      RETRO_DEVICE_ID_JOYPAD_A,  # NES 2 = A Genesis / Mega Drive — A/B/X/Y map directly onto their same-named
+    "2":      RETRO_DEVICE_ID_JOYPAD_A,
     "C":      RETRO_DEVICE_ID_JOYPAD_R,
     "Z":      RETRO_DEVICE_ID_JOYPAD_L,
     "Mode":   RETRO_DEVICE_ID_JOYPAD_SELECT,
-    # Standard RetroPad PSX mapping.
     "Cross":    RETRO_DEVICE_ID_JOYPAD_B,
     "Circle":   RETRO_DEVICE_ID_JOYPAD_A,
     "Square":   RETRO_DEVICE_ID_JOYPAD_Y,
@@ -160,6 +336,10 @@ def lr_id_for(console, btn_name):
         return override
     return CONSOLE_BTN_TO_LIBRETRO.get(btn_name)
 
+
+# ============================================================================
+# SECTION: C structures & callback types
+# ============================================================================
 
 
 class retro_system_info(ctypes.Structure):
@@ -262,8 +442,8 @@ class retro_core_options_v2(ctypes.Structure):
 
 class retro_controller_description(ctypes.Structure):
     _fields_ = [
-        ("desc", ctypes.c_char_p),   # human-readable name, e.g. "Multitap" / "RetroPad"
-        ("id",   ctypes.c_uint),     # the value to pass back into retro_set_controller_port_device
+        ("desc", ctypes.c_char_p),
+        ("id",   ctypes.c_uint),
     ]
 
 
@@ -295,7 +475,6 @@ class retro_disk_control_callback(ctypes.Structure):
     ]
 
 
-
 RETRO_ENVIRONMENT_CB        = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_uint, ctypes.c_void_p)
 RETRO_VIDEO_REFRESH_CB      = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_size_t)
 RETRO_AUDIO_SAMPLE_CB       = ctypes.CFUNCTYPE(None, ctypes.c_int16, ctypes.c_int16)
@@ -303,6 +482,10 @@ RETRO_AUDIO_SAMPLE_BATCH_CB = ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.POINTER(c
 RETRO_INPUT_POLL_CB         = ctypes.CFUNCTYPE(None)
 RETRO_INPUT_STATE_CB        = ctypes.CFUNCTYPE(ctypes.c_int16, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint)
 
+
+# ============================================================================
+# SECTION: Input state
+# ============================================================================
 
 
 class LibretroInputState:
@@ -368,36 +551,39 @@ class LibretroInputManager:
             self.port(port_num).clear()
 
 
+# ============================================================================
+# SECTION: Audio output
+# ============================================================================
+
 
 class LibretroAudio:
 
-    CHANNEL_ID  = 6          # pygame.mixer.Channel reserved for game audio
-    OUT_CHUNK   = 1024       # output (mixer-rate) pairs handed to the mixer at a time
+    # VALUES CHANGE HERE
+    CHANNEL_ID  = 6
+    OUT_CHUNK   = 1024
     TARGET_OUT  = 4096
-    MAX_OUT     = 12288      # hard cap on the reservoir to bound latency
-    PREBUFFER   = 3072       # fill this many output pairs before first playback
-    DRC_RANGE   = 0.004      # max ±fraction the ratio is nudged for drift control
+    MAX_OUT     = 12288
+    PREBUFFER   = 3072
+    DRC_RANGE   = 0.004
 
     LOUDNESS_GAIN = 0.45
 
     def __init__(self, sample_rate=32768):
         self._sample_rate = int(sample_rate) if sample_rate else 32768
 
-        # Ingest: deque of (frames, 2) int16 blocks straight from the core.
         self._in_blocks = collections.deque()
         self._in_count  = 0
         self._buf_lock  = threading.Lock()
 
         self._src = np.empty((0, 2), dtype=np.float32)
 
-        # Already-resampled output reservoir (mixer-rate int16 pairs).
         self._out = np.empty((0, 2), dtype=np.int16)
 
-        # Fractional read position within self._src, carried across ticks.
         self._pos = 0.0
 
         self._channel     = None
-        self._snd_playing = None    # hard refs so GC can't free a live Sound
+        # WARNING: keep hard refs to the playing and queued Sound objects so GC never frees one the channel still needs.
+        self._snd_playing = None
         self._snd_queued  = None
 
         self._volume = 1.0
@@ -410,7 +596,6 @@ class LibretroAudio:
             self._mixer_freq     = 44100
             self._mixer_channels = 2
 
-        # Base conversion ratio (mixer samples produced per source sample).
         self._base_ratio = (self._mixer_freq / self._sample_rate
                              if self._sample_rate > 0 else 1.0)
 
@@ -468,17 +653,14 @@ class LibretroAudio:
         out = src[idx] * (1.0 - frac) + src[idx + 1] * frac
         out = np.clip(out, -32768, 32767).astype(np.int16)
 
-        # Advance the read head and carry the fractional remainder.
         new_pos  = self._pos + n_out / ratio
         consumed = int(np.floor(new_pos))
         if consumed > n_src - 1:
             consumed = n_src - 1
         self._pos = new_pos - consumed
 
-        # Keep the unconsumed tail (plus the overlap sample at `consumed`).
         self._src = src[consumed:]
 
-        # Append to the output reservoir; cap it to bound latency.
         if len(self._out):
             self._out = np.concatenate([self._out, out], axis=0)
         else:
@@ -501,7 +683,6 @@ class LibretroAudio:
             except Exception:
                 return
 
-        # 1) Pull newly-ingested source into the contiguous working buffer.
         with self._buf_lock:
             if self._in_blocks:
                 blocks = list(self._in_blocks)
@@ -519,13 +700,10 @@ class LibretroAudio:
         buffered = len(self._out)
         error    = (buffered - self.TARGET_OUT) / float(self.TARGET_OUT)
         error    = max(-1.0, min(1.0, error))
-        # Too full → produce slightly fewer output samples (ratio↓); too empty → ratio↑.
         ratio    = self._base_ratio * (1.0 - self.DRC_RANGE * error)
 
-        # 3) Resample available source into the reservoir.
         self._resample_into_out(ratio)
 
-        # 4) Prebuffer gate so the first frames after load don't underrun.
         if not self._ready:
             if len(self._out) < self.PREBUFFER:
                 return
@@ -534,7 +712,7 @@ class LibretroAudio:
         try:
             busy = self._channel.get_busy()
             if not busy:
-                self._feed_one_chunk(start=True)        # (re)start after idle/underrun
+                self._feed_one_chunk(start=True)
                 self._feed_one_chunk(start=False)
             elif self._channel.get_queue() is None:
                 self._feed_one_chunk(start=False)
@@ -548,19 +726,6 @@ class LibretroAudio:
         chunk     = np.ascontiguousarray(self._out[:self.OUT_CHUNK])
         self._out = self._out[self.OUT_CHUNK:]
         if self._mixer_channels == 1 and chunk.ndim == 2 and chunk.shape[1] == 2:
-            # Downmix true stereo to mono right at the point it leaves this
-            # buffer -- average L+R rather than dropping a channel, so a
-            # single-speaker TV gets the full mix instead of whichever
-            # channel happened to be picked. self._out itself stays
-            # 2-channel throughout (the resampler above always works in
-            # stereo pairs, straight from push_samples), so this is the one
-            # place that needs to actually match whatever pygame.mixer was
-            # opened with. Needed because the Mono Audio System-menu toggle
-            # reinitializes the mixer itself to channels=1 (see
-            # _apply_mixer_channels_setting() in retro_tv_emulator.py) --
-            # without this, every make_sound() call below would start
-            # raising, since pygame requires the array's channel depth to
-            # match the open mixer's.
             chunk = ((chunk[:, 0].astype(np.int32) + chunk[:, 1].astype(np.int32)) // 2).astype(np.int16)
             chunk = np.ascontiguousarray(chunk)
         try:
@@ -568,7 +733,6 @@ class LibretroAudio:
         except Exception as exc:
             log.warning(f"[LIBRETRO AUDIO] make_sound error: {exc}")
             return
-        # Promote refs so GC never frees a Sound the channel still needs.
         self._snd_playing = self._snd_queued
         self._snd_queued  = snd
         if start:
@@ -616,7 +780,6 @@ class LibretroAudio:
                     self._channel.stop()
                 except Exception as e:
                     log.warning("LibretroAudio.set_muted: pygame Channel.stop() failed while muting: %s", e)
-            # Reset the resampler/reservoir so we re-prebuffer cleanly on unmute.
             self._src   = np.empty((0, 2), dtype=np.float32)
             self._out   = np.empty((0, 2), dtype=np.int16)
             self._pos   = 0.0
@@ -642,8 +805,12 @@ class LibretroAudio:
         self._pos         = 0.0
         self._snd_playing = None
         self._snd_queued  = None
-        self._ready       = False   # reset prebuffer for next ROM load
+        self._ready       = False
 
+
+# ============================================================================
+# SECTION: Video filters
+# ============================================================================
 
 
 class CRTFilter:
@@ -670,7 +837,6 @@ class CRTFilter:
                 arr  = grey + (arr - grey) * (saturation / 50.0)
                 arr  = np.clip(arr, 0, 255)
 
-            # hue shift (±180° range mapped to 0-100 slider, 50=0°)
             if hue_shift != 50:
                 angle = math.radians((hue_shift - 50) / 50.0 * 180.0)
                 c, s  = math.cos(angle), math.sin(angle)
@@ -702,46 +868,8 @@ class CRTFilter:
             return surface
 
 
-
 class PixelArtScaler:
-    """Edge-preserving 2x upscale (Scale2x/AdvMAME2x/EPX) applied to the
-    core's native-resolution frame BEFORE it's stretched to fill the
-    screen, so the final picture has smoothed diagonal lines and curves
-    instead of the blocky steps a straight scale-up of the native pixels
-    produces.
-
-    WHY THIS ALGORITHM AND NOT xBRZ: xBRZ looks a little better on fine
-    detail (small text, gradients) but its correctness rests on a full
-    16-direction edge-classification pass per pixel -- getting that right
-    in hand-written NumPy without introducing visible artifacts is a much
-    larger, easier-to-get-wrong piece of code than this. Scale2x's rule is
-    four comparisons and four np.where() calls, so it's both cheap and
-    easy to verify. If xBRZ's extra sharpness on fine detail turns out to
-    matter once this is on screen, swap the body of _scale2x below for a
-    vetted implementation -- the cache/config/logging wrapper around it
-    doesn't need to change.
-
-    WHY PACKED-UINT32, NOT PLAIN (H,W,3) COMPARISONS: a first version of
-    this compared the three RGB channels separately with np.all(...,
-    axis=-1) for each of the six neighbor-pair equality tests. Measured on
-    a 256x224 SNES-sized frame, that cost ~15ms -- on its own, more than
-    a full 60fps frame budget (16.6ms). Packing each pixel's R,G,B into a
-    single uint32 first turns every one of those equality tests into one
-    plain 2D array compare instead of a 3-channel compare plus an axis=-1
-    reduction, which is where nearly all of that time was going. Same
-    algorithm, same output, ~7x faster: measured ~2.1ms for the same
-    256x224 frame, ~2.9ms for 320x240 (Genesis/PS1-2D-ish) -- see
-    _PIXEL_SCALE_TIMING below for how to watch the live cost on your own
-    machine rather than trust these numbers blindly.
-
-    4x is two chained 2x passes (there's no native 4x rule) and costs
-    roughly 4x a single pass, not 2x -- the second pass runs on 4x as
-    many pixels as the first. Measured ~9.8ms for 256x224, ~10.9ms for
-    320x240: still under budget alone, but stacked with anything else
-    non-trivial (the CRT shader's own measured 3-5ms, for instance) it
-    can genuinely eat the frame. Kept available (factor=4) but NOT the
-    default for that reason -- see PIXEL_ART_SCALER_DEFAULT_FACTOR.
-    """
+    """Edge-preserving 2x upscale (Scale2x/AdvMAME2x/EPX) of the core's native-resolution frame, applied before the final stretch."""
 
     def __init__(self):
         self._cache_key = None
@@ -756,17 +884,11 @@ class PixelArtScaler:
                   | arr[:, :, 2].astype(np.uint32))
         padded = np.pad(packed, ((1, 1), (1, 1)), mode="edge")
         C = padded[1:-1, 1:-1]
-        B = padded[0:-2, 1:-1]   # up
-        H = padded[2:, 1:-1]     # down
-        D = padded[1:-1, 0:-2]   # left
-        F = padded[1:-1, 2:]     # right
+        B = padded[0:-2, 1:-1]
+        H = padded[2:, 1:-1]
+        D = padded[1:-1, 0:-2]
+        F = padded[1:-1, 2:]
 
-        # Canonical Scale2x/AdvMAME2x rule: only redraw a corner toward a
-        # neighbor when the two neighbors ACROSS this pixel disagree (B!=H
-        # and D!=F) -- i.e. only where the source art actually has an edge
-        # running through this pixel, not on flat single-color regions.
-        # That's what keeps flat areas pixel-perfect and only smooths real
-        # diagonal edges.
         gate = (B != H) & (D != F)
         out_packed = np.empty((h * 2, w * 2), dtype=np.uint32)
         out_packed[0::2, 0::2] = np.where(gate & (D == B), D, C)
@@ -781,28 +903,19 @@ class PixelArtScaler:
         return out
 
     def apply(self, surface, factor=2):
-        """Return `surface` scaled by `factor` (2 or 4) using Scale2x,
-        with a small identity cache so repeated calls against the SAME
-        source surface (e.g. reprocess_current_frame() redrawing a paused/
-        menu-open frame every render tick without a new game frame having
-        landed) don't redo the work -- only a genuinely new frame (a new
-        `surface` object) or a changed `factor` triggers real computation.
-        factor values other than 2 or 4 fall back to 2."""
+        """Return `surface` scaled by `factor` (2 or 4, other values fall back to 2) using Scale2x, cached by source-surface identity and factor."""
         if factor not in (2, 4):
             factor = 2
         cache_key = (id(surface), factor)
         if self._cache_key == cache_key and self._cache_surf is not None:
             return self._cache_surf
         try:
-            t0 = time.perf_counter()
-            arr = pygame.surfarray.array3d(surface)   # (W, H, 3) -- pygame's own axis order
-            arr = arr.transpose(1, 0, 2)               # -> (H, W, 3) for the algorithm above
+            arr = pygame.surfarray.array3d(surface)
+            arr = arr.transpose(1, 0, 2)
             out = self._scale2x_pass(arr)
             if factor == 4:
                 out = self._scale2x_pass(out)
             out_surf = pygame.surfarray.make_surface(out.transpose(1, 0, 2))
-            ms = (time.perf_counter() - t0) * 1000.0
-            _record_pixel_scale_timing(factor, ms)
             self._cache_key = cache_key
             self._cache_surf = out_surf
             return out_surf
@@ -811,41 +924,19 @@ class PixelArtScaler:
             return surface
 
 
-_PIXEL_SCALE_TIMING = {}
-
-
-def _record_pixel_scale_timing(factor, ms):
-    """Same rolling-5-second-average logging shape as [CRT-SHADER TIMING]
-    elsewhere in this app, so the cost of turning this on is visible the
-    same way every other per-frame effect's cost already is -- watch this
-    log line after enabling it rather than guessing whether it's safe on
-    a given core."""
-    stats = _PIXEL_SCALE_TIMING.setdefault(
-        factor, {"total_ms": 0.0, "frames": 0, "last_print": 0.0})
-    stats["total_ms"] += ms
-    stats["frames"] += 1
-    now = time.perf_counter()
-    if stats["last_print"] == 0.0:
-        stats["last_print"] = now
-    elif now - stats["last_print"] >= 5.0:
-        n = max(1, stats["frames"])
-        log.info("[PIXEL SCALER TIMING] %dx avg %.2fms (over %d frames)",
-                  factor, stats["total_ms"] / n, n)
-        stats["total_ms"] = 0.0
-        stats["frames"] = 0
-        stats["last_print"] = now
-
-
-# Off by default: this is new, and the whole point of the measurement work
-# above is to let YOU turn it on deliberately once you've seen the real
-# cost on your own machine/core via [PIXEL SCALER TIMING], not to change
-# what every existing save/profile suddenly costs per frame. See
-# db.config["pixel_art_scaler_enabled"] / ["pixel_art_scaler_factor"].
-PIXEL_ART_SCALER_DEFAULT_ENABLED = False
 PIXEL_ART_SCALER_DEFAULT_FACTOR = 2
 
 
+# ============================================================================
+# SECTION: Core wrapper
+# ============================================================================
+
+
 class LibretroCore:
+
+    # ========================================================================
+    # SECTION: Setup & core loading
+    # ========================================================================
 
     def __init__(self, dll_path, system_dir, save_dir, create_system_dir=True):
         self.dll_path      = dll_path
@@ -882,10 +973,11 @@ class LibretroCore:
         self._save_dir_b = b""
 
         self._disk_control  = None
-        self._disc_data_ref = None   # keeps the swapped-in disc's bytes alive
-        self._rom_data_ref  = None   # keeps an in-memory ROM buffer alive
+        # WARNING: _disc_data_ref and _rom_data_ref keep the core's raw buffers alive; dropping them frees memory the core still reads.
+        self._disc_data_ref = None
+        self._rom_data_ref  = None
 
-        # Ctypes callback refs (must be kept alive — GC will kill them otherwise)
+        # WARNING: the ctypes callback refs below must stay referenced or the core calls freed callbacks.
         self._cb_env   = None
         self._cb_vid   = None
         self._cb_aud   = None
@@ -1004,7 +1096,7 @@ class LibretroCore:
     def _parse_controller_info(self, data):
         infos = []
         arr = ctypes.cast(data, ctypes.POINTER(retro_controller_info))
-        for port in range(64):  # sane upper bound; no real core has this many ports
+        for port in range(64):
             info = arr[port]
             if not info.types:
                 break
@@ -1015,6 +1107,10 @@ class LibretroCore:
                 types.append((name, desc.id))
             infos.append(types)
         return infos
+
+    # ========================================================================
+    # SECTION: Core callbacks
+    # ========================================================================
 
     def _cb_environment(self, cmd, data):
         try:
@@ -1100,14 +1196,6 @@ class LibretroCore:
                     self._controller_info = None
                 return True
             elif cmd == RETRO_ENVIRONMENT_SET_VARIABLES:
-                # data -> NULL-key-terminated array of retro_variable, each
-                # value string formatted "Description; default|opt2|opt3".
-                # Reading this populates self._core_variables with the
-                # core's own declared defaults, so a later GET_VARIABLE for
-                # a key the frontend hasn't explicitly overridden (see
-                # set_variable/update_variable_live) returns the option's
-                # real, declared default instead of the core's own internal
-                # fallback for "frontend doesn't support options at all".
                 try:
                     arr = ctypes.cast(data, ctypes.POINTER(retro_variable))
                     i = 0
@@ -1122,7 +1210,6 @@ class LibretroCore:
                     log.warning(f"[LIBRETRO ENV] SET_VARIABLES parse failed: {e}")
                 return True
             elif cmd == RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
-                # data -> NULL-key-terminated array of retro_core_option_definition.
                 try:
                     arr = ctypes.cast(data, ctypes.POINTER(retro_core_option_definition))
                     i = 0
@@ -1142,9 +1229,6 @@ class LibretroCore:
                     log.warning(f"[LIBRETRO ENV] SET_CORE_OPTIONS parse failed: {e}")
                 return True
             elif cmd == RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
-                # data -> pointer to a single retro_core_options_v2 struct
-                # holding a NULL-key-terminated definitions array (the
-                # categories array isn't needed here -- only default values).
                 try:
                     opts = ctypes.cast(data, ctypes.POINTER(retro_core_options_v2)).contents
                     defs = opts.definitions
@@ -1171,21 +1255,20 @@ class LibretroCore:
             _log_warn_throttled("env_cb_cmd_failed", f"[LIBRETRO ENV] cmd={cmd}: {e}")
         return False
 
-    # Sane upper bounds for a single video frame. No real libretro core
-    # produces frames anywhere near this large; these exist purely to stop
-    # a malformed/malicious core from driving from_address() with a size
-    # that reads outside the buffer the core actually allocated (which is
-    # a native memory fault, not a catchable Python exception).
-    _MAX_FRAME_DIM   = 4096          # per libretro's own documented ceiling
-    _MAX_FRAME_PITCH = 4096 * 4      # widest supported dim * 4 bytes/px
-    _MAX_FRAME_BYTES = 64 * 1024 * 1024  # ~64MB; far above any real frame
+    _MAX_FRAME_DIM   = 4096
+    _MAX_FRAME_PITCH = 4096 * 4
+    _MAX_FRAME_BYTES = 64 * 1024 * 1024
 
     def _cb_video_refresh(self, data, width, height, pitch):
+        _t0 = time.perf_counter()
+        try:
+            self._cb_video_refresh_impl(data, width, height, pitch)
+        finally:
+            GAME_FRAME_TIMER.add("video_cb", (time.perf_counter() - _t0) * 1000.0)
+
+    def _cb_video_refresh_impl(self, data, width, height, pitch):
         if data is None:
-            return   # No new frame; keep the last surface.
-        # Validate geometry before it's used to size a raw memory read.
-        # width/height/pitch come straight from the core via ctypes and
-        # are otherwise trusted with zero bounds-checking below.
+            return
         try:
             width, height, pitch = int(width), int(height), int(pitch)
         except (TypeError, ValueError):
@@ -1266,10 +1349,14 @@ class LibretroCore:
                 self._audio._in_count -= len(dropped)
 
     def _cb_audio_batch(self, data, frames):
-        return self._audio.push_samples(data, frames)
+        _t0 = time.perf_counter()
+        try:
+            return self._audio.push_samples(data, frames)
+        finally:
+            GAME_FRAME_TIMER.add("audio_cb", (time.perf_counter() - _t0) * 1000.0)
 
     def _cb_input_poll(self):
-        pass   # state is pre-populated by game_deck._poll_libretro_input()
+        """No-op: input state is filled in by game_deck._poll_libretro_input()."""
 
     def _cb_input_state(self, port, device, index, btn_id):
         if device == RETRO_DEVICE_JOYPAD:
@@ -1278,9 +1365,13 @@ class LibretroCore:
             return self._input.get_analog(port, index, btn_id)
         return 0
 
+    # ========================================================================
+    # SECTION: ROM loading & controller ports
+    # ========================================================================
 
     def load_rom(self, rom_path):
         """Load a ROM file. Returns True on success."""
+        GAME_FRAME_TIMER.new_session()
         self._rom_load_ts       = time.time()
         self._first_frame_ts    = None
         self._first_nonblack_ts = None
@@ -1337,15 +1428,15 @@ class LibretroCore:
             return False
 
         self._rom_path    = rom_path
-        self._rom_data_ref = c_data   # keep alive so the pointer doesn't dangle (None for need_fullpath cores)
+        # WARNING: keep this reference alive so the core's pointer doesn't dangle.
+        self._rom_data_ref = c_data
 
-        # Re-read AV info now that ROM is loaded (more accurate)
         self._read_av_info()
         self._audio = LibretroAudio(int(self._sample_rate))
         self._audio.set_volume(self._volume)
         self._audio.set_muted(self._muted)
 
-        self._multitap_hub_port = None  # fresh ROM => fresh multitap state
+        self._multitap_hub_port = None
         self._negotiate_controller_ports()
 
         os.makedirs(self.save_dir, exist_ok=True)
@@ -1431,6 +1522,10 @@ class LibretroCore:
             log.warning("disable_multitap: retro_set_controller_port_device(%d) failed: %s", port, e)
         self._multitap_hub_port = None
 
+    # ========================================================================
+    # SECTION: Disc change & unload
+    # ========================================================================
+
     def change_disc(self, new_disc_path):
         if self._disk_control is None:
             log.warning("[LIBRETRO] Core has no disk control interface — cannot swap discs live")
@@ -1473,7 +1568,8 @@ class LibretroCore:
     def unload(self):
         if not self._loaded:
             return
-        self.save_sram()  # persist battery/SRAM save data before the core (and its memory buffer) goes away
+        # WARNING: save SRAM before the core and its memory buffer are released.
+        self.save_sram()
         try:
             self._dll.retro_unload_game()
             self._dll.retro_deinit()
@@ -1481,14 +1577,15 @@ class LibretroCore:
             log.warning(f"[LIBRETRO] Unload error: {e}")
         self._audio.stop()
         self._loaded = False
-        _free_dll_handle(self._dll)  # actually release the OS module handle -- see docstring
+        _free_dll_handle(self._dll)
         self._dll    = None
         print("[LIBRETRO] Core unloaded.")
 
     def unload_game(self):
         if not self._loaded or self._dll is None:
             return
-        self.save_sram()  # persist battery/SRAM save data before the game (and its memory buffer) goes away
+        # WARNING: save SRAM before the game and its memory buffer are released.
+        self.save_sram()
         try:
             self._dll.retro_unload_game()
         except Exception as e:
@@ -1501,22 +1598,31 @@ class LibretroCore:
         self._disc_data_ref = None
         print("[LIBRETRO] Game unloaded (core still initialized).")
 
+    # ========================================================================
+    # SECTION: Frame loop & playback state
+    # ========================================================================
 
     def run_frame(self, crt_cfg=None, pixel_cfg=None):
         if not self._loaded or self._frozen or self._dll is None:
             return self._vid_surface
 
+        _t0 = time.perf_counter()
         try:
             self._dll.retro_run()
 
         except Exception as e:
             _log_warn_throttled("retro_run", f"[LIBRETRO] retro_run(): {e}")
             return self._vid_surface
+        finally:
+            GAME_FRAME_TIMER.add("core_run", (time.perf_counter() - _t0) * 1000.0)
 
+        _t0 = time.perf_counter()
         self._audio.tick()
+        GAME_FRAME_TIMER.add("audio_tick", (time.perf_counter() - _t0) * 1000.0)
 
         if self._raw_vid_surface and crt_cfg:
             if any(v != 50 for v in crt_cfg.values()):
+                _t0 = time.perf_counter()
                 self._vid_surface = self._crt.apply(
                     self._raw_vid_surface,
                     brightness=crt_cfg.get("brightness", 50),
@@ -1525,18 +1631,15 @@ class LibretroCore:
                     sharpness=crt_cfg.get("sharpness",  50),
                     hue_shift=crt_cfg.get("hue_shift",  50),
                 )
+                GAME_FRAME_TIMER.add("color", (time.perf_counter() - _t0) * 1000.0)
             else:
                 self._vid_surface = self._raw_vid_surface
 
-        # Pixel-art scaling runs AFTER the CRT color pass, not before: the
-        # CRT filter's brightness/contrast/saturation/sharpness math is a
-        # per-pixel color transform whose cost scales with pixel count, so
-        # running it on the native (small) frame keeps it cheap regardless
-        # of whether this scaler is on. Only the scaler itself pays the
-        # cost of the larger surface, and only when enabled.
         if pixel_cfg and pixel_cfg.get("enabled") and self._vid_surface is not None:
+            _t0 = time.perf_counter()
             self._vid_surface = self._pixel_scaler.apply(
                 self._vid_surface, factor=pixel_cfg.get("factor", PIXEL_ART_SCALER_DEFAULT_FACTOR))
+            GAME_FRAME_TIMER.add("pixel", (time.perf_counter() - _t0) * 1000.0)
 
         return self._vid_surface
 
@@ -1554,13 +1657,6 @@ class LibretroCore:
             )
         else:
             self._vid_surface = self._raw_vid_surface
-        # Same reasoning and ordering as run_frame() above. This path is
-        # called every render tick while a menu/overlay/exit-confirm/
-        # disconnect state is showing -- i.e. potentially every frame at
-        # display refresh rate, not just every game frame -- which is
-        # exactly why PixelArtScaler.apply() caches on (surface identity,
-        # factor): none of those redraws re-run this scaler's real work
-        # unless the underlying raw frame actually changed.
         if pixel_cfg and pixel_cfg.get("enabled") and self._vid_surface is not None:
             self._vid_surface = self._pixel_scaler.apply(
                 self._vid_surface, factor=pixel_cfg.get("factor", PIXEL_ART_SCALER_DEFAULT_FACTOR))
@@ -1594,6 +1690,9 @@ class LibretroCore:
     @property
     def fps(self):         return self._fps
 
+    # ========================================================================
+    # SECTION: Save profiles, SRAM & save states
+    # ========================================================================
 
     def set_active_profile(self, profile_num):
         self.active_profile = int(profile_num)
@@ -1622,7 +1721,8 @@ class LibretroCore:
             if not ptr:
                 return False
             buf = (ctypes.c_uint8 * size).from_address(ptr)
-            data = bytes(buf)  # copy out before the pointer can move/invalidate
+            # WARNING: copy the data out before the pointer can move or be invalidated.
+            data = bytes(buf)
             path = self._sram_path()
             with open(path, "wb") as f:
                 f.write(data)
@@ -1663,7 +1763,8 @@ class LibretroCore:
             rom_name = os.path.splitext(os.path.basename(rom_path))[0]
             dest = self._sram_path()
             if os.path.exists(dest):
-                return  # this profile already has its own save -- never overwrite it
+                # WARNING: never overwrite a profile's existing save.
+                return
             for ext in (".sav", ".srm"):
                 stray = os.path.join(rom_dir, rom_name + ext)
                 if os.path.exists(stray):
@@ -1714,6 +1815,9 @@ class LibretroCore:
     def has_state(self, slot=0):
         return self._loaded and os.path.exists(self._state_path(slot))
 
+    # ========================================================================
+    # SECTION: Audio pass-through & core variables
+    # ========================================================================
 
     def set_volume(self, volume_pct):
         self._volume = volume_pct
@@ -1728,10 +1832,10 @@ class LibretroCore:
     def set_variable(self, key, value):
         self._core_variables[key] = str(value).encode("utf-8")
 
-    def update_variable_live(self, key, value):
-        self._core_variables[key] = str(value).encode("utf-8")
-        self._var_dirty = True
 
+# ============================================================================
+# SECTION: Core factory
+# ============================================================================
 
 
 BIOS_REQUIRED_CONSOLES = {"PSX"}
@@ -1750,11 +1854,6 @@ def build_core_for_console(console, base_dir, preferred_name=None, preferred_bio
     dll_path = None
     if os.path.isdir(emu_dir):
         _dll_files = [f for f in os.listdir(emu_dir) if f.lower().endswith(".dll")]
-        # A saved active-core selection (emulator_config.json, set either by
-        # picking a core in the menu or by the post-scan default-assignment)
-        # always wins when it's still actually present -- otherwise, with
-        # multiple cores sitting in the same folder, this would silently
-        # ignore the user's choice and fall back to directory-listing order.
         if preferred_name:
             for fname in _dll_files:
                 if fname.lower() == preferred_name.lower():
@@ -1764,16 +1863,6 @@ def build_core_for_console(console, base_dir, preferred_name=None, preferred_bio
                 log.warning(f"[LIBRETRO]   saved active core {preferred_name!r} not found "
                       f"in {emu_dir}, auto-detecting instead.")
         if dll_path is None:
-            # No saved active-core pick (or it's gone) -- rather than
-            # trusting whatever order the OS happens to list files in
-            # (which is what RetroArch's own filesystem-driven pick
-            # effectively depends on), fall back to this project's own
-            # curated metadata (PREFERRED_CORE_ORDER / CORE_NAME_TO_CONSOLES
-            # in game_deck.py) so the choice is deliberate and reproducible.
-            # Local import: libretro_core has no top-level dependency on
-            # game_deck, and game_deck imports build_core_for_console from
-            # here at module level, so importing game_deck up top here
-            # would be a circular import.
             _preferred_fname = None
             try:
                 from game_deck import resolve_preferred_core_filename
@@ -1803,20 +1892,15 @@ def build_core_for_console(console, base_dir, preferred_name=None, preferred_bio
                 for name in _bios_files
             ):
                 log.warning(f"[LIBRETRO]   *** BIOS folder exists but is EMPTY: {system_dir} ***")
-                log.warning(f"[LIBRETRO]   *** Place the required BIOS file(s) there and retry. ***")
+                log.warning("[LIBRETRO]   *** Place the required BIOS file(s) there and retry. ***")
         else:
             log.warning(f"[LIBRETRO]   *** BIOS folder does NOT exist yet: {system_dir} ***")
-            log.warning(f"[LIBRETRO]   *** It will be created on first launch, but it needs "
-                  f"BIOS files placed inside it before the core can boot. ***")
+            log.warning("[LIBRETRO]   *** It will be created on first launch, but it needs "
+                  "BIOS files placed inside it before the core can boot. ***")
 
     core = LibretroCore(dll_path, system_dir, save_dir, create_system_dir=needs_bios)
 
     if console == "PSX":
-        # The active BIOS pick (Games menu -> Add BIOS -> select the active
-        # one) always wins over HLE when that file is still actually
-        # sitting in the system folder -- a real BIOS dump gives noticeably
-        # better game compatibility than pcsx_rearmed's HLE fallback, and
-        # picking one in the menu should actually change what gets used.
         _bios_choice = "HLE"
         if preferred_bios_name and os.path.isdir(system_dir):
             for _bf in os.listdir(system_dir):
@@ -1833,3 +1917,16 @@ def build_core_for_console(console, base_dir, preferred_name=None, preferred_bio
         return None
 
     return core
+
+
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = [
+    "LibretroCore", "LibretroAudio", "LibretroInputManager", "LibretroInputState",
+    "CRTFilter", "PixelArtScaler", "build_core_for_console", "lr_id_for",
+    "BIOS_REQUIRED_CONSOLES",
+    "RETRO_DEVICE_ID_JOYPAD_UP", "RETRO_DEVICE_ID_JOYPAD_DOWN",
+    "RETRO_DEVICE_ID_JOYPAD_LEFT", "RETRO_DEVICE_ID_JOYPAD_RIGHT",
+    "RETRO_DEVICE_INDEX_ANALOG_LEFT", "RETRO_DEVICE_ID_ANALOG_X", "RETRO_DEVICE_ID_ANALOG_Y",
+]

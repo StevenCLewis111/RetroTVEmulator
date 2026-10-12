@@ -1,9 +1,12 @@
 """Detached file-swap helper for Retro TV Emulator updates.
 
-This process must be separate because Windows keeps the running executable
-locked.  It waits for the foreground process to exit, backs up every payload
-target, copies the staged files, relaunches the app, and restores the backup if
-the replacement cannot stay alive.
+Owns: waiting for the old process to exit, backing up every payload target,
+copying the staged files, relaunching the app, and restoring the backup if the
+replacement cannot stay alive.
+Does not own: downloading, hash checks or staging (auto_updater.py).
+
+WARNING: this must stay a separate process. Windows keeps the running
+executable locked, so the swap can only happen after the app has exited.
 """
 
 from __future__ import annotations
@@ -19,8 +22,12 @@ import sys
 import tempfile
 import time
 
-# server_diagnostics.py may be a sibling of this file (server/) or one
-# directory up (../server), depending on how the build is packaged.
+# ============================================================================
+# SECTION: Server-path bootstrap & constants
+# ============================================================================
+# NOTE: server_diagnostics.py may be a sibling of this file (server/) or one
+# directory up (../server), depending on how the build is packaged. The import
+# below has to stay after _add_server_path() for that reason.
 def _add_server_path():
     if getattr(sys, "frozen", False):
         _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
@@ -40,6 +47,11 @@ WAIT_FOR_PARENT_SECONDS = 120
 HEALTH_CHECK_SECONDS = 15
 
 log = logging.getLogger("retro_tv.update_helper")
+
+
+# ============================================================================
+# SECTION: Logging & small helpers
+# ============================================================================
 
 
 def _configure_logging(install_dir):
@@ -72,6 +84,11 @@ def _pid_alive(pid):
         return True
     except (OSError, ValueError, ProcessLookupError):
         return False
+
+
+# ============================================================================
+# SECTION: Payload, backup & restore
+# ============================================================================
 
 
 def _payload_files(staged_path):
@@ -121,6 +138,11 @@ def _apply_payload(install_dir, files):
         shutil.copy2(source, target)
 
 
+# ============================================================================
+# SECTION: Apply update
+# ============================================================================
+
+
 def apply_update(metadata_path):
     metadata = _read_json(metadata_path)
     install_dir = os.path.abspath(metadata["install_dir"])
@@ -161,8 +183,8 @@ def apply_update(metadata_path):
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
             ) if os.name == "nt" else 0,
         )
-        # A spawn that immediately dies is usually a bad executable/path. Give
-        # normal startup a little time, then restore the previous files.
+        # NOTE: a spawn that dies immediately is usually a bad executable or
+        # path. Give normal startup a little time, then restore the old files.
         deadline = time.monotonic() + HEALTH_CHECK_SECONDS
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -200,6 +222,11 @@ def apply_update(metadata_path):
     return 0
 
 
+# ============================================================================
+# SECTION: Command line
+# ============================================================================
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", required=True, dest="metadata_path")
@@ -207,8 +234,8 @@ def main(argv=None):
     try:
         return apply_update(args.metadata_path)
     except Exception as exc:
-        # apply_update already logs the underlying failure via breadcrumb;
-        # this line is the terminal outcome for a run that had no console.
+        # NOTE: apply_update already logs the underlying failure via
+        # breadcrumb; this line is the terminal outcome for a run with no console.
         try:
             log.error("[UPDATE DIAG] Helper exiting with failure: %s", exc)
         except Exception:
@@ -216,6 +243,11 @@ def main(argv=None):
         print(f"[RETRO TV UPDATE] {exc}", file=sys.stderr)
         return 1
 
+
+# ============================================================================
+# SECTION: Exports & entry point
+# ============================================================================
+__all__ = ["apply_update", "main"]
 
 if __name__ == "__main__":
     raise SystemExit(main())

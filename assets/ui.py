@@ -1,50 +1,41 @@
+"""Screen drawing for the TV guide, the settings overlay menu and the popups.
 
+WARNING: guide and menu canvases are filled with (1, 1, 1), never pure black. (0, 0, 0) is the
+game-overlay transparency key.
+"""
 import pygame
 import logging
-import datetime
 import threading
 import time
 import media
 import broadcast_clock
+import menu_nav
+try:
+    import performance_governor
+except Exception:
+    performance_governor = None
 
 log = logging.getLogger(__name__)
 
-# Shared focus/selection highlight border thickness -- see media.py for the
-# single source of truth. Import it under this name so every draw call below
-# can reference SELECTION_BORDER_WIDTH directly instead of media.SELECTION_BORDER_WIDTH.
+
+# ============================================================================
+# SECTION: Drawing & canvas-fit helpers
+# ============================================================================
+
+
 SELECTION_BORDER_WIDTH = media.SELECTION_BORDER_WIDTH
+
+# VALUES CHANGE HERE
+CHANNEL_SCAN_BAR_HEIGHT_PX = 3
+CHANNEL_SCAN_BAR_HEAD_PX = 6
+CHANNEL_SCAN_BAR_HALO_MIX = 0.35
 
 
 def _aa_rounded_rect(surface, color, rect, width=0, border_radius=0, supersample=4):
-    """Drop-in replacement for pygame.draw.rect(surface, color, rect, width,
-    border_radius=...) that actually anti-aliases the curved corners (and
-    the straight edges/corners too, for free).
-
-    pygame.draw.rect has no anti-aliasing option at all -- every pixel on a
-    border_radius curve gets hard-rounded to fully on or fully off, which is
-    what reads as "choppy"/jagged, especially on thin (width=1-2) outlines.
-    This renders the same shape at `supersample`x the resolution on a
-    transparent surface (still with the normal hard-edged pygame.draw.rect),
-    then smoothscales it back down to the real size -- the downscale step is
-    what actually produces the anti-aliasing, since each output pixel is now
-    an averaged blend of several supersampled input pixels instead of a
-    single hard on/off sample.
-
-    width/border_radius are scaled by `supersample` before drawing so the
-    proportions match the original call exactly; width=0 (or omitted) still
-    means "filled", matching pygame.draw.rect's own convention.
-    """
+    """Anti-aliased replacement for pygame.draw.rect with border_radius."""
     x, y, w, h = rect
     if w <= 0 or h <= 0:
         return
-    # The supersample+downscale work below only earns its keep on frames
-    # where _apply_crt_shader is actually going to warp this canvas
-    # afterward (that nearest-neighbor-turned-bilinear remap is what was
-    # re-jaggying a plain pygame.draw.rect edge in the first place). No
-    # Bezel/no warp this frame -> a plain draw already looks fine, so
-    # skip straight to it instead of paying for supersampling nothing
-    # will use. See media.CRT_WARP_ACTIVE, set once per frame in
-    # retro_tv_emulator.py before any menu/dialog UI is drawn.
     if not media.CRT_WARP_ACTIVE:
         pygame.draw.rect(surface, color, rect, width, border_radius=border_radius)
         return
@@ -59,25 +50,7 @@ def _aa_rounded_rect(surface, color, rect, width=0, border_radius=0, supersample
 
 
 def fit_design_canvas(canvas_w, canvas_h, real_w, real_h, margin=20):
-    """Shared "native size if it fits, else shrink-to-fit" placement math
-    for fixed-design-resolution overlays (guide, quit/restart prompt,
-    controller-mapping panel, and similar popups drawn at a constant
-    design-space size and then centered/scaled into the real window).
-
-    Returns (dest_w, dest_h, dest_x, dest_y): the size the design-space
-    canvas should be blitted/scaled to, and the top-left position to blit
-    it at, centered in a `real_w` x `real_h` surface. When the window is
-    at least as large as the canvas, dest_w/dest_h equal canvas_w/canvas_h
-    exactly (no scaling call needed -- callers should skip smoothscale in
-    that case). Otherwise the canvas is shrunk to fit within
-    `real_w - margin` x `real_h - margin` while preserving its aspect
-    ratio.
-
-    Shared by every fixed-design-resolution overlay (the tv-guide screen,
-    the quit/restart prompt, and the controller-mapping panel's
-    content-rect math in retro_tv_emulator.py) so they can't drift out of
-    sync with each other.
-    """
+    """Placement math for centering a fixed-design-size overlay in the window: native size if it fits, else shrunk to fit."""
     if real_w >= canvas_w and real_h >= canvas_h:
         return canvas_w, canvas_h, (real_w - canvas_w) // 2, (real_h - canvas_h) // 2
     shrink_w = min(canvas_w, real_w - margin)
@@ -89,47 +62,7 @@ def fit_design_canvas(canvas_w, canvas_h, real_w, real_h, margin=20):
 
 
 def fit_menu_envelope(real_w, real_h, db=None, margin=16):
-    """The on-screen envelope the Main Menu, Controls splash, and File
-    Explorer are all boxed into.
-
-    With the TV Bezel (fake_43_border_enabled) OFF, this always targets
-    a 4:3 reference -- NOT the currently-selected content package aspect
-    (db.config["aspect_ratio"]) that _compute_content_rect boxes every
-    other content type into. Content is meant to visibly resize when the
-    Aspect Ratio setting changes; these overlays are not -- keying the
-    envelope off that setting made the Main Menu/Controls/File Explorer
-    jump to a different size every time Aspect Ratio was flipped between
-    4:3 and 16:9 on the same real window, even though nothing about the
-    window itself changed. A fixed 4:3 reference keeps their footprint
-    constant across that toggle. Whenever `real_w` x `real_h` already
-    has a 4:3 shape (within the same tolerance _real_screen_matches_aspect
-    uses), the envelope fills the full surface edge to edge, inset only
-    by `margin`. Otherwise this boxes the largest 4:3 rect that fits
-    inside `real_w` x `real_h`, inset by `margin` px on every side of
-    that box (not of the outer real_w x real_h surface). Callers
-    contain-fit their fixed-aspect design canvas inside this envelope
-    (stretch_fill False) so text/UI proportions stay correct.
-
-    With Bezel ON, the whole finished frame -- overlay included -- gets
-    mapped edge-to-edge onto the Bezel's own (possibly non-4:3, possibly
-    larger-than-4:3) cutout later on, independently per axis, so every
-    edge of whatever's drawn here lands exactly on the cutout's own edge
-    (see _bezel_composite_geometry) -- the same way Static and the
-    Visualizer are never boxed to a package shape themselves and just
-    fill whatever they're given. A contain-fit design canvas would leave
-    its own letterbox bars baked into that "whatever's given", which
-    then get carried through unchanged by that later per-axis stretch --
-    the actual source of a visible gap around the menu inside the
-    cutout. So here the envelope is inset by the same `margin` as the
-    no-Bezel case (for a deliberate, even gap around the menu instead of
-    an accidental, aspect-driven one), and stretch_fill is True: callers
-    resize their design canvas to exactly env_w x env_h instead of
-    contain-fitting it, so the menu itself reaches every edge of that
-    margin -- matching how every other content type already fills its
-    given rect in Bezel mode.
-
-    Returns (env_w, env_h, env_x, env_y, stretch_fill).
-    """
+    """The on-screen envelope the Main Menu, Controls splash, and File Explorer are all boxed into."""
     _bezel_on = bool(db is not None and db.config.get("fake_43_border_enabled", False))
     if _bezel_on:
         env_w = max(1, real_w - margin * 2)
@@ -155,38 +88,18 @@ def fit_menu_envelope(real_w, real_h, db=None, margin=16):
     return env_w, env_h, env_x, env_y, False
 
 
-_BEZEL_STYLES_WITH_MENU_SHRINK = (1, 2)  # global Bezel Style numbers (System tab,
-                                          # db.config["bezel_style"]) this applies to
-_MENU_FIT_SHRINK_FACTOR = 0.94  # ~6% smaller -- see _menu_fit_shrink_factor() below
+# ============================================================================
+# SECTION: Menu-fit shrink for bezel styles
+# ============================================================================
+
+
+_BEZEL_STYLES_WITH_MENU_SHRINK = (1, 2)
+# VALUES CHANGE HERE
+_MENU_FIT_SHRINK_FACTOR = 0.94
 
 
 def _menu_fit_shrink_factor(db):
-    """Shrink factor for the Main Menu (_build_settings_overlay_menu) and
-    Controls Menu (render_controls_splash) overlays: _MENU_FIT_SHRINK_FACTOR
-    (~6% smaller) while the Bezel toggle (db.config["fake_43_border_enabled"]
-    -- the real on/off state, NOT just which style is currently selected)
-    is genuinely on and its style is 1 or 2; 1.0 (no change) otherwise.
-
-    Bezel Styles 1 and 2's picture cutouts (see _resolve_current_bezel_path
-    / _full_tv_border_geometry in retro_tv_emulator.py) sit a bit inside
-    those bezels' outer art, so a full-size menu reads a touch oversized
-    against those two specific cutouts -- every other Bezel Style, and
-    Bezel off entirely, already look right at full size.
-
-    This used to also key off Warp Screen (db.config["warp_screen_enabled"]),
-    on the theory that Warp's barrel curvature was doing the same inward
-    pull a full-size menu needed. That coupling was itself a bug: Warp is
-    a picture-curvature effect only -- menus/overlays draw on the flat
-    pre-composite canvas, above/outside anything Warp touches (see
-    _apply_crt_shader's own warp_screen_enabled gate) -- so toggling Warp
-    was visibly resizing both menus as an unrelated side effect. It also
-    never actually checked whether Bezel was on at all, only which style
-    number was last selected, so the shrink could fire even with Bezel
-    fully off as long as style 1/2 was still selected from before. Both
-    are fixed here: Warp is no longer part of this condition at all, and
-    fake_43_border_enabled (the real Bezel on/off state) gates it instead
-    of bezel_style alone.
-    """
+    """Return _MENU_FIT_SHRINK_FACTOR while the Bezel toggle is on with style 1 or 2, else 1.0."""
     if db is None:
         return 1.0
     if not bool(db.config.get("fake_43_border_enabled", False)):
@@ -199,6 +112,39 @@ def _menu_fit_shrink_factor(db):
     if style in _BEZEL_STYLES_WITH_MENU_SHRINK:
         return _MENU_FIT_SHRINK_FACTOR
     return 1.0
+
+
+# ============================================================================
+# SECTION: Main Menu panel rectangle
+# ============================================================================
+
+# VALUES CHANGE HERE
+MENU_CANVAS_W = 1036
+MENU_CANVAS_H = 680
+
+
+def menu_panel_rect(real_w, real_h, db=None):
+    """Returns (x, y, w, h): where the Main Menu panel sits on a surface of real_w by real_h; the File Explorer is sized by this same function."""
+    # WARNING: the Main Menu and the File Explorer must both take their size from here; a second copy of this math makes them drift apart.
+    env_w, env_h, env_x, env_y, stretch_fill = fit_menu_envelope(real_w, real_h, db)
+    if stretch_fill:
+        fit_w, fit_h = env_w, env_h
+    else:
+        fit_w = env_w
+        fit_h = int(fit_w * (float(MENU_CANVAS_H) / MENU_CANVAS_W))
+        if fit_h > env_h:
+            fit_h = env_h
+            fit_w = int(fit_h * (float(MENU_CANVAS_W) / MENU_CANVAS_H))
+    shrink = _menu_fit_shrink_factor(db)
+    if shrink != 1.0:
+        fit_w = max(1, int(fit_w * shrink))
+        fit_h = max(1, int(fit_h * shrink))
+    return env_x + (env_w - fit_w) // 2, env_y + (env_h - fit_h) // 2, fit_w, fit_h
+
+
+# ============================================================================
+# SECTION: Remote & DVD key bindings
+# ============================================================================
 
 
 REMOTE_REMAP_ACTIONS = [
@@ -229,7 +175,7 @@ for _i in range(10):
     DEFAULT_REMOTE_BINDINGS[str(_i)] = getattr(pygame, f"K_{_i}")
 del _i
 
-_SDLK_MASK = 0x40000000  # SDL2 scancode → keycode formula (scancode | mask)
+_SDLK_MASK = 0x40000000
 
 _REMOTE_KEY_NAME_OVERRIDES = {
     pygame.K_RETURN:    "ENTER",   pygame.K_ESCAPE: "ESC",      pygame.K_SPACE:  "SPACE",
@@ -238,7 +184,6 @@ _REMOTE_KEY_NAME_OVERRIDES = {
     pygame.K_LSHIFT:    "L-SHIFT", pygame.K_RSHIFT: "R-SHIFT",
     pygame.K_LCTRL:     "L-CTRL",  pygame.K_RCTRL:  "R-CTRL",
     pygame.K_LALT:      "L-ALT",   pygame.K_RALT:   "R-ALT",
-    # Function keys (common on mini keyboards and PC remotes)
     pygame.K_F1:  "F1",  pygame.K_F2:  "F2",  pygame.K_F3:  "F3",  pygame.K_F4:  "F4",
     pygame.K_F5:  "F5",  pygame.K_F6:  "F6",  pygame.K_F7:  "F7",  pygame.K_F8:  "F8",
     pygame.K_F9:  "F9",  pygame.K_F10: "F10", pygame.K_F11: "F11", pygame.K_F12: "F12",
@@ -247,7 +192,6 @@ _REMOTE_KEY_NAME_OVERRIDES = {
     pygame.K_PAGEUP:   "PGUP",  pygame.K_PAGEDOWN: "PGDN",
     pygame.K_NUMLOCK:  "NUMLK", pygame.K_CAPSLOCK: "CAPSLK",
     pygame.K_PRINT:    "PRINT", pygame.K_PAUSE:    "PAUSE",
-    # Numpad — appear on full-size keyboards and some remotes
     pygame.K_KP_ENTER:    "KP-ENT", pygame.K_KP_PERIOD:   "KP-.",
     pygame.K_KP_PLUS:     "KP-+",   pygame.K_KP_MINUS:    "KP--",
     pygame.K_KP_MULTIPLY: "KP-*",   pygame.K_KP_DIVIDE:   "KP-/",
@@ -285,23 +229,23 @@ def _get_remote_binding(db, action):
 
 
 DVD_MAP_ACTIONS = [
-    ("play_pause",     "Play / Pause"),
-    ("rewind",         "Rewind  (hold = fast)"),
-    ("fast_forward",   "Fast Forward  (hold = fast)"),
-    ("return_to_menu", "Return to Main Menu"),
+    (menu_nav.DVD_PLAY_PAUSE,   "Play / Pause"),
+    (menu_nav.DVD_REWIND,       "Rewind  (hold = fast)"),
+    (menu_nav.DVD_FAST_FORWARD, "Fast Forward  (hold = fast)"),
+    (menu_nav.DVD_RETURN_MENU,  "Return to Main Menu"),
 ]
-DVD_MAP_DEFAULTS = {
-    "play_pause":     _SDLK_MASK | 261,
-    "rewind":         _SDLK_MASK | 285,
-    "fast_forward":   _SDLK_MASK | 286,
-    "return_to_menu": pygame.K_BACKSPACE,  # Return to the main menu.
-}
+DVD_MAP_DEFAULTS = {action: menu_nav.dvd_default_binding(action) for action in menu_nav.DVD_ACTIONS}
 
 
 def get_dvd_binding(db, action):
     """Current key bound to a DVD transport action (falls back to default)."""
     bindings = db.config.get("dvd_bindings", {}) if db is not None else {}
     return bindings.get(action, DVD_MAP_DEFAULTS.get(action))
+
+
+# ============================================================================
+# SECTION: DVD button-mapping popup
+# ============================================================================
 
 
 def render_dvd_button_mapping_popup(surface, app_state, db):
@@ -311,7 +255,6 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
     capturing   = app_state.get("dvd_map_capturing", False)
     capture_idx = app_state.get("dvd_map_capture_idx", 0)
 
-    # Theme colors (mirror the rest of the menu).
     ui_hue = db.config.get("theme_ui_hue", 140) / 360.0 if db is not None else 140 / 360.0
     r, g, b = colorsys.hsv_to_rgb(ui_hue, 0.9, 1.0)
     NEON_GREEN = (int(r * 255), int(g * 255), int(b * 255))
@@ -367,7 +310,6 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
         lbl = f_body.render(label, True, NEON_GREEN if is_cap_row else TEXT_WHITE)
         surface.blit(lbl, (list_x + 14, ry + row_h // 2 - lbl.get_height() // 2))
 
-        # Key box on the right -- sized to match the System tab's key boxes.
         key_txt = "PRESS…" if is_cap_row else _remote_key_label(get_dvd_binding(db, action))
         kb_w, kb_h = 110, 30
         kb_x = list_x + list_w - kb_w - 12
@@ -398,6 +340,12 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
         _aa_rounded_rect(surface, NEON_GREEN, (cb_x, cb_y, cb_w, cb_h), SELECTION_BORDER_WIDTH, border_radius=5)
     cb_lbl = f_btn.render("Close", True, TEXT_WHITE)
     surface.blit(cb_lbl, (cb_x + cb_w // 2 - cb_lbl.get_width() // 2, cb_y + cb_h // 2 - cb_lbl.get_height() // 2))
+
+
+# ============================================================================
+# SECTION: Font cache & logo fitting helpers
+# ============================================================================
+
 
 _font_cache = {}
 
@@ -432,6 +380,12 @@ def _fit_logo_to_box(logo_surface, box_w, box_h):
     except Exception:
         return None
 
+
+# ============================================================================
+# SECTION: TV guide: layout, canvases & time math
+# ============================================================================
+
+
 _guide_timeline_cache = {}
 
 _guide_exists_state = {"token": None, "cache": {}}
@@ -459,9 +413,6 @@ def _get_guide_canvas():
         _guide_canvas = pygame.Surface((GUIDE_DESIGN_W, GUIDE_DESIGN_H))
     return _guide_canvas
 
-# Keep the 4:3 guide at the same design density as the 16:9 guide.
-# A 1440px-wide canvas was being scaled to the same physical screen width,
-# making every label/font 4/3 larger and clipping the date/day header.
 GUIDE_DESIGN_W_4_3, GUIDE_DESIGN_H_4_3 = 1920, 1440
 GUIDE_VISIBLE_ROWS_4_3 = 5
 
@@ -476,44 +427,14 @@ def _get_guide_canvas_43():
     return _guide_canvas_43
 
 def _guide_aspect_is_4_3(db):
-    """Whether the TV guide should render in its 4:3 layout right now.
-
-    Only real 4:3/CRT hardware (db._detected_aspect_ratio == "4:3") flips
-    this -- always 4:3, full stop, regardless of any config value. The
-    CRT Bezel (fake_43_border_enabled) does NOT flip this on its own.
-
-    This used to also flip to 4:3 whenever Bezel was on, on the theory
-    that the Bezel's photo has a physically 4:3-shaped screen cutout so
-    everything behind it -- guide included -- has to be pre-boxed to
-    that shape to fit. That was the same bug already identified and
-    fixed for ordinary video/package-aspect content (see
-    _apply_bezel_on_aspect_lock's docstring in retro_tv_emulator.py):
-    Bezel's own per-axis compositing (_bezel_composite_geometry) already
-    maps whatever shape its content actually is directly onto the bezel
-    art's measured cutout, independently on both axes -- it doesn't need
-    the guide pre-boxed to 4:3 to fit, and never did. Pre-boxing the
-    guide to a 4:3 design canvas here, before Bezel ever saw it, just
-    pillarboxed the guide into a narrower rect first, which then got
-    letterboxed a second time on the way into the (now full-window-sized)
-    target rect Bezel-on content renders into -- baking in exactly the
-    left/right black bars a real CRT tube wouldn't show. The guide now
-    keeps its normal 16:9 layout the whole time Bezel is on, the same way
-    the Visualizer and game-channel picker pages already do (see
-    _vis_ignores_package_aspect / _game_ignores_package_aspect in
-    retro_tv_emulator.py), and Bezel's own mapping does 100% of the
-    fitting into its cutout.
-    """
+    """Whether the TV guide should render in its 4:3 layout right now."""
     if db is None:
         return False
     return getattr(db, "_detected_aspect_ratio", None) == "4:3"
 
 
 def _is_real_43_display(db):
-    """True on genuine 4:3 (CRT) hardware -- the "boot to 4:3" case, as
-    opposed to the fake-4:3 Bezel simulated inside a 16:9 window. Every
-    control the Bezel greys out (Aspect Ratio, console TV Bezel rows) is
-    greyed the same way here, and the Warp Screen toggle is greyed too,
-    since the real tube already provides the look those controls fake."""
+    """True on genuine 4:3 hardware, not the Bezel simulated inside a 16:9 window."""
     return bool(db is not None and getattr(db, "_detected_aspect_ratio", None) == "4:3")
 
 
@@ -523,41 +444,18 @@ def get_guide_visible_rows(db):
 def get_guide_num_cols(db):
     return GUIDE_NUM_COLS_4_3 if _guide_aspect_is_4_3(db) else GUIDE_NUM_COLS_16_9
 
-GUIDE_TOTAL_HALF_HOURS = 336  # 7 days * 48 half-hour columns/day
+GUIDE_TOTAL_HALF_HOURS = 336
 
 def clamp_guide_time_idx(raw_idx, num_cols):
     return max(0, min(raw_idx, GUIDE_TOTAL_HALF_HOURS - num_cols))
 
 
-_NAME_CELL_SIDE_PAD = 10  # px clearance kept clear on EACH side of the name
-                          # cell's gridlines, so a maxed-out name never
-                          # touches the cell border.
+# VALUES CHANGE HERE
+_NAME_CELL_SIDE_PAD = 10
 
 
 def compute_channel_name_char_limit(real_h=None):
-    """How many characters of a channel name the TV Guide's name cell can
-    show without the text running into the cell's gridlines.
-
-    The guide draws the channel name in whichever of the two layouts (4:3
-    or 16:9) is active, at that layout's own column width and font size.
-    Typing has no idea which layout will be showing the name later -- the
-    aspect ratio can change after the name is saved -- so a single input
-    cap has to be safe for BOTH. The 4:3 guide is the tighter of the two
-    (narrower name column, same-or-larger font floor -- see
-    _render_tv_guide_impl's _min_font_pt), so sizing the cap to the 4:3
-    cell keeps the name from overflowing its cell on either layout.
-
-    This mirrors the 4:3 branch of _render_tv_guide_impl's geometry
-    exactly (col widths, header-font fit loop, row height, dynamic name
-    font size) so the two never drift apart -- it does not re-derive the
-    numbers independently.
-
-    real_h: the real on-screen height the guide is being rendered at
-    (e.g. WINDOW_HEIGHT), used the same way _render_tv_guide_impl uses it
-    to floor the row-label font size for small/low-res screens. Pass None
-    (or omit) to size against the guide's own design resolution, i.e. as
-    if no upscale/downscale were happening.
-    """
+    """Return how many characters of a channel name fit in the guide's name cell."""
     import math as _math
 
     w, h = GUIDE_DESIGN_W_4_3, GUIDE_DESIGN_H_4_3
@@ -565,8 +463,6 @@ def compute_channel_name_char_limit(real_h=None):
     num_rows = GUIDE_VISIBLE_ROWS_4_3
     col_width = w // (num_cols + 1)
 
-    # --- header/clock font-fit loop, copied from _render_tv_guide_impl's
-    # is_4_3 branch, to get the same header_height it would produce ---
     _CLOCK_CELL_PAD = 10
     _HDR_CELL_PAD = 12
     _CLOCK_PAIR_GAP = 8
@@ -607,7 +503,6 @@ def compute_channel_name_char_limit(real_h=None):
     _base_ph = int(_base_pw * (9.0 / 16.0))
     _header_growth = header_height - 32
     ph = _base_ph - _header_growth
-    pw = int(ph * (16.0 / 9.0))
     py = 15
     grid_top_y = py + ph + 10
     start_y = grid_top_y + header_height
@@ -619,53 +514,30 @@ def compute_channel_name_char_limit(real_h=None):
 
     max_txt_w = col_width - (2 * _NAME_CELL_SIDE_PAD)
 
-    # Courier New is monospace, so a run of characters divides out to an
-    # exact per-character advance -- more reliable than measuring a
-    # single glyph, which some fonts kern differently in isolation.
     _probe_len = 20
     _char_w = font_row_sm.size("M" * _probe_len)[0] / _probe_len
     if _char_w <= 0:
-        return 18  # defensive fallback; shouldn't happen with a real font
+        return 18
 
     return max(4, int(max_txt_w // _char_w))
 
 def get_current_guide_time_idx(app_state, db):
-    """Compute the half-hour column index for the guide's currently active
-    time window, using the exact same formula _render_tv_guide_impl uses to
-    pick its viewport. Callers use this to check whether a cached row's
-    stops were actually built for the window that's on screen right now,
-    rather than a stale one left over from before a horizontal (A/D) time
-    shift -- see get_cached_row_stops."""
+    """Return the half-hour column index of the guide's current time window."""
     num_cols = get_guide_num_cols(db)
     now_dt = broadcast_clock.now().replace(tzinfo=None)
     system_live_c_idx = (now_dt.hour * 2) + (1 if now_dt.minute >= 30 else 0)
     user_shift = app_state.get("selected_guide_time_idx", 0)
     return clamp_guide_time_idx(system_live_c_idx + user_shift, num_cols)
 
-# Temporary kill-switch for the update/server-sync subsystems (auto_updater,
-# server_discovery, server_sync, server_service). Those four modules are
-# still being packaged/tested and can take the whole app down with them if
-# left live during that process. Set this False to fully grey out the
-# "Look for Updates" button and the "Server Mode" toggle/"Menu" button in
-# the System tab, and to no-op every runtime call into those four modules
-# (background update thread, server listener, schedule broadcaster/client,
-# server-service autostart) -- without deleting any of that code. Flip back
-# to True once packaging is solid and those features are ready to test again.
-UPDATER_AND_SERVER_FEATURES_ENABLED = False
 
-# GPU-accelerated warp/bezel-scale render path (see d3d11_warp_renderer.py
-# and _gpu_warp_backend_requested/_apply_crt_shader in retro_tv_emulator.py).
-# Testing found the round-trip CPU<->GPU readback stalls the pipeline every
-# frame, making GPU mode roughly 2x SLOWER than CPU-only on real hardware
-# (confirmed on both a discrete Arc A380 and an integrated UHD 730 -- same
-# ~30ms cost on both, which is the signature of a sync stall, not GPU
-# compute time). Set this False to fully grey out the GPU/CPU System-menu
-# button (locked to CPU Only, matching Recommended's removal from the cycle
-# below) and no-op the Enter-key cycle handler, without deleting any of the
-# renderer code -- it's proven correct (see d3d11_warp_poc.py), just not a
-# win as currently architected. Flip back to True once/if a non-blocking
-# (double-buffered Map, or direct-to-swapchain) redesign lands.
-GPU_RENDER_MODE_ENABLED = False
+# ============================================================================
+# SECTION: Settings menu: feature flags & row metadata
+# ============================================================================
+
+
+UPDATER_AND_SERVER_FEATURES_ENABLED = True
+
+GPU_RENDER_MODE_ENABLED = True
 
 SYSTEM_ROW_META = {
     "game_ch":            {"kind": "toggle", "label": "Games (Channel 03):"},
@@ -681,15 +553,8 @@ SYSTEM_ROW_META = {
     "mono_stereo_toggle": {"kind": "toggle", "label": "Mono Audio:"},
     "update_check":       {"kind": "button", "label": "Look for Updates", "color": (45, 80, 130)},
     "remote_remap":       {"kind": "button", "label": "Remote Remapping", "color": (45, 80, 130)},
-    # Label is a static fallback only -- the real button always renders
-    # via _gpu_render_mode_label() below, which reflects the live
-    # Recommended/adapter-name/CPU Only cycle state instead of this fixed
-    # string.
     "gpu_render_mode":    {"kind": "button", "label": "GPU/CPU: Disabled (CPU Only)", "color": (45, 80, 130)},
-    # Opens SYSTEM_ADVANCED_SUB_MENU -- takes gpu_render_mode's old slot
-    # (standalone row under the left toggle column) now that Server Mode,
-    # Custom Shell Launcher, GPU/CPU, Remote Remapping, and Updates have
-    # all moved there. See get_advanced_settings_menu_rows below.
+    "performance_mode":   {"kind": "button", "label": "Performance Mode: Standard", "color": (45, 80, 130)},
     "advanced_settings":  {"kind": "button", "label": "Advanced Settings", "color": (45, 80, 130)},
     "reset_settings":     {"kind": "button", "label": "Reset All Settings"},
     "exit_program":       {"kind": "button", "label": "Exit Program"},
@@ -698,28 +563,7 @@ SYSTEM_ROW_META = {
 
 
 def _gpu_render_mode_options(db):
-    """Ordered (value, display_label) pairs for the GPU/CPU render-mode
-    button's cycle: every real (non-software) DXGI adapter this boot's
-    _detect_gpu_tier() found (retro_tv_emulator.py), highest-VRAM first --
-    same order that function already returns them in -- then a fixed
-    'CPU Only' last. `value` is the adapter's real DXGI name (what gets
-    saved to db.config so a later boot can still match it against a
-    re-enumerated adapter list); `display_label` is a shortened,
-    button-width-friendly version of that same name.
-
-    NOTE: 'Recommended' was removed from this cycle -- testing showed the
-    GPU path is currently slower than CPU-only regardless of adapter (see
-    GPU_RENDER_MODE_ENABLED's comment above), so there's no adapter worth
-    auto-recommending right now. While GPU_RENDER_MODE_ENABLED is False,
-    the caller (retro_tv_emulator.py's Enter-key handler) never actually
-    invokes this cycle at all -- CPU Only is locked in -- but the function
-    itself stays adapter-list-driven rather than hardcoded, so turning
-    GPU_RENDER_MODE_ENABLED back on later doesn't require rebuilding this.
-
-    db._detected_gpu_adapters not existing yet (very early boot, before
-    the background subsystem worker runs) or being empty (detection
-    failed/found nothing) both degrade to just [CPU Only] -- same
-    single-option list you'd get on a machine with no GPU at all."""
+    """Return ordered (value, label) pairs for the GPU/CPU button: detected adapters by VRAM, then 'CPU Only'."""
     adapters = getattr(db, "_detected_gpu_adapters", None) if db is not None else None
     real_adapters = [a for a in (adapters or []) if not a.get("is_software")]
     opts = []
@@ -727,32 +571,15 @@ def _gpu_render_mode_options(db):
         name = str(a.get("name", "")).strip()
         if not name:
             continue
-        # Trim the (R)/(TM) legal-symbol clutter and cap length so a long
-        # adapter name (e.g. "Intel(R) Arc(TM) A380 Graphics") still fits
-        # this button -- the FULL name is still what's stored/matched
-        # against, only the on-screen text is shortened.
         short = name.replace("(R)", "").replace("(TM)", "")
         short = " ".join(short.split())
-        if len(short) > 22:
-            short = short[:21].rstrip() + "\u2026"
         opts.append((name, short))
     opts.append(("cpu_only", "CPU Only"))
     return opts
 
 
 def _gpu_render_mode_label(db):
-    """Current 'GPU/CPU: <choice>' button text, reading the saved cycle
-    position from db.config['render_mode_override'] (same persisted-
-    preference pattern as bezel_style) and falling back to CPU Only if
-    that saved value doesn't match any option this boot actually detected
-    -- e.g. a saved adapter name from a since-removed eGPU, or a
-    pre-existing 'recommended' value saved before that option was removed
-    from the cycle.
-
-    While GPU_RENDER_MODE_ENABLED is False, this ignores db.config
-    entirely and always reports the disabled state -- matching how
-    update_check's label does the same for UPDATER_AND_SERVER_FEATURES_
-    ENABLED just above."""
+    """Return the 'GPU/CPU: <choice>' button text from render_mode_override, falling back to CPU Only."""
     if not GPU_RENDER_MODE_ENABLED:
         return "GPU/CPU: Disabled (CPU Only)"
     opts = _gpu_render_mode_options(db)
@@ -763,31 +590,33 @@ def _gpu_render_mode_label(db):
     return f"GPU/CPU: {by_value[saved]}"
 
 
-# Sentinel menu_selection_index values for inline buttons/option-boxes that
-# sit on a System tab toggle row but aren't real entries in
-# get_system_menu_rows() -- kept well outside that list's normal index
-# range, same pattern as the Channels-tab footer's 41-99 sentinel range
-# sitting outside the channel grid's 0-39.
-SERVER_MENU_BTN_SEL    = 500  # "Server Menu" open-button, right of server_option's toggle
-CAPTIONS_COLOR_BOX_SEL = 502  # caption-color swatch, right of captions_toggle's toggle
+def _mode_locks(config_key):
+    """True while the current performance mode greys out and switches off this setting."""
+    try:
+        return performance_governor is not None and performance_governor.feature_locked(config_key)
+    except Exception:
+        return False
+
+
+def _performance_mode_label(db):
+    """Return the 'Performance Mode: <mode>' button text from the live governor mode."""
+    if performance_governor is None:
+        return "Performance Mode: Standard"
+    mode = performance_governor.get_mode()
+    return "Performance Mode: " + str(performance_governor.MODE_TABLE.get(mode, {}).get("label", mode.title()))
+
+
+# ============================================================================
+# SECTION: Settings menu: server picker entries
+# ============================================================================
+
+
+SERVER_MENU_BTN_SEL    = 500
+CAPTIONS_COLOR_BOX_SEL = 502
 
 
 def get_mock_discovered_servers():
-    """Hardcoded fake discovery list matching the real discovery shape
-    exactly: a flat list of {"name": <slot display name>, "host": <machine
-    label>} dicts, one entry per *named slot*, not one per physical
-    machine.
-
-    Not called by the real picker -- get_server_picker_entries(db) reads
-    live results from db.server_listener instead. Left in place since it's
-    still handy for manual testing without two machines/processes on hand:
-    point get_server_picker_entries at this instead of a listener if you
-    need to poke the picker UI in isolation.
-
-    "Mom" and "Dad" intentionally share the same mock host on purpose --
-    one physical server can surface multiple pickable slot names (up to
-    7), and this exercises that multi-slot-per-host layout/logic case.
-    """
+    """Return the hardcoded list of {name, host} entries used as mock server discovery results."""
     return [
         {"name": "Mom",   "host": "Living Room PC"},
         {"name": "Dad",   "host": "Living Room PC"},
@@ -796,24 +625,7 @@ def get_mock_discovered_servers():
 
 
 def get_server_picker_entries(db):
-    """Alphabetically-sorted (by display name) *live* discovered-server
-    entries for SERVER_PICKER_MENU.
-
-    Reads db.server_listener -- a runtime-only attribute retro_tv_emulator.py
-    attaches to db in _background_subsystem_worker (same pattern already
-    used for db.playback_active_check), pointing at the single
-    server_discovery.ServerListener instance owned for the app's lifetime.
-    Falls back to an empty list if the listener hasn't started yet or db is
-    None, so the existing "No server found." empty state covers that case
-    too.
-
-    Single source of truth for the sort order so the render loop and the
-    event-handling nav in retro_tv_emulator.py can't disagree on which row
-    is which. Called fresh every frame the picker is on screen (the render
-    loop re-invokes this every draw), so servers appearing/disappearing
-    while the picker is open update live with no extra polling code needed
-    here.
-    """
+    """Alphabetically-sorted (by display name) *live* discovered-server entries for SERVER_PICKER_MENU."""
     listener = getattr(db, "server_listener", None) if db is not None else None
     if listener is None:
         return []
@@ -825,19 +637,7 @@ def get_server_picker_entries(db):
 
 
 def get_server_picker_display_rows(entries, include_close=True):
-    """Builds SERVER_PICKER_MENU's render list: a display-only letter-header
-    row inserted whenever the first letter of the (already-sorted) entries
-    changes, the entry rows themselves, and -- unless the caller is
-    rendering a scrolled-to window rather than the full list -- a trailing
-    Close row. Headers are never selectable --
-    get_server_picker_selectable_count() below is the one place that
-    counts the *selectable* rows, so this render list and the W/S nav
-    range in retro_tv_emulator.py can't drift out of sync.
-
-    include_close=False is used when rendering a single scrolled-into-view
-    page of entries (SERVER_PICKER_MENU caps visible rows at 6 and scrolls
-    past that); the caller appends one real Close row itself once, after
-    the last page."""
+    """Build the SERVER_PICKER_MENU render list: letter headers, entry rows and, unless windowed, a Close row."""
     rows = []
     last_letter = None
     for entry in entries:
@@ -849,9 +649,6 @@ def get_server_picker_display_rows(entries, include_close=True):
                 "type": "entry",
                 "name": entry["name"],
                 "host": entry["host"],
-                # Keep the slot identity attached to the row.  Older/manual
-                # mock entries do not have one, so the picker remains
-                # backwards-compatible with those too.
                 "slot_id": entry.get("slot_id"),
             })
     if include_close:
@@ -860,23 +657,18 @@ def get_server_picker_display_rows(entries, include_close=True):
 
 
 def get_server_picker_selectable_count(entries):
-    """How many selectable rows SERVER_PICKER_MENU has: one per entry,
-    plus the trailing Close row. Headers don't count -- this is the
-    ceiling `menu_selection_index` must stay within."""
+    """Return the number of selectable SERVER_PICKER_MENU rows: the entries plus Close, headers excluded."""
     return len(entries) + 1
+
+
+# ============================================================================
+# SECTION: Settings menu: row lists per tab
+# ============================================================================
 
 
 def get_system_menu_rows(db, app_state):
     kiosk_on = db.config.get("kiosk_mode_enabled", False) if db is not None else False
 
-    # Power Off is "skip Windows entirely and kill the machine" -- it only
-    # makes sense to show when this session is actually running as the
-    # replaced shell (shell_takeover_active), not just because Custom Shell
-    # Launcher is checked in saved config. Using the config flag here would
-    # show it (and let it fire an unconfirmed shutdown) even while sitting
-    # at a normal Windows desktop testing Kiosk Mode with the launcher
-    # toggled on but not actually running through it -- same check the
-    # full System menu below already uses.
     poweroff_visible = app_state.get("shell_takeover_active", False) if app_state is not None else False
 
     if kiosk_on:
@@ -884,11 +676,6 @@ def get_system_menu_rows(db, app_state):
 
     rows = ["game_ch", "guide", "controls_on_start", "kiosk_mode",
             "loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle"]
-    # Server Mode, Custom Shell Launcher, Updates, GPU/CPU, and Remote
-    # Remapping have all moved into the Advanced Settings sub-menu (see
-    # get_advanced_settings_menu_rows below), reached through the single
-    # "Advanced Settings" button here -- the same standalone slot under
-    # the left toggle column that GPU/CPU used to occupy alone.
     rows += ["advanced_settings", "reset_settings", "exit_program"]
     if poweroff_visible:
         rows.append("poweroff")
@@ -896,64 +683,23 @@ def get_system_menu_rows(db, app_state):
 
 
 def get_advanced_settings_menu_rows(db, app_state):
-    """Row order for SYSTEM_ADVANCED_SUB_MENU -- Server Mode, Custom Shell
-    Launcher, Look for Updates, GPU/CPU render mode, and Remote Remapping,
-    all moved out of the main System tab rows and behind the single
-    "Advanced Settings" button (see get_system_menu_rows above). Mirrors
-    get_channels_settings_menu_rows' shared-source-of-truth pattern:
-    "server_menu_open" rides along with "server_option" as a same-row
-    companion target (the "Menu" button beside Server Mode's toggle), the
-    same way "watermark_select" rides along with "watermark" there --
-    never counted as its own visual row, just a second selectable target
-    on server_option's row.
-    """
-    return ["server_option", "server_menu_open", "boot_on_start",
-            "update_check", "gpu_render_mode", "remote_remap"]
-
+    """Return the row order for SYSTEM_ADVANCED_SUB_MENU: shortest label first, bars with a side switch last, the Server Menu button right after its row."""
+    return ["update_check", "remote_remap", "performance_mode", "gpu_render_mode",
+            "boot_on_start", "server_option", "server_menu_open"]
 
 
 def get_channels_settings_menu_rows(db, app_state):
-    """Row order for CHANNEL_SETTINGS_SUB_MENU -- every display toggle that
-    used to live in the CHANNEL_LIST footer, now reached through that
-    footer's single "Settings" button (index 43). Kept as one shared
-    source of truth (mirroring get_system_menu_rows above) so the real-4:3
-    hide/show for Scan Lines is handled in exactly one place, rather than
-    being re-derived both in the input handler and in the drawing code and
-    risking the two disagreeing.
-    """
-    true_43_display = (getattr(db, "_detected_aspect_ratio", None) == "4:3") if db is not None else False
-
-    rows = []
-    # Scan Lines hides entirely on real 4:3 hardware -- a genuine CRT
-    # already has real scan lines, so the fake overlay would just be
-    # layering fake lines on top of real ones. Same gating the footer
-    # switch used before this moved here.
-    if not true_43_display:
-        rows.append("scan_lines")
-    rows.append("static_noise")
+    """Return the row order for CHANNEL_SETTINGS_SUB_MENU."""
+    rows = ["bezel_toggle"]
+    if media.bezel_style_count() > 1:
+        rows.append("bezel_style_select")
     rows.append("warp_screen")
-    rows.append("reception_lines")
-    # CRT TV Bezels -- moved here from the System tab (see
-    # get_system_menu_rows). Same real-4:3-hardware hide/show Scan Lines
-    # already has above: a genuine CRT tube already has its own physical
-    # bezel, so the fake overlay (and its style picker) has nothing to do
-    # there.
-    if not true_43_display:
-        rows.append("bezel_toggle")
-        # Style-cycle button beside the toggle -- only a real, selectable
-        # row when 2+ styles actually exist (same gate the System tab's
-        # number-box used); unlike watermark_select below, this is fully
-        # hidden rather than shown-but-greyed when there's nothing to
-        # cycle between.
-        if media.bezel_style_count() > 1:
-            rows.append("bezel_style_select")
+    rows.append("scan_lines")
     rows.append("watermark")
-    # "Add" button (renamed from "Select") for the watermark image -- always
-    # present as its own row, same as it always sat beside the Water Mark
-    # toggle in the old footer; it's inert (greyed, no-op on Enter) while
-    # Water Mark is off rather than hidden, so it doesn't jump around.
     rows.append("watermark_select")
     rows.append("boot_anim")
+    rows.append("static_noise")
+    rows.append("reception_lines")
     return rows
 
 
@@ -961,18 +707,15 @@ def get_games_sub_menu_rows(db, app_state, console_key, is_on):
     if console_key == "MENU":
         return ["controller_map", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores",
                 "menu_bg_select_image", "multitap_toggle", "scroll_style", "text_color",
-                "game_aspect_ratio", "game_screen_mode"]
+                "game_screen_mode"]
 
     if not is_on:
         return []
 
     if console_key == "DVD":
-        splash_on = db.config.get("dvd_splash_enabled", False) if db is not None else False
         splash_rows = ["splash_toggle", "splash_select_image", "splash_select_video"]
-        # "Change Audio Selection" now sits at the bottom of the left column,
-        # under Screen Mode, instead of right below Button Mapping.
         return (splash_rows + ["dvd_captions_toggle", "dvd_resume_toggle"]
-                + ["dvd_button_mapping", "dvd_aspect_ratio", "dvd_screen_mode", "dvd_audio_track"])
+                + ["dvd_button_mapping", "dvd_screen_mode", "dvd_audio_track"])
 
     kiosk_on = db.config.get("kiosk_mode_enabled", False) if db is not None else False
 
@@ -993,6 +736,11 @@ def get_games_sub_menu_rows(db, app_state, console_key, is_on):
     splash_rows += ["relocate_roms_folder", "clear_console_roms"]
 
     return rows + splash_rows
+
+
+# ============================================================================
+# SECTION: Games tab: splash panel & asset preload
+# ============================================================================
 
 
 def _draw_console_splash_panel(menu_canvas, db, console_key, cx, content_w, top_y,
@@ -1114,18 +862,6 @@ def _draw_console_splash_panel(menu_canvas, db, console_key, cx, content_w, top_
                                           clear_row_y + cell_h // 2 - lbl_clear.get_height() // 2))
 
 
-# Raw (not yet convert_alpha()'d, already cropped) console-logo surfaces
-# warmed by a background thread at boot (see
-# retro_tv_emulator._preload_games_tab_logos), keyed by console_key. Disk
-# I/O + PNG decode + the get_bounding_rect() crop scan -- the actual slow
-# parts -- happen off the render thread there; convert_alpha() itself is
-# comparatively cheap but still needs to happen on the main/render thread
-# once a display mode is set, so preload_games_tab_assets() below does
-# that small remaining step on first real use instead of doing the whole
-# load synchronously in the menu-open keypress handler (see retro_tv_
-# emulator's [FRAME GAP] 375ms stall the first time Menu was opened,
-# before this split existed -- every logo's disk read + decode + crop was
-# happening inline, blocking the keypress handler that opens the menu).
 _games_tab_logo_raw_preload = {}
 _games_tab_logo_raw_preload_lock = threading.Lock()
 
@@ -1147,17 +883,11 @@ def preload_games_tab_assets(app_state):
         with _games_tab_logo_raw_preload_lock:
             preloaded = _games_tab_logo_raw_preload.pop(console_key, None)
         if preloaded is not None:
-            # Already loaded + cropped by the boot-time background thread --
-            # convert_alpha() here is just a cheap pixel-format conversion,
-            # not a disk-read+decode+crop stall.
             try:
                 _menu_logo_raw_cache[console_key] = preloaded.convert_alpha()
             except Exception:
                 _menu_logo_raw_cache[console_key] = None
             continue
-        # Fallback for a console added/renamed after boot (or if the
-        # background preload thread hasn't reached this key yet) -- same
-        # synchronous path as before, just no longer the common case.
         logo_path = os.path.join(logos_dir, f"{console_key}.png")
         try:
             logo_raw = (
@@ -1167,6 +897,11 @@ def preload_games_tab_assets(app_state):
             _menu_logo_raw_cache[console_key] = _crop_logo_to_artwork(logo_raw)
         except Exception:
             _menu_logo_raw_cache[console_key] = None
+
+
+# ============================================================================
+# SECTION: Loading screen & controls splash
+# ============================================================================
 
 
 def _get_font(name, size, bold=False):
@@ -1212,7 +947,7 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
     if app_state is None:
         app_state = {}
     page  = app_state.get("controls_splash_page",  0)
-    focus = app_state.get("controls_splash_focus", 1)  # 0=left-arrow, 1=right-arrow/Close
+    focus = app_state.get("controls_splash_focus", 1)
 
     tv_controls = [
         ("UP / DOWN",    "CHANNEL UP / CHANNEL DOWN"),
@@ -1275,16 +1010,17 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
     page_data = PAGES[page]
 
     margin  = 40
-    full_w  = CANVAS_W - margin * 2
-    ROW_KEY_GAP  = 48   # gap between key label and description on "rows" pages
-    COL_KEY_GAP  = 40   # gap between key label and description within one "cols" column
-    COL_GAP      = 90   # gap between the KEYBOARD and CONTROLLER columns
+    # VALUES CHANGE HERE
+    ROW_KEY_GAP  = 48
+    COL_KEY_GAP  = 40
+    COL_GAP      = 90
 
     BODY_SIZE = 22
     f_body = _get_font("Courier New", BODY_SIZE, bold=True)
     f_sub  = _get_font("Courier New", BODY_SIZE + 9, bold=True)
     ROW_STEP = f_body.get_height() + 16
-    SECT_H   = f_sect.get_height() + 22   # title height + underline gap + padding
+    # VALUES CHANGE HERE
+    SECT_H   = f_sect.get_height() + 22
 
     def _is_icon_key(k):
         return isinstance(k, tuple) and k[0] == "ICON"
@@ -1347,7 +1083,6 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
         canvas.blit(hint, (margin, footer_y + 6))
 
         if page_num == 0:
-            # Right arrow -- always highlighted (only nav item on the first page)
             lbl   = f_footer.render("  \u25ba  ", True, MIDNIGHT_NAVY)
             btn_w = lbl.get_width() + 8
             btn_h = lbl.get_height() + 4
@@ -1357,7 +1092,6 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
             canvas.blit(lbl, (bx, by + 2))
         elif page_num == NUM_PAGES - 1:
             left_focused = (focus == 0)
-            # Close button
             cl  = f_footer.render("  CLOSE  ", True, MIDNIGHT_NAVY if not left_focused else TEXT_WHITE)
             cw  = cl.get_width() + 8
             ch  = cl.get_height() + 4
@@ -1377,7 +1111,6 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
         else:
             left_focused  = (focus == 0)
             right_focused = not left_focused
-            # Right arrow (drawn first, pinned to the right margin)
             rl  = f_footer.render("  \u25ba  ", True, MIDNIGHT_NAVY if right_focused else TEXT_WHITE)
             rw  = rl.get_width() + 8
             rh  = rl.get_height() + 4
@@ -1386,7 +1119,6 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
             pygame.draw.rect(canvas, NEON_GREEN if right_focused else DIM_GREY,
                              (rx_ - 4, ry_, rw + 4, rh), border_radius=4)
             canvas.blit(rl, (rx_, ry_ + 2))
-            # Left arrow, just to the left of it
             ll  = f_footer.render("  \u25c4  ", True, MIDNIGHT_NAVY if left_focused else TEXT_WHITE)
             lw  = ll.get_width() + 8
             lh  = ll.get_height() + 4
@@ -1442,41 +1174,7 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
 
     draw_footer(page)
 
-    # Box into the shared package-aspect, margin-inset envelope (see
-    # fit_menu_envelope). With the Bezel off, contain-fit the
-    # CANVAS_W:CANVAS_H (1036:680) design shape inside that envelope --
-    # the same math the Main Menu uses, so the two always land on the
-    # identical on-screen size given the same real_w x real_h.
-    # (fit_design_canvas's plain "native size if it fits" behavior is
-    # still correct for the small Quit/Restart confirm dialog, which is
-    # meant to stay a small centered popup -- it's deliberately not used
-    # here. Likewise, stretching each axis independently to fill the
-    # envelope would warp the content out of proportion.) With the Bezel
-    # on, fit_menu_envelope reports stretch_fill=True: the whole finished
-    # frame gets mapped per-axis onto the Bezel cutout right after this
-    # anyway, so contain-fitting here would just bake its own letterbox
-    # bars into that mapping -- stretch to the envelope instead so the
-    # menu reaches every edge of the margin, same as every other content
-    # type already does in Bezel mode.
-    _env_w, _env_h, _env_x, _env_y, _stretch_fill = fit_menu_envelope(real_w, real_h, db)
-    if _stretch_fill:
-        dest_w, dest_h = _env_w, _env_h
-    else:
-        dest_w = _env_w
-        dest_h = int(dest_w * (float(CANVAS_H) / CANVAS_W))
-        if dest_h > _env_h:
-            dest_h = _env_h
-            dest_w = int(dest_h * (float(CANVAS_W) / CANVAS_H))
-    dest_x = _env_x + (_env_w - dest_w) // 2
-    dest_y = _env_y + (_env_h - dest_h) // 2
-
-    _shrink = _menu_fit_shrink_factor(db)
-    if _shrink != 1.0:
-        _shrunk_w = max(1, int(dest_w * _shrink))
-        _shrunk_h = max(1, int(dest_h * _shrink))
-        dest_x += (dest_w - _shrunk_w) // 2
-        dest_y += (dest_h - _shrunk_h) // 2
-        dest_w, dest_h = _shrunk_w, _shrunk_h
+    dest_x, dest_y, dest_w, dest_h = menu_panel_rect(real_w, real_h, db)
 
     if dest_w == CANVAS_W and dest_h == CANVAS_H:
         surface.blit(canvas, (dest_x, dest_y))
@@ -1485,16 +1183,23 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
         surface.blit(scaled, (dest_x, dest_y))
 
 
-_guide_frame_cache = {"key": None, "canvas": None, "preview_bounds": None, "clock_box": None}
+# ============================================================================
+# SECTION: TV guide: frame cache, locking & async rendering
+# ============================================================================
+
+
+_guide_frame_cache = {"key": None, "canvas": None, "preview_bounds": None, "clock_box": None, "serial": 0}
+_guide_scaled_cache = {"key": None, "surf": None}
+
+# VALUES CHANGE HERE (channel row cache: seconds a drawn row stays valid, most rows kept)
+_GUIDE_ROW_CACHE_TTL_S = 20.0
+_GUIDE_ROW_CACHE_MAX = 24
+_guide_row_cache = {}
+_guide_row_cache_state = {"gen": 0}
 
 
 class _TrackedLock:
-    """threading.Lock wrapper that records who's holding it and since when,
-    so a watchdog can report *why* something is stalled instead of just
-    *that* it is. Only meant for the guide's build lock, which two threads
-    (GuidePreloader + main-thread STEP3 probes) contend over -- this makes
-    contention/starvation directly observable instead of requiring another
-    guess-and-log round every time it's suspected."""
+    """threading.Lock wrapper that records its holder and when it took the lock."""
     def __init__(self, name):
         self._lock = threading.Lock()
         self._name = name
@@ -1520,92 +1225,28 @@ class _TrackedLock:
         return f"{self._name}: held by {self._holder} for {held_for:.2f}s"
 
 
-# Guards the shared scratch canvases (_guide_canvas / _guide_canvas_43) that
-# _render_tv_guide_impl draws onto -- both the background preloader thread
-# and the occasional on-demand synchronous callers (e.g. row-stop refresh)
-# can reach that drawing code, and it's not safe for two of them to paint
-# onto the same singleton surface at once.
 _guide_build_lock = _TrackedLock("_guide_build_lock")
-# Guards reads/writes of _guide_frame_cache itself, separately from the
-# build lock above, so the main thread can cheaply peek at "is there a
-# ready frame?" without waiting on an in-progress build.
 _guide_cache_lock = threading.Lock()
 
-# Per-channel row-stops cache. Populated for every visible row whenever a full
-# guide repaint runs (not just the highlighted row), so that switching the
-# highlighted row (W/S) can usually reuse a value that was already computed
-# a moment ago instead of forcing a brand-new full-grid repaint just to read
-# one row's stops back out. TTL guards against reusing something that's
-# gone stale if the guide hasn't actually painted in a while.
-#
-# Each entry also records the half-hour time_idx of the viewport it was
-# built under. The background preloader repaints (and re-populates this
-# cache) on its own periodic schedule, so if the user shifts the guide's
-# time window (A/D) and then switches rows (W/S) before the preloader's
-# next tick catches up, a row's cached entry here can still belong to the
-# *previous* window. Handing that back as if it matched the window that's
-# actually on screen would resolve the new row's selection to an absolute
-# time outside the visible viewport -- nothing on screen matches it, so the
-# highlight simply vanishes. Checking time_idx alongside the TTL closes
-# that gap: a window mismatch is treated as a cache miss, which forces a
-# synchronous rebuild instead of returning stale-window stops.
 _guide_row_stops_cache = {}
-# BUG FIX: this cache used to also expire on a 3-second wall-clock TTL
-# (_GUIDE_ROW_STOPS_TTL_SECONDS), on top of the expected_time_idx check
-# below. That TTL predates the guide-rebuild redesign described in
-# invalidate_guide_cache()'s docstring: rebuilds used to happen on every
-# ~0.5s tick regardless of whether anything changed, so a stale TTL barely
-# mattered. Now a real rebuild only runs on an actual schedule boundary or
-# an explicit invalidate_guide_cache() call -- so once the guide sits idle
-# (nothing about the schedule changed) for longer than the TTL, every row's
-# entry "expires" for no reason, and the very next row switch (get_cached_row_stops
-# returning None) forces the slow synchronous offscreen rebuild fallback in
-# _resync_guide_stop_after_row_switch, even though nothing was ever actually
-# stale. expected_time_idx already correctly invalidates a row the instant
-# its 30-minute window rolls over, and invalidate_guide_cache() already
-# correctly clears everything the moment schedule data actually changes --
-# between those two, a wall-clock TTL adds no real correctness and only
-# forces needless rebuilds. Removed.
 
 
 def invalidate_guide_cache():
-    """Force the next guide render to do a real rebuild instead of serving
-    a stale cached frame/row-stops.
-
-    _compute_guide_cache_key() is keyed on viewport/selection/date/theme --
-    never on schedule content -- because checking every channel's schedule
-    contents on every frame just to build a cache key would defeat the
-    point of caching. That means any code path that mutates schedule data
-    out from under an already-cached key (clearing a channel's broadcast
-    files or music tracks, "Reset All Settings", or any future bulk-edit
-    of channels_db) must call this afterward, or the guide keeps painting
-    whatever it last had cached until some unrelated key field (e.g. the
-    half-hour bucket) happens to change on its own.
-    """
+    """Force the next guide render to do a real rebuild instead of serving a stale cached frame/row-stops."""
     with _guide_cache_lock:
         _guide_frame_cache["key"] = None
         _guide_frame_cache["canvas"] = None
         _guide_frame_cache["preview_bounds"] = None
         _guide_frame_cache["clock_box"] = None
+        _guide_row_cache_state["gen"] += 1
+    _guide_scaled_cache["key"] = None
+    _guide_scaled_cache["surf"] = None
+    _guide_row_cache.clear()
     _guide_row_stops_cache.clear()
 
 
 def get_cached_row_stops(ch_str, expected_time_idx=None):
-    """Return (blocks, stops) for ch_str if we have a cached value from the
-    last full guide repaint that was also built for the currently active
-    time window, else None.
-
-    Correctness relies on two things, not a wall-clock age check: the
-    expected_time_idx match below (invalidates the instant the 30-minute
-    guide window rolls over) and invalidate_guide_cache() (invalidates the
-    instant schedule data actually changes). See the comment above
-    _guide_row_stops_cache for why a TTL used to sit here and why it was
-    removed.
-
-    expected_time_idx should be the caller's current guide time_idx (see
-    get_current_guide_time_idx). Pass None to skip the window check (only
-    appropriate for callers that don't care which window the stops came
-    from)."""
+    """Return the cached (blocks, stops) for ch_str if built for the active time window, else None."""
     entry = _guide_row_stops_cache.get(str(ch_str).zfill(2))
     if entry is None:
         return None
@@ -1614,29 +1255,13 @@ def get_cached_row_stops(ch_str, expected_time_idx=None):
     return entry["blocks"], entry["stops"]
 
 def _clean_show_title(raw_title):
-    """Thin wrapper -- the actual 'hide extra text' logic lives in
-    media.clean_video_display_title() now, shared with every other screen
-    that shows a video's display name (file explorer / DVD-splash picker),
-    so the TV Guide and those screens can never drift out of sync."""
+    """Return the guide display title via media.clean_video_display_title()."""
     return media.clean_video_display_title(raw_title)
 
 
 def _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th):
     aspect_mode = "4:3" if _guide_aspect_is_4_3(db) else "16:9"
     _now = broadcast_clock.now().replace(tzinfo=None)
-    # Was `int(_time.time() * 2)` -- a raw half-second timestamp bucket that
-    # guaranteed a cache miss (and a full grid rebuild via build_block_timeline
-    # for every visible row) twice a second, forever, regardless of whether
-    # anything on screen actually changed. The schedule grid itself is only
-    # ever affected by time at two much coarser grains:
-    #   - which 30-minute column is the "now" column (system_live_c_idx,
-    #     computed the same way in _render_tv_guide_impl)
-    #   - the calendar date, which is what actually needs the last day's
-    #     block to clear and the next day's to appear
-    # so the key only needs to change on those boundaries. The live
-    # HH:MM:SS clock text is handled separately as a cheap overlay redrawn
-    # at display time (see render_tv_guide_async) instead of forcing a
-    # rebuild of the whole grid every tick.
     _now_bucket = (_now.hour * 2) + (1 if _now.minute >= 30 else 0)
     return (
         aspect_mode, real_w, real_h, tx, ty, tw, th,
@@ -1652,22 +1277,6 @@ def _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th):
     )
 
 
-def _aspect_fit_blit(dest_surface, src_surface, tx, ty, tw, th, bar_color=(1, 1, 1)):
-    """Stretch `src_surface` to exactly fill the (tx, ty, tw, th) rect,
-    independently on each axis -- no letterbox/pillarbox bars. The TV
-    Guide is UI chrome, not a video/content area governed by an Aspect
-    Ratio setting (aspect_ratio/dvd_aspect_ratio/game_aspect_ratio only
-    ever apply to what's actually playing), so it always fills whatever
-    space it's given edge to edge, the same way the Settings menu,
-    Controls splash, and file explorer now do. Kept as a non-uniform
-    stretch (not a contain-fit) so it matches _render_tv_guide_impl's own
-    final blit exactly -- see the comment there."""
-    sw, sh = src_surface.get_size()
-    if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
-        return
-    dest_surface.blit(pygame.transform.smoothscale(src_surface, (tw, th)), (tx, ty))
-
-
 def _guide_target_geometry(surface, target_rect):
     real_w, real_h = surface.get_size()
     if target_rect is not None:
@@ -1678,30 +1287,20 @@ def _guide_target_geometry(surface, target_rect):
 
 
 def _build_and_cache_guide_frame(surface, app_state, db, theme, target_rect=None):
-    """Actually does the (potentially slow) work of rebuilding the guide --
-    calls into media.build_block_timeline for every visible row. Called
-    either synchronously (row-stop refresh, which genuinely needs fresh
-    data right now) or from the background preloader thread. Either way,
-    _guide_build_lock keeps two builds from painting onto the shared
-    scratch canvas at the same time."""
+    """Rebuild the guide from media.build_block_timeline for every visible row and cache the frame."""
     real_w, real_h, tx, ty, tw, th = _guide_target_geometry(surface, target_rect)
-    is_4_3 = _guide_aspect_is_4_3(db)
-    cache_key = _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th)
 
-    _lock_wait_t0 = time.monotonic()
     with _guide_build_lock:
-        _lock_wait_ms = (time.monotonic() - _lock_wait_t0) * 1000.0
+        is_4_3 = _guide_aspect_is_4_3(db)
+        cache_key = _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th)
 
-        # Re-check after acquiring the lock -- another thread may have just
-        # finished building this exact frame while we were waiting.
         with _guide_cache_lock:
             cached = _guide_frame_cache
             if cached["key"] == cache_key and cached["canvas"] is not None:
 
                 return cache_key, cached["canvas"], cached["preview_bounds"]
 
-
-        _render_tv_guide_impl(surface, app_state, db, theme, target_rect=target_rect)
+        _render_tv_guide_impl(surface, app_state, db, theme, target_rect=target_rect, present=False)
         design_canvas = _get_guide_canvas_43() if is_4_3 else _get_guide_canvas()
         canvas_copy = design_canvas.copy()
         preview_bounds = app_state.get("guide_preview_bounds")
@@ -1712,58 +1311,27 @@ def _build_and_cache_guide_frame(surface, app_state, db, theme, target_rect=None
             _guide_frame_cache["canvas"] = canvas_copy
             _guide_frame_cache["preview_bounds"] = preview_bounds
             _guide_frame_cache["clock_box"] = clock_box
+            _guide_frame_cache["serial"] += 1
 
     return cache_key, canvas_copy, preview_bounds
 
 
-def render_tv_guide(surface, app_state, db, theme, target_rect=None):
-    """Synchronous, blocking guide render -- rebuilds now if the cache is
-    stale. Used where fresh data is genuinely needed immediately (e.g. the
-    row-stop refresh below). NOT used for the main per-frame guide display
-    any more -- see render_tv_guide_async for that."""
-    real_w, real_h, tx, ty, tw, th = _guide_target_geometry(surface, target_rect)
-    cache_key = _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th)
-
-    with _guide_cache_lock:
-        cached = _guide_frame_cache
-        _hit = cached["key"] == cache_key and cached["canvas"] is not None
-        _canvas = cached["canvas"] if _hit else None
-        _preview_bounds = cached["preview_bounds"] if _hit else None
-        _clock_box = cached["clock_box"] if _hit else None
-
-    if _hit:
-        _draw_guide_clock_overlay(_canvas, _clock_box)
-        _aspect_fit_blit(surface, _canvas, tx, ty, tw, th)
-        if _preview_bounds is not None:
-            app_state["guide_preview_bounds"] = _preview_bounds
-        return
-
-    _build_and_cache_guide_frame(surface, app_state, db, theme, target_rect=target_rect)
-
-
-def _draw_guide_clock_overlay(canvas, clock_box):
-    """Repaints just the live HH:MM:SS clock + date box on top of an
-    already-built, cached guide canvas -- two small text renders and a
-    rect fill, nothing touching the actual schedule rows/timeline. Cheap
-    enough to call on every displayed frame while the guide is on screen
-    (see render_tv_guide_async), which is what keeps the clock ticking
-    live now that a schedule change/date rollover/30-min "now" column
-    move is what triggers a real rebuild (see _compute_guide_cache_key),
-    not a raw 500ms timer.
-
-    Mutates `canvas` in place. That's safe here: the background preloader
-    never mutates an existing cached canvas object -- it always builds a
-    fresh copy and swaps the cache's reference to it (see
-    _build_and_cache_guide_frame), so a canvas reference already handed
-    to the main thread is never touched by the preloader again."""
-    if canvas is None or not clock_box:
-        return
+def _guide_clock_texts(clock_box):
+    """Return the (clock, date) strings the guide clock box shows right now."""
     now_dt = broadcast_clock.now().replace(tzinfo=None)
     clock_txt = now_dt.strftime("%I:%M:%S %p")
     if clock_box["is_4_3"]:
         date_txt = now_dt.strftime('%m/%d/%Y')
     else:
         date_txt = f"{now_dt.strftime('%a').upper()} {now_dt.strftime('%m/%d/%Y')}"
+    return clock_txt, date_txt
+
+
+def _draw_guide_clock_overlay(canvas, clock_box, texts=None):
+    """Repaint the live clock and date box on a cached guide canvas."""
+    if canvas is None or not clock_box:
+        return
+    clock_txt, date_txt = texts if texts is not None else _guide_clock_texts(clock_box)
 
     font = clock_box["font"]
     lbl_clock = font.render(clock_txt, True, clock_box["text_color"])
@@ -1783,28 +1351,7 @@ def _draw_guide_clock_overlay(canvas, clock_box):
 
 
 def render_tv_guide_async(surface, app_state, db, theme, target_rect=None):
-    """Non-blocking guide render for the main per-frame draw path. In the
-    overwhelmingly common case it only blits whatever the background
-    preloader thread has most recently finished building, which keeps guide
-    display (and everything else on the main thread, including input
-    handling) from stalling while a rebuild runs.
-
-    If the selection/time cursor just moved and the preloader hasn't caught
-    up yet, this blits the previous (very slightly stale) frame rather than
-    blocking -- the preloader typically catches up within one poll interval
-    (well under the time it'd take a human to notice), so in practice this
-    just looks like a normal frame.
-
-    There is no "loading" placeholder state, ever. The guide grid is
-    actively built and maintained from boot by the background preloader
-    (see _guide_preload_worker), so by the time a person actually switches
-    to the guide channel there's already a real frame sitting in the cache.
-    The only edge case is switching to the guide in the first fraction of a
-    second of the run, before the preloader's very first tick has landed --
-    in that case we just build the real frame synchronously, once, instead
-    of drawing a placeholder screen. That first build is cheap and this
-    path is essentially never hit in practice.
-    """
+    """Non-blocking guide render for the main per-frame draw path."""
     real_w, real_h, tx, ty, tw, th = _guide_target_geometry(surface, target_rect)
 
     with _guide_cache_lock:
@@ -1812,37 +1359,43 @@ def render_tv_guide_async(surface, app_state, db, theme, target_rect=None):
         _canvas = cached["canvas"]
         _preview_bounds = cached["preview_bounds"]
         _clock_box = cached["clock_box"]
+        _serial = cached["serial"]
 
     if _canvas is None:
-        # Nothing built yet at all (guide opened before the preloader's
-        # first tick). Build the real frame now rather than faking one.
         _, _canvas, _preview_bounds = _build_and_cache_guide_frame(
             surface, app_state, db, theme, target_rect=target_rect)
         with _guide_cache_lock:
             _clock_box = _guide_frame_cache["clock_box"]
+            _serial = _guide_frame_cache["serial"]
 
-    # Keep the seconds ticking live while the guide is actually on screen,
-    # without forcing a rebuild of the whole grid to do it -- see
-    # _draw_guide_clock_overlay.
-    _draw_guide_clock_overlay(_canvas, _clock_box)
-
-    _aspect_fit_blit(surface, _canvas, tx, ty, tw, th)
+    if tw > 0 and th > 0 and _canvas.get_width() > 0 and _canvas.get_height() > 0:
+        _clock_texts = _guide_clock_texts(_clock_box) if _clock_box else None
+        _scaled_key = (_serial, _clock_texts, tw, th)
+        _scaled = _guide_scaled_cache["surf"]
+        if _scaled is None or _guide_scaled_cache["key"] != _scaled_key:
+            _draw_guide_clock_overlay(_canvas, _clock_box, _clock_texts)
+            _scaled = pygame.transform.smoothscale(_canvas, (tw, th))
+            _guide_scaled_cache["surf"] = _scaled
+            _guide_scaled_cache["key"] = _scaled_key
+        surface.blit(_scaled, (tx, ty))
     if _preview_bounds is not None:
         app_state["guide_preview_bounds"] = _preview_bounds
 
 
 def guide_preload_tick(scratch_surface, app_state, db, theme, target_rect=None):
-    """One iteration of background guide preloading -- call this
-    periodically from a daemon thread, never from the main render loop.
-    Rebuilds the cached guide frame if it's stale, so render_tv_guide_async
-    almost always has a fresh frame ready without ever blocking the caller
-    that needs it right now."""
+    """One iteration of background guide preloading."""
+    # WARNING: call only from a daemon thread, never from the main render loop.
     if db is None:
         return
     _build_and_cache_guide_frame(scratch_surface, app_state, db, theme, target_rect=target_rect)
 
 
-def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
+# ============================================================================
+# SECTION: TV guide: render implementation
+# ============================================================================
+
+
+def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, present=True):
     import os
     import datetime
     import math
@@ -1850,13 +1403,19 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     real_surface = surface
     real_w, real_h = real_surface.get_size()
     is_4_3 = _guide_aspect_is_4_3(db)
+
+    # ========================================================================
+    # SECTION: Canvas & layout setup
+    # ========================================================================
+
     num_rows = GUIDE_VISIBLE_ROWS_4_3 if is_4_3 else GUIDE_VISIBLE_ROWS_16_9
     num_cols = GUIDE_NUM_COLS_4_3 if is_4_3 else GUIDE_NUM_COLS_16_9
     last_col = num_cols - 1
-    viewport_seconds = num_cols * 1800  # 2hrs (4:3) / 2.5hrs (16:9) of visible timeline
+    viewport_seconds = num_cols * 1800
     surface = _get_guide_canvas_43() if is_4_3 else _get_guide_canvas()
     w, h = (GUIDE_DESIGN_W_4_3, GUIDE_DESIGN_H_4_3) if is_4_3 else (GUIDE_DESIGN_W, GUIDE_DESIGN_H)
-    surface.fill((1, 1, 1))  # not pure black: (0,0,0) is the game-overlay transparency key
+    # WARNING: not pure black; (0,0,0) is the game-overlay transparency key.
+    surface.fill((1, 1, 1))
     
     import colorsys
     bg_hue = db.config.get("theme_bg_hue", 220) / 360.0 if db is not None else 220/360.0
@@ -1878,8 +1437,9 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     _CLOCK_FONT_PX_16_9 = 17
 
     if is_4_3:
-        _CLOCK_CELL_PAD = 10  # ~5px clearance each side of the clock/date pair
-        _HDR_CELL_PAD = 12    # ~6px clearance each side of the hour label
+        # VALUES CHANGE HERE
+        _CLOCK_CELL_PAD = 10
+        _HDR_CELL_PAD = 12
         _CLOCK_PAIR_GAP = 8
         _HDR_TO_CLOCK_RATIO = 22.0 / 17.0
         _CLOCK_FONT_PX_4_3 = _CLOCK_FONT_PX_16_9
@@ -1890,14 +1450,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
             _fh = _get_font("Courier New", _hdr_pt, bold=True)
             _clock_total_w = (_fc.size("00/00/0000")[0] + _CLOCK_PAIR_GAP
                                + _fc.size("00:00:00 AM")[0])
-            # Must match hdr_txt's actual format below ("WED 01:30 PM" --
-            # day-of-week, then time) or this picks a font that's too big:
-            # measuring the bare "12:00 PM" time only (no day prefix) used
-            # to let the fit-check pass at a size where the real 4-char
-            # "WED " prefix pushed the rendered label past the column
-            # width -- Courier New is monospace, so the width is exact per
-            # character count and every 3-letter day abbreviation costs the
-            # same regardless of which day it is.
             _hdr_total_w = _fh.size("WED 12:00 PM")[0]
             if (_clock_total_w <= col_width - _CLOCK_CELL_PAD
                     and _hdr_total_w <= col_width - _HDR_CELL_PAD):
@@ -1916,21 +1468,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     _guide_scale_y = (real_h / h) if h else 1.0
     if is_4_3 and 0 < _guide_scale_y < 1.0:
         _min_font_pt = max(_MIN_GUIDE_FONT_PX, int(math.ceil(_MIN_GUIDE_FONT_PX / _guide_scale_y)))
-        # font_hdr/font_clock are deliberately NOT bumped up here the way
-        # font_row_lg is a few lines down. They already went through the
-        # column-fit loop above, which picked the LARGEST size that still
-        # fits col_width -- that's a hard pixel ceiling for those two,
-        # not a starting point to grow from. Re-deriving them here from
-        # "how small can real on-screen text get before it's illegible"
-        # (a rule with no idea what col_width is) used to overwrite that
-        # ceiling and push the header/clock text back past their column
-        # edges into the neighboring cells -- the exact overlap bug this
-        # comment is here to keep from regressing. If a real screen is
-        # small enough that the fitted size reads too small once scaled
-        # down, that's a genuine "not enough physical pixels for this
-        # content" situation -- the fix for that is a smaller font (let
-        # the loop above pick one) or fewer/narrower columns, never a
-        # bigger font that no longer fits its box.
     else:
         _min_font_pt = _MIN_GUIDE_FONT_PX
 
@@ -1938,7 +1475,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
         font_row_lg = _get_font("Courier New", _min_font_pt * 2, bold=True)
         font_ch_num = _get_font("Courier New", max(13, int(_min_font_pt * 1.35)), bold=True)
     else:
-        font_ch_num = font_row_lg   # 16:9: CH ## shares the same size as show titles
+        font_ch_num = font_row_lg
 
     _pw_ratio = (900.0 / 1920.0) if is_4_3 else (800.0 / 1920.0)
     _base_pw = int(w * _pw_ratio)
@@ -1981,11 +1518,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     surface.blit(lbl_date, (pair_left_x, pair_y))
     surface.blit(lbl_clock, (pair_left_x + lbl_date.get_width() + pair_gap, pair_y))
 
-    # Stash everything needed to repaint just this little clock/date box
-    # later, cheaply, without rebuilding the rest of the grid -- see
-    # _draw_guide_clock_overlay. The cache key no longer ticks every
-    # 500ms (see _compute_guide_cache_key), so the seconds in this box
-    # would otherwise go stale for up to 30 minutes at a stretch.
     app_state["_guide_clock_box"] = {
         "rect": (0, grid_top_y, col_width, header_height),
         "bg_color": DARKER_TIME_BLUE,
@@ -1999,6 +1531,10 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     user_shift = app_state.get("selected_guide_time_idx", 0)
     time_idx = clamp_guide_time_idx(system_live_c_idx + user_shift, num_cols)
     viewport_start_seconds = time_idx * 1800
+
+    # ========================================================================
+    # SECTION: Time header row
+    # ========================================================================
 
     for col in range(num_cols):
         c_idx = time_idx + col
@@ -2032,7 +1568,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
             pygame.draw.rect(surface, MINT_GREEN, (cell_x, grid_top_y, current_block_w, header_height), 2)
         
     pygame.draw.rect(surface, CYAN_GRID, (0, grid_top_y, col_width, header_height), 1)
-    
+
+    # ========================================================================
+    # SECTION: Visible channel selection
+    # ========================================================================
+
     allowed_channels = []
     for i in range(5, 45):
         if db.channels_db.get(str(i).zfill(2), {}).get("active", True):
@@ -2046,12 +1586,14 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     row_height = (h - start_y) // num_rows
     
     viewport_start_seconds = time_idx * 1800
-    viewport_end_seconds = viewport_start_seconds + viewport_seconds
 
     _guide_target_abs = app_state.get("guide_selected_abs_time")
     if _guide_target_abs is None:
         _guide_target_abs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
 
+    # ========================================================================
+    # SECTION: Channel rows (selected row drawn first)
+    # ========================================================================
 
     _row_start_y_map = {
         str(visible_channels[_ri]).zfill(2): start_y + _ri * row_height
@@ -2062,8 +1604,28 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
         range(len(visible_channels)),
         key=lambda _i: (0 if str(visible_channels[_i]).zfill(2) == _sel_guide_ch else 1, _i)
     )
+    _row_cache_now = time.monotonic()
+    _row_cache_gen = _guide_row_cache_state["gen"]
+    _row_cache_base = (
+        is_4_3, real_w, real_h, w, h, col_width, row_height, num_cols, time_idx,
+        now_dt.date(), (now_dt.hour * 2) + (1 if now_dt.minute >= 30 else 0),
+        app_state.get("guide_refresh_token", 0),
+        db.config.get("theme_bg_hue"), db.config.get("theme_ui_hue"),
+    )
+
+    def _row_cache_store(cache_key, y, blocks, stops):
+        if y < 0 or y + row_height > h or _row_cache_gen != _guide_row_cache_state["gen"]:
+            return
+        strip = surface.subsurface((0, y, w, row_height)).copy()
+        while len(_guide_row_cache) >= _GUIDE_ROW_CACHE_MAX:
+            _guide_row_cache.pop(next(iter(_guide_row_cache)), None)
+        _guide_row_cache.pop(cache_key, None)
+        _guide_row_cache[cache_key] = {
+            "strip": strip, "blocks": list(blocks), "stops": list(stops),
+            "gen": _row_cache_gen, "ts": _row_cache_now,
+        }
+
     for _pi in _guide_proc_order:
-        r_idx = _pi
         ch_num = visible_channels[_pi]
         start_y = _row_start_y_map.get(str(ch_num).zfill(2), grid_top_y + header_height)
         if start_y + row_height > h + 5:
@@ -2072,6 +1634,21 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
         ch_str = str(ch_num).zfill(2)
         ch_info = db.channels_db.get(ch_str, {})
         is_highlighted_row = (ch_str == str(app_state["selected_guide_channel"]).zfill(2))
+
+        _row_cache_key = None
+        if not is_highlighted_row:
+            _row_cache_key = _row_cache_base + (ch_str, str(ch_info.get("name")), repr(ch_info.get("playback_anchor")))
+            _row_hit = _guide_row_cache.get(_row_cache_key)
+            if (_row_hit is not None and _row_hit["gen"] == _row_cache_gen
+                    and _row_cache_now - _row_hit["ts"] < _GUIDE_ROW_CACHE_TTL_S):
+                surface.blit(_row_hit["strip"], (0, start_y))
+                _guide_row_stops_cache[ch_str] = {
+                    "blocks": list(_row_hit["blocks"]),
+                    "stops": list(_row_hit["stops"]),
+                    "ts": time.time(),
+                    "time_idx": time_idx,
+                }
+                continue
         
         pygame.draw.rect(surface, UNSELECTED_BLUE, (0, start_y, col_width, row_height))
         pygame.draw.rect(surface, CYAN_GRID, (0, start_y, col_width, row_height), 1)
@@ -2159,16 +1736,12 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 "ts": _time.time(),
                 "time_idx": time_idx,
             }
+            if _row_cache_key is not None:
+                _row_cache_store(_row_cache_key, start_y, current_row_blocks_list, current_row_stops_list)
             if is_highlighted_row:
                 app_state["guide_current_row_blocks"] = current_row_blocks_list
                 app_state["guide_current_row_stops"] = current_row_stops_list
                 if app_state.get("_guide_stops_only_probe"):
-                    # Caller only wants this row's stop list (e.g. the A/D
-                    # time-window probe in _guide_jump_col) and doesn't care
-                    # about pixels -- _guide_proc_order always puts the
-                    # highlighted row first, so once we have it there's no
-                    # reason to keep rebuilding every other visible row's
-                    # timeline too.
                     return
         else:
             last_drawn_pixel_x = col_width
@@ -2177,14 +1750,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
             _is_six_block_guide = (not ch_info.get("is_visualizer", False)
                                    and ch_info.get("scheduling_mode", "random_slots") != "marathon"
                                    and ch_info.get("block_mode", "full_day") == "six_block")
-            if _is_six_block_guide:
-                time_blocks = [(_n, _s, _e) for (_n, _s, _e) in media.SIX_HOUR_BLOCKS]
-            else:
-                time_blocks = [
-                    ("Morning", 4, 12),   
-                    ("Evening", 12, 20),  
-                    ("Night", 20, 28),    
-                ]
             
             viewport_adjusted_start = viewport_start_seconds
             viewport_adjusted_end = viewport_adjusted_start + viewport_seconds
@@ -2222,7 +1787,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 else:
                     _seg_nominal = {"Morning": 4 * 3600, "Evening": 12 * 3600, "Night": 20 * 3600}
                 _seg_yday = now_dt.timetuple().tm_yday
-                # _seg_yesterday is already computed unconditionally above.
                 for _bn, _nom in _seg_nominal.items():
                     _av = _seg_anchors.get(f"{now_dt.year}_{_seg_yday}_{_bn}")
                     if (_av is None
@@ -2245,7 +1809,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 if _is_full_day_guide:
                     return "Full Day", hour * 3600
                 if _is_six_block_guide:
-                    # Clean 4h windows, no wrap: bucket index = hour // 4.
                     _bn, _bs, _be = media.SIX_HOUR_BLOCKS[hour // 4]
                     return _bn, (hour - _bs) * 3600
                 if 4 <= hour < 12:
@@ -2397,8 +1960,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                                 dict(playback_log.get("show_pos", {}))
                             )
 
-                    # Preserve the channel's saved position when preview caches
-                    # do not contain a schedule.
                     _show_pos_copy = dict(playback_log.get("show_pos", {}))
 
                 _fixed_order = playback_log.get("show_order", {}).get(block_name)
@@ -2408,7 +1969,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                     "Night":   8 * 3600,
                     "Full Day": 86400,
                 }
-                # 4-hour buckets are 4h each (matches the engine's block_duration_seconds).
                 for _bdn in media.SIX_HOUR_BLOCK_NAMES:
                     _block_dur_lut[_bdn] = 4 * 3600
                 _block_dur_sec = _block_dur_lut.get(block_name, 8 * 3600)
@@ -2455,7 +2015,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                     ]
                 return ordered
 
-
             _is_marathon = (not ch_info.get("is_visualizer", False)
                             and ch_info.get("scheduling_mode", "random_slots") == "marathon")
 
@@ -2485,10 +2044,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 ch_info.get("holiday_schedules", {}).get(_holiday_key_guide, [])
                 if _holiday_key_guide else []
             )
-            # Marathon never yields to a holiday override (see the matching
-            # guard in calculate_slotted_playback_state) -- so the Guide
-            # shouldn't preview holiday content for a marathon channel
-            # either, since that content will never actually play.
             _is_holiday_guide = bool(_holiday_entries_guide) and not _is_marathon
 
             viewport_start_hour = viewport_adjusted_start // 3600
@@ -2498,7 +2053,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                        app_state.get("guide_refresh_token", 0))
             _tl_hit = _guide_timeline_cache.get(_tl_key)
             if _tl_hit is not None:
-                # Rebuild cached timelines whose source files are unavailable.
                 _cached_sources_ok = True
                 for _cached_row in _tl_hit:
                     _cached_entry = _cached_row[0] if isinstance(_cached_row, tuple) else _cached_row
@@ -2510,7 +2064,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                         break
                 if not _cached_sources_ok:
                     _tl_hit = None
-            timeline_entries = _tl_hit if _tl_hit is not None else []
+            # WARNING: the cached timeline must never be edited in place; the anchor and live-preview passes below rewrite entries and would move every later render of this row.
+            timeline_entries = list(_tl_hit) if _tl_hit is not None else []
             _block_overflow_end = {}
             if _is_six_block_guide:
                 _sbn = media.SIX_HOUR_BLOCK_NAMES
@@ -2736,7 +2291,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                                   _block_overflow_end.get(block_name, block_abs_start))
                 
                 while abs_pos < block_abs_end and abs_pos < viewport_adjusted_end + 3600:
-                    loop_start_pos = abs_pos  # FREEZE GUARD: track progress each pass
+                    # WARNING: loop_start_pos guards against an endless loop; every pass must advance abs_pos.
+                    loop_start_pos = abs_pos
                     cycle_start = abs_pos
                     hit_block_boundary = False
                     for entry in block_timeline:
@@ -2795,14 +2351,13 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                   _real_day_len = _DAY_SPAN + _base_overflow
                   _guide_span_end = min(viewport_adjusted_end + 3600,
                                          GUIDE_TOTAL_HALF_HOURS * 1800)
-                  _day_start = _base_day_start + _real_day_len  # start of day 2
+                  _day_start = _base_day_start + _real_day_len
                   _day_num = 2
                   while _day_start < _guide_span_end and _day_num <= 7:
                       _shift = _day_start - _base_day_start
                       _shifted = []
                       for _e, _es, _ee, _eb in _base_day_entries:
                           _ns, _ne = _es + _shift, _ee + _shift
-                          # Only keep the shifted slice the viewport actually needs.
                           if _ne > viewport_adjusted_start and _ns < _guide_span_end:
                               _shifted.append((_e, _ns, _ne, _eb))
                       timeline_entries = timeline_entries + _shifted
@@ -2832,9 +2387,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 timeline_entries = _merged_entries
                 if len(_guide_timeline_cache) > 80:
                     _guide_timeline_cache.clear()
-                _guide_timeline_cache[_tl_key] = timeline_entries
+                _guide_timeline_cache[_tl_key] = list(timeline_entries)
 
-            _is_live_ch_row = (str(app_state.get("current_channel", "")).zfill(2) == ch_str)
             _anchor = {} if ch_info.get("is_visualizer", False) else ch_info.get("playback_anchor", {})
             _ch_snaps_grid = bool(
                 ch_info.get("commercials_enabled", False)
@@ -2859,12 +2413,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                         _a_dur = _probed_real_dur
                 _elapsed = _now_secs - _wall_start
                 if _elapsed < 0:
-                    _elapsed += 86400  # midnight rollover, same as the engine
+                    _elapsed += 86400
                 _slot_start_seek_a = _anchor.get("slot_start_seek", 0)
                 _seek_into_slot_a  = _seek_off - _slot_start_seek_a
                 if (_a_dur - _seek_into_slot_a - _elapsed) > 0:
                     _a_start_abs_seg = _wall_start - _seek_into_slot_a
-                    # End of the current (last) segment = end of the full show slot.
                     _a_end_abs = _a_start_abs_seg + _a_dur
                     while _a_start_abs_seg < _now_secs - 43200:
                         _a_start_abs_seg += 86400
@@ -2911,18 +2464,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                         break
 
             if not ch_info.get("is_visualizer", False):
-                # There are two legitimate sources of a "what is on right
-                # now" override:
-                #
-                # * live_now_playing for the channel actually on screen;
-                # * guide_preview_live_state for the highlighted row while
-                #   channel 04 (the guide) is on screen.
-                #
-                # Both must be consulted (with live_now_playing taking
-                # priority when it applies) so the preview and the
-                # highlighted row always agree on the same schedule
-                # resolution -- otherwise the row could say OFF-AIR while
-                # the preview was visibly playing the current show.
                 _guide_live_state = None
                 if str(app_state.get("current_channel", "")).zfill(2) == ch_str:
                     _candidate_live = app_state.get("live_now_playing") or {}
@@ -2973,9 +2514,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                         _lnp_end = _lnp_start + _lnp_dur
                         _lnp_found = False
 
-                        # A post-midnight Night block is represented in the
-                        # guide's absolute timeline as 24:00-28:00, so test
-                        # both the same-day and rolled-forward clock.
                         _lnp_now_candidates = [_lnp_now_secs]
                         if _lnp_now_secs < 4 * 3600:
                             _lnp_now_candidates.append(_lnp_now_secs + 86400)
@@ -2994,18 +2532,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                             _lnp_found = True
                             if _lnp_is_commercial and not (
                                     isinstance(_le, dict) and _le.get("is_commercial")):
-                                # The guide's own timeline already merged this
-                                # ad break into the surrounding show's block
-                                # (see the commercial-merge pass above). The
-                                # live player being mid-commercial right now
-                                # is exactly what that merge is meant to hide
-                                # from the guide -- splicing in this single
-                                # ad's own short duration as its own entry
-                                # would punch a tiny "COMMERCIAL BREAK" box
-                                # out of that merged block instead. Leave the
-                                # already-merged entry alone, same as the
-                                # playback_anchor override above does via its
-                                # `not _anchor_is_commercial` guard.
                                 break
                             _same_path = (
                                 os.path.normcase(os.path.normpath(str(_le.get("path", ""))))
@@ -3029,15 +2555,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                             _lc = _lnp_end
                             if _ch_snaps_grid and (_lc % 1800) != 0:
                                 _lc = ((_lc // 1800) + 1) * 1800
-                            # Draw the live entry itself out to the snapped
-                            # boundary too, not just the cursor used to place
-                            # what comes after it -- otherwise the box ends
-                            # at the real (short) content length while the
-                            # next entry gets pushed out to the half-hour
-                            # mark, leaving the gap between them rendered as
-                            # a stray OFF-AIR sliver. Mirrors how the
-                            # playback_anchor override above handles the
-                            # same snap-to-grid case.
                             timeline_entries[_li] = (
                                 _lnp_entry, _lnp_start, _lc, _leb
                             )
@@ -3051,10 +2568,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                             break
 
                         if not _lnp_found:
-                            # If the independently-built guide timeline has
-                            # an OFF-AIR gap at the scheduler's current
-                            # position, add the scheduler result instead of
-                            # allowing that gap to hide a real broadcast.
                             _lnp_now_abs = _lnp_now_secs
                             if (_guide_live_state.get("block") == "Night"
                                     and _lnp_now_secs < 4 * 3600):
@@ -3074,18 +2587,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                             timeline_entries.sort(key=lambda _row: _row[1])
 
             if not ch_info.get("is_visualizer", False):
-                # guide_onair_since is stamped exactly once, at the moment
-                # a genuinely brand-new channel (nothing scheduled on any
-                # block yet) first gets media assigned -- see the schedule-
-                # write handler in retro_tv_emulator.py. It is intentionally
-                # NOT (re)created here just because no record exists for
-                # today: doing so on every ordinary, already-established
-                # channel's first guide render of each new day would wrongly
-                # stamp "now" as this channel's on-air start and hide
-                # everything it actually aired earlier today back to
-                # midnight. Reading it here only ever consumes a cutoff
-                # that a real "just scheduled" event created; it never
-                # invents one.
                 _cutoff_g = None
                 if db is not None:
                     _since_g = db.config.get("guide_onair_since", {})
@@ -3108,7 +2609,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 ]
                 timeline_entries = _gated_g
 
-
             for show, show_abs_start, show_abs_end, block_name in timeline_entries:
                 if show is None:
                     continue
@@ -3125,36 +2625,9 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 col_start_float = float(clip_start - viewport_adjusted_start) / 1800.0
                 col_end_float = float(clip_end - viewport_adjusted_start) / 1800.0
                 
-                # +1e-6 guards against float subtraction/division landing a
-                # column boundary that's THEORETICALLY an exact integer (a
-                # show starting precisely on a half-hour tick) a hair under
-                # it instead -- e.g. 0.99999999998 -- which plain int()
-                # truncates DOWN to the previous column instead of the
-                # correct one. That's not cosmetic: every column past the
-                # first one ends up mislabeled one column short, colliding
-                # with (and getting deduped against) its actual neighbor,
-                # so the guide highlight lands on/near the right time but
-                # A/D navigation and its right-edge clamp work off an
-                # undercounted, collision-riddled column list.
                 rounded_start_block_col = int(col_start_float + 1e-6)
                 if rounded_start_block_col not in current_row_blocks_list:
                     current_row_blocks_list.append(rounded_start_block_col)
-                # Key on abs rounded to the nearest whole second, not the raw
-                # float. For a row whose "now playing" entry comes from the
-                # live-preview/live-now-playing override above, show_abs_start
-                # is recomputed from actual wall-clock playback position on
-                # every single render -- it drifts by a fraction of a second
-                # from one frame to the next even though it's logically the
-                # same show. _guide_jump_col's _resolve_curr_abs() matches the
-                # previously-selected stop's key against this frame's freshly
-                # rendered stops by exact equality, so that sub-second drift
-                # makes the match fail on almost every frame for whichever
-                # channel's preview is actively playing -- forward/backward
-                # nav would silently fall back to a stale column-based guess
-                # and appear stuck/looping on that row. Rounding to the
-                # nearest second absorbs the drift while still being far
-                # finer than the 1800-second column width, so two genuinely
-                # different shows still get distinct keys.
                 current_row_stops_list.append({
                     "col": rounded_start_block_col,
                     "abs": show_abs_start,
@@ -3166,38 +2639,12 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 pixel_cell_width = max(pixel_cell_width, 2)
                 
                 if cell_x >= w:
-                    # BUG FIX: this used to unconditionally skip painting
-                    # ANY show whose left edge computed at or past the
-                    # right edge of the grid -- including the show that's
-                    # actually selected right now. The stop was already
-                    # registered above (current_row_blocks_list /
-                    # current_row_stops_list, a few lines up), so A/D
-                    # navigation still treated it as a real, selectable
-                    # stop -- it just never got a highlight painted
-                    # anywhere on screen. That's the "highlight vanishes,
-                    # pressing D lands on the show after it" bug: the
-                    # selection itself was correct the whole time, the
-                    # paint was silently dropped.
-                    #
-                    # A genuinely off-screen, non-selected show still has
-                    # nothing to gain from drawing (nothing visible either
-                    # way), so this only forces a draw through when this
-                    # IS the selected show -- clamped to a thin sliver at
-                    # the grid's right edge so the highlight is always
-                    # visible somewhere instead of disappearing. The
-                    # underlying reason a show's clip can compute past `w`
-                    # at all (overlapping schedule entries, a live-preview
-                    # override recomputing abs times mid-frame) is a
-                    # separate, not-yet-root-caused question -- see the
-                    # todo list. This guard makes the symptom impossible
-                    # regardless of that root cause.
                     _is_target_show = (is_highlighted_row and
                                         show_abs_start <= _guide_target_abs < show_abs_end)
                     if not _is_target_show:
                         continue
                     cell_x = w - 3
                 
-                # Scissor crop grid boxes that extend off-screen
                 current_draw_w = min(pixel_cell_width, w - cell_x)
                 current_draw_w = max(current_draw_w, 1)
                 
@@ -3205,10 +2652,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                     _gap_abs_start = last_drawn_abs_time
                     _oa_x = last_drawn_pixel_x
                     _oa_abs_cursor = _gap_abs_start
-                    _sec_per_px = 1800.0 / col_width
                     while _oa_x < cell_x and _oa_x < w:
-                        # Same +1e-6 float-truncation guard as
-                        # rounded_start_block_col above.
+                        # WARNING: keep the +1e-6 float-truncation guard identical to rounded_start_block_col.
                         _oa_col  = max(0, int(float(_oa_x - col_width) / col_width + 1e-6))
                         _oa_next = col_width + (_oa_col + 1) * col_width
                         _oa_end  = min(cell_x, _oa_next, w)
@@ -3297,7 +2742,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 _gap_abs_start = last_drawn_abs_time
                 _tr_x = last_drawn_pixel_x
                 _tr_abs_cursor = _gap_abs_start
-                _sec_per_px = 1800.0 / col_width
                 while _tr_x < viewport_absolute_max_pixel_x and _tr_x < w:
                     _tr_col  = max(0, int(float(_tr_x - col_width) / col_width))
                     _tr_next = col_width + (_tr_col + 1) * col_width
@@ -3357,15 +2801,17 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
                 "ts": _time.time(),
                 "time_idx": time_idx,
             }
+            if _row_cache_key is not None:
+                _row_cache_store(_row_cache_key, start_y, current_row_blocks_list, current_row_stops_list)
             if is_highlighted_row:
                 app_state["guide_current_row_blocks"] = current_row_blocks_list
                 app_state["guide_current_row_stops"] = current_row_stops_list
-                # start_y is pre-computed per channel; no increment needed here
                 if app_state.get("_guide_stops_only_probe"):
-                    # See matching comment in the visualizer-channel branch
-                    # above -- highlighted row is always processed first in
-                    # _guide_proc_order, so a stops-only caller is done here.
                     return
+
+    # ========================================================================
+    # SECTION: Fit to target rect
+    # ========================================================================
 
     if target_rect is not None:
         tx, ty = int(target_rect.x), int(target_rect.y)
@@ -3374,20 +2820,14 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
         tx, ty = 0, 0
         tw, th = max(1, int(real_w)), max(1, int(real_h))
 
-    # Stretch-fill (independent x/y scale, no bars) -- must match
-    # _aspect_fit_blit exactly, since that's what actually draws this
-    # canvas on cache-hit frames. The guide is UI chrome, not a video/
-    # content area governed by an Aspect Ratio setting, so it fills
-    # whatever space it's given edge to edge rather than letterboxing to
-    # preserve the design canvas's own 16:9/4:3 shape. guide_preview_bounds
-    # below is computed with its own independent x_scale/y_scale, so it
-    # stays in sync with this non-uniform stretch automatically.
+    # WARNING: must match the size and placement render_tv_guide_async scales the cached canvas to.
     disp_w = max(1, int(round(tw)))
     disp_h = max(1, int(round(th)))
     off_x = int(round(tx))
     off_y = int(round(ty))
 
-    real_surface.blit(pygame.transform.smoothscale(surface, (disp_w, disp_h)), (off_x, off_y))
+    if present:
+        real_surface.blit(pygame.transform.smoothscale(surface, (disp_w, disp_h)), (off_x, off_y))
 
     x_scale = disp_w / float(w)
     y_scale = disp_h / float(h)
@@ -3399,46 +2839,35 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None):
     )
 
 
+# ============================================================================
+# SECTION: Settings menu: caches & change detection
+# ============================================================================
+
+
 _cached_bg_gradient_surf = None
 _cached_ui_gradient_surf = None
 _cached_gradient_width = -1
 
-# Cache for the fully-rendered + fitted menu frame, keyed on everything that
-# can change what's on screen.
+# WARNING: the cache key must include everything that can change what is on screen.
 _settings_menu_frame_cache = {"key": None, "stamp": None, "pos": None}
 
 
 def _safe_state_hash(obj):
-    """Best-effort hash of a (possibly nested, possibly unhashable) bit of
-    state for cache-key purposes. Falls back to identity so a weird value
-    never crashes the menu -- worst case that one field just always reads
-    as 'changed', which only costs an extra rebuild, never a stale frame."""
+    """Hash a possibly nested or unhashable value for cache keys, falling back to its id."""
     try:
         return hash(repr(obj))
     except Exception:
         return id(obj)
 
 
-# Config keys that are pure background-scan bookkeeping -- per-file probe/
-# gain/caption caches and scan ledgers. These grow unboundedly as the
-# library gets scanned (media_probe_cache alone routinely runs tens to
-# hundreds of KB) and are never read anywhere in the settings-menu build
-# below -- they're written and read only by the background probe/renorm/
-# caption threads. Excluding them keeps the menu's change-detection hash
-# cheap and flat regardless of library size, instead of re-serializing and
-# hashing the whole probe cache on every single frame the menu is open
-# (this was measured as the dominant cost behind menu-open/navigation lag
-# and the video stutter it caused -- see the menu-lag notes).
 _MENU_IRRELEVANT_CONFIG_KEYS = frozenset({
-    "media_probe_cache", "caption_cache", "_renorm_sweep_processed",
+    "media_probe_cache", "caption_cache",
     "dvd_gain_cache", "_part_group_gain_cache",
 })
 
 
 def _menu_relevant_config_hash(config):
-    """Same idea as _safe_state_hash(), but strips the known-irrelevant
-    background-cache keys first so their size never factors into the
-    settings menu's per-frame cache-key cost."""
+    """Hash the config with the known background-cache keys removed."""
     if config is None:
         return None
     try:
@@ -3450,13 +2879,7 @@ def _menu_relevant_config_hash(config):
 
 
 def _channel_menu_fingerprint(ch_info):
-    """Cheap per-channel summary covering exactly the fields the settings
-    menu ever reads for a channel (see the CHANNEL_SUB_MENU/HOLIDAY_SUB_MENU/
-    AUDIO_TRACK_PICKER blocks below) -- small scalar settings plus, for
-    schedules, only the *count* of entries per block, never their full
-    per-asset content (paths, gains, durations, ...). That content is what
-    makes a channel's full record large, and the menu never displays it
-    directly, only how many items are in a block."""
+    """Return a small per-channel summary of the fields the settings menu reads, with entry counts instead of schedule content."""
     if not isinstance(ch_info, dict):
         return None
     scheds = ch_info.get("schedules", {})
@@ -3487,20 +2910,7 @@ def _channel_menu_fingerprint(ch_info):
 
 
 def _menu_relevant_channels_hash(channels_db, app_state):
-    """Replaces a wholesale hash of the entire channels_db (every channel's
-    full schedules -- every scheduled asset's path/gain/duration -- which
-    measured at well over 100KB of repr() text per channel on a populated
-    library) with exactly what the settings menu actually looks at:
-      - every channel's (active, server_locked) pair, for the CHANNEL_LIST
-        grid of on/off dots -- cheap, two small values per channel.
-      - a full _channel_menu_fingerprint() for whichever channel(s) are
-        actually in view right now (the selected channel's sub-menu, and
-        whichever channel an audio-track picker is showing), since those
-        views also depend on things like scheduling_mode and per-block
-        counts, not just active/server_locked.
-    Everything else about a channel (the actual per-asset schedule
-    entries) is invisible to the menu and correctly left out.
-    """
+    """Hash what the settings menu shows: each channel's (active, server_locked) pair plus a full fingerprint of the channels in view."""
     if not isinstance(channels_db, dict):
         return None
     grid = tuple(sorted(
@@ -3514,6 +2924,43 @@ def _menu_relevant_channels_hash(channels_db, app_state):
         (k, _channel_menu_fingerprint(channels_db.get(k)))
         for k in focus_keys if k in channels_db))
     return (grid, focus_prints)
+
+
+# ============================================================================
+# SECTION: Settings menu: Advanced Settings scrolling labels
+# ============================================================================
+
+
+_advanced_scroll = {"row": None, "t0": 0.0, "seen": 0.0, "active": False}
+
+
+def _advanced_menu_value(name, default):
+    """Returns one Advanced Settings tunable from the governor table."""
+    if performance_governor is None:
+        return default
+    return getattr(performance_governor, name, default)
+
+
+def _marquee_offset(overflow_px, elapsed_s, speed_px, pause_s):
+    """Returns how many pixels a too-long label is shifted left: rest, scroll to the end, rest, jump back, repeat."""
+    if overflow_px <= 0 or speed_px <= 0:
+        return 0
+    travel_s = overflow_px / float(speed_px)
+    cycle_s = pause_s + travel_s + pause_s
+    t = elapsed_s % cycle_s
+    if t < pause_s:
+        return 0
+    if t < pause_s + travel_s:
+        return int((t - pause_s) * speed_px)
+    return int(overflow_px)
+
+
+def _advanced_scroll_tick(app_state):
+    """Returns a number that changes at the scroll redraw rate while a highlighted Advanced Settings label is scrolling, else 0."""
+    if app_state.get("menu_layer") != "SYSTEM_ADVANCED_SUB_MENU" or not _advanced_scroll["active"]:
+        return 0
+    steps = max(1, int(_advanced_menu_value("ADVANCED_MENU_SCROLL_STEPS_PER_SECOND", 20)))
+    return int(time.time() * steps)
 
 
 def _compute_settings_menu_cache_key(app_state, db, real_w, real_h):
@@ -3546,26 +2993,20 @@ def _compute_settings_menu_cache_key(app_state, db, real_w, real_h):
         app_state.get("audio_track_source_channel"),
         app_state.get("dvd_audio_track_count"),
         _safe_state_hash(app_state.get("audio_track_list")),
-        # Wholesale hash of config + channel data rather than an enumerated
-        # Hash all config and channel values so every menu input is covered
-        # -- but scoped down to just what the menu actually reads (see
-        # _menu_relevant_config_hash / _menu_relevant_channels_hash) rather
-        # than the entire blobs, which include large background-scan-only
-        # caches and every channel's full schedule content that this menu
-        # never displays.
         _menu_relevant_config_hash(db.config) if db is not None else None,
         _menu_relevant_channels_hash(channels_db, app_state),
-        # Coarse 500ms time bucket -- covers the blinking text-edit cursor
-        # and any other purely time-driven animation in the menu, same
-        # granularity the TV guide cache already uses.
         int(_time.time() * 2),
+        _advanced_scroll_tick(app_state),
     )
 
 
+# ============================================================================
+# SECTION: Settings menu: entry points
+# ============================================================================
+
+
 def render_settings_overlay_menu(surface, theme, app_state, db):
-    """Cached dispatcher: reuse last frame's finished (already fitted +
-    scaled) menu surface when nothing the menu depends on has changed,
-    otherwise fall through to the real (expensive) build below."""
+    """Reuse the last finished menu surface when nothing it depends on changed, otherwise rebuild it."""
     real_w, real_h = surface.get_size()
     cache_key = _compute_settings_menu_cache_key(app_state, db, real_w, real_h)
     cached = _settings_menu_frame_cache
@@ -3581,16 +3022,16 @@ def render_settings_overlay_menu(surface, theme, app_state, db):
 
 
 def _build_settings_overlay_menu(surface, theme, app_state, db):
-    """Does the actual (expensive) menu build: every tab, every row, then
-    fit-scale to the target surface. Returns (stamp, pos) instead of
-    blitting directly so the cached dispatcher above can stash and reuse
-    the result on subsequent unchanged frames."""
+    """Does the actual (expensive) menu build: every tab, every row, then fit-scale to the target surface."""
     global _cached_bg_gradient_surf, _cached_ui_gradient_surf, _cached_gradient_width
     real_w, real_h = surface.get_size()
-    
-    w = 1036
-    h = 680
-    scale_factor = 1.0  
+
+    # ========================================================================
+    # SECTION: Canvas & tab-bar setup
+    # ========================================================================
+
+    w = MENU_CANVAS_W
+    h = MENU_CANVAS_H
     
     menu_canvas = pygame.Surface((w, h), pygame.SRCALPHA)
     
@@ -3633,7 +3074,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
     f_body = _get_font("Courier New", 17, bold=True)
     f_ch_label = _get_font("Courier New", 22, bold=True)
     f_ch_btn   = _get_font("Courier New", 19, bold=True)
-    # Tab bar text now matches the channel-button label size exactly.
     f_nav_tab = f_ch_label
     f_menu_lg = f_ch_label
 
@@ -3678,24 +3118,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
     
     pygame.draw.rect(menu_canvas, NEON_GREEN, (cx, content_y, content_w, content_h), 1)
 
-    # Shared footer-control drawing helpers, used by both the Channels tab
-    # footer below and the Video tab's Aspect Ratio / screen-mode controls,
-    # so both use the exact same look without duplicating the drawing code.
     box_h_43 = 32
     pill_w, pill_h = 60, 24
     _radio_dot_r = 9
 
     def _draw_footer_switch(x, y, label, is_on, focused, lbox_w=None, disabled=False):
-        # disabled=True dims the whole switch (label box, pill, handle) for
-        # a control that is unavailable right now -- same look as
-        # _draw_footer_value_box's disabled state -- while keeping the
-        # focus outline so the cursor stays visible when it passes over it.
         lbl_surf = f_ch_btn.render(label, True, (140, 140, 140) if disabled else TEXT_WHITE)
-        # lbox_w can be forced to a fixed, column-wide value so two
-        # switches stacked in the same column (different label lengths)
-        # still land their pills at the same x -- see the footer's
-        # _col*_lbox_w calcs below. Falls back to auto-sizing off this
-        # label alone for any other caller.
         if lbox_w is None:
             lbox_w = lbl_surf.get_width() + 28
         if disabled:
@@ -3724,12 +3152,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         return pill_x + pill_w
 
     def _draw_footer_radio(x, y, label, selected, focused):
-        """Column header for one of the three screen-mode options: an
-        unboxed holo dot sits to the LEFT of the label (no button
-        background behind the text), unlike the switches/value-boxes
-        below it -- these read as section headers for the column, not
-        as another pressable pill. Only one dot across the three
-        columns is lit at a time."""
+        """Draw a screen-mode column header: an unboxed dot to the left of the label."""
         dot_r = _radio_dot_r
         dot_x = x + dot_r
         dot_y = y + box_h_43 // 2
@@ -3748,13 +3171,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         return lbl_x + lbl_surf.get_width()
 
     def _draw_footer_value_box(x, y, label, value_text, focused, disabled=False):
-        """Same left-label styling as _draw_footer_switch, but the
-        right side is a plain value display (e.g. 'Aspect Ratio 16:9')
-        instead of an on/off pill -- for settings with more than two
-        states, or that cycle through named values rather than toggle.
-        disabled=True dims both boxes for a control that is temporarily
-        unavailable, while preserving a visible focus outline if it is
-        navigated to."""
+        """Same left-label styling as _draw_footer_switch, but the right side is a plain value display (e.g."""
         lbl_surf = f_ch_btn.render(label, True, (140, 140, 140) if disabled else TEXT_WHITE)
         lbox_w = lbl_surf.get_width() + 28
         if disabled:
@@ -3776,8 +3193,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                     y + (box_h_43 - val_surf.get_height()) // 2))
         return val_x + val_box_w
 
+    # ========================================================================
+    # SECTION: System tab: main list
+    # ========================================================================
+
     if active_tab == "System" and layer not in ("REMOTE_REMAP_LIST", "REMOTE_REMAP_CAPTURE", "NUMBER_REMAP_CAPTURE", "SERVER_MENU", "SYSTEM_ADVANCED_SUB_MENU"):
-        scale_factor = 1.0
 
         toggle_w = 55
         toggle_h = 24
@@ -3791,31 +3211,14 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         toggle_rows = [r for r in sys_rows if SYSTEM_ROW_META[r]["kind"] == "toggle"]
         button_rows = [r for r in sys_rows if SYSTEM_ROW_META[r]["kind"] == "button"]
 
-        # Toggle rows split into two columns: the original left column,
-        # and a right column for Loudness Scan, Pixel Orbiter, Bezel
-        # (+ its style box), Captions (+ its color box), and Server Mode
-        # (+ its Server Menu button) -- all moved/relocated here so both
-        # columns run 5 rows deep and line up row-for-row.
         LEFT_TOGGLE_IDS  = ("game_ch", "guide", "controls_on_start", "kiosk_mode")
         RIGHT_TOGGLE_IDS = ("loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle")
         left_toggle_rows  = [r for r in toggle_rows if r in LEFT_TOGGLE_IDS]
         right_toggle_rows = [r for r in toggle_rows if r in RIGHT_TOGGLE_IDS]
 
         left_col_x  = cx
-        # Right column (labels, their toggles, and the Bezel-style/
-        # Captions-color/Server Menu boxes past them) stays at the panel's
-        # original half-mark -- only the left column's toggles needed to
-        # move, not this group.
         right_col_x = cx + content_w // 2 + 10
 
-        # The right column's toggles sit closer to their labels than the
-        # left column's -- Bezel/Captions/Server Mode's boxes and buttons
-        # sit to the toggle's right, so the toggle needs to shift left to
-        # leave room for those, especially the wider "Server Menu" button,
-        # without running past the panel's edge. The left column's toggles
-        # sit further out so they clear the longer labels (e.g. "Controls
-        # Menu (Nav Info):") and land in a straight vertical line with each
-        # other, matching a reference screenshot.
         LEFT_COL_TOGGLE_OFFSET  = 370
         RIGHT_COL_TOGGLE_OFFSET = 260
 
@@ -3828,17 +3231,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             "server_option":     db.config.get("server_mode_enabled", False) if db is not None else False,
             "loudness_scan":     db.config.get("loudness_scan_enabled", False) if db is not None else False,
             "pixel_orbiter":     db.config.get("pixel_orbiter_enabled", False) if db is not None else False,
-            "captions_toggle":   db.config.get("tv_captions_enabled", False) if db is not None else False,
-            # Pill reads "on" (green/right) when audio is locked to mono --
-            # i.e. the INVERSE of audio_stereo, which defaults True (normal
-            # stereo, toggle off). See _stereo_mode_args() in
-            # retro_tv_emulator.py for what this drives.
+            "captions_toggle":   (db.config.get("tv_captions_enabled", False) and not _mode_locks("tv_captions_enabled")) if db is not None else False,
             "mono_stereo_toggle": (not db.config.get("audio_stereo", True)) if db is not None else False,
         }
 
-        # Right-side option box width (bezel-style number box, captions
-        # color swatch).
-        _opt_box_w = 18 + 24  # swatch size + fixed padding, matches the captions swatch draw below
+        # VALUES CHANGE HERE
+        _opt_box_w = 18 + 24
 
         toggle_start_y = 40
         bottom_reserved = 130
@@ -3847,17 +3245,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         def _draw_system_toggle_row(row_id, col_x, row_y_offset, toggle_offset):
             toggle_x = col_x + toggle_offset
-            # Bezel/Captions/Server Menu's boxes/button sit further right of
-            # their toggle than a plain option box would, shifted as a
-            # group per a reference screenshot.
             _opt_box_x = toggle_x + toggle_w + 80
             row_idx = sys_rows.index(row_id)
             is_focused = (layer == "SYSTEM_ROWS" and cur_sel == row_idx)
             row_enabled = current_values[row_id]
             if row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED:
-                # Server subsystem disabled during packaging -- always shows
-                # off, and never takes the green focus ring, matching how a
-                # locked/disabled toggle reads elsewhere in this menu.
                 row_enabled = False
                 is_focused = False
             if row_id == "server_option" and layer == "SYSTEM_ROWS" and cur_sel == SERVER_MENU_BTN_SEL:
@@ -3866,19 +3258,15 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     cur_sel == CAPTIONS_COLOR_BOX_SEL:
                 is_focused = False
 
-            _row_label_col = (105, 105, 115) if (row_id == "server_option"
-                              and not UPDATER_AND_SERVER_FEATURES_ENABLED) else TEXT_WHITE
+            _mode_locked_row = (row_id == "captions_toggle" and _mode_locks("tv_captions_enabled"))
+            _row_label_col = (105, 105, 115) if ((row_id == "server_option"
+                              and not UPDATER_AND_SERVER_FEATURES_ENABLED) or _mode_locked_row) else TEXT_WHITE
             row_label = f_ch_label.render(SYSTEM_ROW_META[row_id]["label"], True, _row_label_col)
             menu_canvas.blit(row_label, (col_x + label_padding_x, content_y + row_y_offset))
 
             toggle_y = content_y + row_y_offset - 3
 
             if row_id == "server_option":
-                # "Server Menu" open-button sits to the right of the
-                # toggle -- same row, own focus target (see
-                # SERVER_MENU_BTN_SEL), in the same slot the Bezel-style
-                # number box and Captions color swatch occupy on their
-                # rows, matching the other right-column option controls.
                 _srv_btn_focused = (layer == "SYSTEM_ROWS" and cur_sel == SERVER_MENU_BTN_SEL
                                      and UPDATER_AND_SERVER_FEATURES_ENABLED)
                 _srv_mode_on = current_values.get("server_option", False) and \
@@ -3887,20 +3275,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _srv_btn_lbl = f_ch_btn.render("Menu", True, _srv_btn_txt_col)
                 _srv_btn_w = _srv_btn_lbl.get_width() + 28
                 _srv_btn_h = box_h_43
-                # Centered on the same vertical line as the Bezel-style box
-                # and Captions swatch (_opt_box_x/_opt_box_w are identical
-                # on all three rows) rather than sharing their left edge --
-                # the button is wider than those boxes, so left-aligning it
-                # would leave its center offset from theirs.
                 _opt_box_center_x = _opt_box_x + _opt_box_w // 2
                 _srv_btn_x = _opt_box_center_x - _srv_btn_w // 2
                 _srv_btn_y = toggle_y - (_srv_btn_h - toggle_h) // 2
-                # Same blue as Remote Remapping/other option buttons, but
-                # greyed out (like the disabled Reset All Settings button)
-                # until Server Mode itself is switched on -- the role picker
-                # this opens has nothing to do until then. Also forced grey
-                # whenever UPDATER_AND_SERVER_FEATURES_ENABLED is off, since
-                # the server subsystem itself is disabled during packaging.
                 _srv_btn_col = (45, 80, 130) if _srv_mode_on else (32, 32, 40)
                 pygame.draw.rect(menu_canvas, _srv_btn_col,
                                  (_srv_btn_x, _srv_btn_y, _srv_btn_w, _srv_btn_h), border_radius=5)
@@ -3911,19 +3288,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                  (_srv_btn_x + (_srv_btn_w - _srv_btn_lbl.get_width()) // 2,
                                   _srv_btn_y + (_srv_btn_h - _srv_btn_lbl.get_height()) // 2))
 
-            sw_bg = OFF_GREEN if row_enabled else (45, 65, 100)
+            sw_bg = (32, 32, 40) if _mode_locked_row else (OFF_GREEN if row_enabled else (45, 65, 100))
             pygame.draw.rect(menu_canvas, sw_bg, (toggle_x, toggle_y, toggle_w, toggle_h), border_radius=pill_radius)
             if is_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (toggle_x, toggle_y, toggle_w, toggle_h), focus_thickness, border_radius=pill_radius)
             handle_x = toggle_x + toggle_w - 13 if row_enabled else toggle_x + 12
-            pygame.draw.circle(menu_canvas, TEXT_WHITE, (handle_x, toggle_y + toggle_h // 2), handle_rad)
+            pygame.draw.circle(menu_canvas, (100, 100, 100) if _mode_locked_row else TEXT_WHITE,
+                               (handle_x, toggle_y + toggle_h // 2), handle_rad)
             if is_focused:
                 pygame.draw.circle(menu_canvas, NEON_GREEN, (handle_x, toggle_y + toggle_h // 2), handle_rad + 2, SELECTION_BORDER_WIDTH)
 
             if row_id == "captions_toggle":
-                # Caption text-color swatch -- same fixed size/position
-                # pattern as the Bezel Style number box above, moved here
-                # from the Channels tab footer as-is.
                 from game_deck import LIST_TEXT_COLOR_NAMES, LIST_TEXT_COLOR_RGB
                 _captions_on = current_values.get("captions_toggle", False)
                 _captions_color_val = db.config.get("tv_captions_color", "white") if db is not None else "white"
@@ -3931,9 +3306,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     _captions_color_val = "white"
                 _ccolor_swatch_size = 18
                 _ccolor_focused = layer == "SYSTEM_ROWS" and cur_sel == CAPTIONS_COLOR_BOX_SEL
-                # Same blue as the other option boxes, greyed out (like the
-                # Menu button) until Captions itself is switched on -- the
-                # color swatch has nothing to preview until then.
                 _ccolor_bg = (45, 80, 130) if _captions_on else (32, 32, 40)
                 pygame.draw.rect(menu_canvas, _ccolor_bg,
                                  (_opt_box_x, toggle_y, _opt_box_w, box_h_43), border_radius=5)
@@ -3955,7 +3327,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         for t_idx, row_id in enumerate(right_toggle_rows):
             _draw_system_toggle_row(row_id, right_col_x, int(toggle_start_y + (t_idx * toggle_gap)), RIGHT_COL_TOGGLE_OFFSET)
 
-
         box_radius = 4
         focus_thickness = SELECTION_BORDER_WIDTH
         label_padding_x = 35
@@ -3966,7 +3337,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         bx_left = cx + label_padding_x
         btn_text_y_offset_base = (btn_h // 2)
 
-        # Keep reset, power, and close controls on the bottom row.
         bottom_row_y = content_y + content_h - 52
 
         import sys as _sys
@@ -3974,13 +3344,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _any_settings_to_reset_fn = getattr(_main, "_any_settings_to_reset", None) if _main else None
         _reset_has_content = bool(_any_settings_to_reset_fn()) if _any_settings_to_reset_fn else True
 
-        # Power Off stands alone under the right toggle column (below it,
-        # see the standalone block after Remote Remapping) whenever the
-        # full menu is showing -- it's too wide a 4th button for this row
-        # to fit before running into the fixed Close button on the right
-        # edge. Kiosk Mode's stripped-down row set has no Remote Remapping
-        # and no right column, so there's nothing to stand Power Off under
-        # there -- it stays as this row's sole button, same as before.
         poweroff_standalone = "poweroff" in sys_rows and "advanced_settings" in sys_rows
         bottom_left_button_rows = [r for r in button_rows
                                     if r not in ("advanced_settings",)
@@ -3991,8 +3354,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             row_idx = sys_rows.index(row_id)
             is_btn_highlighted = (layer == "SYSTEM_ROWS" and cur_sel == row_idx)
             if row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED:
-                # Updater subsystem disabled during packaging -- static
-                # label, no live status text.
                 btn_txt = "Updates Disabled"
             elif row_id == "update_check":
                 if app_state.get("_update_check_inflight", False):
@@ -4030,15 +3391,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                       bottom_row_y + btn_text_y_offset_base - (lbl_b.get_height() // 2)))
             _bx += btn_w + btn_gap
 
-        # GPU/CPU render-mode and Remote Remapping now stand side by side
-        # on a single row, centered under the left toggle column, in the
-        # gap between Kiosk Mode (the last left-column toggle) and the
-        # bottom-left button row above -- GPU/CPU on the left (the slot
-        # Remote Remapping used to occupy alone), Remote Remapping to its
-        # right. Written as a loop over a fixed order tuple rather than two
-        # copy-pasted blocks so a future row missing from sys_rows (e.g.
-        # some stripped-down mode) just collapses to fewer items in the row
-        # instead of leaving a gap.
         _standalone_order = [r for r in ("advanced_settings",) if r in sys_rows]
         if _standalone_order:
             _left_col_bottom_y = content_y + toggle_start_y + (max(0, len(left_toggle_rows) - 1) * toggle_gap) + toggle_h
@@ -4048,13 +3400,14 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _x = bx_left
             for _row_id in _standalone_order:
                 _row_idx = sys_rows.index(_row_id)
-                _focused = (layer == "SYSTEM_ROWS" and cur_sel == _row_idx)
                 _lbl_txt = _gpu_render_mode_label(db) if _row_id == "gpu_render_mode" else SYSTEM_ROW_META[_row_id]["label"]
                 _gpu_disabled = (_row_id == "gpu_render_mode" and not GPU_RENDER_MODE_ENABLED)
-                _txt_col = (105, 105, 115) if _gpu_disabled else TEXT_WHITE
+                _row_disabled = _gpu_disabled
+                _focused = (layer == "SYSTEM_ROWS" and cur_sel == _row_idx)
+                _txt_col = (105, 105, 115) if _row_disabled else TEXT_WHITE
                 _lbl = f_ch_btn.render(_lbl_txt, True, _txt_col)
                 _w = _lbl.get_width() + (btn_pad_x * 2)
-                _color = (32, 32, 40) if _gpu_disabled else SYSTEM_ROW_META[_row_id].get("color", OFF_RED)
+                _color = (32, 32, 40) if _row_disabled else SYSTEM_ROW_META[_row_id].get("color", OFF_RED)
                 pygame.draw.rect(menu_canvas, _color, (_x, _y, _w, _h), border_radius=box_radius)
                 if _focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (_x, _y, _w, _h), focus_thickness, border_radius=box_radius)
@@ -4063,10 +3416,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _x += _w + btn_gap
 
         if poweroff_standalone:
-            # Mirrors the Remote Remapping block above exactly, but anchored
-            # under the right toggle column (below Server Mode) instead of
-            # the left one -- same "centered in the gap above the bottom
-            # row" placement logic.
             _po_row_idx = sys_rows.index("poweroff")
             _po_focused = (layer == "SYSTEM_ROWS" and cur_sel == _po_row_idx)
             _po_lbl = f_ch_btn.render(SYSTEM_ROW_META["poweroff"]["label"], True, TEXT_WHITE)
@@ -4097,17 +3446,14 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_c = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_c, (close_btn_x + (close_btn_w // 2) - (lbl_c.get_width() // 2), close_btn_y + close_txt_y_offset))
 
+    # ========================================================================
+    # SECTION: System tab: advanced settings
+    # ========================================================================
 
     elif active_tab == "System" and layer == "SYSTEM_ADVANCED_SUB_MENU":
-        # Same two-column, centered-per-half treatment as the Channels
-        # tab's CHANNEL_SETTINGS_SUB_MENU (same overlay/opacity/theme
-        # colors from the shared build above, same Close button slot) --
-        # see get_advanced_settings_menu_rows for the row order/grouping.
-        scale_factor = 1.0
 
         f_sub_title = _get_font("Courier New", 20, bold=True)
         lbl_hdr = f_sub_title.render("Advanced Settings", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
 
         _as_rows = get_advanced_settings_menu_rows(db, app_state)
         _as_cur_row = app_state.get("menu_selection_index", 0)
@@ -4118,8 +3464,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             "boot_on_start": "Custom Shell Launcher:",
         }
         _as_button_labels = {
-            "update_check": None,   # live text, computed below
-            "gpu_render_mode": None,  # live text via _gpu_render_mode_label
+            "update_check": None,
+            "gpu_render_mode": None,
+            "performance_mode": None,
             "remote_remap": SYSTEM_ROW_META["remote_remap"]["label"],
         }
         if app_state.get("_update_check_inflight", False):
@@ -4138,103 +3485,115 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _as_update_txt = "Updates Disabled"
         _as_button_labels["update_check"] = _as_update_txt
         _as_button_labels["gpu_render_mode"] = _gpu_render_mode_label(db)
+        _as_button_labels["performance_mode"] = _performance_mode_label(db)
 
         _as_server_on = bool(db.config.get("server_mode_enabled", False)) and UPDATER_AND_SERVER_FEATURES_ENABLED
         _as_shell_on = bool(db.config.get("start_on_boot", False))
 
-        _as_bar_pad = 36
-        _as_bar_w = max(f_ch_label.size(_lbl)[0] for _lbl in _as_toggle_labels.values()) + _as_bar_pad
-        _as_toggle_row_w = _as_bar_w + 20 + pill_w
-        _as_menu_lbl_w = f_ch_btn.render("Menu", True, TEXT_WHITE).get_width() + 28
-        _as_server_row_w = _as_toggle_row_w + 20 + _as_menu_lbl_w
+        _as_bar_w = int(_advanced_menu_value("ADVANCED_MENU_BAR_WIDTH", 360))
+        _as_text_pad = int(_advanced_menu_value("ADVANCED_MENU_TEXT_PAD", 18))
+        _as_side_gap = int(_advanced_menu_value("ADVANCED_MENU_SIDE_GAP", 20))
+        _as_header_gap = int(_advanced_menu_value("ADVANCED_MENU_HEADER_GAP", 40))
+        _as_bottom_reserved = int(_advanced_menu_value("ADVANCED_MENU_BOTTOM_RESERVED", 70))
+        _as_row_gap_want = int(_advanced_menu_value("ADVANCED_MENU_ROW_GAP", 20))
+        _as_row_gap_min = int(_advanced_menu_value("ADVANCED_MENU_ROW_GAP_MIN", 8))
+        _as_scroll_speed = float(_advanced_menu_value("ADVANCED_MENU_SCROLL_SPEED_PX", 55))
+        _as_scroll_pause = float(_advanced_menu_value("ADVANCED_MENU_SCROLL_PAUSE_SECONDS", 1.0))
 
-        _as_btn_pad_x = 28
         btn_h = box_h_43 + 8
+        _as_row_h = 44
 
         _as_wm_sel_idx = _as_rows.index("server_menu_open") if "server_menu_open" in _as_rows else None
         _as_entries = [(_i, _rid) for _i, _rid in enumerate(_as_rows) if _rid != "server_menu_open"]
-        _as_left_count = (len(_as_entries) + 1) // 2
-        _as_columns = [_as_entries[:_as_left_count], _as_entries[_as_left_count:]]
+        _as_count = len(_as_entries)
 
-        _as_half_w = content_w // 2
-        _as_col_centers = [cx + _as_half_w // 2, cx + _as_half_w + _as_half_w // 2]
+        _as_room = content_h - _as_bottom_reserved - lbl_hdr.get_height() - _as_header_gap - _as_count * _as_row_h
+        if _as_count < 2:
+            _as_row_gap = _as_row_gap_want
+        else:
+            _as_row_gap = max(_as_row_gap_min, min(_as_row_gap_want, _as_room // (_as_count - 1)))
+        _as_block_h = lbl_hdr.get_height() + _as_header_gap + _as_count * _as_row_h + max(0, _as_count - 1) * _as_row_gap
+        _as_block_top = content_y + max(20, (content_h - _as_bottom_reserved - _as_block_h) // 2)
+        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, _as_block_top))
+        _as_top_y = _as_block_top + lbl_hdr.get_height() + _as_header_gap
 
-        _as_row_h = 44
-        _as_row_gap = 14
-        _as_top_y = content_y + 68
+        _as_bar_x = cx + content_w // 2 - _as_bar_w // 2
+        _as_inner_w = max(1, _as_bar_w - _as_text_pad * 2)
 
-        def _as_row_block_w(_rid):
-            if _rid == "server_option":
-                return _as_server_row_w
-            if _rid in _as_toggle_labels:
-                return _as_toggle_row_w
-            _lbl_txt = _as_button_labels.get(_rid, SYSTEM_ROW_META.get(_rid, {}).get("label", _rid))
-            return f_ch_btn.render(_lbl_txt, True, TEXT_WHITE).get_width() + (_as_btn_pad_x * 2)
+        _as_now = time.time()
+        _as_focus_id = None
+        if 0 <= _as_cur_row < len(_as_rows) and _as_rows[_as_cur_row] != "server_menu_open":
+            _as_focus_id = _as_rows[_as_cur_row]
+        _as_state = _advanced_scroll
+        if _as_focus_id != _as_state["row"] or _as_now - _as_state["seen"] > 0.75:
+            _as_state["row"] = _as_focus_id
+            _as_state["t0"] = _as_now
+        _as_state["seen"] = _as_now
+        _as_state["active"] = False
+        _as_elapsed = _as_now - _as_state["t0"]
 
-        for _as_col_idx, _as_col_entries in enumerate(_as_columns):
-            if not _as_col_entries:
-                continue
-            _as_block_w = max(_as_row_block_w(_rid) for _i, _rid in _as_col_entries)
-            _as_col_x = _as_col_centers[_as_col_idx] - _as_block_w // 2
+        def _as_draw_text(_font, _txt, _col, _by, _focused):
+            _surf = _font.render(_txt, True, _col)
+            _over = _surf.get_width() - _as_inner_w
+            _ty = _by + (btn_h - _surf.get_height()) // 2
+            if _over <= 0:
+                menu_canvas.blit(_surf, (_as_bar_x + (_as_bar_w - _surf.get_width()) // 2, _ty))
+                return
+            _off = 0
+            if _focused:
+                _as_state["active"] = True
+                _off = _marquee_offset(_over, _as_elapsed, _as_scroll_speed, _as_scroll_pause)
+            _clip = pygame.Surface((_as_inner_w, _surf.get_height()), pygame.SRCALPHA)
+            _clip.blit(_surf, (-_off, 0))
+            menu_canvas.blit(_clip, (_as_bar_x + _as_text_pad, _ty))
 
-            for _as_pos, (_as_idx, _as_row_id) in enumerate(_as_col_entries):
-                _as_y = _as_top_y + _as_pos * (_as_row_h + _as_row_gap)
-                _as_focused = _as_cur_row == _as_idx
-                _as_bar_y = _as_y + (_as_row_h - box_h_43) // 2
+        for _as_pos, (_as_idx, _as_row_id) in enumerate(_as_entries):
+            _as_y = _as_top_y + _as_pos * (_as_row_h + _as_row_gap)
+            _as_focused = _as_cur_row == _as_idx
+            _as_bar_y = _as_y + (_as_row_h - btn_h) // 2
 
-                if _as_row_id in _as_toggle_labels:
-                    pygame.draw.rect(menu_canvas, (25, 45, 80), (_as_col_x, _as_bar_y, _as_bar_w, box_h_43), border_radius=6)
-                    if _as_focused:
-                        _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_col_x, _as_bar_y, _as_bar_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=6)
-                    _as_disabled_row = (_as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
-                    _as_lbl_col = (105, 105, 115) if _as_disabled_row else TEXT_WHITE
-                    _as_lbl_surf = f_ch_label.render(_as_toggle_labels[_as_row_id], True, _as_lbl_col)
-                    menu_canvas.blit(_as_lbl_surf, (_as_col_x + (_as_bar_w - _as_lbl_surf.get_width()) // 2,
-                                                     _as_bar_y + (box_h_43 - _as_lbl_surf.get_height()) // 2))
+            if _as_row_id in _as_toggle_labels:
+                pygame.draw.rect(menu_canvas, (25, 45, 80), (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), border_radius=6)
+                if _as_focused:
+                    _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=6)
+                _as_disabled_row = (_as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
+                _as_lbl_col = (105, 105, 115) if _as_disabled_row else TEXT_WHITE
+                _as_draw_text(f_ch_label, _as_toggle_labels[_as_row_id], _as_lbl_col, _as_bar_y, _as_focused)
 
-                    _as_pill_x = _as_col_x + _as_bar_w + 20
-                    _as_on = _as_server_on if _as_row_id == "server_option" else _as_shell_on
-                    _as_pill_col = (32, 32, 40) if _as_disabled_row else (OFF_GREEN if _as_on else (45, 65, 100))
-                    _as_pill_y = _as_bar_y + (box_h_43 - pill_h) // 2
-                    pygame.draw.rect(menu_canvas, _as_pill_col, (_as_pill_x, _as_pill_y, pill_w, pill_h), border_radius=12)
-                    _as_handle_x = _as_pill_x + pill_w - 12 if _as_on else _as_pill_x + 12
-                    pygame.draw.circle(menu_canvas, (100, 100, 100) if _as_disabled_row else TEXT_WHITE,
-                                       (_as_handle_x, _as_pill_y + pill_h // 2), 9)
+                _as_pill_x = _as_bar_x + _as_bar_w + _as_side_gap
+                _as_on = _as_server_on if _as_row_id == "server_option" else _as_shell_on
+                _as_pill_col = (32, 32, 40) if _as_disabled_row else (OFF_GREEN if _as_on else (45, 65, 100))
+                _as_pill_y = _as_bar_y + (btn_h - pill_h) // 2
+                pygame.draw.rect(menu_canvas, _as_pill_col, (_as_pill_x, _as_pill_y, pill_w, pill_h), border_radius=12)
+                _as_handle_x = _as_pill_x + pill_w - 12 if _as_on else _as_pill_x + 12
+                pygame.draw.circle(menu_canvas, (100, 100, 100) if _as_disabled_row else TEXT_WHITE,
+                                   (_as_handle_x, _as_pill_y + pill_h // 2), 9)
 
-                    if _as_row_id == "server_option":
-                        # "Menu" companion button, same slot/pattern as
-                        # Water Mark's "Add" button in Channel Settings.
-                        _as_menu_focused = (_as_wm_sel_idx is not None and _as_cur_row == _as_wm_sel_idx)
-                        _as_menu_on = _as_server_on
-                        _as_menu_txt_col = TEXT_WHITE if _as_menu_on else (105, 105, 115)
-                        _as_menu_lbl = f_ch_btn.render("Menu", True, _as_menu_txt_col)
-                        _as_menu_w = _as_menu_lbl.get_width() + 28
-                        _as_menu_x = _as_pill_x + pill_w + 20
-                        _as_menu_bg = (45, 80, 130) if _as_menu_on else (32, 32, 40)
-                        pygame.draw.rect(menu_canvas, _as_menu_bg, (_as_menu_x, _as_bar_y, _as_menu_w, box_h_43), border_radius=5)
-                        if _as_menu_focused:
-                            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_menu_x, _as_bar_y, _as_menu_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=5)
-                        menu_canvas.blit(_as_menu_lbl,
-                                         (_as_menu_x + (_as_menu_w - _as_menu_lbl.get_width()) // 2,
-                                          _as_bar_y + (box_h_43 - _as_menu_lbl.get_height()) // 2))
-                else:
-                    # Look for Updates / GPU-CPU / Remote Remapping -- a
-                    # plain full-width button, same look as the old
-                    # bottom-row buttons they used to be.
-                    _as_lbl_txt = _as_button_labels.get(_as_row_id, SYSTEM_ROW_META.get(_as_row_id, {}).get("label", _as_row_id))
-                    _as_gpu_disabled = (_as_row_id == "gpu_render_mode" and not GPU_RENDER_MODE_ENABLED)
-                    _as_upd_disabled = (_as_row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
-                    _as_btn_disabled = _as_gpu_disabled or _as_upd_disabled
-                    _as_txt_col = (105, 105, 115) if _as_btn_disabled else TEXT_WHITE
-                    _as_lbl = f_ch_btn.render(_as_lbl_txt, True, _as_txt_col)
-                    _as_btn_w = _as_lbl.get_width() + (_as_btn_pad_x * 2)
-                    _as_btn_y = _as_y + (_as_row_h - btn_h) // 2
-                    _as_btn_color = (32, 32, 40) if _as_btn_disabled else SYSTEM_ROW_META.get(_as_row_id, {}).get("color", (45, 80, 130))
-                    pygame.draw.rect(menu_canvas, _as_btn_color, (_as_col_x, _as_btn_y, _as_btn_w, btn_h), border_radius=5)
-                    if _as_focused:
-                        _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_col_x, _as_btn_y, _as_btn_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=5)
-                    menu_canvas.blit(_as_lbl, (_as_col_x + (_as_btn_w - _as_lbl.get_width()) // 2,
-                                                _as_btn_y + (btn_h - _as_lbl.get_height()) // 2))
+                if _as_row_id == "server_option":
+                    _as_menu_focused = (_as_wm_sel_idx is not None and _as_cur_row == _as_wm_sel_idx)
+                    _as_menu_on = _as_server_on
+                    _as_menu_txt_col = TEXT_WHITE if _as_menu_on else (105, 105, 115)
+                    _as_menu_lbl = f_ch_btn.render("Menu", True, _as_menu_txt_col)
+                    _as_menu_w = _as_menu_lbl.get_width() + 28
+                    _as_menu_x = _as_pill_x + pill_w + _as_side_gap
+                    _as_menu_bg = (45, 80, 130) if _as_menu_on else (32, 32, 40)
+                    pygame.draw.rect(menu_canvas, _as_menu_bg, (_as_menu_x, _as_bar_y, _as_menu_w, btn_h), border_radius=5)
+                    if _as_menu_focused:
+                        _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_menu_x, _as_bar_y, _as_menu_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=5)
+                    menu_canvas.blit(_as_menu_lbl,
+                                     (_as_menu_x + (_as_menu_w - _as_menu_lbl.get_width()) // 2,
+                                      _as_bar_y + (btn_h - _as_menu_lbl.get_height()) // 2))
+            else:
+                _as_lbl_txt = _as_button_labels.get(_as_row_id, SYSTEM_ROW_META.get(_as_row_id, {}).get("label", _as_row_id))
+                _as_gpu_disabled = (_as_row_id == "gpu_render_mode" and not GPU_RENDER_MODE_ENABLED)
+                _as_upd_disabled = (_as_row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
+                _as_btn_disabled = _as_gpu_disabled or _as_upd_disabled
+                _as_txt_col = (105, 105, 115) if _as_btn_disabled else TEXT_WHITE
+                _as_btn_color = (32, 32, 40) if _as_btn_disabled else SYSTEM_ROW_META.get(_as_row_id, {}).get("color", (45, 80, 130))
+                pygame.draw.rect(menu_canvas, _as_btn_color, (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), border_radius=5)
+                if _as_focused:
+                    _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=5)
+                _as_draw_text(f_ch_btn, _as_lbl_txt, _as_txt_col, _as_bar_y, _as_focused)
 
         _as_close_focused = _as_cur_row == _as_close_idx
         _as_bk_x, _as_bk_y, _as_bk_w, _as_bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
@@ -4244,6 +3603,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _as_bk_lbl = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(_as_bk_lbl, (_as_bk_x + _as_bk_w // 2 - _as_bk_lbl.get_width() // 2, _as_bk_y + _as_bk_h // 2 - _as_bk_lbl.get_height() // 2))
 
+    # ========================================================================
+    # SECTION: System tab: remote remap
+    # ========================================================================
 
     elif active_tab == "System" and layer in ("REMOTE_REMAP_LIST", "REMOTE_REMAP_CAPTURE", "NUMBER_REMAP_CAPTURE"):
         box_radius = 4
@@ -4253,10 +3615,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         is_capturing = layer in ("REMOTE_REMAP_CAPTURE", "NUMBER_REMAP_CAPTURE")
         is_number_capture = (layer == "NUMBER_REMAP_CAPTURE")
         capture_idx = app_state.get("remote_remap_index", 0)
-        rr_sel = cur_sel  # 0 = Remap Remote, 1 = Remap Numbers, 2 = Close
+        rr_sel = cur_sel
 
         remote_rows_per_col = -(-len(REMOTE_REMAP_ACTIONS) // 2)
-        remote_label_col_w = 195   # fits the widest label ("Back/Minimize:") at 22px
+        # VALUES CHANGE HERE
+        remote_label_col_w = 195
         key_box_w, key_box_h = 110, 30
         col_gap = 30
 
@@ -4277,7 +3640,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         hdr2 = f_sub_header.render("Number Remapping", True, (255, 220, 0))
         menu_canvas.blit(hdr2, (number_label_x, content_y + 14))
 
-        # Reject flash state — shared by both columns.
         _remap_reject_flash = app_state.get("_remap_reject_flash")
         _remap_reject_active = (
             _remap_reject_flash is not None
@@ -4394,12 +3756,16 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_c2 = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_c2, (close_btn_x + (close_btn_w // 2) - (lbl_c2.get_width() // 2), close_btn_y + close_txt_y_offset))
 
+    # ========================================================================
+    # SECTION: System tab: server menu
+    # ========================================================================
+
     elif active_tab == "System" and layer == "SERVER_MENU":
         box_radius = 4
         focus_thickness = SELECTION_BORDER_WIDTH
         label_padding_x = 35
 
-        srv_sel = cur_sel  # 0 = Server card, 1 = User card, 2 = Manage Servers/Pick a Server (role-gated), last = Close
+        srv_sel = cur_sel
         server_role = db.config.get("server_role") if db is not None else None
         _manage_servers_visible = server_role == "server"
         _pick_server_visible = server_role == "user"
@@ -4512,12 +3878,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_c3 = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_c3, (close_btn_x + (close_btn_w // 2) - (lbl_c3.get_width() // 2), close_btn_y + close_txt_y_offset))
 
+    # ========================================================================
+    # SECTION: System tab: server slots
+    # ========================================================================
+
     elif active_tab == "System" and layer == "SERVER_SLOTS_MENU":
-        # Fixed 6-slot grid (2 columns x 3 rows: slots 1-3 left, 4-6
-        # right), with Create/Manage as separate focusable buttons off to
-        # the right, matching the layout of the other System sub-menus.
-        # Focus index: 0-2 = left column (slots 1-3), 3-5 = right column
-        # (slots 4-6), 6 = Create, 7 = Manage, 8 = Close.
         box_radius = 4
         focus_thickness = SELECTION_BORDER_WIDTH
         label_padding_x = 35
@@ -4533,9 +3898,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         SLOT_ROWS = 3
         SLOT_COLS = 2
-        CREATE_IDX = SLOT_ROWS * SLOT_COLS      # 6
-        MANAGE_IDX = CREATE_IDX + 1             # 7
-        CLOSE_IDX = MANAGE_IDX + 1              # 8
+        CREATE_IDX = SLOT_ROWS * SLOT_COLS
+        MANAGE_IDX = CREATE_IDX + 1
+        CLOSE_IDX = MANAGE_IDX + 1
 
         f_row = _get_font("Courier New", 17)
         f_btn = f_ch_btn
@@ -4564,10 +3929,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             is_focused = cur_sel == i
 
             bg = (35, 45, 65) if is_named else (24, 27, 34)
-            # Named + focused gets the normal bright highlight; an unnamed
-            # cell can still be navigated to (per spec) but its focus ring
-            # is the same dimmer tone used for other "visible but not yet
-            # selectable" cells (e.g. server-locked channel cells).
             if is_focused:
                 border_col = NEON_GREEN if is_named else (145, 145, 155)
             else:
@@ -4603,7 +3964,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 if tag_x > text_x + lbl.get_width() + 8:
                     menu_canvas.blit(tag, (tag_x, y + (row_h // 2) - (tag.get_height() // 2)))
 
-        # Create / Manage buttons, stacked to the right of the grid.
         side_x = grid_x + grid_w + side_gap
         create_y = grid_y
         manage_y = grid_y + row_h + 16
@@ -4636,6 +3996,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_close = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_close, (close_btn_x + (close_btn_w // 2) - (lbl_close.get_width() // 2), close_btn_y + close_txt_y_offset))
 
+    # ========================================================================
+    # SECTION: System tab: server slot actions
+    # ========================================================================
+
     elif active_tab == "System" and layer == "SERVER_SLOT_ACTIONS":
         box_radius = 4
         focus_thickness = SELECTION_BORDER_WIDTH
@@ -4658,8 +4022,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             menu_canvas.blit(active_tag, (cx + label_padding_x + hdr.get_width() + 12, content_y + 12))
 
         pending_delete = app_state.get("server_slot_pending_delete", False)
-        # "Make Active" / "Deactivate" is always row 0 so its position
-        # never shifts as the label text changes.
         make_active_label = "Deactivate (back to local)" if is_active else "Make Active"
         actions = [make_active_label, "Rename", "Delete", "Cancel"]
         f_row = _get_font("Courier New", 18)
@@ -4681,9 +4043,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl = f_row.render(shown, True, col)
             menu_canvas.blit(lbl, (row_x + 16, y + (row_h // 2) - (lbl.get_height() // 2)))
 
+    # ========================================================================
+    # SECTION: System tab: server picker
+    # ========================================================================
+
     elif active_tab == "System" and layer == "SERVER_PICKER_MENU":
-        # User-side "pick a server" picker, backed by real discovery
-        # results from db.server_listener.
         box_radius = 4
         focus_thickness = SELECTION_BORDER_WIDTH
         label_padding_x = 35
@@ -4694,21 +4058,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         entries = get_server_picker_entries(db)
 
-        # Live list can shrink while this screen is already open (a server
-        # goes offline) -- clamp focus back onto a real row instead of
-        # leaving it pointed past the end, where nothing would highlight.
-        # Recomputed every frame since entries are too, so the picker stays
-        # correctly focused as the list changes.
         _sp_live_count = get_server_picker_selectable_count(entries)
         if cur_sel >= _sp_live_count:
             cur_sel = max(0, _sp_live_count - 1)
             app_state["menu_selection_index"] = cur_sel
 
-        # Scan results can run past 6 -- multiple TVs on the same WiFi can
-        # each broadcast several named slots. Rather than capping what's
-        # shown, keep 6 rows visible and scroll the window so the focused
-        # row is always in view (same idea as the ROM/channel lists
-        # elsewhere in the app).
         SP_VISIBLE_ROWS = 6
         total_entries = len(entries)
         max_scroll = max(0, total_entries - SP_VISIBLE_ROWS)
@@ -4780,12 +4134,16 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 menu_canvas.blit(lbl, (text_x, name_y))
                 lbl_host = f_host.render(disp_row["host"], True, (150, 160, 180))
                 menu_canvas.blit(lbl_host, (text_x, name_y + lbl.get_height() - 2))
-            else:  # close
+            else:
                 lbl = f_row.render("Close", True, NEON_GREEN)
                 menu_canvas.blit(lbl, (row_x + 16, y + (row_h // 2) - (lbl.get_height() // 2)))
 
             y += row_h + row_gap
             selectable_i += 1
+
+    # ========================================================================
+    # SECTION: Channels tab: channel list
+    # ========================================================================
 
     elif active_tab == "Channels" and layer in ("CHANNEL_LIST", "TAB_SELECTION"):
         box_radius = 4
@@ -4870,14 +4228,26 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             pygame.draw.circle(menu_canvas, dot_color, (cell_x + cell_w - cell_dot_x_offset, cell_y + (cell_h // 2)), dot_radius)
 
+            _scan_progress = app_state.get("_channel_scan_progress", {}).get(current_lookup_key)
+            if _scan_progress and ch_active and not ch_server_locked:
+                _scan_done, _scan_total = _scan_progress
+                if _scan_total > 0 and _scan_done < _scan_total:
+                    _bar_max_w = cell_w - 2 * cell_radius
+                    _bar_w = max(1, int(_bar_max_w * _scan_done / _scan_total))
+                    _bar_x = cell_x + cell_radius
+                    _bar_y = cell_y + cell_h - CHANNEL_SCAN_BAR_HEIGHT_PX
+                    _halo_color = tuple(int(cell_bg[_c] + (NEON_GREEN[_c] - cell_bg[_c]) * CHANNEL_SCAN_BAR_HALO_MIX)
+                                        for _c in range(3))
+                    _head_color = tuple(int(NEON_GREEN[_c] + (255 - NEON_GREEN[_c]) * 0.5) for _c in range(3))
+                    pygame.draw.rect(menu_canvas, _halo_color, (_bar_x, _bar_y - 1, _bar_w, 1))
+                    pygame.draw.rect(menu_canvas, NEON_GREEN, (_bar_x, _bar_y, _bar_w, CHANNEL_SCAN_BAR_HEIGHT_PX))
+                    _head_w = min(CHANNEL_SCAN_BAR_HEAD_PX, _bar_w)
+                    pygame.draw.rect(menu_canvas, _head_color,
+                                     (_bar_x + _bar_w - _head_w, _bar_y, _head_w, CHANNEL_SCAN_BAR_HEIGHT_PX))
+
         grid_bottom_y = grid_start_y + (rows_per_page * (cell_h + y_pad)) - y_pad
 
         arrow_btn_w, arrow_btn_h = 56, 38
-        # Right edge lines up with the right edge of the grid's last
-        # column (the same edge Channel 08/12/16/20/24 share), instead of
-        # sitting flush against the content box's own right edge with its
-        # own 14px pad -- those two edges only coincided by coincidence of
-        # the old cell sizing, not by any real alignment relationship.
         arrow_btn_x = grid_start_x + grid_w_total - arrow_btn_w
         arrow_btn_y = grid_bottom_y + 14
         is_arrow_focused = (layer == "CHANNEL_LIST" and cur_sel == 42)
@@ -4892,7 +4262,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(arrow_lbl, (arrow_btn_x + (arrow_btn_w - arrow_lbl.get_width())  // 2,
                                       arrow_btn_y + (arrow_btn_h - arrow_lbl.get_height()) // 2))
 
-        # Small page indicator ("1/2") just left of the arrow button.
         page_lbl = f_ch_btn.render(f"{channels_page + 1}/{num_pages}", True, TEXT_WHITE)
         menu_canvas.blit(page_lbl, (arrow_btn_x - page_lbl.get_width() - 14,
                                      arrow_btn_y + (arrow_btn_h - page_lbl.get_height()) // 2))
@@ -4910,20 +4279,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_cl, (close_btn_x + (close_btn_w // 2) - (lbl_cl.get_width() // 2), close_btn_y + close_txt_y_offset))
 
-        # The footer used to hold seven separate toggle/button controls
-        # (Scan Lines, Static Noise, Warp Screen, Reception Lines, Water
-        # Mark + its Add button, Boot Anim) in a three-column grid. They've
-        # all moved into the CHANNEL_SETTINGS_SUB_MENU (see
-        # get_channels_settings_menu_rows and the drawing block below),
-        # reached through this single "Settings" button at footer index 43
-        # -- the same slot the old grid used to start at.
         _settings_btn_w = 150
         _settings_btn_h = box_h_43
         _settings_btn_x = grid_start_x
-        # Bottom edge lines up with the arrow button's bottom edge (same
-        # row as the page arrow, not down at the Close button's row) --
-        # left edge lines up with the grid's first column (Channel
-        # 21/17/13/09/05, whichever page is showing).
         _settings_btn_y = arrow_btn_y + arrow_btn_h - _settings_btn_h
         _settings_focused = layer == "CHANNEL_LIST" and cur_sel == 43
         _settings_bg = (60, 140, 220) if _settings_focused else (40, 100, 180)
@@ -4938,19 +4296,14 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                          (_settings_btn_x + (_settings_btn_w - _settings_lbl.get_width()) // 2,
                           _settings_btn_y + (_settings_btn_h - _settings_lbl.get_height()) // 2))
 
+    # ========================================================================
+    # SECTION: Channels tab: settings sub-menu
+    # ========================================================================
 
     elif active_tab == "Channels" and layer == "CHANNEL_SETTINGS_SUB_MENU":
-        # Two columns (3 rows each in the common case), each centered
-        # within its own half of the content box -- room for future
-        # options in either column without needing a redesign. Row
-        # order/visibility comes from get_channels_settings_menu_rows so
-        # Scan Lines' real-4:3-hardware hide/show is handled in one place
-        # rather than being re-derived here too.
-        scale_factor = 1.0
 
         f_sub_title = _get_font("Courier New", 20, bold=True)
         lbl_hdr = f_sub_title.render("Channels \u2014 Settings", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
 
         _cs_row_labels = {
             "scan_lines": "Scan Lines",
@@ -4963,58 +4316,51 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         }
         _cs_rows = get_channels_settings_menu_rows(db, app_state)
         _cs_cur_row = app_state.get("menu_selection_index", 0)
-        _true_43_display = (getattr(db, "_detected_aspect_ratio", None) == "4:3") if db is not None else False
         _watermark_on = bool(db.config.get("watermark_enabled", False)) if db is not None else False
         _bezel_on = bool(db.config.get("fake_43_border_enabled", False)) if db is not None else False
         _bezel_style_n = media.bezel_style_count() if db is not None else 1
 
         _cs_row_h = 44
-        _cs_row_gap = 10
-        _cs_top_y = content_y + 68
+        _cs_row_gap = 36
+        _cs_pitch = _cs_row_h + _cs_row_gap
 
-        # The label bar is sized to the longest label plus a little
-        # breathing room -- just big enough to hold the text, not a full
-        # row-width bar -- and every row shares that one width so they all
-        # line up, in both columns. watermark_select has no label/bar of
-        # its own (it draws as the Add button on the Water Mark row, see
-        # below), so it's left out of this measurement.
         _cs_bar_pad = 36
         _cs_bar_w = max(f_ch_label.size(_lbl)[0] for _lbl in _cs_row_labels.values()) + _cs_bar_pad
         _cs_row_content_w = _cs_bar_w + 20 + pill_w
         _cs_add_lbl_w = f_ch_btn.render("Add", True, TEXT_WHITE).get_width() + 28
         _cs_watermark_row_w = _cs_row_content_w + 20 + _cs_add_lbl_w
-        # Style-cycle box beside CRT TV Bezels' toggle -- same fixed
-        # small-number-box width the System tab used to give it.
         _cs_bstyle_box_w = 18 + 24
         _cs_bezel_row_w = _cs_row_content_w + 20 + _cs_bstyle_box_w
 
-        # Build one entry per visual line: watermark_select rides along
-        # with "watermark" (the Add button sits beside its toggle, not on
-        # a line of its own), and bezel_style_select rides along with
-        # "bezel_toggle" the same way -- neither gets counted separately.
         _cs_watermark_select_idx = _cs_rows.index("watermark_select") if "watermark_select" in _cs_rows else None
         _cs_bezel_style_select_idx = _cs_rows.index("bezel_style_select") if "bezel_style_select" in _cs_rows else None
+        _cs_recep_idx = _cs_rows.index("reception_lines") if "reception_lines" in _cs_rows else None
         _cs_entries = [(_i, _rid) for _i, _rid in enumerate(_cs_rows)
-                        if _rid not in ("watermark_select", "bezel_style_select")]
+                        if _rid not in ("watermark_select", "bezel_style_select", "reception_lines")]
 
-        # 3 left, 3 right in the common 6-entry case; if Scan Lines is
-        # hidden (real 4:3 hardware, 5 entries) the extra lands on the
-        # left so the right column -- which already carries the wider
-        # Water Mark/Add row -- doesn't grow past 3.
         _cs_left_count = (len(_cs_entries) + 1) // 2
         _cs_columns = [_cs_entries[:_cs_left_count], _cs_entries[_cs_left_count:]]
 
         _cs_half_w = content_w // 2
         _cs_col_centers = [cx + _cs_half_w // 2, cx + _cs_half_w + _cs_half_w // 2]
 
+        _cs_grid_rows_tall = max((len(_c) for _c in _cs_columns), default=0)
+        _cs_total_rows = _cs_grid_rows_tall + (1 if _cs_recep_idx is not None else 0)
+        # VALUES CHANGE HERE
+        _cs_header_gap = 40
+        _cs_block_h = lbl_hdr.get_height() + _cs_header_gap
+        if _cs_total_rows > 0:
+            _cs_block_h += (_cs_total_rows - 1) * _cs_pitch + _cs_row_h
+        # VALUES CHANGE HERE
+        _cs_bottom_reserved = 70
+        _cs_block_top = content_y + max(20, (content_h - _cs_bottom_reserved - _cs_block_h) // 2)
+
+        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, _cs_block_top))
+        _cs_top_y = _cs_block_top + lbl_hdr.get_height() + _cs_header_gap
+
         for _cs_col_idx, _cs_col_entries in enumerate(_cs_columns):
             if not _cs_col_entries:
                 continue
-            # Column block width is set by its widest row (Water Mark's
-            # row, when this column holds it) -- every row's bar starts at
-            # the same left edge, so the block centers as one unit even
-            # though the Water Mark/Add row extends further right than
-            # its neighbors.
             _cs_block_w = max(
                 _cs_watermark_row_w if _rid == "watermark" else
                 (_cs_bezel_row_w if _rid == "bezel_toggle" else _cs_row_content_w)
@@ -5047,11 +4393,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     "boot_anim": "boot_anim_enabled",
                 }.get(_cs_row_id)
                 _cs_on = bool(db.config.get(_cs_config_key, False)) if (db is not None and _cs_config_key) else False
-                # Warp Screen greys out (still shows OFF) on real 4:3
-                # hardware -- the warp step never runs there -- same
-                # "disabled but still focusable" treatment it had in the
-                # old footer switch.
-                _cs_disabled = (_cs_row_id == "warp_screen" and _true_43_display)
+                _cs_disabled = _cs_config_key is not None and _mode_locks(_cs_config_key)
                 if _cs_disabled:
                     _cs_on = False
                 _pill_y = _cs_bar_y + (box_h_43 - pill_h) // 2
@@ -5065,10 +4407,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                    (_handle_x, _pill_y + pill_h // 2), 9)
 
                 if _cs_row_id == "watermark":
-                    # "Add" button for the watermark image, right of Water
-                    # Mark's own toggle on the same line -- greyed, inert
-                    # on Enter while Water Mark is off, same as the old
-                    # footer.
                     _cs_add_focused = (_cs_watermark_select_idx is not None
                                         and _cs_cur_row == _cs_watermark_select_idx)
                     _cs_add_col_txt = TEXT_WHITE if _watermark_on else (105, 105, 115)
@@ -5084,11 +4422,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                       _cs_bar_y + (box_h_43 - _cs_add_lbl.get_height()) // 2))
 
                 if _cs_row_id == "bezel_toggle" and _cs_bezel_style_select_idx is not None:
-                    # Small numeric box showing which bezel style is active,
-                    # right of the toggle -- same fixed-size box and "greyed
-                    # out until the toggle itself is on" treatment the
-                    # System tab used to give it. Only ever a row here when
-                    # 2+ styles exist (see get_channels_settings_menu_rows).
                     _cs_bstyle_focused = (_cs_cur_row == _cs_bezel_style_select_idx)
                     _bezel_style_val = db.config.get("bezel_style", 1) if db is not None else 1
                     try:
@@ -5108,6 +4441,29 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                      (_cs_bstyle_x + (_cs_bstyle_box_w - _cs_bstyle_lbl.get_width()) // 2,
                                       _cs_bar_y + (box_h_43 - _cs_bstyle_lbl.get_height()) // 2))
 
+        if _cs_recep_idx is not None:
+            _cs_recep_rows_tall = max((len(_c) for _c in _cs_columns), default=0)
+            _cs_recep_y = _cs_top_y + _cs_recep_rows_tall * (_cs_row_h + _cs_row_gap)
+            _cs_recep_bar_y = _cs_recep_y + (_cs_row_h - box_h_43) // 2
+            _cs_recep_col_x = cx + content_w // 2 - _cs_row_content_w // 2
+            _cs_recep_pill_x = _cs_recep_col_x + _cs_bar_w + 20
+            _cs_recep_focused = _cs_cur_row == _cs_recep_idx
+
+            pygame.draw.rect(menu_canvas, (25, 45, 80), (_cs_recep_col_x, _cs_recep_bar_y, _cs_bar_w, box_h_43), border_radius=6)
+            if _cs_recep_focused:
+                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cs_recep_col_x, _cs_recep_bar_y, _cs_bar_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=6)
+
+            _cs_recep_lbl_surf = f_ch_label.render(_cs_row_labels.get("reception_lines", "Reception Lines"), True, TEXT_WHITE)
+            menu_canvas.blit(_cs_recep_lbl_surf, (_cs_recep_col_x + (_cs_bar_w - _cs_recep_lbl_surf.get_width()) // 2,
+                                                    _cs_recep_bar_y + (box_h_43 - _cs_recep_lbl_surf.get_height()) // 2))
+
+            _cs_recep_on = bool(db.config.get("fake_reception_lines_enabled", False)) if db is not None else False
+            _cs_recep_pill_y = _cs_recep_bar_y + (box_h_43 - pill_h) // 2
+            _cs_recep_pill_col = OFF_GREEN if _cs_recep_on else (45, 65, 100)
+            pygame.draw.rect(menu_canvas, _cs_recep_pill_col, (_cs_recep_pill_x, _cs_recep_pill_y, pill_w, pill_h), border_radius=12)
+            _cs_recep_handle_x = _cs_recep_pill_x + pill_w - 12 if _cs_recep_on else _cs_recep_pill_x + 12
+            pygame.draw.circle(menu_canvas, TEXT_WHITE, (_cs_recep_handle_x, _cs_recep_pill_y + pill_h // 2), 9)
+
         _cs_close_idx = len(_cs_rows)
         _cs_close_focused = _cs_cur_row == _cs_close_idx
         _cs_bk_x, _cs_bk_y, _cs_bk_w, _cs_bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
@@ -5117,9 +4473,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _cs_bk_lbl = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(_cs_bk_lbl, (_cs_bk_x + _cs_bk_w // 2 - _cs_bk_lbl.get_width() // 2, _cs_bk_y + _cs_bk_h // 2 - _cs_bk_lbl.get_height() // 2))
 
+    # ========================================================================
+    # SECTION: Channels tab: per-channel sub-menu
+    # ========================================================================
 
     elif active_tab == "Channels" and layer == "CHANNEL_SUB_MENU":
-        scale_factor = 1.0
         
         target_ch_str = str(app_state.get("selected_channel_row", 5)).zfill(2)
         ch_info = db.channels_db.get(target_ch_str, {"active": True, "is_visualizer": False, "name": f"STATION {target_ch_str}", "visualizer_style": "Random"})
@@ -5136,7 +4494,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         is_toggle_focused = (sub_r == 0 and sub_c == 0)
         t_active = ch_info.get("active", True)
 
-        # Count active content channels to know if this is the last one
         _active_ch_count = 0
         if db is not None:
             for _n in range(5, 45):
@@ -5146,14 +4503,13 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _is_last_active = t_active and (_active_ch_count <= 1)
 
         if _is_last_active and sub_c == 0:
-            _effective_col = 1   # display-only remap; don't write back to app_state here
+            # WARNING: display-only remap; never write back to app_state here.
+            _effective_col = 1
         else:
             _effective_col = sub_c
 
-        # is_toggle_focused is False when locked (greyed item gets NO highlight)
         is_toggle_focused = (not _is_last_active) and (sub_r == 0 and _effective_col == 0)
 
-        # Grey out the label and toggle when it's the last active channel
         _toggle_label_color = (90, 90, 90) if _is_last_active else (NEON_GREEN if is_toggle_focused else TEXT_WHITE)
         lbl_toggle_txt = f_ch_label.render("Status:", True, _toggle_label_color)
         _status_lbl_x = cx + 25
@@ -5161,11 +4517,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         _status_pill_x = _status_lbl_x + lbl_toggle_txt.get_width() + 20
 
-        # Greyed out pill when locked; normal colors otherwise
         if _is_last_active:
-            sw_bg = (55, 90, 55)   # muted green - on but locked
+            sw_bg = (55, 90, 55)
             sw_handle_col = (130, 130, 130)
-            # Draw lock icon (small padlock shape using rect+circle)
             pygame.draw.rect(menu_canvas, (80, 80, 80), (_status_pill_x + 63, top_y + 4, 10, 8), border_radius=2)
             pygame.draw.circle(menu_canvas, (80, 80, 80), (_status_pill_x + 68, top_y + 4), 4, 2)
         else:
@@ -5173,7 +4527,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             sw_handle_col = TEXT_WHITE
 
         pygame.draw.rect(menu_canvas, sw_bg, (_status_pill_x, top_y, 55, 24), border_radius=12)
-        # Only draw focus rings when NOT locked
         if is_toggle_focused:
             _aa_rounded_rect(menu_canvas, NEON_GREEN, (_status_pill_x, top_y, 55, 24), SELECTION_BORDER_WIDTH, border_radius=12)
         sw_handle_x = _status_pill_x + 42 if t_active else _status_pill_x + 12
@@ -5207,13 +4560,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (_name_box_x, top_y - 4, _name_box_w, 36), SELECTION_BORDER_WIDTH, border_radius=4)
             ch_name_str = ch_info.get("name", f"STATION {target_ch_str}").upper()
             if all_selected:
-                # Draw selection highlight behind the text
                 sel_lbl = f_ch_label.render(f"NAME: {ch_name_str[:12]}", True, (0, 0, 0))
                 sel_w = sel_lbl.get_width() + 6
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (_name_box_x + 7, top_y - 1, sel_w, 30), border_radius=2)
                 menu_canvas.blit(sel_lbl, (_name_box_x + 10, top_y + 3))
             else:
-                # Normal text, plus a blinking cursor while editing
                 display_str = f"NAME: {ch_name_str[:12]}"
                 if is_editing_name and (pygame.time.get_ticks() // 500) % 2 == 0:
                     display_str += "_"
@@ -5223,7 +4574,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         cell_w, cell_h = 340, 48
         grid_y_start = content_y + 125
         y_gap = 20
-        x_gap = 30
 
         if not t_active:
             msg_y = grid_y_start + 60
@@ -5246,7 +4596,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             vis_row_h = 40
             vis_gap = 20
 
-            # The visualizer rows are Style, Add Audio, Clear, and Close.
             _clear_row_idx = 3
             close_row_idx = 4
             is_close_focused = (sub_r == close_row_idx)
@@ -5260,7 +4609,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             style_str = ch_info.get("visualizer_style", "Random").upper()
             lbl_style = f_ch_label.render(f"VISUALIZER ENGINE STYLE: < {style_str} >", True, _style_text_col)
             menu_canvas.blit(lbl_style, (row_x + 20, style_y + vis_row_h // 2 - lbl_style.get_height() // 2))
-
 
             audio_y = style_y + vis_row_h + vis_gap
             is_audio_dir_focused = (sub_r == 2)
@@ -5292,7 +4640,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             row_x = cx + 25
             row_w = content_w - 60
 
-            SCHED_MODES = ["random_slots", "one_slot", "two_slots", "marathon"]
             SCHED_LABELS = {
                 "random_slots": "RANDOM SLOTS",
                 "one_slot":     "ONE SLOT",
@@ -5304,7 +4651,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             _block_mode  = ch_info.get("block_mode", "full_day")
             _is_full_day = (not _sched_is_marathon) and (_block_mode == "full_day")
-            # 4-HOUR mode: folder row renders the 6 SIX_HOUR_BLOCK_NAMES buckets.
             _is_six_block = (not _sched_is_marathon) and (_block_mode == "six_block")
             _folder_row  = 4 if _sched_is_marathon else 5
             _holiday_row = 5 if _sched_is_marathon else 6
@@ -5320,11 +4666,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             )
             sched_x = row_x
             _row1_gap = 20
-            _row1_right = cx + content_w - 25   # matches Close button's right edge
+            _row1_right = cx + content_w - 25
             if _sched_is_marathon:
                 sched_w = row_w
                 sched_text_x = sched_x + 20
-                order_w = 0  # unused in marathon (no Episode Order box)
+                order_w = 0
                 order_x = 0
             else:
                 _order_prefix_txt = "EPISODE ORDER:  \u25c4  "
@@ -5362,7 +4708,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _order_suffix_x = _order_content_x + _order_prefix_surf.get_width() + _order_word_slot_w
                 menu_canvas.blit(_order_suffix_surf, (_order_suffix_x, _order_text_y))
 
-
             pair_thresh_y = sched_y + sched_r_h + 16
             pair_r_h      = 36
             is_pair_focused = (sub_r == 2)
@@ -5377,7 +4722,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if is_pair_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, pair_thresh_y, pair_w, pair_r_h), SELECTION_BORDER_WIDTH, border_radius=6)
             menu_canvas.blit(lbl_pair, (row_x + 20, pair_thresh_y + pair_r_h // 2 - lbl_pair.get_height() // 2))
-
 
             com_row_y = pair_thresh_y + pair_r_h + 16
             com_h     = 36
@@ -5438,7 +4782,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             else:
                 bl_y = com_row_y + com_h + 16
                 is_bl_focused = (sub_r == 4)
-                # Cycles 24-HOUR (FULL DAY) -> 8-HOUR BLOCKS -> 4-HOUR BLOCKS.
                 if _is_full_day:
                     _bl_label = "24-HOUR (FULL DAY)"
                 elif _is_six_block:
@@ -5449,7 +4792,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     f"BLOCK LENGTH:   \u25c4  {_bl_label}  \u25ba",
                     True, NEON_GREEN if is_bl_focused else TEXT_WHITE
                 )
-                # Hugs the label still, just the left edge now matches row_x.
                 bl_w = min(lbl_bl.get_width() + 40, row_w)
                 pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, bl_y, bl_w, bl_h), border_radius=6)
                 if is_bl_focused:
@@ -5530,12 +4872,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             hol_y  = folder_y_start + f_cell_h + 20
             hol_h  = 40
-            # Marathon plays its lineup straight through in exact order
-            # with no interruptions -- that's the mode's whole point --
-            # so Holiday Schedule Overrides (which exist specifically to
-            # cut in and replace what would otherwise be playing) has no
-            # place here and isn't offered. Audio Track then gets the
-            # full row to itself instead of sharing it with Holiday.
             if not _sched_is_marathon:
                 is_hol_focused = (sub_r == _holiday_row and sub_c == 0)
                 lbl_hol = f_ch_label.render("HOLIDAY SCHEDULE OVERRIDES", True, NEON_GREEN if is_hol_focused else TEXT_WHITE)
@@ -5580,7 +4916,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _lbl_tip2 = _f_tip2.render(_tip2_text, True, (140, 100, 60))
                 menu_canvas.blit(_lbl_tip2, (atr_x, atr_y + atr_h + 2))
 
-
             clear_y = atr_y + atr_h + 20 + (bl_h + 16 if _sched_is_marathon else 0)
             clear_h = 40
             is_clear_focused = (sub_r == _close_row and sub_c == 0)
@@ -5605,11 +4940,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
             menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
 
-        # A remote schedule is an overlay, not a replacement for the User's
-        # local data.  Keep the complete channel editor visible for context,
-        # but dim every editing control and leave only Close undimmed.  The
-        # event handler independently blocks writes, so this remains safe even
-        # if a frame is cached while a live server update arrives.
         if ch_info.get("server_locked", False):
             _lock_top = content_y + 55
             _lock_bottom = content_y + content_h - 60
@@ -5631,9 +4961,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                  content_y + 42),
             )
 
-
     elif layer == "AUDIO_TRACK_PICKER" and active_tab in ("Channels", "Games"):
-        scale_factor = 1.0
         _audio_ctx = app_state.get("audio_track_context", "channel")
         if _audio_ctx == "dvd":
             f_sub_title = f_ch_label
@@ -5642,7 +4970,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             target_ch_str = str(app_state.get("audio_track_source_channel", app_state.get("selected_channel_row", 5))).zfill(2)
             ch_info = db.channels_db.get(target_ch_str, {"name": f"STATION {target_ch_str}"})
 
-            f_sub_title = f_ch_label  # matches the menu tab-bar text size (22px)
+            f_sub_title = f_ch_label
             _ch_name = ch_info.get("name", f"STATION {target_ch_str}").upper()
             lbl_hdr = f_sub_title.render(
                 f"Channel {target_ch_str} — {_ch_name}: Audio Track", True, TEXT_WHITE
@@ -5696,8 +5024,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
 
+    # ========================================================================
+    # SECTION: Channels tab: holiday sub-menu
+    # ========================================================================
+
     elif active_tab == "Channels" and layer == "HOLIDAY_SUB_MENU":
-        scale_factor = 1.0
         target_ch_str = str(app_state.get("selected_channel_row", 5)).zfill(2)
         ch_info = db.channels_db.get(
             target_ch_str,
@@ -5740,9 +5071,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_bk = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_bk, (_bk_x + _bk_w // 2 - lbl_bk.get_width() // 2, _bk_y + _bk_h // 2 - lbl_bk.get_height() // 2))
 
+    # ========================================================================
+    # SECTION: Video tab
+    # ========================================================================
 
     if active_tab == "Video" or active_tab == "video" or active_tab.upper() == "VIDEO":
-        scale_factor = 1.0
         
         top_buttons_y = content_y + 20
         close_button_y = content_y + content_h - 50
@@ -5752,69 +5085,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         inner_radius = 3
         focus_thickness = SELECTION_BORDER_WIDTH
 
-        # Place aspect ratio and screen mode above the sliders.
-        _aspect_ratio_val = db.config.get("aspect_ratio", "16:9") if db is not None else "16:9"
         _screen_mode_val = db.config.get("screen_mode", "normal") if db is not None else "normal"
         try:
-            # Streamed Server channel: show the Server's Screen Mode (locked).
             _srv_sm = db.remote_screen_mode_for(app_state.get("current_channel", "")) if db is not None else None
             if _srv_sm:
                 _screen_mode_val = _srv_sm
         except Exception:
             pass
 
-        # Display-only: while Bezel owns this row (see _asp_locked_by_bezel
-        # just below), show "4:3" instead of whatever the stored value
-        # really is, since Bezel simulates a 4:3 tube. This does NOT touch
-        # db.config["aspect_ratio"] -- the real stored value is untouched
-        # and reappears here the instant Bezel turns back off. Deliberately
-        # cosmetic only, per _apply_bezel_on_aspect_lock's docstring: Bezel
-        # must not actually force/rewrite the TV-station's own Aspect Ratio
-        # value or its content-fitting behavior.
-        if db is not None and (db.config.get("fake_43_border_enabled", False)
-                               or _is_real_43_display(db)):
-            _aspect_ratio_val = "4:3"
-
         _row_gap = 14
-        _aspect_row_y = top_buttons_y + 6
-        _radio_row_y = _aspect_row_y + box_h_43 + _row_gap
+        _radio_row_y = top_buttons_y + 6
 
-        # Aspect Ratio cycle button, centered at the top. Greyed out
-        # (but still focusable -- disabled= keeps the focus outline)
-        # while Bezel owns the value -- see
-        # _aspect_ratio_locked_by_bezel in retro_tv_emulator.py, which
-        # this mirrors exactly so the dimmed rendering and the
-        # no-op-on-Enter behavior never disagree about when it's locked.
-        #
-        # FIX (TV-station aspect audit): this used to also require
-        # _aspect_ratio_val == "4:3" before dimming, matching a pattern
-        # that made sense back when Bezel turning on force-wrote the
-        # value to "4:3" -- at that point "Bezel on" and "value is 4:3"
-        # were the same moment, so the extra check was harmless. Once
-        # that forcing was removed (see _apply_bezel_on_aspect_lock's own
-        # docstring), the value legitimately stays whatever it really is
-        # (e.g. "16:9") while Bezel is on, so this extra condition failed
-        # and the row silently stopped greying out -- while the real,
-        # separate lock in retro_tv_emulator.py still correctly blocked
-        # editing. That mismatch (locked but not visibly locked) is
-        # exactly what was reported. _aspect_ratio_locked_by_bezel()
-        # itself was deliberately written to NOT require the value to
-        # already be "4:3" (see its own docstring: "Do not require the
-        # config value to already be 4:3 here"); this now matches that
-        # exactly, with no independent value condition of its own.
-        # Also locked (greyed, shows "4:3") on real 4:3 hardware -- same
-        # treatment as the Bezel, and as the DVD/Games rows below.
-        _asp_locked_by_bezel = (bool(db.config.get("fake_43_border_enabled", False))
-                                or _is_real_43_display(db)) if db is not None else False
-        _asp_label_box_w = f_ch_btn.size("Aspect Ratio")[0] + 28
-        _asp_val_box_w = max(60, f_ch_btn.size(str(_aspect_ratio_val))[0] + 20)
-        _asp_total_w = _asp_label_box_w + 10 + _asp_val_box_w
-        _asp_x = cx + (content_w // 2) - (_asp_total_w // 2)
-        _draw_footer_value_box(_asp_x, _aspect_row_y, "Aspect Ratio",
-                                _aspect_ratio_val, layer == "VIDEO_ROWS" and cur_sel == 0,
-                                disabled=_asp_locked_by_bezel)
-
-        # Screen-mode radios, centered as a row under Aspect Ratio.
         _radio_col_gap = 32
         _normal_w   = (_radio_dot_r * 2) + 10 + f_ch_label.size("Normal Mode")[0]
         _stretch_w  = (_radio_dot_r * 2) + 10 + f_ch_label.size("Stretch Fit")[0]
@@ -5829,35 +5110,29 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         _draw_footer_radio(_normal_x, _radio_row_y, "Normal Mode",
                            _screen_mode_val == "normal",
-                           layer == "VIDEO_ROWS" and cur_sel == 1)
+                           layer == "VIDEO_ROWS" and cur_sel == 0)
         _draw_footer_radio(_stretch_x, _radio_row_y, "Stretch Fit",
                            _screen_mode_val == "stretch",
-                           layer == "VIDEO_ROWS" and cur_sel == 2)
+                           layer == "VIDEO_ROWS" and cur_sel == 1)
         _draw_footer_radio(_crop_x, _radio_row_y, "Crop Fit",
                            _screen_mode_val == "crop",
-                           layer == "VIDEO_ROWS" and cur_sel == 3)
+                           layer == "VIDEO_ROWS" and cur_sel == 2)
         _draw_footer_radio(_panscan_x, _radio_row_y, "Pan & Scan",
                            _screen_mode_val == "panscan",
-                           layer == "VIDEO_ROWS" and cur_sel == 4)
+                           layer == "VIDEO_ROWS" and cur_sel == 3)
 
-        # Sliders now start below the Aspect Ratio / screen-mode block
-        # instead of at the very top. slider_area_bottom stays clamped to
-        # close_button_y - 20 so the last slider (Tint) never sinks lower
-        # than the top of the Close button, matching the moved-up block
-        # above it -- spacing between the 5 sliders is computed to fit
-        # whatever room remains, capped at the original 70px so it never
-        # stretches out looser than before on tall windows.
         slider_area_top = _radio_row_y + box_h_43 + 22
         slider_area_bottom = close_button_y - 20
-        _slider_row_reserve = 40  # room a single slider's bar/handle needs below its label
+        # VALUES CHANGE HERE
+        _slider_row_reserve = 40
         slider_spacing = min(70, max(40, (slider_area_bottom - slider_area_top - _slider_row_reserve) // 4))
 
         sliders = [
-            (5, "Brightness:", db.config.get("brightness", 50), slider_area_top + slider_spacing * 0),
-            (6, "Contrast:", db.config.get("contrast", 50), slider_area_top + slider_spacing * 1),
-            (7, "Color:", db.config.get("color", 50), slider_area_top + slider_spacing * 2),
-            (8, "Sharpness:", db.config.get("sharpness", 50), slider_area_top + slider_spacing * 3),
-            (9, "Tint:", db.config.get("tint", 50), slider_area_top + slider_spacing * 4)
+            (4, "Brightness:", db.config.get("brightness", 50), slider_area_top + slider_spacing * 0),
+            (5, "Contrast:", db.config.get("contrast", 50), slider_area_top + slider_spacing * 1),
+            (6, "Color:", db.config.get("color", 50), slider_area_top + slider_spacing * 2),
+            (7, "Sharpness:", db.config.get("sharpness", 50), slider_area_top + slider_spacing * 3),
+            (8, "Tint:", db.config.get("tint", 50), slider_area_top + slider_spacing * 4)
         ]
         
         slider_padding_x = 35
@@ -5879,7 +5154,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             pygame.draw.circle(menu_canvas, TEXT_WHITE, (handle_x, sy + 33), handle_rad)
             if is_sl_focused: pygame.draw.circle(menu_canvas, NEON_GREEN, (handle_x, sy + 33), focus_handle_rad, SELECTION_BORDER_WIDTH)
 
-        is_cl_focused = (layer == "VIDEO_ROWS" and cur_sel == 10)
+        is_cl_focused = (layer == "VIDEO_ROWS" and cur_sel == 9)
         close_btn_w = 110
         close_btn_h = 40
         close_btn_x = cx + content_w - close_btn_w - 25
@@ -5890,9 +5165,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_c = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_c, (close_btn_x + (close_btn_w // 2) - (lbl_c.get_width() // 2), _close_btn_y + close_txt_y_offset))
 
+    # ========================================================================
+    # SECTION: Theme tab
+    # ========================================================================
 
     elif active_tab == "Theme" or active_tab == "theme" or active_tab.upper() == "THEME":
-        scale_factor = 1.0
         import colorsys
         
         bg_hue = db.config.get("theme_bg_hue", 220) if db is not None else 220  
@@ -5923,127 +5200,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         close_btn_y = content_y + content_h - 52
         close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
-        # Place volume, static, and transition controls above the sliders.
         top_area_y = content_y + 20
 
         vol_bar_button_y = top_area_y + 6
-        static_button_y = vol_bar_button_y + trans_btn_h + 15
-        trans_type_button_y = static_button_y + trans_btn_h + 15
+        trans_type_button_y = vol_bar_button_y + trans_btn_h + 15
+        static_button_y = vol_bar_button_y
 
-        is_vol_bar_focused = (layer == "THEME_ROWS" and cur_sel == 0)
-
-        vol_bar_style_val = db.config.get("volume_bar_style", "1")
-        vol_bar_value_text = "VOLUME 2" if vol_bar_style_val == "2" else "VOLUME 1"
-
-        # Volume Bar and Channel Static (still full-width, one per row)
-        # share one common width -- the widest label between the two,
-        # plus padding -- so they line up as a uniform size instead of each
-        # one hugging its own (shorter) label. Channel Transition no longer
-        # takes part in this -- it's now a half-width button paired with
-        # Letterboxing (see _pair_btn_w below), not a third full-width row.
-        _common_btn_label_w = max(
-            f_menu_lg.size("VOLUME BAR: VOLUME 1")[0],
-            f_menu_lg.size("VOLUME BAR: VOLUME 2")[0],
-            f_menu_lg.size("CHANNEL STATIC: RAINBOW")[0],
-            f_menu_lg.size("CHANNEL STATIC: WHITE")[0],
-            f_menu_lg.size("CHANNEL STATIC: THEME")[0],
-            f_menu_lg.size("CHANNEL STATIC: GREY")[0],
-        )
-        _common_btn_w = _common_btn_label_w + 40
-
-        vol_bar_btn_w = _common_btn_w
-
-        vol_bar_btn_x = cx + (content_w // 2) - (vol_bar_btn_w // 2)
-        pygame.draw.rect(menu_canvas, BUTTON_BLUE, (vol_bar_btn_x, vol_bar_button_y, vol_bar_btn_w, trans_btn_h), border_radius=box_radius)
-        if is_vol_bar_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (vol_bar_btn_x, vol_bar_button_y, vol_bar_btn_w, trans_btn_h), focus_thickness, border_radius=box_radius)
-
-        lbl_vol_bar = f_menu_lg.render(f"VOLUME BAR: {vol_bar_value_text}", True, TEXT_WHITE)
-        lbl_vol_bar_y = vol_bar_button_y + (trans_btn_h // 2) - (f_menu_lg.get_height() // 2)
-        menu_canvas.blit(lbl_vol_bar, (cx + (content_w // 2) - (lbl_vol_bar.get_width() // 2), lbl_vol_bar_y))
-
-        is_static_focused = (layer == "THEME_ROWS" and cur_sel == 1)
-
-        static_color_val = db.config.get("static_noise_color", "white")
-        static_value_text = {"rainbow": "RAINBOW", "theme": "THEME", "white": "WHITE"}.get(static_color_val, "GREY")
-
-        static_btn_w = _common_btn_w
-
-        static_btn_x = cx + (content_w // 2) - (static_btn_w // 2)
-        pygame.draw.rect(menu_canvas, BUTTON_BLUE, (static_btn_x, static_button_y, static_btn_w, trans_btn_h), border_radius=box_radius)
-        if is_static_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (static_btn_x, static_button_y, static_btn_w, trans_btn_h), focus_thickness, border_radius=box_radius)
-
-        lbl_static = f_menu_lg.render(f"CHANNEL STATIC: {static_value_text}", True, TEXT_WHITE)
-        lbl_static_y = static_button_y + (trans_btn_h // 2) - (f_menu_lg.get_height() // 2)
-        menu_canvas.blit(lbl_static, (cx + (content_w // 2) - (lbl_static.get_width() // 2), lbl_static_y))
-
-        # Channel Transition and Letterboxing now share one row as a pair
-        # of equal-size buttons (Channel Transition on the left,
-        # Letterboxing on the right), centered together as a single block
-        # -- same idea as the Water Mark/Add pair in the Channels Settings
-        # sub-menu. cur_sel stays 2 for this whole row (Opacity/Background
-        # Color/Border-Text Color/Close keep their existing row numbers);
-        # theme_row2_col (0=Channel Transition, 1=Letterboxing) tracks
-        # which of the pair is focused.
-        _theme_row2_col = app_state.get("theme_row2_col", 0) if cur_sel == 2 else 0
-        is_tt_focused = (layer == "THEME_ROWS" and cur_sel == 2 and _theme_row2_col == 0)
-        is_lb_focused = (layer == "THEME_ROWS" and cur_sel == 2 and _theme_row2_col == 1)
-
-        transition_type_val = db.config.get("transition_type", "black")
-        tt_value_text = "STATIC" if transition_type_val == "static" else "BLACK"
-
-        letterbox_color_val = db.config.get("letterbox_color", "black")
-        lb_value_text = "GREY" if letterbox_color_val == "grey" else "BLACK"
-
-        _pair_btn_label_w = max(
-            f_menu_lg.size("CHANNEL TRANSITION: BLACK")[0],
-            f_menu_lg.size("CHANNEL TRANSITION: STATIC")[0],
-            f_menu_lg.size("LETTERBOXING: BLACK")[0],
-            f_menu_lg.size("LETTERBOXING: GREY")[0],
-        )
-        _pair_btn_w = _pair_btn_label_w + 40
-        _pair_gap = 20
-        _pair_total_w = (_pair_btn_w * 2) + _pair_gap
-        _pair_start_x = cx + (content_w // 2) - (_pair_total_w // 2)
-
-        trans_btn_w = _pair_btn_w
-        trans_btn_x = _pair_start_x
-        pygame.draw.rect(menu_canvas, BUTTON_BLUE, (trans_btn_x, trans_type_button_y, trans_btn_w, trans_btn_h), border_radius=box_radius)
-        if is_tt_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (trans_btn_x, trans_type_button_y, trans_btn_w, trans_btn_h), focus_thickness, border_radius=box_radius)
-
-        lbl_tt = f_menu_lg.render(f"CHANNEL TRANSITION: {tt_value_text}", True, TEXT_WHITE)
-        lbl_tt_y = trans_type_button_y + (trans_btn_h // 2) - (f_menu_lg.get_height() // 2)
-        menu_canvas.blit(lbl_tt, (trans_btn_x + (trans_btn_w // 2) - (lbl_tt.get_width() // 2), lbl_tt_y))
-
-        letterbox_btn_w = _pair_btn_w
-        letterbox_btn_x = _pair_start_x + _pair_btn_w + _pair_gap
-        pygame.draw.rect(menu_canvas, BUTTON_BLUE, (letterbox_btn_x, trans_type_button_y, letterbox_btn_w, trans_btn_h), border_radius=box_radius)
-        if is_lb_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (letterbox_btn_x, trans_type_button_y, letterbox_btn_w, trans_btn_h), focus_thickness, border_radius=box_radius)
-
-        lbl_lb = f_menu_lg.render(f"LETTERBOXING: {lb_value_text}", True, TEXT_WHITE)
-        lbl_lb_y = trans_type_button_y + (trans_btn_h // 2) - (f_menu_lg.get_height() // 2)
-        menu_canvas.blit(lbl_lb, (letterbox_btn_x + (letterbox_btn_w // 2) - (lbl_lb.get_width() // 2), lbl_lb_y))
-
-        # Slider block (Opacity, then Background Color, then Border/Text
-        # Color) now starts below the three buttons above. Each block is
-        # a title then its slider -- Opacity's slider sits 30px under its
-        # title, the two gradient sliders sit 50px under theirs (they're
-        # visually taller). block_spacing (title-to-title distance) is
-        # computed to fit the remaining room, capped at the original 88px
-        # so it never stretches looser than before on tall windows, and
-        # floored so the last slider can never sink below
-        # close_btn_y - 15.
         slider_block_top = trans_type_button_y + trans_btn_h + 34
         slider_area_bottom = close_btn_y - 15
-        _last_block_reserve = 50 + gradient_height  # Border/Text Color's own title->slider->bar height
+        # VALUES CHANGE HERE
+        _last_block_reserve = 50 + gradient_height
         block_spacing = min(88, max(50, (slider_area_bottom - slider_block_top - _last_block_reserve) // 2))
-        # Opacity->Background Color gap tightened a bit versus the other
-        # gap (Background Color->Border/Text Color, still block_spacing)
-        # -- just closes up the extra whitespace between the Opacity
-        # slider and the "BACKGROUND COLOR" title sitting right below it.
         _first_gap = max(38, block_spacing - 18)
 
         trans_title_y = slider_block_top
@@ -6055,7 +5222,68 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         ui_title_y = bg_title_y + block_spacing
         ui_slider_y = ui_title_y + 50
 
-        is_trans_focused = (layer == "THEME_ROWS" and cur_sel == 3)
+        _theme_block_top = vol_bar_button_y
+        _theme_block_bottom = ui_slider_y + gradient_height
+        _theme_dy = (content_y + close_btn_y - _theme_block_top - _theme_block_bottom) // 2
+        vol_bar_button_y += _theme_dy
+        static_button_y += _theme_dy
+        trans_type_button_y += _theme_dy
+        trans_title_y += _theme_dy
+        trans_slider_y += _theme_dy
+        bg_title_y += _theme_dy
+        bg_slider_y += _theme_dy
+        ui_title_y += _theme_dy
+        ui_slider_y += _theme_dy
+
+        _theme_col = app_state.get("theme_row2_col", 0)
+        is_vol_bar_focused = (layer == "THEME_ROWS" and cur_sel == 0 and _theme_col == 0)
+        is_static_focused = (layer == "THEME_ROWS" and cur_sel == 0 and _theme_col == 1)
+        is_tt_focused = (layer == "THEME_ROWS" and cur_sel == 1 and _theme_col == 0)
+        is_lb_focused = (layer == "THEME_ROWS" and cur_sel == 1 and _theme_col == 1)
+
+        vol_bar_style_val = db.config.get("volume_bar_style", "1")
+        vol_bar_value_text = "VOLUME 2" if vol_bar_style_val == "2" else "VOLUME 1"
+
+        static_color_val = db.config.get("static_noise_color", "white")
+        static_value_text = {"rainbow": "RAINBOW", "theme": "THEME", "white": "WHITE"}.get(static_color_val, "GREY")
+
+        transition_type_val = db.config.get("transition_type", "black")
+        tt_value_text = "STATIC" if transition_type_val == "static" else "BLACK"
+
+        letterbox_color_val = db.config.get("letterbox_color", "black")
+        lb_value_text = "GREY" if letterbox_color_val == "grey" else "BLACK"
+
+        _pair_btn_label_w = max(
+            f_menu_lg.size("VOLUME BAR: VOLUME 1")[0],
+            f_menu_lg.size("VOLUME BAR: VOLUME 2")[0],
+            f_menu_lg.size("CHANNEL STATIC: RAINBOW")[0],
+            f_menu_lg.size("CHANNEL STATIC: WHITE")[0],
+            f_menu_lg.size("CHANNEL STATIC: THEME")[0],
+            f_menu_lg.size("CHANNEL STATIC: GREY")[0],
+            f_menu_lg.size("CHANNEL TRANSITION: BLACK")[0],
+            f_menu_lg.size("CHANNEL TRANSITION: STATIC")[0],
+            f_menu_lg.size("LETTERBOXING: BLACK")[0],
+            f_menu_lg.size("LETTERBOXING: GREY")[0],
+        )
+        _pair_btn_w = _pair_btn_label_w + 40
+        _pair_gap = 20
+        _pair_total_w = (_pair_btn_w * 2) + _pair_gap
+        _pair_start_x = cx + (content_w // 2) - (_pair_total_w // 2)
+        _pair_right_x = _pair_start_x + _pair_btn_w + _pair_gap
+
+        def _theme_pair_button(btn_x, btn_y, label_text, focused):
+            pygame.draw.rect(menu_canvas, BUTTON_BLUE, (btn_x, btn_y, _pair_btn_w, trans_btn_h), border_radius=box_radius)
+            if focused:
+                _aa_rounded_rect(menu_canvas, NEON_GREEN, (btn_x, btn_y, _pair_btn_w, trans_btn_h), focus_thickness, border_radius=box_radius)
+            _lbl = f_menu_lg.render(label_text, True, TEXT_WHITE)
+            menu_canvas.blit(_lbl, (btn_x + (_pair_btn_w // 2) - (_lbl.get_width() // 2), btn_y + (trans_btn_h // 2) - (f_menu_lg.get_height() // 2)))
+
+        _theme_pair_button(_pair_start_x, vol_bar_button_y, f"VOLUME BAR: {vol_bar_value_text}", is_vol_bar_focused)
+        _theme_pair_button(_pair_right_x, static_button_y, f"CHANNEL STATIC: {static_value_text}", is_static_focused)
+        _theme_pair_button(_pair_start_x, trans_type_button_y, f"CHANNEL TRANSITION: {tt_value_text}", is_tt_focused)
+        _theme_pair_button(_pair_right_x, trans_type_button_y, f"LETTERBOXING: {lb_value_text}", is_lb_focused)
+
+        is_trans_focused = (layer == "THEME_ROWS" and cur_sel == 2)
         title_color = NEON_GREEN if is_trans_focused else TEXT_WHITE
         
         trans_val = db.config.get("menu_opacity", 50)
@@ -6082,14 +5310,13 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 pygame.draw.line(_cached_bg_gradient_surf, _pixel_color, (i, 0), (i, gradient_height))
                 pygame.draw.line(_cached_ui_gradient_surf, _pixel_color, (i, 0), (i, gradient_height))
 
-        is_bg_focused = (layer == "THEME_ROWS" and cur_sel == 4)
+        is_bg_focused = (layer == "THEME_ROWS" and cur_sel == 3)
         title_color = NEON_GREEN if is_bg_focused else TEXT_WHITE
         
         lbl_bg = f_menu_lg.render("BACKGROUND COLOR", True, title_color)
         bg_title_x = cx + (content_w // 2) - (lbl_bg.get_width() // 2)
         menu_canvas.blit(lbl_bg, (bg_title_x, bg_title_y))
         
-        # Super-fast instant texture stamp replace pass
         menu_canvas.blit(_cached_bg_gradient_surf, (slider_x, bg_slider_y))
         
         bg_knob_x = slider_x + int((bg_hue / 360.0) * slider_width)
@@ -6097,14 +5324,13 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         if is_bg_focused:
             pygame.draw.circle(menu_canvas, NEON_GREEN, (bg_knob_x, bg_slider_y - 5), focus_knob_rad, SELECTION_BORDER_WIDTH)
         
-        is_ui_focused = (layer == "THEME_ROWS" and cur_sel == 5)
+        is_ui_focused = (layer == "THEME_ROWS" and cur_sel == 4)
         title_color = NEON_GREEN if is_ui_focused else TEXT_WHITE
         
         lbl_ui = f_menu_lg.render("BORDER/TEXT COLOR", True, title_color)
         ui_title_x = cx + (content_w // 2) - (lbl_ui.get_width() // 2)
         menu_canvas.blit(lbl_ui, (ui_title_x, ui_title_y))
         
-        # Super-fast instant texture stamp replace pass
         menu_canvas.blit(_cached_ui_gradient_surf, (slider_x, ui_slider_y))
         
         ui_knob_x = slider_x + int((ui_hue / 360.0) * slider_width)
@@ -6112,7 +5338,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         if is_ui_focused:
             pygame.draw.circle(menu_canvas, NEON_GREEN, (ui_knob_x, ui_slider_y - 5), focus_knob_rad, SELECTION_BORDER_WIDTH)
 
-        is_cl_focused = (layer == "THEME_ROWS" and cur_sel == 6)
+        is_cl_focused = (layer == "THEME_ROWS" and cur_sel == 5)
 
         pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
         if is_cl_focused: 
@@ -6120,6 +5346,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         lbl_c = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_c, (close_btn_x + (close_btn_w // 2) - (lbl_c.get_width() // 2), close_btn_y + close_txt_y_offset))
 
+    # ========================================================================
+    # SECTION: Games tab: console list
+    # ========================================================================
 
     elif active_tab == "Games" and layer in ("GAMES_LIST", "TAB_SELECTION"):
         import os
@@ -6140,7 +5369,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         page_start  = games_page * PAGE_SIZE
         page_items  = console_list[page_start:page_start + PAGE_SIZE]
 
-        # Scale cell size from content_w so the grid never overflows on smaller windows
         x_pad, y_pad = 8, 8
         cell_w = (content_w - (x_pad * (cols - 1)) - 20) // cols
         cell_h = max(52, int(content_h * 0.16))
@@ -6166,7 +5394,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if is_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (cell_x, cell_y, cell_w, cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
 
-            # Black inset background box — sits inside the blue button, makes logos pop
             inset_pad = 6
             inset_x   = cell_x + inset_pad
             inset_y   = cell_y + inset_pad
@@ -6206,7 +5433,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 lbl_name = f_body.render(CONSOLE_LABELS.get(console_key, console_key), True, TEXT_WHITE)
                 menu_canvas.blit(lbl_name, (inset_x + 8, inset_y + inset_h // 2 - lbl_name.get_height() // 2))
 
-            # Enabled indicator dot — top-right corner of the blue button (outside inset)
             pygame.draw.circle(menu_canvas, dot_color, (cell_x + cell_w - 10, cell_y + 10), 5)
 
         arrow_btn_y = grid_start_y + 3 * (cell_h + y_pad) - y_pad + 10
@@ -6250,24 +5476,15 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         sync_target      = int(db.config.get("all_profiles_sync_target", 1)) if db else 1
         sync_val_str     = f"Profile {sync_target}"
 
-        # All three black value badges (Profile N / timer minutes / track count)
-        # share one fixed width -- the widest of their worst-case strings -- so
-        # they render as three identically-sized buttons instead of each one
-        # hugging its own text.
         BADGE_W = max(f_ch_btn.size(PROFILE_BADGE_MAX_STR)[0],
                       f_ch_btn.size(TIMER_VAL_MAX_STR)[0],
                       f_ch_btn.size(MM_BADGE_MAX_STR)[0]) + 18
 
         _toggle_w = lambda lbl: f_ch_btn.size(lbl)[0] + 24 + 10 + 55
-        # Left column: the three plain toggles, stacked (All Consoles /
-        # Screen Saver / Menu Music), matching a reference screenshot.
         left_col_w = max(_toggle_w("All Consoles"), _toggle_w("Screen Saver:"), _toggle_w("Game Music:"))
 
-        # Right column: the three toggle-or-button + badge pairs, stacked
-        # (All Settings+profile / Screen Saver Timer / Set Music).
         _all_settings_pair_w = _toggle_w("All Settings") + 10 + BADGE_W
 
-        # Keep the column wide enough for the timer and music controls.
         _timer_w = f_ch_btn.size("Screen Saver Timer")[0] + 24 + 10 + BADGE_W
         right_col_w = max(_all_settings_pair_w, _timer_w)
         if not kiosk_on_gl:
@@ -6275,17 +5492,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             right_col_w = max(right_col_w, _set_w)
 
         col_gap = 93
-        # Both columns (toggles + badges) shifted left together as one block,
-        # so the "default" badge clears the Close button below it instead of
-        # butting right up against it. Close button's own position is fixed
-        # elsewhere and is untouched by this.
         GROUP_SHIFT_LEFT = 40
         _col_left_x_base = grid_start_x + 169 - GROUP_SHIFT_LEFT
-        # Right column position is derived from the left column's *original*
-        # spot, so nudging the left column below never drags this along.
+        # WARNING: the right column position comes from the left column's original spot; keep it ahead of the left-column nudge.
         col_right_x = _col_left_x_base + left_col_w + col_gap
-        # Left column (All Consoles / Screen Saver / Game Music) shifted right
-        # as a whole, closer to the right column, without moving col_right_x.
         LEFT_COL_SHIFT = 50
         col_left_x  = _col_left_x_base + LEFT_COL_SHIFT
         grid_bottom_y = grid_start_y + 3 * (cell_h + y_pad) - y_pad
@@ -6316,32 +5526,19 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if focused:
                 pygame.draw.circle(surf, NEON_GREEN, (hx, py + pill_h // 2), 11, SELECTION_BORDER_WIDTH)
 
-        # Left col: all three toggle boxes share one width (the widest label,
-        # "Screen Saver:") so their pills line up in a straight column instead
-        # of drifting with each label's own width.
         left_box_w = max(f_ch_btn.size("All Consoles")[0], f_ch_btn.size("Screen Saver:")[0],
                           f_ch_btn.size("Game Music:")[0]) + 24
 
-        # Left col row1 — All Consoles (sel=95)
         allcon_others = [c for c in console_list if c != "DVD"]
         allcon_all_on = bool(allcon_others) and all(enabled_map.get(c, False) for c in allcon_others)
         _draw_toggle(menu_canvas, col_left_x, row1_y, "All Consoles", allcon_all_on, cur_sel_g == 95, box_w=left_box_w)
 
-        # Left col row2 — Screen Saver (sel=98)
         _draw_toggle(menu_canvas, col_left_x, row2_y, "Screen Saver:", ss_on, cur_sel_g == 98, box_w=left_box_w)
 
-        # Left col row3 — Menu Music (sel=97)
         _draw_toggle(menu_canvas, col_left_x, row3_y, "Game Music:", mm_enabled, cur_sel_g == 97, box_w=left_box_w)
 
-        # Right col row1 — All Settings (sel=101). This button's own width (label
-        # + pill) is the alignment target the two rows below get pinned to, so
-        # the black value badges (Profile 1 / 5 min / default) all start at the
-        # same x instead of drifting with each row's own button width.
         _draw_toggle(menu_canvas, col_right_x, row1_y, "All Settings", all_profiles_sync, cur_sel_g == 101)
 
-        # Profile badge stays visible in its slot next to "All Settings" whether
-        # the toggle is on or off -- only its focus/edit affordance depends on
-        # all_profiles_sync being on. Dimmed when off so it still reads as inactive.
         all_settings_w   = _toggle_w("All Settings")
         sync_badge_x     = col_right_x + all_settings_w + 10
         if all_profiles_sync:
@@ -6358,13 +5555,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(lbl_sv, (sync_badge_x + (sync_badge_w - lbl_sv.get_width()) // 2,
                                    row1_y + (row_h - lbl_sv.get_height()) // 2))
 
-        # Right col row2 — Screen Saver Timer (sel=100). Stays on screen and stays
-        # navigable when Screen Saver is off; it just greys out and can't be
-        # activated until the toggle is back on.
         timer_lbl_col    = TEXT_WHITE if ss_on else (110, 110, 110)
         timer_lbl_surf   = f_ch_btn.render("Screen Saver Timer", True, timer_lbl_col)
-        # Pinned to the All Settings button's width (see above) so this row's
-        # value badge lines up with the Profile badge, not its own label width.
         timer_btn_w      = max(all_settings_w, timer_lbl_surf.get_width() + 24)
         timer_btn_col    = (40, 100, 180) if ss_on else (35, 45, 60)
         pygame.draw.rect(menu_canvas, timer_btn_col,
@@ -6390,15 +5582,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(lbl_tv, (val_badge_x + (val_badge_w - lbl_tv.get_width()) // 2,
                                    row2_y + (row_h - lbl_tv.get_height()) // 2))
 
-        # Right col row3 — Set Music (sel=96). Stays on screen and stays navigable when
-        # Menu Music is off; it just greys out and can't be activated until the toggle
-        # is back on. Kiosk mode still hides this row entirely (separate behavior).
         if not kiosk_on_gl:
             btn_col        = (40, 100, 180) if mm_enabled else (35, 45, 60)
             btn_lbl_col    = TEXT_WHITE if mm_enabled else (110, 110, 110)
             btn_lbl        = f_ch_btn.render("Set Music", True, btn_lbl_col)
-            # Pinned to the All Settings button's width so this row's value
-            # badge ("default") lines up with the Profile badge above it.
             set_btn_w      = max(all_settings_w, btn_lbl.get_width() + 24)
             pygame.draw.rect(menu_canvas, btn_col,    (col_right_x, row3_y, set_btn_w, row_h), border_radius=5)
             if is_set_focused:
@@ -6422,7 +5609,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             menu_canvas.blit(badge_surf, (badge_x + (badge_w - badge_surf.get_width()) // 2,
                                            row3_y + (row_h - badge_surf.get_height()) // 2))
 
-        # Close button
         is_close_g = (cur_sel_g == 99)
         _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
         pygame.draw.rect(menu_canvas, OFF_RED,
@@ -6432,6 +5618,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                              (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
         lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
         menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+
+    # ========================================================================
+    # SECTION: Games tab: console sub-menu
+    # ========================================================================
 
     elif active_tab == "Games" and layer == "GAMES_SUB_MENU":
         import os
@@ -6445,7 +5635,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         logos_dir = os.path.join(media.resolve_main_dir(), "images", "logos")
 
-        header_pad   = 8
         header_box_h = max(52, int(content_h * 0.18))
         header_box_w = content_w // 3
         header_box_x = cx + (content_w // 2) - (header_box_w // 2)
@@ -6453,7 +5642,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         logo_path  = os.path.join(logos_dir, f"{console_key}.png")
         logo_drawn = False
-        # Cache key includes size so it re-renders if the window is resized
         _sub_logo_cache = app_state.setdefault("_sub_logo_cache", {})
         _menu_logo_raw_cache = app_state.setdefault("_menu_logo_raw_cache", {})
         _sub_key = (console_key, header_box_w, header_box_h)
@@ -6483,7 +5671,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 header_box_y + header_box_h // 2 - lbl_sub.get_height() // 2
             ))
 
-        # Everything below starts after the header box with a gap
         top_y  = header_box_y + header_box_h + 14
         row_x  = cx + 35
         row_w  = content_w - 70
@@ -6498,23 +5685,20 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _con_enabled_map = db.config.get("consoles_enabled", {})
             for _c in _CON_ORDER:
                 if _c == "MENU":
-                    continue  # pseudo-console -- never counts toward "last active console"
+                    continue
                 if _con_enabled_map.get(_c, _c == "DVD"):
                     _active_console_count += 1
         _is_last_console = is_on and (_active_console_count <= 1)
 
         if console_key != "MENU":
-            # is_toggle_focused is False when locked (greyed item gets NO highlight)
             is_toggle_focused = (not _is_last_console) and (sub_row == 0)
             _toggle_label_color = (90, 90, 90) if _is_last_console else (NEON_GREEN if is_toggle_focused else TEXT_WHITE)
             lbl_toggle_txt = f_ch_label.render("Status:", True, _toggle_label_color)
             menu_canvas.blit(lbl_toggle_txt, (cx + 25, top_y + 4))
 
-            # Greyed out pill when locked; normal colors otherwise
             if _is_last_console:
-                sw_bg = (55, 90, 55)   # muted green - on but locked
+                sw_bg = (55, 90, 55)
                 sw_handle_col = (130, 130, 130)
-                # Draw lock icon (small padlock shape using rect+circle)
                 pygame.draw.rect(menu_canvas, (80, 80, 80), (cx + 208, top_y + 4, 10, 8), border_radius=2)
                 pygame.draw.circle(menu_canvas, (80, 80, 80), (cx + 213, top_y + 4), 4, 2)
             else:
@@ -6530,7 +5714,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 pygame.draw.circle(menu_canvas, NEON_GREEN, (sw_handle_x, top_y + 12), 11, SELECTION_BORDER_WIDTH)
 
         if not is_on:
-            # Console is OFF — show message and only Close button, same as channel sub-menu
             f_msg = _get_font("Courier New", 18, bold=True)
             lbl_msg1 = f_msg.render("CONSOLE IS CURRENTLY DISABLED", True, OFF_RED)
             lbl_msg2 = f_msg.render("Enable the console to access settings", True, TEXT_WHITE)
@@ -6556,50 +5739,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_map = f_ch_label.render("BUTTON MAPPING", True, NEON_GREEN if is_map_focused else TEXT_WHITE)
             menu_canvas.blit(lbl_map, (row_x + 20, top_y + cell_h + y_gap + cell_h // 2 - lbl_map.get_height() // 2))
 
-            # DVD's own Aspect Ratio / Screen Mode -- independent of the
-            # Video tab's settings (see media.py's "dvd_aspect_ratio" /
-            # "dvd_screen_mode" config keys). Same row style as BUTTON
-            # MAPPING / CHANGE AUDIO SELECTION above; current value is
-            # shown right in the label since pressing Select just cycles
-            # it in place.
-            _dvd_aspect_val = db.config.get("dvd_aspect_ratio", "16:9") if db is not None else "16:9"
             _dvd_mode_val   = db.config.get("dvd_screen_mode", "normal") if db is not None else "normal"
             _dvd_mode_labels = {"normal": "Normal Mode", "stretch": "Stretch Fit",
                                  "crop": "Crop Fit", "panscan": "Pan & Scan"}
-            # Locked to "4:3" and greyed out on real 4:3 hardware, same
-            # treatment as the Video tab's own Aspect Ratio row and
-            # Launched Games' "game_aspect_ratio" row above -- see
-            # _apply_config_defaults in media.py and the "dvd_aspect_ratio"
-            # row handler's lock guard in retro_tv_emulator.py, which
-            # no-ops Select while this is true. Still focusable/navigable,
-            # just dimmed and non-interactive.
-            # ALSO greyed while the CRT Bezel is on -- Bezel forces
-            # dvd_aspect_ratio to "4:3" for as long as it's on (see
-            # _apply_bezel_on_aspect_lock / _dvd_aspect_ratio_locked_by_bezel
-            # in retro_tv_emulator.py) and this mirrors that check inline,
-            # same as the Video tab row's own "_asp_locked_by_bezel" above,
-            # so the dimmed rendering and the no-op-on-Select behavior
-            # never disagree about when it's locked.
-            _dvd_aspect_locked = ((getattr(db, "_detected_aspect_ratio", None) == "4:3")
-                                  or (bool(db.config.get("fake_43_border_enabled", False))
-                                      and db.config.get("dvd_aspect_ratio", "16:9") == "4:3")) if db is not None else False
 
-            aspect_row_y = top_y + (cell_h + y_gap) * 2
-            is_aspect_focused = (sub_row == dvd_full_rows.index("dvd_aspect_ratio"))
-            _aspect_bg = (32, 32, 40) if _dvd_aspect_locked else (25, 45, 80)
-            if _dvd_aspect_locked:
-                _aspect_txt_color = (160, 160, 175) if is_aspect_focused else (105, 105, 115)
-            else:
-                _aspect_txt_color = NEON_GREEN if is_aspect_focused else TEXT_WHITE
-            pygame.draw.rect(menu_canvas, _aspect_bg, (row_x, aspect_row_y, short_row_w, cell_h), border_radius=6)
-            if is_aspect_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, aspect_row_y, short_row_w, cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            lbl_aspect = f_ch_label.render(
-                f"ASPECT RATIO: {_dvd_aspect_val}", True, _aspect_txt_color
-            )
-            menu_canvas.blit(lbl_aspect, (row_x + 20, aspect_row_y + cell_h // 2 - lbl_aspect.get_height() // 2))
-
-            mode_row_y = top_y + (cell_h + y_gap) * 3
+            mode_row_y = top_y + (cell_h + y_gap) * 2
             is_mode_focused = (sub_row == dvd_full_rows.index("dvd_screen_mode"))
             pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, mode_row_y, short_row_w, cell_h), border_radius=6)
             if is_mode_focused:
@@ -6610,12 +5754,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             )
             menu_canvas.blit(lbl_mode, (row_x + 20, mode_row_y + cell_h // 2 - lbl_mode.get_height() // 2))
 
-            # Change Audio Selection -- moved to the bottom of the left
-            # column, under Screen Mode, instead of right below Button
-            # Mapping.
             _dvd_audio_track_count = app_state.get("dvd_audio_track_count", 0)
             _dvd_audio_enabled = _dvd_audio_track_count > 1
-            audio_row_y = top_y + (cell_h + y_gap) * 4
+            audio_row_y = top_y + (cell_h + y_gap) * 3
             is_audio_focused = (sub_row == dvd_full_rows.index("dvd_audio_track"))
             _audio_bg = (25, 45, 80) if _dvd_audio_enabled else (35, 35, 35)
             _audio_txt_color = TEXT_WHITE if _dvd_audio_enabled else (110, 110, 110)
@@ -6628,8 +5769,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             )
             menu_canvas.blit(lbl_audio, (row_x + 20, audio_row_y + cell_h // 2 - lbl_audio.get_height() // 2))
 
-            # Splash Screen toggle + Video/Image buttons -- top of the right
-            # column, level with Status; occupies two rows.
             _cap_right_col_w = content_w // 3
             _cap_right_margin = 40
             _cap_right_col_x = cx + content_w - _cap_right_col_w - _cap_right_margin
@@ -6638,34 +5777,29 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                         cell_h, y_gap, dvd_full_rows, sub_row, f_ch_label, _get_font,
                                         NEON_GREEN, TEXT_WHITE, OFF_GREEN)
 
-            # Captions on/off toggle -- below the splash panel, level with
-            # BUTTON MAPPING's row-2 counterpart (AUDIO SELECTION on the left).
             _captions_row_y = top_y + (cell_h + y_gap) * 2
-            captions_on = db.config.get("dvd_captions_enabled", False) if db is not None else False
+            _cap_mode_locked = _mode_locks("dvd_captions_enabled")
+            captions_on = (db.config.get("dvd_captions_enabled", False) and not _cap_mode_locked) if db is not None else False
             is_captions_focused = (sub_row == dvd_full_rows.index("dvd_captions_toggle"))
-            lbl_captions_txt = f_ch_label.render("Captions:", True, NEON_GREEN if is_captions_focused else TEXT_WHITE)
+            lbl_captions_txt = f_ch_label.render("Captions:", True, NEON_GREEN if is_captions_focused else ((105, 105, 115) if _cap_mode_locked else TEXT_WHITE))
             menu_canvas.blit(lbl_captions_txt, (_cap_right_col_x, _captions_row_y + 4))
 
             _cap_sw_x = _cap_right_col_x + 210
-            _cap_sw_bg = OFF_GREEN if captions_on else (45, 65, 100)
+            _cap_sw_bg = (32, 32, 40) if _cap_mode_locked else (OFF_GREEN if captions_on else (45, 65, 100))
             pygame.draw.rect(menu_canvas, _cap_sw_bg, (_cap_sw_x, _captions_row_y, 55, 24), border_radius=12)
             if is_captions_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cap_sw_x, _captions_row_y, 55, 24), SELECTION_BORDER_WIDTH, border_radius=12)
             _cap_handle_x = _cap_sw_x + 42 if captions_on else _cap_sw_x + 12
-            pygame.draw.circle(menu_canvas, TEXT_WHITE, (_cap_handle_x, _captions_row_y + 12), 9)
+            pygame.draw.circle(menu_canvas, (100, 100, 100) if _cap_mode_locked else TEXT_WHITE, (_cap_handle_x, _captions_row_y + 12), 9)
             if is_captions_focused:
                 pygame.draw.circle(menu_canvas, NEON_GREEN, (_cap_handle_x, _captions_row_y + 12), 11, SELECTION_BORDER_WIDTH)
 
-            # Resume-from-last-played toggle -- right under Captions, below
-            # the last left-column row (floats with no left neighbor).
             _resume_row_y = top_y + (cell_h + y_gap) * 3
             resume_on = db.config.get("dvd_resume_enabled", False) if db is not None else False
             is_resume_focused = (sub_row == dvd_full_rows.index("dvd_resume_toggle"))
             lbl_resume_txt = f_ch_label.render("Resume:", True, NEON_GREEN if is_resume_focused else TEXT_WHITE)
             menu_canvas.blit(lbl_resume_txt, (_cap_right_col_x, _resume_row_y + 4))
 
-            # Align with the Captions switch directly above it, rather than
-            # sizing off this row's own (shorter) label width.
             _res_sw_x = _cap_sw_x
             _res_sw_bg = OFF_GREEN if resume_on else (45, 65, 100)
             pygame.draw.rect(menu_canvas, _res_sw_bg, (_res_sw_x, _resume_row_y, 55, 24), border_radius=12)
@@ -6690,47 +5824,19 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             grid_row_ids = [r for r in sub_rows if r in ("core_select", "controller_map", "multitap_toggle",
                                                            "menu_bg_select_image", "scroll_style", "text_color",
                                                            "scan_for_roms", "scan_for_cores", "clear_roms",
-                                                           "clear_cores", "game_aspect_ratio", "game_screen_mode")]
+                                                           "clear_cores", "game_screen_mode")]
             has_disc = "disc" in sub_rows
 
             grid_y = top_y + cell_h + y_gap
 
-            from game_deck import CONSOLE_SCROLL_STYLE_LABELS, LIST_TEXT_COLOR_NAMES, console_bezel_currently_active
+            from game_deck import CONSOLE_SCROLL_STYLE_LABELS, console_bezel_currently_active
 
             _cur_scroll_style = db.config.get("console_scroll_style", "carousel") if db else "carousel"
             _cur_text_color   = db.config.get("menu_text_color", "white") if db else "white"
             _multitap_on      = bool(db.config.get("multitap_enabled_global", False)) if db else False
 
-            # Launched Games' own Aspect Ratio / Screen Mode -- independent
-            # of the Video tab's "aspect_ratio"/"screen_mode" and DVD's
-            # "dvd_aspect_ratio"/"dvd_screen_mode" (see media.py's
-            # _apply_config_defaults and the GAMES_SUB_MENU row handlers in
-            # retro_tv_emulator.py). Locked to "4:3" and greyed out on real
-            # 4:3 hardware, same as the Video tab's Aspect Ratio row.
-            # ALSO greyed while the CRT Bezel is on -- Bezel forces
-            # game_aspect_ratio to "4:3" for as long as it's on (see
-            # _apply_bezel_on_aspect_lock / _game_aspect_ratio_locked_by_bezel
-            # in retro_tv_emulator.py) and this mirrors that check inline,
-            # same as the DVD tab's own "_dvd_aspect_locked" above, so the
-            # dimmed rendering and the no-op-on-Select behavior never
-            # disagree about when it's locked.
-            # ALSO greyed while THIS console's own bezel is on (the "game
-            # bezel" -- console_bezel_currently_active, distinct from the
-            # CRT/outer Bezel above). That bezel image is fit to whatever
-            # shape game_aspect_ratio currently selects; leaving the row
-            # editable while it's active let the aspect change out from
-            # under the bezel and put black bars over the bezel image
-            # instead. Purely cosmetic here too -- it dims the row, it
-            # doesn't force the stored value -- mirrored by the matching
-            # no-op-on-Select guard in retro_tv_emulator.py so the two
-            # never disagree.
-            _cur_game_aspect = db.config.get("game_aspect_ratio", "16:9") if db else "16:9"
             _cur_game_mode   = db.config.get("game_screen_mode", "normal") if db else "normal"
             _game_mode_labels = {"normal": "Normal Mode", "stretch": "Stretch Fit"}
-            _game_aspect_locked = ((getattr(db, "_detected_aspect_ratio", None) == "4:3")
-                                   or (bool(db.config.get("fake_43_border_enabled", False))
-                                       and db.config.get("game_aspect_ratio", "16:9") == "4:3")
-                                   or console_bezel_currently_active(console_key, db)) if db else False
 
             row_labels = {
                 "core_select":    "SELECT LIBRETRO CORE (.DLL)",
@@ -6743,24 +5849,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 "scan_for_cores": "SCAN FOR CORES",
                 "clear_roms":   "CLEAR ROMS",
                 "clear_cores":  "CLEAR CORES",
-                "game_aspect_ratio": f"GAME ASPECT RATIO:  {_cur_game_aspect}",
                 "game_screen_mode":  f"GAME SCREEN MODE:  {_game_mode_labels.get(_cur_game_mode, _cur_game_mode).upper()}",
             }
 
-            # The MENU console's settings list is long enough to overflow a
-            # single column, so it's laid out in two columns instead. Every
-            # other console keeps the original single-column stack.
             if console_key == "MENU":
-                # "Scan For Roms"/"Clear Roms" and "Game Aspect Ratio"/"Game
-                # Screen Mode" have swapped slots with each other -- Roms now
-                # sit at the bottom of the right column, Aspect Ratio/Screen
-                # Mode now sit under Controller Mapping on the left.
-                _menu_left_order  = ["controller_map", "game_aspect_ratio", "game_screen_mode",
+                _menu_left_order  = ["controller_map", "game_screen_mode",
                                       "scan_for_cores", "clear_cores"]
-                # "text_color" no longer gets its own row -- it's drawn as a
-                # small color-swatch button glued to the right of the
-                # (shortened) "scroll_style" row instead (see the
-                # "scroll_style" branch in the row-drawing loop below).
                 _menu_right_order = ["menu_bg_select_image", "multitap_toggle", "scroll_style",
                                      "scan_for_roms", "clear_roms"]
                 _left_ids  = [r for r in _menu_left_order if r in grid_row_ids]
@@ -6770,9 +5864,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _left_col_x   = row_x
                 _right_col_x  = row_x + _menu_col_w + _menu_col_gap
 
-                # Center the row block between the MENU logo box and the Close
-                # button, so the gap above the rows matches the gap below
-                # Clear Roms instead of the rows just sitting flush under the logo.
                 _menu_n_rows   = max(len(_left_ids), len(_right_ids))
                 _menu_block_h  = _menu_n_rows * cell_h + (_menu_n_rows - 1) * y_gap
                 _menu_top_bound    = header_box_y + header_box_h
@@ -6800,16 +5891,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             for row_id in grid_row_ids:
                 if row_id not in row_positions:
-                    # "text_color" (MENU tab only) is drawn as a swatch
-                    # button glued to "scroll_style" instead of its own row
-                    # -- see the "scroll_style" branch below -- so it has no
-                    # position of its own to look up here.
                     continue
                 rx, ry, rw = row_positions[row_id]
-                # On the MENU tab, "scroll_style" gives up its trailing edge
-                # to make room for the "text_color" swatch button sitting
-                # right next to it (see below), rather than "text_color"
-                # occupying a full row of its own.
                 if row_id == "scroll_style" and console_key == "MENU":
                     _ss_gap = 10
                     _ss_swatch_w = cell_h
@@ -6820,14 +5903,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     _has_content = _menu_clear_has_content[row_id]
                     _row_bg = (80, 30, 30) if _has_content else (32, 32, 40)
                     _row_txt_col = (NEON_GREEN if is_focused else (255, 150, 150)) if _has_content else (105, 105, 115)
-                elif row_id == "game_aspect_ratio" and _game_aspect_locked:
-                    # Real 4:3 hardware forces Game Aspect Ratio to "4:3" and
-                    # no-ops Select (see the "game_aspect_ratio" row handler
-                    # in retro_tv_emulator.py) -- still focusable/navigable,
-                    # just dimmed and non-interactive, matching the Video
-                    # tab's own locked Aspect Ratio row.
-                    _row_bg = (32, 32, 40)
-                    _row_txt_col = (160, 160, 175) if is_focused else (105, 105, 115)
                 else:
                     _row_bg = (25, 45, 80)
                     _row_txt_col = NEON_GREEN if is_focused else TEXT_WHITE
@@ -6838,12 +5913,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 menu_canvas.blit(lbl_r, (rx + 20, ry + cell_h // 2 - lbl_r.get_height() // 2))
 
                 if row_id == "scroll_style" and console_key == "MENU":
-                    # "Text Color" button: a small square glued to the right
-                    # of the (shortened) Scroll Style row above, just the
-                    # color swatch itself with no label -- selecting it still
-                    # cycles "menu_text_color" via the "text_color" row_id
-                    # handler in retro_tv_emulator.py, it just no longer has
-                    # its own full-width row.
                     from game_deck import LIST_TEXT_COLOR_RGB
                     _is_tc_focused = (sub_row == full_rows.index("text_color"))
                     _tc_x = rx + rw + _ss_gap
@@ -6963,14 +6032,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                             NEON_GREEN, TEXT_WHITE, OFF_GREEN)
 
             if console_key == "MENU":
-                # "Scan For Roms"/"Scan For Cores" result banner shares this
-                # same timed-flash pattern as the remote-remap reject warning
-                # (_remap_reject_flash): a plain 2s-visible message, no fade.
-                # Sits centered just above the Close button so it doesn't
-                # collide with either settings column. Gated to MENU (where
-                # these banners are actually set) so a message doesn't leak
-                # onto a different console's screen if the user navigates
-                # away within the 2s window.
                 _flash_msg = app_state.get("_games_menu_flash_msg")
                 _flash_at  = app_state.get("_games_menu_flash_at")
                 if _flash_msg and _flash_at is not None and (pygame.time.get_ticks() - _flash_at) < 2000:
@@ -6988,7 +6049,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
             menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
 
-
+    # ========================================================================
+    # SECTION: Games tab: save profile
+    # ========================================================================
 
     elif active_tab == "Games" and layer == "GAMES_SAVE_PROFILE":
         import os
@@ -7001,12 +6064,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         is_handheld = console_key in HANDHELD_CONSOLES
         is_border_console = border_available_for_console(console_key)
 
-        # Left column = save-state management (always present); right column =
-        # display-related toggles for this console (only shown when relevant).
-        # Row indices flow: 0 = active-profile banner, then left column
-        # top-to-bottom, then right column top-to-bottom, then Close.
-        # (Multitap now lives as a single global switch under Games -> MENU,
-        # not per-profile -- see get_games_sub_menu_rows.)
         right_specs = []
         if is_handheld:
             right_specs.append("screen_size")
@@ -7016,46 +6073,22 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         LOAD_ROW      = 2
         AUTO_SAVE_ROW = 3
         AUTO_LOAD_ROW = 4
-        SCREEN_SIZE_ROW = 5 + right_specs.index("screen_size") if "screen_size" in right_specs else None
         TV_BEZEL_ROW    = 5 + right_specs.index("tv_bezel") if "tv_bezel" in right_specs else None
 
-        # Bezel style picker: a second, separately-focusable control drawn
-        # as its own row directly below TV BEZEL (see the show_bezel_style
-        # block below) -- game/home consoles only (32X, A2600, GENESIS,
-        # MASTERSYSTEM, N64, NES, PSX, SNES). Handhelds keep their single
-        # fixed frame image, matching real handheld hardware. Must mirror
-        # retro_tv_emulator.py's GAMES_SAVE_PROFILE input handling exactly.
+        # WARNING: must mirror retro_tv_emulator.py's GAMES_SAVE_PROFILE input handling exactly.
         import sys as _sys
         _main = _sys.modules.get("__main__")
         _gd   = getattr(_main, "game_deck", None) if _main else None
         _console_bezel_style_n = 1
         if TV_BEZEL_ROW is not None and console_key in BORDER_CONSOLES_HOME and _gd is not None:
-            # Always at least 2 so the picker is a usable 1<->2 toggle even
-            # before a second bezel image file exists on disk -- the row is
-            # now always shown for these consoles (see show_bezel_style
-            # below), not gated on file count, so the cycle range can't be
-            # gated on file count either or Enter would never move off 1.
-            # _load_border_surface still clamps to the REAL discovered file
-            # count when picking which image to actually display, so
-            # selecting "2" with no bezel2.png present just safely falls
-            # back to showing style 1's image instead of erroring.
             _console_bezel_style_n = max(_gd.console_bezel_style_count(console_key), 2)
         show_bezel_style = TV_BEZEL_ROW is not None and console_key in BORDER_CONSOLES_HOME
         TV_BEZEL_STYLE_ROW = (5 + len(right_specs)) if show_bezel_style else None
         back_row      = 5 + len(right_specs) + (1 if show_bezel_style else 0)
 
-        # Read active profile + this profile's settings from db
-        # Outer/whole-screen TV Bezel (Channels tab) and this console's own
-        # decorative bezel can't sensibly layer -- see
-        # _outer_tv_bezel_blocks_console_bezel in game_deck.py for why.
-        # Home/game consoles only; handhelds are unaffected.
-        # Also blocked on real 4:3 hardware (a real CRT has its own
-        # physical bezel) -- same greyed-out treatment as the Bezel toggle.
-        _real_43_blocks = bool(console_key in BORDER_CONSOLES_HOME and _is_real_43_display(db))
-        _outer_bezel_blocks = (console_key in BORDER_CONSOLES_HOME
-                               and bool(db.config.get("fake_43_border_enabled", False)) if db else False) or _real_43_blocks
+        _outer_bezel_blocks = bool(console_key in BORDER_CONSOLES_HOME
+                                   and db and db.config.get("fake_43_border_enabled", False))
 
-        # Read active profile + this profile's settings from db
         all_profiles_cfg = db.config.get("console_profiles", {}) if db else {}
         con_prof_cfg     = all_profiles_cfg.get(console_key, {})
         active_profile   = int(con_prof_cfg.get("active", 1))
@@ -7110,15 +6143,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         col_w    = (content_w - 70 - col_gap) // 2
         right_x  = left_x + col_w + col_gap
 
-        # Banner is sized/centered like the original single-column layout.
         banner_w = content_w // 3
         banner_x = cx + content_w // 2 - banner_w // 2
         banner_h = cell_h2
 
-        # Distribute the remaining vertical space evenly between: title ->
-        # banner, banner -> options grid, and options grid -> Close button.
         title_h   = lbl_prefix.get_height()
-        grid_rows = 4  # left column (save/load/auto-save/auto-load) always has 4
+        grid_rows = 4
         grid_h    = grid_rows * cell_h2 + (grid_rows - 1) * gap2
         close_h   = 40
         top_margin    = 14
@@ -7136,13 +6166,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             bg   = (30, 50, 30) if is_foc else (20, 30, 50)
             bdr  = NEON_GREEN  if is_foc else (50, 70, 100)
             if greyed:
-                # Still needs to look focused when the cursor is sitting on
-                # it -- these rows are legitimately reachable while the
-                # profile is inactive (they just don't DO anything until
-                # it's active), so wiping out the highlight here made the
-                # cursor invisible while passing through them, as if nav
-                # had skipped straight to Close. Use a muted (not green)
-                # highlight so it's still clearly "disabled" but visible.
                 bg  = (34, 34, 46) if is_foc else (22, 22, 30)
                 bdr = (110, 110, 125) if is_foc else (45, 45, 55)
             pygame.draw.rect(menu_canvas, bg,  (x_pos, y_pos, width, cell_h2), border_radius=5)
@@ -7161,29 +6184,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_row = f_ch_label.render(label, True, txt_col)
             menu_canvas.blit(lbl_row, (label_x, y_pos + cell_h2 // 2 - lbl_row.get_height() // 2))
             if toggle_val is not None:
-                # A stepper (bezel style picker) drawn on this same row
-                # reserves space at the row's right edge, shrinking the
-                # ON/OFF switch leftward to make room for it -- same
-                # compact number-box look as the Channels-tab Bezel Style
-                # control, just inline with the switch instead of below it.
                 _step_lbl = None
                 _step_box_w = 0
                 _step_reserve = 0
                 if stepper_value is not None:
                     _step_lbl = f_ch_btn.render(str(stepper_value), True, TEXT_WHITE)
                     _step_box_w = max(32, _step_lbl.get_width() + 20)
-                    # 40px of daylight between the switch and the stepper
-                    # box, not 16 -- 16 was mathematically non-overlapping
-                    # but read as one crowded control at a glance since the
-                    # switch's pill shape and the stepper's box sat almost
-                    # flush against each other. This is on top of the
-                    # switch itself being shrunk further below.
                     _step_reserve = _step_box_w + 40
 
                 sw_bg  = OFF_GREEN if toggle_val else (45, 65, 100)
                 if greyed:
                     sw_bg = (35, 35, 45)
-                # Shrink the switch when a stepper sits beside it.
                 if stepper_value is not None:
                     sw_w, sw_h = 36, 20
                 else:
@@ -7219,11 +6230,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 menu_canvas.blit(lbl_val, (x_pos + width - lbl_val.get_width() - 16,
                                            y_pos + cell_h2 // 2 - lbl_val.get_height() // 2))
 
-        # Row 0: active-profile banner (sized like the original, centered)
         act_label = "ACTIVE PROFILE" if is_active else "SET AS ACTIVE PROFILE"
         _draw_prof_row(0, act_label, banner_x, banner_y, banner_w, active_square=(True if is_active else None))
 
-        # Left column: save-state management (always present)
         _draw_prof_row(SAVE_ROW,      "SAVE NOW",  left_x, rows_top + 0 * (cell_h2 + gap2), col_w,
                        greyed=not is_active)
         _draw_prof_row(LOAD_ROW,      "LOAD NOW",  left_x, rows_top + 1 * (cell_h2 + gap2), col_w,
@@ -7233,7 +6242,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _draw_prof_row(AUTO_LOAD_ROW, "AUTO-LOAD", left_x, rows_top + 3 * (cell_h2 + gap2), col_w,
                        toggle_val=auto_load_on, greyed=not is_active)
 
-        # Right column: display-related settings for this console
         for i, key in enumerate(right_specs):
             idx = 5 + i
             y   = rows_top + i * (cell_h2 + gap2)
@@ -7244,7 +6252,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _draw_prof_row(idx, "TV BEZEL", right_x, y, col_w,
                                toggle_val=border_on, greyed=(not is_active) or _outer_bezel_blocks)
 
-        # Draw the bezel style picker below TV BEZEL.
         if show_bezel_style:
             _style_y = rows_top + len(right_specs) * (cell_h2 + gap2)
             _draw_prof_row(TV_BEZEL_STYLE_ROW, "BEZEL STYLE", right_x, _style_y, col_w,
@@ -7262,7 +6269,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(lbl_bk, (_bk_x + _bk_w // 2 - lbl_bk.get_width() // 2,
                                    _bk_y + _bk_h // 2 - lbl_bk.get_height() // 2))
 
-        # Note if toggles are greyed
         if not is_active:
             note = _get_font("Courier New", 11).render(
                 "Set as active profile to enable auto-save / auto-load", True, (90, 90, 110))
@@ -7270,46 +6276,28 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                     close_y - note.get_height() - 8))
         elif _outer_bezel_blocks:
             note = _get_font("Courier New", 11).render(
-                ("Console TV Bezels aren't used on a real 4:3 display" if _real_43_blocks
-                 else "Turn off the main Bezel (Channels tab) to use this console's own TV Bezel"),
+                "Turn off the System Bezel (Channels tab) to use this console's own TV Bezel",
                 True, (90, 90, 110))
             menu_canvas.blit(note, (cx + content_w // 2 - note.get_width() // 2,
                                     close_y - note.get_height() - 8))
 
-    # Box into the shared package-aspect, margin-inset envelope (see
-    # fit_menu_envelope). With the Bezel off, contain-fit the 1036:680
-    # design shape inside that envelope (not independent-axis stretch,
-    # which warps every box, border and line of text out of proportion
-    # on any window that isn't exactly 1036:680). With the Bezel on,
-    # fit_menu_envelope reports stretch_fill=True and this stretches to
-    # exactly fill the envelope instead: the finished frame gets mapped
-    # per-axis onto the Bezel cutout right after this regardless, so
-    # contain-fitting here would just bake its own letterbox bars into
-    # that mapping -- stretching here instead lets the menu reach every
-    # edge of the margin, same as every other content type in Bezel mode.
-    _env_w, _env_h, _env_x, _env_y, _stretch_fill = fit_menu_envelope(real_w, real_h, db)
-    if _stretch_fill:
-        fit_w, fit_h = _env_w, _env_h
-    else:
-        fit_w = _env_w
-        fit_h = int(fit_w * (680.0 / 1036.0))
-        if fit_h > _env_h:
-            fit_h = _env_h
-            fit_w = int(fit_h * (1036.0 / 680.0))
+    # ========================================================================
+    # SECTION: Fit to envelope & return placement
+    # ========================================================================
 
-    _shrink = _menu_fit_shrink_factor(db)
-    if _shrink != 1.0:
-        fit_w = max(1, int(fit_w * _shrink))
-        fit_h = max(1, int(fit_h * _shrink))
+    final_x, final_y, fit_w, fit_h = menu_panel_rect(real_w, real_h, db)
 
     if fit_w == w and fit_h == h:
         stamp = menu_canvas
     else:
         stamp = pygame.transform.smoothscale(menu_canvas, (fit_w, fit_h))
-    final_x = _env_x + (_env_w - fit_w) // 2
-    final_y = _env_y + (_env_h - fit_h) // 2
 
     return stamp, (final_x, final_y)
+
+
+# ============================================================================
+# SECTION: Popups: quit, pick layout, controller wait, clear confirm
+# ============================================================================
 
 
 def render_quit_prompt(surface, theme, db=None):
@@ -7329,9 +6317,6 @@ def render_quit_prompt(surface, theme, db=None):
     TEXT_WHITE    = (255, 255, 255)
     ACTION_RED    = (255, 60, 60)
 
-    # Unlike the "Are You Sure" confirm popups (which always render fully
-    # opaque so their warning text stays readable), the minimize screen
-    # should track the same menu transparency slider as the regular menu.
     slider_val   = db.config.get("menu_opacity", 50) if db is not None else 50
     menu_opacity = int((slider_val / 100.0) * 255)
 
@@ -7341,7 +6326,7 @@ def render_quit_prompt(surface, theme, db=None):
     pygame.draw.rect(canvas, NEON_GREEN, (0, 0, CANVAS_W, CANVAS_H), 2)
 
     f_title = _get_font("Courier New", 22, bold=True)
-    f_body  = _get_font("Courier New", 19, bold=True)   # Body text font.
+    f_body  = _get_font("Courier New", 19, bold=True)
 
     lbl1 = f_title.render("MINIMIZE PROGRAM?", True, ARCADE_GOLD)
     lbl2 = f_body.render("PRESS  [ ESCAPE ]  TO RESUME", True, TEXT_WHITE)
@@ -7351,7 +6336,6 @@ def render_quit_prompt(surface, theme, db=None):
     canvas.blit(lbl2, (CANVAS_W//2 - lbl2.get_width()//2, 100))
     canvas.blit(lbl3, (CANVAS_W//2 - lbl3.get_width()//2, 140))
 
-    # Stamp onto screen — same logic as main menu
     dest_w, dest_h, dest_x, dest_y = fit_design_canvas(CANVAS_W, CANVAS_H, real_w, real_h)
     if dest_w == CANVAS_W and dest_h == CANVAS_H:
         surface.blit(canvas, (dest_x, dest_y))
@@ -7420,9 +6404,6 @@ def render_pick_layout_popup(surface, theme, db, game_deck, player_num):
     hint = f_hint.render("ENTER  REMAP NOW     ESC  DO IT LATER", True, (160, 160, 160))
     surface.blit(hint, (real_w // 2 - hint.get_width() // 2, box_y + box_h - 32))
 
-    if game_deck is not None:
-        game_deck._pick_layout_popup_remap_rect = remap_rect
-
 
 def render_controller_pick_wait_popup(surface, theme, db, game_deck, player_num):
     import colorsys
@@ -7489,16 +6470,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     state = app_state or {}
     target = state.get("clear_confirm_target")
 
-    # Every burn-in-risk warning (visualizer-style lock, per-console TV
-    # bezel, full-program bezel) shares one look, one body-copy template,
-    # and one "don't show this message again" checkbox -- kept in one
-    # table so none of them can drift from each other in wording or
-    # layout. Bezel targets only ever fire for the ON direction (turning
-    # one off is never a risk), so they only need a True entry.
-    # visualizer_style_change stores the pending style *name* (not a bool) in
-    # clear_confirm_burnin_new_value, and only ever fires in the one risky
-    # direction (leaving Random) -- same as the bezel targets -- so it always
-    # keys as True rather than looking at the stored value.
     if target == "visualizer_style_change":
         _burnin_turning_on = True
     else:
@@ -7507,22 +6478,13 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         ("visualizer_style_change", True):    "SWITCH OFF RANDOM STYLE?",
         ("console_bezel_toggle", True):       "TURN ON BEZEL?",
         ("program_bezel_toggle", True):       "TURN ON BEZEL?",
-        # Pixel Orbiter and the Games-tab Screen Saver are the burn-in-family
-        # members where the *off* direction is the risky one (they're
-        # protections themselves), so they key as False rather than True
-        # like the other three.
         ("pixel_orbiter_toggle", False):      "TURN OFF PIXEL ORBITER?",
         ("ch03_screensaver_toggle", False):   "TURN OFF SCREEN SAVER?",
     }
-    # One shared two-line warning for every burn-in-family target that
-    # warns on turning ON -- kept short and generic on purpose so it can't
-    # drift out of the box regardless of target, and so the warnings can't
-    # say slightly different things about the same underlying risk.
     _BURNIN_WARNING_LINES_ON = [
         "Turning this on puts you at risk for burn in.",
         "Beware of burn in on older TVs.",
     ]
-    # Same, but for Pixel Orbiter, where turning it OFF is the risk.
     _BURNIN_WARNING_LINES_OFF = [
         "Turning this off puts you at risk for burn in.",
         "Beware of burn in on older TVs.",
@@ -7537,9 +6499,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     _burnin_key = (target, _burnin_turning_on)
     _is_burnin_family = _burnin_key in _BURNIN_TITLES
 
-    # These popups all need the same taller box for the body copy plus the
-    # checkbox row that the plain single-line title layout doesn't have
-    # room for -- one shared height so they can't drift from each other.
     if _is_burnin_family:
         box_h = 290
     box_x = (real_w - box_w) // 2
@@ -7552,10 +6511,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         ui_color = tuple(theme.get("ui", ui_color))
         bg_color = tuple(theme.get("bg", bg_color))
 
-    # "Are You Sure" boxes (reset/clear confirmations and the burn-in-family
-    # warnings) are important to read and don't overlay well against busy
-    # backgrounds -- always render fully opaque regardless of the menu
-    # transparency slider.
     alpha_val = 255
     if theme is None and db is not None:
         try:
@@ -7600,11 +6555,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     surface.blit(title, (real_w // 2 - title.get_width() // 2, box_y + 25))
 
     if _is_burnin_family:
-        # Defensive width guard: the body copy is meant to fit comfortably
-        # inside the box at 15pt, but if a line ever comes out wider than
-        # the box (a longer target string, a different font falling back,
-        # etc.) step the size down rather than letting it run off the box
-        # edges.
         _body_max_w = box_w - 40
         _body_size = 15
         while _body_size > 10:
@@ -7647,14 +6597,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     )
 
     if _is_burnin_family:
-        # "Don't show this message again" checkbox -- sits between the
-        # buttons and the hint line. W/S moves focus between the Yes/No
-        # row and this row; ENTER toggles it while focused here (and
-        # confirms Yes/No while focus is on the buttons instead). Checked
-        # state persists to db.config so the confirmation can be skipped
-        # on future flips until the user resets it; left unchecked, every
-        # one of these three warnings shows again the next time its
-        # toggle is turned back on.
         _dont_show = state.get("clear_confirm_dont_show_again", False)
         _checkbox_focused = (_cc_focus == "checkbox")
         _cb_size = 16
@@ -7673,9 +6615,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     else:
         _hint_text = "A/D  NAVIGATE     ENTER  CONFIRM"
 
-    # Defensive width guard, same idea as the body copy above -- the hint
-    # is centered on the full popup width and must never run past the
-    # box's own edges.
     _hint_max_w = box_w - 20
     _hint_size = 17
     while _hint_size > 11:
@@ -7685,3 +6624,60 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         _hint_size -= 1
     hint = f_hint.render(_hint_text, True, (160, 160, 160))
     surface.blit(hint, (real_w // 2 - hint.get_width() // 2, box_y + box_h - 35))
+
+
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = [
+    "CAPTIONS_COLOR_BOX_SEL",
+    "DEFAULT_REMOTE_BINDINGS",
+    "DVD_MAP_ACTIONS",
+    "DVD_MAP_DEFAULTS",
+    "GPU_RENDER_MODE_ENABLED",
+    "GUIDE_DESIGN_H",
+    "GUIDE_DESIGN_H_4_3",
+    "GUIDE_DESIGN_W",
+    "GUIDE_DESIGN_W_4_3",
+    "GUIDE_NUM_COLS_16_9",
+    "GUIDE_NUM_COLS_4_3",
+    "GUIDE_TOTAL_HALF_HOURS",
+    "GUIDE_VISIBLE_ROWS_16_9",
+    "GUIDE_VISIBLE_ROWS_4_3",
+    "NUMBER_REMAP_ACTIONS",
+    "REMOTE_REMAP_ACTIONS",
+    "SELECTION_BORDER_WIDTH",
+    "SERVER_MENU_BTN_SEL",
+    "SYSTEM_ROW_META",
+    "UPDATER_AND_SERVER_FEATURES_ENABLED",
+    "clamp_guide_time_idx",
+    "compute_channel_name_char_limit",
+    "fit_design_canvas",
+    "fit_menu_envelope",
+    "menu_panel_rect",
+    "get_advanced_settings_menu_rows",
+    "get_cached_row_stops",
+    "get_channels_settings_menu_rows",
+    "get_current_guide_time_idx",
+    "get_dvd_binding",
+    "get_games_sub_menu_rows",
+    "get_guide_num_cols",
+    "get_guide_visible_rows",
+    "get_mock_discovered_servers",
+    "get_server_picker_display_rows",
+    "get_server_picker_entries",
+    "get_server_picker_selectable_count",
+    "get_system_menu_rows",
+    "guide_preload_tick",
+    "invalidate_guide_cache",
+    "preload_games_tab_assets",
+    "render_clear_confirm_popup",
+    "render_controller_pick_wait_popup",
+    "render_controls_splash",
+    "render_dvd_button_mapping_popup",
+    "render_loading_screen",
+    "render_pick_layout_popup",
+    "render_quit_prompt",
+    "render_settings_overlay_menu",
+    "render_tv_guide_async",
+]

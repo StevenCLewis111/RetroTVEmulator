@@ -1,9 +1,15 @@
 """Small, dependency-free updater for the Retro TV Emulator.
 
-The updater deliberately does not replace a running executable itself.  It
-downloads and validates a signed-by-hash zip, stages it in a private update
-directory, and asks update_helper.py (a separate process) to perform the
-Windows file swap after this process exits.
+Owns: manifest fetch and validation, package download, SHA-256 and zip-safety
+checks, staging, the background "is there an update" check, and handing a
+staged payload to update_helper.py.
+Does not own: the file swap itself (update_helper.py, a separate process) or
+any update UI (retro_tv_emulator.py).
+
+WARNING: this module must never replace a running executable itself. It
+downloads and validates a hash-checked zip, stages it in a private update
+directory, and asks update_helper.py to do the Windows file swap after this
+process exits.
 
 Manifest shape:
 
@@ -37,8 +43,12 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-# server_diagnostics.py may be a sibling of this file (server/) or one
-# directory up (../server), depending on how the build is packaged.
+# ============================================================================
+# SECTION: Server-path bootstrap
+# ============================================================================
+# NOTE: server_diagnostics.py may be a sibling of this file (server/) or one
+# directory up (../server), depending on how the build is packaged. The import
+# below has to stay after _add_server_path() for that reason.
 def _add_server_path():
     if getattr(sys, "frozen", False):
         _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
@@ -54,6 +64,12 @@ def _add_server_path():
 _add_server_path()
 from server_diagnostics import breadcrumb as _server_breadcrumb
 
+
+# ============================================================================
+# SECTION: Constants & errors
+# ============================================================================
+
+
 log = logging.getLogger("retro_tv.auto_updater")
 
 UPDATE_DIR_NAME = ".retro_tv_updates"
@@ -67,6 +83,11 @@ VERSION_RE = re.compile(r"^[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$")
 
 class UpdateError(RuntimeError):
     """An expected, user-displayable update failure."""
+
+
+# ============================================================================
+# SECTION: Local state helpers
+# ============================================================================
 
 
 def _update_dir(base_dir):
@@ -101,6 +122,11 @@ def _read_json(path, default=None):
         return value
     except (FileNotFoundError, OSError, ValueError, TypeError):
         return default
+
+
+# ============================================================================
+# SECTION: Version handling & configuration
+# ============================================================================
 
 
 def parse_version(value):
@@ -142,8 +168,8 @@ def current_version(base_dir, config=None):
         if value:
             return str(value).strip()
 
-    # Development/source copies have no release stamp.  A release manifest
-    # with version 0.0.0 is therefore the natural "no update" baseline.
+    # NOTE: development/source copies have no release stamp, so 0.0.0 is the
+    # "no update" baseline.
     return "0.0.0"
 
 
@@ -156,11 +182,16 @@ def manifest_url(config=None):
     ).strip()
 
 
+# ============================================================================
+# SECTION: Manifest fetch, validation & update check
+# ============================================================================
+
+
 def _validate_url(url, label="URL"):
     parsed = urllib.parse.urlparse(str(url))
     if parsed.scheme.lower() != "https":
-        # HTTP is useful for an explicitly local test server, but never permit
-        # a remote plaintext update source.
+        # WARNING: plain HTTP is allowed for a local test server only. Never
+        # permit a remote plaintext update source.
         host = (parsed.hostname or "").lower()
         if not (parsed.scheme.lower() == "http" and host in ("127.0.0.1", "localhost", "::1")):
             raise UpdateError(f"{label} must use HTTPS")
@@ -245,6 +276,11 @@ def check_for_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
     }
 
 
+# ============================================================================
+# SECTION: Package download & extraction
+# ============================================================================
+
+
 def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS):
     _validate_url(url, "Update package URL")
     request = urllib.request.Request(
@@ -283,8 +319,8 @@ def _safe_zip_member(info):
     parts = [part for part in name.split("/") if part not in ("", ".")]
     if ".." in parts:
         return False
-    # Reject Unix symlink entries; extracting one would make the stage escape
-    # its directory later when the helper copies it.
+    # WARNING: reject Unix symlink entries. Extracting one would let the stage
+    # escape its directory when the helper copies it.
     mode = (info.external_attr >> 16) & 0xFFFF
     if (mode & 0o170000) == 0o120000:
         return False
@@ -303,7 +339,7 @@ def _extract_package(package_path, stage_root):
     except zipfile.BadZipFile as exc:
         raise UpdateError("Downloaded update is not a valid zip archive") from exc
 
-    # Accept either a flat package or the common single-root-folder package.
+    # NOTE: accepts either a flat package or a single-root-folder package.
     entries = [
         os.path.join(stage_root, name)
         for name in os.listdir(stage_root)
@@ -312,6 +348,11 @@ def _extract_package(package_path, stage_root):
     if len(entries) == 1 and os.path.isdir(entries[0]):
         return entries[0]
     return stage_root
+
+
+# ============================================================================
+# SECTION: Staging
+# ============================================================================
 
 
 def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS):
@@ -357,6 +398,11 @@ def stage_available_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECOND
     return result
 
 
+# ============================================================================
+# SECTION: Background check
+# ============================================================================
+
+
 def background_check_loop(base_dir, config_provider, result_callback, stop_event,
                           initial_delay=120, interval=DEFAULT_CHECK_INTERVAL_SECONDS):
     """Check manifests quietly; never download or install in the background.
@@ -377,9 +423,8 @@ def background_check_loop(base_dir, config_provider, result_callback, stop_event
                 if result_callback is not None:
                     result_callback(result)
         except Exception as exc:
-            # This loop only ticks every DEFAULT_CHECK_INTERVAL_SECONDS (hours
-            # apart), so a plain log call here can never become log spam even
-            # without the breadcrumb coalescing used elsewhere.
+            # NOTE: this loop ticks hours apart, so a failure here cannot spam
+            # the log; interval=0.0 emits every one.
             _server_breadcrumb(
                 log, logging.WARNING, "background-update-check",
                 "[UPDATE DIAG] Background update check failed: %s", exc,
@@ -394,6 +439,11 @@ def background_check_loop(base_dir, config_provider, result_callback, stop_event
                 })
         if stop_event.wait(interval):
             return
+
+
+# ============================================================================
+# SECTION: Hand-off to update_helper
+# ============================================================================
 
 
 def _helper_command(base_dir):
@@ -445,3 +495,13 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
         )
         raise UpdateError(f"Could not start update helper: {exc}") from exc
     return process.pid
+
+
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = [
+    "UpdateError", "parse_version", "version_is_newer", "current_version",
+    "manifest_url", "validate_manifest", "check_for_update", "stage_update",
+    "stage_available_update", "background_check_loop", "launch_staged_update",
+]

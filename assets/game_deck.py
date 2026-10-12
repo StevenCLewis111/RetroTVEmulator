@@ -1,4 +1,8 @@
+"""External game deck: console carousel, ROM lists, DVD player screen, gamepad input and launchers.
 
+WARNING: surfaces drawn here are filled with (1, 1, 1), never pure black, wherever they can end up
+under the game overlay. (0, 0, 0) is the overlay transparency key.
+"""
 import os
 import sys
 import re
@@ -13,10 +17,18 @@ import logging
 import collections
 import pygame
 import pygame.gfxdraw
+import menu_nav as _nav
+import performance_governor as _gov
 
 from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info,
                     is_dvd_disc_source, apply_video_effects,
-                    generate_captions_via_asr_chunked, _asr_slot)
+                    generate_captions_via_asr_chunked, _asr_slot, resolve_caption_source)
+
+
+# ============================================================================
+# SECTION: Logger & optional DVD highlight module
+# ============================================================================
+
 
 log = logging.getLogger(__name__)
 
@@ -27,12 +39,18 @@ except Exception as _e:
     log.warning(f"[DVD HIGHLIGHT] dvdnav_highlight module unavailable ({_e}) -- "
           f"menu highlight overlay disabled, playback unaffected.")
 
+
+# ============================================================================
+# SECTION: Archive helpers (7-Zip, zip/7z/rar entries)
+# ============================================================================
+
+
 def _find_7zip_exe():
     """Return path to 7z.exe, or None when 7-Zip is not installed / not on PATH."""
     candidates = [
         r"C:\Program Files\7-Zip\7z.exe",
         r"C:\Program Files (x86)\7-Zip\7z.exe",
-        "7z",      # Linux / macOS homebrew / PATH
+        "7z",
         "7z.exe",
     ]
     for path in candidates:
@@ -49,25 +67,11 @@ def _find_7zip_exe():
     return None
 
 
-# Every archive container the rom picker/scanner will recognize. RAR is
-# routed through the same system 7-Zip binary as .7z (modern 7-Zip reads,
-# and in most current builds also extracts, RAR/RAR5 via its bundled
-# codec) -- there's no extra Python dependency for it, same as .7z.
 ARCHIVE_EXTS = (".zip", ".7z", ".rar")
 
 
 def _list_archive_entries(archive_path):
-    """Peek inside a .zip/.7z/.rar archive and return a list of (entry_name,
-    size) pairs WITHOUT extracting anything -- for .zip this only reads
-    the central directory (zipfile never decompresses to do this), and
-    for .7z/.rar it's a listing-only 7z call ("7z l"), never an extract.
-    Cheap enough to run during a scan, unlike actually pulling files out.
-
-    Returns None (as opposed to an empty list) when the archive couldn't
-    be listed at all -- corrupt file, encrypted/unsupported 7z, 7-Zip not
-    installed, or a RAR variant this 7-Zip build can't read -- so callers
-    can tell "verified empty" apart from "couldn't verify" and decide how
-    to handle each case."""
+    """List the (entry_name, size) pairs inside a .zip/.7z/.rar without extracting anything."""
     ext = os.path.splitext(archive_path)[1].lower()
     try:
         if ext == ".zip":
@@ -103,52 +107,20 @@ def _list_archive_entries(archive_path):
     return None
 
 
-# (path, size, mtime, console) -> bool. Module-level so it's shared by both
-# scan entry points (per-console folder browsing AND the bulk "Scan For
-# Roms" walk) and survives the 1.5s live-rescan timer re-hitting the same
-# folder over and over without re-opening every archive each time.
-#
-# Bounded as an LRU: the key includes mtime, so a ROM that gets
-# re-downloaded/re-compressed leaves its old-mtime entry behind forever
-# alongside the new one if nothing ever evicts -- on top of the cache
-# simply growing without limit across a long-running session that scans
-# many different folders. Capping at a generous size and evicting
-# least-recently-used entries bounds memory while still keeping the
-# common case (repeat scans of the same folder) fast.
 _ARCHIVE_CONTENT_CACHE = collections.OrderedDict()
 _ARCHIVE_CONTENT_CACHE_LOCK = threading.Lock()
 _ARCHIVE_CONTENT_CACHE_MAX_ENTRIES = 5000
 
 
 def _archive_matches_console(archive_path, console):
-    """Best-effort content check for a .zip/.7z/.rar that's already passed the
-    extension filter for `console`: does it actually contain a file with
-    that console's real (non-archive) extension inside, or is it only
-    riding along because .zip/.7z itself happens to be an accepted
-    extension for nearly every console? A folder-name match alone can't
-    tell an arcade "CPS1" zip full of raw MAME chip dumps apart from a
-    genuine PSX zip -- this looks at what's actually inside the archive
-    instead of trusting the folder it was found in.
-
-    Returns True (treat as a match) when the archive genuinely contains a
-    matching file, OR when it couldn't be inspected at all (corrupt file,
-    encrypted 7z, 7-Zip not installed) -- failing OPEN in that case so an
-    archive that simply can't be peeked into doesn't just silently vanish
-    from the list; a truly bad file still gets a real error at launch
-    time (see _extract_rom_from_zip) instead of being hidden here.
-    Returns False only when the archive WAS read successfully and
-    genuinely contains nothing matching this console.
-
-    Cached per (path, size, mtime, console) -- see _ARCHIVE_CONTENT_CACHE
-    -- so repeat scans of the same folder don't re-open the same archive
-    on every pass."""
+    """Checks that a .zip/.7z/.rar passing the extension filter for `console` contains a file with that console's extension, cached per (path, size, mtime, console)."""
     ext = os.path.splitext(archive_path)[1].lower()
     if ext not in (".zip", ".7z", ".rar"):
         return True
 
     real_exts = [e for e in ROM_EXTENSIONS.get(console, []) if e not in (".zip", ".7z", ".rar")]
     if not real_exts:
-        return True   # console has no distinct inner extension to check against
+        return True
 
     cache_key = None
     try:
@@ -178,68 +150,21 @@ def _archive_matches_console(archive_path, console):
                 _ARCHIVE_CONTENT_CACHE.popitem(last=False)
     return result
 
+# WARNING: importing this module runs _find_7zip_exe() (up to 4 subprocess calls).
+# WARNING: retro_tv_emulator.py imports game_deck lazily inside functions on purpose; a top-level import moves that cost into app boot.
 _7ZIP_EXE = _find_7zip_exe()
+
+
+# ============================================================================
+# SECTION: Shared helpers: throttled log, fonts, drive checks
+# ============================================================================
+
 
 def _log_warn_throttled(_key, msg, *args, **_kwargs):
     log.error(msg, *args)
 
 
-# Was a complete no-op (__enter__/__exit__ did nothing, "_stage" was never
-# even stored) -- every `with _perf_timer(...)` in this file has been
-# silently measuring nothing since whenever this was written. That left
-# the console's own per-frame picture blit (_libretro_blit_scaled's
-# pygame.transform.scale, run on EVERY frame for EVERY console) and its
-# decorative bezel compositing (_blit_bordered_cached's border art blit,
-# run whenever a console's own bezel is on) completely outside any of
-# the [CRT-SHADER TIMING]/[BEZEL SCALE TIMING]/[BORDER BLIT TIMING] logs
-# in retro_tv_emulator.py -- those only ever covered the *outer/system*
-# TV Bezel's own compositing step, never this module's.
-# Real rolling-average timer now, same 5-second-window style as those
-# logs, one accumulator per distinct stage name so "blit_scale" and
-# "border_blit" (and any future stage) track independently.
-_perf_timer_stats = {}
-_PERF_TIMER_PRINT_INTERVAL_SEC = 5.0
 _blit_libretro_frame_log_state = {"key": None}
-
-
-def _record_perf_stage_timing(stage, elapsed_ms):
-    """Shared accumulator behind _perf_timer's __exit__ -- pulled out so
-    call sites that already have an elapsed duration in hand (e.g. a
-    sub-stage timed inside a function that returns its own timing dict,
-    like _blit_video_with_screen_mode's timing_out) can record into the
-    same [GAMEDECK BLIT TIMING] rolling-average log instead of standing
-    up a second, differently-labeled timing system. Same 5-second-window
-    style as _perf_timer and retro_tv_emulator.py's [CRT-SHADER TIMING]/
-    [FRAME PATH A/B] logs -- added for item A of the 2026-09-19 handoff
-    (profiling only, no behavior change)."""
-    t1 = time.perf_counter()
-    stats = _perf_timer_stats.setdefault(
-        stage, {"total_ms": 0.0, "frames": 0, "last_print": 0.0})
-    stats["total_ms"] += elapsed_ms
-    stats["frames"] += 1
-    if stats["last_print"] == 0.0:
-        stats["last_print"] = t1
-    elif t1 - stats["last_print"] >= _PERF_TIMER_PRINT_INTERVAL_SEC:
-        n = max(1, stats["frames"])
-        log.info("[GAMEDECK BLIT TIMING] %s avg %.2fms (over %d frames)",
-                  stage, stats["total_ms"] / n, n)
-        stats["total_ms"] = 0.0
-        stats["frames"] = 0
-        stats["last_print"] = t1
-
-
-class _perf_timer:
-    def __init__(self, stage):
-        self._stage = stage
-        self._t0 = None
-
-    def __enter__(self):
-        self._t0 = time.perf_counter()
-        return self
-
-    def __exit__(self, *args):
-        _record_perf_stage_timing(self._stage, (time.perf_counter() - self._t0) * 1000.0)
-        return False
 
 try:
     from libretro_core import (
@@ -248,10 +173,28 @@ try:
         RETRO_DEVICE_ID_JOYPAD_LEFT,   RETRO_DEVICE_ID_JOYPAD_RIGHT,
         RETRO_DEVICE_INDEX_ANALOG_LEFT,
         RETRO_DEVICE_ID_ANALOG_X,       RETRO_DEVICE_ID_ANALOG_Y,
+        GAME_FRAME_TIMER,
     )
     _LIBRETRO_AVAILABLE = True
     log.info("[GAME DECK] libretro_core loaded OK")
 except ImportError as _e:
+    class _NoFrameTimer:
+        def add(self, *_a):
+            pass
+
+        def count(self, *_a):
+            pass
+
+        def tick_start(self):
+            pass
+
+        def tick_end(self, *_a):
+            pass
+
+        def set_pad_stats_source(self, *_a):
+            pass
+
+    GAME_FRAME_TIMER = _NoFrameTimer()
     _LIBRETRO_AVAILABLE = False
     log.warning(f"[GAME DECK] libretro_core not found — .exe fallback mode: {_e}")
 
@@ -281,16 +224,18 @@ def _gd_is_drive_responsive(path):
 
 
 def _gd_drive_root_of(path):
-    """Mirrors media.py's private _drive_root_of() -- kept as a tiny local
-    copy rather than importing it, since it's a 3-line pure function and
-    this avoids reaching into another module's private helper. Used to
-    report which drive(s) a "Scan For Roms" run had to skip."""
+    """Return a path's drive root; a local copy of media.py's _drive_root_of()."""
     if not path:
         return None
     if sys.platform == "win32":
         drive, _tail = os.path.splitdrive(str(path))
         return (drive + "\\") if drive else None
     return "/"
+
+
+# ============================================================================
+# SECTION: Per-process audio (WASAPI)
+# ============================================================================
 
 
 def _wasapi_set_process_audio(pid, *, mute=None, volume_pct=None):
@@ -361,7 +306,6 @@ def _wasapi_set_process_audio(pid, *, mute=None, volume_pct=None):
             if not pCtl.value:
                 continue
 
-            # QI → IAudioSessionControl2 to read the process ID
             pCtl2 = PVOID()
             qhr = _vt(pCtl, 0, _c.c_long,
                       [_c.POINTER(GUID_T), _c.POINTER(PVOID)],
@@ -373,7 +317,6 @@ def _wasapi_set_process_audio(pid, *, mute=None, volume_pct=None):
                 _vt(pCtl2, 2, _c.c_long, [])
 
             if spid.value == pid:
-                # QI → ISimpleAudioVolume to set volume / mute
                 pVol = PVOID()
                 vhr = _vt(pCtl, 0, _c.c_long,
                           [_c.POINTER(GUID_T), _c.POINTER(PVOID)],
@@ -397,6 +340,11 @@ def _wasapi_set_process_audio(pid, *, mute=None, volume_pct=None):
     except Exception as e:
         _log_warn_throttled("wasapi_ctypes_init", f"[WASAPI ctypes] error: {e}")
         return False
+
+
+# ============================================================================
+# SECTION: Console tables & folder matching
+# ============================================================================
 
 
 CONSOLE_ORDER = ["MENU", "DVD",
@@ -444,11 +392,6 @@ ROM_EXTENSIONS = {
     "MASTERSYSTEM": [".sms", ".zip", ".7z", ".rar"],
 }
 
-# Folder-name aliases used by the bulk "Scan For Roms" feature to work out
-# which console a given folder belongs to. Matching is case-insensitive and
-# ignores spaces/punctuation, so "GB", "Gameboy", "Game Boy", "game-boy",
-# and "GAME_BOY" all resolve to the same console -- the person doesn't have
-# to name their folders exactly right.
 CONSOLE_FOLDER_ALIASES = {
     "GB":           ["gb", "gameboy", "game boy"],
     "GBC":          ["gbc", "gameboy color", "game boy color", "gb color"],
@@ -470,18 +413,10 @@ CONSOLE_FOLDER_ALIASES = {
 
 
 def _normalize_folder_name(name):
-    """Lowercase and collapse every run of non-alphanumeric characters into
-    a single space, e.g. 'Game-Boy_Color!!' -> 'game boy color'. Used for
-    both folder names being scanned and the alias table itself so the two
-    sides compare on equal footing regardless of spacing/punctuation."""
+    """Lowercase and collapse every run of non-alphanumeric characters into a single space, e.g."""
     return re.sub(r"[^a-z0-9]+", " ", str(name).lower()).strip()
 
 
-# Precomputed once: every (alias, console) pair, keeping both the
-# space-preserved and fully-glued (spaces stripped) forms, sorted
-# longest-alias-first. Matching longest-first is what lets "Game Boy
-# Color" resolve to GBC instead of the shorter, more generic "gb" alias
-# also matching as a substring.
 _CONSOLE_ALIAS_PAIRS = sorted(
     (
         (_normalize_folder_name(alias), _normalize_folder_name(alias).replace(" ", ""), console)
@@ -494,19 +429,7 @@ _CONSOLE_ALIAS_PAIRS = sorted(
 
 
 def match_console_for_folder_name(name):
-    """Return the console key whose folder-name aliases best match `name`,
-    or None if nothing matches closely enough. Case/spacing/punctuation-
-    insensitive (see _normalize_folder_name); tries the most specific
-    (longest) alias first so compound names like "Game Boy Color" don't
-    get mistaken for the plain "Game Boy" (GB) folder.
-
-    Single-word aliases (e.g. "ps1", "gb", "md") only match on a real
-    word boundary against the space-preserved name, so a folder like
-    "CPS1" doesn't false-match PSX's "ps1" just because that substring
-    happens to appear glued inside an unrelated word. Multi-word aliases
-    (e.g. "game boy color") still fall back to a glued/no-space
-    substring check, since that's needed to match compound folder names
-    typed with no separators at all, like "GameBoyColor"."""
+    """Return the console key whose folder-name aliases best match `name`, or None."""
     norm = _normalize_folder_name(name)
     if not norm:
         return None
@@ -522,6 +445,11 @@ def match_console_for_folder_name(name):
     return None
 
 
+# ============================================================================
+# SECTION: Console capability & option constants
+# ============================================================================
+
+
 HANDHELD_CONSOLES = {"GB", "GBC", "GBA", "GG", "NGP", "NES", "SNES", "GENESIS", "N64", "PSX",
                       "A2600", "NGPC", "32X", "MASTERSYSTEM"}
 
@@ -530,7 +458,6 @@ BIOS_REQUIRED_CONSOLES = {"PSX"}
 DVD_SPLASH_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
 DVD_SPLASH_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg"}
 
-# Console-selector scroll styles (Games tab / MENU / Scroll Style, cycled with ENTER).
 CONSOLE_SCROLL_STYLES = ["carousel", "side", "updown"]
 CONSOLE_SCROLL_STYLE_LABELS = {
     "carousel": "CAROUSEL",
@@ -538,10 +465,6 @@ CONSOLE_SCROLL_STYLE_LABELS = {
     "updown":   "UP / DOWN",
 }
 
-# List/legend text color choices (Games tab / MENU / Text Color, cycled with ENTER).
-# Applies to the console-selector fallback labels, the ROMs/DVD list text, and the
-# bottom instruction (legend) text for both the console list and the ROMs list --
-# lets the text stay readable against custom menu-background art.
 LIST_TEXT_COLOR_NAMES = ["white", "black", "red", "orange", "yellow", "green", "blue", "purple"]
 LIST_TEXT_COLOR_RGB = {
     "white":  (255, 255, 255),
@@ -555,26 +478,11 @@ LIST_TEXT_COLOR_RGB = {
 }
 
 
-# Known RetroArch core filenames (the part before "_libretro.dll") mapped
-# to every console key they can play, for the "Scan For Cores" feature.
-# Some cores are single-system (fceumm -> NES only); others cover several
-# related systems on one core -- genesis_plus_gx covers Genesis, Master
-# System, and Game Gear, Picodrive covers Genesis, 32X, and Master System,
-# mgba also plays GB/GBC alongside GBA -- those get copied into every
-# console folder they match. Matching is done on a punctuation-stripped
-# name (see _normalize_core_key), longest known name first, so versioned
-# builds like "snes9x2010_libretro.dll" or "mesen-s_libretro.dll" still
-# resolve correctly.
-#
-# This list is our own metadata -- not read from RetroArch itself (no
-# core-info .dll/.info files, no scraping RetroArch's own database) -- so
-# it stays correct even against a RetroArch install with its info files
-# missing, renamed, or out of date. Matching is done via substring,
-# either directly or through a parent name (e.g. a "bsnes2014_accuracy"
-# build still matches the "bsnes" entry). The explicit variant entries
-# below aren't needed for basic recognition -- they exist so each
-# variant can also be given its own exact spot in PREFERRED_CORE_ORDER
-# instead of silently inheriting its parent's rank.
+# ============================================================================
+# SECTION: Libretro core matching
+# ============================================================================
+
+
 CORE_NAME_TO_CONSOLES = {
     "fceumm":          ["NES"],
     "nestopia":        ["NES"],
@@ -617,30 +525,7 @@ CORE_NAME_TO_CONSOLES = {
     "swanstation":     ["PSX"],
 }
 
-# NOTE on the three bsnes2014 accuracy/balanced/performance builds: they
-# all share the RetroArch filename stem "bsnes2014" (the tier is a
-# separate "_accuracy"/"_balanced"/"_performance" suffix that
-# _normalize_core_key doesn't strip), so _normalize_core_key produces
-# three different exact strings ("bsnes2014accuracy" etc.) that all still
-# contain "bsnes2014" as a substring -- matched as one family via
-# CORE_NAME_TO_CONSOLES's substring lookup, same as every other
-# multi-build core here. Since none of the three normalizes to a bare
-# "bsnes2014" and this family already sits near the bottom of SNES's
-# preference order anyway, PREFERRED_CORE_ORDER's exact-match entry
-# targets "bsnes2014balanced" specifically (a reasonable middle-ground
-# default between the accuracy/performance extremes) rather than a
-# stem that could never exact-match any real file.
 
-# When more than one matching core lands in a console's folder and that
-# console doesn't have an active core recorded yet, this decides which one
-# becomes the default -- listed best-first per console. Anything not in
-# this list (a core discovered later, or one the person drops in by hand)
-# just becomes an alternate the person can switch to from the console's
-# "Select Libretro Core" screen; it's never forced to become active. Newly
-# added variant entries (snes9x's versioned builds, bsnes's forks/betas,
-# the genesis_plus_gx widescreen build, stella2023) are appended at the
-# end of their family so they're recognized and rankable without bumping
-# any existing default choice.
 PREFERRED_CORE_ORDER = {
     "NES":          ["fceumm", "mesen", "nestopia", "quicknes"],
     "SNES":         ["snes9x", "bsnesmercury", "bsnes", "mesens",
@@ -660,41 +545,13 @@ PREFERRED_CORE_ORDER = {
     "PSX":          ["mednafenpsx", "beetlepsx", "pcsxrearmed", "swanstation", "mednafenpsxhw"],
 }
 
-# Time constant (ms) for the launch splash's progress-bar animation -- see
-# _libretro_tick_loading. Not a timeout, just how slowly the bar creeps
-# toward its cap; consoles whose cores do real work after load_rom()
-# returns (PSX's BIOS boot / disc TOC read) get a much longer constant so
-# the bar keeps visibly climbing for as long as that actually takes,
-# instead of hitting its cap in ~2s and then looking finished/stuck for
-# the remaining tens of seconds.
 _LIBRETRO_LOAD_TAU_MS = {
     "PSX": 9000,
 }
 _LIBRETRO_LOAD_TAU_MS_DEFAULT = 1200
 
-# How long, once every completion condition is satisfied, to keep the
-# splash on screen at 100% before actually flipping emulator_loading off
-# -- mirrors the boot splash's own _HOLD_AT_100_S. Without this, a
-# core.load_rom() call that runs long enough to already clear
-# _libretro_load_min_ms on its own (e.g. a first-run .exe build, where a
-# freshly-extracted core DLL can take far longer to load than it does in
-# a dev environment) lets every condition in _libretro_tick_loading go
-# true on the very same tick that first_frame arrives -- pct jumps to
-# 100 and emulator_loading flips off together, before render() (called
-# right after this each frame) ever draws a frame with the bar at 100%.
-# The asymptotic climb toward its cap in the meantime also flattens out
-# within a few seconds regardless of how long the real wait ends up
-# being, so the visible symptom is the bar creeping up into the high
-# 80s/low 90s, sitting there for however long the real load takes, then
-# jumping straight to gameplay with 100% never actually shown.
 _LIBRETRO_HOLD_AT_100_MS = 350
 
-# How long the splash will keep waiting, after core.load_rom() returns,
-# for the core to actually produce its first visible frame before giving
-# up and handing off to normal gameplay rendering anyway (see
-# _libretro_first_frame_giveup_ms). PSX BIOS boot + disc read genuinely
-# takes longer than a cartridge core lighting up, so it gets more slack
-# here rather than bailing early into a dark screen.
 _LIBRETRO_FIRST_FRAME_GIVEUP_MS = {
     "PSX": 75000,
 }
@@ -704,10 +561,7 @@ _CORE_NAME_PAIRS = sorted(CORE_NAME_TO_CONSOLES.items(), key=lambda kv: len(kv[0
 
 
 def _normalize_core_key(filename):
-    """'Snes9x_2010_libretro.DLL' -> 'snes9x2010'. Strips the extension,
-    the trailing 'libretro' marker every core filename carries, and all
-    punctuation/underscores, so filename variations (dashes, version
-    numbers, capitalization) don't get in the way of matching."""
+    """'Snes9x_2010_libretro.DLL' -> 'snes9x2010'."""
     base = os.path.splitext(str(filename))[0]
     base = re.sub(r"[^a-z0-9]+", "", base.lower())
     if base.endswith("libretro"):
@@ -716,8 +570,7 @@ def _normalize_core_key(filename):
 
 
 def match_consoles_for_core_filename(filename):
-    """Return the list of console keys a given core .dll file plays, or []
-    if it doesn't match any known RetroArch core name."""
+    """Return the console keys a core .dll plays, or [] if it matches no known RetroArch core name."""
     norm = _normalize_core_key(filename)
     if not norm:
         return []
@@ -728,18 +581,7 @@ def match_consoles_for_core_filename(filename):
 
 
 def resolve_preferred_core_filename(console, present_filenames):
-    """Given the .dll filenames actually sitting in a console's core
-    folder, return the single best pick: the first name in
-    PREFERRED_CORE_ORDER (in rank order) that has an exact normalized
-    match present, or the first filename alphabetically if none of the
-    ranked names are present, or None if the folder is empty.
-
-    This is the one shared source of truth for "which core is the
-    sensible default" -- used both by bulk_scan_for_cores (assigning a
-    console's first-ever default after a scan) and by the "Select
-    Libretro Core" browser's active-core [A] highlight, so a fresh scan
-    and what the browser highlights as active never disagree with each
-    other the way a separate ad-hoc "first *_libretro.dll" guess could."""
+    """Return the best core filename from a console's core folder: first PREFERRED_CORE_ORDER match, else first alphabetically, else None."""
     if not present_filenames:
         return None
     for pref in PREFERRED_CORE_ORDER.get(console, []):
@@ -749,12 +591,16 @@ def resolve_preferred_core_filename(console, present_filenames):
     return sorted(present_filenames)[0]
 
 
-
-
 def get_bios_dir_for_console(base_dir, console):
     if console not in BIOS_REQUIRED_CONSOLES:
         return None
     return os.path.join(base_dir, "main", "cores", console, "system")
+
+
+# ============================================================================
+# SECTION: Borders & bezel availability
+# ============================================================================
+
 
 BORDER_CONSOLES_HANDHELD = {"GB", "GBC", "GBA", "GG", "NGP", "NGPC"}
 BORDER_CONSOLES_HOME     = {"NES", "SNES", "GENESIS", "N64", "PSX",
@@ -763,17 +609,7 @@ BORDER_CONSOLES = BORDER_CONSOLES_HANDHELD | BORDER_CONSOLES_HOME
 
 
 def _discover_border_style_files(bezel_dir):
-    """Mirrors media.discover_bezel_style_files, but scoped to a single
-    console's own bezel/border folder instead of the shared TV-bezel
-    images directory used by the outer/whole-screen Bezel. Recognizes
-    bezel.png/border.png (unnumbered, used first/as the default style)
-    plus bezel1.png, bezel2.png, ... / border1.png, border2.png, ...
-    (numbered, ordered ascending) as additional selectable styles for
-    that console's own decorative frame. Any other image file in the
-    folder that doesn't follow this naming convention is ignored here --
-    _load_border_surface still falls back to picking it up directly when
-    no bezel/border(N)-named file exists at all, so folders set up before
-    this style-picker existed keep working exactly as before."""
+    """List the bezel style files in a single console's own border folder."""
     files = []
     if os.path.isdir(bezel_dir):
         exts = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
@@ -802,52 +638,16 @@ def _discover_border_style_files(bezel_dir):
 
 
 def border_available_for_console(console):
-    """Whether this console's TV bezel toggle is reachable at all.
-
-    Bezels are available for every bordered console -- home (TV) and
-    handheld alike -- in every display mode. There's no aspect-ratio
-    condition here: reading "4:3" on a real 16:9 monitor via the app's
-    fake/simulated-4:3 test mode is never a genuine burn-in risk, so
-    hiding the toggle outright the way real CRT hardware does would be
-    wrong. The actual burn-in risk is instead surfaced as a Yes/No warning
-    when the user turns the bezel ON on genuine real 4:3/CRT hardware (see
-    _is_true_43_hardware() at the retro_tv_emulator.py call site) --
-    turning it back off never needs a warning, and non-CRT displays never
-    need one at all."""
+    """Whether this console's TV bezel toggle is reachable at all."""
     return console in BORDER_CONSOLES
 
 
 def console_bezel_currently_active(console, db):
-    """True when `console`'s own decorative bezel is actually being
-    composited on screen right now for that console's active profile.
-
-    Free function -- reads straight from db/db.config instead of a live
-    GameDeck instance's self._libretro_border_enabled/_libretro_console,
-    so it can be asked about ANY console, not just whichever one a
-    GameDeck instance currently has loaded. That matters because the
-    settings menu (ui.py's GAMES_SUB_MENU "game_aspect_ratio" row, and
-    its Select handler in retro_tv_emulator.py) needs to know this for
-    whatever console the menu is currently open on, which is tracked
-    independently of playback.
-
-    Mirrors the same three gates GameDeck._blit_libretro_frame /
-    _outer_tv_bezel_blocks_console_bezel use at render time, so this
-    never disagrees with what's actually on screen:
-      1. The console has to support a bezel at all and this profile's
-         own border toggle (border_enabled, or gb_border on legacy
-         handheld saves) has to be on.
-      2. Real 4:3/CRT hardware suppresses it -- the physical tube already
-         IS the bezel.
-      3. The outer/whole-screen TV Bezel (fake_43_border_enabled) also
-         suppresses it for home/game consoles -- layering the console's
-         own frame image inside the outer TV frame is the "bezel-in-a-
-         bezel" case _outer_tv_bezel_blocks_console_bezel exists to avoid.
-    """
+    """True when `console`'s own decorative bezel is being composited on screen for its active profile."""
+    # WARNING: mirrors the gates _blit_libretro_frame and _outer_tv_bezel_blocks_console_bezel use at render time so it never disagrees with the screen.
     if db is None or console not in BORDER_CONSOLES_HOME:
         return False
     if not border_available_for_console(console):
-        return False
-    if getattr(db, "_detected_aspect_ratio", None) == "4:3":
         return False
     if bool(db.config.get("fake_43_border_enabled", False)):
         return False
@@ -861,18 +661,19 @@ def console_bezel_currently_active(console, db):
     return bool(this_prof.get("border_enabled", this_prof.get("gb_border", False)))
 
 
+# ============================================================================
+# SECTION: Players, screen sizes & PSX discs
+# ============================================================================
+
+
 MULTITAP_CONSOLES = {"SNES", "NES", "GENESIS", "PSX"}
 
-# Maximum controller slots shown in the per-console mapping screen.  These
-# are hardware/core limits, not the number of controllers currently plugged
-# in; availability still greys out any unconnected slot within the limit.
 CONSOLE_MAX_PLAYERS = {
     "GB": 1, "GBC": 1, "GBA": 1, "GG": 1, "NGP": 1, "NGPC": 1,
     "A2600": 2, "32X": 2, "MASTERSYSTEM": 2,
     "NES": 4, "SNES": 4, "GENESIS": 4, "N64": 4, "PSX": 4,
 }
 
-# Ordered (key, display label, scale factor) — cycled in this order by A/D.
 SCREEN_SIZE_OPTIONS = [
     ("full", "FULL", 1.0),
     ("75",   "75%",  0.75),
@@ -917,6 +718,12 @@ def find_psx_disc_siblings(rom_path):
         log.warning(f"[LIBRETRO] Disc sibling scan failed: {e}")
         return []
 
+
+# ============================================================================
+# SECTION: Gamepad input: XInput, DirectInput & HID (Windows)
+# ============================================================================
+
+
 _PROCESS_SUSPEND_RESUME = 0x0800
 _PROCESS_QUERY_INFORMATION = 0x0400
 
@@ -935,21 +742,15 @@ VK_NAMES = {
 }
 VK_FROM_NAME = {v: k for k, v in VK_NAMES.items()}
 
-_DVD_CANON_PLAY_PAUSE   = -9001
-_DVD_CANON_REWIND       = -9002
-_DVD_CANON_FASTFORWARD  = -9003
-
 _XI_UP    = 0x0001;  _XI_DOWN  = 0x0002
 _XI_LEFT  = 0x0004;  _XI_RIGHT = 0x0008
 _XI_START = 0x0010;  _XI_BACK  = 0x0020
-_XI_LS    = 0x0040;  _XI_RS    = 0x0080  # left/right thumbstick click
+_XI_LS    = 0x0040;  _XI_RS    = 0x0080
 _XI_LB    = 0x0100;  _XI_RB    = 0x0200
 _XI_A     = 0x1000;  _XI_B     = 0x2000
 _XI_X     = 0x4000;  _XI_Y     = 0x8000
 _XI_LT    = 0x10000;  _XI_RT    = 0x20000
 
-# Preserve raw WinMM button indices in a separate namespace.  Legacy
-# DirectInput does not identify which physical button is Start or Select.
 _DI_RAW_BUTTON_BASE = 1 << 24
 
 def _di_raw_button_bit(index):
@@ -1020,98 +821,106 @@ class _GPState:
 
 
 _xinput_seen_logged = set()
-_xinput_last_raw     = {}    # slot idx -> last-seen 7-tuple snapshot, for change-only logging
+_xinput_last_raw     = {}
 
 
-def _try_xinput_read():
-    for lib in ("xinput1_4", "xinput1_3", "xinput9_1_0"):
+# ============================================================================
+# SECTION: XInput structures and DLL handle cache
+# ============================================================================
+class _XI_GP(ctypes.Structure):
+    _fields_ = [("wButtons", ctypes.c_ushort),
+                ("bLT", ctypes.c_ubyte), ("bRT", ctypes.c_ubyte),
+                ("sLX", ctypes.c_short), ("sLY", ctypes.c_short),
+                ("sRX", ctypes.c_short), ("sRY", ctypes.c_short)]
+
+
+class _XI_STATE(ctypes.Structure):
+    _fields_ = [("dwPkt", ctypes.c_ulong), ("Gamepad", _XI_GP)]
+
+
+# WARNING: fallback order must stay newest first; the first DLL that loads is the one used for every later call.
+_XI_LIB_NAMES = ("xinput1_4", "xinput1_3", "xinput9_1_0")
+_xinput_dll = {"handle": None}
+
+
+def _xinput_handle():
+    xi = _xinput_dll["handle"]
+    if xi is not None:
+        return xi
+    for lib in _XI_LIB_NAMES:
         try:
             xi = ctypes.windll.LoadLibrary(lib)
         except Exception:
             continue
-
-        class _GP(ctypes.Structure):
-            _fields_ = [("wButtons", ctypes.c_ushort),
-                        ("bLT", ctypes.c_ubyte), ("bRT", ctypes.c_ubyte),
-                        ("sLX", ctypes.c_short), ("sLY", ctypes.c_short),
-                        ("sRX", ctypes.c_short), ("sRY", ctypes.c_short)]
-
-        class _XS(ctypes.Structure):
-            _fields_ = [("dwPkt", ctypes.c_ulong), ("Gamepad", _GP)]
-
-        state = _XS()
-        for idx in range(4):
-            try:
-                rc = xi.XInputGetState(idx, ctypes.byref(state))
-                if rc == 0:
-                    g = _GPState()
-                    g.wButtons = state.Gamepad.wButtons
-                    g.bLT = state.Gamepad.bLT
-                    g.bRT = state.Gamepad.bRT
-                    g.sLX = state.Gamepad.sLX
-                    g.sLY = state.Gamepad.sLY
-                    g.sRX = state.Gamepad.sRX
-                    g.sRY = state.Gamepad.sRY
-                    if idx not in _xinput_seen_logged:
-                        _xinput_seen_logged.add(idx)
-                    snap = (g.wButtons, g.bLT, g.bRT, g.sLX, g.sLY, g.sRX, g.sRY)
-                    if _xinput_last_raw.get(idx) != snap:
-                        _xinput_last_raw[idx] = snap
-                    return g
-            except Exception:
-                continue
-        return None  # this DLL loaded fine; no pad in any of its 4 slots
+        _xinput_dll["handle"] = xi
+        return xi
     return None
 
 
-_xinput_connected_slots = set()  # slot idx believed connected as of the last
-                                  # call, so connect/disconnect only logs once
-                                  # per transition rather than every frame
+# ============================================================================
+# SECTION: XInput reads
+# ============================================================================
+def _try_xinput_read():
+    xi = _xinput_handle()
+    if xi is None:
+        return None
+    # WARNING: the state buffer is per call, never module level; the menu-nav thread and the main thread both call this.
+    state = _XI_STATE()
+    for idx in range(4):
+        try:
+            rc = xi.XInputGetState(idx, ctypes.byref(state))
+            if rc == 0:
+                g = _GPState()
+                g.wButtons = state.Gamepad.wButtons
+                g.bLT = state.Gamepad.bLT
+                g.bRT = state.Gamepad.bRT
+                g.sLX = state.Gamepad.sLX
+                g.sLY = state.Gamepad.sLY
+                g.sRX = state.Gamepad.sRX
+                g.sRY = state.Gamepad.sRY
+                if idx not in _xinput_seen_logged:
+                    _xinput_seen_logged.add(idx)
+                snap = (g.wButtons, g.bLT, g.bRT, g.sLX, g.sLY, g.sRX, g.sRY)
+                if _xinput_last_raw.get(idx) != snap:
+                    _xinput_last_raw[idx] = snap
+                return g
+        except Exception:
+            continue
+    return None
+
+
+_xinput_connected_slots = set()
 
 
 def _try_xinput_read_all():
     global _xinput_connected_slots
     out = {}
-    for lib in ("xinput1_4", "xinput1_3", "xinput9_1_0"):
+    xi = _xinput_handle()
+    if xi is None:
+        return out
+    for idx in range(4):
+        state = _XI_STATE()
         try:
-            xi = ctypes.windll.LoadLibrary(lib)
+            if xi.XInputGetState(idx, ctypes.byref(state)) == 0:
+                g = _GPState()
+                g.wButtons = state.Gamepad.wButtons
+                g.bLT = state.Gamepad.bLT
+                g.bRT = state.Gamepad.bRT
+                g.sLX = state.Gamepad.sLX
+                g.sLY = state.Gamepad.sLY
+                g.sRX = state.Gamepad.sRX
+                g.sRY = state.Gamepad.sRY
+                out[idx] = g
         except Exception:
             continue
 
-        class _GP(ctypes.Structure):
-            _fields_ = [("wButtons", ctypes.c_ushort),
-                        ("bLT", ctypes.c_ubyte), ("bRT", ctypes.c_ubyte),
-                        ("sLX", ctypes.c_short), ("sLY", ctypes.c_short),
-                        ("sRX", ctypes.c_short), ("sRY", ctypes.c_short)]
-
-        class _XS(ctypes.Structure):
-            _fields_ = [("dwPkt", ctypes.c_ulong), ("Gamepad", _GP)]
-
-        for idx in range(4):
-            state = _XS()
-            try:
-                if xi.XInputGetState(idx, ctypes.byref(state)) == 0:
-                    g = _GPState()
-                    g.wButtons = state.Gamepad.wButtons
-                    g.bLT = state.Gamepad.bLT
-                    g.bRT = state.Gamepad.bRT
-                    g.sLX = state.Gamepad.sLX
-                    g.sLY = state.Gamepad.sLY
-                    g.sRX = state.Gamepad.sRX
-                    g.sRY = state.Gamepad.sRY
-                    out[idx] = g
-            except Exception:
-                continue
-
-        _now_connected = set(out.keys())
-        for _idx in _now_connected - _xinput_connected_slots:
-            log.info("[CONTROLLER] XInput controller connected at slot %s", _idx)
-        for _idx in _xinput_connected_slots - _now_connected:
-            log.warning("[CONTROLLER] XInput controller at slot %s disconnected", _idx)
-        _xinput_connected_slots = _now_connected
-        return out  # this DLL loaded fine -- report whatever slots answered
+    _now_connected = set(out.keys())
+    for _idx in _now_connected - _xinput_connected_slots:
+        log.info("[CONTROLLER] XInput controller connected at slot %s", _idx)
+    for _idx in _xinput_connected_slots - _now_connected:
+        log.warning("[CONTROLLER] XInput controller at slot %s disconnected", _idx)
+    _xinput_connected_slots = _now_connected
     return out
-
 
 
 class _JOYCAPSW(ctypes.Structure):
@@ -1147,7 +956,7 @@ class _JOYINFOEX(ctypes.Structure):
 
 _JOY_RETURNALL_CENTERED = 0xFF | 0x400
 _JOYERR_NOERROR = 0
-_JOYCAPS_HASPOV = 0x0010  # caps.wCaps bit: device actually has a POV hat.
+_JOYCAPS_HASPOV = 0x0010
 
 _DI_BUTTON_ORDER = [_XI_A, _XI_B, _XI_X, _XI_Y, _XI_LB, _XI_RB,
                      _XI_BACK, _XI_START, _XI_LS, _XI_RS]
@@ -1159,9 +968,9 @@ _dinput_no_pov_logged = set()
 _dinput_diag_logged  = set()
 _dinput_last_raw     = {}
 
-_dinput_first_seen_raw = {}   # jid -> raw_snapshot at first sighting
-_dinput_ever_live      = set()  # jids that have shown ANY change since first seen
-_dinput_dpad_latch     = {}   # jid -> hysteresis latch dict, see _stick_to_dpad_hysteresis
+_dinput_first_seen_raw = {}
+_dinput_ever_live      = set()
+_dinput_dpad_latch     = {}
 
 _DINPUT_AXIS_LIVENESS_THRESHOLD = 1500
 
@@ -1205,8 +1014,9 @@ if _WIN:
 
 
 _hid_identity_cache = None
-_HID_IDENTITY_CACHE_TTL = 2.0  # seconds -- a full SetupAPI enumeration pass
-_hid_scan_failed_logged = False  # so a SetupAPI failure only prints once
+# VALUES CHANGE HERE
+_HID_IDENTITY_CACHE_TTL = 2.0
+_hid_scan_failed_logged = False
 
 
 def _scan_hid_identities():
@@ -1301,7 +1111,7 @@ def _scan_hid_identities():
 
             if entry["vid"] is not None:
                 out.append(entry)
-    except Exception as e:
+    except Exception:
         if not _hid_scan_failed_logged:
             _hid_scan_failed_logged = True
     finally:
@@ -1318,8 +1128,11 @@ def _get_hid_identities():
     now = time.monotonic()
     if _hid_identity_cache is not None and now - _hid_identity_cache[0] < _HID_IDENTITY_CACHE_TTL:
         return _hid_identity_cache[1]
+    _hid_t0 = time.perf_counter()
     identities = _scan_hid_identities()
-    _hid_identity_cache = (now, identities)
+    _hid_identity_cache = (time.monotonic(), identities)
+    _PAD_COUNTERS["hid_scans"] += 1
+    _PAD_COUNTERS["hid_ms"] += (time.perf_counter() - _hid_t0) * 1000.0
     return identities
 
 
@@ -1356,7 +1169,8 @@ def _norm_axis(raw, lo, hi):
 
 
 _dinput_frame_cache = None
-_DINPUT_FRAME_CACHE_WINDOW = 0.008  # seconds -- shorter than one frame even
+# VALUES CHANGE HERE
+_DINPUT_FRAME_CACHE_WINDOW = 0.008
 
 
 def _try_dinput_read_all():
@@ -1367,7 +1181,9 @@ def _try_dinput_read_all():
         if now - cached_ts < _DINPUT_FRAME_CACHE_WINDOW:
             return cached_result
     result = _try_dinput_read_all_impl()
-    _dinput_frame_cache = (now, result)
+    # WARNING: the cache stamp must be taken AFTER the read, or a read slower than the window is expired the moment it is stored.
+    _dinput_frame_cache = (time.monotonic(), result)
+    _PAD_COUNTERS["joy_reads"] += 1
     return result
 
 
@@ -1390,7 +1206,7 @@ def _try_dinput_read_all_impl():
         caps = _JOYCAPSW()
         try:
             caps_rc = winmm.joyGetDevCapsW(jid, ctypes.byref(caps), ctypes.sizeof(caps))
-        except Exception as e:
+        except Exception:
             if (jid, "caps_exc") not in _dinput_diag_logged:
                 _dinput_diag_logged.add((jid, "caps_exc"))
             continue
@@ -1406,14 +1222,14 @@ def _try_dinput_read_all_impl():
         if (jid, "seen", name) not in _dinput_diag_logged:
             _dinput_diag_logged.add((jid, "seen", name))
         if "xinput" in name.lower():
-            continue  # already covered by _try_xinput_read_all -- don't double-count
+            continue
 
         info = _JOYINFOEX()
         info.dwSize = ctypes.sizeof(info)
         info.dwFlags = _JOY_RETURNALL_CENTERED
         try:
             pos_rc = winmm.joyGetPosEx(jid, ctypes.byref(info))
-        except Exception as e:
+        except Exception:
             if (jid, "pos_exc") not in _dinput_diag_logged:
                 _dinput_diag_logged.add((jid, "pos_exc"))
             continue
@@ -1457,10 +1273,6 @@ def _try_dinput_read_all_impl():
 
         _di_btn_count = caps.wNumButtons if caps.wNumButtons else len(_DI_BUTTON_ORDER)
         g.raw_button_count = min(int(_di_btn_count), 32)
-        # Always retain the raw button index.  The canonical mapping below
-        # keeps existing controllers working, while the raw namespace lets
-        # the remapper bind controllers whose Start/Select buttons are not
-        # at the usual indices.
         for i in range(g.raw_button_count):
             if info.dwButtons & (1 << i):
                 g.wButtons |= _di_raw_button_bit(i)
@@ -1506,12 +1318,17 @@ def _try_dinput_read_all_impl():
     return out
 
 
-_player_slot_of = {}          # player_num (1-4) -> slot key, or absent if unbound
-_slot_player_of = {}          # slot key -> player_num (reverse lookup)
-_known_slots     = set()      # slots we've already auto-assigned once this session
-_reassign_armed_player = None # player_num currently waiting to be re-bound, or None
+_player_slot_of = {}
+_slot_player_of = {}
+_known_slots     = set()
+_reassign_armed_player = None
 
 _last_player_signature = {}
+
+
+# ============================================================================
+# SECTION: Player slot assignment
+# ============================================================================
 
 
 def _slot_signature(slot):
@@ -1523,18 +1340,235 @@ def _slot_signature(slot):
     return None
 
 
+# ============================================================================
+# SECTION: Background controller reader and per-tick snapshot
+# ============================================================================
+_PAD_COUNTERS = {"joy_reads": 0, "hid_scans": 0, "hid_ms": 0.0}
+
+try:
+    import performance_governor as _pad_governor
+except Exception:
+    _pad_governor = None
+
+_pad_snapshot = {"slots": None, "thread": None}
+_pad_poller = None
+_pad_poller_lock = threading.Lock()
+
+
+def _gp_clone(gp):
+    out = _GPState()
+    for name in _GPState.__slots__:
+        try:
+            setattr(out, name, getattr(gp, name))
+        except AttributeError:
+            pass
+    return out
+
+
+def _clone_slots(slots):
+    return {k: _gp_clone(v) for k, v in slots.items()}
+
+
+class _PadPoller:
+    """Background thread that reads every controller at GAME_PAD_POLL_HZ and keeps the newest result for the game thread."""
+
+    def __init__(self):
+        gov = _pad_governor
+        self.period = 1.0 / max(1.0, float(gov.GAME_PAD_POLL_HZ))
+        self.max_age = float(gov.GAME_PAD_SNAPSHOT_MAX_AGE_SECONDS)
+        self.idle_stop = float(gov.GAME_PAD_POLL_IDLE_STOP_SECONDS)
+        self.latest = None
+        self.ready = threading.Event()
+        self.stop_event = threading.Event()
+        self.started_at = time.monotonic()
+        self.last_touch = self.started_at
+        self.cap_logged = False
+        self._stats_lock = threading.Lock()
+        self._stats = {"scans": 0, "ms": 0.0, "worst": 0.0, "xinput": 0.0, "joy": 0.0}
+        self.thread = threading.Thread(target=self._run, name="GamePadPoller", daemon=True)
+
+    def touch(self):
+        self.last_touch = time.monotonic()
+
+    def fresh_slots(self):
+        latest = self.latest
+        if latest is None or time.monotonic() - latest[1] > self.max_age:
+            return None
+        return latest[0]
+
+    def stats(self):
+        with self._stats_lock:
+            out = dict(self._stats)
+            self._stats["worst"] = 0.0
+        out.update(_PAD_COUNTERS)
+        return out
+
+    def _run(self):
+        global _pad_poller
+        first = True
+        while not self.stop_event.is_set():
+            if time.monotonic() - self.last_touch > self.idle_stop:
+                with _pad_poller_lock:
+                    if time.monotonic() - self.last_touch > self.idle_stop:
+                        self.stop_event.set()
+                        if _pad_poller is self:
+                            _pad_poller = None
+                        break
+            t0 = time.perf_counter()
+            parts = {}
+            try:
+                slots = _player_connected_slots_scan(parts=parts)
+            except Exception as e:
+                slots = None
+                _log_warn_throttled("game_pad_poller_scan", "[GAME PAD] background controller read failed: %s", e)
+            ms = (time.perf_counter() - t0) * 1000.0
+            if slots is not None:
+                self.latest = (slots, time.monotonic())
+                with self._stats_lock:
+                    st = self._stats
+                    st["scans"] += 1
+                    st["ms"] += ms
+                    st["worst"] = max(st["worst"], ms)
+                    st["xinput"] += parts.get("xinput", 0.0)
+                    st["joy"] += parts.get("joy", 0.0)
+                if first:
+                    first = False
+                    log.info("[GAME PAD] first controller read finished %.0f ms after the reader started "
+                             "(read %.1f ms: xinput %.1f, joystick %.1f)",
+                             (time.monotonic() - self.started_at) * 1000.0, ms,
+                             parts.get("xinput", 0.0), parts.get("joy", 0.0))
+                self.ready.set()
+            self.stop_event.wait(max(0.001, self.period - (time.perf_counter() - t0)))
+
+
+def pad_poller_ensure():
+    """Starts the background controller reader if it is not running and returns it, or None when it cannot be used."""
+    global _pad_poller
+    if _pad_governor is None or _is_running_under_wine():
+        return None
+    with _pad_poller_lock:
+        p = _pad_poller
+        if p is not None and not p.stop_event.is_set() and p.thread.is_alive():
+            p.touch()
+            return p
+        try:
+            p = _PadPoller()
+            _pad_poller = p
+            p.thread.start()
+        except Exception as e:
+            _pad_poller = None
+            log.warning("[GAME PAD] could not start the background controller reader: %s", e)
+            return None
+        return p
+
+
+def pad_poller_stop():
+    """Stops the background controller reader."""
+    global _pad_poller
+    with _pad_poller_lock:
+        p = _pad_poller
+        _pad_poller = None
+    if p is not None:
+        p.stop_event.set()
+
+
+def pad_warmup_done(elapsed_ms):
+    """True once the first background controller read has finished, or the load-bar wait cap has passed."""
+    p = _pad_poller
+    if p is None or p.ready.is_set():
+        return True
+    if elapsed_ms >= float(_pad_governor.GAME_PAD_WARMUP_MAX_WAIT_SECONDS) * 1000.0:
+        if not p.cap_logged:
+            p.cap_logged = True
+            log.warning("[GAME PAD] load bar stopped waiting for the first controller read after %d ms", elapsed_ms)
+        return True
+    return False
+
+
+def pad_poller_stats():
+    p = _pad_poller
+    return p.stats() if p is not None else None
+
+
+GAME_FRAME_TIMER.set_pad_stats_source(pad_poller_stats)
+
+
+def _count_served():
+    if _pad_snapshot["thread"] == threading.get_ident():
+        GAME_FRAME_TIMER.count("pad_served")
+
+
+def _current_pad_slots():
+    """The tick snapshot on the game thread, else the newest background read, else None."""
+    if _pad_snapshot["slots"] is not None and _pad_snapshot["thread"] == threading.get_ident():
+        return _pad_snapshot["slots"]
+    p = _pad_poller
+    return p.fresh_slots() if p is not None else None
+
+
+def pad_snapshot_begin():
+    """Pins one controller read for this game tick: the newest background read, or one direct read if none is fresh."""
+    _pad_snapshot["slots"] = None
+    _pad_snapshot["thread"] = threading.get_ident()
+    p = pad_poller_ensure()
+    if p is not None:
+        slots = p.fresh_slots()
+        if slots is not None:
+            _pad_snapshot["slots"] = slots
+            GAME_FRAME_TIMER.add("pad_age", (time.monotonic() - p.latest[1]) * 1000.0)
+            GAME_FRAME_TIMER.count("pad_pinned")
+            return
+        GAME_FRAME_TIMER.count("pad_stale")
+    t0 = time.perf_counter()
+    try:
+        slots = _player_connected_slots_scan()
+    except Exception:
+        return
+    _pad_snapshot["slots"] = slots
+    ms = (time.perf_counter() - t0) * 1000.0
+    GAME_FRAME_TIMER.add("pad_scan", ms)
+    GAME_FRAME_TIMER.add("input", ms)
+    GAME_FRAME_TIMER.count("pad_scan")
+
+
+def pad_snapshot_end():
+    """Ends the per-tick controller snapshot."""
+    _pad_snapshot["slots"] = None
+    _pad_snapshot["thread"] = None
+
+
 def _player_connected_slots():
+    slots = _current_pad_slots()
+    if slots is not None:
+        _count_served()
+        return _clone_slots(slots)
+    return _player_connected_slots_scan()
+
+
+def _snapshot_gamepad_state(slots):
+    """First XInput pad, else the first pressed legacy pad, else the first legacy pad, from a snapshot."""
+    for key in sorted(k for k in slots if isinstance(k, int)):
+        return _gp_clone(slots[key])
+    legacy = [gp for k, gp in slots.items() if isinstance(k, str) and k.startswith("di")]
+    for gp in legacy:
+        if gp.wButtons or gp.bLT > 20 or gp.bRT > 20:
+            return _gp_clone(gp)
+    return _gp_clone(legacy[0]) if legacy else None
+
+
+def _player_connected_slots_scan(parts=None):
     out = {}
+    _t0 = time.perf_counter()
     try:
         out.update(_try_xinput_read_all())
     except Exception:
         pass
+    if parts is not None:
+        parts["xinput"] = (time.perf_counter() - _t0) * 1000.0
+    _t0 = time.perf_counter()
     try:
         for did, gp in _try_dinput_read_all().items():
-            # Windows can expose one XInput pad a second time through the
-            # Joystick API. Treat the common Xbox/XInput aliases as
-            # the same physical pad; otherwise one plugged-in controller
-            # incorrectly becomes Player 1 *and* Player 2.
+            # WARNING: treat the common Xbox/XInput aliases as one physical pad, or one controller becomes Player 1 and Player 2.
             sig = _dinput_signature_of.get(did, "") or ""
             sig_lower = sig.lower()
             if out and any(marker in sig_lower for marker in (
@@ -1544,6 +1578,8 @@ def _player_connected_slots():
             out[f"di{did}"] = gp
     except Exception:
         pass
+    if parts is not None:
+        parts["joy"] = (time.perf_counter() - _t0) * 1000.0
     if _is_running_under_wine():
         try:
             for path, reader in _get_all_linux_joystick_readers().items():
@@ -1573,7 +1609,7 @@ def _ensure_player_slots_assigned():
                 continue
         _known_slots.add(slot)
         if slot in _slot_player_of:
-            continue  # already bound (e.g. just claimed via reassign)
+            continue
 
         sig = _slot_signature(slot)
 
@@ -1644,11 +1680,9 @@ def _player_reassign_poll():
     connected = _player_connected_slots()
     for slot, gp in connected.items():
         if gp.wButtons or gp.bLT > 40 or gp.bRT > 40:
-            # Free this slot from whichever player (if any) held it before.
             old_player = _slot_player_of.get(slot)
             if old_player is not None and old_player != player_num:
                 _player_slot_of.pop(old_player, None)
-            # Free player_num from whatever slot it held before.
             old_slot = _player_slot_of.get(player_num)
             if old_slot is not None:
                 _slot_player_of.pop(old_slot, None)
@@ -1705,11 +1739,16 @@ def _menu_reassign_poll():
     return False
 
 
+# ============================================================================
+# SECTION: Gamepad input: Linux joystick
+# ============================================================================
+
+
 _JS_EVENT_FMT    = "<Ihbb"
 _JS_EVENT_SIZE   = struct.calcsize(_JS_EVENT_FMT)
 _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS   = 0x02
-_JS_EVENT_INIT   = 0x80  # ORed into type for the initial-state dump on open
+_JS_EVENT_INIT   = 0x80
 
 _JS_BUTTON_MAP = {
     0: _XI_A, 1: _XI_B, 2: _XI_X, 3: _XI_Y,
@@ -1719,11 +1758,12 @@ _JS_BUTTON_MAP = {
 }
 _JS_AXIS_MAP         = {0: "sLX", 1: "sLY", 3: "sRX", 4: "sRY"}
 _JS_TRIGGER_AXIS_MAP = {2: "bLT", 5: "bRT"}
-_JS_HAT_X_AXIS = 6   # D-pad left/right on most Xbox-style pads
+_JS_HAT_X_AXIS = 6
 _JS_HAT_Y_AXIS = 7
 
 
-_JS_DEAD_TIMEOUT = 5.0  # seconds an opened-but-silent node gets before we
+# VALUES CHANGE HERE
+_JS_DEAD_TIMEOUT = 5.0
 
 _gamepad_perm_denied_path = None
 
@@ -1893,9 +1933,9 @@ class _LinuxJoystickReader:
         return self._state
 
 
-_linux_joystick_readers    = {}     # path -> _LinuxJoystickReader, only currently-good entries
+_linux_joystick_readers    = {}
 _linux_joystick_dead_paths = set()
-_linux_joystick_none_found_logged = False  # so the "nothing found" message only prints once
+_linux_joystick_none_found_logged = False
 
 def _get_all_linux_joystick_readers():
     global _linux_joystick_none_found_logged
@@ -1932,41 +1972,23 @@ def _get_linux_joystick_reader():
     return next(iter(readers.values()), None)
 
 
-DEFAULT_STICK_DEADZONE = 8000  # out of a max stick magnitude of 32767
+# ============================================================================
+# SECTION: Stick deadzone & unified gamepad read
+# ============================================================================
+
+
+# VALUES CHANGE HERE
+DEFAULT_STICK_DEADZONE = 8000
 
 def _get_stick_deadzone():
     return DEFAULT_STICK_DEADZONE
 
 
-# Release threshold, as a fraction of the enter (DEAD/DZ) threshold, for
-# _stick_to_dpad_hysteresis below. A bare `if value > DEAD: UP = True`
-# per-axis check (the old behavior at every stick-as-dpad call site) uses
-# the SAME value to turn a direction both on and off -- a stick resting
-# right at that boundary (worn stick, slight drift, holding a diagonal)
-# can tick back and forth across DEAD from one poll to the next, firing a
-# fresh press/release on every crossing. That reads as directional input
-# flickering/misfiring during precise platforming, exactly where it'd be
-# most noticeable. Standard fix: once a direction is ON, it takes a bigger
-# move back through a dead band -- down to this lower release fraction --
-# before it's allowed to turn back OFF. 0.75 leaves a real gap (25% of the
-# deadzone's own width) without requiring the stick to nearly re-center.
 _STICK_DPAD_RELEASE_FRAC = 0.75
 
 
 def _stick_to_dpad_hysteresis(sLX, sLY, dead, latch):
-    """Convert raw stick X/Y axis values into up/down/left/right booleans
-    with hysteresis, instead of one bare threshold used for both entering
-    and leaving a direction.
-
-    `latch` is a small dict the CALLER owns and passes back in on every
-    call -- one persistent dict per controller/player/context -- holding
-    the up/down/left/right booleans from the previous poll. It has to be
-    caller-owned because the gamepad-state object itself (_GPState) is a
-    fresh instance built fresh on every read, so there's nowhere on `gp`
-    itself to remember previous-frame state.
-
-    Returns (up, down, left, right) and updates `latch` in place.
-    """
+    """Convert raw stick X/Y values into up/down/left/right booleans with hysteresis."""
     release = dead * _STICK_DPAD_RELEASE_FRAC
     up    = (sLY >  dead) or (latch.get("up", False)    and sLY >  release)
     down  = (sLY < -dead) or (latch.get("down", False)  and sLY < -release)
@@ -1976,8 +1998,12 @@ def _stick_to_dpad_hysteresis(sLX, sLY, dead, latch):
     return up, down, left, right
 
 
-
 def _read_gamepad_state():
+    if not _is_running_under_wine():
+        _slots = _current_pad_slots()
+        if _slots is not None:
+            _count_served()
+            return _snapshot_gamepad_state(_slots)
     gp = _try_xinput_read()
     if gp is not None:
         return gp
@@ -1994,6 +2020,10 @@ def _read_gamepad_state():
             return next(iter(di.values()))
     return None
 
+
+# ============================================================================
+# SECTION: Console button definitions & menu-nav mapping
+# ============================================================================
 
 
 CONSOLE_BUTTON_DEFS = {
@@ -2015,7 +2045,7 @@ CONSOLE_BUTTON_DEFS = {
         "default_map": {
             "A":      0x5A,
             "B":      0x58,
-            "Start":  0x0D,  # Return
+            "Start":  0x0D,
             "Select": 0x08,
             "Up":     0x26,  "Down":  0x28,
             "Left":   0x25,  "Right": 0x27,
@@ -2138,9 +2168,9 @@ CONSOLE_BUTTON_DEFS = {
             "Select": (0.447, 0.593),
         },
         "default_map": {
-            "A":      0x58, "B":      0x5A,  # X, Z
-            "X":      0x53, "Y":      0x41,  # S, A
-            "L":      0x51, "R":      0x57,  # Q, W
+            "A":      0x58, "B":      0x5A,
+            "X":      0x53, "Y":      0x41,
+            "L":      0x51, "R":      0x57,
             "Start":  0x0D, "Select": 0x08,
             "Up":     0x26, "Down":   0x28,
             "Left":   0x25, "Right":  0x27,
@@ -2221,10 +2251,10 @@ CONSOLE_BUTTON_DEFS = {
             "Z":      0,
             "L":      0x41,
             "R":      0x53,
-            "CUp":    0x49,  # 'I'
-            "CDown":  0x4B,  # 'K'
-            "CLeft":  0x43,  # 'C'
-            "CRight": 0x4C,  # 'L'
+            "CUp":    0x49,
+            "CDown":  0x4B,
+            "CLeft":  0x43,
+            "CRight": 0x4C,
             "Start":  0x0D,
             "Up":     0x26, "Down":   0x28,
             "Left":   0x25, "Right":  0x27,
@@ -2299,12 +2329,12 @@ CONSOLE_BUTTON_DEFS = {
             "Select": (0.455, 0.450),
         },
         "default_map": {
-            "Cross":  pygame.K_RETURN,
-            "Circle": pygame.K_ESCAPE,
-            "Up":     pygame.K_w,
-            "Down":   pygame.K_s,
-            "Left":   pygame.K_a,
-            "Right":  pygame.K_d,
+            "Cross":  _nav.action_key(_nav.ACCEPT),
+            "Circle": _nav.action_key(_nav.BACK),
+            "Up":     _nav.action_key(_nav.UP),
+            "Down":   _nav.action_key(_nav.DOWN),
+            "Left":   _nav.action_key(_nav.LEFT),
+            "Right":  _nav.action_key(_nav.RIGHT),
             "Square": 0, "Triangle": 0, "L1": 0, "L2": 0, "R1": 0, "R2": 0,
             "Start":  0, "Select":  0,
             "stick_as_dpad": False,
@@ -2495,7 +2525,6 @@ CONSOLE_BUTTON_DEFS = {
     },
 }
 
-# DVD has no controller mapping — use a minimal stub so the UI gracefully skips it
 CONSOLE_BUTTON_DEFS["DVD"] = {
     "buttons":    [],
     "left_btns":  [],
@@ -2518,72 +2547,92 @@ XINPUT_TO_GBA_BTN = CONSOLE_BUTTON_DEFS["GBA"]["xinput_map"]
 GBA_BTN_HOTSPOTS = CONSOLE_BUTTON_DEFS["GBA"]["hotspots"]
 
 
-
 _NAV_MAP = {
-    _XI_UP:    pygame.K_w,
-    _XI_DOWN:  pygame.K_s,
-    _XI_LEFT:  pygame.K_a,
-    _XI_RIGHT: pygame.K_d,
-    _XI_A:     pygame.K_RETURN,
-    _XI_B:     pygame.K_ESCAPE,
+    _XI_UP:    _nav.action_key(_nav.UP),
+    _XI_DOWN:  _nav.action_key(_nav.DOWN),
+    _XI_LEFT:  _nav.action_key(_nav.LEFT),
+    _XI_RIGHT: _nav.action_key(_nav.RIGHT),
+    _XI_A:     _nav.action_key(_nav.ACCEPT),
+    _XI_B:     _nav.action_key(_nav.BACK),
 }
 
 _MENU_NAV_ACTIONS = [
-    ("Up",     _XI_UP,    pygame.K_w),
-    ("Down",   _XI_DOWN,  pygame.K_s),
-    ("Left",   _XI_LEFT,  pygame.K_a),
-    ("Right",  _XI_RIGHT, pygame.K_d),
-    ("Cross",  _XI_A,     pygame.K_RETURN),
-    ("Circle", _XI_B,     pygame.K_ESCAPE),
-    # Start/Select are common on DirectInput pads even when SDL does not
-    # expose them as the usual A/B buttons.  Treat them as the same
-    # confirm/back pair for the menu, while still allowing the mapping screen
-    # to bind their actual physical button indices.
-    ("Start",  _XI_START, pygame.K_RETURN),
-    ("Select", _XI_BACK, pygame.K_ESCAPE),
+    ("Up",     _XI_UP,    _nav.UP),
+    ("Down",   _XI_DOWN,  _nav.DOWN),
+    ("Left",   _XI_LEFT,  _nav.LEFT),
+    ("Right",  _XI_RIGHT, _nav.RIGHT),
+    ("Cross",  _XI_A,     _nav.ACCEPT),
+    ("Circle", _XI_B,     _nav.BACK),
+    ("Start",  _XI_START, _nav.ACCEPT),
+    ("Select", _XI_BACK,  _nav.BACK),
 ]
 
 
 def apply_menu_nav_mapping(bit_by_button):
     _NAV_MAP.clear()
-    for btn_name, default_bit, key in _MENU_NAV_ACTIONS:
+    for btn_name, default_bit, action in _MENU_NAV_ACTIONS:
         bit = bit_by_button.get(btn_name, default_bit)
-        _NAV_MAP[bit] = key
+        _NAV_MAP[bit] = _nav.action_key(action)
 
 
 _xi_nav_state = {
     "ch03_active":   False,
-    "game_running":  False,   # True while mode == "GAME" and emulator live
-    "browse_mode":   False,   # True while on the top-level console logo page (BROWSE)
-    "dvd_active":    False,   # True while the DVD player is mounted (mode == "DVD_PLAYER")
-    "dvd_in_menu":   False,   # True while an on-disc dvdnav menu is on screen (see game_deck.dvd_in_menu)
-    "dvd_left_held":  False,  # live (non-edge) D-pad/stick-left state while dvd_active
-    "dvd_right_held": False,  # live (non-edge) D-pad/stick-right state while dvd_active
-    "running":       True,    # set to False on clean shutdown
+    "game_running":  False,
+    "browse_mode":   False,
+    "dvd_active":    False,
+    "dvd_in_menu":   False,
+    "dvd_left_held":  False,
+    "dvd_right_held": False,
+    "running":       True,
 }
 
-def _xi_nav_worker():
-    POLL_HZ    = 30
-    REPEAT_MS  = 180
-    REPEAT_DEL = 400     # ms before first repeat fires
+# ============================================================================
+# SECTION: Menu-nav wake signal & sync
+# ============================================================================
+_xi_nav_wake = threading.Event()
 
+# VALUES CHANGE HERE
+_XI_NAV_POLL_HZ = 30
+_XI_NAV_NO_PAD_INTERVAL = 0.25
+_XI_NAV_MISSES_BEFORE_SLOW = 30
+
+
+def _xi_nav_is_active():
+    return bool(_xi_nav_state["ch03_active"]) and not _xi_nav_state["game_running"]
+
+
+def xi_nav_sync(ch03_active, game_running, browse_mode, dvd_active, dvd_in_menu):
+    was_active = _xi_nav_is_active()
+    _xi_nav_state["ch03_active"]  = bool(ch03_active)
+    _xi_nav_state["game_running"] = bool(game_running)
+    _xi_nav_state["browse_mode"]  = bool(browse_mode)
+    _xi_nav_state["dvd_active"]   = bool(dvd_active)
+    _xi_nav_state["dvd_in_menu"]  = bool(dvd_in_menu)
+    if _xi_nav_is_active() != was_active:
+        _xi_nav_wake.set()
+
+
+# ============================================================================
+# SECTION: Menu-nav gamepad worker
+# ============================================================================
+
+
+def _xi_nav_worker():
+    POLL_HZ    = _XI_NAV_POLL_HZ
+    _pad_rule  = _nav.HOLD_RULES["gamepad"]
 
     _DVD_NAV_MAP = {
-        _XI_DOWN:  _DVD_CANON_PLAY_PAUSE,
-        _XI_LEFT:  _DVD_CANON_REWIND,
-        _XI_RIGHT: _DVD_CANON_FASTFORWARD,
-        _XI_Y:     pygame.K_BACKSPACE,
+        _XI_DOWN:  _nav.dvd_canonical(_nav.DVD_PLAY_PAUSE),
+        _XI_LEFT:  _nav.dvd_canonical(_nav.DVD_REWIND),
+        _XI_RIGHT: _nav.dvd_canonical(_nav.DVD_FAST_FORWARD),
+        _XI_Y:     _nav.dvd_canonical(_nav.DVD_RETURN_MENU),
     }
 
     prev_bits   = 0
-    hold_bits   = 0
-    hold_since  = {}         # bit → time.monotonic() when hold started
-    last_repeat = {}         # bit → time.monotonic() of last repeat fire
-    held_key    = {}         # bit → key we posted a synthetic KEYDOWN for,
-                              # so the matching KEYUP can be posted for the
-                              # same key once the physical bit releases —
-                              # see _release_held() below.
-    stick_dpad_latch = {}    # persists across polls -- see _stick_to_dpad_hysteresis
+    hold_since  = {}
+    last_repeat = {}
+    held_key    = {}
+    stick_dpad_latch = {}
 
     def _post(key):
         try:
@@ -2604,36 +2653,29 @@ def _xi_nav_worker():
             log.warning("Failed to post synthetic KEYUP for ch03 nav key %s: %s", key, e)
 
     def _release_held(bits_to_release):
-        # Every synthetic KEYDOWN this worker posts MUST get a matching
-        # synthetic KEYUP when the physical button/stick releases --
-        # otherwise the main loop's _held_keys set (built purely from the
-        # KEYDOWN/KEYUP stream) never sees a KEYUP for that key and the
-        # key stays "held" until the separate 1.5-2s SUSPECTED STUCK KEY
-        # self-heal times it out. That self-heal is a safety net for
-        # genuinely lost events (focus loss, etc.), not a substitute for
-        # releasing keys this worker itself pressed down.
         for _bit in list(held_key.keys()):
             if bits_to_release & _bit:
                 _post_up(held_key.pop(_bit))
 
     just_resumed = True
 
-    while _xi_nav_state["running"]:
-        time.sleep(1.0 / POLL_HZ)
+    no_pad_streak = 0
 
-        # Only active on ch03 when not in a live game
-        if not _xi_nav_state["ch03_active"] or _xi_nav_state["game_running"]:
-            # Leaving ch03 nav (or a game just started) while a synthetic
-            # key was still held down would otherwise strand it -- release
-            # everything this worker is currently holding before resetting.
+    while _xi_nav_state["running"]:
+        # WARNING: release every key this worker holds before resetting, or a synthetic key is stranded when ch03 nav ends or a game starts.
+        if not _xi_nav_is_active():
             _release_held(prev_bits)
             prev_bits = 0
-            hold_bits = 0
             hold_since.clear()
             last_repeat.clear()
             _xi_nav_state["dvd_left_held"]  = False
             _xi_nav_state["dvd_right_held"] = False
             just_resumed = True
+            no_pad_streak = 0
+            _xi_nav_wake.clear()
+            # WARNING: re-check after clear() or a wake-up set between the check and the clear is lost
+            if not _xi_nav_is_active():
+                _xi_nav_wake.wait()
             continue
 
         buttons = 0
@@ -2649,9 +2691,6 @@ def _xi_nav_worker():
 
         now = time.monotonic()
 
-        # Include the effective mapping's physical bits, not just the
-        # canonical XInput mask.  A DirectInput remap may use a raw
-        # "Button N" bit for Start/Select (or any other menu action).
         nav_mask = (_XI_UP | _XI_DOWN | _XI_LEFT | _XI_RIGHT |
                     _XI_A | _XI_B | _XI_START | _XI_BACK | _XI_Y)
         for _mapped_bit in _NAV_MAP:
@@ -2675,18 +2714,12 @@ def _xi_nav_worker():
         else:
             active_map = _NAV_MAP
 
-        # Release first, before any new presses: a bit that went from held
-        # to not-held since last frame gets a synthetic KEYUP for whatever
-        # key was posted down for it, regardless of dvd/browse mode below --
-        # this is what actually clears the key, rather than leaving it for
-        # the main loop's stuck-key self-heal to time out 1.5-2s later.
         _release_held(prev_bits & ~nav_bits)
 
-        # New presses — fire immediately
         just_pressed = nav_bits & ~prev_bits
         for bit, key in active_map.items():
             if just_pressed & bit:
-                if key == pygame.K_ESCAPE and _xi_nav_state.get("browse_mode", False):
+                if _nav.is_back(key) and _xi_nav_state.get("browse_mode", False):
                     hold_since.pop(bit, None)
                     last_repeat.pop(bit, None)
                     continue
@@ -2701,42 +2734,43 @@ def _xi_nav_worker():
         else:
             for bit, key in active_map.items():
                 if nav_bits & bit and not (just_pressed & bit):
-                    # Never repeat K_ESCAPE, and skip it entirely in browse_mode
-                    if key == pygame.K_ESCAPE:
+                    # WARNING: never repeat the back key, and skip it entirely in browse_mode.
+                    if _nav.is_back(key):
                         continue
                     since = hold_since.get(bit, now)
                     last  = last_repeat.get(bit, now)
-                    if (now - since) >= REPEAT_DEL / 1000:
-                        if (now - last) >= REPEAT_MS / 1000:
-                            _post(key)
-                            last_repeat[bit] = now
+                    if _nav.hold_due(_pad_rule, (now - since) * 1000.0, (now - last) * 1000.0):
+                        _post(key)
+                        last_repeat[bit] = now
                 elif not (nav_bits & bit):
                     hold_since.pop(bit, None)
                     last_repeat.pop(bit, None)
 
         prev_bits = nav_bits
 
+        if gp is None:
+            no_pad_streak += 1
+        else:
+            no_pad_streak = 0
+        if no_pad_streak >= _XI_NAV_MISSES_BEFORE_SLOW:
+            _xi_nav_wake.clear()
+            _xi_nav_wake.wait(_XI_NAV_NO_PAD_INTERVAL)
+        else:
+            time.sleep(1.0 / POLL_HZ)
+
     log.info("[XI NAV] Thread exited.")
 
-# Start the nav thread immediately — it idles until ch03 becomes active
 if _WIN:
     threading.Thread(target=_xi_nav_worker, daemon=True).start()
 
 
-def resolve_emulator_config_path():
-    """Path to emulator_config.json -- lives under <root>/controllers/,
-    not loose in the app root alongside the exe/launcher. Every read/write
-    site (active-core selection, per-console controller mappings, XInput
-    gamepad maps) should go through this function rather than building its
-    own os.path.join, so the folder is guaranteed to exist and every site
-    agrees on the exact same location.
+# ============================================================================
+# SECTION: Emulator config path
+# ============================================================================
 
-    One-time migration: earlier builds wrote this file straight into the
-    app root instead of controllers/. If the new controllers/ copy doesn't
-    exist yet but an old root-level one does, move it in rather than
-    silently starting every saved core selection and controller mapping
-    over from scratch the first time someone runs a build with this fix.
-    """
+
+def resolve_emulator_config_path():
+    """Return the path to emulator_config.json under <root>/controllers/."""
     root_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     controllers_dir = os.path.join(root_dir, "controllers")
     new_path = os.path.join(controllers_dir, "emulator_config.json")
@@ -2758,7 +2792,17 @@ def resolve_emulator_config_path():
     return new_path
 
 
+# ============================================================================
+# SECTION: External game deck
+# ============================================================================
+
+
 class ExternalGameDeck:
+
+    # ========================================================================
+    # SECTION: State & setup
+    # ========================================================================
+
     def __init__(self, vlc_engine=None):
         self.base_dir = os.path.dirname(resolve_main_dir())
         self.cores_dir = os.path.join(self.base_dir, "main", "cores")
@@ -2776,11 +2820,8 @@ class ExternalGameDeck:
         self.status_msg = ""
 
         self.romlist_focus     = "list"
-        self.romlist_arrow_sel = "up"     # which arrow is highlighted while focus == "arrows"
+        self.romlist_arrow_sel = "up"
 
-        # Momentary highlight state for the BROWSE console-switch arrows (side/updown
-        # scroll styles) -- set when a nav key is pressed, cleared after a short flash
-        # so the arrows aren't lit up all the time, just when actually switching.
         self._console_arrow_flash_dir   = None
         self._console_arrow_flash_until = 0
         self._CONSOLE_ARROW_FLASH_MS    = 220
@@ -2800,14 +2841,11 @@ class ExternalGameDeck:
         self._romlist_error_msg   = ""
         self._romlist_error_until = 0
 
-        # Hold-to-scroll state for the ROM / DVD-file list (see _poll_rom_hold)
-        self._rom_hold_dir   = 0   # -1 = up, 1 = down, 0 = nothing held
-        self._rom_hold_start = 0   # ticks when current direction was first held
-        self._rom_hold_last  = 0
+        self._rom_hold = _nav.HoldState()
 
         self.deck_process = None
         self.game_hwnd = None
-        self.ui_overlay_hwnd = None   # layered child window that sits above mGBA for OSD/menus
+        self.ui_overlay_hwnd = None
         self._fit_rect = None
         self.parent_hwnd = None
         self.is_visible = False
@@ -2852,7 +2890,6 @@ class ExternalGameDeck:
         self._dvd_highlight_shadow = None
         self.dvd_splash_playing = False
         self.dvd_hud_until = 0
-        self.dvd_debug_overlay = False
         self.dvd_splash_done = False
         self.dvd_splash_enabled = False
         self.dvd_splash_path = ""
@@ -2884,11 +2921,13 @@ class ExternalGameDeck:
         self._dvd_captions_auto_done = True
         self._dvd_captions_auto_deadline = 0
         self._dvd_captions_auto_next_try = 0
-        self._dvd_captions_asr_state = "idle"     # "idle" | "running" | "done"
+        self._dvd_captions_asr_state = "idle"
         self._dvd_captions_asr_srt_path = None
+        self._dvd_cap_flow = None
+        self._dvd_cap_suppress = None
         self.dvd_exit_confirm = False
         self.dvd_exit_selection = "No"
-        self.dvd_exit_confirm_shown_at = 0     # pygame.time.get_ticks() when opened/last interacted -- burn-in timeout
+        self.dvd_exit_confirm_shown_at = 0
         self.dvd_return_menu_confirm = False
         self.dvd_return_menu_selection = "No"
         self.dvd_return_menu_confirm_shown_at = 0
@@ -2912,61 +2951,49 @@ class ExternalGameDeck:
 
         self.game_exit_confirm = False
         self.game_exit_selection = "No"
-        self._game_exit_prev_buttons = 0
-        self._game_exit_toggle_held = False   # tracks ESC/Start+Select held state for open/close toggle
+        self._game_exit_prev_buttons = frozenset()
+        self._game_exit_toggle_held = False
+        self._exit_key_event_at = -1
         self.game_exit_confirm_shown_at = 0
-        self._prev_overlay_open = False       # was a TV-shell overlay (menu/splash/quit-confirm) open last frame?
+        self._prev_overlay_open = False
         self._libretro_suppress_start_select = False
 
         self._active_mapping_console = "GBA"
         self._console_mappings = {}
         self.ctrl_mapping = self._load_controller_mapping("GBA")
-        self.ctrl_mapping_active_btn = None   # Which button is awaiting remap
+        self.ctrl_mapping_active_btn = None
         self.ctrl_mapping_mode = "controller"
-        self._wf_surface_cache = {}           # console_key → raw wireframe pygame surface
+        self._wf_surface_cache = {}
         self._wf_tinted_cache  = {}
-        self._wf_tint_color_cache = {}        # console_key → last tint color used
-        # GBA wireframe aliases.
+        self._wf_tint_color_cache = {}
         self._gba_wf_surface = None
         self._gba_wf_tinted  = None
         self._gba_wf_tint_color = None
-        self._seq_remap_active = False         # Sequential auto-advance remap in progress
-        self._ctrl_labels = {}                 # btn → human-readable controller button name
+        self._seq_remap_active = False
+        self._ctrl_labels = {}
         self._last_xinput_btns = 0
-        self._mapping_close_requested = False  # Close button was clicked
-        self._ctrl_map_cursor = 0              # Bottom-option cursor (0=Player row, 1=Map, 2=Stick, 3=Close)
-        self._mapping_opt_rects = []
+        self._mapping_close_requested = False
+        self._ctrl_map_cursor = 0
 
         self._active_mapping_player = 1
         self._ctrl_map_player_sel = 1
         self._mapping_player_by_console = {}
-        self._mapping_player_rects = {}
-        self._mapping_reassign_wait_started = None  # monotonic() while armed, for the on-screen prompt
-        self._ctrl_map_on_pick = False         # nav cursor currently parked on the PICK CONTROLLER button
-        self._pick_flow_pending_player = None  # player_num mid-capture via PICK CONTROLLER (vs. quick-reassign)
+        self._mapping_reassign_wait_started = None
+        self._ctrl_map_on_pick = False
+        self._pick_flow_pending_player = None
         self._pick_layout_popup_player = None
         self._gameplay_ctrl_mapping_cache = {}
         self._ctrl_test_lit = set()
-        self._ctrl_test_lit_joy = set()        # N64 left-analog-stick "JoyUp/Down/Left/Right" hotspots currently lit
+        self._ctrl_test_lit_joy = set()
 
         self.console_rom_dir = {}
-        self.console_roms_manual = {}   # console -> [full file path, ...], added via
-                                         # "Add Roms" (per-console) or "Scan For Roms" (bulk)
+        self.console_roms_manual = {}
 
         self.emulator_config = self._load_emulator_config()
         self._refresh_consoles()
 
         self._libretro_core           = None
         self._libretro_console        = ""
-        # Real elapsed wall-time and accumulator for pacing
-        # core.run_frame() at the core's TRUE native rate regardless of
-        # how long this frame's rendering (CRT shader + Bezel composite)
-        # takes. See render_libretro's catch-up loop for why this exists
-        # -- without it, a slow render frame doesn't just look choppier,
-        # it makes the actual GAME (animation speed, physics, audio
-        # pitch) run in slow motion, since retro_run() would otherwise be
-        # called at most once per render iteration with no way to make up
-        # lost ground.
         self._libretro_run_accum_s    = 0.0
         self._libretro_last_run_wall  = None
         self._prev_libretro_console   = ""
@@ -2975,74 +3002,42 @@ class ExternalGameDeck:
         self._libretro_loading        = False
         self._libretro_load_start     = 0
         self._libretro_load_min_ms    = 2500
-        # Ceiling on how long the loading screen will wait on the
-        # background core.load_rom()/retro_load_game() call before giving
-        # up on it -- that call has no timeout of its own, so a drive that
-        # stalls mid-read (see _launch_libretro_worker) can otherwise leave
-        # the loading screen frozen forever with no way out. See
-        # _libretro_tick_loading.
         self._libretro_launch_pending_timeout_ms = 20000
-        # How long, after core.load_rom() returns, the splash screen will
-        # keep waiting for the core to actually produce its first visible
-        # frame before giving up and handing off to normal gameplay
-        # rendering anyway. A flat 20s (see _LIBRETRO_FIRST_FRAME_GIVEUP_MS
-        # default below) is fine for cartridge-style cores that are on
-        # screen almost the instant load_rom() returns, but PSX cores do a
-        # real BIOS boot (memory card scan, disc TOC read, boot logo) after
-        # that point that can legitimately take longer -- without a longer
-        # allowance here the splash bails early and the screen just goes
-        # dark/frozen for the remainder of the real boot instead of still
-        # showing the (accurate) loading bar. Set per-launch in
-        # _launch_libretro from _LIBRETRO_FIRST_FRAME_GIVEUP_MS.
         self._libretro_first_frame_giveup_ms = 20000
-        # Time constant for the loading bar's animation curve (see
-        # _libretro_tick_loading's _asymptotic_pct). Larger = the bar
-        # creeps upward more slowly/longer instead of racing to its cap in
-        # the first couple of seconds and then sitting there looking
-        # finished while the real (much slower) work is still happening.
-        # Set per-launch from _LIBRETRO_LOAD_TAU_MS below.
         self._libretro_load_tau_ms = 1200
-        # Wall-clock (pygame ticks) timestamp of the first tick where every
-        # completion condition in _libretro_tick_loading was satisfied at
-        # once, or None until that happens. See _LIBRETRO_HOLD_AT_100_MS
-        # and _libretro_tick_loading for why this exists.
         self._libretro_100_reached_at = None
-
 
         self._libretro_launch_lock       = threading.Lock()
         self._libretro_launch_pending    = False
         self._libretro_launch_result     = None
         self._libretro_launch_request_id = 0
         self._libretro_launch_thread     = None
-        self._libretro_auto_save      = False   # off by default; set per-console profile
-        self._libretro_auto_load      = False   # off by default; set per-console profile
+        self._libretro_auto_save      = False
+        self._libretro_auto_load      = False
         self._libretro_active_profile = 1
         self._libretro_screen_size    = "full"
-        self._libretro_border_enabled       = False  # current console's overlay toggle (default OFF; see sync_profile_from_db)
-        self._libretro_border_style         = 1      # which bezel/border(N) image is active (home consoles only; see sync_profile_from_db)
-        self._libretro_border_path          = None      # filename of the currently-loaded border/bezel image (see _load_border_surface) -- used to key the shared curvature/LED styling below, same lookup the outer TV Bezel uses
+        self._libretro_border_enabled       = False
+        self._libretro_border_style         = 1
+        self._libretro_border_path          = None
         self._libretro_border_surf          = None
-        self._libretro_border_rect_frac     = None   # detected (x,y,w,h) screen-cutout fractions, or None
+        self._libretro_border_rect_frac     = None
         self._libretro_border_src_key       = None
+        self._border_rect_cache             = {}
         self._border_blit_cache             = None
         self._libretro_xinput_map     = {}
-        self._libretro_hotkey_cooldown = 0      # ticks; blocks re-fire until expired
+        self._libretro_hotkey_cooldown = 0
         self._libretro_osd_msg        = ""
         self._libretro_osd_until      = 0
         self._libretro_prev_connected_players = set()
         self._libretro_disconnect_pause  = False
         self._libretro_disconnect_player = None
-        # True only when multitap got switched on/off by the live controller-count
-        # heuristic below, never when the user explicitly forced it via the profile
-        # toggle -- lets auto-off know it's safe to revert without clobbering a
-        # standing user choice.
         self._libretro_multitap_auto_engaged = False
-        # True while 3+ controllers are connected but we're withholding the actual
-        # enable until player 3/4 shows real input activity -- see
-        # _reconcile_multitap_live / _poll_libretro_input.
         self._libretro_multitap_pending = False
         threading.Thread(target=self._preload_logos_async, daemon=True).start()
 
+    # ========================================================================
+    # SECTION: Config, console folders & profile sync
+    # ========================================================================
 
     def _load_emulator_config(self):
         try:
@@ -3061,21 +3056,6 @@ class ExternalGameDeck:
 
     def _console_bezel_dir(self, console):
         if console in BORDER_CONSOLES_HOME:
-            # Home/game consoles share ONE bezel folder instead of each
-            # having its own copy of the same images under its rom
-            # directory -- drop bezel.png / bezel1.png (or border.png /
-            # border1.png) in here once and every home console in
-            # BORDER_CONSOLES_HOME picks its style from this same place.
-            # Handhelds (BORDER_CONSOLES_HANDHELD) use their own
-            # per-console rom_dir/bezel(or border) folder below instead.
-            #
-            # Checks "image" (singular) first, then
-            # falls back to "images" (plural) -- every OTHER shared-asset
-            # path in this codebase uses the plural form (logos_dir,
-            # Wireframes, and the existing whole-screen TV Bezel folder in
-            # media.py's resolve_bezel_dir(), which is also main/images/
-            # bezel) so a folder created by following that existing
-            # pattern would otherwise be silently missed.
             _shared_singular = os.path.join(self.base_dir, "main", "image", "bezel")
             _shared_plural    = os.path.join(self.base_dir, "main", "images", "bezel")
             if os.path.isdir(_shared_singular):
@@ -3090,28 +3070,12 @@ class ExternalGameDeck:
     _bezel_style_debug_seen = {}
 
     def console_bezel_style_count(self, console):
-        """How many selectable bezel/border image styles this console's
-        own decorative frame has (see BORDER_CONSOLES) -- NOT the outer/
-        whole-screen TV Bezel, which has its own independent style count
-        via media.bezel_style_count(). Always >= 1 so callers can safely
-        check `> 1` to decide whether to show a style-cycle control.
-        Restricted to the "home console" bordered systems (BORDER_
-        CONSOLES_HOME) -- handhelds keep their single fixed frame image,
-        matching real handheld hardware, which only ever has the one
-        physical shell."""
+        """Return how many border image styles this console's own frame has (see BORDER_CONSOLES)."""
         if console not in BORDER_CONSOLES_HOME:
             return 1
         bezel_dir  = self._console_bezel_dir(console)
         discovered = _discover_border_style_files(bezel_dir)
         count      = max(1, len(discovered))
-        # Throttled diagnostic: log only when the folder or its discovered
-        # style files actually change for this console, so this is safe to
-        # leave in even though the profile screen calls this every frame
-        # while open. This is the exact thing to check when the style
-        # picker doesn't appear where expected -- either the folder isn't
-        # what _console_bezel_dir() resolved to, or the files inside it
-        # don't match the bezel/bezel<N> (or border/border<N>) naming
-        # convention _discover_border_style_files looks for.
         _key = (console, bezel_dir)
         _cur = (count, tuple(discovered))
         if self._bezel_style_debug_seen.get(_key) != _cur:
@@ -3136,10 +3100,6 @@ class ExternalGameDeck:
                 continue
             emu_folder = os.path.join(self.cores_dir, c)
             rom_folder = self._get_console_rom_dir(c)
-            # A console with manually-added ROMs is usable even when its
-            # conventional main/roms/<CONSOLE> folder has not been created.
-            # This matters for NGPC because the existing library may live in
-            # a user-selected folder recorded in console_roms_manual.
             if (os.path.isdir(emu_folder)
                     or os.path.isdir(rom_folder)
                     or bool(self.console_roms_manual.get(c))):
@@ -3184,29 +3144,22 @@ class ExternalGameDeck:
         else:
             self._libretro_border_enabled = False
             self._libretro_border_style = 1
-        # Reset border caches for the active profile and console.
         self._libretro_border_surf      = None
         self._libretro_border_rect_frac = None
         self._libretro_border_src_key   = None
         self._border_blit_cache         = None
-        # Multitap is now a single global on/off switch (Games -> MENU ->
-        # Multitap), applying to whichever multitap-capable console is
-        # currently running rather than being saved per profile/console --
-        # only one console plays at a time, so there's no need for it to vary
-        # per profile. It's always an explicit choice (never "undecided"), so
-        # forced True/False is read straight from the global setting; see
-        # toggle_multitap_live / _reconcile_multitap_live for how True/False
-        # are honored.
         self._libretro_multitap_enabled = (bool(db_config.get("multitap_enabled_global", False))
                                             if console in MULTITAP_CONSOLES else None)
-        # Reset live auto-engage state for the active ROM and profile.
         self._libretro_multitap_auto_engaged = False
         self._libretro_multitap_pending = False
-        # Keep the core in sync so saves/loads land in the right profile folder
         if self._libretro_core is not None and hasattr(self._libretro_core, "set_active_profile"):
             self._libretro_core.set_active_profile(active)
         log.info(f"[GAMEDECK PROFILE] {console} → profile {active}, "
               f"auto_save={self._libretro_auto_save}, auto_load={self._libretro_auto_load}")
+
+    # ========================================================================
+    # SECTION: Border & multitap live toggles
+    # ========================================================================
 
     def set_border_live(self, enabled):
         if enabled and not border_available_for_console(self._libretro_console):
@@ -3214,13 +3167,7 @@ class ExternalGameDeck:
         self._libretro_border_enabled = bool(enabled)
 
     def set_border_style_live(self, style):
-        """Apply a new bezel/border style number to the currently-running
-        console's own decorative frame (home consoles only -- see
-        console_bezel_style_count). Clamps into the valid range and forces
-        a reload next frame, since _load_border_surface's (console, path,
-        mtime) cache key only busts itself automatically once the *path*
-        it computes changes, not merely because this in-memory style
-        number did."""
+        """Apply a new border style number to the running console's own frame (home consoles only)."""
         if self._libretro_console not in BORDER_CONSOLES_HOME:
             return
         n = self.console_bezel_style_count(self._libretro_console)
@@ -3238,11 +3185,6 @@ class ExternalGameDeck:
         core = self._libretro_core
         if core is None:
             return None
-        # This is an explicit user decision (from the profile menu toggle), so it
-        # takes precedence over the live controller-count heuristic below in both
-        # directions: forced ON must never be auto-reverted, and forced OFF must
-        # never be immediately re-engaged just because 3+ controllers still happen
-        # to be connected. Clearing auto_engaged marks this as "not ours to revert".
         self._libretro_multitap_enabled = bool(enabled)
         self._libretro_multitap_auto_engaged = False
         self._libretro_multitap_pending = False
@@ -3255,18 +3197,7 @@ class ExternalGameDeck:
         return "OFF"
 
     def _reconcile_multitap_live(self, prev_bound, bound_players):
-        """Keep multitap in sync with controller count while a game is running.
-
-        Only fires on a genuine crossing of the 3-player threshold (not on every
-        frame the count happens to sit above/below it), so it reacts to actual
-        connect/disconnect events rather than fighting a standing user choice:
-          - crossing up (2->3+):   auto-enable, if not already forced/active.
-          - crossing down (3+->2): auto-disable, but ONLY if we're the ones who
-            turned it on (self._libretro_multitap_auto_engaged); an explicit
-            profile/manual "on" is never reverted, and an explicit manual "off"
-            is never immediately re-engaged since no threshold crossing occurs
-            while the count stays put.
-        """
+        """Keep multitap in sync with controller count while a game is running."""
         core = self._libretro_core
         if core is None or not core.is_loaded:
             return
@@ -3281,25 +3212,12 @@ class ExternalGameDeck:
             return
 
         is_active = core.multitap_active() if hasattr(core, "multitap_active") else False
-        # Tri-state (see sync_profile_from_db / toggle_multitap_live): only an
-        # explicit False should block auto-engage. None (never decided) must
-        # not read the same as an explicit "off", or a forced-off decision
-        # would get silently re-armed by the very next connect/disconnect
-        # blip instead of holding for the rest of the session.
+        # WARNING: None (never decided) must not read as an explicit off, or a forced-off decision is re-armed by the next connect/disconnect.
         forced_state = getattr(self, "_libretro_multitap_enabled", None)
 
         if crossed_up and not is_active and forced_state is not False:
-            # Don't flip the core the instant a 3rd/4th pad connects -- some
-            # players just plug a controller in without intending to play
-            # right away, and switching port devices mid-session can reset
-            # that pad's in-game state on some cores. Wait for player 3/4 to
-            # actually press something; _resolve_pending_multitap (called each
-            # frame from _poll_libretro_input) commits the enable once real
-            # input activity shows up.
             self._libretro_multitap_pending = True
         elif crossed_down:
-            # Count dropped back below 3 before the pending activity check
-            # ever fired -- withdraw the offer, nothing to revert yet.
             self._libretro_multitap_pending = False
             if is_active and self._libretro_multitap_auto_engaged:
                 core.disable_multitap()
@@ -3322,14 +3240,7 @@ class ExternalGameDeck:
         )
 
     def _resolve_pending_multitap(self, player_gps):
-        """Commit the deferred multitap enable once player 3/4 shows real input.
-
-        Called each frame from _poll_libretro_input while a 3rd/4th controller
-        is connected but multitap hasn't been switched on yet (see
-        _reconcile_multitap_live and the ROM-launch path). Only players 3 and
-        4 count -- activity from an already-seated player 1/2 says nothing
-        about whether the newly-connected pad is actually being used.
-        """
+        """Commit the deferred multitap enable once player 3/4 shows real input."""
         if not self._libretro_multitap_pending:
             return
         core = self._libretro_core
@@ -3353,81 +3264,27 @@ class ExternalGameDeck:
     _HANDHELD_BEZEL_FIT_MARGIN = 0.90
 
     _CONFIRM_BURN_IN_MS = 20000
-    # Max extra core.run_frame() calls per rendered frame when catching up
-    # from a slow render iteration -- see render_libretro's catch-up loop
-    # and the accumulator fields' init comment. 4 covers catching up from
-    # a full stop down to ~15fps render throughput (still plenty of
-    # catch-up headroom for what we've actually measured, ~35-38fps)
-    # without letting a genuine
-    # multi-second pause try to replay it all in one burst.
     _LIBRETRO_MAX_CATCHUP_FRAMES = 4
 
+    # ========================================================================
+    # SECTION: Border loading & drawing
+    # ========================================================================
+
     def _detect_border_cutout_frac(self, raw_surf):
-        """Returns rect_frac, the (x,y,w,h) fraction of the image occupied
-        by the enclosed transparent screen cutout (or the SGB-style
-        default if none is found). Along the way it also finds every
-        transparent pixel connected to the image's own outer edge --
-        rounded corners, or any transparent padding baked around a
-        smaller/oddly-shaped bezel graphic sitting on a larger rectangular
-        canvas -- that edge-connected region has no consumer, so it's
-        computed here as a required intermediate step (see `visited`
-        below) but not returned."""
+        """Return rect_frac, the (x, y, w, h) fraction of the image occupied by the transparent screen cutout, or the SGB-style default."""
         try:
             import numpy as np
             w, h = raw_surf.get_size()
             alpha = pygame.surfarray.array_alpha(raw_surf)
             transparent = alpha < 24
-            visited = np.zeros_like(transparent, dtype=bool)
-            edge_mask = np.zeros_like(transparent)
-            edge_mask[0, :] = True; edge_mask[-1, :] = True
-            edge_mask[:, 0] = True; edge_mask[:, -1] = True
-            seed_xs, seed_ys = np.nonzero(transparent & edge_mask)
-            stack = list(zip(seed_xs.tolist(), seed_ys.tolist()))
-            visited[seed_xs, seed_ys] = True
-            while stack:
-                x, y = stack.pop()
-                if x > 0 and transparent[x - 1, y] and not visited[x - 1, y]:
-                    visited[x - 1, y] = True; stack.append((x - 1, y))
-                if x < w - 1 and transparent[x + 1, y] and not visited[x + 1, y]:
-                    visited[x + 1, y] = True; stack.append((x + 1, y))
-                if y > 0 and transparent[x, y - 1] and not visited[x, y - 1]:
-                    visited[x, y - 1] = True; stack.append((x, y - 1))
-                if y < h - 1 and transparent[x, y + 1] and not visited[x, y + 1]:
-                    visited[x, y + 1] = True; stack.append((x, y + 1))
-            interior = transparent & ~visited
-            if interior.sum() < (w * h * 0.005):
-                raise ValueError("no enclosed transparent cutout found")
-            comp_visited = np.zeros_like(interior, dtype=bool)
-            ixs, iys = np.nonzero(interior)
-            best_pixels = None
-            best_size = 0
-            for sx, sy in zip(ixs.tolist(), iys.tolist()):
-                if comp_visited[sx, sy]:
-                    continue
-                comp_stack = [(sx, sy)]
-                comp_visited[sx, sy] = True
-                comp_xs = [sx]; comp_ys = [sy]
-                while comp_stack:
-                    x, y = comp_stack.pop()
-                    if x > 0 and interior[x - 1, y] and not comp_visited[x - 1, y]:
-                        comp_visited[x - 1, y] = True; comp_stack.append((x - 1, y))
-                        comp_xs.append(x - 1); comp_ys.append(y)
-                    if x < w - 1 and interior[x + 1, y] and not comp_visited[x + 1, y]:
-                        comp_visited[x + 1, y] = True; comp_stack.append((x + 1, y))
-                        comp_xs.append(x + 1); comp_ys.append(y)
-                    if y > 0 and interior[x, y - 1] and not comp_visited[x, y - 1]:
-                        comp_visited[x, y - 1] = True; comp_stack.append((x, y - 1))
-                        comp_xs.append(x); comp_ys.append(y - 1)
-                    if y < h - 1 and interior[x, y + 1] and not comp_visited[x, y + 1]:
-                        comp_visited[x, y + 1] = True; comp_stack.append((x, y + 1))
-                        comp_xs.append(x); comp_ys.append(y + 1)
-                if len(comp_xs) > best_size:
-                    best_size = len(comp_xs)
-                    best_pixels = (comp_xs, comp_ys)
-            xs, ys = best_pixels
-            minx, maxx = min(xs), max(xs)
-            miny, maxy = min(ys), max(ys)
-            rect = (minx / w, miny / h, (maxx - minx + 1) / w, (maxy - miny + 1) / h)
+            try:
+                import cv2
+            except ImportError:
+                cv2 = None
+            if cv2 is not None:
+                rect = self._cutout_rect_cv2(transparent, w, h, np, cv2)
+            else:
+                rect = self._cutout_rect_python(transparent, w, h, np)
             log.info(f"[LIBRETRO] Border cutout auto-detected: {rect}")
             return rect
         except Exception as e:
@@ -3435,24 +3292,104 @@ class ExternalGameDeck:
                   f"using default SGB-style proportions")
             return self._BORDER_DEFAULT_RECT_FRAC
 
-    def _load_border_surface(self, console):
+    @staticmethod
+    def _cutout_rect_cv2(transparent, w, h, np, cv2):
+        """Finds the largest transparent region not touching the image edge with OpenCV connected components; the GIL is released while it runs."""
+        # WARNING: the array stays indexed [x, y]; transposing it changes which region wins a size tie.
+        mask = np.ascontiguousarray(transparent, dtype=np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+        outside = np.zeros(count, dtype=bool)
+        outside[labels[0, :]] = True
+        outside[labels[-1, :]] = True
+        outside[labels[:, 0]] = True
+        outside[labels[:, -1]] = True
+        outside[0] = True
+        areas = stats[:, cv2.CC_STAT_AREA]
+        interior_areas = np.where(outside, 0, areas)
+        if int(interior_areas.sum()) < (w * h * 0.005):
+            raise ValueError("no enclosed transparent cutout found")
+        best_size = int(interior_areas.max())
+        tied = np.nonzero(interior_areas == best_size)[0]
+        if len(tied) == 1:
+            best = int(tied[0])
+        else:
+            flat = labels.ravel()
+            best = min((int(t) for t in tied), key=lambda t: int(np.argmax(flat == t)))
+        minx = int(stats[best, cv2.CC_STAT_TOP])
+        maxx = minx + int(stats[best, cv2.CC_STAT_HEIGHT]) - 1
+        miny = int(stats[best, cv2.CC_STAT_LEFT])
+        maxy = miny + int(stats[best, cv2.CC_STAT_WIDTH]) - 1
+        return (minx / w, miny / h, (maxx - minx + 1) / w, (maxy - miny + 1) / h)
+
+    @staticmethod
+    def _cutout_rect_python(transparent, w, h, np):
+        """Finds the largest transparent region not touching the image edge with a per-pixel flood fill; used only when OpenCV is missing."""
+        visited = np.zeros_like(transparent, dtype=bool)
+        edge_mask = np.zeros_like(transparent)
+        edge_mask[0, :] = True; edge_mask[-1, :] = True
+        edge_mask[:, 0] = True; edge_mask[:, -1] = True
+        seed_xs, seed_ys = np.nonzero(transparent & edge_mask)
+        stack = list(zip(seed_xs.tolist(), seed_ys.tolist()))
+        visited[seed_xs, seed_ys] = True
+        while stack:
+            x, y = stack.pop()
+            if x > 0 and transparent[x - 1, y] and not visited[x - 1, y]:
+                visited[x - 1, y] = True; stack.append((x - 1, y))
+            if x < w - 1 and transparent[x + 1, y] and not visited[x + 1, y]:
+                visited[x + 1, y] = True; stack.append((x + 1, y))
+            if y > 0 and transparent[x, y - 1] and not visited[x, y - 1]:
+                visited[x, y - 1] = True; stack.append((x, y - 1))
+            if y < h - 1 and transparent[x, y + 1] and not visited[x, y + 1]:
+                visited[x, y + 1] = True; stack.append((x, y + 1))
+        interior = transparent & ~visited
+        if interior.sum() < (w * h * 0.005):
+            raise ValueError("no enclosed transparent cutout found")
+        comp_visited = np.zeros_like(interior, dtype=bool)
+        ixs, iys = np.nonzero(interior)
+        best_pixels = None
+        best_size = 0
+        for sx, sy in zip(ixs.tolist(), iys.tolist()):
+            if comp_visited[sx, sy]:
+                continue
+            comp_stack = [(sx, sy)]
+            comp_visited[sx, sy] = True
+            comp_xs = [sx]; comp_ys = [sy]
+            while comp_stack:
+                x, y = comp_stack.pop()
+                if x > 0 and interior[x - 1, y] and not comp_visited[x - 1, y]:
+                    comp_visited[x - 1, y] = True; comp_stack.append((x - 1, y))
+                    comp_xs.append(x - 1); comp_ys.append(y)
+                if x < w - 1 and interior[x + 1, y] and not comp_visited[x + 1, y]:
+                    comp_visited[x + 1, y] = True; comp_stack.append((x + 1, y))
+                    comp_xs.append(x + 1); comp_ys.append(y)
+                if y > 0 and interior[x, y - 1] and not comp_visited[x, y - 1]:
+                    comp_visited[x, y - 1] = True; comp_stack.append((x, y - 1))
+                    comp_xs.append(x); comp_ys.append(y - 1)
+                if y < h - 1 and interior[x, y + 1] and not comp_visited[x, y + 1]:
+                    comp_visited[x, y + 1] = True; comp_stack.append((x, y + 1))
+                    comp_xs.append(x); comp_ys.append(y + 1)
+            if len(comp_xs) > best_size:
+                best_size = len(comp_xs)
+                best_pixels = (comp_xs, comp_ys)
+        xs, ys = best_pixels
+        minx, maxx = min(xs), max(xs)
+        miny, maxy = min(ys), max(ys)
+        rect = (minx / w, miny / h, (maxx - minx + 1) / w, (maxy - miny + 1) / h)
+        return rect
+
+    def _border_source_path(self, console, style):
+        """Returns the bezel image path for this console and style number, or None when it has none."""
         bezel_dir = self._console_bezel_dir(console)
         path = None
         style_files = _discover_border_style_files(bezel_dir)
         if style_files:
             if console in BORDER_CONSOLES_HOME:
-                # Home consoles get the style picker -- clamp whatever's
-                # currently selected (per-profile "border_style", synced
-                # in sync_profile_from_db) into range in case the folder
-                # has fewer numbered styles than the saved value expects.
                 n = len(style_files)
-                idx = max(1, min(int(self._libretro_border_style or 1), n)) - 1
+                idx = max(1, min(int(style or 1), n)) - 1
             else:
-                # Handhelds use the first discovered frame image.
                 idx = 0
             path = style_files[idx]
         elif os.path.isdir(bezel_dir):
-            # If no numbered style exists, use the first image in the folder.
             exts = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
             try:
                 for f in sorted(os.listdir(bezel_dir)):
@@ -3460,78 +3397,143 @@ class ExternalGameDeck:
                         path = os.path.join(bezel_dir, f); break
             except Exception:
                 path = None
+        return path
 
+    def _prepare_border_asset(self, console):
+        """Finds and loads the bezel image and finds its screen cutout; safe to run off the main thread."""
+        # WARNING: no display conversion (convert_alpha) and no draw-state writes may run here; they stay on the main thread.
+        style = self._libretro_border_style
+        prepared = {"console": console, "style": style, "path": None, "thread": threading.current_thread().name}
+        path = self._border_source_path(console, style)
+        if path is None:
+            return prepared
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0
+        key = (console, path, mtime)
+        prepared["path"] = path
+        prepared["key"] = key
+        if key == self._libretro_border_src_key and self._libretro_border_surf is not None:
+            prepared["reuse"] = True
+            return prepared
+        _t0 = time.perf_counter()
+        try:
+            raw = pygame.image.load(path)
+        except Exception as e:
+            prepared["error"] = e
+            return prepared
+        prepared["load_ms"] = (time.perf_counter() - _t0) * 1000.0
+        prepared["raw"] = raw
+        prepared["rect"] = self._border_rect_cache.get((path, mtime))
+        prepared["rect_cached"] = prepared["rect"] is not None
+        prepared["detect_ms"] = 0.0
+        _masks = raw.get_masks()
+        if prepared["rect"] is None and raw.get_bitsize() == 32 and _masks[3] != 0:
+            _t0 = time.perf_counter()
+            prepared["rect"] = self._detect_border_cutout_frac(raw)
+            prepared["detect_ms"] = (time.perf_counter() - _t0) * 1000.0
+            self._border_rect_cache[(path, mtime)] = prepared["rect"]
+        return prepared
+
+    def _border_reuse_valid(self, prepared):
+        return prepared.get("key") == self._libretro_border_src_key and self._libretro_border_surf is not None
+
+    def _install_prepared_border(self, console, prepared):
+        """Main-thread step: converts the prepared bezel image for drawing and makes it the active border; prepares it here when no valid prepared copy was given."""
+        if (prepared is None or prepared.get("console") != console
+                or prepared.get("style") != self._libretro_border_style
+                or (prepared.get("reuse") and not self._border_reuse_valid(prepared))):
+            prepared = self._prepare_border_asset(console)
+
+        path = prepared.get("path")
         if path is None:
             self._libretro_border_path      = None
             self._libretro_border_surf      = None
             self._libretro_border_rect_frac = None
             self._libretro_border_src_key   = None
             return
+        if prepared.get("reuse"):
+            return
 
-        try:
-            mtime = os.path.getmtime(path)
-        except Exception:
-            mtime = 0
-
-        cache_key = (console, path, mtime)
-        if cache_key == self._libretro_border_src_key and self._libretro_border_surf is not None:
-            return  # already loaded for this exact image
-
-        try:
-            raw_surf = pygame.image.load(path).convert_alpha()
-        except Exception as e:
-            log.warning(f"[LIBRETRO] Could not load bezel image '{path}': {e}")
+        _t0 = time.perf_counter()
+        raw_surf = None
+        err = prepared.get("error")
+        if err is None:
+            try:
+                raw_surf = prepared["raw"].convert_alpha()
+            except Exception as e:
+                err = e
+        if err is not None:
+            log.warning(f"[LIBRETRO] Could not load bezel image '{path}': {err}")
             self._libretro_border_path      = None
             self._libretro_border_surf      = None
             self._libretro_border_rect_frac = None
             self._libretro_border_src_key   = None
             return
 
-        self._libretro_border_rect_frac = self._detect_border_cutout_frac(raw_surf)
+        rect = prepared.get("rect")
+        detect_ms = prepared.get("detect_ms", 0.0)
+        if rect is None:
+            _t1 = time.perf_counter()
+            rect = self._detect_border_cutout_frac(raw_surf)
+            detect_ms = (time.perf_counter() - _t1) * 1000.0
+            self._border_rect_cache[(path, prepared["key"][2])] = rect
+        self._libretro_border_rect_frac = rect
         self._libretro_border_path      = path
         self._libretro_border_surf      = raw_surf
-        self._libretro_border_src_key   = cache_key
+        self._libretro_border_src_key   = prepared["key"]
+        log.info("[LIBRETRO BORDER] %s: prepared on %s (image load %.0f ms, cutout %s %.0f ms); main-thread install %.1f ms",
+                 console, prepared.get("thread", "?"), prepared.get("load_ms", 0.0),
+                 "from cache" if prepared.get("rect_cached") else "detected", detect_ms,
+                 (time.perf_counter() - _t0) * 1000.0)
+
+    def _load_border_surface(self, console):
+        """Loads and installs the console's bezel image on the calling thread."""
+        self._install_prepared_border(console, None)
+
+    def _start_border_prep(self, console):
+        """Starts preparing the console's bezel image on a background thread and returns (thread, holder), or None when the console has no bezel."""
+        if not border_available_for_console(console):
+            return None
+        holder = {}
+
+        def _run():
+            try:
+                holder["prepared"] = self._prepare_border_asset(console)
+            except Exception as e:
+                log.warning("[LIBRETRO] Bezel prepare failed for %s: %s", console, e)
+
+        th = threading.Thread(target=_run, name="BorderPrep", daemon=True)
+        th.start()
+        return th, holder
 
     def _outer_tv_bezel_blocks_console_bezel(self, console):
-        """True when the console's own decorative bezel must NOT be drawn
-        because the outer/whole-screen TV Bezel (Channels tab, Video ->
-        fake_43_border_enabled) is already on. Layering the console's own
-        frame image inside the outer TV frame produced a visible
-        "bezel-in-a-bezel" (or, depending on timing, an inconsistently
-        greyed-out toggle) -- so for home/game consoles the two are made
-        mutually exclusive: the outer whole-screen bezel wins, and the
-        console's own bezel is suppressed at render time regardless of
-        what the per-profile TV BEZEL toggle says. Handhelds are
-        deliberately excluded -- not part of this change, their own frame
-        already layers fine with the outer bezel."""
+        """True when the console's own bezel must not be drawn because the outer System Bezel is on."""
         if console not in BORDER_CONSOLES_HOME:
             return False
         try:
             import sys as _sys
             _main = _sys.modules.get("__main__")
             if _main and hasattr(_main, "db") and _main.db:
-                # Real 4:3 hardware blocks it too: the CRT is the bezel,
-                # exactly as the outer TV Bezel would be.
-                if getattr(_main.db, "_detected_aspect_ratio", None) == "4:3":
-                    return True
                 return bool(_main.db.config.get("fake_43_border_enabled", False))
         except Exception:
             pass
         return False
 
     def _blit_libretro_frame(self, screen, surf, dest_rect):
+        _gft_t0 = time.perf_counter()
+        try:
+            self._blit_libretro_frame_impl(screen, surf, dest_rect)
+        finally:
+            GAME_FRAME_TIMER.add("blit", (time.perf_counter() - _gft_t0) * 1000.0)
+
+    def _blit_libretro_frame_impl(self, screen, surf, dest_rect):
         _in_border_consoles = self._libretro_console in BORDER_CONSOLES
         _border_avail = border_available_for_console(self._libretro_console)
         _outer_blocks = self._outer_tv_bezel_blocks_console_bezel(self._libretro_console)
         _use_bordered = (_in_border_consoles and self._libretro_border_enabled
                           and _border_avail and not _outer_blocks)
-        # Logged once per distinct (console, decision, reason) combination --
-        # not every frame -- so it's cheap to leave in permanently, but
-        # still answers "is the console's own bezel compositing on top of
-        # (or alongside) the system TV Bezel this session?" directly from
-        # the log instead of by inference. See _perf_timer above for why
-        # this needed adding: the bordered path's actual per-frame cost
-        # was never measured before now.
         _log_key = (self._libretro_console, _use_bordered, self._libretro_border_enabled, _outer_blocks)
         if _blit_libretro_frame_log_state.get("key") != _log_key:
             _blit_libretro_frame_log_state["key"] = _log_key
@@ -3568,41 +3570,10 @@ class ExternalGameDeck:
         return (ox, oy, draw_bw, draw_bh), (inner_x, inner_y, inner_w, inner_h)
 
     def get_active_console_bezel_inner_rect(self, dest_rect):
-        # Deliberately always returns None now: the Game (console) bezel's
-        # menus/popups (exit-confirm, and -- via retro_tv_emulator.py's
-        # _overlay_content_rect/_active_bezel_content_rect -- the Settings
-        # menu, Controls splash, and file explorer while on the Games
-        # channel) must NEVER be confined/shrunk to the console bezel's
-        # own photographed screen cutout, no matter the Screen Size
-        # setting (Full/75%/50%). This used to hold menus to that cutout
-        # only when Screen Size was "full", to mimic how the separate,
-        # whole-program TV Bezel holds its own menus to ITS cutout (see
-        # _MENU_BEZEL_SHRINK/_overlay_target_for_menu) -- but that made
-        # the "does the menu shrink to fit its bezel?" question depend on
-        # an unrelated setting instead of on which bezel is even active.
-        # Now that behavior itself is the signal: a menu that shrinks to
-        # match its screen means you're looking at the whole-program TV
-        # Bezel; a menu that stays full-sized regardless of Screen Size
-        # means you're looking at the Game bezel. Every caller already
-        # falls back to the plain (unshrunk) dest_rect whenever this
-        # returns None, so no call site needs to change.
         return None
 
     def _console_bezel_shader_enabled(self):
-        """Whether the console's own bezel should warp its picture with
-        the same curvature/vignette CRT shader the outer whole-program TV
-        Bezel uses -- gated on the same crt_shader_enabled setting and
-        real-4:3-hardware exclusion. Neither bezel has a perf-lite
-        fallback anymore (that mechanism, which used to drop curvature to
-        flat scanlines under load, has been removed entirely): turning
-        this bezel on is opting into the warp's real cost, same as the
-        outer one, unconditionally -- if the cost isn't wanted, the fix is
-        to turn the bezel off, not to silently drop curvature under it.
-
-        Handhelds are excluded unconditionally: their bezel is meant to
-        be just the frame art and the game picture, with none of the
-        home/system-bezel extras -- no CRT warp, no matter what stem
-        their own bezel file happens to be named."""
+        """Whether the console's own bezel warps its picture with the CRT shader, gated on crt_shader_enabled, warp_screen_enabled and the Performance Mode lock."""
         if self._libretro_console in BORDER_CONSOLES_HANDHELD:
             return False
         try:
@@ -3612,41 +3583,15 @@ class ExternalGameDeck:
                 return False
             if not _main.db.config.get("crt_shader_enabled", True):
                 return False
-            if getattr(_main.db, "_detected_aspect_ratio", None) == "4:3":
-                return False
-            # Must also honor the persisted "Warp Screen" toggle
-            # (db.config["warp_screen_enabled"], Channels tab footer) --
-            # the outer whole-program TV Bezel already gates its own
-            # curvature/vignette warp on this same setting (see the
-            # warp_screen_enabled check around _apply_crt_shader's call
-            # site in retro_tv_emulator.py). Before this check, a console
-            # bezel would warp any time crt_shader_enabled was on,
-            # completely ignoring whether the person had Warp Screen
-            # turned off -- the two bezel systems disagreeing about which
-            # setting controls curvature.
-            if not _main.db.config.get("warp_screen_enabled", False):
+            if not _main.db.config.get("warp_screen_enabled", False) or _main._feature_locked("warp_screen_enabled"):
                 return False
             return True
         except Exception:
             return False
 
     def _draw_console_bezel_channel_led(self, screen, border_rect):
-        """Live 'CH NN' readout + black hide-patch over this bezel's own
-        baked-in channel number, in the exact same style/position logic
-        as the outer whole-program TV Bezel -- see
-        _draw_bezel_channel_led in retro_tv_emulator.py (this file can't
-        import that module directly, it's __main__ and imports this one,
-        so it's reached the same way _outer_tv_bezel_blocks_console_bezel
-        already reaches `db`). border_rect is this bezel's own drawn
-        (ox, oy, draw_bw, draw_bh) -- the console-bezel equivalent of the
-        outer bezel's border_rect from _full_tv_border_geometry. No-op if
-        the current style has no LED readout defined (see
-        _BEZEL_CHANNEL_LED_FRAC) or main isn't reachable.
-
-        Handhelds are excluded unconditionally: no channel-number LED
-        should appear on a handheld bezel even if its own bezel file
-        happens to share a stem (e.g. "bezel") with a home/system bezel
-        style that does have one defined."""
+        """Draws the live 'CH NN' readout and a black hide-patch over the bezel's baked-in channel number; border_rect is this bezel's drawn (ox, oy, draw_bw, draw_bh)."""
+        # WARNING: retro_tv_emulator.py is __main__ and imports this file, so reach it through __main__; never import it here.
         if self._libretro_console in BORDER_CONSOLES_HANDHELD:
             return
         try:
@@ -3679,28 +3624,10 @@ class ExternalGameDeck:
         key = (id(border_surf), tuple(dest_rect), tuple(rect_frac))
         cached = self._border_blit_cache
         if cached is None or cached[0] != key:
+            _gft_rebuild_t0 = time.perf_counter()
             try:
                 (ox, oy, draw_bw, draw_bh), (inner_x, inner_y, inner_w, inner_h) = \
                     self._compute_border_inner_geometry(border_surf, rect_frac, dest_rect)
-                # smoothscale (not the plain nearest-neighbor scale()) --
-                # every other piece of this compositing path (background
-                # fill, corner-mask patch below) already uses smoothscale;
-                # the frame art itself was the one place still using the
-                # unfiltered version. That's mostly invisible on a
-                # high-resolution source image close to the display's own
-                # size, but a lower-resolution bezel PNG (any style whose
-                # source art is well under the monitor's native
-                # resolution) gets stretched by a much larger factor here,
-                # and nearest-neighbor scaling of a hard alpha-cutout edge
-                # at that factor produces a visibly blocky/jagged screen
-                # cutout boundary -- exactly what reads as the screen "not
-                # fitting" the frame, even though the source PNG's own
-                # cutout mask is perfectly clean.
-                #
-                # Handhelds are the one exception: they should get just
-                # the bezel and the video, nothing extra -- plain
-                # nearest-neighbor scale() here, same as everywhere else
-                # a handheld bezel is kept extras-free.
                 if self._libretro_console in BORDER_CONSOLES_HANDHELD:
                     scaled_border = pygame.transform.scale(border_surf, (draw_bw, draw_bh))
                 else:
@@ -3712,136 +3639,67 @@ class ExternalGameDeck:
                 self._border_blit_cache = None
                 _libretro_blit_scaled(screen, surf, dest_rect)
                 return
+            finally:
+                GAME_FRAME_TIMER.add("cache_rebuild", (time.perf_counter() - _gft_rebuild_t0) * 1000.0)
+                GAME_FRAME_TIMER.count("cache_rebuild")
 
-        # NOTE: draw_bw/draw_bh (the border art's own drawn size, used
-        # below by _draw_console_bezel_channel_led to position the LED
-        # readout) used to only be assigned on the cache-MISS branch
-        # above and never stored in the cache tuple -- so every
-        # cache-HIT frame (i.e. almost every frame once the cache was
-        # warm) referenced a local that was never assigned this call,
-        # raising UnboundLocalError right after the border art itself
-        # had already been blit. That fired on essentially every frame
-        # the console bezel was on screen (see the flood of "Console
-        # bezel frame (border art + LED) blit failed this frame" in the
-        # logs) -- cheap-looking on its own, but log.exception's
-        # per-frame stack-trace capture and synchronous file write was
-        # enough extra frame time to trip the in-game perf-lite
-        # fallback that used to exist elsewhere, which is what was
-        # actually dropping the outer TV Bezel's CRT curvature/vignette
-        # shader down to its flat scanline fallback while a game ran.
-        # (That perf-lite mechanism has since been removed entirely --
-        # this is a historical note about what this bug used to trigger.)
-        # Both values are now carried in the cache tuple so this stays
-        # correct on cache-hit frames too.
         _key, scaled_border, (ox, oy), (draw_bw, draw_bh), (inner_x, inner_y, inner_w, inner_h) = cached
 
-        # NOTE on error handling below: the picture (fit+blit+shader) and
-        # the frame (border art + LED) are now in SEPARATE try/except
-        # blocks, deliberately. They used to share one try wrapping all
-        # four steps, which meant ANY transient failure in any one of
-        # them -- including ones that have nothing to do with whether
-        # the cached border geometry/art is still valid -- discarded
-        # self._border_blit_cache and fell all the way back to the
-        # plain unbordered frame for that render. If the same transient
-        # condition recurred every frame, that produced a genuine
-        # flicker between "bezel" and "no bezel" while silently hiding
-        # the real exception behind a throttled log line. Now: a picture/
-        # shader failure still shows the border+LED (game frame just
-        # doesn't warp that frame), a border/LED failure still shows the
-        # game picture, and the border cache is only ever discarded when
-        # the geometry/smoothscale BUILD itself fails (the try/except
-        # above this one) -- not because something unrelated hiccuped
-        # downstream of it. Failures also log with a real traceback
-        # (log.exception, not throttled) so a persistent cause -- as
-        # opposed to a one-off -- is actually visible instead of getting
-        # swallowed.
         _fit_x = _fit_y = _fit_w = _fit_h = 0
         try:
-            with _perf_timer("blit_scale"):
-                # Fit the game's own frame into the bezel's screen cutout
-                # using the same Launched Games "Screen Mode" setting the
-                # no-bezel path (_libretro_blit_scaled) already honors:
-                # "normal" contain-fits (preserving aspect, any leftover
-                # gap in the cutout stays plain black -- see the
-                # background-image note above), "stretch" forces the
-                # exact inner_w x inner_h dimensions edge-to-edge, same
-                # as _libretro_blit_scaled's stretch branch. This used to
-                # always contain-fit here regardless of the setting, so
-                # turning the console bezel on silently overrode Stretch
-                # to Fill back to Normal -- Stretch worked fine with the
-                # bezel off, then stopped doing anything the moment the
-                # bezel was turned on.
-                if _active_game_screen_mode() == "stretch":
-                    _fit_x, _fit_y, _fit_w, _fit_h = inner_x, inner_y, inner_w, inner_h
-                else:
-                    _fit_x, _fit_y, _fit_w, _fit_h = _contain_fit_rect(
-                        surf.get_width(), surf.get_height(), (inner_x, inner_y, inner_w, inner_h))
-                if _fit_w < inner_w or _fit_h < inner_h:
-                    # Letterboxing toggle (Theme tab) drives this color the
-                    # same way it drives every other real content bar in the
-                    # app -- see _video_bar_color() in retro_tv_emulator.py.
-                    # Falls back to the original near-black if that helper
-                    # is ever unavailable; (0,0,0) is reserved as the game-
-                    # overlay transparency key.
-                    _bezel_bar_color = (1, 1, 1)
+            if _active_game_screen_mode() == "stretch":
+                _fit_x, _fit_y, _fit_w, _fit_h = inner_x, inner_y, inner_w, inner_h
+            else:
+                _fit_x, _fit_y, _fit_w, _fit_h = _contain_fit_rect(
+                    surf.get_width(), surf.get_height(), (inner_x, inner_y, inner_w, inner_h))
+            if _fit_w < inner_w or _fit_h < inner_h:
+                _bezel_bar_color = (1, 1, 1)
+                try:
+                    _main_gd = sys.modules.get("__main__")
+                    _bezel_bar_fn = getattr(_main_gd, "_video_bar_color", None)
+                    if callable(_bezel_bar_fn):
+                        _bezel_bar_color = _bezel_bar_fn()
+                except Exception:
+                    pass
+                screen.fill(_bezel_bar_color, (inner_x, inner_y, inner_w, inner_h))
+            if _fit_w > 0 and _fit_h > 0:
+                _gft_t0 = time.perf_counter()
+                screen.blit(pygame.transform.scale(surf, (_fit_w, _fit_h)), (_fit_x, _fit_y))
+                GAME_FRAME_TIMER.add("scale", (time.perf_counter() - _gft_t0) * 1000.0)
+                if self._console_bezel_shader_enabled():
                     try:
-                        _main_gd = sys.modules.get("__main__")
-                        _bezel_bar_fn = getattr(_main_gd, "_video_bar_color", None)
-                        if callable(_bezel_bar_fn):
-                            _bezel_bar_color = _bezel_bar_fn()
-                    except Exception:
-                        pass
-                    screen.fill(_bezel_bar_color, (inner_x, inner_y, inner_w, inner_h))
-                if _fit_w > 0 and _fit_h > 0:
-                    screen.blit(pygame.transform.scale(surf, (_fit_w, _fit_h)), (_fit_x, _fit_y))
-                    # Same curvature/vignette warp the outer whole-program
-                    # TV Bezel applies to its picture -- see
-                    # _console_bezel_shader_enabled for why there's no
-                    # perf-lite fallback here (deliberate: this bezel's
-                    # cost is opt-in, not adaptive).
-                    if self._console_bezel_shader_enabled():
-                        try:
-                            import sys as _sys
-                            _main = _sys.modules.get("__main__")
-                            if _main and hasattr(_main, "_apply_crt_shader"):
-                                _scanlines_on = bool(_main.db.config.get("fake_43_scanlines_enabled", False))
-                                # Must warp with THIS bezel's own curvature,
-                                # not whatever style the outer/whole-program
-                                # TV Bezel last had selected -- _apply_crt_shader
-                                # defaults to the latter when no curvature is
-                                # passed, which is wrong here since this
-                                # console's bezel image can be (and usually
-                                # is) a completely different photo with a
-                                # different real screen-cutout curve. Look it
-                                # up the same way the outer bezel derives its
-                                # own (_active_crt_shader_curvature), just
-                                # keyed off this bezel's own filename stem.
-                                _stem = (os.path.splitext(os.path.basename(self._libretro_border_path))[0].lower()
-                                         if self._libretro_border_path else None)
-                                _curv_map = getattr(_main, "_CRT_SHADER_CURVATURE", {})
-                                _curv_default = getattr(_main, "_CRT_SHADER_CURVATURE_DEFAULT", 0.20)
-                                _curvature = _curv_map.get(_stem, _curv_default) if _stem else _curv_default
-                                _main._apply_crt_shader(
-                                    screen, pygame.Rect(_fit_x, _fit_y, _fit_w, _fit_h),
-                                    scanlines=_scanlines_on, curvature=_curvature)
-                        except Exception as _e:
-                            _log_warn_throttled("console_bezel_shader", "Console bezel CRT shader failed: %s", _e)
+                        import sys as _sys
+                        _main = _sys.modules.get("__main__")
+                        if _main and hasattr(_main, "_apply_crt_shader"):
+                            _scanlines_on = bool(_main.db.config.get("fake_43_scanlines_enabled", False)) and not _main._feature_locked("fake_43_scanlines_enabled")
+                            _stem = (os.path.splitext(os.path.basename(self._libretro_border_path))[0].lower()
+                                     if self._libretro_border_path else None)
+                            _curv_map = getattr(_main, "_CRT_SHADER_CURVATURE", {})
+                            _curv_default = getattr(_main, "_CRT_SHADER_CURVATURE_DEFAULT", 0.20)
+                            _curvature = _curv_map.get(_stem, _curv_default) if _stem else _curv_default
+                            _gft_t0 = time.perf_counter()
+                            _main._apply_crt_shader(
+                                screen, pygame.Rect(_fit_x, _fit_y, _fit_w, _fit_h),
+                                scanlines=_scanlines_on, curvature=_curvature)
+                            GAME_FRAME_TIMER.add("shader", (time.perf_counter() - _gft_t0) * 1000.0)
+                    except Exception as _e:
+                        _log_warn_throttled("console_bezel_shader", "Console bezel CRT shader failed: %s", _e)
         except Exception:
             log.exception("Console bezel picture blit failed this frame (border/LED still drawn below)")
             if _fit_w <= 0 or _fit_h <= 0:
-                # Never got a picture on screen at all this frame -- draw
-                # something rather than nothing.
                 _libretro_blit_scaled(screen, surf, dest_rect)
 
         try:
-            with _perf_timer("border_blit"):
-                screen.blit(scaled_border, (ox, oy))
-            # Live channel-number LED readout + black patch hiding this
-            # bezel art's own baked-in channel number -- see
-            # _draw_console_bezel_channel_led.
+            _gft_t0 = time.perf_counter()
+            screen.blit(scaled_border, (ox, oy))
             self._draw_console_bezel_channel_led(screen, (ox, oy, draw_bw, draw_bh))
+            GAME_FRAME_TIMER.add("border", (time.perf_counter() - _gft_t0) * 1000.0)
         except Exception:
             log.exception("Console bezel frame (border art + LED) blit failed this frame")
+
+    # ========================================================================
+    # SECTION: Libretro profile save/load & PSX discs
+    # ========================================================================
 
     def libretro_save_to_profile(self, console=None, profile=None):
         if self._libretro_core is None:
@@ -3849,7 +3707,6 @@ class ExternalGameDeck:
         if profile is None:
             profile = self._libretro_active_profile
         slot = int(profile)
-        # Route the core to the correct profile folder before saving
         if hasattr(self._libretro_core, "set_active_profile"):
             self._libretro_core.set_active_profile(slot)
         ok = self._libretro_core.save_state(slot=slot)
@@ -3862,7 +3719,6 @@ class ExternalGameDeck:
         if profile is None:
             profile = self._libretro_active_profile
         slot = int(profile)
-        # Route the core to the correct profile folder before loading
         if hasattr(self._libretro_core, "set_active_profile"):
             self._libretro_core.set_active_profile(slot)
         if not self._libretro_core.has_state(slot=slot):
@@ -3907,20 +3763,12 @@ class ExternalGameDeck:
         log.info(f"[GAMEDECK] Change disc → disc {disc_num}: {'OK' if ok else 'FAILED'}")
         return ok
 
-    def set_paused(self, paused, hard=False, reason="", muted=None):
-        """Single authoritative pause entry point for the libretro core.
+    # ========================================================================
+    # SECTION: Pause state
+    # ========================================================================
 
-        Each caller identifies itself with `reason` (e.g. "overlay",
-        "exit_confirm", "disconnect", "channel", "screensaver"). Multiple
-        reasons can be active at once -- the core only actually unfreezes
-        once every reason that asked for a pause has cleared its own
-        request. `hard=True` is for the "really leaving the game" case
-        (saves state/SRAM before freezing); every transient overlay/menu
-        case should leave it False. `muted` overrides the unfreeze mute
-        state for callers that need to account for something beyond the
-        plain global mute setting (e.g. a channel-switch static burst);
-        left as None, the current global mute setting is used.
-        """
+    def set_paused(self, paused, hard=False, reason="", muted=None):
+        """Single authoritative pause entry point for the libretro core."""
         core = self._libretro_core
         if core is None or not core.is_loaded:
             return
@@ -3946,35 +3794,11 @@ class ExternalGameDeck:
                 core.unfreeze(muted=muted)
                 log.info(f"[GAMEDECK] Resumed (last reason cleared: {reason})")
             elif self._pause_reasons and core.is_frozen:
-                # Diagnostic only -- helps pin down the "never unpaused"
-                # report: whichever reason(s) print here are the ones not
-                # getting their own set_paused(False, reason=...) call from
-                # wherever added them. Throttled to once per distinct
-                # remaining-set (this is called every frame from
-                # render_libretro's reason="overlay" sync, so without this
-                # it would print every frame once stuck). Safe to remove
-                # once the leak is identified; this never changes behavior,
-                # only visibility.
                 _stuck_sig = (reason, tuple(sorted(self._pause_reasons)))
                 if getattr(self, "_last_stuck_pause_sig", None) != _stuck_sig:
                     self._last_stuck_pause_sig = _stuck_sig
                     log.info(f"[GAMEDECK] '{reason}' cleared but still frozen -- "
                           f"remaining pause reasons: {sorted(self._pause_reasons)}")
-
-    DVD_ACTION_CANONICAL = {
-        "play_pause":     _DVD_CANON_PLAY_PAUSE,
-        "rewind":         _DVD_CANON_REWIND,
-        "fast_forward":   _DVD_CANON_FASTFORWARD,
-        "return_to_menu": pygame.K_BACKSPACE,
-    }
-
-    _SDLK_MASK_DVD = 0x40000000
-    _DVD_DEFAULTS = {
-        "play_pause":     _SDLK_MASK_DVD | 261,
-        "rewind":         _SDLK_MASK_DVD | 285,
-        "fast_forward":   _SDLK_MASK_DVD | 286,
-        "return_to_menu": pygame.K_BACKSPACE,    # back to Backspace -- not every remote/keyboard
-    }
 
     DVD_LOAD_SCREEN_MS = 1600
 
@@ -3991,31 +3815,19 @@ class ExternalGameDeck:
 
     DVD_MENU_FLIP_DEBOUNCE_MS = 400
 
-    # Grace period before a State.Ended/Stopped reading is treated as the disc
-    # actually finishing, to ride out brief state flicker during menu/title
-    # domain jumps.
     DVD_END_STATE_GRACE_MS = 2500
 
+    # ========================================================================
+    # SECTION: Input: key translation, config refresh & events
+    # ========================================================================
+
     def _dvd_translate_key(self, key):
-        bindings = getattr(self, "dvd_bindings", None)
-        if not bindings:
-            return key
-        for action, canon in self.DVD_ACTION_CANONICAL.items():
-            mapped = bindings.get(action)
-            if mapped is not None and key == mapped:
-                return canon
-        return key
+        return _nav.dvd_translate(getattr(self, "dvd_bindings", None), key)
 
     def refresh_from_config(self, db_config):
         self.console_rom_dir = dict(db_config.get("console_rom_dir", {}) or {})
         manual_cfg = db_config.setdefault("console_roms_manual", {})
 
-        # Older versions accepted .ngc and .ngp for both Neo Geo systems.
-        # The supplied configuration consequently stored all 40 Color ROMs
-        # under NGP and left NGPC empty.  Repair that persisted state once at
-        # load time, while leaving archive containers in their existing list
-        # because their inner ROM type cannot be established from the filename
-        # alone.
         ngp_paths = list(manual_cfg.get("NGP", []) or [])
         ngpc_paths = list(manual_cfg.get("NGPC", []) or [])
         migrated_ngp = []
@@ -4069,8 +3881,8 @@ class ExternalGameDeck:
             self.active_console = None
         stored = db_config.get("dvd_bindings", {}) or {}
         self.dvd_bindings = {
-            action: stored.get(action, self._DVD_DEFAULTS.get(action, canon))
-            for action, canon in self.DVD_ACTION_CANONICAL.items()
+            action: stored.get(action, _nav.dvd_default_binding(action))
+            for action in _nav.DVD_ACTIONS
         }
 
         self.dvd_splash_enabled = db_config.get("dvd_splash_enabled", False)
@@ -4102,8 +3914,6 @@ class ExternalGameDeck:
             self._apply_menu_nav_mapping_from_libretro_map()
         return migration_changed
 
-
-
     def handle_event(self, event):
         if self.mode == "GAME":
             return False
@@ -4114,76 +3924,62 @@ class ExternalGameDeck:
             self.mode = "DVD_PLAYER"
             return self._handle_dvd_input(event.key)
 
-        action = self._event_to_action(event)
+        action = _nav.joystick_action(event)
 
         if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_w:        action = "up"
-            elif event.key == pygame.K_s:      action = "down"
-            elif event.key == pygame.K_a:      action = "left"
-            elif event.key == pygame.K_d:      action = "right"
-            elif event.key == pygame.K_RETURN: action = "confirm"
-            elif event.key == pygame.K_ESCAPE: action = "back"
+            _key_action = _nav.key_to_action(event.key)
+            if _key_action is not None: action = _key_action
 
         if action is None:
             return False
 
         if self.mode == "BROWSE":
-            if self.scroll_style == "side":
-                prev_action, next_action = "left", "right"
-            else:
-                prev_action, next_action = "up", "down"
-            if action == prev_action:
-                self._cycle_console(-1)
-                self._flash_console_arrow(prev_action)
-            elif action == next_action:
-                self._cycle_console(1)
-                self._flash_console_arrow(next_action)
-            elif action == "confirm":      self._enter_romlist()
+            _browse_move = _nav.deck_browse_step(self.scroll_style, action)
+            if _browse_move is not None:
+                self._cycle_console(_browse_move[0])
+                self._flash_console_arrow(_browse_move[1])
+            elif action == _nav.ACCEPT:    self._enter_romlist()
             return True
-
 
         if self.mode == "ROMLIST":
             if self.romlist_focus == "arrows":
-                if action == "up":
-                    if self.romlist_arrow_sel == "up":
-                        self._activate_romlist_arrow()
-                    else:
-                        self.romlist_arrow_sel = "up"
-                elif action == "down":
-                    if self.romlist_arrow_sel == "down":
-                        self._activate_romlist_arrow()
-                    else:
-                        self.romlist_arrow_sel = "down"
-                elif action == "left":
-                    self.romlist_focus = "list"
-                elif action == "confirm":
+                _arrows_move = _nav.deck_arrows_step(self.romlist_arrow_sel, action)
+                if _arrows_move == _nav.DECK_ACTIVATE:
                     self._activate_romlist_arrow()
-                elif action == "back":
+                elif _arrows_move == _nav.DECK_SELECT_UP:
+                    self.romlist_arrow_sel = "up"
+                elif _arrows_move == _nav.DECK_SELECT_DOWN:
+                    self.romlist_arrow_sel = "down"
+                elif _arrows_move == _nav.DECK_TO_LIST:
+                    self.romlist_focus = "list"
+                elif action == _nav.ACCEPT:
+                    self._activate_romlist_arrow()
+                elif action == _nav.BACK:
                     log.info("[GAMEDECK INFO] Escaped list. Returning to main console selector carousel.")
                     self.mode = "BROWSE"
                     self.romlist_focus = "list"
                 return True
 
-            if action == "up":
+            _list_move = _nav.deck_list_step(action)
+            if _list_move == _nav.DECK_PREV:
                 if self.roms and self.rom_index > 0:
                     self.rom_index -= 1
                 return True
 
-            elif action == "down":
+            elif _list_move == _nav.DECK_NEXT:
                 if self.roms and self.rom_index < len(self.roms) - 1:
                     self.rom_index += 1
-                # At the bottom already -- just stop.
                 return True
 
-            elif action == "right":
+            elif _list_move == _nav.DECK_TO_ARROWS:
                 self.romlist_focus = "arrows"
                 return True
 
-            elif action == "confirm":
+            elif action == _nav.ACCEPT:
                 self._launch_selected_rom()
                 return True
 
-            elif action == "back":
+            elif action == _nav.BACK:
                 log.info("[GAMEDECK INFO] Escaped list. Returning to main console selector carousel.")
                 self.mode = "BROWSE"
                 self.romlist_focus = "list"
@@ -4191,7 +3987,9 @@ class ExternalGameDeck:
 
         return False
 
-
+    # ========================================================================
+    # SECTION: Input: ROM & DVD hold polling
+    # ========================================================================
 
     def _poll_rom_hold(self):
         if not self.roms or self.romlist_focus != "list":
@@ -4200,94 +3998,50 @@ class ExternalGameDeck:
         now  = pygame.time.get_ticks()
         matrix = pygame.key.get_pressed()
 
-        # Read from the app's hand-tracked _held_keys set (built from the
-        # actual KEYDOWN/KEYUP event stream) instead of the raw SDL
-        # pressed_keys_matrix. The matrix is known to desync from reality
-        # during this app's own AttachThreadInput focus-stealing (a rapid
-        # focus-loss/regain cycle can leave it reporting a key as
-        # physically down when it isn't) -- see the identical guard on the
-        # main menu's W/A/S/D nav and the guide's up/down nav for the same
-        # reasoning. Using _held_keys alone means the focus-loss handler's
-        # existing _held_keys clear is enough to stop a stuck repeat here
-        # too, instead of the matrix silently keeping the illusion alive.
         _main_mod = sys.modules.get("__main__")
         _held = getattr(_main_mod, "app_state", {}).get("_held_keys", set()) if _main_mod else set()
 
-        held_up   = (pygame.K_w in _held) or (pygame.K_UP in _held)
-        held_down = (pygame.K_s in _held) or (pygame.K_DOWN in _held)
+        _up_keys   = _nav.action_keys(_nav.UP, arrows=True)
+        _down_keys = _nav.action_keys(_nav.DOWN, arrows=True)
+        held_up   = any(k in _held for k in _up_keys)
+        held_down = any(k in _held for k in _down_keys)
 
         if held_up and held_down:
-            # Both directions "held" at once almost never reflects two real
-            # keys physically down together -- it means one of them is a
-            # stale _held_keys entry from a swallowed KEYUP (e.g. a remap
-            # capture that changed which layer translates a key between its
-            # down and up events, the same gap the main-menu guard calls
-            # out). Trust the raw matrix to break the tie: whichever
-            # direction it still shows as physically down is real, and the
-            # other one is discarded from _held_keys so it can't keep
-            # winning. This replaces the old "-1 if held_up else 1", which
-            # always favored Up unconditionally and is exactly what made a
-            # stuck Up key beat a real, currently-held Down.
-            _up_physical   = bool(matrix[pygame.K_w]) or bool(matrix[pygame.K_UP])
-            _down_physical = bool(matrix[pygame.K_s]) or bool(matrix[pygame.K_DOWN])
-            if _up_physical and not _down_physical:
-                held_down = False
-                _held.discard(pygame.K_s); _held.discard(pygame.K_DOWN)
-            elif _down_physical and not _up_physical:
-                held_up = False
-                _held.discard(pygame.K_w); _held.discard(pygame.K_UP)
-            else:
-                # Matrix agrees with neither, or with both -- fully stale.
-                # Drop both and stop repeating rather than guessing.
+            _up_physical   = any(bool(matrix[k]) for k in _up_keys)
+            _down_physical = any(bool(matrix[k]) for k in _down_keys)
+            _drop = _nav.hold_conflict(_up_physical, _down_physical, both_pressed=_nav.DROP_BOTH)
+            if _drop == _nav.DROP_BOTH and not _up_physical and not _down_physical:
                 log.warning("[GAMEDECK NAV] SUSPECTED STUCK KEY: rom list saw both "
                             "up and down held via _held_keys with matrix=(up=%s, down=%s) "
                             "-- clearing both and stopping repeat", _up_physical, _down_physical)
-                _held.discard(pygame.K_w); _held.discard(pygame.K_UP)
-                _held.discard(pygame.K_s); _held.discard(pygame.K_DOWN)
-                held_up = held_down = False
+            if _drop in (_nav.DROP_FIRST, _nav.DROP_BOTH):
+                held_up = False
+                for k in _up_keys:
+                    _held.discard(k)
+            if _drop in (_nav.DROP_SECOND, _nav.DROP_BOTH):
+                held_down = False
+                for k in _down_keys:
+                    _held.discard(k)
 
         if not held_up and not held_down:
-            self._rom_hold_dir   = 0
-            self._rom_hold_start = 0
-            self._rom_hold_last  = 0
+            self._rom_hold.clear()
             return
 
         direction = -1 if held_up else 1
 
-        if direction != self._rom_hold_dir:
-            self._rom_hold_dir   = direction
-            self._rom_hold_start = now
-            self._rom_hold_last  = now
-            return
-
-        # STUCK-KEY GUARD: a single direction that's been "held" for a long
-        # time via _held_keys while the matrix says it isn't physically
-        # down anymore is a swallowed KEYUP, not a real hold. Self-heal
-        # instead of repeating forever.
-        _hold_key = (pygame.K_w if held_up and pygame.K_w in _held else
-                     pygame.K_UP if held_up else
-                     pygame.K_s if held_down and pygame.K_s in _held else
-                     pygame.K_DOWN)
-        if (now - self._rom_hold_start) > 1500 and not bool(matrix[_hold_key]):
+        _hold_keys = _up_keys if held_up else _down_keys
+        _hold_key = _nav.hold_pick(_held, _hold_keys) or _hold_keys[-1]
+        _held_ms = now - self._rom_hold.start if self._rom_hold.key == direction else 0
+        _step = _nav.hold_step(_nav.HOLD_RULES["rom_list"], self._rom_hold, direction, now,
+                               bool(matrix[_hold_key]), False, _nav.HOLD_STUCK_MS["rom_list"])
+        if _step == _nav.HOLD_STUCK:
             log.warning("[GAMEDECK NAV] SUSPECTED STUCK KEY: key=%s has been 'held' "
                         "for %sms via _held_keys only (matrix says NOT pressed) -- "
-                        "self-healing by releasing it now", pygame.key.name(_hold_key),
-                        now - self._rom_hold_start)
+                        "self-healing by releasing it now", pygame.key.name(_hold_key), _held_ms)
             _held.discard(_hold_key)
-            self._rom_hold_dir   = 0
-            self._rom_hold_start = 0
-            self._rom_hold_last  = 0
             return
-
-        _INITIAL_DELAY_MS = 380   # ms before repeat starts
-        _REPEAT_RATE_MS   = 70    # ms between repeat steps while held
-
-        if (now - self._rom_hold_start) < _INITIAL_DELAY_MS:
+        if _step != _nav.HOLD_REPEAT:
             return
-        if (now - self._rom_hold_last) < _REPEAT_RATE_MS:
-            return
-
-        self._rom_hold_last = now
 
         if direction == -1 and self.rom_index > 0:
             self.rom_index -= 1
@@ -4305,8 +4059,8 @@ class ExternalGameDeck:
         dir_held = 0
 
         _b = getattr(self, "dvd_bindings", None) or {}
-        _fwd_key = _b.get("fast_forward", self._DVD_DEFAULTS.get("fast_forward"))
-        _rew_key = _b.get("rewind", self._DVD_DEFAULTS.get("rewind"))
+        _fwd_key = _b.get(_nav.DVD_FAST_FORWARD, _nav.dvd_default_binding(_nav.DVD_FAST_FORWARD))
+        _rew_key = _b.get(_nav.DVD_REWIND, _nav.dvd_default_binding(_nav.DVD_REWIND))
 
         def _held(kc):
             try:
@@ -4314,50 +4068,44 @@ class ExternalGameDeck:
             except (IndexError, TypeError):
                 return False
 
-        if _held(_fwd_key) or _xi_nav_state.get("dvd_right_held", False): dir_held = 1
-        elif _held(_rew_key) or _xi_nav_state.get("dvd_left_held", False): dir_held = -1
+        dir_held = _nav.dvd_hold_direction(
+            _held(_fwd_key) or _xi_nav_state.get("dvd_right_held", False),
+            _held(_rew_key) or _xi_nav_state.get("dvd_left_held", False))
 
         if dir_held == 0:
             self._dvd_skip_hold_start = 0
             self._dvd_skip_dir = 0
             return
 
-        if not hasattr(self, "_dvd_skip_hold_start"):
+        if not getattr(self, "_dvd_skip_hold_start", 0):
             self._dvd_skip_hold_start = now
             self._dvd_skip_dir = dir_held
 
         held_ms = now - self._dvd_skip_hold_start
         cooldown = getattr(self, "_dvd_skip_cooldown", 0)
-        if held_ms > 500 and now > cooldown:
+        if _nav.dvd_hold_due(held_ms, now, cooldown):
             vlc = self.vlc_engine
             if vlc:
                 try:
                     t = vlc.player.get_time()
                     length = vlc.player.get_length()
-                    new_t = t + dir_held * 5000
-                    # Item E: clamp the hold-to-scrub path the same way as
-                    # the discrete +30s tap -- never land within 10s of the
-                    # real end, so holding fast-forward can no longer run
-                    # the movie off the end even during a long scrub.
-                    if dir_held > 0 and length and length > 0:
-                        new_t = min(new_t, max(0, length - 10000))
-                    vlc.player.set_time(max(0, new_t))
+                    new_t = _nav.dvd_hold_seek(dir_held, t, length)
+                    vlc.player.set_time(new_t)
                     self._set_dvd_osd(">>" if dir_held > 0 else "<<")
                     log.info("[DVD SEEK] hold %s: %sms -> %sms (length=%sms)",
-                              ">>" if dir_held > 0 else "<<", t, max(0, new_t), length)
+                              ">>" if dir_held > 0 else "<<", t, new_t, length)
                 except Exception as e:
                     log.warning("DVD seek during held skip failed: %s", e)
             self.dvd_hud_until = now + 3000
-            self._dvd_skip_cooldown = now + 400
+            self._dvd_skip_cooldown = now + _nav.DVD_SKIP_COOLDOWN_MS
 
+    # ========================================================================
+    # SECTION: DVD on-screen display & input
+    # ========================================================================
 
     def _set_dvd_osd(self, msg, duration_ms=2000):
         self.dvd_osd_msg = msg
         self.dvd_osd_until = pygame.time.get_ticks() + duration_ms
-
-    _SDLK_MASK = 0x40000000
-    K_REMOTE_FASTFORWARD = _SDLK_MASK | 286
-    K_REMOTE_REWIND       = _SDLK_MASK | 285
 
     _DVD_OSD_ICON_MAP = {
         "PLAYING":   "PLAY",
@@ -4371,7 +4119,6 @@ class ExternalGameDeck:
     def _draw_dvd_osd_icon(self, screen, cx, cy, icon_key, ui_col, radius=46):
         white = (255, 255, 255)
 
-        # Anti-aliased filled circle background (theme color)
         pygame.gfxdraw.aacircle(screen, cx, cy, radius, ui_col)
         pygame.gfxdraw.filled_circle(screen, cx, cy, radius, ui_col)
 
@@ -4413,20 +4160,11 @@ class ExternalGameDeck:
         if vlc is None:
             return True
 
-        _dir = None
-        if key in (pygame.K_w, pygame.K_UP):
-            _dir = "up"
-        elif key in (pygame.K_s, pygame.K_DOWN):
-            _dir = "down"
-        elif key in (pygame.K_a, pygame.K_LEFT):
-            _dir = "left"
-        elif key in (pygame.K_d, pygame.K_RIGHT):
-            _dir = "right"
-        elif key == pygame.K_RETURN:
+        _dir = _nav.key_to_direction(key, arrows=True)
+        if _dir is None and _nav.is_accept(key):
             _dir = "activate"
 
         if _dir is not None:
-            pass
             vlc.navigate(_dir)
             if self._dvd_highlight_shadow is not None:
                 self._dvd_highlight_shadow.mirror_navigate(_dir)
@@ -4434,8 +4172,6 @@ class ExternalGameDeck:
                 self._dvd_menu_manual_override = False
 
         return True
-
-
 
     def _dvd_menu_is_up(self):
         if not self.dvd_is_disc_image:
@@ -4447,24 +4183,16 @@ class ExternalGameDeck:
     def _handle_dvd_input(self, key):
         vlc = self.vlc_engine
 
-        _raw_key = key
         key = self._dvd_translate_key(key)
 
-        if key == pygame.K_F9:
-            self.dvd_debug_overlay = not self.dvd_debug_overlay
-            log.info(f"[DVD INPUT] Debug overlay toggled {'ON' if self.dvd_debug_overlay else 'OFF'}.")
-            return True
+        _confirm_choice = _nav.deck_confirm_choice(_nav.key_to_direction(key))
 
         if self.dvd_exit_confirm:
-            if key == pygame.K_a:
-                self.dvd_exit_selection = "Yes"
+            if _confirm_choice is not None:
+                self.dvd_exit_selection = _confirm_choice
                 self.dvd_exit_confirm_shown_at = pygame.time.get_ticks()
-                log.info("[DVD INPUT] Quit-confirm: selection -> Yes")
-            elif key == pygame.K_d:
-                self.dvd_exit_selection = "No"
-                self.dvd_exit_confirm_shown_at = pygame.time.get_ticks()
-                log.info("[DVD INPUT] Quit-confirm: selection -> No")
-            elif key == pygame.K_RETURN:
+                log.info(f"[DVD INPUT] Quit-confirm: selection -> {_confirm_choice}")
+            elif _nav.is_accept(key):
                 log.info(f"[DVD INPUT] Quit-confirm: committing '{self.dvd_exit_selection}'")
                 if self.dvd_exit_selection == "Yes":
                     if vlc:
@@ -4496,15 +4224,11 @@ class ExternalGameDeck:
             return True
 
         if self.dvd_return_menu_confirm:
-            if key == pygame.K_a:
-                self.dvd_return_menu_selection = "Yes"
+            if _confirm_choice is not None:
+                self.dvd_return_menu_selection = _confirm_choice
                 self.dvd_return_menu_confirm_shown_at = pygame.time.get_ticks()
-                log.info("[DVD INPUT] Back-to-main-confirm: selection -> Yes")
-            elif key == pygame.K_d:
-                self.dvd_return_menu_selection = "No"
-                self.dvd_return_menu_confirm_shown_at = pygame.time.get_ticks()
-                log.info("[DVD INPUT] Back-to-main-confirm: selection -> No")
-            elif key == pygame.K_RETURN:
+                log.info(f"[DVD INPUT] Back-to-main-confirm: selection -> {_confirm_choice}")
+            elif _nav.is_accept(key):
                 log.info(f"[DVD INPUT] Back-to-main-confirm: committing '{self.dvd_return_menu_selection}'")
                 if self.dvd_return_menu_selection == "Yes":
                     self.dvd_return_menu_confirm = False
@@ -4531,18 +4255,19 @@ class ExternalGameDeck:
         is_iso  = self.dvd_is_disc_image
         menu_up = self._dvd_menu_is_up()
 
-        if key == pygame.K_ESCAPE:
+        if _nav.is_back(key):
             self.dvd_exit_confirm = True
             self.dvd_exit_selection = "No"
             self.dvd_exit_confirm_shown_at = pygame.time.get_ticks()
             log.info(f"[DVD INPUT] ESC -> opening quit-to-TV confirm (is_iso={is_iso}).")
             return True
 
-        if key == pygame.K_BACKSPACE:
-            if not is_iso:
+        if _nav.dvd_action(key) == _nav.DVD_RETURN_MENU:
+            _return_step = _nav.dvd_return_menu_step(is_iso, menu_up)
+            if _return_step == _nav.DVD_RETURN_IGNORE:
                 log.info("[DVD INPUT] Backspace ignored (regular video file has no disc menu).")
                 return True
-            if menu_up:
+            if _return_step == _nav.DVD_RETURN_REISSUE:
                 self.dvd_in_menu = True
                 self._dvd_menu_flip_candidate = True
                 self._dvd_menu_flip_since = pygame.time.get_ticks()
@@ -4560,26 +4285,17 @@ class ExternalGameDeck:
                 log.info("[DVD INPUT] Backspace -> opening back-to-main-menu confirm.")
             return True
 
-        if key in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, pygame.K_RETURN):
+        if _nav.key_to_direction(key) is not None or _nav.is_accept(key):
             if is_iso and menu_up:
-                pass
                 return self._handle_dvd_menu_nav(key)
-            _reason = "n/a"
-            _title = "n/a"
-            if vlc is not None:
-                try:
-                    _title = getattr(vlc, "_current_title", "n/a")
-                    _reason = getattr(vlc, "_dvd_menu_active_last_reason", "n/a")
-                except Exception:
-                    pass
             return True
 
-        if is_iso and menu_up and key in (
-                _DVD_CANON_REWIND, _DVD_CANON_PLAY_PAUSE, _DVD_CANON_FASTFORWARD):
-            pass
+        if _nav.dvd_swallows_transport(key, is_iso, menu_up):
             return True
 
-        if key == _DVD_CANON_PLAY_PAUSE:
+        _transport = _nav.dvd_action(key, remote=True)
+
+        if _transport == _nav.DVD_PLAY_PAUSE:
             self.dvd_hud_until = pygame.time.get_ticks() + 5000
             if vlc:
                 try:
@@ -4590,103 +4306,58 @@ class ExternalGameDeck:
                     log.warning("DVD pause/resume toggle failed: %s", e)
             return True
 
-        if key == _DVD_CANON_FASTFORWARD or key == self.K_REMOTE_FASTFORWARD:
+        if _transport == _nav.DVD_FAST_FORWARD:
             self.dvd_hud_until = pygame.time.get_ticks() + 5000
-            # Item E fix (2026-09-19 handoff): this handler fires once per
-            # KEYDOWN, and OS auto-repeat (or a remote's own repeat) posts
-            # KEYDOWN continuously while the key is held -- confirmed in
-            # vlc-debug.log at ~30 seeks/sec, which flushes the decoder on
-            # every single one and is what looked like a freeze before
-            # dumping the user at the end. Gate it with the SAME cooldown
-            # _poll_dvd_hold already uses for the hold-to-scrub path (one
-            # shared _dvd_skip_cooldown), so a burst of repeat events here
-            # collapses to a handful of real seeks instead of hundreds,
-            # and a clean single tap still always registers (the cooldown
-            # starts at 0 / already elapsed).
             _now_ff = pygame.time.get_ticks()
-            if _now_ff <= getattr(self, "_dvd_skip_cooldown", 0):
+            if _nav.dvd_skip_blocked(_now_ff, getattr(self, "_dvd_skip_cooldown", 0)):
                 return True
             if vlc:
                 try:
                     t = vlc.player.get_time()
                     length = vlc.player.get_length()
-                    new_t = t + 30000
-                    # Never seek within 10s of the real end -- this is the
-                    # "movie never runs off the end" half of item E's Done
-                    # When. A held key can no longer produce hundreds of
-                    # +30s jumps, but a legitimate handful of taps very
-                    # near the end must still be clamped rather than
-                    # running past a length libVLC actually knows.
-                    if length and length > 0:
-                        new_t = min(new_t, max(0, length - 10000))
-                    vlc.player.set_time(max(0, new_t))
-                    self._set_dvd_osd(">> +30s")
+                    new_t = _nav.dvd_tap_seek(1, t, length)
+                    vlc.player.set_time(new_t)
+                    self._set_dvd_osd(f">> +{_nav.DVD_SKIP_TAP_MS // 1000}s")
                     self._dvd_skip_hold_start = _now_ff
                     self._dvd_skip_dir = 1
-                    self._dvd_skip_cooldown = _now_ff + 400
-                    log.info("[DVD SEEK] +30s: %sms -> %sms (length=%sms)", t, max(0, new_t), length)
+                    self._dvd_skip_cooldown = _now_ff + _nav.DVD_SKIP_COOLDOWN_MS
+                    log.info("[DVD SEEK] +30s: %sms -> %sms (length=%sms)", t, new_t, length)
                 except Exception as e:
                     log.warning("DVD +30s skip failed: %s", e)
             return True
 
-        if key == _DVD_CANON_REWIND or key == self.K_REMOTE_REWIND:
+        if _transport == _nav.DVD_REWIND:
             self.dvd_hud_until = pygame.time.get_ticks() + 5000
-            # Same shared-cooldown fix as the +30s handler above.
             _now_rw = pygame.time.get_ticks()
-            if _now_rw <= getattr(self, "_dvd_skip_cooldown", 0):
+            if _nav.dvd_skip_blocked(_now_rw, getattr(self, "_dvd_skip_cooldown", 0)):
                 return True
             if vlc:
                 try:
                     t = vlc.player.get_time()
-                    new_t = max(0, t - 30000)
+                    new_t = _nav.dvd_tap_seek(-1, t, 0)
                     vlc.player.set_time(new_t)
-                    self._set_dvd_osd("<< -30s")
+                    self._set_dvd_osd(f"<< -{_nav.DVD_SKIP_TAP_MS // 1000}s")
                     self._dvd_skip_hold_start = _now_rw
                     self._dvd_skip_dir = -1
-                    self._dvd_skip_cooldown = _now_rw + 400
+                    self._dvd_skip_cooldown = _now_rw + _nav.DVD_SKIP_COOLDOWN_MS
                     log.info("[DVD SEEK] -30s: %sms -> %sms", t, new_t)
                 except Exception as e:
                     log.warning("DVD -30s skip failed: %s", e)
             return True
 
-
+        log.info(f"[DVD INPUT] Ignored key {key} (no DVD action bound to it).")
         return True
 
-    def _event_to_action(self, event):
-        if event.type == pygame.JOYHATMOTION:
-            x, y = event.value if isinstance(event.value, tuple) else (0, event.value)
-            if y == 1:  return "up"
-            if y == -1: return "down"
-            if x == -1: return "left"
-            if x == 1:  return "right"
-        elif event.type == pygame.JOYAXISMOTION:
-            if event.axis == 1:
-                if event.value < -0.6: return "up"
-                if event.value > 0.6:  return "down"
-            elif event.axis == 0:
-                if event.value < -0.6: return "left"
-                if event.value > 0.6:  return "right"
-        elif event.type == pygame.JOYBUTTONDOWN:
-            if event.button == 0: return "confirm"
-            if event.button == 1: return "back"
-            # SDL's standard game-controller layout exposes Back/Select as
-            # button 6 and Start as button 7.  Keep these aliases for
-            # ordinary pygame joystick events; the polling path still uses
-            # the saved mapping for gameplay and remapping.
-            if event.button == 6: return "back"
-            if event.button == 7: return "confirm"
-        return None
-
-
+    # ========================================================================
+    # SECTION: Console carousel & ROM list navigation
+    # ========================================================================
 
     def _cycle_console(self, delta):
         if not self.consoles: return
         self.console_index = (self.console_index + delta) % len(self.consoles)
 
     def _flash_console_arrow(self, direction):
-        """Momentarily highlight the console-switch arrow for `direction`
-        (one of 'left'/'right'/'up'/'down') right after it's pressed, instead
-        of the arrow staying lit the whole time."""
+        """Briefly highlight the console-switch arrow for `direction` after it is pressed."""
         self._console_arrow_flash_dir   = direction
         self._console_arrow_flash_until = pygame.time.get_ticks() + self._CONSOLE_ARROW_FLASH_MS
 
@@ -4716,7 +4387,7 @@ class ExternalGameDeck:
                 for entry in it:
                     try:
                         if entry.is_dir():
-                            return True   # has subdirs → might contain files
+                            return True
                         if entry.is_file():
                             ext = os.path.splitext(entry.name.lower())[1]
                             if ext in exts:
@@ -4726,6 +4397,10 @@ class ExternalGameDeck:
         except OSError:
             pass
         return False
+
+    # ========================================================================
+    # SECTION: ROM & core scanning
+    # ========================================================================
 
     def _get_windows_drives(self):
         import ctypes
@@ -4738,22 +4413,7 @@ class ExternalGameDeck:
         return drives
 
     def _normalize_rom_title(self, filename):
-        """Normalize a rom filename down to a duplicate-detection key --
-        strips the extension and any (region)/[tag] annotations, lowercases,
-        collapses whitespace. 'Tetris (USA).gb' and 'Tetris.rar' land on the
-        same key even though the container/extension differs, so the same
-        game found packed and unpacked (or under two differently-spelled
-        folders) is only counted once.
-
-        A disc marker ("Disc 1", "Disc 2 of 3", "CD1"...) is folded into
-        the key instead of being stripped out with the rest of the tags --
-        otherwise every disc of a multi-disc game (Final Fantasy VII/VIII/
-        IX, Metal Gear Solid, etc.) normalizes to the exact same title and
-        every disc after the first gets silently discarded as a
-        "duplicate" of it. Discs need to all be added and stay individually
-        selectable -- a save can land on any of them, and swapping discs
-        mid-game is handled separately (see find_psx_disc_siblings /
-        change_psx_disc), not by only ever keeping disc 1 around."""
+        """Normalize a rom filename to a duplicate-detection key: strip extension and (region)/[tag] notes, lowercase, collapse whitespace."""
         base = os.path.splitext(os.path.basename(filename))[0]
         key = self._clean_rom_display_name(str(base)).strip().lower()
         disc_match = _DISC_MARKER_RE.search(base)
@@ -4762,29 +4422,10 @@ class ExternalGameDeck:
         return key
 
     def add_manual_roms(self, console, paths):
-        """Append file paths to this console's manually-added ROM list
-        (shown at the top of that console's ROM list, alongside the rest).
-        De-duplicates two ways: the exact same path is always skipped, and
-        anything whose normalized title (see _normalize_rom_title) already
-        matches something already in the manual list OR a file already
-        sitting in this console's own ROM folder is skipped too -- so the
-        same game showing up as a .rar in one folder and unpacked in
-        another, or the same folder getting scanned twice, doesn't create
-        duplicate entries. Returns (added_count, skipped_duplicate_count).
-        """
+        """Append file paths to this console's manually-added ROM list."""
         existing_paths = set(self.console_roms_manual.get(console, []))
         existing_titles = {self._normalize_rom_title(p) for p in existing_paths}
 
-        # Also treat anything already physically in this console's ROM
-        # folder as "already have it" -- no point manually adding a
-        # duplicate of a file that's already going to show up on its own.
-        # Skip the scandir entirely if that folder's drive isn't currently
-        # responding (disconnected/asleep external drive, stalled network
-        # share, etc.) -- os.scandir() on a genuinely unresponsive drive can
-        # block for a long time, and this runs on the main thread at commit
-        # time, so a hang here would freeze the whole app. The global
-        # drive-health monitor (bottom red banner) already tracks this root once we've
-        # asked about it once, so a bad drive surfaces there instead.
         try:
             rom_dir = self._get_console_rom_dir(console)
             if _gd_is_drive_responsive(rom_dir) and os.path.isdir(rom_dir):
@@ -4806,7 +4447,7 @@ class ExternalGameDeck:
             if title in existing_titles:
                 skipped += 1
                 continue
-            existing_titles.add(title)   # so two dupes within this same batch also collapse to one
+            existing_titles.add(title)
             new_paths.append(p)
 
         if new_paths:
@@ -4815,56 +4456,12 @@ class ExternalGameDeck:
         return len(new_paths), skipped
 
     def bulk_scan_for_roms(self, parent_folder, max_depth=4, progress_cb=None):
-        """"Scan For Roms": walk `parent_folder` looking for console-named
-        subfolders (matched via match_console_for_folder_name -- tolerant
-        of spelling/spacing/case, e.g. "GB"/"Gameboy"/"Game Boy" all match
-        GB) and add every file inside each match whose extension belongs to
-        that console into its manually-added ROM list. If `parent_folder`
-        itself is named after a console, it's scanned directly instead of
-        requiring a subfolder. Once a folder is matched to a console, its
-        whole subtree is scanned as that console's roms (no further
-        name-matching inside it), so nested folders like "Roms/GB/USA" all
-        count toward GB. Duplicate protection (same title added twice,
-        exact-path re-adds from re-scanning a folder) is handled by
-        add_manual_roms.
-
-        A .zip/.7z/.rar that merely has the right extension isn't taken on
-        faith -- see _archive_matches_console -- its contents are peeked
-        at to confirm it actually holds a file with that console's real
-        extension, so a folder-name collision (an arcade "CPS1" folder
-        matching PSX's "ps1" alias, for instance) can't sweep unrelated
-        zips into a console's rom list just because .zip itself is an
-        accepted extension for nearly every console. That content check
-        opens each archive's listing, which costs real time on a big
-        collection -- this can take a while and MUST be run off the main
-        thread (see _fe_bulkscan_worker in retro_tv_emulator.py, which
-        already does this and keeps the file explorer's own busy overlay
-        up while it works).
-
-        `progress_cb`, if given, is called as `progress_cb(done, total)`:
-        once with (0, total) right after the cheap pre-count pass below
-        works out how many candidate files there are, then once per file
-        as the slower archive-verifying pass works through them. `total`
-        can be 0 (nothing matched at all) -- callers should treat that as
-        "done immediately" rather than dividing by it.
-
-        Any folder sitting on a drive that isn't currently responding
-        (disconnected/asleep external drive, stalled network share) is
-        skipped rather than walked -- os.walk()/os.scandir() can block for
-        a long time on a genuinely unresponsive drive. Returns (results,
-        unresponsive_roots) where results is
-        {console: (added_count, skipped_count)} for anything actually
-        touched, and unresponsive_roots is a sorted list of drive roots
-        that had to be skipped for this reason (empty if none).
-        """
-        matches = {}   # console -> [file paths found under a matched folder]
+        """"Scan For Roms": walk `parent_folder` for console-named subfolders and collect their ROMs."""
+        matches = {}
         unresponsive_roots = set()
 
         def _candidate_files(folder, console):
-            """Every file under `folder` whose extension belongs to
-            `console` -- extension check only, no archive-content
-            verification yet. Used for both the cheap pre-count pass and
-            as the candidate list the real pass below verifies."""
+            """Return every file under `folder` whose extension belongs to `console`; no archive-content check."""
             exts = set(ROM_EXTENSIONS.get(console, []))
             found = []
             if not _gd_is_drive_responsive(folder):
@@ -4873,7 +4470,7 @@ class ExternalGameDeck:
             for root, dirs, files in os.walk(folder):
                 if not _gd_is_drive_responsive(root):
                     unresponsive_roots.add(_gd_drive_root_of(root))
-                    dirs[:] = []   # don't descend any further under a bad drive
+                    dirs[:] = []
                     continue
                 for fn in files:
                     if fn.startswith(".") or fn.startswith("$"):
@@ -4884,10 +4481,7 @@ class ExternalGameDeck:
             return found
 
         def _iter_matched_folders(folder, depth):
-            """Yields (folder, console) for every folder that matches a
-            console name under `folder` -- name-matching only, no file
-            access -- mirroring the original single-pass walk's matching
-            rules (stop recursing once a folder is claimed)."""
+            """Yield (folder, console) for each folder under `folder` matching a console name; name matching only, no file access."""
             if depth > max_depth:
                 return
             if not _gd_is_drive_responsive(folder):
@@ -4897,8 +4491,7 @@ class ExternalGameDeck:
             console = match_console_for_folder_name(base_name)
             if console:
                 yield (folder, console)
-                return  # whole subtree already claimed by this console -- don't
-                        # keep name-matching further down inside it
+                return
             try:
                 entries = list(os.scandir(folder))
             except Exception:
@@ -4910,11 +4503,7 @@ class ExternalGameDeck:
                 except OSError:
                     continue
 
-        # ---- pass 1: cheap pre-count. Extension match only, no archive
-        # opening, so this is fast even on a big collection -- it exists
-        # purely to give progress_cb a real denominator before the slow
-        # archive-verifying pass below starts. ----
-        candidates_by_folder = []   # [(console, [file paths])], in walk order
+        candidates_by_folder = []
         total = 0
         for folder, console in _iter_matched_folders(parent_folder, 0):
             files = _candidate_files(folder, console)
@@ -4925,9 +4514,6 @@ class ExternalGameDeck:
         if progress_cb:
             progress_cb(0, total)
 
-        # ---- pass 2: real scan. Verifies archive contents (the slow
-        # part) against the file list pass 1 already collected -- no
-        # second filesystem walk needed -- reporting progress as it goes. ----
         done = 0
         for console, files in candidates_by_folder:
             kept = []
@@ -4949,30 +4535,8 @@ class ExternalGameDeck:
         return results, sorted(r for r in unresponsive_roots if r)
 
     def bulk_scan_for_cores(self, parent_folder, max_depth=6):
-        """"Scan For Cores": walk `parent_folder` -- RetroArch's install
-        root, its cores/ folder directly, or anything in between -- looking
-        for *_libretro.dll files, works out which console(s) each one plays
-        via match_consoles_for_core_filename, and copies every match into
-        this project's own main/cores/<CONSOLE>/ folder. A core good for
-        several systems (e.g. Picodrive, Genesis Plus GX) is copied into
-        every console folder it matches.
-
-        Nothing already sitting in a console's folder is ever overwritten
-        or removed -- multiple cores are meant to coexist there so the
-        person can switch between them from that console's "Select
-        Libretro Core" screen (which opens straight into this same
-        folder). If a console doesn't have an active core recorded yet,
-        the best-known match found for it (see PREFERRED_CORE_ORDER)
-        becomes the default so it's playable immediately.
-
-        Same drive-responsiveness protection as bulk_scan_for_roms --
-        anything on a drive that isn't currently responding is skipped
-        instead of risking a long hang on the main thread. Returns
-        (results, unresponsive_roots): results is
-        {console: (new_count, already_present_count)}, unresponsive_roots
-        is a sorted list of skipped drive roots (empty if none).
-        """
-        found = {}   # console -> [source .dll paths]
+        """"Scan For Cores": walk `parent_folder` for *_libretro.dll files and copy each match into main/cores/<CONSOLE>/."""
+        found = {}
         unresponsive_roots = set()
 
         def _walk(folder, depth):
@@ -5025,12 +4589,7 @@ class ExternalGameDeck:
         return results, sorted(r for r in unresponsive_roots if r)
 
     def _assign_default_cores_after_scan(self, consoles):
-        """After a core scan, any of the given consoles that doesn't
-        already have an active core recorded in emulator_config.json gets
-        one -- the best match sitting in its folder per
-        PREFERRED_CORE_ORDER -- so newly-scanned consoles are playable
-        right away instead of silently depending on directory-listing
-        order (see _has_libretro_core)."""
+        """Give each console without an active core in emulator_config.json the best match in its folder per PREFERRED_CORE_ORDER."""
         try:
             with open(self.config_path, "r", encoding="utf-8") as fp:
                 cfg = json.load(fp)
@@ -5112,12 +4671,6 @@ class ExternalGameDeck:
         )
         self._scan_thread.start()
 
-    # Strips (region)/[tag]-style annotations from a rom filename for
-    # display -- but NOT a disc marker like "(Disc 1)"/"(Disc 2 of 3)"/
-    # "[CD1]". Those need to survive so multi-disc games are still
-    # distinguishable from each other in the rom list (see
-    # _normalize_rom_title / add_manual_roms below for why they can't be
-    # collapsed to one entry either).
     _ROM_TAG_RE = re.compile(
         r"\s*[\(\[](?!\s*(?:disc|disk|cd)\s*\d)[^\(\)\[\]]*[\)\]]",
         re.IGNORECASE,
@@ -5135,14 +4688,6 @@ class ExternalGameDeck:
         roms = []
         status_msg = ""
 
-        # Manually-added roms (via the per-console "Add Roms" button, or the
-        # bulk "Scan For Roms" folder match) can live anywhere on disk -- they
-        # were never moved into this console's own folder -- so they aren't
-        # found by the scandir walk below. Build them here instead, and only
-        # show them at this console's own root (not inside a subfolder the
-        # person has navigated into). They're shown with a plain display
-        # name, same as any other rom -- only broken ones (missing/offline)
-        # get a tag, since those are the ones worth flagging.
         manual_entries = []
         if console != "DVD":
             manual_paths = self.console_roms_manual.get(console, [])
@@ -5153,24 +4698,11 @@ class ExternalGameDeck:
                         base_name_only = os.path.splitext(os.path.basename(p))[0]
                         clean_name = self._clean_rom_display_name(str(base_name_only))
                         if not _gd_is_drive_responsive(p):
-                            # The drive/device this rom lives on isn't answering
-                            # right now (disconnected/asleep external drive,
-                            # stalled network share). Don't call os.path.exists()
-                            # on it -- that can block for a long time on a truly
-                            # unresponsive drive -- and don't drop it from the
-                            # list either, since the file may well still be
-                            # there once the drive comes back. Tag it instead;
-                            # the global drive-health monitor (bottom red
-                            # banner) already surfaces the underlying problem.
+                            # WARNING: do not call os.path.exists() on an unresponsive drive path (it can block) and do not drop the path from the list.
                             shown = "[OFFLINE] " + clean_name
                             manual_entries.append((shown, p))
                             continue
                         if not os.path.exists(p):
-                            # Drive's fine, but this specific file isn't where
-                            # it was added from -- moved, renamed, or deleted.
-                            # Keep it visible (tagged) instead of silently
-                            # vanishing, so a moved rom is noticed rather than
-                            # just quietly disappearing from the list.
                             shown = "[MISSING] " + clean_name
                             manual_entries.append((shown, p))
                             continue
@@ -5215,10 +4747,6 @@ class ExternalGameDeck:
                     if not exts or ext_str in exts:
                         if (console != "DVD" and ext_str in (".zip", ".7z", ".rar")
                                 and not _archive_matches_console(full_path, console)):
-                            # Extension matched, but peeking inside shows it
-                            # doesn't actually contain a {console} rom (e.g.
-                            # an arcade CPS1 zip sitting in a folder that got
-                            # matched to PSX) -- don't show it as one.
                             continue
                         _shown_name = (self._clean_rom_display_name(str(base_name_only))
                                        if console != "DVD" else str(base_name_only))
@@ -5240,9 +4768,6 @@ class ExternalGameDeck:
                 roms = dir_entries + manual_entries + file_entries
                 status_msg = "" if roms else f"No files found in: {console}"
             elif manual_entries:
-                # The console's ROM folder doesn't exist (never created/used),
-                # but roms were added manually -- show those rather than an
-                # empty list.
                 roms = manual_entries
                 status_msg = ""
         except Exception as e:
@@ -5311,7 +4836,7 @@ class ExternalGameDeck:
 
         elapsed = pygame.time.get_ticks() - self._scan_started_ticks
         if elapsed > self._scan_timeout_ms:
-            self._scan_request_id += 1  # invalidate the still-running thread's eventual result
+            self._scan_request_id += 1
             self._scan_pending = False
             pygame.event.clear(pygame.KEYDOWN)
 
@@ -5323,9 +4848,6 @@ class ExternalGameDeck:
             return
         self._scan_is_background = True
         self._scan_roms(self.active_console)
-
-
-
 
     def _activate_romlist_arrow(self):
         if len(self.consoles) > 1:
@@ -5341,6 +4863,10 @@ class ExternalGameDeck:
         if not self._scan_pending:
             self.rom_index = self._first_content_index()
             self.rom_scroll = 0
+
+    # ========================================================================
+    # SECTION: Launching the selected ROM
+    # ========================================================================
 
     def _launch_selected_rom(self):
         if not self.roms: return
@@ -5375,13 +4901,6 @@ class ExternalGameDeck:
             pygame.event.clear(pygame.KEYDOWN)
             return
 
-        # Manually-added roms (via "Add Roms"/"Scan For Roms") can live
-        # anywhere on disk and aren't copied anywhere -- they're read from
-        # wherever they were picked. That means the file can legitimately
-        # go away (moved, renamed, drive disconnected) between being added
-        # and being launched, without the app ever touching it. Refuse to
-        # launch and surface why, instead of handing a dead path to the
-        # libretro core / external emulator and getting a confusing failure.
         if not _gd_is_drive_responsive(full_path):
             self._romlist_error_msg   = "Drive not responding — can't launch this rom right now"
             self._romlist_error_until = pygame.time.get_ticks() + 4000
@@ -5393,7 +4912,6 @@ class ExternalGameDeck:
             pygame.event.clear(pygame.KEYDOWN)
             return
 
-        # Prefer libretro core (.dll) if available; fall back to .exe
         _core_dll = self._has_libretro_core(console)
         _use_libretro = bool(_LIBRETRO_AVAILABLE and _core_dll)
         if _use_libretro:
@@ -5408,23 +4926,12 @@ class ExternalGameDeck:
                       f"main/cores/{console}/ contains a *_libretro.dll (preferred) or "
                       f"that an external emulator .exe is configured for this console.")
 
-    def _apply_dvd_captions_state(self, enable, vlc, silent=True, forced_srt=None):
-        """Turn DVD captions on or off against the given VLC engine.
+    # ========================================================================
+    # SECTION: DVD captions
+    # ========================================================================
 
-        Returns True if captions were actually engaged (only meaningful when
-        enable=True -- if no subtitle track/sidecar file could be found this
-        returns False and self.dvd_captions is forced back to False).
-        Captions are controlled entirely by the "Captions" toggle in the DVD
-        settings sub-menu (applied automatically once per title, at the start
-        of playback) -- there is no in-player on-screen confirmation for this,
-        so this never emits a DVD OSD message regardless of the `silent` flag.
-
-        forced_srt, if given, skips the embedded-track and on-disk sidecar
-        search entirely and add_slaves that exact file -- used by the ASR
-        fallback (see _maybe_auto_apply_dvd_captions) once a background
-        transcription finishes, so an auto-generated .srt goes through the
-        exact same VLC-native captions path as any other sidecar file.
-        """
+    def _apply_dvd_captions_state(self, enable, vlc, silent=True):
+        """Turn DVD captions on or off against the given VLC engine, using the subtitle tracks VLC already lists."""
         applied = False
         self.dvd_captions = enable
         if vlc is None:
@@ -5437,43 +4944,9 @@ class ExternalGameDeck:
                 except Exception as _hl_e:
                     log.warning("DVD captions-off highlight re-check failed: %s", _hl_e)
             else:
-                chosen_id = None
-
-                def _try_add_slave(path):
-                    nonlocal chosen_id
-                    try:
-                        import vlc as _vlc_mod
-                        file_uri = 'file:///' + path.replace('\\', '/').lstrip('/')
-                        vlc.player.add_slave(_vlc_mod.MediaSlaveType.subtitle, file_uri, True)
-                        pygame.time.wait(300)
-                        spu_desc2 = vlc.player.video_get_spu_description()
-                        if spu_desc2:
-                            for track_id, _name in spu_desc2:
-                                if track_id != -1:
-                                    chosen_id = track_id
-                                    break
-                    except Exception as sub_err:
-                        _log_warn_throttled("dvd_captions_sidecar", f"[DVD CAPTIONS] Sidecar load error: {sub_err}")
-
-                if forced_srt:
-                    _try_add_slave(forced_srt)
-                else:
-                    spu_desc = vlc.player.video_get_spu_description()
-                    if spu_desc:
-                        for track_id, _name in spu_desc:
-                            if track_id != -1:
-                                chosen_id = track_id
-                                break
-                    if chosen_id is None and self.dvd_file_path:
-                        base = os.path.splitext(self.dvd_file_path)[0]
-                        for sub_ext in ['.srt', '.ass', '.ssa', '.vtt', '.sub', '.smi']:
-                            candidate = base + sub_ext
-                            if os.path.exists(candidate):
-                                _try_add_slave(candidate)
-                                break
-
-                if chosen_id is not None:
-                    vlc.player.video_set_spu(chosen_id)
+                track_ids = self._dvd_caption_spu_ids(vlc)
+                if track_ids:
+                    vlc.player.video_set_spu(track_ids[0])
                     applied = True
                 else:
                     self.dvd_captions = False
@@ -5481,30 +4954,163 @@ class ExternalGameDeck:
             log.warning(f"[DVD CAPTIONS ERROR] {e}")
         return applied
 
+    def _dvd_caption_spu_ids(self, vlc):
+        """Ids of the subtitle tracks VLC lists right now, without the off entry."""
+        try:
+            description = vlc.player.video_get_spu_description()
+        except Exception as e:
+            log.warning("[DVD CAPTIONS] Could not read VLC's subtitle tracks: %s", e)
+            return []
+        return [track_id for track_id, _name in (description or []) if track_id != -1]
+
+    def _dvd_caption_flow_new(self, now):
+        """Starts the per-title caption state; a video file also starts its caption-source lookup on a thread."""
+        flow = {"stage": "fallback", "path": self.dvd_file_path, "started": now,
+                "result": None, "slave": None, "deadline": 0, "next": 0, "legacy_tried": False}
+        if self.dvd_is_disc_image or not self.dvd_file_path:
+            return flow
+        flow["stage"] = "lookup"
+        threading.Thread(target=self._dvd_caption_lookup_job, args=(flow,), daemon=True,
+                         name="DVDCaptionsLookup").start()
+        return flow
+
+    @staticmethod
+    def _dvd_caption_lookup_job(flow):
+        """Thread body: finds where this file's captions come from and stores the answer in the flow."""
+        try:
+            flow["result"] = resolve_caption_source(flow["path"])
+        except Exception as e:
+            log.warning("[DVD CAPTIONS] Caption lookup failed for %s: %s", flow["path"], e)
+            flow["result"] = {"kind": None, "srt_path": None}
+
+    def _dvd_caption_slave_begin(self, vlc, flow, path, now):
+        """Hands a caption file to VLC and starts waiting, without blocking, for its new track to be listed."""
+        before = self._dvd_caption_spu_ids(vlc)
+        try:
+            import vlc as _vlc_mod
+            file_uri = 'file:///' + path.replace('\\', '/').lstrip('/')
+            vlc.player.add_slave(_vlc_mod.MediaSlaveType.subtitle, file_uri, True)
+        except Exception as sub_err:
+            _log_warn_throttled("dvd_captions_sidecar", f"[DVD CAPTIONS] Sidecar load error: {sub_err}")
+            return False
+        flow["slave"] = {"path": path, "before": before,
+                         "deadline": now + _gov.DVD_CAPTIONS_TRACK_TIMEOUT_MS,
+                         "next": now + _gov.DVD_CAPTIONS_POLL_MS}
+        return True
+
+    def _dvd_caption_slave_step(self, vlc, flow, now):
+        """Checks once for the track a caption file added; returns "wait", "selected" or "failed"."""
+        slave = flow["slave"]
+        if now < slave["next"]:
+            return "wait"
+        slave["next"] = now + _gov.DVD_CAPTIONS_POLL_MS
+        added = [t for t in self._dvd_caption_spu_ids(vlc) if t not in slave["before"]]
+        if added:
+            flow["slave"] = None
+            try:
+                vlc.player.video_set_spu(added[-1])
+            except Exception as e:
+                log.warning("[DVD CAPTIONS] Could not select the new track: %s", e)
+                flow["stage"] = "fallback"
+                return "failed"
+            self.dvd_captions = True
+            return "selected"
+        if now >= slave["deadline"]:
+            log.warning("[DVD CAPTIONS] VLC never listed a track for %s; using the old flow",
+                        os.path.basename(slave["path"]))
+            flow["slave"] = None
+            flow["stage"] = "fallback"
+            return "failed"
+        return "wait"
+
+    def _dvd_caption_source_step(self, vlc, flow, now):
+        """Advances the lookup and the choice that follows it; True while it owns the frame, False when the old flow should run."""
+        if flow["stage"] == "lookup":
+            result = flow["result"]
+            if result is None:
+                if now - flow["started"] < _gov.DVD_CAPTIONS_LOOKUP_TIMEOUT_MS:
+                    return True
+                log.warning("[DVD CAPTIONS] Caption lookup for %s took over %d ms; using the old flow",
+                            os.path.basename(flow["path"]), _gov.DVD_CAPTIONS_LOOKUP_TIMEOUT_MS)
+                flow["stage"] = "fallback"
+                return False
+            kind = result.get("kind")
+            log.info("[DVD CAPTIONS] %s: caption source = %s", os.path.basename(flow["path"]), kind)
+            if kind == "baked":
+                self._dvd_cap_suppress = {"path": flow["path"],
+                                          "until": now + _gov.DVD_CAPTIONS_SUPPRESS_WATCH_MS, "next": 0}
+                self.dvd_captions = False
+                self._dvd_captions_auto_done = True
+                self._dvd_captions_auto_pending = False
+                return True
+            if kind in ("sidecar", "cache") and result.get("srt_path"):
+                if self._dvd_caption_slave_begin(vlc, flow, result["srt_path"], now):
+                    flow["stage"] = "sidecar"
+                    return True
+                flow["stage"] = "fallback"
+                return False
+            if kind == "embedded":
+                flow["stage"] = "embedded"
+                flow["deadline"] = now + _gov.DVD_CAPTIONS_TRACK_TIMEOUT_MS
+                flow["next"] = 0
+            else:
+                flow["stage"] = "fallback"
+                return False
+        if flow["stage"] == "embedded":
+            if now < flow["next"]:
+                return True
+            flow["next"] = now + _gov.DVD_CAPTIONS_POLL_MS
+            track_ids = self._dvd_caption_spu_ids(vlc)
+            if track_ids:
+                try:
+                    vlc.player.video_set_spu(track_ids[0])
+                except Exception as e:
+                    log.warning("[DVD CAPTIONS] Could not select the embedded track: %s", e)
+                    flow["stage"] = "fallback"
+                    return False
+                self.dvd_captions = True
+                self._dvd_captions_auto_done = True
+                self._dvd_captions_auto_pending = False
+                return True
+            if now >= flow["deadline"]:
+                log.warning("[DVD CAPTIONS] VLC lists no embedded track for %s; using the old flow",
+                            os.path.basename(flow["path"]))
+                flow["stage"] = "fallback"
+                return False
+            return True
+        return False
+
+    def _dvd_suppress_vlc_subtitles(self, vlc):
+        """Keeps VLC's own subtitle track off for a while after a burned-in file starts."""
+        state = self._dvd_cap_suppress
+        if state is None or vlc is None:
+            return
+        if not self.dvd_captions_enabled or self.dvd_file_path != state["path"]:
+            self._dvd_cap_suppress = None
+            return
+        now = pygame.time.get_ticks()
+        if now > state["until"]:
+            self._dvd_cap_suppress = None
+            return
+        if now < state["next"]:
+            return
+        state["next"] = now + _gov.DVD_CAPTIONS_SUPPRESS_POLL_MS
+        try:
+            spu = vlc.player.video_get_spu()
+            if spu is not None and spu >= 0:
+                vlc.player.video_set_spu(-1)
+                log.info("[DVD CAPTIONS] VLC's own subtitle track switched off for %s (burned-in captions)",
+                         os.path.basename(state["path"]))
+        except Exception as e:
+            log.warning("[DVD CAPTIONS] Could not switch VLC's subtitle track off: %s", e)
+
     def _start_dvd_captions_asr_job(self, video_path):
-        """Fire the (slow, single-slot -- see media._asr_slot) background
-        transcription for video_path and land the result back on
-        self._dvd_captions_asr_srt_path / self._dvd_captions_asr_state once
-        done. Runs on its own daemon thread since a full transcription can
-        take real time -- this must never block the render/VLC-callback
-        thread that _maybe_auto_apply_dvd_captions ticks from every frame.
-        """
+        """Run background transcription for video_path on a daemon thread and store the result in self._dvd_captions_asr_srt_path and self._dvd_captions_asr_state."""
+        # WARNING: never block the render/VLC-callback thread that _maybe_auto_apply_dvd_captions ticks from every frame.
         def _job():
             srt_path = None
             try:
                 with _asr_slot(f"dvd_captions({os.path.basename(video_path)})"):
-                    # Start from wherever this title is actually resuming
-                    # from (self._dvd_resume_seek_seconds was set when
-                    # playback began -- see play_dvd_file's reset block),
-                    # not always from 0:00, so a resumed title doesn't
-                    # spend time transcribing minutes the viewer already
-                    # watched. Chunked (beam_size=1, no cross-chunk
-                    # context) is also just faster per-second of audio
-                    # than the old whole-file/beam_size=5 pass, even
-                    # though the result is only applied once fully done --
-                    # see the note on _maybe_auto_apply_dvd_captions below
-                    # about why this doesn't attach a live-growing file to
-                    # VLC mid-transcription.
                     srt_path, _reason = generate_captions_via_asr_chunked(
                         video_path, start_sec=getattr(self, "_dvd_resume_seek_seconds", 0) or 0,
                         should_stop=lambda: self.dvd_file_path != video_path,
@@ -5512,79 +5118,79 @@ class ExternalGameDeck:
             except Exception as e:
                 log.warning(f"[DVD CAPTIONS] ASR job failed for {video_path}: {e}")
             finally:
-                # Apply the result only while the same title is active.
+                # WARNING: apply the result only while the same title is still active.
                 if self.dvd_file_path == video_path:
                     self._dvd_captions_asr_srt_path = srt_path
                     self._dvd_captions_asr_state = "done"
         threading.Thread(target=_job, daemon=True, name="DVDCaptionsASR").start()
 
     def _maybe_auto_apply_dvd_captions(self, vlc):
-        """Per-frame tick (called from the DVD player render loop) that engages
-        captions once, shortly after a title starts playing, if the persisted
-        "Captions" toggle in the DVD settings sub-menu is on. Retries for a
-        short window since subtitle tracks aren't available the instant
-        playback starts.
-
-        The ASR fallback job (plain video files only -- see
-        generate_captions_via_asr_chunked's docstring for why real
-        discs/ISOs still give up quietly) now starts IMMEDIATELY, the
-        first time this ticks for a title, running in parallel with the
-        embedded/sidecar retry polling below instead of waiting for that
-        8-second window to be exhausted first. If embedded/sidecar finds
-        something during that window (the common case), this method
-        applies that and marks the title done; the ASR job -- already
-        running by then -- gets told to stop at its next chunk boundary
-        via should_stop rather than being left to transcribe a whole
-        title nobody needs it for. If nothing embedded/sidecar ever
-        shows up, the ASR job has already had a head start instead of
-        only starting after 8 seconds were spent finding nothing."""
+        """Per-frame tick that turns DVD captions on once, shortly after a title starts, when the DVD Captions toggle is on."""
+        # WARNING: nothing in this tick may block; it runs every frame on the render thread.
+        self._dvd_suppress_vlc_subtitles(vlc)
         if self._dvd_captions_auto_done or not self._dvd_captions_auto_pending:
+            self._dvd_cap_flow = None
             return
         if vlc is None or self.dvd_in_menu or not self.dvd_splash_done:
             return
         now = pygame.time.get_ticks()
+        flow = self._dvd_cap_flow
+        if flow is None:
+            flow = self._dvd_cap_flow = self._dvd_caption_flow_new(now)
 
-        # A background ASR job already finished -- apply its result (or,
-        # if it found nothing, give up) and stop polling this title.
+        if flow["slave"] is not None:
+            outcome = self._dvd_caption_slave_step(vlc, flow, now)
+            if outcome == "wait":
+                return
+            if outcome == "selected":
+                self._dvd_captions_auto_done = True
+                self._dvd_captions_auto_pending = False
+                return
+        elif self._dvd_caption_source_step(vlc, flow, now):
+            return
+
         if self._dvd_captions_asr_state == "done":
-            if self._dvd_captions_asr_srt_path:
-                self._apply_dvd_captions_state(True, vlc, silent=True,
-                                                forced_srt=self._dvd_captions_asr_srt_path)
+            srt_path = self._dvd_captions_asr_srt_path
+            if srt_path and self._dvd_caption_slave_begin(vlc, flow, srt_path, now):
+                self._dvd_captions_asr_state = "applying"
+                return
             self._dvd_captions_auto_done = True
             self._dvd_captions_auto_pending = False
             return
 
-        # Kick the ASR job off on the very first tick for this title,
-        # rather than waiting for the embedded/sidecar retry window to
-        # run out first -- a real disc/ISO still has no ASR fallback
-        # (see docstring), so there's nothing to start for those.
         if (self._dvd_captions_asr_state == "idle"
                 and not self.dvd_is_disc_image and self.dvd_file_path):
             self._dvd_captions_asr_state = "running"
             self._start_dvd_captions_asr_job(self.dvd_file_path)
 
-        # ASR job running in the background -- still keep polling for
-        # embedded/sidecar below, since either can win this race.
         if now < self._dvd_captions_auto_next_try:
             return
         if not self._dvd_captions_auto_deadline:
-            self._dvd_captions_auto_deadline = now + 8000
+            self._dvd_captions_auto_deadline = now + _gov.DVD_CAPTIONS_TRACK_TIMEOUT_MS
         applied = self._apply_dvd_captions_state(True, vlc, silent=True)
         if applied:
             self._dvd_captions_auto_done = True
             self._dvd_captions_auto_pending = False
-        elif now >= self._dvd_captions_auto_deadline:
-            # Embedded/sidecar retry window exhausted with nothing found.
+            return
+        if not flow["legacy_tried"] and self.dvd_file_path:
+            flow["legacy_tried"] = True
+            base = os.path.splitext(self.dvd_file_path)[0]
+            for sub_ext in ['.srt', '.ass', '.ssa', '.vtt', '.sub', '.smi']:
+                candidate = base + sub_ext
+                if os.path.exists(candidate):
+                    if self._dvd_caption_slave_begin(vlc, flow, candidate, now):
+                        return
+                    break
+        if now >= self._dvd_captions_auto_deadline:
             if self._dvd_captions_asr_state != "running":
-                # Real disc/ISO (no ASR job was ever started above) --
-                # give up quietly.
                 self._dvd_captions_auto_done = True
                 self._dvd_captions_auto_pending = False
-            # else: ASR job is already in flight (started above) --
-            # just keep waiting for it, handled by the "done" branch
-            # at the top of this method on a future tick.
         else:
-            self._dvd_captions_auto_next_try = now + 500
+            self._dvd_captions_auto_next_try = now + _gov.DVD_CAPTIONS_POLL_MS
+
+    # ========================================================================
+    # SECTION: DVD resume position
+    # ========================================================================
 
     def _dvd_resume_save_to_db(self):
         """Persist self.dvd_resume_positions back to db.config + disk."""
@@ -5600,9 +5206,7 @@ class ExternalGameDeck:
             log.warning("Failed to save dvd_resume_positions: %s", e)
 
     def _dvd_get_resume_seconds(self, video_path):
-        """Return the saved resume position (seconds) for video_path, or 0
-        if resume is disabled, nothing is saved, or the saved spot is too
-        close to the start to bother seeking."""
+        """Return the saved resume position in seconds for video_path, or 0 if resume is off, nothing is saved, or it is too close to the start."""
         if not self.dvd_resume_enabled or not video_path:
             return 0
         pos = self.dvd_resume_positions.get(video_path)
@@ -5611,9 +5215,7 @@ class ExternalGameDeck:
         return pos
 
     def _dvd_save_resume_position(self, video_path, seconds):
-        """Record how far into video_path playback got, so it can be picked
-        back up next time -- unless the position is too close to the start
-        to be worth resuming from, in which case any prior entry is cleared."""
+        """Record how far video_path got so it can resume; clears any entry when the position is too close to the start."""
         if not video_path:
             return
         if not seconds or seconds < 5:
@@ -5626,6 +5228,10 @@ class ExternalGameDeck:
         if video_path and video_path in self.dvd_resume_positions:
             del self.dvd_resume_positions[video_path]
             self._dvd_resume_save_to_db()
+
+    # ========================================================================
+    # SECTION: DVD playback start
+    # ========================================================================
 
     def _start_dvd_playback(self, video_path):
         import sys
@@ -5649,12 +5255,15 @@ class ExternalGameDeck:
         self.dvd_paused = False
         self.dvd_paused_frame = None
         self.dvd_captions = False
-        self._dvd_captions_auto_pending = self.dvd_captions_enabled
-        self._dvd_captions_auto_done = not self.dvd_captions_enabled
+        _dvd_caps_on = bool(self.dvd_captions_enabled) and not _dvd_captions_locked()
+        self._dvd_captions_auto_pending = _dvd_caps_on
+        self._dvd_captions_auto_done = not _dvd_caps_on
         self._dvd_captions_auto_deadline = 0
         self._dvd_captions_auto_next_try = 0
         self._dvd_captions_asr_state = "idle"
         self._dvd_captions_asr_srt_path = None
+        self._dvd_cap_flow = None
+        self._dvd_cap_suppress = None
         self.dvd_exit_selection = "No"
         self.dvd_return_menu_confirm = False
         self.dvd_return_menu_selection = "No"
@@ -5696,8 +5305,6 @@ class ExternalGameDeck:
         self._dvd_splash_start_time = pygame.time.get_ticks()
         self._dvd_main_ever_played = False
         log.info("[DVD] Showing load screen before starting playback.")
-
-
 
     def _close_dvd_highlight_shadow(self):
         if self._dvd_highlight_shadow is not None:
@@ -5748,9 +5355,13 @@ class ExternalGameDeck:
             else:
                 self._dvd_iso_watchdog_armed = False
                 if self.dvd_is_disc_image:
-                    log.warning(f"[DVD DEBUG] Disc image but play_file_segmented() reported failure -- watchdog NOT armed.")
+                    log.warning("[DVD DEBUG] Disc image but play_file_segmented() reported failure -- watchdog NOT armed.")
         except Exception as e:
             log.warning(f"[DVD] Failed to play {self.dvd_file_path}: {e}")
+
+    # ========================================================================
+    # SECTION: External emulator launch & monitoring
+    # ========================================================================
 
     def _resolve_emulator_exe(self, console):
         folder = os.path.join(self.cores_dir, console)
@@ -5783,8 +5394,6 @@ class ExternalGameDeck:
     def reload_emulator_config(self):
         self.emulator_config = self._load_emulator_config()
 
-
-
     def _patch_mgba_config(self, exe_dir):
         targets = {
             "ports.qt": {
@@ -5795,7 +5404,7 @@ class ExternalGameDeck:
                 "key.b":                "88",
                 "key.l":                "65",
                 "key.r":                "83",
-                "key.start":            "16777221",  # Return (VK_RETURN 0x0D)
+                "key.start":            "16777221",
                 "key.select":           "16777219",
                 "key.up":               "16777235",
                 "key.down":             "16777237",
@@ -5902,7 +5511,6 @@ class ExternalGameDeck:
 
             self._patch_mgba_config(os.path.dirname(exe))
 
-
             launch_env = os.environ.copy()
             launch_env["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"]       = "1"
             launch_env["SDL_GAMECONTROLLER_ALLOW_BACKGROUND_EVENTS"]  = "1"
@@ -5910,12 +5518,11 @@ class ExternalGameDeck:
             if _WIN:
                 ctypes.windll.user32.AllowSetForegroundWindow(-1)
 
-            # Launch hidden so we can mount it before it appears anywhere
             if _WIN:
                 import subprocess as _sp
                 si = _sp.STARTUPINFO()
                 si.dwFlags     = _sp.STARTF_USESHOWWINDOW
-                si.wShowWindow = 0   # SW_HIDE — we reveal it after SetParent
+                si.wShowWindow = 0
                 self.deck_process = _sp.Popen(
                     [exe, rom_path],
                     cwd=os.path.dirname(exe),
@@ -5970,7 +5577,7 @@ class ExternalGameDeck:
                     break
 
             poll_n += 1
-            time.sleep(0.05)  # poll every 50ms — catch the window before SDL finishes init
+            time.sleep(0.05)
 
         self.emulator_load_pct = 100
         self.emulator_load_msg = "Mounting to Channel 03..."
@@ -5981,13 +5588,6 @@ class ExternalGameDeck:
                 if not pygame_hwnd:
                     log.warning("[GAMEDECK MONITOR] No pygame HWND — cannot mount.")
                 elif not ctypes.windll.user32.IsWindow(pygame_hwnd):
-                    # Windows recycles HWND values: if pygame_hwnd_ref[0]
-                    # went stale (e.g. destroyed/recreated during a
-                    # fullscreen toggle race) between being cached and
-                    # being read here, a since-reused HWND could belong to
-                    # a completely unrelated window, and SetParent/SetWindowPos
-                    # below would silently reparent and resize THAT window
-                    # instead of failing loudly.
                     log.warning("[GAMEDECK MONITOR] Cached pygame HWND is no "
                                 "longer a valid window — skipping mount to "
                                 "avoid attaching to a stale/reused handle.")
@@ -6002,14 +5602,11 @@ class ExternalGameDeck:
                     WS_EX_APPWINDOW     = 0x00040000
                     WS_EX_NOACTIVATE    = 0x08000000
 
-                    # Attach mGBA as a true child of pygame's window.
                     ctypes.windll.user32.SetParent(found_hwnd, pygame_hwnd)
 
-                    WS_POPUP = 0x80000000
                     new_style = (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN)
                     ctypes.windll.user32.SetWindowLongW(found_hwnd, GWL_STYLE, new_style)
 
-                    # Remove taskbar button, Alt-Tab entry, and activation.
                     ex = ctypes.windll.user32.GetWindowLongW(found_hwnd, GWL_EXSTYLE)
                     ctypes.windll.user32.SetWindowLongW(
                         found_hwnd, GWL_EXSTYLE,
@@ -6069,7 +5666,7 @@ class ExternalGameDeck:
         target_pid = self.deck_process.pid
         found = []
 
-        # EnumWindows callback — must survive via a persistent reference
+        # WARNING: the EnumWindows callback must stay alive through a persistent reference.
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_size_t, ctypes.c_size_t)
 
         def _cb(hwnd, _lp):
@@ -6086,7 +5683,7 @@ class ExternalGameDeck:
                 log.warning("GetWindowRect failed while scoring a candidate mGBA child window: %s", e)
             return True
 
-        _enum_cb = WNDENUMPROC(_cb)   # keep reference so GC doesn't collect it
+        _enum_cb = WNDENUMPROC(_cb)
         try:
             ctypes.windll.user32.EnumWindows(_enum_cb, 0)
         except Exception as e:
@@ -6094,7 +5691,6 @@ class ExternalGameDeck:
 
         if not found:
             return None
-        # Prefer the largest window — most likely to be the main game surface
         found.sort(reverse=True)
         return found[0][1]
 
@@ -6106,7 +5702,6 @@ class ExternalGameDeck:
             except Exception as e:
                 log.warning("SetParent (detach mGBA child window) failed: %s", e)
 
-        # Destroy the UI overlay child window — re-created on next launch.
         if self.ui_overlay_hwnd and _WIN:
             try:
                 ctypes.windll.user32.DestroyWindow(self.ui_overlay_hwnd)
@@ -6121,7 +5716,7 @@ class ExternalGameDeck:
         self.is_embedded  = False
         self.is_frozen    = False
         self.emulator_loading = False
-        self._child_visible = None  # next launch re-seeds the visibility state
+        self._child_visible = None
 
         if not self.roms and self.active_console:
             log.info(f"[GAMEDECK] ROM list empty on return — re-scanning {self.active_console}.")
@@ -6166,7 +5761,6 @@ class ExternalGameDeck:
 
         log.info("[GAMEDECK CTRL WATCHER] Started — waiting for overlay_ready...")
 
-        # Wait until the child window is fully mounted
         wait_deadline = time.time() + 120
         while not getattr(self, "overlay_ready", False) and time.time() < wait_deadline:
             time.sleep(0.15)
@@ -6180,11 +5774,9 @@ class ExternalGameDeck:
         def _active_controller_map(console):
             """Return the effective physical-bit -> logical-button map."""
             try:
-                # This includes per-console/per-player remaps, including the
-                # raw DirectInput button bits captured by the mapping screen.
                 return self._ensure_xi_map(console, 1)
             except Exception:
-                # The watcher must remain usable during early startup.
+                # WARNING: the watcher must stay usable during early startup.
                 return {
                     logical: bit
                     for bit, logical in _get_console_def(console)["xinput_map"].items()
@@ -6192,7 +5784,8 @@ class ExternalGameDeck:
 
         hold_since   = None
         prev_buttons = 0
-        TRIG_THRESH  = 30     # analog trigger press threshold (0-255 range)
+        # VALUES CHANGE HERE
+        TRIG_THRESH  = 30
 
         while my_process.poll() is None:
             time.sleep(0.016)
@@ -6222,7 +5815,6 @@ class ExternalGameDeck:
             gp = _read_gamepad_state()
             if gp is not None:
                 buttons = gp.wButtons
-                # Left stick → D-pad (if enabled in mapping)
                 if self.ctrl_mapping.get("stick_as_dpad", False):
                     DEAD = _get_stick_deadzone()
                     if not hasattr(self, "_ctrl_test_dpad_latch"):
@@ -6246,7 +5838,6 @@ class ExternalGameDeck:
                     log.info("[GAMEDECK CTRL WATCHER] Start+Select held — confirming...")
                 elif (time.time() - hold_since) * 1000 >= HOLD_MS:
                     log.info("[GAMEDECK CTRL WATCHER] Confirmed. Killing emulator.")
-                    # Release any held keys so OS isn't left with stuck keys
                     _active_con_e = getattr(self, "active_console", "GBA") or "GBA"
                     _xi_map_e     = _active_controller_map(_active_con_e)
                     for console_btn, bit in _xi_map_e.items():
@@ -6254,14 +5845,6 @@ class ExternalGameDeck:
                             vk = self.ctrl_mapping.get(console_btn, 0)
                             _send_key(vk, key_up=True)
                     try:
-                        # Use my_process (the specific process instance this
-                        # watcher was launched to babysit), not self.deck_process.
-                        # If the emulator was closed and relaunched in a tight
-                        # window, self.deck_process could already point at a
-                        # newer, unrelated process by the time this fires --
-                        # killing that instead of the one this watcher is
-                        # actually chartered to watch would be a nasty
-                        # surprise for whatever the user has running now.
                         my_process.kill()
                     except Exception as e:
                         log.warning("Failed to kill deck_process during controller-mapping key-release cleanup: %s", e)
@@ -6275,9 +5858,6 @@ class ExternalGameDeck:
 
             changed = buttons ^ prev_buttons
             if changed:
-                # Use the active console's effective map, not the static
-                # XInput defaults.  This is what makes a DirectInput
-                # Start/Select remap reach the external emulator too.
                 _active_con = getattr(self, "active_console", "GBA") or "GBA"
                 _xi_map     = _active_controller_map(_active_con)
                 for console_btn, bit in _xi_map.items():
@@ -6291,7 +5871,9 @@ class ExternalGameDeck:
 
         log.info("[GAMEDECK CTRL WATCHER] Exited.")
 
-
+    # ========================================================================
+    # SECTION: Emulator window embedding & process control
+    # ========================================================================
 
     def _set_child_visible(self, visible):
         if not _WIN or not self.game_hwnd:
@@ -6299,7 +5881,7 @@ class ExternalGameDeck:
         want = bool(visible)
         with self._vis_lock:
             if self._child_visible == want:
-                return  # already in the desired state — nothing to do
+                return
             try:
                 HWND_TOP       = 0
                 SWP_NOMOVE     = 0x0002
@@ -6345,25 +5927,14 @@ class ExternalGameDeck:
         if not _WIN:
             return True
         if getattr(self, "emulator_loading", False):
-            pass
             return True
         if not self.game_hwnd:
-            pass
             return True
 
         try:
             if not visible:
                 self._set_child_visible(False)
-                # This used to hand _suspend_process() off to yet another
-                # nested background thread -- but set_viewport_state()
-                # itself is already only ever called off the render thread
-                # (see change_channel's leave-ch03 branch), so that extra
-                # hop bought nothing except more scheduling uncertainty for
-                # the one call that actually halts new audio generation.
-                # NtSuspendProcess is a single fast syscall; call it inline
-                # here so the process is confirmed suspended before this
-                # function returns, closing the window a quick channel
-                # change could otherwise land in.
+                # WARNING: call NtSuspendProcess inline so the process is confirmed suspended before returning; a quick channel change could land in the gap.
                 try:
                     self._suspend_process()
                 except Exception as e:
@@ -6412,6 +5983,10 @@ class ExternalGameDeck:
             return True
         return bool(self.deck_process and self.deck_process.poll() is None)
 
+    # ========================================================================
+    # SECTION: Deck lifecycle: freeze, audio & shutdown
+    # ========================================================================
+
     def pre_boot_background_deck(self, parent_hwnd=None):
         if parent_hwnd: self.parent_hwnd = parent_hwnd
         self.ready_flag = True
@@ -6435,12 +6010,11 @@ class ExternalGameDeck:
             class _IN(ctypes.Structure):
                 _fields_ = [("type", ctypes.c_ulong), ("_", _IU)]
 
-            # All VK codes mGBA could be polling: mapped game keys + TV control keys
             vk_codes = set()
             for v in self.ctrl_mapping.values():
                 if isinstance(v, int):
                     vk_codes.add(v)
-            # TV shell keys that must never leak into the game
+            # WARNING: TV shell keys must never leak into the game.
             tv_keys = [
                 0x4D,
                 0x43,
@@ -6477,25 +6051,6 @@ class ExternalGameDeck:
         if proc is None or not self.is_process_running():
             return False
         pid = proc.pid
-        # Runs the pycaw/WASAPI session lookup inline on the caller's own
-        # thread rather than spawning a new one -- both call sites
-        # (change_channel's leave-ch03 and enter-ch03 branches) already
-        # invoke set_audio_state from a background thread of their own,
-        # never from the render thread, so there's no need to hop threads
-        # again. AudioUtilities.GetAllSessions() enumerates every audio
-        # session on the system, which is not fast; running it inline
-        # means the caller (already off the render thread) can rely on
-        # the mute actually being applied -- or definitively failed --
-        # before it moves on to resume/suspend the process, instead of
-        # racing an unsynchronized second thread.
-        #
-        # retry_deadline_ms lets a caller that's racing a fixed-length
-        # burst (see ch03's static-transition duck in change_channel) keep
-        # retrying the lookup for as long as the burst itself lasts,
-        # rather than a single shot that may lose that race -- a session
-        # that hasn't registered with WASAPI yet (common right after the
-        # process has just been launched/resumed) needs another attempt,
-        # not a one-time "not found yet" warning and giving up.
         _deadline = (time.monotonic() + retry_deadline_ms / 1000.0
                      if retry_deadline_ms is not None else None)
         while True:
@@ -6583,7 +6138,6 @@ class ExternalGameDeck:
                     self.deck_process.kill()
             except Exception as e:
                 log.warning("Failed to terminate/kill deck_process during shutdown: %s", e)
-        # Destroy the UI overlay child window on full shutdown.
         if self.ui_overlay_hwnd and _WIN:
             try:
                 ctypes.windll.user32.DestroyWindow(self.ui_overlay_hwnd)
@@ -6608,7 +6162,9 @@ class ExternalGameDeck:
         self.dvd_paused           = False
         self.dvd_was_in_menu_on_leave = False
 
-
+    # ========================================================================
+    # SECTION: Controller mapping: storage & player slots
+    # ========================================================================
 
     @staticmethod
     def _mapping_key(console, player=1):
@@ -6631,7 +6187,6 @@ class ExternalGameDeck:
                     saved = data.get(self._mapping_key(console, player), {})
                 if not saved:
                     saved = data.get(f"{console}_mapping", {})
-                # Use the alternate GBA key when the primary mapping is absent.
                 if not saved and console == "GBA":
                     saved = data.get("GBA_mapping", {})
                 mapping = dict(default)
@@ -6658,7 +6213,6 @@ class ExternalGameDeck:
             if os.path.exists(cfg_path):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            # Serialize VK codes as human-readable names where possible
             serialised = {}
             for k, v in self.ctrl_mapping.items():
                 if k == "stick_as_dpad":
@@ -6666,7 +6220,6 @@ class ExternalGameDeck:
                 else:
                     serialised[k] = VK_NAMES.get(v, v)
             data[self._mapping_key(console, player)] = serialised
-            # Keep the alternate GBA key synchronized for Player 1.
             if console == "GBA" and (not player or player <= 1):
                 data["GBA_mapping"] = serialised
             with open(cfg_path, "w", encoding="utf-8") as f:
@@ -6720,7 +6273,6 @@ class ExternalGameDeck:
         console = getattr(self, "_active_mapping_console", "GBA") or "GBA"
         self._switch_mapping_player(player_num, console)
         if isinstance(slot, int):
-            # XInput -- standard layout, safe to auto-fill outright.
             cdef = _get_console_def(console)
             per_console = self._libretro_xinput_map.setdefault(console, {})
             fresh_map = {}
@@ -6768,7 +6320,6 @@ class ExternalGameDeck:
                 self._remap_await_release  = True
                 self._remap_last_capture_ts = time.monotonic()
                 return
-        # Sequence complete (skip was the last button)
         self._seq_remap_active = False
         self.ctrl_mapping_active_btn = None
         self._save_controller_mapping(console)
@@ -6881,9 +6432,11 @@ class ExternalGameDeck:
     def refresh_player_slots(self):
         _ensure_player_slots_assigned()
 
+    # ========================================================================
+    # SECTION: Controller mapping: UI, clicks & sequential remap
+    # ========================================================================
 
     def render_controller_mapping_ui(self, surface, rect, ui_color=(0, 255, 128), db=None, console=None):
-        # Resolve which console to render, defaulting to GBA.
         if console is None:
             console = "GBA"
         console_label = CONSOLE_LABELS.get(console, console)
@@ -6966,16 +6519,8 @@ class ExternalGameDeck:
             if console in ("GG", "GB"):
                 _NONN64_CONTENT_SHIFT += int(h * 0.03)
             if console == "MENU":
-                # The bottom option row ("L-STICK AS D-PAD") was crowding/
-                # overlapping the Close button on this layout -- nudge the
-                # whole block (logo, wireframe, button labels, options) up.
                 _NONN64_CONTENT_SHIFT += int(h * 0.05)
             elif console == "PSX":
-                # PSX ended up sitting too high with the MENU nudge applied.
-                # A negative shift moves the whole block (logo, wireframe,
-                # button labels/boxes, MAP CONTROLLER and the L-STICK toggle)
-                # back down as one unit, so the toggle row rests just above
-                # the bottom button row instead of floating mid-panel.
                 _NONN64_CONTENT_SHIFT -= int(h * 0.017)
             logo_top = content_top - _NONN64_CONTENT_SHIFT
 
@@ -7000,9 +6545,8 @@ class ExternalGameDeck:
             try:
                 raw = pygame.image.load(wf_path).convert_alpha()
                 self._wf_surface_cache[console] = raw
-                self._wf_tinted_cache[console]     = None   # force re-tint
+                self._wf_tinted_cache[console]     = None
                 self._wf_tint_color_cache[console] = None
-                # Keep GBA wireframe aliases synchronized.
                 if console == "GBA":
                     self._gba_wf_surface    = raw
                     self._gba_wf_tinted     = None
@@ -7017,7 +6561,7 @@ class ExternalGameDeck:
         elif console == "GG":
             img_area_h = int(h * 0.42)
             img_area_w = int(w * 0.60)
-        elif console in ("NES", "GBC", "PSX", "MENU"):  # MENU shares PSX's wireframe -> same sizing
+        elif console in ("NES", "GBC", "PSX", "MENU"):
             img_area_h = int(h * 0.39)
             img_area_w = int(w * 0.55)
         elif console == "GB":
@@ -7030,12 +6574,6 @@ class ExternalGameDeck:
         if console == "N64":
             img_y = img_y_n64_target
         elif console == "NES":
-            # The NES wireframe art is wide, so it ends up width-limited and
-            # centres vertically inside img_area_h -- that dead space on top
-            # read as an oversized gap under the logo.  Pull the image block
-            # up so the wireframe sits closer to the logo.  The button labels
-            # (label_block_top) and the hotspot lines follow draw_y, so they
-            # move with it automatically.
             img_y = logo_bottom - int(h * 0.05) - int(h * 0.04)
         else:
             img_y = logo_bottom - int(h * 0.05)
@@ -7081,7 +6619,6 @@ class ExternalGameDeck:
                     tinted.blit(inv, (0, 0))
                 self._wf_tinted_cache[console]     = tinted
                 self._wf_tint_color_cache[console] = ui_color
-                # Keep GBA wireframe aliases synchronized.
                 if console == "GBA":
                     self._gba_wf_tinted     = tinted
                     self._gba_wf_tint_color = ui_color
@@ -7097,7 +6634,6 @@ class ExternalGameDeck:
             draw_y = img_y
             iw = img_area_w
             ih = img_area_h
-            # Draw a dashed outline box to indicate where the wireframe would be
             pygame.draw.rect(surface, (40, 50, 40), (draw_x, draw_y, iw, ih))
             pygame.draw.rect(surface, (60, 80, 60), (draw_x, draw_y, iw, ih), 2)
             if not hasattr(self, '_wf_fallback_fonts'):
@@ -7112,7 +6648,6 @@ class ExternalGameDeck:
             surface.blit(lbl_nf2, (draw_x + iw // 2 - lbl_nf2.get_width() // 2, draw_y + ih // 2 + 8))
 
         wireframe_bottom = draw_y + ih
-
 
         _XI_LABELS = {
             _XI_UP: "Dpad U", _XI_DOWN: "Dpad D", _XI_LEFT: "Dpad L", _XI_RIGHT: "Dpad R",
@@ -7133,11 +6668,6 @@ class ExternalGameDeck:
 
         def _ctrl_label_for_btn(btn):
             _label_player = getattr(self, "_active_mapping_player", 1) or 1
-            # The saved per-console/per-player bit map is the source of
-            # truth.  _ctrl_labels is only a transient capture cache and can
-            # describe a previous console/player or the old static default.
-            # Looking up the current map first makes a swapped mapping render
-            # as e.g. "A = B" instead of falling back to "A = A".
             xi_bit = self._ensure_xi_map(console, _label_player).get(btn)
             if xi_bit is not None:
                 return _XI_LABELS.get(xi_bit, f"XI{xi_bit:04X}")
@@ -7148,10 +6678,9 @@ class ExternalGameDeck:
                 return _N64_C_BTN_DEFAULT_LABELS[btn]
             return "---"
 
-
-        # Columns sit ~18% inward from edges — much closer to the console image
-        left_col_right_edge  = x + int(w * 0.22)   # right edge of left label block
-        right_col_left_edge  = x + int(w * 0.78)   # left edge of right label block
+        # VALUES CHANGE HERE
+        left_col_right_edge  = x + int(w * 0.22)
+        right_col_left_edge  = x + int(w * 0.78)
 
         label_h         = int(ih * 0.20) if not LEFT_BTNS else max(int(ih * 0.10), int(ih * 0.96 / max(len(LEFT_BTNS), len(RIGHT_BTNS), 1)))
         label_block_top = draw_y + int(ih * 0.02)
@@ -7166,9 +6695,6 @@ class ExternalGameDeck:
 
         def _draw_btn_label(btn, right_edge, row_y, align_right=True, fixed_box_x=None):
             is_active = (active_btn == btn)
-            is_next   = seq_running and not is_active and (
-                BTN_SEQ.index(btn) == BTN_SEQ.index(active_btn)
-                if (active_btn in BTN_SEQ and btn in BTN_SEQ) else False)
 
             name_col = (255, 220, 0) if is_active else (180, 180, 180)
             name_surf = f_label.render(btn, True, name_col)
@@ -7205,7 +6731,6 @@ class ExternalGameDeck:
             surface.blit(val_surf, (box_x + VAL_BOX_W // 2 - val_surf.get_width() // 2,
                                      box_y + VAL_BOX_H // 2 - val_surf.get_height() // 2))
 
-            # Connector line from the assembled label+box edge → button hotspot dot
             hotspot = _btn_screen_pos(btn)
             if align_right:
                 line_anchor = (right_edge + 4, row_y)
@@ -7227,7 +6752,6 @@ class ExternalGameDeck:
             rect_top    = min(name_y, box_y) - 2
             rect_bottom = max(name_y + name_surf.get_height(), box_y + VAL_BOX_H) + 2
             return pygame.Rect(rect_left, rect_top, rect_right - rect_left, rect_bottom - rect_top)
-
 
         btn_rects = {}
 
@@ -7260,7 +6784,8 @@ class ExternalGameDeck:
             f_joy_dim = (ui_color[0] // 4, ui_color[1] // 4, ui_color[2] // 4)
 
             row_pitch     = VAL_BOX_H + 10
-            _joy_anchor_sq_y   = y + h - 34 - 14   # matches sq_size/sq_y math further down
+            # WARNING: must match the sq_size/sq_y math further down.
+            _joy_anchor_sq_y   = y + h - 34 - 14
             _joy_block_h       = 2 * VAL_BOX_H + 10
             _map_label_gap     = 14
             _map_label_h       = f_opt.get_height()
@@ -7291,7 +6816,7 @@ class ExternalGameDeck:
                                          box_y + VAL_BOX_H // 2 - val_surf.get_height() // 2))
                 fx, fy = joy_hotspots.get(jkey, (0.5, 0.5))
                 hotspot = (int(draw_x + fx * iw), int(draw_y + fy * ih))
-                line_anchor = (box_x + VAL_BOX_W // 2, box_y)  # top-center of box, pointing back up to the stick
+                line_anchor = (box_x + VAL_BOX_W // 2, box_y)
                 if is_lit:
                     pygame.draw.line(surface, (60, 200, 90), line_anchor, hotspot, 2)
                     pygame.draw.circle(surface, (90, 255, 130), hotspot, 6)
@@ -7317,12 +6842,10 @@ class ExternalGameDeck:
 
         wireframe_bottom = joy_block_bottom
 
-
         sq_size  = 34
         sq_gap   = 8
         sq_y     = y + h - sq_size - 14
         sq_x0    = x + 16
-        self._mapping_player_rects = {}
         is_focused_row = (getattr(self, "_ctrl_map_cursor", 0) == 0)
 
         if console == "MENU":
@@ -7337,16 +6860,16 @@ class ExternalGameDeck:
                                      sq_y + sq_size // 2 - num_surf.get_height() // 2))
             squares_right_edge = sq_x0 + sq_size
         else:
-            active_player = getattr(self, "_active_mapping_player", 1)      # whose mapping is actually being shown/edited
-            nav_player    = getattr(self, "_ctrl_map_player_sel", active_player)  # which square the cursor is currently on (A/D), before Enter commits it
+            active_player = getattr(self, "_active_mapping_player", 1)
+            nav_player    = getattr(self, "_ctrl_map_player_sel", active_player)
             reassign_pending_player = self.mapping_reassign_pending_player()
             max_players = CONSOLE_MAX_PLAYERS.get(console, 4)
             for p in range(1, max_players + 1):
                 sq_x = sq_x0 + (p - 1) * (sq_size + sq_gap)
-                connected = player_is_connected(p) if p > 1 else True  # Player 1 always usable (keyboard/base pad fallback)
+                connected = player_is_connected(p) if p > 1 else True
                 is_active = (p == active_player)
                 is_navved = (is_focused_row and not getattr(self, "_ctrl_map_on_pick", False)
-                             and (p == nav_player))  # cursor currently parked here (not yet committed, and not over on PICK CONTROLLER)
+                             and (p == nav_player))
                 is_armed  = (reassign_pending_player == p)
                 if is_armed:
                     fill = (200, 160, 30)
@@ -7355,7 +6878,7 @@ class ExternalGameDeck:
                 elif connected:
                     fill = (70, 70, 95)
                 else:
-                    fill = (35, 35, 45)  # no controller connected -- fully greyed out, not selectable
+                    fill = (35, 35, 45)
                 txt_col = (20, 20, 20) if (is_active or is_armed) else (
                     (200, 200, 210) if connected else (90, 90, 95))
                 pygame.draw.rect(surface, fill, (sq_x, sq_y, sq_size, sq_size), border_radius=6)
@@ -7364,7 +6887,6 @@ class ExternalGameDeck:
                 num_surf = f_opt.render(str(p), True, txt_col)
                 surface.blit(num_surf, (sq_x + sq_size // 2 - num_surf.get_width() // 2,
                                          sq_y + sq_size // 2 - num_surf.get_height() // 2))
-                self._mapping_player_rects[p] = pygame.Rect(sq_x, sq_y, sq_size, sq_size)
             squares_right_edge = sq_x0 + max_players * (sq_size + sq_gap) - sq_gap
 
         pick_x = squares_right_edge + 8 + sq_gap
@@ -7385,19 +6907,14 @@ class ExternalGameDeck:
         pick_lbl = f_small.render("PICK CONTROLLER", True, pick_col)
         surface.blit(pick_lbl, (pick_rect.centerx - pick_lbl.get_width() // 2,
                                  pick_rect.centery - pick_lbl.get_height() // 2))
-        self._mapping_pick_rect = pick_rect
-
 
         cursor = getattr(self, "_ctrl_map_cursor", 0)
 
-        opt_gap    = 40   # gap between the two option lines
-        line_h     = f_opt.get_height()
+        # VALUES CHANGE HERE
+        opt_gap    = 40
         gap_top    = wireframe_bottom + 14
         if console == "NES":
-            # Same dead-space problem on the underside of the NES wireframe:
-            # close up the wireframe -> [MAP CONTROLLER] / L-STICK gap.
             gap_top -= int(h * 0.04)
-        gap_bottom = y + h - 16
         if console == "N64":
             opt_y = gap_top
         else:
@@ -7410,7 +6927,6 @@ class ExternalGameDeck:
             lbl    = f_opt.render(label, True, col)
             lx     = center_x - lbl.get_width() // 2
             if extra_right:
-                # If there's a toggle widget we shift the text left a bit
                 lx = center_x - (lbl.get_width() + 10 + extra_right.get_width()) // 2
 
             surface.blit(lbl, (lx, y_pos))
@@ -7464,107 +6980,14 @@ class ExternalGameDeck:
                                   close_y + close_h // 2 - lbl_close.get_height() // 2))
         r2 = pygame.Rect(close_x, close_y, close_w, close_h)
 
-
         if seq_running and active_btn:
             ctrl_bottom = y + h - 6
             hint_lbl = f_small.render("BACKSPACE to skip button   ESC to cancel remap", True, (120, 120, 60))
             surface.blit(hint_lbl, (center_x - hint_lbl.get_width() // 2, ctrl_bottom - 14))
 
-        _scale_x = _target_w / BASE_W
-        _scale_y = _target_h / BASE_H
         if _target_w > 0 and _target_h > 0:
             _scaled_panel = pygame.transform.smoothscale(surface, (_target_w, _target_h))
             _real_surface.blit(_scaled_panel, (_target_x, _target_y))
-
-        def _to_real(r):
-            return pygame.Rect(
-                _target_x + int(r.x * _scale_x), _target_y + int(r.y * _scale_y),
-                max(1, int(r.width * _scale_x)), max(1, int(r.height * _scale_y)))
-
-        self._mapping_btn_rects = {btn: _to_real(r) for btn, r in btn_rects.items()}
-        self._mapping_sad_rect   = _to_real(r1) if r1 is not None else None
-        self._mapping_close_rect = _to_real(r2)
-        _opt_rects = {1: _to_real(r0)}
-        if r1 is not None:
-            _opt_rects[2] = _to_real(r1)
-        _opt_rects[close_idx] = _to_real(r2)
-        self._mapping_opt_rects  = _opt_rects
-
-    def handle_mapping_click(self, mouse_pos):
-        """Route a mouse click inside the mapping UI. Returns True if consumed."""
-        console = getattr(self, "_active_mapping_console", "GBA") or "GBA"
-        is_n64 = (console == "N64")
-        close_idx = 2 if is_n64 else 3
-
-        player_rects = getattr(self, "_mapping_player_rects", {})
-        for p, rect in player_rects.items():
-            if rect and rect.collidepoint(mouse_pos):
-                self._ctrl_map_cursor = 0
-                self._ctrl_map_on_pick = False
-                if not self._player_slot_pickable(p):
-                    return True  # not reachable yet (out of order) — not selectable
-                self._ctrl_map_player_sel = p
-                if p != getattr(self, "_active_mapping_player", 1):
-                    self._switch_mapping_player(p, console)
-                return True
-
-        pick_rect = getattr(self, "_mapping_pick_rect", None)
-        if pick_rect and pick_rect.collidepoint(mouse_pos):
-            self._ctrl_map_cursor = 0
-            self._ctrl_map_on_pick = True
-            if console == "MENU":
-                self.start_menu_controller_pick()
-            else:
-                target = getattr(self, "_ctrl_map_player_sel", getattr(self, "_active_mapping_player", 1))
-                if self._player_slot_pickable(target):
-                    self.start_controller_pick(target)
-            return True
-
-        # Didn't-register-layout popup buttons, if one's currently up.
-        if getattr(self, "_pick_layout_popup_player", None) is not None:
-            remap_rect = getattr(self, "_pick_layout_popup_remap_rect", None)
-            if remap_rect and remap_rect.collidepoint(mouse_pos):
-                self.confirm_pick_layout_popup()
-            return True  # swallow all clicks while the popup is up
-
-        opt_rects = getattr(self, "_mapping_opt_rects", {})
-        for idx, rect in opt_rects.items():
-            if rect and rect.collidepoint(mouse_pos):
-                self._ctrl_map_cursor = idx   # move cursor to clicked option
-                if idx == 1:
-                    if not getattr(self, "_seq_remap_active", False):
-                        self.start_sequential_remap(console)
-                elif idx == close_idx:
-                    self._mapping_close_requested = True
-                    self.ctrl_mapping_active_btn = None
-                    self._seq_remap_active = False
-                elif idx == 2 and not is_n64:
-                    self.ctrl_mapping["stick_as_dpad"] = not self.ctrl_mapping.get("stick_as_dpad", False)
-                    self._save_controller_mapping(console)
-                return True
-
-        # Individual GBA button label click in the wireframe diagram area
-        rects = getattr(self, "_mapping_btn_rects", {})
-        for btn, rect in rects.items():
-            if rect.collidepoint(mouse_pos):
-                if self.ctrl_mapping_active_btn == btn:
-                    self.ctrl_mapping_active_btn = None
-                    self._seq_remap_active = False
-                else:
-                    self.ctrl_mapping_active_btn = btn
-                    self._seq_remap_active = False
-                    # Same one-capture-per-press gate for single remaps.
-                    self._remap_await_release  = True
-                    self._remap_last_capture_ts = time.monotonic()
-                    _remap_player_now = getattr(self, "_active_mapping_player", 1) or 1
-                    _console_map_now = self._libretro_xinput_map.get(console, {}).get(_remap_player_now, {})
-                    self._remap_used_bits = [v for k, v in _console_map_now.items() if k != btn]
-                    self._remap_reject_flash = None
-                    log.info(f"[GAMEDECK MAPPING] Single remap: waiting for {btn}")
-                return True
-
-        return False
-
 
     def start_sequential_remap(self, console=None):
         """Begin the auto-advance sequential remap flow (all buttons in order)."""
@@ -7586,14 +7009,7 @@ class ExternalGameDeck:
         log.info(f"[GAMEDECK MAPPING] Sequential remap started for {console} — press controller button for: {BTN_SEQ[0]}")
 
     def poll_xinput_for_remap(self, console=None):
-        """Capture one physical button from any supported controller backend.
-
-        The old name is retained because the main loop already calls it, but
-        this is not XInput-only: player1_gpstate()/player_gpstate() fall back
-        to the WinMM DirectInput reader on Windows.  The former _WIN early
-        return made the mapping screen silently unusable for non-XInput
-        controllers.
-        """
+        """Capture one physical button from any supported controller backend."""
         if self.ctrl_mapping_active_btn is None:
             return
 
@@ -7615,7 +7031,8 @@ class ExternalGameDeck:
                 f"Button {_di_label_index + 1}",
             )
 
-        TRIGGER_PRESS_THRESHOLD = 30  # ignores light/accidental trigger touches
+        # VALUES CHANGE HERE
+        TRIGGER_PRESS_THRESHOLD = 30
 
         remap_player = getattr(self, "_active_mapping_player", 1) or 1
         gp = player1_gpstate() if remap_player == 1 else player_gpstate(remap_player)
@@ -7668,9 +7085,6 @@ class ExternalGameDeck:
 
         pressed_bit = None
         if is_dinput and raw_buttons:
-            # Prefer the raw edge so a DirectInput controller's physical
-            # button number is preserved instead of being mislabeled as the
-            # canonical A/B/Start position assumed by _DI_BUTTON_ORDER.
             new_raw = raw_buttons & ~last_raw
             if new_raw:
                 low_bit = new_raw & -new_raw
@@ -7711,11 +7125,6 @@ class ExternalGameDeck:
             return
 
         console_default = cdef["default_map"]
-        # A remap changes the physical controller binding, not the emulator's
-        # keyboard binding for the logical console button, so this always
-        # looks up the default key for the *logical* button being remapped
-        # (`active`), never the one for whichever physical button was
-        # pressed.
         target_vk = console_default.get(active, 0)
         self.ctrl_mapping[active] = target_vk
         remap_player = getattr(self, "_active_mapping_player", 1) or 1
@@ -7765,7 +7174,9 @@ class ExternalGameDeck:
             if console == "MENU":
                 self._apply_menu_nav_mapping_from_libretro_map()
 
-
+    # ========================================================================
+    # SECTION: Rendering: fonts, logos & legend
+    # ========================================================================
 
     def _ensure_fonts(self):
         if self._font_big is None:
@@ -7794,16 +7205,8 @@ class ExternalGameDeck:
         return surf
 
     def _get_boxed_logo(self, console, box_w, box_h):
-        """Fit the console logo into a (box_w, box_h) box using the exact
-        same crop + fit-to-box math the Games-tab menu buttons use for
-        their logos (ui.py's _crop_logo_to_artwork / _fit_logo_to_box:
-        crop transparent padding, then scale to fit inside 84% of the
-        box width / 76% of the box height, whichever is tighter).
-        Give this an on-screen box that's the button's own inset box
-        (converted to this screen's real-pixel scale) and the logo it
-        returns is guaranteed to come out the same size as the button's
-        logo -- no separate formula to keep in sync by hand.
-        """
+        """Fit the console logo into a (box_w, box_h) box with the same crop and fit math as the Games-tab menu buttons."""
+        # WARNING: must match ui.py's _crop_logo_to_artwork / _fit_logo_to_box (84% of box width, 76% of box height).
         cache = self._boxed_logo_cache.setdefault(console, {})
         key = (box_w, box_h)
         if key in cache:
@@ -7844,12 +7247,11 @@ class ExternalGameDeck:
     def set_theme(self, ui_color):
         if ui_color: self.ui_color = ui_color
 
-
-
     def _draw_legend(self, screen, cx, y, h, groups):
         f     = self._font_small
         col_w = 130
-        row_h = 20   # Legend row height.
+        # VALUES CHANGE HERE
+        row_h = 20
         total_w = col_w * len(groups)
         block_x = cx - total_w // 2
         y_title = y + h - 3 * row_h - 8
@@ -7868,20 +7270,16 @@ class ExternalGameDeck:
                 lbl = f.render(text, True, color)
                 screen.blit(lbl, (col_cx - lbl.get_width() // 2, row_y))
 
+    # ========================================================================
+    # SECTION: Rendering: console carousel
+    # ========================================================================
+
     def render(self, screen, rect, crt_cfg=None):
         self._ensure_fonts()
         self._active_crt_cfg = crt_cfg
         x, y, w, h = rect
         cx = x + w // 2
 
-        # The custom background attaches to the same black canvas the
-        # game channel already draws behind everything else -- it fills
-        # `rect` exactly, the same way screen.fill(rect) always does,
-        # instead of letterboxing to preserve its own image aspect. That
-        # keeps it moving/resizing in lockstep with `rect` (Aspect Ratio,
-        # Screen Mode, Bezel, Pixel Orbiter -- whatever shaped it this
-        # frame) exactly like the black fallback does, rather than being
-        # fit independently and left behind whenever `rect` changes shape.
         bg_surf = self._get_menu_bg_surface()
         if bg_surf is not None:
             try:
@@ -7931,7 +7329,6 @@ class ExternalGameDeck:
                     lbl_m = self._font_mid.render(msg, True, (150, 150, 150))
                     screen.blit(lbl_m, (cx - lbl_m.get_width() // 2, y + h // 2 - 30))
 
-
                 display_pct = pct
                 bw = int(w * 0.5); bh = 10
                 bx = cx - bw // 2;  by = y + h // 2 + 12
@@ -7963,8 +7360,6 @@ class ExternalGameDeck:
             else:
                 self._render_carousel(screen, rect)
         elif self.mode == "ROMLIST": self._render_romlist(screen, rect)
-
-
 
     def _render_carousel(self, screen, rect):
         x, y, w, h = rect
@@ -8010,20 +7405,11 @@ class ExternalGameDeck:
             ("Back",     "B",   "ESC"),
         ])
 
-    _NAV_ARROW_SIZE = 15  # half-width/half-height of the console-switch arrow triangle
+    # VALUES CHANGE HERE
+    _NAV_ARROW_SIZE = 15
 
     def _draw_console_switch_arrow(self, screen, direction, cx, cy, can_switch, flashed):
-        """Draws a real filled triangle pointing `direction` ('left'/'right'/
-        'up'/'down') instead of relying on a font glyph (some fonts have no
-        glyph for the unicode arrow triangles, which renders as tofu boxes).
-        Idle color follows the list-text-color setting; briefly flashes to
-        the UI accent color right after the arrow is actually used to switch.
-        `flashed` also covers "currently focused/selected" (see
-        _draw_romlist_console_arrows) -- that highlight should still show
-        even when can_switch is False (e.g. only one console enabled), so
-        the user gets visual confirmation their focus moved there even
-        though there's nothing to page to yet. Only the idle (unfocused)
-        color falls back to disabled-gray in that case."""
+        """Draw a filled triangle pointing `direction` ('left'/'right'/'up'/'down') instead of a font glyph."""
         if flashed:
             color = self.ui_color
         elif not can_switch:
@@ -8038,15 +7424,13 @@ class ExternalGameDeck:
             pts = [(cx - s, cy - s), (cx - s, cy + s), (cx + s, cy)]
         elif direction == "up":
             pts = [(cx - s, cy + s), (cx + s, cy + s), (cx, cy - s)]
-        else:  # "down"
+        else:
             pts = [(cx - s, cy - s), (cx + s, cy - s), (cx, cy + s)]
 
         pygame.draw.polygon(screen, color, pts)
 
     def _render_console_single(self, screen, rect, orientation):
-        """Shared renderer for the 'side' (left/right) and 'updown' (up/down)
-        console-selector scroll styles: one logo/label centered, with a pair
-        of switch arrows hugging it on either side."""
+        """Shared renderer for the 'side' and 'updown' console-selector styles: one centered logo/label with a pair of arrows hugging it."""
         x, y, w, h = rect
         cx = x + w // 2
         cy = y + h // 2
@@ -8066,14 +7450,14 @@ class ExternalGameDeck:
             logo_w, logo_h_actual = lbl.get_width(), lbl.get_height()
             screen.blit(lbl, (cx - logo_w // 2, cy - logo_h_actual // 2))
 
-        # Clear the flash once its window has elapsed so arrows go back to idle color.
         now = pygame.time.get_ticks()
         flash_active = (self._console_arrow_flash_dir is not None and
                         now < self._console_arrow_flash_until)
         if not flash_active:
             self._console_arrow_flash_dir = None
 
-        ARROW_PAD = 46  # gap between the logo/label edge and the arrow, i.e. "hug" it
+        # VALUES CHANGE HERE
+        ARROW_PAD = 46
         if orientation == "side":
             arrow_gap = logo_w // 2 + ARROW_PAD
             self._draw_console_switch_arrow(
@@ -8105,6 +7489,10 @@ class ExternalGameDeck:
     def _render_console_updown(self, screen, rect):
         self._render_console_single(screen, rect, "updown")
 
+    # ========================================================================
+    # SECTION: Rendering: ROM list
+    # ========================================================================
+
     def _draw_romlist_error_banner(self, screen, cx, top_y):
         if not self._romlist_error_msg:
             return
@@ -8127,12 +7515,13 @@ class ExternalGameDeck:
 
         col_w   = 130
         groups  = groups or []
-        back_i  = len(groups) - 1  # "Back" is always the last legend column
+        back_i  = len(groups) - 1
         total_w = col_w * len(groups) if groups else col_w
         block_x = cx - total_w // 2
         back_col_cx = block_x + back_i * col_w + col_w // 2 if groups else cx
 
-        PUSH_PAST_BACK = 140  # extra push right past the "Back" column
+        # VALUES CHANGE HERE
+        PUSH_PAST_BACK = 140
 
         arrow_col_x = back_col_cx + PUSH_PAST_BACK
 
@@ -8140,7 +7529,8 @@ class ExternalGameDeck:
         arrow_col_x = min(arrow_col_x, x + w - _arrow_right_margin)
 
         list_area_top    = y + list_top_offset
-        list_area_bottom = y + h - 90  # Reserve space for the legend.
+        # VALUES CHANGE HERE
+        list_area_bottom = y + h - 90
         list_area_mid    = (list_area_top + list_area_bottom) // 2
         arrow_gap = 46
         arrow_up_y   = list_area_mid - arrow_gap
@@ -8158,19 +7548,10 @@ class ExternalGameDeck:
         cx = x + w // 2
         console = self.active_console or ""
 
-        # Invisible box, sized off the Games-tab menu button's own inset
-        # box, not a hand-picked pixel number. On the button's fixed
-        # 1036x680 virtual canvas: 4 cols, 8px gaps, 20px content margin
-        # -> cell 238x84 -> minus the button's 6px inset pad on every
-        # side -> inset box 226x72. That inset box is exactly what the
-        # button fits its logo inside, so reusing it here (scaled to
-        # this screen's real pixel size) makes the two logos land on the
-        # same sizing logic instead of two formulas that have to be kept in sync
-        # by hand. Taller than the button's box (not wider) so it reads
-        # bigger here without drifting off the button's width.
         _BTN_INSET_BOX_W = 226
         _BTN_INSET_BOX_H = 72
-        _HEADER_TALLER   = 1.35   # up/down only -- width stays button-sized
+        # VALUES CHANGE HERE
+        _HEADER_TALLER   = 1.35
         _scale  = w / 1036.0
         box_w   = _BTN_INSET_BOX_W * _scale
         box_h   = _BTN_INSET_BOX_H * _scale * _HEADER_TALLER
@@ -8198,9 +7579,7 @@ class ExternalGameDeck:
         self._poll_live_rescan()
         self._refresh_dvd_root_labels()
 
-        # The "READING FOLDER..." box must sit ON TOP of the list, so it is
-        # drawn last (at each exit below). It used to be drawn here, before
-        # the rows/legend/arrows, which put every one of them on top of it.
+        # WARNING: draw the READING FOLDER box last, at every exit, so it sits on top of the list.
         _busy_due = bool(self._scan_pending and self._scan_started_ticks and
                          (pygame.time.get_ticks() - self._scan_started_ticks) >= 1000)
 
@@ -8232,10 +7611,6 @@ class ExternalGameDeck:
             display_name, full_path = self.roms[i]
             selected     = (i == self.rom_index) and self.romlist_focus == "list"
             if display_name.startswith("[MISSING] ") or display_name.startswith("[OFFLINE] "):
-                # Flag these distinctly instead of blending in with the rest
-                # of the list -- the file this entry points at either can't
-                # be found anymore or lives on a drive that isn't responding
-                # right now.
                 color = (255, 150, 90) if selected else (200, 100, 60)
             else:
                 color        = self.ui_color if selected else self.list_text_color
@@ -8270,7 +7645,6 @@ class ExternalGameDeck:
         bx = x + (w - box_w) // 2
         by = y + (h - box_h) // 2
 
-        # Dim the whole list area so the box reads as sitting on top of it.
         dim = pygame.Surface((w, h), pygame.SRCALPHA)
         dim.fill((0, 0, 0, 90))
         screen.blit(dim, (x, y))
@@ -8282,7 +7656,6 @@ class ExternalGameDeck:
         lbl   = f_lbl.render("READING FOLDER...", True, ui_c)
         screen.blit(lbl, (bx + (box_w - lbl.get_width()) // 2, by + 16))
 
-        # Indeterminate bar: a chunk that bounces back and forth across the track.
         track_w, track_h = box_w - 40, 14
         tx = bx + 20
         ty = by + box_h - 18 - track_h
@@ -8294,11 +7667,13 @@ class ExternalGameDeck:
         t     = (pygame.time.get_ticks() % period_ms) / period_ms
         phase = t * 2
         if phase > 1:
-            phase = 2 - phase   # ping-pong 0 -> 1 -> 0 instead of snapping back
+            phase = 2 - phase
         chunk_x = tx + int((track_w - chunk_w) * phase)
         pygame.draw.rect(screen, ui_c, (chunk_x, ty, chunk_w, track_h))
 
-
+    # ========================================================================
+    # SECTION: Splash & DVD load screens
+    # ========================================================================
 
     def _dvd_path_is_video(self, path):
         return os.path.splitext(path)[1].lower() in self.DVD_SPLASH_VIDEO_EXTS
@@ -8355,23 +7730,7 @@ class ExternalGameDeck:
         return surf
 
     def _cover_scale_bg(self, surf, w, h):
-        """Fit `surf` to fill a (w, h) box exactly with no distortion.
-
-        Crops the source to the box's own aspect ratio first (centered,
-        trimming whichever axis has the excess -- e.g. shaving the left
-        and right edges off a 16:9 image being dropped into a 4:3 box),
-        then scales that crop uniformly to (w, h). Unlike the old plain
-        smoothscale(surf, (w, h)), this never squishes/stretches the
-        source non-uniformly when its aspect ratio doesn't match the
-        target box's (that's what made logos/text hard to read in 4:3
-        mode -- a 16:9 background getting squeezed horizontally). And
-        unlike a naive "scale to cover, let it overflow" crop, it never
-        needs to spill past the box's edges to avoid distortion: the
-        crop already matches (w, h)'s own aspect ratio before any
-        scaling happens, so the final scale is uniform on both axes and
-        lands exactly on (w, h), filling the box with nothing left over
-        and nothing cut off outside it.
-        """
+        """Fit `surf` to fill a (w, h) box exactly with no distortion."""
         sw, sh = surf.get_width(), surf.get_height()
         w = max(1, int(w))
         h = max(1, int(h))
@@ -8380,15 +7739,11 @@ class ExternalGameDeck:
         target_ratio = w / h
         src_ratio = sw / sh
         if src_ratio > target_ratio:
-            # Source is relatively wider than the box -- crop its left
-            # and right edges, keep full height.
             crop_w = max(1, min(sw, round(sh * target_ratio)))
             crop_h = sh
             crop_x = (sw - crop_w) // 2
             crop_y = 0
         else:
-            # Source is relatively taller than the box -- crop its top
-            # and bottom edges, keep full width.
             crop_w = sw
             crop_h = max(1, min(sh, round(sw / target_ratio)))
             crop_x = 0
@@ -8501,10 +7856,7 @@ class ExternalGameDeck:
                 surf = pygame.image.frombuffer(frame, (vlc.width, vlc.height), "BGRA")
                 surf = self._apply_crt_cfg_to_surface(surf)
                 surf = self._dvd_true_content_surf(vlc, surf)
-                # Splash video is part of the DVD player, so it must use the
-                # DVD Screen Mode rather than inheriting the global Video-tab
-                # setting. The destination rect itself is supplied by the
-                # stable DVD-aspect canvas in retro_tv_emulator.py.
+                # WARNING: the splash video uses the DVD Screen Mode, not the global Video-tab setting.
                 _dvd_mode = "normal"
                 try:
                     import sys as _sys
@@ -8529,12 +7881,6 @@ class ExternalGameDeck:
                     _main_blit(screen, surf, _sp_target, mode=_dvd_mode, pixel_aspect=_sp_pa, **_sp_kw)
                 else:
                     _aspect_fit_blit(screen, surf, rect)
-                # rect can carry the Pixel Orbiter's few-pixel overscan
-                # cushion on legacy callers, which is allowed to poke slightly
-                # outside the real window -- fine for the blit above (blit
-                # clips silently), but subsurface() below raises if the rect
-                # isn't entirely inside the screen. Clip before subsurface()
-                # so the rectangle stays inside the screen.
                 _safe_rect = pygame.Rect(rect).clip(screen.get_rect())
                 if _safe_rect.width > 0 and _safe_rect.height > 0:
                     self._dvd_splash_video_last_frame = screen.subsurface(_safe_rect).copy()
@@ -8546,21 +7892,12 @@ class ExternalGameDeck:
             return
         screen.fill((0, 0, 0), rect)
 
+    # ========================================================================
+    # SECTION: DVD player rendering
+    # ========================================================================
+
     def _dvd_true_content_surf(self, vlc, surf):
-        """Crop VLC's own baked-in letterbox/pillarbox bars back out of a
-        decoded DVD frame. dvd_engine is a VLCEngineWrapper (same class
-        the Video channel's vlc_engine uses) -- when the DVD's own
-        aspect ratio doesn't match the decode canvas shape,
-        _configure_letterbox_for_source already fits the true picture
-        into a smaller box inside that canvas and bakes black bars
-        around it (self._decode_w/_decode_h and self._letterbox_offset_x/
-        _y describe exactly where). Cropping that box back out here
-        means the DVD's own designed aspect ratio -- not the padded
-        canvas shape -- is what gets fit into the on-screen rect below,
-        so a 16:9 DVD playing on a 4:3-shaped screen (or vice versa)
-        letterboxes once, correctly, instead of the padded canvas being
-        squashed into the rect on top of the bars it already has.
-        Mirrors _true_content_surf in retro_tv_emulator.py."""
+        """Crop VLC's baked-in letterbox/pillarbox bars out of a decoded DVD frame."""
         try:
             dw, dh = vlc._decode_w, vlc._decode_h
             cw, ch = vlc.width, vlc.height
@@ -8575,11 +7912,8 @@ class ExternalGameDeck:
             return surf
 
     def _dvd_fit_aspect(self, surf):
-        """The standard shape (4:3 / 16:9 / 9:16) Normal mode lays this DVD
-        picture out as -- the same rule TV video uses, so a disc gets the
-        very same bars a TV station of that shape gets (see
-        _snap_standard_aspect in retro_tv_emulator.py). None when that rule
-        isn't reachable, in which case the picture keeps its own ratio."""
+        """Return the standard shape (4:3 / 16:9 / 9:16) Normal mode lays this DVD picture out as."""
+        # WARNING: must match _snap_standard_aspect in retro_tv_emulator.py so a disc gets the same bars as a TV station of that shape.
         try:
             main = sys.modules.get("__main__")
             snap = getattr(main, "_snap_standard_aspect", None)
@@ -8592,28 +7926,13 @@ class ExternalGameDeck:
         return None
 
     def _dvd_video_fit(self, screen, surf, rect, mode):
-        """(target_rect, pixel_aspect) to hand _blit_video_with_screen_mode
-        for a DVD picture. Bezel ON: the exact rule set TV stations use
-        (see _dvd_bezel_video_fit in retro_tv_emulator.py) with this
-        player's own dvd_screen_mode, so a 16:9 disc gets bars top/bottom
-        only, a 4:3 disc gets bars on the sides only, and Stretch/Crop/
-        Pan & Scan fill the glass -- instead of the raw full-window rect
-        that Bezel's per-axis composite then squeezed. Also paints the
-        outer gap (when the target is smaller than the canvas, i.e. the
-        4:3 box) in the same bar color TV video uses, so no stale pixels
-        show outside it. Bezel OFF, or if anything is unavailable:
-        returns (rect, 1.0) untouched -- the previous behavior exactly.
-        """
+        """(target_rect, pixel_aspect) to hand _blit_video_with_screen_mode for a DVD picture."""
         target = pygame.Rect(rect)
         try:
             main = sys.modules.get("__main__")
             fit = getattr(main, "_dvd_bezel_video_fit", None)
             sh = surf.get_height()
             if callable(fit) and sh > 0:
-                # Route on the standard shape (same rule as _dvd_fit_aspect).
-                # Kept inline rather than calling self._dvd_fit_aspect so
-                # this method stays independent of `self`, as its tests
-                # call it.
                 aspect = surf.get_width() / sh
                 snap = getattr(main, "_snap_standard_aspect", None)
                 if callable(snap):
@@ -8631,11 +7950,7 @@ class ExternalGameDeck:
         return target, 1.0
 
     def _apply_crt_cfg_to_surface(self, surf):
-        """Apply the Video-tab Brightness/Contrast/Color/Sharpness/Tint filter
-        (same one TV channels and the visualizer use) to a raw VLC frame
-        surface. crt_cfg uses the same key names render_libretro()/
-        reprocess_current_frame() expect; map them onto apply_video_effects()'s
-        param names here so both DVD and libretro read one shared config dict."""
+        """Apply the Video-tab Brightness/Contrast/Color/Sharpness/Tint filter to a raw VLC frame surface, mapping crt_cfg keys onto apply_video_effects() parameters."""
         cfg = getattr(self, "_active_crt_cfg", None)
         if not cfg:
             return surf
@@ -8659,7 +7974,6 @@ class ExternalGameDeck:
 
         vlc = self.vlc_engine
         now = pygame.time.get_ticks()
-        _dvd_pre_t0 = time.perf_counter()
 
         self._maybe_auto_apply_dvd_captions(vlc)
 
@@ -8743,7 +8057,7 @@ class ExternalGameDeck:
                             _tail = vlc.get_recent_vlc_log()
                             if _tail:
                                 pass
-                        except Exception as _e:
+                        except Exception:
                             pass
                 self._dvd_jump_watch_wall = _t_now_wall
                 self._dvd_jump_watch_pos = _t_pos
@@ -8852,7 +8166,7 @@ class ExternalGameDeck:
                             _tail = vlc.get_recent_vlc_log()
                             if _tail:
                                 pass
-                        except Exception as _e:
+                        except Exception:
                             pass
                         self.dvd_playback_active = False
                         self.dvd_splash_done     = False
@@ -8866,14 +8180,6 @@ class ExternalGameDeck:
                         return
             except Exception as e:
                 _log_warn_throttled("dvd_main_end_check", "DVD main-video-ended state check failed this frame: %s", e)
-
-        # Closes the timer opened as _dvd_pre_t0 at function entry -- covers
-        # everything ahead of the frame_drawn branch (caption auto-apply,
-        # splash-timer/state checks, confirm-popup burn-in checks, the
-        # end-state watchdog above) that item A's timers didn't reach,
-        # since all of item A's stages only start once we're already inside
-        # the frame_drawn==False/vlc-not-None branch below.
-        _record_perf_stage_timing("dvd_pre_frame_logic", (time.perf_counter() - _dvd_pre_t0) * 1000.0)
 
         frame_drawn = False
         if getattr(self, 'dvd_awaiting_resume', False):
@@ -8890,29 +8196,8 @@ class ExternalGameDeck:
                     except Exception as e:
                         _log_warn_throttled("dvd_pending_pause", "Deferred DVD pause application failed this frame: %s", e)
 
-                _dvd_ff_t0 = time.perf_counter()
                 frame = vlc.get_display_frame()
-                _record_perf_stage_timing("dvd_frame_fetch", (time.perf_counter() - _dvd_ff_t0) * 1000.0)
                 if frame:
-                    # Tell the mute guard a real DVD picture is now on
-                    # screen, the same way the main TV pipeline's own
-                    # frame-consume branch does (see the "elif vlc_bytes:"
-                    # block in retro_tv_emulator.py that calls
-                    # _lift_buffering_mute(ch, "first-frame")). DVD
-                    # playback renders through this separate game_deck
-                    # branch instead of that one, so without this call
-                    # nothing ever clears app_state["_video_pending_unmute"]
-                    # for a DVD load -- every apply_volume_when_ready
-                    # watchdog spawned for it bails out (superseded by the
-                    # next one) before it ever gets a chance to notice a
-                    # first frame itself, so the audio stays force-muted
-                    # indefinitely. That's what a manual nudge of the
-                    # volume slider was actually working around: it drives
-                    # audio_set_volume/mute directly, bypassing this stuck
-                    # flag rather than fixing it. _lift_buffering_mute is
-                    # a no-op once the flag's already clear, so calling it
-                    # every frame here is safe/cheap, same as the
-                    # guide-preview call sites already do.
                     try:
                         _main_mod_mute = sys.modules.get("__main__")
                         if _main_mod_mute and hasattr(_main_mod_mute, "_lift_buffering_mute"):
@@ -8923,32 +8208,8 @@ class ExternalGameDeck:
                         _log_warn_throttled("dvd_lift_buffering_mute",
                                              "DVD first-frame mute-guard lift failed: %s", _e)
                     surf = pygame.image.frombuffer(frame, (vlc.width, vlc.height), "BGRA")
-                    _dvd_fx_t0 = time.perf_counter()
                     surf = self._apply_crt_cfg_to_surface(surf)
-                    _record_perf_stage_timing("dvd_video_effects", (time.perf_counter() - _dvd_fx_t0) * 1000.0)
                     surf = self._dvd_true_content_surf(vlc, surf)
-                    # DVD picture fit goes through the same
-                    # _blit_video_with_screen_mode the Video tab uses,
-                    # passing dvd_screen_mode explicitly as `mode` so it
-                    # can't fall back to the global screen_mode setting
-                    # the DVD player is deliberately decoupled from (see
-                    # the dvd_aspect_ratio/dvd_screen_mode split in
-                    # media.py's default config). This call itself needs
-                    # no reopen for a mode switch -- it re-reads
-                    # dvd_screen_mode fresh every frame and is purely a
-                    # destination-rect change on top of whatever `surf`
-                    # already is. `surf`'s own shape DOES depend on
-                    # dvd_screen_mode now, though (see
-                    # _apply_screen_mode_geometry's is_dvd_iso branch in
-                    # retro_tv_emulator.py): Normal/Crop/Pan & Scan need
-                    # the true-source letterbox buffer preserved at the
-                    # decoder so _dvd_true_content_surf() above can
-                    # recover the disc's real aspect, and getting a
-                    # freshly-picked mode's buffer shape to actually take
-                    # effect at the decoder does require a reopen --
-                    # that's handled elsewhere (refresh_screen_mode_
-                    # geometry() / _apply_dvd_native_dims_when_ready()),
-                    # not here.
                     _dvd_mode = "normal"
                     _main_mod_bl = sys.modules.get("__main__")
                     if _main_mod_bl and hasattr(_main_mod_bl, "db") and _main_mod_bl.db is not None:
@@ -8957,10 +8218,6 @@ class ExternalGameDeck:
                     _dvd_blit_timing = {}
                     _dvd_fit_rect, _dvd_fit_pa = pygame.Rect(x, y, w, h), 1.0
                     if _main_mod_bl and hasattr(_main_mod_bl, "_blit_video_with_screen_mode"):
-                        # Bezel on: same target rect + squish correction TV
-                        # stations use, with dvd_screen_mode (see
-                        # _dvd_video_fit). Bezel off: (rect, 1.0), i.e. the
-                        # unchanged plain canvas fit.
                         _dvd_fit_rect, _dvd_fit_pa = self._dvd_video_fit(
                             screen, surf, pygame.Rect(x, y, w, h), _dvd_mode)
                         _dvd_fit_kw = {}
@@ -8971,20 +8228,6 @@ class ExternalGameDeck:
                             screen, surf, _dvd_fit_rect, mode=_dvd_mode,
                             geom_out=_dvd_blit_geom, timing_out=_dvd_blit_timing,
                             pixel_aspect=_dvd_fit_pa, **_dvd_fit_kw)
-                        if "smoothscale_ms" in _dvd_blit_timing:
-                            _record_perf_stage_timing("dvd_smoothscale", _dvd_blit_timing["smoothscale_ms"])
-                        if "panscan_ms" in _dvd_blit_timing:
-                            _record_perf_stage_timing("dvd_panscan_analysis", _dvd_blit_timing["panscan_ms"])
-                        # Was previously unlogged, unlike the TV video call
-                        # sites' [REAL VIDEO BLIT] line -- meaning a log
-                        # audit could only ever see the outer canvas rect
-                        # here (correctly identical across Normal/Stretch/
-                        # Crop/Pan & Scan by design, since that's the fixed
-                        # target box, not the fit), with no way to confirm
-                        # from the log alone that dvd_screen_mode was
-                        # actually producing a different draw underneath it.
-                        # Mirrors the TV call site's log so the next test
-                        # can confirm this on paper, not just on screen.
                         _dvd_rbg_key = (
                             (x, y, w, h), surf.get_size(), _dvd_mode,
                             tuple(sorted(_dvd_blit_geom.items())) if _dvd_blit_geom else None,
@@ -9004,29 +8247,11 @@ class ExternalGameDeck:
                                 ("%.4f" % (_dw / _dh)) if _dw and _dh else None,
                             )
                     else:
-                        # Defensive fallback if the main module ever isn't
-                        # reachable -- keeps DVD playback rendering (as
-                        # plain contain-fit) instead of a hard failure.
                         _aspect_fit_blit(screen, surf, (x, y, w, h))
-                    # Clip before subsurface() so the rectangle stays inside the screen.
+                    # WARNING: clip before subsurface() so the rectangle stays inside the screen.
                     _safe_rect = pygame.Rect(x, y, w, h).clip(screen.get_rect())
                     if _safe_rect.width > 0 and _safe_rect.height > 0:
-                        _dvd_pc_t0 = time.perf_counter()
                         self.dvd_paused_frame = screen.subsurface(_safe_rect).copy()
-                        _record_perf_stage_timing("dvd_paused_frame_copy", (time.perf_counter() - _dvd_pc_t0) * 1000.0)
-                    # Where the true picture actually landed on screen this
-                    # frame, in its own (post-crop) coordinate space -- used
-                    # below to keep the DVD-menu highlight box aligned.
-                    # _blit_video_with_screen_mode hands back the real
-                    # destination geometry it drew (via geom_out), which
-                    # matches whatever dvd_screen_mode actually did --
-                    # contain-fit for Normal, but a larger, possibly
-                    # off-rect-origin draw for Crop/Pan & Scan (the parts
-                    # outside the visible rect got clipped at blit time,
-                    # not cropped out of the geometry, so the highlight
-                    # math below still maps proportionally from source
-                    # space into it correctly). Use contain-fit geometry
-                    # when mode-specific geometry is unavailable.
                     if all(k in _dvd_blit_geom for k in ("dest_x", "dest_y", "draw_w", "draw_h")):
                         self._dvd_last_fit_geom = (
                             surf.get_width(), surf.get_height(),
@@ -9043,14 +8268,6 @@ class ExternalGameDeck:
             frame_drawn = True
         if not frame_drawn:
             screen.fill((0, 0, 0), rect)
-
-        # Opens the last untimed span: everything from here to the end of
-        # the function -- highlight-box overlay, hold-poll, OSD text/icon,
-        # the exit/return-to-menu confirm dialogs, and the F9 debug panel.
-        # None of these were reachable from inside the vlc-frame try/except
-        # above, so item A's timers never saw them either. Closed out at
-        # the very end of the function, right before the next def.
-        _dvd_post_t0 = time.perf_counter()
 
         if (frame_drawn and self._dvd_menu_is_up() and vlc is not None
                 and self._dvd_highlight_shadow is not None
@@ -9073,8 +8290,6 @@ class ExternalGameDeck:
             ))
             if not _menu_open:
                 self._poll_dvd_hold()
-
-
 
         try:
             import colorsys as _cs, sys as _sys2
@@ -9114,9 +8329,7 @@ class ExternalGameDeck:
             rgb_bg     = (int(r_bg * 255), int(g_bg * 255), int(b_bg * 255))
             accent_col = (int(r_ui * 255), int(g_ui * 255), int(b_ui * 255))
 
-            # "Are You Sure" boxes are important to read and don't overlay
-            # well against busy backgrounds -- always render fully opaque
-            # regardless of the menu transparency slider.
+            # WARNING: "Are You Sure" boxes always render fully opaque, regardless of the menu transparency slider.
             alpha_val = 255
             overlay   = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
             overlay.fill((rgb_bg[0], rgb_bg[1], rgb_bg[2], alpha_val))
@@ -9129,7 +8342,6 @@ class ExternalGameDeck:
 
             lbl_q = f_title.render("EXIT DVD PLAYER?", True, (255, 220, 0))
             screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
-
 
             box_radius      = 4
             focus_thickness = SELECTION_BORDER_WIDTH
@@ -9174,9 +8386,7 @@ class ExternalGameDeck:
             rgb_bg     = (int(r_bg * 255), int(g_bg * 255), int(b_bg * 255))
             accent_col = (int(r_ui * 255), int(g_ui * 255), int(b_ui * 255))
 
-            # "Are You Sure" boxes are important to read and don't overlay
-            # well against busy backgrounds -- always render fully opaque
-            # regardless of the menu transparency slider.
+            # WARNING: "Are You Sure" boxes always render fully opaque, regardless of the menu transparency slider.
             alpha_val = 255
             overlay   = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
             overlay.fill((rgb_bg[0], rgb_bg[1], rgb_bg[2], alpha_val))
@@ -9215,25 +8425,9 @@ class ExternalGameDeck:
             lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, (160, 160, 160))
             screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
 
-        if getattr(self, "dvd_debug_overlay", False) and vlc is not None:
-            try:
-                _dbg_lines = ["--- DVD DEBUG (F9 to hide) ---"] + vlc.get_dvd_debug_snapshot()
-            except Exception as e:
-                _dbg_lines = [f"--- DVD DEBUG (F9 to hide) --- snapshot failed: {e}"]
-            f_dbg = _cached_font("Courier New", 15, bold=True)
-            _pad = 8
-            _line_h = f_dbg.get_height() + 2
-            _panel_w = max(f_dbg.size(l)[0] for l in _dbg_lines) + _pad * 2
-            _panel_h = _line_h * len(_dbg_lines) + _pad * 2
-            _panel = pygame.Surface((_panel_w, _panel_h), pygame.SRCALPHA)
-            _panel.fill((0, 0, 0, 210))
-            for _i, _line in enumerate(_dbg_lines):
-                _col = (255, 220, 0) if _i == 0 else (140, 255, 140)
-                _surf = f_dbg.render(_line, True, _col)
-                _panel.blit(_surf, (_pad, _pad + _i * _line_h))
-            screen.blit(_panel, (x + 12, y + 12))
-
-        _record_perf_stage_timing("dvd_post_frame_overlay", (time.perf_counter() - _dvd_post_t0) * 1000.0)
+    # ========================================================================
+    # SECTION: Libretro: cores & XInput map
+    # ========================================================================
 
     def _has_libretro_core(self, console):
         emu_dir = os.path.join(self.cores_dir, console)
@@ -9287,7 +8481,7 @@ class ExternalGameDeck:
             console_map.update(per_console[1])
             return
 
-        # Personal per-console overrides load first and always win.
+        # WARNING: personal per-console overrides load first and always win.
         for btn_name, xi_bit in saved.items():
             console_map.setdefault(btn_name, xi_bit)
 
@@ -9346,15 +8540,14 @@ class ExternalGameDeck:
         except Exception as e:
             log.warning(f"[GAMEDECK MAPPING] Gamepad-map save failed for {console} player {player}: {e}")
 
-    # Archive-bomb guards for _extract_rom_from_zip. ROM archives are
-    # legitimately large (CD/DVD images can run into several GB) but a
-    # hostile archive can declare an absurd entry count or a wildly
-    # inflated decompressed size for a tiny compressed payload. These caps
-    # are generous enough for any real ROM/disc-image archive while still
-    # bounding the worst case.
     _MAX_ARCHIVE_ENTRIES = 20000
-    _MAX_EXTRACT_ENTRY_BYTES = 8 * 1024 ** 3       # 8 GiB per extracted file
-    _MAX_ARCHIVE_COMPRESSION_RATIO = 300            # uncompressed / compressed
+    # VALUES CHANGE HERE
+    _MAX_EXTRACT_ENTRY_BYTES = 8 * 1024 ** 3
+    _MAX_ARCHIVE_COMPRESSION_RATIO = 300
+
+    # ========================================================================
+    # SECTION: Libretro: ROM archive extraction
+    # ========================================================================
 
     def _extract_rom_from_zip(self, console, archive_path):
         ext = os.path.splitext(archive_path)[1].lower()
@@ -9366,35 +8559,14 @@ class ExternalGameDeck:
         base_name = os.path.basename(archive_path)
 
         if not real_exts:
-            pass
             return archive_path
 
         try:
-            file_size = os.path.getsize(archive_path)
             with open(archive_path, "rb") as _f:
                 magic = _f.read(8)
         except Exception as _e:
-            file_size = -1
             magic = b""
             log.warning(f"[LIBRETRO DBG] Could not read archive for sniffing: {_e}")
-
-        # Identify the true container format from the first few bytes.
-        if magic[:4] == b"PK\x03\x04":
-            _sniffed = "standard ZIP (local-file header OK)"
-        elif magic[:4] == b"PK\x05\x06":
-            _sniffed = "empty/comment-only ZIP (end-of-central-dir, no files)"
-        elif magic[:6] == b"7z\xbc\xaf'\x1c":
-            _sniffed = "7-ZIP archive — rename the file to .7z"
-        elif magic[:4] == b"Rar!":
-            _sniffed = "RAR archive — cannot be extracted (unsupported format)"
-        elif magic[:4] == b"\x1f\x8b\x08\x00":
-            _sniffed = "GZIP stream — not a zip or 7z"
-        elif magic[:3] == b"BZh":
-            _sniffed = "BZIP2 stream — not a zip or 7z"
-        elif len(magic) == 0:
-            _sniffed = "EMPTY FILE — zero bytes on disk"
-        else:
-            _sniffed = f"unknown (first 8 bytes: {magic.hex()})"
 
         try:
             if ext == ".zip":
@@ -9413,7 +8585,6 @@ class ExternalGameDeck:
                     if not candidates:
                         log.warning(f"[LIBRETRO] No {console} ROM found inside zip: {base_name}")
                         return None
-                    # Largest matching file is almost always the actual ROM.
                     chosen = max(candidates, key=lambda info: info.file_size)
 
                     if chosen.file_size > self._MAX_EXTRACT_ENTRY_BYTES:
@@ -9436,14 +8607,13 @@ class ExternalGameDeck:
                     entry_base = os.path.basename(chosen.filename)
                     out_path   = os.path.join(cache_dir, f"{zip_stem}__{entry_base}")
 
-                    # Skip re-extracting if we already have a same-size copy cached.
                     if not (os.path.exists(out_path) and os.path.getsize(out_path) == chosen.file_size):
                         with zf.open(chosen, "r") as src, open(out_path, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                         log.info(f"[LIBRETRO] Extracted {entry_base} from {base_name}")
                     return out_path
 
-            else:  # .7z — use the system 7-Zip binary (no extra Python packages)
+            else:
                 if _7ZIP_EXE is None:
                     log.warning(f"[LIBRETRO] Cannot extract {base_name} — 7-Zip not found")
                     return None
@@ -9457,7 +8627,6 @@ class ExternalGameDeck:
                           f"{list_r.stderr.strip()}")
                     return None
 
-                # Parse the -slt output into (name, size, packed_size) pairs.
                 names        = []
                 sizes        = {}
                 packed_sizes = {}
@@ -9477,7 +8646,6 @@ class ExternalGameDeck:
                         except ValueError:
                             pass
                     elif _line == "" and _cur is not None:
-                        # blank line ends this entry's field block
                         _cur = None
 
                 if len(names) > self._MAX_ARCHIVE_ENTRIES:
@@ -9518,14 +8686,12 @@ class ExternalGameDeck:
                 target_dir = os.path.join(cache_dir, f"{zip_stem}__7z")
                 out_path   = os.path.join(target_dir, os.path.basename(chosen))
 
-                # Skip re-extracting if cached copy matches expected size.
                 cached_ok = (
                     os.path.exists(out_path)
                     and os.path.getsize(out_path) == sizes.get(chosen, -1)
                 )
                 if not cached_ok:
                     os.makedirs(target_dir, exist_ok=True)
-                    # Pass chosen entry name so 7z only extracts that file.
                     ext_r = subprocess.run(
                         [_7ZIP_EXE, "e", archive_path,
                          "-o" + target_dir, chosen, "-y"],
@@ -9558,15 +8724,17 @@ class ExternalGameDeck:
                       f"directly in the roms/{console}/ folder. ***")
             return None
 
+    # ========================================================================
+    # SECTION: Libretro: launch & loading
+    # ========================================================================
+
     def _launch_libretro(self, console, rom_path):
         self.emulator_loading  = True
         self.emulator_load_pct = 0
         self.emulator_load_msg = f"Loading {console}..."
         self.active_console    = console
         self.mode               = "GAME"
-        # Do not let the previous game's source path make a newly-starting
-        # ROM look like an active reader.  The path is restored only after
-        # the new ROM has actually been accepted by the core.
+        # WARNING: clear the previous game's source path so a newly-starting ROM never looks like an active reader.
         self._libretro_rom_path = ""
         self.is_frozen          = False
         self._pause_reasons.clear()
@@ -9605,6 +8773,7 @@ class ExternalGameDeck:
         self._libretro_console    = console
         self._libretro_loading    = True
         self._libretro_load_start = pygame.time.get_ticks()
+        pad_poller_ensure()
         self._libretro_100_reached_at = None
         self._libretro_load_tau_ms = _LIBRETRO_LOAD_TAU_MS.get(console, _LIBRETRO_LOAD_TAU_MS_DEFAULT)
         self._libretro_first_frame_giveup_ms = _LIBRETRO_FIRST_FRAME_GIVEUP_MS.get(
@@ -9625,36 +8794,10 @@ class ExternalGameDeck:
 
     def _launch_libretro_worker(self, req_id, console, rom_path, display_name, reuse_core):
         result = {"req_id": req_id, "console": console, "display_name": display_name}
-        # Freshly built here (not carried over from a previous launch via
-        # reuse_core) -- if we bail out below without ever handing this
-        # core back in result["core"], it's ours alone to clean up. A
-        # fresh core's .dll is already loaded (build_core_for_console
-        # only returns a core once load_dll() succeeded), so dropping
-        # this local reference without calling unload() would leak that
-        # OS module handle for the rest of the process's life -- see
-        # _free_dll_handle's docstring in libretro_core.py -- silently
-        # making this console's core file undeletable from then on even
-        # though the ROM it choked on was never actually played. A
-        # reused core is deliberately left alone here: it was already
-        # loaded successfully before this attempt and the caller (see
-        # _launch_libretro) may still want it for a future retry.
-        # DEBUG (temporary, remove once the lag/black-screen investigation
-        # is done): step-by-step wall-clock timing for the whole launch
-        # sequence, logged unconditionally so a slow launch shows exactly
-        # which stage ate the time (zip extraction, core DLL build/load,
-        # drive-health probe, or the actual synchronous core.load_rom
-        # call) instead of only the two boot markers libretro_core.py
-        # already prints (first frame / first non-black frame after ROM
-        # load, which only cover what happens AFTER this worker returns).
-        _lw_t_start = time.time()
-        _lw_marks = []
-        def _lw_mark(label):
-            _lw_marks.append((label, time.time()))
-
         _owned_core = None
+        _border_job = self._start_border_prep(console)
         try:
             extracted = self._extract_rom_from_zip(console, rom_path)
-            _lw_mark("extract_rom")
             if extracted is None:
                 result["error"] = f"Could not open: {display_name} (bad or unsupported archive)"
                 self._publish_libretro_launch_result(result)
@@ -9662,11 +8805,9 @@ class ExternalGameDeck:
 
             if reuse_core is not None:
                 core = reuse_core
-                _lw_mark("reuse_core")
             else:
                 core = build_core_for_console(console, self.base_dir, self.emulator_config.get(console),
                                                self.active_bios.get(console))
-                _lw_mark("build_core_for_console")
                 if core is None:
                     result["error"] = f"Could not load {console} core"
                     self._publish_libretro_launch_result(result)
@@ -9676,23 +8817,22 @@ class ExternalGameDeck:
             if hasattr(core, "set_variable"):
                 core.set_variable("mgba_sgb_borders", "OFF")
 
-            # Check drive health before the synchronous core load. The
-            # background launch timeout handles drives that fail mid-read.
             if not _gd_is_drive_responsive(extracted):
                 result["error"] = f"Drive not responding: {display_name}"
                 self._publish_libretro_launch_result(result)
                 return
-            _lw_mark("drive_health_check")
 
             if not core.load_rom(extracted):
                 result["error"] = f"Failed to load: {display_name}"
                 self._publish_libretro_launch_result(result)
                 return
-            _lw_mark("core.load_rom")
 
             result["core"]     = core
             result["rom_path"] = extracted
-            _owned_core = None  # handed off in result -- caller owns cleanup now
+            if _border_job is not None:
+                _border_job[0].join()
+                result["border"] = _border_job[1].get("prepared")
+            _owned_core = None
         except Exception as e:
             log.warning("libretro launch worker failed for %s: %s", console, e)
             result["error"] = f"Failed to load: {display_name}"
@@ -9702,14 +8842,6 @@ class ExternalGameDeck:
                     _owned_core.unload()
                 except Exception as _ue:
                     log.warning("_launch_libretro_worker: cleanup unload failed: %s", _ue)
-            _lw_prev_t = _lw_t_start
-            _lw_steps = []
-            for _lw_label, _lw_t in _lw_marks:
-                _lw_steps.append(f"{_lw_label}={(_lw_t - _lw_prev_t) * 1000.0:.1f}ms")
-                _lw_prev_t = _lw_t
-            log.info("[LAUNCH TIMING] %s (%s) total=%.1fms -- %s",
-                     console, display_name, (time.time() - _lw_t_start) * 1000.0,
-                     ", ".join(_lw_steps) if _lw_steps else "no steps reached")
         self._publish_libretro_launch_result(result)
 
     def _publish_libretro_launch_result(self, result):
@@ -9717,18 +8849,9 @@ class ExternalGameDeck:
             self._libretro_launch_result = result
 
     def _reap_abandoned_libretro_launch(self, abandoned_req_id):
-        """Watches for a core.load_rom() result that arrives after its own
-        loading screen already gave up on it (see the launch-pending
-        timeout in _libretro_tick_loading). That background call is never
-        forcibly killed -- there's no safe way to cancel a ctypes call
-        mid-flight -- so it can still succeed and hand back a fully loaded
-        core, BIOS and all, minutes later. Without this, that result just
-        sits in self._libretro_launch_result until the next launch
-        silently overwrites the reference (see _launch_libretro resetting
-        it to None), leaking the loaded core instead of unloading it.
-        Mirrors the same req_id staleness check _poll_libretro_launch
-        already uses for the normal (non-timeout) case."""
-        deadline = time.time() + 600  # generous -- this is cleanup, not UX
+        """Reap a core.load_rom() result that arrives after its loading screen already gave up; that background call cannot be cancelled."""
+        # VALUES CHANGE HERE
+        deadline = time.time() + 600
         while time.time() < deadline:
             with self._libretro_launch_lock:
                 result = self._libretro_launch_result
@@ -9781,10 +8904,8 @@ class ExternalGameDeck:
             import sys as _sys
             _main = _sys.modules.get("__main__")
             if _main and hasattr(_main, "db") and _main.db:
-                # Sync the active profile settings for this console before launch
                 self.sync_profile_from_db(console, _main.db.config)
                 core.set_volume(_main.db.config.get("global_volume", 70))
-                # Mute during load screen — unsilenced once loading clears
                 core.set_muted(True)
         except Exception as e:
             log.warning("Failed to sync profile/volume settings before libretro launch: %s", e)
@@ -9792,28 +8913,17 @@ class ExternalGameDeck:
         try:
             _ensure_player_slots_assigned()
             _bound_players = sum(1 for _p in (1, 2, 3, 4) if player_is_connected(_p))
-            _profile_forced = self._libretro_multitap_enabled  # tri-state: None/True/False
+            _profile_forced = self._libretro_multitap_enabled
             self._libretro_multitap_auto_engaged = False
             self._libretro_multitap_pending = False
             if _profile_forced is True and core.multitap_available():
-                # Explicit profile setting -- honor it immediately, no need to
-                # wait for input; the user already told us they want it on.
                 if core.enable_multitap():
                     log.info(f"[LIBRETRO MULTIPLAYER] Multitap enabled for {console} "
                           f"(profile setting)")
             elif _profile_forced is not False and _bound_players >= 3 and core.multitap_available():
-                # 3+ pads bound at launch, but not explicitly requested --
-                # defer to the same input-activity gate as the live
-                # reconciliation path (_resolve_pending_multitap) instead of
-                # flipping the port device before we know player 3/4 is
-                # actually going to be used.
                 self._libretro_multitap_pending = True
                 log.info(f"[LIBRETRO MULTIPLAYER] Multitap pending for {console} "
                       f"({_bound_players} controllers bound, awaiting player 3/4 input)")
-            # Seed the baseline for live reconciliation using the exact same
-            # connectedness test _poll_disconnect_pause uses each frame (player 1
-            # counts only with a real pad plugged in, not the keyboard fallback).
-            # Seed the baseline so the first frame cannot report a disconnect.
             _seed_connected = set()
             if _read_gamepad_state() is not None:
                 _seed_connected.add(1)
@@ -9825,7 +8935,7 @@ class ExternalGameDeck:
             log.warning("Multitap auto-enable check failed for %s: %s", console, e)
 
         if border_available_for_console(console):
-            self._load_border_surface(console)
+            self._install_prepared_border(console, result.get("border"))
         else:
             self._libretro_border_surf      = None
             self._libretro_border_rect_frac = None
@@ -9839,43 +8949,30 @@ class ExternalGameDeck:
         return False
 
     def _libretro_tick_loading(self):
+        """Runs one loading-splash tick; wraps the real work so the frame timing line covers the splash too."""
+        GAME_FRAME_TIMER.tick_start()
+        try:
+            return self._libretro_tick_loading_impl()
+        finally:
+            GAME_FRAME_TIMER.tick_end("loading", self._libretro_console, 1, self._LIBRETRO_MAX_CATCHUP_FRAMES)
+
+    def _libretro_tick_loading_impl(self):
         if not self._libretro_loading:
             return False
 
+        pad_poller_ensure()
         now     = pygame.time.get_ticks()
         elapsed = now - self._libretro_load_start
 
-        # Approaches `cap` but never actually reaches it, however long
-        # `elapsed_ms` grows -- so the bar always has visible room left to
-        # climb instead of maxing out in the first couple of seconds (per
-        # the old fixed self._libretro_load_min_ms=2500 divisor) and then
-        # sitting dead flat -- or worse, jumping straight to 100 -- while
-        # a slow core (PSX's BIOS boot / disc read) is still genuinely
-        # working in the background. self._libretro_load_tau_ms is set
-        # per-console in _launch_libretro (see _LIBRETRO_LOAD_TAU_MS).
         import math as _math
         def _asymptotic_pct(elapsed_ms, cap):
             tau = max(1, self._libretro_load_tau_ms)
             return cap * (1.0 - _math.exp(-elapsed_ms / tau))
 
         if self._libretro_launch_pending:
-            # core.load_rom() (retro_load_game()) is still running on its
-            # background thread -- keep the bar honestly climbing with
-            # elapsed time instead of leaving it dead at 0% the whole time
-            # this branch is taken.
             self.emulator_load_pct = int(_asymptotic_pct(elapsed, 90))
 
             if elapsed >= self._libretro_launch_pending_timeout_ms:
-                # That call has no timeout of its own, so a drive that
-                # goes bad mid-read (spun-down external disk, dropped
-                # network share) can leave it running forever -- this is
-                # the backstop. Give up waiting rather than sit frozen:
-                # bump the request id so if the worker thread ever does
-                # return, _poll_libretro_launch's existing staleness check
-                # sees a mismatched req_id and quietly unloads whatever it
-                # produced instead of clobbering a newer launch attempt.
-                # The thread itself is left running (daemon, harmless) --
-                # there's no safe way to cancel a ctypes call mid-flight.
                 log.warning(f"[LIBRETRO] Launch of {self._libretro_console} timed out after "
                       f"{elapsed}ms waiting on core.load_rom() -- likely a stalled "
                       f"drive; abandoning the launch.")
@@ -9907,12 +9004,8 @@ class ExternalGameDeck:
         min_done    = elapsed >= self._libretro_load_min_ms
         timed_out   = elapsed >= self._libretro_first_frame_giveup_ms
 
-        if first_frame or timed_out:
-            # Actually done (or genuinely given up) -- only now is 100
-            # allowed on screen. Until this is true, keep creeping toward
-            # (never reaching) 99 so a slow BIOS boot still reads as "still
-            # working" instead of a bar that's already said 100% for the
-            # last N seconds while nothing visibly happens.
+        _pad_ok = pad_warmup_done(elapsed)
+        if (first_frame or timed_out) and _pad_ok:
             self.emulator_load_pct = 100
         else:
             self.emulator_load_pct = max(self.emulator_load_pct, min(99, int(_asymptotic_pct(elapsed, 99))))
@@ -9931,7 +9024,7 @@ class ExternalGameDeck:
                 ended = True
             splash_video_done = ended
 
-        _ready = (first_frame or timed_out) and min_done and splash_video_done
+        _ready = (first_frame or timed_out) and min_done and splash_video_done and _pad_ok
         if _ready:
             self.emulator_load_pct = 100
             if self._libretro_100_reached_at is None:
@@ -9939,17 +9032,9 @@ class ExternalGameDeck:
         else:
             self._libretro_100_reached_at = None
 
-        # Hold at 100 for a beat before actually leaving -- see
-        # _LIBRETRO_HOLD_AT_100_MS. Checking this separately from _ready
-        # (rather than flipping loading off in the same tick _ready first
-        # becomes true) is what guarantees render() gets called at least
-        # once while emulator_loading is still True and emulator_load_pct
-        # is already 100, instead of both changing together and skipping
-        # straight to gameplay rendering.
         if _ready and (now - self._libretro_100_reached_at) >= _LIBRETRO_HOLD_AT_100_MS:
             self._libretro_loading = False
             self.emulator_loading  = False
-            # Restore correct mute state now that the load screen is done
             try:
                 import sys as _sys
                 _main = _sys.modules.get("__main__")
@@ -9962,11 +9047,14 @@ class ExternalGameDeck:
             return False
         return True
 
+    # ========================================================================
+    # SECTION: Libretro: input & disconnect handling
+    # ========================================================================
+
     def _poll_libretro_input(self):
         core = self._libretro_core
         if core is None or not core.is_loaded or core.is_frozen:
             return
-        # Block game inputs while the load screen is still showing
         if getattr(self, "_libretro_loading", False):
             core._input.clear()
             return
@@ -10011,14 +9099,12 @@ class ExternalGameDeck:
 
             now = pygame.time.get_ticks()
             if now >= self._libretro_hotkey_cooldown:
-                # LB + RB + Select → SAVE  (L1 + R1 + Select)
                 if (btns & _XI_LB) and (btns & _XI_RB) and (btns & _XI_BACK):
                     ok = core.save_state(slot=self._libretro_active_profile)
                     self._libretro_osd_msg   = f"STATE SAVED (P{self._libretro_active_profile})" if ok else "SAVE FAILED"
                     self._libretro_osd_until = now + 2000
                     self._libretro_hotkey_cooldown = now + _COOLDOWN_MS
                     log.info(f"[LIBRETRO] Save hotkey: {self._libretro_osd_msg}")
-                # LT + RT + Select → LOAD  (L2 + R2 + Select)
                 elif (gp1.bLT >= _TRIG_THRESH and gp1.bRT >= _TRIG_THRESH
                       and (btns & _XI_BACK)):
                     if core.has_state(slot=self._libretro_active_profile):
@@ -10112,11 +9198,28 @@ class ExternalGameDeck:
                   f"unplugged -- auto-pausing.")
             self.set_paused(True, reason="disconnect")
 
+    # ========================================================================
+    # SECTION: Libretro: rendering
+    # ========================================================================
+
     def render_libretro(self, screen, dest_rect, crt_cfg=None, overlay_open=False, pixel_cfg=None):
+        """Draws one game frame; wraps the real work so the frame timing line can account for the whole call."""
+        GAME_FRAME_TIMER.tick_start()
+        self._gft_runs = 0
+        try:
+            return self._render_libretro_impl(screen, dest_rect, crt_cfg=crt_cfg,
+                                              overlay_open=overlay_open, pixel_cfg=pixel_cfg)
+        finally:
+            pad_snapshot_end()
+            GAME_FRAME_TIMER.tick_end("play" if self._gft_runs > 0 else "idle", self._libretro_console,
+                                      self._gft_runs, self._LIBRETRO_MAX_CATCHUP_FRAMES)
+
+    def _render_libretro_impl(self, screen, dest_rect, crt_cfg=None, overlay_open=False, pixel_cfg=None):
         core = self._libretro_core
         if core is None or not core.is_loaded:
             return False
 
+        pad_snapshot_begin()
         self._poll_disconnect_pause()
         self.set_paused(overlay_open, reason="overlay")
 
@@ -10135,9 +9238,7 @@ class ExternalGameDeck:
             self._prev_overlay_open = True
             surf = core.reprocess_current_frame(crt_cfg=crt_cfg, pixel_cfg=pixel_cfg)
             if surf: self._blit_libretro_frame(screen, surf, dest_rect)
-            # Don't let a menu/dialog being open accrue catch-up debt --
-            # see the accumulator fields' init comment. Time spent here
-            # is a legitimate pause, not lost render throughput.
+            # WARNING: an open menu or dialog must not accrue catch-up debt.
             self._libretro_last_run_wall = None
             return True
 
@@ -10160,41 +9261,26 @@ class ExternalGameDeck:
                 self._poll_game_exit_confirm_input()
                 _popup_rect = self.get_active_console_bezel_inner_rect(dest_rect) or dest_rect
                 self._render_game_exit_confirm(screen, _popup_rect)
-                self._libretro_last_run_wall = None   # legitimate pause -- see overlay_open above
+                self._libretro_last_run_wall = None
                 return True
 
         if self._libretro_disconnect_pause:
             surf = core.reprocess_current_frame(crt_cfg=crt_cfg, pixel_cfg=pixel_cfg)
             if surf: self._blit_libretro_frame(screen, surf, dest_rect)
             _libretro_draw_disconnect_banner(screen, dest_rect, self._libretro_disconnect_player)
-            self._libretro_last_run_wall = None   # legitimate pause -- see overlay_open above
+            self._libretro_last_run_wall = None
             return True
 
         if core.is_frozen:
             surf = core.reprocess_current_frame(crt_cfg=crt_cfg, pixel_cfg=pixel_cfg)
             if surf: self._blit_libretro_frame(screen, surf, dest_rect)
-            self._libretro_last_run_wall = None   # legitimate pause -- see overlay_open above
+            self._libretro_last_run_wall = None
             return True
-        with _perf_timer("poll_input"):
-            self._poll_libretro_input()
+        _gft_t0 = time.perf_counter()
+        self._poll_libretro_input()
+        GAME_FRAME_TIMER.add("input", (time.perf_counter() - _gft_t0) * 1000.0)
 
-        # Paces core.run_frame() by REAL elapsed wall-clock time against
-        # the core's own native frame rate, catching up with extra
-        # run_frame() calls when this loop iteration ran long (CRT shader
-        # + Bezel composite are the expensive part -- see [CRT-SHADER
-        # TIMING]/[FRAME PATH A] logs). Without this, a slow PICTURE
-        # (render cost) would make the actual GAME run in slow motion --
-        # wrong animation/physics speed, audio pitch drift -- instead of
-        # just looking less smooth.
-        #
-        # Capped at _LIBRETRO_MAX_CATCHUP_FRAMES per render iteration so
-        # a genuine pause (window drag, breakpoint, machine sleep, menu
-        # left open) can't try to instantly replay minutes of missed
-        # frames in one burst when it closes -- if the real gap is
-        # bigger than that, the excess is simply dropped (accumulator
-        # reset to zero) rather than queued, the same way real hardware
-        # has no way to "un-drop" wall-clock time that already passed
-        # while its own clock kept ticking forward at a fixed rate.
+        # WARNING: run catch-up steps so a slow picture never slows the game itself (animation, physics, audio pitch).
         _now_wall = time.perf_counter()
         try:
             _core_fps = float(core.fps)
@@ -10204,22 +9290,21 @@ class ExternalGameDeck:
             _core_fps = 60.0
         _frame_dur = 1.0 / _core_fps
         if self._libretro_last_run_wall is None:
-            # First run after load, or after a paused/frozen/overlay
-            # stretch reset this below -- always exactly one step, never
-            # a catch-up burst for time that was legitimately paused.
+            # WARNING: the first run after a load or a paused/frozen/overlay stretch is exactly one step, never a catch-up burst.
             _n_runs = 1
             self._libretro_run_accum_s = 0.0
         else:
             self._libretro_run_accum_s += _now_wall - self._libretro_last_run_wall
             _n_runs = int(self._libretro_run_accum_s // _frame_dur)
             if _n_runs < 1:
-                _n_runs = 1   # always advance the game at least one step per rendered frame
+                _n_runs = 1
             elif _n_runs > self._LIBRETRO_MAX_CATCHUP_FRAMES:
                 _n_runs = self._LIBRETRO_MAX_CATCHUP_FRAMES
-                self._libretro_run_accum_s = 0.0   # drop the rest -- see docstring above
+                self._libretro_run_accum_s = 0.0
             else:
                 self._libretro_run_accum_s -= _n_runs * _frame_dur
         self._libretro_last_run_wall = _now_wall
+        self._gft_runs = _n_runs
 
         surf = None
         for _ in range(_n_runs):
@@ -10228,14 +9313,20 @@ class ExternalGameDeck:
             self._blit_libretro_frame(screen, surf, dest_rect)
         now = pygame.time.get_ticks()
         if self._libretro_osd_msg and now < self._libretro_osd_until:
+            _gft_t0 = time.perf_counter()
             _libretro_draw_osd(screen, dest_rect, self._libretro_osd_msg,
                                self._libretro_osd_until - now, 2000)
+            GAME_FRAME_TIMER.add("osd", (time.perf_counter() - _gft_t0) * 1000.0)
         elif now >= self._libretro_osd_until:
             self._libretro_osd_msg = ""
         return True
 
+    # ========================================================================
+    # SECTION: Game exit confirm
+    # ========================================================================
+
     def _poll_game_exit_toggle(self, sync_only=False):
-        esc_held = pygame.key.get_pressed()[pygame.K_ESCAPE]
+        esc_held = _nav.BACK in _nav.pressed_actions(pygame.key.get_pressed())
         ss_held  = False
         try:
             gp = _read_gamepad_state()
@@ -10251,9 +9342,17 @@ class ExternalGameDeck:
         held = esc_held or ss_held
         prev = getattr(self, "_game_exit_toggle_held", False)
         self._game_exit_toggle_held = held
+        # WARNING: the Escape KEYDOWN event is the reliable signal; polling get_pressed() alone misses a tap that goes down and up between two frames.
+        _ev_at = getattr(self, "_exit_key_event_at", -1)
+        self._exit_key_event_at = -1
         if sync_only:
             return False
-        return held and not prev
+        _event_press = _ev_at >= 0 and pygame.time.get_ticks() - _ev_at <= 250
+        _fired = (held or _event_press) and not prev
+        if _fired:
+            log.info("[GAME EXIT] toggle fired: esc_polled=%s start+select=%s esc_event=%s popup_open=%s",
+                     esc_held, ss_held, _event_press, self.game_exit_confirm)
+        return _fired
 
     def _open_game_exit_confirm(self):
         if self.game_exit_confirm:
@@ -10262,7 +9361,7 @@ class ExternalGameDeck:
         self.game_exit_confirm   = True
         self.game_exit_selection = "No"
         self.game_exit_confirm_shown_at = pygame.time.get_ticks()
-        self._game_exit_prev_buttons = 0
+        self._game_exit_prev_buttons = frozenset()
         self.set_paused(True, reason="exit_confirm")
 
     def _close_game_exit_confirm(self):
@@ -10272,10 +9371,10 @@ class ExternalGameDeck:
         self.set_paused(False, reason="exit_confirm", muted=False)
 
     def _poll_game_exit_confirm_input(self):
-        keys = pygame.key.get_pressed()
-        left  = keys[pygame.K_a] or keys[pygame.K_LEFT]
-        right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
-        a_btn = keys[pygame.K_RETURN]
+        _down = _nav.pressed_actions(pygame.key.get_pressed(), arrows=True)
+        left  = _nav.LEFT in _down
+        right = _nav.RIGHT in _down
+        a_btn = _nav.ACCEPT in _down
         b_btn = False
 
         try:
@@ -10290,24 +9389,23 @@ class ExternalGameDeck:
         except Exception as e:
             _log_warn_throttled("game_exit_confirm_xinput", "Per-frame controller read for exit-confirm input failed: %s", e)
 
-        cur  = (1 if left else 0) | (2 if right else 0) | (4 if a_btn else 0) | (8 if b_btn else 0)
+        cur  = frozenset(action for action, on in ((_nav.LEFT, left), (_nav.RIGHT, right),
+                                                   (_nav.ACCEPT, a_btn), (_nav.BACK, b_btn)) if on)
         prev = self._game_exit_prev_buttons
-        just = cur & ~prev
+        just = cur - prev
         self._game_exit_prev_buttons = cur
 
-        if just & 1:
-            self.game_exit_selection = "Yes"
-            self.game_exit_confirm_shown_at = pygame.time.get_ticks()
-        if just & 2:
-            self.game_exit_selection = "No"
-            self.game_exit_confirm_shown_at = pygame.time.get_ticks()
-        if just & 4:
+        for _direction in (_nav.LEFT, _nav.RIGHT):
+            if _direction in just:
+                self.game_exit_selection = _nav.deck_confirm_choice(_direction)
+                self.game_exit_confirm_shown_at = pygame.time.get_ticks()
+        if _nav.ACCEPT in just:
             if self.game_exit_selection == "Yes":
                 self.game_exit_confirm = False
                 self._libretro_quit_to_romlist(self._libretro_core)
             else:
                 self._close_game_exit_confirm()
-        if just & 8:
+        if _nav.BACK in just:
             self._close_game_exit_confirm()
 
     def _render_game_exit_confirm(self, screen, dest_rect):
@@ -10331,9 +9429,7 @@ class ExternalGameDeck:
         rgb_bg     = (int(r_bg * 255), int(g_bg * 255), int(b_bg * 255))
         accent_col = (int(r_ui * 255), int(g_ui * 255), int(b_ui * 255))
 
-        # "Are You Sure" boxes are important to read and don't overlay well
-        # against busy backgrounds -- always render fully opaque regardless
-        # of the menu transparency slider.
+        # WARNING: "Are You Sure" boxes always render fully opaque, regardless of the menu transparency slider.
         alpha_val = 255
         overlay   = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
         overlay.fill((rgb_bg[0], rgb_bg[1], rgb_bg[2], alpha_val))
@@ -10346,7 +9442,6 @@ class ExternalGameDeck:
 
         lbl_q = f_title.render("EXIT GAME?", True, (255, 220, 0))
         screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
-
 
         box_radius      = 4
         focus_thickness = SELECTION_BORDER_WIDTH
@@ -10373,11 +9468,15 @@ class ExternalGameDeck:
         lbl_h = f_hint2.render("\u2190/\u2192 OR A/D  SELECT     A  CONFIRM     B  CANCEL", True, (160, 160, 160))
         screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
 
+    # ========================================================================
+    # SECTION: Libretro: quit & volume
+    # ========================================================================
+
     def _libretro_quit_to_romlist(self, core):
         log.info("[LIBRETRO] Start+Select: quitting to ROM list")
+        pad_poller_stop()
         if self._libretro_auto_save:
             core.save_state(slot=self._libretro_active_profile)
-        # Fully unload the core so the render loop doesn't re-enter loading.
         try:
             core.unload()
         except Exception as e:
@@ -10395,14 +9494,7 @@ class ExternalGameDeck:
         self.rom_index = 0; self.rom_scroll = 0
 
     def return_active_rom_to_list_for_drive_failure(self):
-        """Stop a loaded libretro ROM whose source drive has failed.
-
-        A normal Channel 03 browse/ROMLIST view has no loaded core and no
-        `_libretro_rom_path`, so it is intentionally a no-op there.  This is
-        the game-side half of the main drive-health fallback: once a real
-        ROM is active, return to the list and show the same short drive
-        error used by a failed launch.
-        """
+        """Stop a loaded libretro ROM whose source drive has failed."""
         if (self.mode != "GAME"
                 or getattr(self, "emulator_loading", False)
                 or not self._libretro_rom_path):
@@ -10429,13 +9521,13 @@ class ExternalGameDeck:
             core.set_muted(muted)
 
 
+# ============================================================================
+# SECTION: Libretro frame drawing helpers
+# ============================================================================
+
 
 def _contain_fit_rect(sw, sh, rect):
-    """Compute the centered, aspect-preserving destination rect for
-    scaling an `sw` x `sh` source into `rect` -- the shared geometry
-    behind every contain-fit blit in this file. Returns (dx, dy, dw, dh)
-    in the same coordinate space as `rect`; dw/dh are always <= rect's
-    own width/height (never a crop, never a stretch)."""
+    """Compute the centered, aspect-preserving destination rect (dx, dy, dw, dh) for scaling an `sw` x `sh` source into `rect`; never crops or stretches."""
     x, y, w, h = rect
     if sw <= 0 or sh <= 0 or w <= 0 or h <= 0:
         return x, y, 0, 0
@@ -10448,12 +9540,7 @@ def _contain_fit_rect(sw, sh, rect):
 
 
 def _aspect_fit_blit(dest_surface, src_surface, rect, bar_color=(0, 0, 0)):
-    """Scale `src_surface` to fit inside `rect` while preserving its own
-    aspect ratio, centering it and filling any leftover space with
-    `bar_color`. Same contain-fit behavior as the shared video/visualizer
-    helper in retro_tv_emulator.py, so a 16:9 menu background stays
-    letterboxed inside a 4:3 bezel cutout instead of being stretched to
-    fill it."""
+    """Scale `src_surface` to fit inside `rect` preserving its aspect ratio, centered, with leftover space filled by `bar_color`."""
     x, y, w, h = rect
     sw, sh = src_surface.get_size()
     dx, dy, dw, dh = _contain_fit_rect(sw, sh, rect)
@@ -10465,18 +9552,8 @@ def _aspect_fit_blit(dest_surface, src_surface, rect, bar_color=(0, 0, 0)):
 
 
 def _active_game_screen_mode():
-    """Reads the Launched Games "game_screen_mode" setting (Games tab/
-    MENU) via the same __main__.db lookup already used elsewhere in this
-    file (see _outer_tv_bezel_blocks_console_bezel above) -- game_deck.py
-    doesn't import retro_tv_emulator.py, so it can't call that module's
-    _active_screen_mode() directly, and this setting is deliberately kept
-    independent of the Video tab's "screen_mode" and DVD's
-    "dvd_screen_mode" anyway. Only "normal" and "stretch" are valid here;
-    unlike the Video/DVD Screen Mode, Crop and Pan & Scan are intentionally
-    not offered for launched games (see the MENU cycle handler in
-    retro_tv_emulator.py) since either would cut off part of a game's own
-    on-screen UI. Any unrecognized stored value falls back to "normal"
-    rather than being treated as "stretch"."""
+    """Read the Launched Games "game_screen_mode" setting through the __main__.db lookup."""
+    # WARNING: this setting stays independent of the Video tab's screen_mode and DVD's dvd_screen_mode; game_deck.py cannot import retro_tv_emulator.py.
     try:
         import sys as _sys
         _main = _sys.modules.get("__main__")
@@ -10488,15 +9565,18 @@ def _active_game_screen_mode():
     return "normal"
 
 
+def _dvd_captions_locked():
+    """True while the current performance mode locks the DVD captions setting off."""
+    try:
+        import sys as _sys
+        _fn = getattr(_sys.modules.get("__main__"), "_feature_locked", None)
+        return bool(_fn and _fn("dvd_captions_enabled"))
+    except Exception:
+        return False
+
+
 def _libretro_blit_scaled(screen, surf, dest_rect, mode=None):
-    """Scales `surf` into `dest_rect` per the Launched Games Screen Mode
-    setting: "normal" (Fit to Screen) contain-fits the picture, preserving
-    its own aspect ratio; "stretch" (Stretch to Fill) forces the exact
-    dest_rect dimensions, ignoring the source aspect and distorting the
-    picture to fill it edge to edge. Mirrors the "normal"/"stretch"
-    branches of _blit_video_with_screen_mode in retro_tv_emulator.py, minus
-    the Crop/Pan & Scan branches that function has -- games don't offer
-    those (see _active_game_screen_mode)."""
+    """Scale `surf` into `dest_rect` per the Launched Games Screen Mode: "normal" contain-fits, "stretch" fills dest_rect exactly."""
     if mode is None:
         mode = _active_game_screen_mode()
     sw, sh = surf.get_size()
@@ -10509,8 +9589,7 @@ def _libretro_blit_scaled(screen, surf, dest_rect, mode=None):
     ox = dest_rect[0] + (dw - draw_w) // 2
     oy = dest_rect[1] + (dh - draw_h) // 2
     try:
-        with _perf_timer("blit_scale"):
-            screen.blit(pygame.transform.scale(surf, (draw_w, draw_h)), (ox, oy))
+        screen.blit(pygame.transform.scale(surf, (draw_w, draw_h)), (ox, oy))
     except Exception as e:
         _log_warn_throttled("libretro_blit_scaled", "Libretro frame blit failed this frame: %s", e)
 
@@ -10563,3 +9642,53 @@ def _libretro_draw_disconnect_banner(screen, dest_rect, player_num):
                              "Disconnect-pause banner draw failed this frame: %s", e)
 
 
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
+__all__ = [
+    "ARCHIVE_EXTS",
+    "BIOS_REQUIRED_CONSOLES",
+    "BORDER_CONSOLES",
+    "BORDER_CONSOLES_HANDHELD",
+    "BORDER_CONSOLES_HOME",
+    "CONSOLE_BUTTON_DEFS",
+    "CONSOLE_FOLDER_ALIASES",
+    "CONSOLE_LABELS",
+    "CONSOLE_MAX_PLAYERS",
+    "CONSOLE_ORDER",
+    "CONSOLE_SCROLL_STYLES",
+    "CONSOLE_SCROLL_STYLE_LABELS",
+    "CORE_NAME_TO_CONSOLES",
+    "DEFAULT_GBA_MAPPING",
+    "DEFAULT_STICK_DEADZONE",
+    "DVD_SPLASH_IMAGE_EXTS",
+    "DVD_SPLASH_VIDEO_EXTS",
+    "ExternalGameDeck",
+    "GBA_BTN_HOTSPOTS",
+    "HANDHELD_CONSOLES",
+    "LIST_TEXT_COLOR_NAMES",
+    "LIST_TEXT_COLOR_RGB",
+    "MULTITAP_CONSOLES",
+    "PREFERRED_CORE_ORDER",
+    "ROM_EXTENSIONS",
+    "SCREEN_SIZE_FACTORS",
+    "SCREEN_SIZE_OPTIONS",
+    "VK_FROM_NAME",
+    "VK_NAMES",
+    "XINPUT_TO_GBA_BTN",
+    "apply_menu_nav_mapping",
+    "border_available_for_console",
+    "console_bezel_currently_active",
+    "find_psx_disc_siblings",
+    "gamepad_permission_denied_path",
+    "get_bios_dir_for_console",
+    "match_console_for_folder_name",
+    "match_consoles_for_core_filename",
+    "menu_nav_connected",
+    "player1_gpstate",
+    "player_gpstate",
+    "player_is_connected",
+    "pygame_hwnd_ref",
+    "resolve_emulator_config_path",
+    "resolve_preferred_core_filename",
+]

@@ -3,6 +3,12 @@
 Emits the first occurrence of a diagnostic event and at most one reminder
 per key per interval, so repeated retries don't flood the log. Dependency-free
 and safe to call from worker threads.
+
+Owns: the coalescing breadcrumb logger.
+Does not own: logger configuration (each service configures its own handlers).
+
+NOTE: diagnostics must never become another failure path, so logging errors
+are swallowed inside breadcrumb().
 """
 from __future__ import annotations
 
@@ -11,9 +17,17 @@ import threading
 import time
 
 
+# ============================================================================
+# SECTION: State
+# ============================================================================
 DEFAULT_INTERVAL_SECONDS = 60.0
 _state = {}
 _lock = threading.Lock()
+
+
+# ============================================================================
+# SECTION: Public API
+# ============================================================================
 
 
 def breadcrumb(logger: logging.Logger, level: int, key: str, message: str,
@@ -40,7 +54,7 @@ def breadcrumb(logger: logging.Logger, level: int, key: str, message: str,
     try:
         logger.log(level, message, *args)
     except Exception:
-        # Diagnostics must never become another failure path.
+        # NOTE: swallowed on purpose -- see module docstring.
         pass
     return True
 

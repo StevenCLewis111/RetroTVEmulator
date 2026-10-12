@@ -4,6 +4,10 @@ The service deliberately keeps its networking dependency-free.  ``pystray``
 and Pillow are optional UI dependencies: when they are installed the service
 gets a real tray icon; when they are not, the headless broadcaster still runs
 and records a useful warning instead of failing to serve schedules.
+
+Owns: the tray icon, its menu, and its worker thread.
+Does not own: what "Stop" or "Open folder" do -- those are callbacks supplied
+by server_service.py.
 """
 from __future__ import annotations
 
@@ -11,6 +15,11 @@ import logging
 import threading
 
 log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# SECTION: Tray icon
+# ============================================================================
 
 
 class ServerTray:
@@ -96,4 +105,8 @@ class ServerTray:
         self._thread = None
 
 
+
+# ============================================================================
+# SECTION: Exports
+# ============================================================================
 __all__ = ["ServerTray"]
