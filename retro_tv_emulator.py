@@ -15,6 +15,7 @@ import re
 import array
 import subprocess
 import random
+import copy
 import itertools
 import datetime
 import ctypes
@@ -108,7 +109,7 @@ def _write_crash_log(exc_type, exc_value, exc_tb):
         _crash_path = os.path.join(_log_output_dir(), "crash_log.txt")
         import traceback as _tb
         with open(_crash_path, "a", encoding="utf-8") as _f:
-            _f.write(f"\n=== CRASH {datetime.datetime.now().isoformat()} ===\n")
+            _f.write(f"\n=== CRASH {broadcast_clock.now().replace(tzinfo=None).isoformat()} ===\n")
             _tb.print_exception(exc_type, exc_value, exc_tb, file=_f)
     except Exception as e:
         try:
@@ -178,7 +179,7 @@ except Exception as _log_setup_e:
         pass
 
 log = logging.getLogger(__name__)
-log.info("=== App start %s ===", datetime.datetime.now().isoformat())
+log.info("=== App start %s ===", broadcast_clock.now().replace(tzinfo=None).isoformat())
 
 
 def _log_boot_environment_fingerprint():
@@ -931,14 +932,6 @@ LEGACY_MIGRATION_BETWEEN_BATCHES_SECONDS = 0.5
 # ============================================================================
 # SECTION: Window mode & display geometry
 # ============================================================================
-
-
-def _is_true_43_hardware():
-    """Whether Windows is running a real 4:3 display mode, as opposed to the fake-4:3 test mode inside a 16:9 window."""
-    try:
-        return bool(db is not None and getattr(db, "_detected_aspect_ratio", None) == "4:3")
-    except Exception:
-        return False
 
 
 def _get_channel_visualizer_style(ch_conf):
@@ -2240,50 +2233,6 @@ def _aspect_ratio_value(ratio_str):
     return 16.0 / 9.0
 
 
-def _aspect_ratio_locked_by_bezel():
-    """True while the Bezel toggle (fake_43_border_enabled) owns the Aspect Ratio setting."""
-    if db is None:
-        return False
-    return bool(db.config.get("fake_43_border_enabled", False)) or _is_true_43_hardware()
-
-
-def _dvd_aspect_ratio_locked_by_bezel():
-    """DVD-menu equivalent of _aspect_ratio_locked_by_bezel(): locked whenever Bezel is on, whatever value is stored."""
-    # WARNING: the stored value is never rewritten; the Select guard must match the greyed-out 4:3 row in ui.py.
-    if db is None:
-        return False
-    return bool(db.config.get("fake_43_border_enabled", False))
-
-
-def _game_aspect_ratio_locked_by_bezel():
-    """Launched-Games equivalent of _dvd_aspect_ratio_locked_by_bezel()."""
-    if db is None:
-        return False
-    return bool(db.config.get("fake_43_border_enabled", False))
-
-
-def _apply_bezel_on_aspect_lock():
-    """Called right before fake_43_border_enabled flips to True (direct toggle and confirm-popup "Yes")."""
-    return
-
-
-def _restore_aspect_ratio_after_bezel_off():
-    """Called right before fake_43_border_enabled flips to False."""
-    if db is None:
-        return
-    if "_dvd_aspect_ratio_before_bezel" in db.config:
-        _dvd_restored = db.config.pop("_dvd_aspect_ratio_before_bezel")
-        db.config["dvd_aspect_ratio"] = _dvd_restored
-        try:
-            if dvd_engine is not None:
-                dvd_engine.resize_canvas(_dvd_restored)
-        except Exception as e:
-            log.warning("Bezel-off DVD Aspect Ratio restore: resize_canvas failed: %s", e)
-    if "_game_aspect_ratio_before_bezel" in db.config:
-        _game_restored = db.config.pop("_game_aspect_ratio_before_bezel")
-        db.config["game_aspect_ratio"] = _game_restored
-
-
 def _selected_package_aspect():
     """Return the aspect ratio of the current content package (db.config["aspect_ratio"], 4:3 or 16:9) as a float."""
     ratio_str = db.config.get("aspect_ratio", "16:9") if db is not None else "16:9"
@@ -2428,43 +2377,15 @@ def _effects_content_rect(win_w, win_h):
     return pygame.Rect(0, 0, win_w, win_h)
 
 
-def _dvd_pillarbox_active(win_w, win_h):
-    """DVD equivalent of _package_pillarbox_active, using DVD's own "dvd_aspect_ratio" setting."""
-    if db is not None and db.config.get("fake_43_border_enabled", False):
-        return False
-    _dvd_ratio = db.config.get("dvd_aspect_ratio", "16:9") if db is not None else "16:9"
-    return not _real_screen_matches_aspect(win_w, win_h, _aspect_ratio_value(_dvd_ratio))
-
-
 def _compute_dvd_content_rect(win_w, win_h):
-    """Return the DVD player's own stable picture canvas."""
+    """Return the DVD player's own stable picture canvas, which is the whole window."""
     # WARNING: do not route this through _compute_content_rect(); its package aspect and Pixel Orbiter belong to the TV content pipeline.
-    if game_deck is not None and getattr(game_deck, "dvd_splash_playing", False):
-        return pygame.Rect(0, 0, win_w, win_h)
-    _dvd_ratio = db.config.get("dvd_aspect_ratio", "16:9") if db is not None else "16:9"
-    if not _dvd_pillarbox_active(win_w, win_h):
-        return pygame.Rect(0, 0, win_w, win_h)
-    return _full_tv_43_outer_rect(
-        win_w, win_h, aspect=_aspect_ratio_value(_dvd_ratio))
-
-
-def _game_pillarbox_active(win_w, win_h):
-    """Game-console equivalent of _dvd_pillarbox_active, using Launched Games' own "game_aspect_ratio" setting."""
-    if db is not None and db.config.get("fake_43_border_enabled", False):
-        return False
-    _game_ratio = db.config.get("game_aspect_ratio", "16:9") if db is not None else "16:9"
-    return not _real_screen_matches_aspect(win_w, win_h, _aspect_ratio_value(_game_ratio))
+    return pygame.Rect(0, 0, win_w, win_h)
 
 
 def _compute_game_content_rect(win_w, win_h):
-    """Return the Launched Games console's own stable picture canvas."""
-    if game_deck is not None and (game_deck.mode in ("BROWSE", "ROMLIST")
-                                   or getattr(game_deck, "emulator_loading", False)):
-        return pygame.Rect(0, 0, win_w, win_h)
-    _game_ratio = db.config.get("game_aspect_ratio", "16:9") if db is not None else "16:9"
-    if not _game_pillarbox_active(win_w, win_h):
-        return pygame.Rect(0, 0, win_w, win_h)
-    return _full_tv_43_outer_rect(win_w, win_h, aspect=_aspect_ratio_value(_game_ratio))
+    """Return the Launched Games console's own stable picture canvas, which is the whole window."""
+    return pygame.Rect(0, 0, win_w, win_h)
 
 
 def _active_screen_mode():
@@ -3828,9 +3749,9 @@ def _crt_scanline_target_lines(final_h):
 _CRT_SCANLINE_BASE_CACHE = {"key": None, "base": None, "bloom_range": None}
 _CRT_BLOOM_SCRATCH_CACHE = {"key": None, "lum_buf": None, "bloom_buf": None, "sum_buf": None}
 
-# ----------------------------------------------------------------------------
-# Bloom lookup table
-# ----------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Bloom lookup table
+# ============================================================================
 # WARNING: the table length (766) is 3 channels x 255 + 1; it must match the 16-bit channel sum below.
 _CRT_BLOOM_LUT_CACHE = {"gamma": None, "lut": None}
 
@@ -3939,9 +3860,9 @@ def _crt_shader_src_scratch_buffer(w, h):
     return cache["buf"]
 
 
-# ----------------------------------------------------------------------------
-# Frame and shader timing log
-# ----------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Frame and shader timing log
+# ============================================================================
 # VALUES CHANGE HERE
 _PERF_LOG_INTERVAL_S = 5.0
 _PERF_LOG_MAX_SAMPLES = 900
@@ -3994,9 +3915,9 @@ def _crt_timing_record(path, w, h, stages):
     st["last_log"] = now
 
 
-# ----------------------------------------------------------------------------
-# CRT shader raw-buffer pass (CPU warp)
-# ----------------------------------------------------------------------------
+# ============================================================================
+# SECTION: CRT shader raw-buffer pass (CPU warp)
+# ============================================================================
 # WARNING: only valid for a 32-bit surface with masks R=0xFF0000 G=0xFF00 B=0xFF and no alpha; any other layout must use the legacy path.
 _CRT_RAW_MASKS = (0xFF0000, 0xFF00, 0xFF, 0)
 _CRT_RAW_CACHE = {"key": None}
@@ -6923,7 +6844,7 @@ from media import (
     get_cached_compressor_bake,
     bake_compressor_pass,
 )
-import ui  # noqa: F401
+import ui
 from ui import render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, fit_design_canvas, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
     get_server_picker_entries, get_server_picker_selectable_count, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
     UPDATER_AND_SERVER_FEATURES_ENABLED, GPU_RENDER_MODE_ENABLED
@@ -10585,7 +10506,7 @@ def _make_vlc_log_callback(vlc_module):
                 pass
 
             level_name = _VLC_LOG_LEVEL_NAMES.get(level, "debug")
-            now = datetime.datetime.now()
+            now = broadcast_clock.now().replace(tzinfo=None)
             line_text = "[{}.{:03d}] {} {}: {}".format(
                 now.strftime("%H:%M:%S"), now.microsecond // 1000, module_name, level_name, msg)
             try:
@@ -10809,7 +10730,7 @@ def initialize_vlc_on_demand():
                         log.warning("VLCEngineWrapper.__init__: log_set failed: %s", _e)
 
                     _boot_marker = "[{}] main info: === {} engine boot: VLC log path = {} ===".format(
-                        datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        broadcast_clock.now().strftime("%H:%M:%S.%f")[:-3],
                         engine_label, _vlc_log_path_status)
                     try:
                         _vlc_log_queue.put_nowait(_boot_marker)
@@ -10819,9 +10740,9 @@ def initialize_vlc_on_demand():
                              engine_label, _vlc_log_path_status)
 
                     _decode_res = db.config.get("vlc_decode_res", "sd") if db else "sd"
-                    # WARNING: the DVD engine reads only dvd_aspect_ratio, never the main aspect_ratio.
+                    # WARNING: the DVD engine's target aspect is always 16:9; it never follows the main aspect_ratio.
                     if engine_label == "dvd":
-                        self.target_aspect = db.config.get("dvd_aspect_ratio", "16:9") if db else "16:9"
+                        self.target_aspect = "16:9"
                     else:
                         self.target_aspect = db.config.get("aspect_ratio", "16:9") if db else "16:9"
                     self.width, self.height = _video_decode_canvas_size(_decode_res)
@@ -13111,6 +13032,36 @@ def _get_channel_ordered_content(ch_key, ch_info):
             return [], None
         return ordered, "Marathon"
 
+    return _get_block_ordered_content(ch_key, ch_info, block_name, now)
+
+
+# ============================================================================
+# SECTION: Per-block lineups
+# ============================================================================
+
+
+def _block_names_after_airing(ch_info, now):
+    """The block names of the channel's scheduling mode that air after the current one, in airing order; empty for visualizer, Marathon and Full Day channels."""
+    if ch_info.get("is_visualizer", False):
+        return []
+    if ch_info.get("scheduling_mode", "random_slots") == "marathon":
+        return []
+    bmode = ch_info.get("block_mode", "full_day")
+    if bmode == "full_day":
+        return []
+    if bmode == "six_block":
+        names = list(SIX_HOUR_BLOCK_NAMES)
+        cur = now.hour // 4
+    else:
+        names = ["Morning", "Evening", "Night"]
+        cur = 0 if 4 <= now.hour < 12 else (1 if 12 <= now.hour < 20 else 2)
+    return [names[(cur + k) % len(names)] for k in range(1, len(names))]
+
+
+def _get_block_ordered_content(ch_key, ch_info, block_name, now, peek_only=False):
+    """The airing-order lineup of one named block of a channel; peek_only reads a block that is not on air and leaves the channel's saved show positions untouched."""
+    # WARNING: peek_only must deep-copy the show positions; build_show_rotation edits nested entries such as __FAIRNESS__ in place, which would move the real scheduler's counters.
+    scheduling_mode = ch_info.get("scheduling_mode", "random_slots")
     folder_items = ch_info.get("schedules", {}).get(block_name, [])
 
     _occ_now_ms = time.monotonic() * 1000.0
@@ -13168,7 +13119,7 @@ def _get_channel_ordered_content(ch_key, ch_info):
                 _ORDERED_CONTENT_CACHE[_occ_key] = (_occ_now_ms, video_tracks, block_name)
                 return video_tracks, block_name
 
-    show_pos_copy = dict(playback_log.get("show_pos", {}))
+    show_pos_copy = copy.deepcopy(playback_log.get("show_pos", {})) if peek_only else dict(playback_log.get("show_pos", {}))
     fixed_order = playback_log.get("show_order", {}).get(block_name)
     _block_len_lut = {"Marathon": 86400, "Full Day": 86400, "Morning": 8 * 3600, "Evening": 8 * 3600, "Night": 8 * 3600}
     for _blkn in SIX_HOUR_BLOCK_NAMES:
@@ -13758,8 +13709,13 @@ _scan_pb_has_box = set()
 _scan_progress_complete_logged = {}
 
 
+def _get_block_ordered_content_peek(ch_key, ch_info, block_name, now):
+    """The lineup of a block that is not on air, read without changing any saved scheduler state."""
+    return _get_block_ordered_content(ch_key, ch_info, block_name, now, peek_only=True)
+
+
 def _build_scan_snapshot():
-    """One pass over every active, non-server channel: its ordered content for the airing block, the file playing now, and its commercials."""
+    """One pass over every active, non-server channel: its ordered content for the airing block, the lineups of its other blocks in airing order, the file playing now, and its commercials."""
     channels = {}
     if db is None:
         return {"built_at": time.monotonic(), "channels": channels}
@@ -13775,9 +13731,20 @@ def _build_scan_snapshot():
             log.warning("[SCAN SNAPSHOT] ch%s content gather failed (skipped): %s", ch_str, e)
             continue
         commercials_on = bool(ch_info.get("commercials_enabled", False))
+        other_blocks = []
+        try:
+            _snap_now = broadcast_clock.now().replace(tzinfo=None)
+            for _other_name in _block_names_after_airing(ch_info, _snap_now):
+                _other_ordered, _other_key = _get_block_ordered_content_peek(ch_str, ch_info, _other_name, _snap_now)
+                if _other_ordered and _other_key:
+                    other_blocks.append({"block_key": _other_key, "ordered": list(_other_ordered)})
+        except Exception as e:
+            log.warning("[SCAN SNAPSHOT] ch%s other-block gather failed (airing block kept): %s", ch_str, e)
+            other_blocks = []
         channels[ch_str] = {
             "ordered": list(ordered or []),
             "block_key": block_key,
+            "other_blocks": other_blocks,
             "current_file": current_file,
             "is_visualizer": bool(ch_info.get("is_visualizer", False)),
             "commercials": list(ch_info.get("schedules", {}).get("Commercials", [])) if commercials_on else [],
@@ -13850,16 +13817,18 @@ def _scan_stages_pending(norm_p, sched_has_gain, sched_has_dur, lookups_left):
 
 
 def _compute_channel_scan_progress(snap, lookups_left):
-    """{channel: (done, total)} counting every distinct file of each channel's airing block plus its commercials."""
+    """{channel: (done, total)} counting every distinct file of each channel's airing block, its other blocks and its commercials."""
     progress = {}
     for ch_str, rec in snap["channels"].items():
         seen = {}
-        for entry in rec["ordered"]:
-            entry_has_gain = isinstance(entry, dict) and "gain" in entry
-            for p in _paths_from_entry(entry):
-                if p and _cached_path_exists(p):
-                    norm_p = os.path.normpath(p)
-                    seen[norm_p] = (seen.get(norm_p, (False, False))[0] or entry_has_gain, False)
+        _all_lineups = [rec["ordered"]] + [ob["ordered"] for ob in rec.get("other_blocks", [])]
+        for _lineup in _all_lineups:
+            for entry in _lineup:
+                entry_has_gain = isinstance(entry, dict) and "gain" in entry
+                for p in _paths_from_entry(entry):
+                    if p and _cached_path_exists(p):
+                        norm_p = os.path.normpath(p)
+                        seen[norm_p] = (seen.get(norm_p, (False, False))[0] or entry_has_gain, False)
         for casset in rec["commercials"]:
             cp = casset.get("path", casset.get("file", "")) if isinstance(casset, dict) else str(casset)
             if cp and _cached_path_exists(cp):
@@ -14151,6 +14120,7 @@ def _music_precache_worker():
 def _gather_deep_backlog_queue():
     out_content = []
     out_commercials = []
+    out_other_blocks = []
     if db is None:
         return out_content
     _pb_lookups = [SCAN_GATHER_LIBRARY_LOOKUPS]
@@ -14196,7 +14166,21 @@ def _gather_deep_backlog_queue():
                     continue
                 out_commercials.append(("channel", ch_str, "Commercials", _cnorm))
 
-    out = _front_load_watched_channel(out_content + out_commercials)
+        for _dist, _ob in enumerate(_snap_rec.get("other_blocks", [])):
+            _ob_items = []
+            for entry in _ob["ordered"]:
+                for p in _paths_from_entry(entry):
+                    if not (p and _cached_path_exists(p)):
+                        continue
+                    norm_p = os.path.normpath(p)
+                    if not _scan_stages_pending(norm_p, isinstance(entry, dict) and "gain" in entry, False, _pb_lookups):
+                        continue
+                    _ob_items.append(("channel", ch_str, _ob["block_key"], norm_p))
+            out_other_blocks.append((_dist, _ob_items))
+
+    _other_by_distance = sorted(out_other_blocks, key=lambda it: it[0])
+    _other_flat = [_item for _d, _items in _other_by_distance for _item in _items]
+    out = _front_load_watched_channel(out_content + out_commercials + _other_flat)
     return out
 
 
@@ -14956,9 +14940,9 @@ def _gather_other_channels_now_playing_targets(boot_ch):
     return targets
 
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # SECTION: Boot units (one file = one slice of the boot bar)
-# ----------------------------------------------------------------------------
+# ============================================================================
 _boot_units_lock = threading.Lock()
 
 
@@ -15629,9 +15613,9 @@ def _mark_boot_step(step_key):
     app_state.setdefault("_boot_step_times", {})[step_key] = time.time()
 
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # SECTION: Boot load bar (steady, time-based, learns this PC's boot costs)
-# ----------------------------------------------------------------------------
+# ============================================================================
 _BOOT_BAR_QUICK_STEPS = ("db", "game_deck", "visualizer_deck", "vlc_engine")
 
 
@@ -15732,9 +15716,9 @@ def _boot_bar_learn(t0):
         log.warning("[BOOT BAR] could not record boot timings (non-fatal): %s", e)
 
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # SECTION: Governor signal feed
-# ----------------------------------------------------------------------------
+# ============================================================================
 _governor_feed = {
     "throttle": None, "busy": None, "loss": None, "cpu": None, "signature": None,
     "last_feed": 0.0, "tick_wait_ms": 0.0, "vlc_media": None, "vlc_media_key": None,
@@ -15950,12 +15934,6 @@ def _background_subsystem_worker():
     print("Starting database...")
     db = RetroDatabase(detected_aspect_ratio=DETECTED_ASPECT_RATIO)
     print("Database ready.")
-    if db.config.get("fake_43_border_enabled", False):
-        _before_bezel_boot_aspect = db.config.get("aspect_ratio", "16:9")
-        _apply_bezel_on_aspect_lock()
-        if db.config.get("aspect_ratio") != _before_bezel_boot_aspect:
-            db.save_settings()
-            log.info("[SETTINGS] Existing Bezel-on state normalized: Aspect Ratio = 4:3")
     _mark_boot_step("db")
 
     try:
@@ -19795,6 +19773,7 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         app_state["guide_selected_stop_key"] = None
         app_state["guide_selected_abs_time"] = None
         app_state["guide_col_anchor_abs"] = None
+        app_state["_guide_live_idx_seen"] = None
         app_state["guide_inactivity_timer"] = pygame.time.get_ticks() + 60000
 
         if not _guide_entry_warm_skip_stop:
@@ -20842,7 +20821,7 @@ def _force_recover_from_dead_main_loop(stalled_ms):
         import traceback as _tb
         _crash_path = os.path.join(_log_output_dir(), "crash_log.txt")
         with open(_crash_path, "a", encoding="utf-8") as _f:
-            _f.write(f"\n=== MAIN LOOP FREEZE DETECTED {datetime.datetime.now().isoformat()} "
+            _f.write(f"\n=== MAIN LOOP FREEZE DETECTED {broadcast_clock.now().replace(tzinfo=None).isoformat()} "
                      f"(heartbeat silent for {stalled_ms}ms) ===\n")
             for _thread_id, _frame in sys._current_frames().items():
                 _f.write(f"\n--- Thread {_thread_id} ---\n")
@@ -21561,6 +21540,30 @@ def _guide_step_row(step, resync_stop):
         _resync_guide_stop_after_row_switch()
 
 
+def _guide_keep_highlight_in_view():
+    """Re-aims the guide highlight at the left-most visible show when the live clock slides the window past the highlighted one."""
+    _target = app_state.get("guide_selected_abs_time")
+    if not db or _target is None:
+        app_state["_guide_live_idx_seen"] = None
+        return
+    _now_dt = broadcast_clock.now().replace(tzinfo=None)
+    _live_idx = (_now_dt.hour * 2) + (1 if _now_dt.minute >= 30 else 0)
+    _seen = app_state.get("_guide_live_idx_seen")
+    app_state["_guide_live_idx_seen"] = _live_idx
+    if _seen is None or _seen == _live_idx:
+        return
+    _ch_str = str(app_state.get("selected_guide_channel", 5)).zfill(2)
+    _cached = get_cached_row_stops(_ch_str, expected_time_idx=get_current_guide_time_idx(app_state, db))
+    if _cached is None:
+        _refresh_guide_row_stops_offscreen()
+        _stops = app_state.get("guide_current_row_stops", []) or []
+    else:
+        _stops = _cached[1]
+    if any(_s.get("abs") == _target for _s in _stops):
+        return
+    _resync_guide_stop_after_row_switch()
+
+
 # ============================================================================
 # SECTION: Standby & CRT power-off
 # ============================================================================
@@ -21793,6 +21796,7 @@ while True:
             change_channel(final_ch, is_surfing=True)
 
     if app_state["current_channel"] == "04":
+        _guide_keep_highlight_in_view()
         if (now_ticks >= app_state.get("guide_inactivity_timer", 0)
                 and not app_state.get("file_explorer_active", False)
                 and not app_state.get("show_menu", False)):
@@ -22222,8 +22226,8 @@ while True:
                 and not app_state.get("show_quit_confirm", False)
                 and not app_state.get("is_loading", False)):
             if event.type == pygame.JOYAXISMOTION:
-                # VALUES CHANGE HERE
-                _AXIS_ACTIVITY_DEADZONE = 8000 / 32767.0
+                # WARNING: the fallback number must match STICK_CH03_AXIS_ACTIVITY_DEADZONE in performance_governor.py; it is used only when that module fails to import.
+                _AXIS_ACTIVITY_DEADZONE = performance_governor.STICK_CH03_AXIS_ACTIVITY_DEADZONE if performance_governor is not None else 8000 / 32767.0
                 _axis_key = (getattr(event, "instance_id", getattr(event, "joy", 0)), event.axis)
                 _axis_active_set = app_state.setdefault("_ch03_axis_active", set())
                 _past_deadzone = abs(event.value) > _AXIS_ACTIVITY_DEADZONE
@@ -22386,7 +22390,8 @@ while True:
                     app_state.get("menu_layer") == "GAMES_STICK_DZ" and
                     game_deck is not None):
                 import game_deck as _sz_mod
-                _sz_on = _sz_mod.stick_switch_on(db.config)
+                _sz_player = app_state.get("stick_dz_player", 1)
+                _sz_on = _sz_mod.stick_switch_on(db.config, _sz_player)
                 _sz_rows = menu_nav.stick_dz_rows(_sz_on)
                 _sz_from = menu_nav.stick_dz_cell(_sz_rows, app_state.get("stick_dz_cursor", 0))
                 _sz_dir = menu_nav.key_to_direction(event.key, arrows=True)
@@ -22397,19 +22402,33 @@ while True:
                     continue
                 if _sz_dir in (menu_nav.LEFT, menu_nav.RIGHT):
                     if _sz_from in menu_nav.STICK_DZ_SETTINGS:
-                        _sz_mod.adjust_stick_setting(db.config, _sz_from, 1 if _sz_dir == menu_nav.RIGHT else -1)
+                        _sz_mod.adjust_stick_setting(db.config, _sz_from, 1 if _sz_dir == menu_nav.RIGHT else -1, _sz_player)
                         _sz_mod.apply_stick_config(db.config)
                         db.save_settings()
+                    elif _sz_from == menu_nav.STICK_DZ_PLAYERS:
+                        _sz_new = menu_nav.stick_dz_player_step(_sz_player, _sz_dir)
+                        if _sz_new is None:
+                            _sz_to = menu_nav.navigate(app_state, "GAMES_STICK_DZ", menu_nav.stick_dz_table(_sz_on), _sz_from, _sz_dir)
+                            if _sz_to is not None:
+                                app_state["stick_dz_cursor"] = menu_nav.stick_dz_index(_sz_rows, _sz_to)
+                        else:
+                            app_state["stick_dz_player"] = _sz_new
+                            _sz_new_rows = menu_nav.stick_dz_rows(_sz_mod.stick_switch_on(db.config, _sz_new))
+                            app_state["stick_dz_cursor"] = menu_nav.stick_dz_index(_sz_new_rows, menu_nav.STICK_DZ_PLAYERS)
+                    elif _sz_from == menu_nav.CLOSE:
+                        _sz_to = menu_nav.navigate(app_state, "GAMES_STICK_DZ", menu_nav.stick_dz_table(_sz_on), _sz_from, _sz_dir)
+                        if _sz_to is not None:
+                            app_state["stick_dz_cursor"] = menu_nav.stick_dz_index(_sz_rows, _sz_to)
                     continue
                 if menu_nav.is_accept(event.key):
                     if _sz_from == menu_nav.STICK_DZ_SWITCH:
-                        _sz_mod.toggle_stick_switch(db.config)
+                        _sz_mod.toggle_stick_switch(db.config, _sz_player)
                         _sz_mod.apply_stick_config(db.config)
                         db.save_settings()
-                        if not _sz_mod.stick_switch_on(db.config):
+                        if not _sz_mod.stick_switch_on(db.config, _sz_player):
                             app_state["stick_dz_cursor"] = 0
                     elif _sz_from == menu_nav.STICK_DZ_RESET:
-                        _sz_mod.reset_stick_defaults(db.config)
+                        _sz_mod.reset_stick_defaults(db.config, _sz_player)
                         _sz_mod.apply_stick_config(db.config)
                         db.save_settings()
                     elif _sz_from == menu_nav.CLOSE:
@@ -22655,7 +22674,6 @@ while True:
                         elif _cc_target == "program_bezel_toggle":
                             log.info("[BEZEL DEBUG] TV Bezel ON (confirmed after burn-in warning), channel=%s",
                                      app_state.get("current_channel"))
-                            _apply_bezel_on_aspect_lock()
                             db.config["fake_43_border_enabled"] = True
                             if app_state.get("clear_confirm_dont_show_again", False):
                                 db.config["program_bezel_skip_confirm"] = True
@@ -23326,7 +23344,6 @@ while True:
                                 if db.config.get("program_bezel_skip_confirm", False):
                                     log.info("[BEZEL DEBUG] TV Bezel ON (skip-confirm path), channel=%s",
                                              app_state.get("current_channel"))
-                                    _apply_bezel_on_aspect_lock()
                                     db.config["fake_43_border_enabled"] = True
                                     db.save_settings()
                                     print("[SETTINGS] Bezel = True (confirmation skipped by user preference).")
@@ -23341,7 +23358,6 @@ while True:
                                 log.info("[BEZEL DEBUG] TV Bezel OFF, channel=%s",
                                          app_state.get("current_channel"))
                                 db.config["fake_43_border_enabled"] = False
-                                _restore_aspect_ratio_after_bezel_off()
                                 db.save_settings()
                                 print("[SETTINGS] Bezel = False")
                         elif _cs_row_id == "bezel_style_select":
@@ -24403,6 +24419,7 @@ while True:
                         elif row_id == "stick_deadzone":
                             app_state["menu_layer"] = "GAMES_STICK_DZ"
                             app_state["stick_dz_cursor"] = 0
+                            app_state["stick_dz_player"] = 1
                             print("[GAMES] Opening stick deadzone screen")
                         elif row_id == "controller_map":
                             app_state["menu_layer"]  = "GAMES_CTRL_MAP"
@@ -27207,13 +27224,14 @@ while True:
             _sz_x, _sz_y, _sz_w, _sz_h2 = menu_panel_rect(_sz_surf.get_width(), _sz_surf.get_height(), db)
             _sz_scale = _sz_w / 1036.0
             import game_deck as _sz_mod
-            _sz_rows = menu_nav.stick_dz_rows(_sz_mod.stick_switch_on(db.config))
+            _sz_player = app_state.get("stick_dz_player", 1)
+            _sz_rows = menu_nav.stick_dz_rows(_sz_mod.stick_switch_on(db.config, _sz_player))
             _sz_mod.mark_stick_test_open()
             _sz_mod.render_stick_deadzone_ui(
                 _sz_surf,
                 (_sz_x + int(20 * _sz_scale), _sz_y + int(138 * _sz_scale), int(996 * _sz_scale), int(525 * _sz_scale)),
                 (int(_sz_r * 255), int(_sz_g * 255), int(_sz_b * 255)), db, app_state.get("stick_dz_cursor", 0), _sz_rows,
-                _sz_mod.stick_test_sticks())
+                _sz_mod.stick_test_sticks(_sz_player), _sz_player)
 
         if app_state.get("menu_layer") == "GAMES_CTRL_MAP" and game_deck is not None:
             game_deck._ctrl_map_cursor = app_state.get("ctrl_map_cursor", 1)

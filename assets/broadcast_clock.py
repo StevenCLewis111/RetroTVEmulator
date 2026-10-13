@@ -9,10 +9,17 @@ import time as _time
 # SECTION: Tunables & anchor state
 # ============================================================================
 # WARNING: every caller that needs "now" must use this module, not datetime.now(), so the scheduler and guide can never disagree.
-# VALUES CHANGE HERE
-_RESYNC_SECONDS = 60.0
-_STEP_TOLERANCE_SECONDS = 2.0
-_JITTER_TOLERANCE_SECONDS = 0.25
+# WARNING: the fallback numbers must match BROADCAST_CLOCK_* in performance_governor.py; they are used only when that module fails to import.
+try:
+    import performance_governor as _governor
+
+    _RESYNC_SECONDS = float(_governor.BROADCAST_CLOCK_RESYNC_SECONDS)
+    _STEP_TOLERANCE_SECONDS = float(_governor.BROADCAST_CLOCK_STEP_TOLERANCE_SECONDS)
+    _JITTER_TOLERANCE_SECONDS = float(_governor.BROADCAST_CLOCK_JITTER_TOLERANCE_SECONDS)
+except Exception:
+    _RESYNC_SECONDS = 60.0
+    _STEP_TOLERANCE_SECONDS = 2.0
+    _JITTER_TOLERANCE_SECONDS = 0.25
 
 _lock = _threading.Lock()
 _wall_anchor = _datetime.datetime.now().astimezone()

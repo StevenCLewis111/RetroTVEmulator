@@ -738,7 +738,7 @@ def detect_burned_in_captions(file_path, duration=None, ffmpeg_path=None,
                               frame_timeout=_BI_FRAME_TIMEOUT_S, diag=None):
     """Returns True when subtitle text is part of the picture, False when it is not, None when it could not tell."""
     try:
-        import numpy  # noqa: F401
+        import numpy
     except ImportError:
         if diag is not None:
             diag["reason"] = "numpy_unavailable"

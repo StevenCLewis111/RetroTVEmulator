@@ -6318,30 +6318,20 @@ class RetroDatabase:
         config["is_muted"] = False
         if "screen_mode" not in config:
             config["screen_mode"] = "normal"
-        if "dvd_aspect_ratio" not in config:
-            config["dvd_aspect_ratio"] = "16:9"
         if "dvd_screen_mode" not in config:
             config["dvd_screen_mode"] = "normal"
-        if "game_aspect_ratio" not in config:
-            config["game_aspect_ratio"] = "16:9"
         if "game_screen_mode" not in config:
             config["game_screen_mode"] = "normal"
         if "pixel_orbiter_enabled" not in config:
             config["pixel_orbiter_enabled"] = True
-        for _live_key, _stash_key in (
-            ("aspect_ratio", "_aspect_ratio_before_bezel"),
-            ("dvd_aspect_ratio", "_dvd_aspect_ratio_before_bezel"),
-            ("game_aspect_ratio", "_game_aspect_ratio_before_bezel"),
-        ):
-            if _stash_key in config:
-                config[_live_key] = config.pop(_stash_key)
         if not config.get("_static_color_migrated"):
             if config.get("static_noise_color") == "white":
                 config["static_noise_color"] = "grey"
             config["_static_color_migrated"] = True
-        # WARNING: the Aspect Ratio settings have no controls. The picture box follows each video's own shape, a screen that is not 16:9 gets the 16:9 picture boxed inside it, and Bezel mode sets 4:3 itself at boot, so every saved value is forced back to 16:9 here (this also clears a 4:3 the old setting saved).
-        for _aspect_key in ("aspect_ratio", "dvd_aspect_ratio", "game_aspect_ratio"):
-            config[_aspect_key] = "16:9"
+        # WARNING: the Aspect Ratio settings have no controls. The picture box follows each video's own shape, a screen that is not 16:9 gets the 16:9 picture boxed inside it, and Bezel mode sets 4:3 itself at boot, so the saved value is forced back to 16:9 here (this also clears a 4:3 the old setting saved), and the old DVD and Games Aspect Ratio keys are dropped from the config.
+        config["aspect_ratio"] = "16:9"
+        for _gone_key in ("dvd_aspect_ratio", "game_aspect_ratio", "_aspect_ratio_before_bezel", "_dvd_aspect_ratio_before_bezel", "_game_aspect_ratio_before_bezel"):
+            config.pop(_gone_key, None)
         config["_aspect_screen_forcing_migrated"] = True
         return config
 
@@ -6771,7 +6761,6 @@ class RetroDatabase:
             "fake_static_noise_enabled": False,
             "loudness_scan_enabled": True,
             "screen_mode": "normal",
-            "dvd_aspect_ratio": "16:9",
             "dvd_screen_mode": "normal",
             "pixel_orbiter_enabled": True,
             "burn_in_protection_skip_confirm": False,
@@ -7119,7 +7108,6 @@ class RetroDatabase:
             "fake_static_noise_enabled": False,
             "loudness_scan_enabled": True,
             "screen_mode": "normal",
-            "dvd_aspect_ratio": "16:9",
             "dvd_screen_mode": "normal",
             "pixel_orbiter_enabled": True,
             "burn_in_protection_skip_confirm": False,

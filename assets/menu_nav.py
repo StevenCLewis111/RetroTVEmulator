@@ -1058,12 +1058,14 @@ def _build_save_profile_table(rows):
 # SECTION: Stick deadzone screen
 # ============================================================================
 
-# WARNING: these cells and their order must match the cursor numbers of render_stick_deadzone_ui in game_deck.py (the switch, then the three setting rows and Reset to Defaults only while the switch is on, then Close).
+# WARNING: these cells and their order must match the cursor numbers of render_stick_deadzone_ui in game_deck.py (the switch, then the three setting rows and Reset to Defaults only while the player's switch is on, then the player squares, then Close).
 STICK_DZ_SWITCH = "switch"
 STICK_DZ_DEADZONE = "deadzone"
 STICK_DZ_SENSITIVITY = "sensitivity"
 STICK_DZ_AXIS = "axis_threshold"
 STICK_DZ_RESET = "reset"
+STICK_DZ_PLAYERS = "players"
+STICK_DZ_PLAYER_COUNT = 4
 STICK_DZ_SETTINGS = (STICK_DZ_DEADZONE, STICK_DZ_SENSITIVITY, STICK_DZ_AXIS)
 
 _stick_dz_tables = {}
@@ -1075,6 +1077,7 @@ def stick_dz_rows(enabled):
     if enabled:
         rows.extend(STICK_DZ_SETTINGS)
         rows.append(STICK_DZ_RESET)
+    rows.append(STICK_DZ_PLAYERS)
     rows.append(CLOSE)
     return rows
 
@@ -1091,6 +1094,15 @@ def stick_dz_index(rows, cell):
     return list(rows).index(cell)
 
 
+def stick_dz_player_step(player, direction):
+    """Returns the player square a Left or Right press moves to on the Stick Deadzone screen, or None when Right is pressed on the last square and the cursor leaves toward Close."""
+    if direction == LEFT:
+        return max(1, player - 1)
+    if direction == RIGHT:
+        return player + 1 if player < STICK_DZ_PLAYER_COUNT else None
+    return player
+
+
 def stick_dz_table(enabled):
     """Returns the cached NavTable of the Stick Deadzone screen."""
     key = bool(enabled)
@@ -1100,6 +1112,8 @@ def stick_dz_table(enabled):
         table = NavTable()
         table.known(*rows)
         _chain(table, rows, None, None)
+        table.link(STICK_DZ_PLAYERS, RIGHT, CLOSE)
+        table.link(CLOSE, LEFT, STICK_DZ_PLAYERS)
         _stick_dz_tables[key] = table
     return table
 
@@ -1888,8 +1902,13 @@ def explorer_button_at(buttons, x, y):
 # ============================================================================
 
 
+# WARNING: the fallback number must match STICK_MENU_AXIS_THRESHOLD in performance_governor.py; it is used only when that module fails to import.
+try:
+    import performance_governor as _governor
+    JOY_AXIS_THRESHOLD = float(_governor.STICK_MENU_AXIS_THRESHOLD)
+except Exception:
+    JOY_AXIS_THRESHOLD = 0.6
 # VALUES CHANGE HERE
-JOY_AXIS_THRESHOLD = 0.6
 JOY_VERTICAL_AXIS = 1
 JOY_HORIZONTAL_AXIS = 0
 JOY_ACCEPT_BUTTONS = (0, 7)
@@ -2130,7 +2149,7 @@ __all__ = [
     "GAMES_SUB_MENU_LEFT", "GAMES_SUB_MENU_RIGHT", "GAMES_SUB_RIGHT_COLUMN", "games_sub_cell", "games_sub_index", "games_sub_table",
     "DVD_MAP_BUTTONS", "dvd_map_cell", "dvd_map_index", "dvd_map_table",
     "SAVE_PROFILE_ACTIVE", "SAVE_PROFILE_LEFT", "SAVE_PROFILE_RIGHT", "save_profile_rows", "save_profile_cell", "save_profile_index", "save_profile_table",
-    "STICK_DZ_SWITCH", "STICK_DZ_DEADZONE", "STICK_DZ_SENSITIVITY", "STICK_DZ_AXIS", "STICK_DZ_RESET", "STICK_DZ_SETTINGS", "stick_dz_rows", "stick_dz_cell", "stick_dz_index", "stick_dz_table",
+    "STICK_DZ_SWITCH", "STICK_DZ_DEADZONE", "STICK_DZ_SENSITIVITY", "STICK_DZ_AXIS", "STICK_DZ_RESET", "STICK_DZ_PLAYERS", "STICK_DZ_PLAYER_COUNT", "stick_dz_player_step", "STICK_DZ_SETTINGS", "stick_dz_rows", "stick_dz_cell", "stick_dz_index", "stick_dz_table",
     "CTRL_MAP_SQUARES", "CTRL_MAP_BUTTONS", "CTRL_MAP_STICK", "ctrl_map_rows", "ctrl_map_cell", "ctrl_map_index", "ctrl_map_table", "ctrl_map_squares_step",
     "GAMES_COLS", "GAMES_ROWS_PER_PAGE", "GAMES_PAGE_SIZE", "games_cell", "games_index", "games_table", "games_page_of", "games_page_count",
     "CHANNELS_COLS", "CHANNELS_ROWS_PER_PAGE", "CHANNELS_TOTAL", "CHANNELS_PAGE_SIZE", "CHANNELS_NUM_PAGES",

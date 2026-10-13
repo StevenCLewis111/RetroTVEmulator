@@ -74,15 +74,15 @@ sys.path.insert(0, HERE)
 if not hasattr(builtins, "ctypes"):
     builtins.ctypes = ctypes
 
-import pygame  # noqa: E402
+import pygame
 
 pygame.init()
 
-import menu_nav as mn  # noqa: E402
-import ui  # noqa: E402
-import media  # noqa: E402
-import media_library as ml  # noqa: E402
-import performance_governor as gov  # noqa: E402
+import menu_nav as mn
+import ui
+import media
+import media_library as ml
+import performance_governor as gov
 
 menu_nav = mn
 
@@ -1027,10 +1027,19 @@ class TestPictureBoxDetection(unittest.TestCase):
         box, _ = _detect([boom])
         self.assertIsNone(box)
 
-    def test_too_few_readable_samples_is_no_answer(self):
+    def test_too_few_readable_samples_without_timeouts_gets_a_full_frame_label(self):
         good = _pb_stderr((720, 576), [(720, 378, 0, 99)])
         empty = _pb_stderr((720, 576), [])
         box, _ = _detect([good, good, empty, empty, empty, empty])
+        self.assertEqual(box["reason"], "thin_samples_full_frame")
+        self.assertEqual(box["rect"], [0, 0, 720, 576])
+        self.assertFalse(box["has_bars"])
+
+    def test_too_few_readable_samples_with_timeouts_is_no_answer(self):
+        import subprocess as real_subprocess
+        good = _pb_stderr((720, 576), [(720, 378, 0, 99)])
+        boom = real_subprocess.TimeoutExpired(cmd="ffmpeg", timeout=25)
+        box, _ = _detect([good, good, boom, boom, boom, boom])
         self.assertIsNone(box)
 
     def test_audio_only_file_is_recorded_as_no_video(self):
@@ -1414,8 +1423,9 @@ def _make_ns(get_cached_return=None, get_cached_raises=None):
         "_get_probe_library": lambda: _FakeLib(),
         "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
         "PICTURE_BOX_FIT_RETRY_SECONDS": 2.0,
+        "_throttled_log_last_ts": {}, "_THROTTLED_LOG_INTERVAL_S": 30.0,
     }
-    for name in ("_pan_scan_content_key", "_picture_box_set_content", "_apply_picture_box_crop"):
+    for name in ("_log_warn_throttled", "_log_probe_failure", "_pan_scan_content_key", "_picture_box_set_content", "_apply_picture_box_crop"):
         exec(compile(_seg(_FUNCS[name]), f"<extracted:{name}>", "exec"), ns)
     ns["_picture_box_fit_state"] = {"content_key": None, "norm_rect": None, "picture_aspect": None, "retry_at": 0.0}
     return ns, log, calls
@@ -1986,13 +1996,15 @@ def hookup_checks():
     n1_check("a slider key held on the last Video slider row repeats", hold("VIDEO_ROWS", 9, pygame.K_a) >= 1, True)
     n1_check("a slider key held on a Theme slider row repeats", hold("THEME_ROWS", 3, pygame.K_d) >= 1, True)
     n1_check("a slider key held on the last Theme slider row repeats", hold("THEME_ROWS", 5, pygame.K_a) >= 1, True)
-    n1_check("W held on a Video slider row does not repeat", hold("VIDEO_ROWS", 5, pygame.K_w), 0)
-    n1_check("S held on a Theme slider row does not repeat", hold("THEME_ROWS", 4, pygame.K_s), 0)
-    n1_check("D held on a Video radio row does not repeat", hold("VIDEO_ROWS", 1, pygame.K_d), 0)
-    n1_check("D held on the Theme transition row does not repeat", hold("THEME_ROWS", 2, pygame.K_d), 0)
-    n1_check("S held on the tab bar does not repeat", hold("TAB_SELECTION", 4, pygame.K_s), 0)
-    n1_check("S held in System does not repeat", hold("SYSTEM_ROWS", 3, pygame.K_s), 0)
-    n1_check("A held in Advanced Settings does not repeat", hold("SYSTEM_ADVANCED_SUB_MENU", 0, pygame.K_a), 0)
+    n1_check("W held on a Video slider row repeats", hold("VIDEO_ROWS", 5, pygame.K_w) >= 1, True)
+    n1_check("S held on a Theme slider row repeats", hold("THEME_ROWS", 4, pygame.K_s) >= 1, True)
+    n1_check("D held on a Video radio row repeats", hold("VIDEO_ROWS", 1, pygame.K_d) >= 1, True)
+    n1_check("D held on the Theme transition row repeats", hold("THEME_ROWS", 2, pygame.K_d) >= 1, True)
+    n1_check("S held on the tab bar repeats", hold("TAB_SELECTION", 4, pygame.K_s) >= 1, True)
+    n1_check("S held in System repeats", hold("SYSTEM_ROWS", 3, pygame.K_s) >= 1, True)
+    n1_check("A held in Advanced Settings repeats", hold("SYSTEM_ADVANCED_SUB_MENU", 0, pygame.K_a) >= 1, True)
+    n1_check("a key held in the controller map never repeats", hold("GAMES_CTRL_MAP", 0, pygame.K_s), 0)
+    n1_check("a key held in the DVD button map never repeats", hold("DVD_BTN_MAP", 0, pygame.K_d), 0)
     n1_check("a slider key that went down in another layer does not repeat", hold("VIDEO_ROWS", 5, pygame.K_d, "TAB_SELECTION"), 0)
 
 
@@ -2000,13 +2012,11 @@ def repeat_allowed_checks():
     for layer in ("VIDEO_ROWS", "THEME_ROWS", "TAB_SELECTION", "SYSTEM_ROWS", "SYSTEM_ADVANCED_SUB_MENU", "CHANNEL_LIST",
                   "CHANNEL_SETTINGS_SUB_MENU", "GAMES_LIST", "GAMES_SUB_MENU", "GAMES_SAVE_PROFILE", "DVD_BTN_MAP", "GAMES_CTRL_MAP",
                   "SERVER_MENU", "SERVER_SLOTS_MENU", "REMOTE_REMAP_LIST", "AUDIO_TRACK_PICKER", "HOLIDAY_SUB_MENU", None):
-        for selection in range(-1, 60):
-            for key in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d, pygame.K_RETURN, pygame.K_UP):
-                expected = (key in (pygame.K_a, pygame.K_d)
-                            and ((layer == "VIDEO_ROWS" and 5 <= selection <= 9)
-                                 or (layer == "THEME_ROWS" and 3 <= selection <= 5)))
-                n1_check("repeat_allowed %s %s %s" % (layer, selection, pygame.key.name(key)),
-                      mn.repeat_allowed(layer, selection, key), expected)
+        for key in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d, pygame.K_RETURN, pygame.K_UP, pygame.K_LEFT):
+            expected = key in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d) and layer not in mn.NO_REPEAT_LAYERS
+            n1_check("repeat_allowed %s %s" % (layer, pygame.key.name(key)), mn.repeat_allowed(layer, key), expected)
+            n1_check("repeat_allowed suppressed %s %s" % (layer, pygame.key.name(key)), mn.repeat_allowed(layer, key, True), False)
+    n1_check("the capture layers are the four that map keys", tuple(mn.NO_REPEAT_LAYERS), ("GAMES_CTRL_MAP", "DVD_BTN_MAP", "REMOTE_REMAP_CAPTURE", "NUMBER_REMAP_CAPTURE"))
 
 
 class TestMenuNavSystemTab(_SectionCase):
@@ -2232,21 +2242,18 @@ def case_channel_settings():
 
 def case_video():
     t = mn.video_table()
-    structure(t, "video", "aspect_ratio")
+    structure(t, "video", "mode_normal")
     check(mn.video_table() is t, "video: table is cached")
-    check(go(t, "aspect_ratio", mn.UP) == mn.TAB_BAR, "video: Aspect Ratio up goes to the tab bar")
-    check(go(t, "aspect_ratio", mn.LEFT) is None and go(t, "aspect_ratio", mn.RIGHT) is None, "video: Aspect Ratio has no sideways move")
-    check(go(t, "aspect_ratio", mn.DOWN) == "mode_normal", "video: Aspect Ratio down defaults to Normal Mode")
     radios = mn.VIDEO_RADIOS
+    check(radios == ("mode_normal", "mode_stretch", "mode_crop", "mode_panscan"), "video: four screen-mode radios in a row")
+    check(mn.VIDEO_SLIDERS == ("brightness", "contrast", "color", "sharpness", "tint"), "video: five sliders in a column")
     for k, radio in enumerate(radios):
-        check(go(t, radio, mn.UP) == "aspect_ratio" and go(t, radio, mn.DOWN) == "brightness", "video: %s goes up and down" % radio)
+        check(go(t, radio, mn.UP) == mn.TAB_BAR and go(t, radio, mn.DOWN) == "brightness", "video: %s goes up and down" % radio)
         check(go(t, radio, mn.LEFT) == (radios[k - 1] if k else None), "video: %s left" % radio)
         check(go(t, radio, mn.RIGHT) == (radios[k + 1] if k + 1 < len(radios) else None), "video: %s right" % radio)
-        for far in ("aspect_ratio", "brightness"):
-            memory = {}
-            go(t, radio, mn.UP if far == "aspect_ratio" else mn.DOWN, memory)
-            back = mn.DOWN if far == "aspect_ratio" else mn.UP
-            check(go(t, far, back, memory) == radio, "video: way back to %s from %s" % (radio, far))
+        memory = {}
+        go(t, radio, mn.DOWN, memory)
+        check(go(t, "brightness", mn.UP, memory) == radio, "video: way back to %s from Brightness" % radio)
     check(go(t, "brightness", mn.UP) == "mode_normal", "video: Brightness up with no memory goes to Normal Mode")
     sliders = mn.VIDEO_SLIDERS
     for k, slider in enumerate(sliders):
@@ -2255,32 +2262,37 @@ def case_video():
             check(go(t, slider, mn.UP) == sliders[k - 1], "video: %s up" % slider)
         check(go(t, slider, mn.LEFT) is None and go(t, slider, mn.RIGHT) is None, "video: %s sideways is left to the value change" % slider)
     check(go(t, mn.CLOSE, mn.UP) == "tint" and go(t, mn.CLOSE, mn.DOWN) is None and go(t, mn.CLOSE, mn.LEFT) is None, "video: Close only goes up to Tint")
-    for sel in range(11):
+    for sel in range(10):
         check(mn.video_index(mn.video_cell(sel)) == sel, "video: selection %d round trip" % sel)
-    check(mn.video_cell(10) == mn.CLOSE, "video: selection 10 is Close")
+    check(mn.video_cell(9) == mn.CLOSE, "video: selection 9 is Close")
+    check("aspect_ratio" not in t.cells, "video: there is no Aspect Ratio row")
 
 
 def case_theme():
     t = mn.theme_table()
     structure(t, "theme", "volume_bar")
     check(mn.theme_table() is t, "theme: table is cached")
-    check(go(t, "volume_bar", mn.UP) == mn.TAB_BAR, "theme: Volume Bar up goes to the tab bar")
-    check(go(t, "volume_bar", mn.DOWN) == "static_color" and go(t, "static_color", mn.DOWN) == "transition", "theme: down through the first rows lands on Channel Transition")
+    check(go(t, "volume_bar", mn.UP) == mn.TAB_BAR and go(t, "static_color", mn.UP) == mn.TAB_BAR, "theme: the top pair goes up to the tab bar")
+    check(go(t, "volume_bar", mn.RIGHT) == "static_color" and go(t, "static_color", mn.LEFT) == "volume_bar", "theme: Volume Bar and Channel Static are neighbours")
+    check(go(t, "volume_bar", mn.LEFT) is None and go(t, "static_color", mn.RIGHT) is None, "theme: nothing beyond the top pair")
+    check(go(t, "volume_bar", mn.DOWN) == "transition" and go(t, "static_color", mn.DOWN) == "letterbox", "theme: each top button goes down to the button under it")
     check(go(t, "transition", mn.RIGHT) == "letterbox" and go(t, "letterbox", mn.LEFT) == "transition", "theme: Transition and Letterboxing are neighbours")
-    check(go(t, "transition", mn.LEFT) is None and go(t, "letterbox", mn.RIGHT) is None, "theme: nothing beyond the pair")
-    check(go(t, "letterbox", mn.UP) == "static_color" and go(t, "letterbox", mn.DOWN) == "opacity", "theme: Letterboxing moves vertically like its row")
+    check(go(t, "transition", mn.LEFT) is None and go(t, "letterbox", mn.RIGHT) is None, "theme: nothing beyond the second pair")
+    check(go(t, "transition", mn.UP) == "volume_bar" and go(t, "letterbox", mn.UP) == "static_color", "theme: each second-row button goes up to the button above it")
+    check(go(t, "transition", mn.DOWN) == "opacity" and go(t, "letterbox", mn.DOWN) == "opacity", "theme: both second-row buttons go down to Menu Opacity")
     check(go(t, "opacity", mn.UP) == "transition", "theme: W from Opacity lands on Channel Transition, never on Letterboxing")
-    check(go(t, "static_color", mn.DOWN) == "transition", "theme: S from Channel Static lands on Channel Transition")
     for a, b in (("opacity", "bg_hue"), ("bg_hue", "ui_hue"), ("ui_hue", mn.CLOSE)):
         check(go(t, a, mn.DOWN) == b and go(t, b, mn.UP) == a, "theme: %s and %s are neighbours" % (a, b))
     for slider in mn.THEME_SLIDERS:
         check(go(t, slider, mn.LEFT) is None and go(t, slider, mn.RIGHT) is None, "theme: %s sideways is left to the value change" % slider)
     check(go(t, mn.CLOSE, mn.DOWN) is None and go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None, "theme: Close only goes up")
-    for sel in range(7):
+    for sel in range(6):
         cell = mn.theme_cell(sel, 0)
         check(mn.theme_index(cell) == sel and mn.theme_row2_column(cell) == 0, "theme: selection %d round trip" % sel)
-    check(mn.theme_cell(2, 1) == "letterbox" and mn.theme_index("letterbox") == 2 and mn.theme_row2_column("letterbox") == 1, "theme: row 2 column 1 is Letterboxing")
-    check(mn.theme_cell(3, 1) == "opacity", "theme: a stale row 2 column does not change other rows")
+    check(mn.theme_cell(0, 1) == "static_color" and mn.theme_index("static_color") == 0 and mn.theme_row2_column("static_color") == 1, "theme: row 0 column 1 is Channel Static")
+    check(mn.theme_cell(1, 1) == "letterbox" and mn.theme_index("letterbox") == 1 and mn.theme_row2_column("letterbox") == 1, "theme: row 1 column 1 is Letterboxing")
+    check(mn.theme_cell(2, 1) == "opacity", "theme: a stale right column does not change other rows")
+    check(mn.theme_cell(5, 0) == mn.CLOSE, "theme: selection 5 is Close")
 
 
 # ============================================================================
@@ -2493,13 +2505,13 @@ SUB_LAYOUTS = {
 def sub_rows_for(console_key, on, kiosk, psx, bios):
     """Returns the rows get_games_sub_menu_rows gives for one console setup (the same lists as ui.py)."""
     if console_key == "MENU":
-        return ["controller_map", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores", "menu_bg_select_image", "multitap_toggle",
-                "scroll_style", "text_color", "game_aspect_ratio", "game_screen_mode"]
+        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores", "menu_bg_select_image",
+                "multitap_toggle", "scroll_style", "text_color", "game_screen_mode"]
     if not on:
         return []
     if console_key == "DVD":
         return ["splash_toggle", "splash_select_image", "splash_select_video", "dvd_captions_toggle", "dvd_resume_toggle",
-                "dvd_button_mapping", "dvd_aspect_ratio", "dvd_screen_mode", "dvd_audio_track"]
+                "dvd_button_mapping", "dvd_screen_mode", "dvd_audio_track"]
     rows = [] if kiosk else ["core_select"]
     rows += ["controller_map", "profile1", "profile2", "profile3"]
     if psx:
@@ -2526,17 +2538,17 @@ def sub_lasts(layout):
 
 EXPECTED_SUB = {
     "MENU": {
-        "controller_map": "W:- S:game_aspect_ratio A:- D:menu_bg_select_image",
+        "controller_map": "W:- S:stick_deadzone A:- D:menu_bg_select_image",
+        "stick_deadzone": "W:controller_map S:game_screen_mode A:- D:multitap_toggle",
         "scan_for_roms": "W:scroll_style S:clear_roms A:scan_for_cores D:-",
         "clear_roms": "W:scan_for_roms S:close A:clear_cores D:-",
         "scan_for_cores": "W:game_screen_mode S:clear_cores A:- D:scan_for_roms",
         "clear_cores": "W:scan_for_cores S:close A:- D:clear_roms",
         "menu_bg_select_image": "W:- S:multitap_toggle A:controller_map D:-",
-        "multitap_toggle": "W:menu_bg_select_image S:scroll_style A:game_aspect_ratio D:-",
+        "multitap_toggle": "W:menu_bg_select_image S:scroll_style A:stick_deadzone D:-",
         "scroll_style": "W:multitap_toggle S:scan_for_roms A:game_screen_mode D:text_color",
         "text_color": "W:multitap_toggle S:scan_for_roms A:scroll_style D:-",
-        "game_aspect_ratio": "W:controller_map S:game_screen_mode A:- D:multitap_toggle",
-        "game_screen_mode": "W:game_aspect_ratio S:scan_for_cores A:- D:scroll_style",
+        "game_screen_mode": "W:stick_deadzone S:scan_for_cores A:- D:scroll_style",
         "close": "W:clear_cores S:- A:clear_cores D:-",
     },
     "DVD": {
@@ -2544,12 +2556,11 @@ EXPECTED_SUB = {
         "splash_toggle": "W:status S:splash_select_image A:status D:-",
         "splash_select_image": "W:splash_toggle S:dvd_captions_toggle A:splash_select_video D:-",
         "splash_select_video": "W:splash_toggle S:dvd_captions_toggle A:dvd_button_mapping D:splash_select_image",
-        "dvd_captions_toggle": "W:splash_select_video S:dvd_resume_toggle A:dvd_aspect_ratio D:-",
-        "dvd_resume_toggle": "W:dvd_captions_toggle S:close A:dvd_screen_mode D:-",
-        "dvd_button_mapping": "W:status S:dvd_aspect_ratio A:- D:splash_select_video",
-        "dvd_aspect_ratio": "W:dvd_button_mapping S:dvd_screen_mode A:- D:dvd_captions_toggle",
-        "dvd_screen_mode": "W:dvd_aspect_ratio S:dvd_audio_track A:- D:dvd_resume_toggle",
-        "dvd_audio_track": "W:dvd_screen_mode S:close A:- D:close",
+        "dvd_captions_toggle": "W:splash_select_video S:dvd_resume_toggle A:dvd_screen_mode D:-",
+        "dvd_resume_toggle": "W:dvd_captions_toggle S:close A:dvd_audio_track D:-",
+        "dvd_button_mapping": "W:status S:dvd_screen_mode A:- D:splash_select_video",
+        "dvd_screen_mode": "W:dvd_button_mapping S:dvd_audio_track A:- D:dvd_captions_toggle",
+        "dvd_audio_track": "W:dvd_screen_mode S:close A:- D:dvd_resume_toggle",
         "close": "W:dvd_resume_toggle S:- A:- D:-",
     },
     "NES": {
@@ -2649,6 +2660,22 @@ def parse_moves(text):
     return {part.split(":")[0]: (None if part.split(":")[1] == "-" else part.split(":")[1]) for part in text.split()}
 
 
+def case_games_sub_rows_match_ui():
+    from game_deck import BIOS_REQUIRED_CONSOLES
+    compared = []
+    for layout, (console_key, on, kiosk, psx, bios) in SUB_LAYOUTS.items():
+        if console_key not in ("MENU", "DVD") and bios != (console_key in BIOS_REQUIRED_CONSOLES):
+            continue
+        compared.append(layout)
+        real = ui.get_games_sub_menu_rows(FakeDbConfig({"kiosk_mode_enabled": kiosk}), {}, console_key, on)
+        check(sub_rows_for(console_key, on, kiosk, psx, bios) == real,
+              "games sub %s: the test's rows %s differ from ui.get_games_sub_menu_rows %s" % (layout, sub_rows_for(console_key, on, kiosk, psx, bios), real))
+    check(sorted(compared) == ["DVD", "MENU", "NES", "NES kiosk", "PSX", "PSX kiosk", "disabled"], "the layouts compared against ui.py are %s" % compared)
+    for gone in ("game_aspect_ratio", "dvd_aspect_ratio"):
+        check(gone not in ui.get_games_sub_menu_rows(None, {}, "MENU", True) + ui.get_games_sub_menu_rows(None, {}, "DVD", True),
+              "%s is not a Games sub-menu row" % gone)
+
+
 def case_games_sub_tables():
     for layout in SUB_LAYOUTS:
         console_key, sub_rows, full = sub_setup(layout)
@@ -2715,8 +2742,13 @@ def case_games_sub_way_back():
     check(walk(psx, "disc", "SW") == "disc" and walk(psx, "disc", "DA") == "disc", "games sub PSX: Close way back to Disc, up and left")
     check(walk(psx, "profile3", "DA") == "profile3" and walk(psx, "profile3", "DW") == "clear_console_roms", "games sub PSX: Profile 3 right then left returns to Profile 3, Close up still goes to Clear Roms")
     check(walk(psx, "clear_console_roms", "SA") == "disc", "games sub PSX: Close left with no sideways memory goes to Disc")
-    check(walk(dvd, "dvd_resume_toggle", "SW") == "dvd_resume_toggle" and walk(dvd, "dvd_audio_track", "SW") == "dvd_audio_track" and walk(dvd, "dvd_audio_track", "DW") == "dvd_audio_track",
-          "games sub DVD: Close way back to Resume or Change Audio, from S or D")
+    check(walk(dvd, "dvd_resume_toggle", "SW") == "dvd_resume_toggle" and walk(dvd, "dvd_audio_track", "SW") == "dvd_audio_track",
+          "games sub DVD: Close way back to Resume or Change Audio, from S")
+    check(walk(dvd, "dvd_audio_track", "D") == "dvd_resume_toggle" and walk(dvd, "dvd_audio_track", "DA") == "dvd_audio_track"
+          and walk(dvd, "dvd_resume_toggle", "AD") == "dvd_resume_toggle",
+          "games sub DVD: Change Audio and Resume share a row, so each goes sideways to the other and back")
+    check(walk(dvd, "dvd_screen_mode", "D") == "dvd_captions_toggle" and walk(dvd, "dvd_captions_toggle", "A") == "dvd_screen_mode",
+          "games sub DVD: Screen Mode and Captions share a row")
     check(walk(dvd, "close", "W") == "dvd_resume_toggle", "games sub DVD: Close up with no memory goes to Resume")
     check(walk(menu, "clear_roms", "SW") == "clear_roms" and walk(menu, "clear_cores", "SW") == "clear_cores" and walk(menu, "close", "W") == "clear_cores", "games sub MENU: Close way back, default Clear Cores")
     check(walk(menu, "close", "A") == "clear_cores" and walk(menu, "clear_roms", "SA") == "clear_cores", "games sub MENU: Close left is always Clear Cores")
@@ -2856,9 +2888,9 @@ def test_n3c_directions():
     check(mn.key_to_direction(pygame.K_RETURN, arrows=True) is None and mn.key_to_direction(pygame.K_ESCAPE) is None, "key_to_direction: other keys give None")
 
 
-# ---------------------------------------------------------------------------
-# DVD button map
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: DVD button map
+# ============================================================================
 
 def test_dvd_map_tables():
     t = mn.dvd_map_table()
@@ -2913,9 +2945,9 @@ def test_dvd_map_handler():
               "handler dvd map: while capturing a direction key is captured as the binding and never moves the cursor (%s)" % key)
 
 
-# ---------------------------------------------------------------------------
-# Save Profile
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Save Profile
+# ============================================================================
 
 SAVE_LAYOUTS = {"home (with bezel style)": (True, True, True), "handheld (no bezel style)": (True, True, False)}
 
@@ -3079,9 +3111,9 @@ def test_save_profile_sequences():
     check(not wrong, "handler save profile: %d random steps all follow the table with the memory a mirror table wrote %s" % (steps, wrong[:3]))
 
 
-# ---------------------------------------------------------------------------
-# Controller map
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SECTION: Controller map
+# ============================================================================
 
 EXPECTED_CTRL_STICK = {
     "squares": "W:- S:- A:map_buttons D:map_buttons",
@@ -3276,6 +3308,13 @@ def case_n3c():
     test_ctrl_map_tables()
     test_ctrl_map_squares_step()
     test_ctrl_map_handler()
+
+
+class TestGamesSubRowsMatchUi(_SectionCase):
+    """The Games sub-menu row lists the navigation tests use are the same lists ui.py builds"""
+
+    def test_games_sub_rows_match_ui(self):
+        self.run_section(case_games_sub_rows_match_ui)
 
 
 class TestMenuNavChannelsVideoGames(_SectionCase):
@@ -4428,8 +4467,8 @@ def case_sliders():
     config = {"x": 1}
     check(mn.slider_adjust(config, "aspect_ratio", mn.RIGHT) is False and config == {"x": 1}, "a cell that is not a slider is left alone")
     check(mn.slider_adjust({}, mn.CLOSE, mn.LEFT) is False, "Close is not a slider")
-    check(mn.SLIDER_SPECS["bg_hue"][1:] == (220, 0, 360) and mn.SLIDER_SPECS["ui_hue"][1:] == (220, 0, 360) and mn.SLIDER_SPECS["opacity"][1:] == (50, 0, 100), "slider ranges as the old code")
-    held = {mn.repeat_allowed("VIDEO_ROWS", sel, pygame.K_d) for sel in range(5, 10)}
+    check(mn.SLIDER_SPECS["bg_hue"][1:] == (220, 0, 360) and mn.SLIDER_SPECS["ui_hue"][1:] == (140, 0, 360) and mn.SLIDER_SPECS["opacity"][1:] == (50, 0, 100), "slider ranges and defaults match the Theme and Video drawing")
+    held = {mn.repeat_allowed("VIDEO_ROWS", key) for key in (pygame.K_a, pygame.K_d)}
     check(held == {True}, "held slider keys still repeat on Video sliders")
 
 
@@ -4527,11 +4566,13 @@ def case_hold_functions():
     check(mn.HOLD_RULES["vertical"] == mn.HoldRule(None, 100, False), "vertical rule is the old 100 ms")
     check(mn.HOLD_RULES["horizontal"] == mn.HoldRule(None, 110, False), "horizontal rule is the old 110 ms")
     check(mn.HOLD_RULES["rom_list"] == mn.HoldRule(380, 70, True), "ROM list rule is the old 380 ms then 70 ms")
-    check(mn.HOLD_STUCK_MS == {"menu": 1500, "guide": 3000, "rom_list": 1500}, "stuck limits are the old numbers")
+    check(mn.HOLD_RULES["volume"] == mn.HoldRule(200, 180, False), "volume rule is 200 ms then 180 ms")
+    check(mn.HOLD_STUCK_MS == {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}, "stuck limits are menu 1500, guide 3000, ROM list 1500, volume 1500")
     arrows = [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN]
     for key in list(range(0, 1200)) + arrows:
         want = (mn.HOLD_RULES["vertical"] if key in (pygame.K_w, pygame.K_s)
-                else mn.HOLD_RULES["horizontal"] if key in (pygame.K_a, pygame.K_d) else None)
+                else mn.HOLD_RULES["horizontal"] if key in (pygame.K_a, pygame.K_d)
+                else mn.HOLD_RULES["volume"] if key in (pygame.K_LEFT, pygame.K_RIGHT) else None)
         check(mn.hold_rule(key) == want, "hold_rule %d" % key)
     old_menu = lambda held, since, interval: held > 400 and since >= interval
     old_rom = lambda held, since: held >= 380 and since >= 70
@@ -6666,7 +6707,7 @@ _R4_FILES = (
     os.path.join("GPU", "d3d11_gpu_core.py"), os.path.join("GPU", "d3d11_gpu_frame.py"),
     os.path.join("GPU", "d3d11_gpu_gate.py"), os.path.join("GPU", "d3d11_gpu_reference.py"),
 )
-_R4_ALLOWED = re.compile(r"^#\s*(=+\s*$|-{10,}\s*$|--\s.*-{5,}\s*$|SECTION:|VALUES CHANGE HERE|WARNING:|COMING SOON|type:|noqa|pragma|-\*-|!)")
+_R4_ALLOWED = re.compile(r"^#\s*(=+\s*$|SECTION:|VALUES CHANGE HERE|WARNING:|COMING SOON|-\*-|!)")
 _R4_HISTORY = re.compile(r"\b(used to|no longer|any ?more|previously|formerly|the old (handler|code|flow|version)|item [A-D]\b)", re.I)
 _R4_DOC_HISTORY = re.compile(r"\b(any ?more|previously|formerly|the old (handler|code|version)|item [A-D]\b)", re.I)
 
@@ -6687,15 +6728,13 @@ def _r4_comments(path):
 
 
 def r4_case_comments():
-    dash = re.compile(r"^#\s*-{10,}\s*$")
     for rel in _R4_FILES:
         path = os.path.join(ROOT, rel)
         if not os.path.isfile(path):
             continue
         src, found = _r4_comments(path)
         for line_no, text, prev_line, next_line in found:
-            title_between_dashes = bool(dash.match(prev_line) and dash.match(next_line))
-            check(bool(_R4_ALLOWED.match(text)) or title_between_dashes, "%s line %d is a comment the rule does not allow: %s" % (rel, line_no, text[:80]))
+            check(bool(_R4_ALLOWED.match(text)), "%s line %d is a comment the rule does not allow: %s" % (rel, line_no, text[:80]))
             check(not _R4_HISTORY.search(text), "%s line %d comment says what used to be: %s" % (rel, line_no, text[:80]))
         for node in ast.walk(ast.parse(src)):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
@@ -6711,6 +6750,470 @@ class TestCommentRule(_SectionCase):
 
     def test_comments(self):
         self.run_section(r4_case_comments)
+
+
+# ============================================================================
+# SECTION: DirectInput reader has no do-nothing branch
+# ============================================================================
+
+
+def dinput_dead_branch_case():
+    with open(os.path.join(ROOT, "game_deck.py"), "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    reader = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_try_dinput_read_all_impl")
+    empty_ifs = [n for n in ast.walk(reader) if isinstance(n, ast.If) and len(n.body) == 1 and isinstance(n.body[0], ast.Pass) and not n.orelse]
+    check(empty_ifs == [], "the DirectInput reader has no if-branch that only passes")
+    used = [n for n in ast.walk(reader) if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "raw_changed_this_frame"]
+    check(len(used) == 1, "the liveness block that uses raw_changed_this_frame is still there")
+    check(any(isinstance(n, ast.Attribute) and n.attr == "add" for u in used for n in ast.walk(u)), "the liveness block still records ever-live pads")
+
+
+class TestDirectInputNoDeadBranch(_SectionCase):
+    """The DirectInput reader keeps its liveness block and has no do-nothing branch"""
+
+    def test_no_dead_branch(self):
+        self.run_section(dinput_dead_branch_case)
+
+
+# ============================================================================
+# SECTION: Broadcast clock numbers live in the governor table
+# ============================================================================
+
+
+def clock_table_case():
+    import broadcast_clock as bc
+    names = (("_RESYNC_SECONDS", "BROADCAST_CLOCK_RESYNC_SECONDS"),
+             ("_STEP_TOLERANCE_SECONDS", "BROADCAST_CLOCK_STEP_TOLERANCE_SECONDS"),
+             ("_JITTER_TOLERANCE_SECONDS", "BROADCAST_CLOCK_JITTER_TOLERANCE_SECONDS"))
+    for clock_name, table_name in names:
+        check(hasattr(gov, table_name), "%s is in the governor table" % table_name)
+        check(getattr(bc, clock_name) == float(getattr(gov, table_name)), "%s follows %s" % (clock_name, table_name))
+    with open(os.path.join(ROOT, "broadcast_clock.py"), "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    fallback = {}
+    for node in tree.body:
+        if isinstance(node, ast.Try):
+            for stmt in node.handlers[0].body:
+                if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+                    fallback[stmt.targets[0].id] = stmt.value.value
+    for clock_name, table_name in names:
+        check(fallback.get(clock_name) == getattr(gov, table_name), "the fallback for %s matches %s" % (clock_name, table_name))
+    top_level_numbers = [n.targets[0].id for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+                         and isinstance(n.value.value, float) and isinstance(n.targets[0], ast.Name)]
+    check(top_level_numbers == [], "broadcast_clock.py has no tunable number outside the governor table and its fallback: %s" % top_level_numbers)
+
+
+class TestBroadcastClockTable(_SectionCase):
+    """The broadcast clock's three tunables come from the governor table (R7)"""
+
+    def test_clock_table(self):
+        self.run_section(clock_table_case)
+
+
+# ============================================================================
+# SECTION: Stick activity numbers live in the governor table
+# ============================================================================
+
+
+def stick_activity_table_case():
+    import menu_nav as mn
+    import game_deck as gd
+    for name in ("STICK_SS_ACTIVITY_DEADZONE", "STICK_MULTITAP_ACTIVITY_DEADZONE",
+                 "STICK_CH03_AXIS_ACTIVITY_DEADZONE", "STICK_MENU_AXIS_THRESHOLD"):
+        check(hasattr(gov, name), "%s is in the governor table" % name)
+    check(mn.JOY_AXIS_THRESHOLD == float(gov.STICK_MENU_AXIS_THRESHOLD), "the menu joystick threshold follows the table")
+    check(gd.ExternalGameDeck._MULTITAP_ACTIVITY_DZ == gov.STICK_MULTITAP_ACTIVITY_DEADZONE, "the multitap activity number follows the table")
+    with open(os.path.join(ROOT, "game_deck.py"), "r", encoding="utf-8") as handle:
+        deck_src = handle.read()
+    check("_SS_STICK_ACTIVITY_DZ = _gov.STICK_SS_ACTIVITY_DEADZONE" in deck_src, "the screensaver stick number follows the table")
+    with open(os.path.join(ROOT, "retro_tv_emulator.py"), "r", encoding="utf-8") as handle:
+        main_src = handle.read()
+    check("performance_governor.STICK_CH03_AXIS_ACTIVITY_DEADZONE" in main_src, "the Channel 03 axis wake number follows the table")
+    check("8000 / 32767.0" in main_src and gov.STICK_CH03_AXIS_ACTIVITY_DEADZONE == 8000 / 32767.0, "its fallback matches the table")
+    with open(os.path.join(ROOT, "menu_nav.py") if os.path.exists(os.path.join(ROOT, "menu_nav.py")) else os.path.join(ROOT, "assets", "menu_nav.py"), "r", encoding="utf-8") as handle:
+        nav_src = handle.read()
+    check("    JOY_AXIS_THRESHOLD = 0.6\n" in nav_src and gov.STICK_MENU_AXIS_THRESHOLD == 0.6, "its fallback matches the table")
+
+
+class TestStickActivityTable(_SectionCase):
+    """The stick activity and menu axis numbers come from the governor table (R7)"""
+
+    def test_stick_activity_table(self):
+        self.run_section(stick_activity_table_case)
+
+
+def controller_read_table_case():
+    import game_deck as gd
+    expected = {"TRIGGER_PRESS_THRESHOLD": 30, "GAME_HOTKEY_TRIGGER_THRESHOLD": 128, "GAME_HOTKEY_COOLDOWN_MS": 2000,
+                "DINPUT_AXIS_LIVENESS_THRESHOLD": 1500, "HID_IDENTITY_CACHE_TTL_SECONDS": 2.0,
+                "DINPUT_FRAME_CACHE_WINDOW_SECONDS": 0.008, "JS_DEAD_TIMEOUT_SECONDS": 5.0, "XI_NAV_POLL_HZ": 30,
+                "XI_NAV_NO_PAD_INTERVAL_SECONDS": 0.25, "XI_NAV_MISSES_BEFORE_SLOW": 30}
+    for name, value in expected.items():
+        check(getattr(gov, name, None) == value, "%s is in the governor table with the number the code had (%s)" % (name, value))
+    check(gd._DINPUT_AXIS_LIVENESS_THRESHOLD == gov.DINPUT_AXIS_LIVENESS_THRESHOLD, "the liveness number follows the table")
+    check(gd._HID_IDENTITY_CACHE_TTL == gov.HID_IDENTITY_CACHE_TTL_SECONDS, "the identity cache time follows the table")
+    check(gd._DINPUT_FRAME_CACHE_WINDOW == gov.DINPUT_FRAME_CACHE_WINDOW_SECONDS, "the DirectInput frame cache follows the table")
+    check(gd._JS_DEAD_TIMEOUT == gov.JS_DEAD_TIMEOUT_SECONDS, "the Linux joystick timeout follows the table")
+    check((gd._XI_NAV_POLL_HZ, gd._XI_NAV_NO_PAD_INTERVAL, gd._XI_NAV_MISSES_BEFORE_SLOW)
+          == (gov.XI_NAV_POLL_HZ, gov.XI_NAV_NO_PAD_INTERVAL_SECONDS, gov.XI_NAV_MISSES_BEFORE_SLOW), "the menu pad polling follows the table")
+    with open(gd.__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    local_names = {"TRIG_THRESH", "TRIGGER_PRESS_THRESHOLD", "_TRIG_THRESH", "_COOLDOWN_MS", "_DINPUT_AXIS_LIVENESS_THRESHOLD",
+                   "_HID_IDENTITY_CACHE_TTL", "_DINPUT_FRAME_CACHE_WINDOW", "_JS_DEAD_TIMEOUT", "_XI_NAV_POLL_HZ",
+                   "_XI_NAV_NO_PAD_INTERVAL", "_XI_NAV_MISSES_BEFORE_SLOW"}
+    seen = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in local_names:
+            seen.add(node.targets[0].id)
+            check(not isinstance(node.value, ast.Constant), "%s is assigned a literal number in game_deck.py" % node.targets[0].id)
+    check(seen == local_names, "every moved name is still assigned from the table: missing %s" % sorted(local_names - seen))
+
+
+class TestControllerReadTable(_SectionCase):
+    """The trigger, pad-liveness and pad-polling numbers come from the governor table (R7)"""
+
+    def test_controller_read_table(self):
+        self.run_section(controller_read_table_case)
+
+
+# ============================================================================
+# SECTION: Stick settings are kept per player
+# ============================================================================
+
+
+def stick_per_player_case():
+    import game_deck as gd
+    names = ("deadzone", "sensitivity", "axis_threshold")
+    check(gd.stick_config_key("stick_deadzone_percent", 1) == "stick_deadzone_percent", "Player 1 keeps the plain key")
+    check(gd.stick_config_key("stick_deadzone_percent", 3) == "stick_deadzone_percent_p3", "Players 2 to 4 add _pN")
+    cfg = {}
+    for player in gd.STICK_PLAYERS:
+        check(gd.stick_switch_on(cfg, player) is gov.STICK_DZ_ENABLED_DEFAULT, "player %d starts with the default switch" % player)
+    gd.adjust_stick_setting(cfg, "deadzone", 1, 2)
+    gd.adjust_stick_setting(cfg, "sensitivity", 1, 3)
+    gd.toggle_stick_switch(cfg, 4)
+    check(gd.stick_setting_percent(cfg, "deadzone", 2) == 1 and gd.stick_setting_percent(cfg, "deadzone", 1) == 0, "a change to Player 2 leaves Player 1 alone")
+    check(gd.stick_setting_percent(cfg, "sensitivity", 3) == 105 and gd.stick_setting_percent(cfg, "sensitivity", 2) == 100, "a change to Player 3 leaves Player 2 alone")
+    check(gd.stick_switch_on(cfg, 4) is (not gov.STICK_DZ_ENABLED_DEFAULT) and gd.stick_switch_on(cfg, 1) is gov.STICK_DZ_ENABLED_DEFAULT, "the switch is per player")
+    gd.reset_stick_defaults(cfg, 2)
+    check(gd.stick_setting_percent(cfg, "deadzone", 2) == gov.STICK_DZ_SPECS["deadzone"][1], "reset acts on one player")
+    check(gd.stick_setting_percent(cfg, "sensitivity", 3) == 105, "reset of Player 2 leaves Player 3's values")
+    old = {gov.STICK_DZ_SPECS[n][0]: v for n, v in (("deadzone", 30), ("sensitivity", 120), ("axis_threshold", 40))}
+    check(gd.stick_settings_from_config(old, 1).deadzone == 0.30, "an old saved config still drives Player 1")
+    check(gd.stick_settings_from_config(old, 2).deadzone == 0.0, "an old saved config does not leak into Player 2")
+
+    previous = {p: gd.current_stick_settings(p) for p in gd.STICK_PLAYERS}
+    saved_slots = dict(gd._player_slot_of)
+    try:
+        cfg = {gov.STICK_DZ_ENABLED_KEY: True, gd.stick_config_key(gov.STICK_DZ_SPECS["deadzone"][0], 2): 50,
+               gd.stick_config_key(gov.STICK_DZ_SPECS["axis_threshold"][0], 2): 80,
+               gd.stick_config_key(gov.STICK_DZ_ENABLED_KEY, 3): False}
+        gd.apply_stick_config(cfg)
+        check(gd.current_stick_settings(2).deadzone == 0.5 and gd.current_stick_settings(1).deadzone == 0.0, "apply keeps four separate settings")
+        check(gd.stick_axis_threshold_raw(2) == int(0.8 * gd.STICK_MAX), "Player 2's threshold is its own")
+        check(gd.stick_axis_threshold_raw(1) == int(0.5 * gd.STICK_MAX), "Player 1's threshold is its own")
+        check(gd.stick_axis_threshold_raw(3) == gov.STICK_DZ_OFF_DPAD_THRESHOLD and gd.stick_dinput_threshold_raw(3) == gov.STICK_DZ_OFF_DINPUT_THRESHOLD, "Player 3 with the switch off keeps the fixed numbers")
+        gd._player_slot_of.clear()
+        gd._player_slot_of.update({1: 0, 2: 1, 3: "di7"})
+        check(gd.stick_player_of_slot(1) == 2 and gd.stick_player_of_slot("di7") == 3 and gd.stick_player_of_slot(9) == 1, "a pad slot belongs to its player; an unassigned pad counts as Player 1")
+
+        def pad(lx, ly):
+            g = gd._GPState()
+            g.sLX, g.sLY = lx, ly
+            return g
+
+        g1 = gd.apply_stick_correction(pad(10000, 0), 0)
+        g2 = gd.apply_stick_correction(pad(10000, 0), 1)
+        g3 = gd.apply_stick_correction(pad(10000, 0), "di7")
+        check(g1.sLX == 10000, "the pad of Player 1 (no deadzone) is left as read")
+        check(g2.sLX == 0 and g2.rawLX == 10000, "the pad of Player 2 is cut by Player 2's deadzone and keeps its raw value")
+        check(g3.sLX == 10000, "the pad of Player 3 (switch off) is left as read")
+        gd._player_slot_of[2] = "js:/dev/input/js0"
+        reader = gd._LinuxJoystickReader.__new__(gd._LinuxJoystickReader)
+        reader._path, reader._fd, reader._state = "/dev/input/js0", None, gd._GPState()
+        reader._fd = os.open(os.devnull, os.O_RDONLY)
+        reader._state.sLX = 10000
+        try:
+            with mock.patch.object(gd.os, "read", side_effect=BlockingIOError):
+                lg = reader.read()
+        finally:
+            os.close(reader._fd)
+        check(lg is not None and lg.sLX == 0 and lg.rawLX == 10000, "a Linux (Wine) joystick follows the settings of the player it is assigned to")
+    finally:
+        gd._player_slot_of.clear()
+        gd._player_slot_of.update(saved_slots)
+        for p, st in previous.items():
+            gd._stick_current[p] = st
+
+
+class TestStickPerPlayer(_SectionCase):
+    """Stick deadzone settings are kept for each of the four players and every stick read uses the owning player's"""
+
+    def test_stick_per_player(self):
+        self.run_section(stick_per_player_case)
+
+
+# ============================================================================
+# SECTION: The DVD and Games Aspect Ratio settings are gone
+# ============================================================================
+
+
+def aspect_keys_gone_case():
+    import media as _media
+    for gone in ("dvd_aspect_ratio", "game_aspect_ratio", "_apply_bezel_on_aspect_lock", "_restore_aspect_ratio_after_bezel_off",
+                 "_aspect_ratio_locked_by_bezel", "_before_bezel_boot_aspect", "_is_true_43_hardware"):
+        check(gone not in MAIN_SRC, "%s is gone from the main script" % gone)
+    with open(_media.__file__, encoding="utf-8") as handle:
+        media_src = handle.read()
+    check("_aspect_ratio_before_bezel" not in media_src.replace("\"_aspect_ratio_before_bezel\"", "").replace("_dvd_aspect_ratio_before_bezel", "").replace("_game_aspect_ratio_before_bezel", ""), "media.py no longer restores aspect_ratio from a stash entry")
+    check("game_aspect_ratio\"] = " not in media_src and "\"dvd_aspect_ratio\": " not in media_src, "media.py no longer sets either key")
+    db = _media.RetroDatabase.__new__(_media.RetroDatabase)
+    config = db._apply_config_defaults({"aspect_ratio": "4:3", "dvd_aspect_ratio": "4:3", "game_aspect_ratio": "4:3",
+                                        "_aspect_ratio_before_bezel": "4:3", "_dvd_aspect_ratio_before_bezel": "4:3", "_game_aspect_ratio_before_bezel": "16:9"})
+    check(not any(k in config for k in ("dvd_aspect_ratio", "game_aspect_ratio", "_aspect_ratio_before_bezel", "_dvd_aspect_ratio_before_bezel", "_game_aspect_ratio_before_bezel")),
+          "an old saved config loses the five old keys")
+    check(config["aspect_ratio"] == "16:9", "the main aspect ratio is still forced to 16:9")
+    block_start = MAIN_SRC.index('self.target_aspect = "16:9"')
+    check('engine_label == "dvd"' in MAIN_SRC[block_start - 120:block_start], "the DVD engine's target aspect is the fixed 16:9")
+
+
+class TestAspectKeysGone(_SectionCase):
+    """The unused DVD and Games Aspect Ratio keys and the dead Bezel aspect helpers are removed"""
+
+    def test_aspect_keys_gone(self):
+        self.run_section(aspect_keys_gone_case)
+
+
+# ============================================================================
+# SECTION: Game deck backgrounds and splash images fit the canvas
+# ============================================================================
+
+
+def canvas_fit_case():
+    import game_deck as gd
+    with open(os.path.join(ROOT, "game_deck.py"), "r", encoding="utf-8") as handle:
+        src = handle.read()
+    check("_cover_scale_bg" not in src, "the cropping background scaler is gone")
+    check(src.count("_scale_to_canvas(") >= 4, "the menu background, console splash and DVD splash all use the canvas fit")
+    for w, h in ((640, 480), (1152, 864), (1280, 720), (500, 900)):
+        src_surf = pygame.Surface((160, 90))
+        src_surf.fill((10, 20, 30))
+        src_surf.set_at((0, 0), (255, 0, 0))
+        src_surf.set_at((159, 0), (0, 255, 0))
+        src_surf.set_at((0, 89), (0, 0, 255))
+        src_surf.set_at((159, 89), (255, 255, 0))
+        big = pygame.transform.scale(src_surf, (1600, 900))
+        out = gd._scale_to_canvas(big, w, h)
+        check(out.get_size() == (w, h), "%dx%d: the picture is scaled to exactly the canvas" % (w, h))
+        for name, pos, want in (("top left", (1, 1), (255, 0, 0)), ("top right", (w - 2, 1), (0, 255, 0)),
+                                ("bottom left", (1, h - 2), (0, 0, 255)), ("bottom right", (w - 2, h - 2), (255, 255, 0))):
+            got = tuple(out.get_at(pos))[:3]
+            check(sum(abs(a - b) for a, b in zip(got, want)) < 400 and max(got) > 60, "%dx%d: %s corner of the picture is still shown (no crop): %s" % (w, h, name, got))
+        check(tuple(out.get_at((w // 2, h // 2)))[:3] != (0, 0, 0), "%dx%d: no black bars in the middle" % (w, h))
+        for edge_pos in ((0, h // 2), (w - 1, h // 2), (w // 2, 0), (w // 2, h - 1)):
+            check(tuple(out.get_at(edge_pos))[:3] != (0, 0, 0), "%dx%d: no black bar at edge %s" % (w, h, edge_pos))
+    check(gd._scale_to_canvas(pygame.Surface((8, 8)), 0, 0).get_size() == (1, 1), "a zero-size canvas gives one pixel, not a crash")
+
+    class _Deck:
+        dvd_splash_enabled = True
+        DVD_LOAD_SCREEN_MS = 1000
+
+        def _ensure_fonts(self):
+            pass
+
+        def _get_dvd_custom_splash_surface(self):
+            pic = pygame.Surface((160, 90))
+            pic.fill((200, 50, 50))
+            return pic
+
+    for w, h in ((640, 480), (1152, 864)):
+        screen = pygame.Surface((w, h))
+        screen.fill((0, 0, 0))
+        gd.ExternalGameDeck._render_dvd_load_screen(_Deck(), screen, pygame.Rect(0, 0, w, h))
+        for pos in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1), (w // 2, 2), (w // 2, h - 3)):
+            check(tuple(screen.get_at(pos))[:3] != (0, 0, 0), "%dx%d: the DVD splash image fills the screen with no bars at %s" % (w, h, pos))
+
+
+class TestGameDeckCanvasFit(_SectionCase):
+    """Menu background, console splash image and DVD splash image are scaled to the whole canvas, never cropped and never letterboxed"""
+
+    def test_canvas_fit(self):
+        self.run_section(canvas_fit_case)
+
+
+# ============================================================================
+# SECTION: Game and DVD picture box follows the TV station rule
+# ============================================================================
+
+
+def game_dvd_picture_box_case():
+    import game_deck as gd
+    for gone in ("_dvd_pillarbox_active", "_game_pillarbox_active"):
+        check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
+    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
+    pictures = ((16, 9), (4, 3), (9, 16), (21, 9), (5, 4))
+    for bezel in (False, True):
+        for ratio in ("16:9", "4:3"):
+            config = {"fake_43_border_enabled": bezel, "aspect_ratio": ratio}
+            ns = {"pygame": pygame, "db": FakeDbConfig(config), "_PICTURE_STANDARD_ASPECTS": (16 / 9, 4 / 3, 9 / 16), "math": math}
+            for name in ("_compute_dvd_content_rect", "_compute_game_content_rect", "_dvd_bezel_video_fit", "_snap_standard_aspect"):
+                exec(main_function_code(name), ns)
+            for w, h in screens:
+                check(tuple(ns["_compute_dvd_content_rect"](w, h)) == (0, 0, w, h), "%dx%d bezel=%s %s: the DVD canvas is not the whole window" % (w, h, bezel, ratio))
+                check(tuple(ns["_compute_game_content_rect"](w, h)) == (0, 0, w, h), "%dx%d bezel=%s %s: the game canvas is not the whole window" % (w, h, bezel, ratio))
+    ns = {"pygame": pygame, "db": FakeDbConfig({"fake_43_border_enabled": False}), "_PICTURE_STANDARD_ASPECTS": (16 / 9, 4 / 3, 9 / 16), "math": math}
+    for name in ("_dvd_bezel_video_fit", "_snap_standard_aspect"):
+        exec(main_function_code(name), ns)
+    blit_ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
+               "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
+               "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
+    exec(main_function_code("_blit_video_with_screen_mode"), blit_ns)
+    dvd_blit = blit_ns["_blit_video_with_screen_mode"]
+
+    def bars_of(geom, w, h):
+        sides = geom["dest_x"] > 1 or w - (geom["dest_x"] + geom["draw_w"]) > 1
+        tops = geom["dest_y"] > 1 or h - (geom["dest_y"] + geom["draw_h"]) > 1
+        return sides, tops
+
+    for w, h in screens:
+        for pw, ph in pictures:
+            surf = pygame.Surface((pw * 40, ph * 40))
+            label = "%dx%d screen, %d:%d picture" % (w, h, pw, ph)
+            for mode in ("normal", "stretch"):
+                screen = pygame.Surface((w, h))
+                geom = {}
+                rect, pa = ns["_dvd_bezel_video_fit"](pygame.Rect(0, 0, w, h), w, h, ns["_snap_standard_aspect"](pw / ph), mode)
+                check(tuple(rect) == (0, 0, w, h), "DVD %s: the fit rect is not the whole window" % label)
+                dvd_blit(screen, surf, rect, mode=mode, geom_out=geom, pixel_aspect=pa, fit_aspect=ns["_snap_standard_aspect"](pw / ph))
+                sides, tops = bars_of(geom, w, h)
+                check(not (sides and tops), "DVD %s in %s has bars on both axes: %s" % (label, mode, geom))
+                if mode == "stretch":
+                    check(geom["draw_w"] >= w and geom["draw_h"] >= h, "DVD %s in Stretch does not fill the screen: %s" % (label, geom))
+            for mode in ("normal", "stretch"):
+                screen = pygame.Surface((w, h))
+                screen.fill((0, 0, 0))
+                frame = pygame.Surface((pw * 40, ph * 40))
+                frame.fill((200, 200, 200))
+                gd._libretro_blit_scaled(screen, frame, pygame.Rect(0, 0, w, h), mode=mode)
+                lit = [(x, y) for x in range(0, w, 4) for y in range(0, h, 4) if screen.get_at((x, y))[0] > 100]
+                xs = [p[0] for p in lit]
+                ys = [p[1] for p in lit]
+                left, right, top, bottom = min(xs), w - 1 - max(xs), min(ys), h - 1 - max(ys)
+                side_bars = left > 6 or right > 6
+                top_bars = top > 6 or bottom > 6
+                check(not (side_bars and top_bars), "Game %s in %s has bars on both axes: %s" % (label, mode, (left, right, top, bottom)))
+                if mode == "stretch":
+                    check(not side_bars and not top_bars, "Game %s in Stretch does not fill the screen: %s" % (label, (left, right, top, bottom)))
+                else:
+                    drawn = (max(xs) - min(xs) + 4) / float(max(ys) - min(ys) + 4)
+                    check(abs(drawn - pw / ph) < 0.05, "Game %s in Normal is distorted: %.3f" % (label, drawn))
+
+
+def game_no_second_box_case():
+    import game_deck as gd
+    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
+    frames = {"NES": (256, 240), "SNES": (256, 224), "GENESIS": (320, 224), "PSX": (320, 240), "N64": (640, 480),
+              "GBA": (240, 160), "GB": (160, 144), "ARCADE43": (1024, 768)}
+    four_three = {"PSX", "N64", "ARCADE43", "NES", "SNES"}
+    check(gov.GAME_DISPLAY_ASPECTS == {"NES": 4.0 / 3.0, "SNES": 4.0 / 3.0}, "the governor table makes NES and SNES 4:3 and lists no other console")
+
+    def shape_of(name, fw, fh):
+        return gov.GAME_DISPLAY_ASPECTS.get(name, fw / float(fh))
+
+    def lit_box(screen, w, h):
+        xs = [x for x in range(w) if screen.get_at((x, h // 2))[0] > 100]
+        ys = [y for y in range(h) if screen.get_at((w // 2, y))[0] > 100]
+        return xs[0], w - 1 - xs[-1], ys[0], h - 1 - ys[-1], xs[-1] - xs[0] + 1, ys[-1] - ys[0] + 1
+
+    deck = gd.ExternalGameDeck.__new__(gd.ExternalGameDeck)
+    deck._libretro_border_enabled = False
+    deck._libretro_border_surf = None
+    for mode in ("normal", "stretch"):
+        with mock.patch.object(gd, "_active_game_screen_mode", lambda mode=mode: mode):
+            for w, h in screens:
+                for name, (fw, fh) in frames.items():
+                    deck._libretro_console = name
+                    label = "%dx%d screen, %s frame %dx%d, %s" % (w, h, name, fw, fh, mode)
+                    screen = pygame.Surface((w, h))
+                    screen.fill((0, 0, 0))
+                    frame = pygame.Surface((fw, fh))
+                    frame.fill((200, 200, 200))
+                    deck._blit_libretro_frame_impl(screen, frame, pygame.Rect(0, 0, w, h))
+                    left, right, top, bottom, drawn_w, drawn_h = lit_box(screen, w, h)
+                    side_bars = left > 2 or right > 2
+                    top_bars = top > 2 or bottom > 2
+                    check(not (side_bars and top_bars), "%s: bars on both axes %s" % (label, (left, right, top, bottom)))
+                    if mode == "stretch":
+                        check(not side_bars and not top_bars, "%s: does not fill the screen %s" % (label, (left, right, top, bottom)))
+                    else:
+                        want = shape_of(name, fw, fh)
+                        check(abs(drawn_w / float(drawn_h) - want) < 0.02, "%s: drawn shape %.3f, wanted %.3f" % (label, drawn_w / float(drawn_h), want))
+                        check(side_bars or top_bars or abs(w / float(h) - want) < 0.02, "%s: no bars but the shape differs" % label)
+                        if (w, h) in ((1152, 864), (1024, 768)) and name in four_three:
+                            check(not side_bars and not top_bars, "%s: a 4:3 picture does not fill a 4:3 screen %s" % (label, (left, right, top, bottom)))
+    with mock.patch.object(gd, "_active_game_screen_mode", lambda: "normal"):
+        for name, fw, fh, want in (("SNES", 256, 224, (1152, 864)), ("NES", 256, 240, (1152, 864)), ("GENESIS", 320, 224, (1152, 806)), ("PSX", 320, 240, (1152, 864))):
+            deck._libretro_console = name
+            screen = pygame.Surface((1152, 864))
+            screen.fill((0, 0, 0))
+            frame = pygame.Surface((fw, fh))
+            frame.fill((200, 200, 200))
+            deck._blit_libretro_frame_impl(screen, frame, pygame.Rect(0, 0, 1152, 864))
+            check(lit_box(screen, 1152, 864)[4:] == want, "%s %dx%d draws %s on a 1152x864 screen, got %s" % (name, fw, fh, want, lit_box(screen, 1152, 864)[4:]))
+        snes_w, snes_h = gd._game_layout_shape("SNES", 256, 224)
+        check(snes_h == 224.0 and abs(snes_w / snes_h - 4.0 / 3.0) < 1e-9, "the SNES layout shape is 4:3 of its frame height")
+        check(gd._game_layout_shape("GENESIS", 320, 224) == (320.0, 224.0) and gd._game_layout_shape(None, 320, 224) == (320.0, 224.0), "a console not in the table keeps its frame shape")
+
+        deck._libretro_border_enabled = True
+        deck._libretro_border_path = None
+        deck._border_blit_cache = None
+        deck._libretro_border_rect_frac = (0.1, 0.1, 0.8, 0.8)
+        for name, fw, fh, fills in (("SNES", 256, 224, True), ("NES", 256, 240, True), ("PSX", 320, 240, True), ("GENESIS", 320, 224, False)):
+            deck._libretro_console = name
+            deck._border_blit_cache = None
+            deck._libretro_border_surf = pygame.Surface((1152, 864), pygame.SRCALPHA)
+            screen = pygame.Surface((1152, 864))
+            screen.fill((0, 0, 0))
+            frame = pygame.Surface((fw, fh))
+            frame.fill((200, 200, 200))
+            deck._blit_libretro_frame_impl(screen, frame, pygame.Rect(0, 0, 1152, 864))
+            inner_x, inner_y = 115, 86
+            inner_w, inner_h = 921, 691
+            corners = [screen.get_at((inner_x + 3, inner_y + 3))[0], screen.get_at((inner_x + inner_w - 4, inner_y + inner_h - 4))[0]]
+            if fills:
+                check(all(c > 100 for c in corners), "%s %dx%d fills the 4:3 console bezel window, corners %s" % (name, fw, fh, corners))
+            else:
+                check(screen.get_at((inner_x + 3, inner_y + inner_h // 2))[0] < 100 or screen.get_at((inner_x + inner_w // 2, inner_y + 3))[0] < 100,
+                      "%s %dx%d keeps its own shape inside the console bezel window" % (name, fw, fh))
+        deck._libretro_border_enabled = False
+
+    ns = {"pygame": pygame, "db": FakeDbConfig({"fake_43_border_enabled": True, "aspect_ratio": "16:9"}), "_real_screen_matches_aspect": lambda *a, **k: False,
+          "_selected_package_aspect": lambda: 16 / 9}
+    exec(main_function_code("_package_pillarbox_active"), ns)
+    for w, h in screens:
+        check(ns["_package_pillarbox_active"](w, h) is False, "%dx%d: with Bezel on the package box is never cut out of a game canvas" % (w, h))
+
+    with open(gd.__file__, encoding="utf-8") as handle:
+        deck_tree = ast.parse(handle.read())
+    for name in ("_blit_libretro_frame_impl", "_render_libretro_impl"):
+        node = next(n for c in ast.walk(deck_tree) if isinstance(c, ast.ClassDef) and c.name == "ExternalGameDeck"
+                    for n in c.body if isinstance(n, ast.FunctionDef) and n.name == name)
+        called = {x.func.id for x in ast.walk(node) if isinstance(x, ast.Call) and isinstance(x.func, ast.Name)}
+        called |= {x.func.attr for x in ast.walk(node) if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute)}
+        for banned in ("_snap_standard_aspect", "_compute_content_rect", "_video_screen_mode_rect", "_dvd_fit_aspect", "_dvd_video_fit", "_aspect_fit_blit"):
+            check(banned not in called, "%s calls %s, which would add a second box to a game" % (name, banned))
+    check("else _compute_game_content_rect(*screen.get_size())" in MAIN_SRC, "the Channel 03 draw hands a game the whole-window canvas")
+    check(MAIN_SRC.count("_compute_game_content_rect(") == 2, "the game canvas is computed in one place only")
+
+
+class TestGameDvdPictureBox(_SectionCase):
+    """Game and DVD pictures are boxed exactly like a TV station: the whole window, one fit, bars on one axis only"""
+
+    def test_game_dvd_picture_box(self):
+        self.run_section(game_dvd_picture_box_case)
+
+    def test_game_no_second_box(self):
+        self.run_section(game_no_second_box_case)
 
 
 # ============================================================================
@@ -6771,8 +7274,8 @@ def stick_case_maths_and_settings():
 def stick_case_screen():
     import game_deck as gd
     key_on = gov.STICK_DZ_ENABLED_KEY
-    check(mn.stick_dz_rows(False) == [mn.STICK_DZ_SWITCH, mn.CLOSE], "off shows only the switch and Close")
-    check(mn.stick_dz_rows(True) == [mn.STICK_DZ_SWITCH, mn.STICK_DZ_DEADZONE, mn.STICK_DZ_SENSITIVITY, mn.STICK_DZ_AXIS, mn.STICK_DZ_RESET, mn.CLOSE], "on shows the settings and Reset")
+    check(mn.stick_dz_rows(False) == [mn.STICK_DZ_SWITCH, mn.STICK_DZ_PLAYERS, mn.CLOSE], "off shows only the switch, the player squares and Close")
+    check(mn.stick_dz_rows(True) == [mn.STICK_DZ_SWITCH, mn.STICK_DZ_DEADZONE, mn.STICK_DZ_SENSITIVITY, mn.STICK_DZ_AXIS, mn.STICK_DZ_RESET, mn.STICK_DZ_PLAYERS, mn.CLOSE], "on shows the settings, Reset and the player squares")
     check(mn.stick_dz_cell(mn.stick_dz_rows(True), 99) == mn.CLOSE, "a number outside the rows is Close")
     for enabled in (False, True):
         rows = mn.stick_dz_rows(enabled)
@@ -6785,6 +7288,13 @@ def stick_case_screen():
             down.append(nxt)
         check(down == rows, "down walks every row in order (switch %s)" % enabled)
         check(table.cells[mn.CLOSE].get(mn.UP) == rows[-2], "up from Close reaches the row above it (switch %s)" % enabled)
+    for enabled in (False, True):
+        table = mn.stick_dz_table(enabled)
+        check(table.cells[mn.STICK_DZ_PLAYERS].get(mn.RIGHT) == mn.CLOSE and table.cells[mn.CLOSE].get(mn.LEFT) == mn.STICK_DZ_PLAYERS,
+              "Right from the squares reaches Close and Left from Close returns to them (switch %s)" % enabled)
+    check([mn.stick_dz_player_step(1, mn.LEFT), mn.stick_dz_player_step(1, mn.RIGHT), mn.stick_dz_player_step(3, mn.RIGHT),
+           mn.stick_dz_player_step(4, mn.RIGHT), mn.stick_dz_player_step(4, mn.LEFT)] == [1, 2, 4, None, 3],
+          "Left and Right step the player square, and Right from Player 4 leaves toward Close")
     check("stick_deadzone" in mn.GAMES_SUB_MENU_LEFT, "the MENU page has the Stick Deadzone row")
     check(mn.GAMES_SUB_MENU_LEFT.index("stick_deadzone") == mn.GAMES_SUB_MENU_LEFT.index("controller_map") + 1, "the row sits under Controller Mapping")
     rows = ui.get_games_sub_menu_rows(None, {}, "MENU", True)
@@ -6817,6 +7327,13 @@ def stick_case_screen():
         for cursor in range(len(rows)):
             gd.render_stick_deadzone_ui(surface, (20, 138, 996, 525), (0, 255, 128), _Db, cursor, rows, ((20000, -5000), (-32767, 32767)))
         check(surface.get_at((20 + 996 - 60, 138 + 525 - 30))[:3] != (0, 0, 0), "the Close button is drawn (switch %s)" % enabled)
+        for shown in gd.STICK_PLAYERS:
+            _Db.config[key_on] = True
+            surface = pygame.Surface((1036, 680), pygame.SRCALPHA)
+            rows = mn.stick_dz_rows(True)
+            gd.render_stick_deadzone_ui(surface, (20, 138, 996, 525), (0, 255, 128), _Db, rows.index(mn.STICK_DZ_PLAYERS), rows, None, shown)
+            square_x = 20 + 16 + (shown - 1) * 42 + 17
+            check(surface.get_at((square_x, 138 + 525 - 14 - 30))[:3] != (0, 0, 0), "the square of Player %d is drawn" % shown)
 
 
 def stick_case_wiring():
@@ -6892,6 +7409,266 @@ class TestStickDeadzone(_SectionCase):
 
     def test_stick_main_script_calls(self):
         self.run_section(stick_case_main_script_calls)
+
+
+# ============================================================================
+# SECTION: TV guide highlight stays in view
+# ============================================================================
+
+
+def guide_highlight_case():
+    cols = 4
+    total = 336
+    clock = {"t": datetime.datetime(2026, 10, 12, 14, 10, 0)}
+
+    class _Clock:
+        @staticmethod
+        def now():
+            return clock["t"]
+
+    def clamp(raw, n):
+        return max(0, min(raw, total - n))
+
+    def make_schedule(rng):
+        t, out = -86400, []
+        while t < 8 * 86400:
+            d = rng.choice([1200, 1800, 1800, 3600, 5400, 7200, 9000, 18000])
+            out.append((t, t + d))
+            t += d
+            if rng.random() < 0.25:
+                t += rng.choice([600, 1800, 3000, 7200])
+        return out
+
+    scheds = {}
+
+    def stops_for(ch, time_idx):
+        vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
+        stops, cursor = [], vs
+        for a, b in scheds[ch]:
+            if b <= vs:
+                continue
+            if a >= ve:
+                break
+            cs = max(vs, a)
+            if cs > cursor:
+                for c in range(int((cursor - vs) / 1800.0), int((cs - vs - 1) / 1800.0) + 1):
+                    stops.append({"col": c, "abs": vs + c * 1800, "key": ("offair", c)})
+            stops.append({"col": int((cs - vs) / 1800.0 + 1e-6), "abs": a, "key": ("show", round(a))})
+            cursor = min(ve, b)
+        for c in range(int((cursor - vs) / 1800.0) if cursor < ve else cols, cols):
+            stops.append({"col": c, "abs": vs + c * 1800, "key": ("offair", c)})
+        return stops
+
+    state = {}
+
+    def live_idx():
+        return clock["t"].hour * 2 + (1 if clock["t"].minute >= 30 else 0)
+
+    def view_idx():
+        return clamp(live_idx() + state.get("selected_guide_time_idx", 0), cols)
+
+    def refresh():
+        state["guide_current_row_stops"] = stops_for(str(state["selected_guide_channel"]).zfill(2), view_idx())
+
+    log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
+    ns = dict(app_state=state, log=log, broadcast_clock=_Clock, db=object(), str=str,
+              get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
+              _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh,
+              get_current_guide_time_idx=lambda a, d: view_idx(),
+              get_cached_row_stops=lambda ch, expected_time_idx=None: None,
+              get_guide_visible_rows=lambda d: 4)
+    for name in ("_guide_jump_col", "_resync_guide_stop_after_row_switch", "_guide_keep_highlight_in_view"):
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+
+    def visible_problem():
+        vs, ve = view_idx() * 1800, view_idx() * 1800 + cols * 1800
+        target = state.get("guide_selected_abs_time")
+        if target is None:
+            return None
+        hit = [x for x in scheds[str(state["selected_guide_channel"]).zfill(2)] if x[0] <= target < x[1]]
+        if not hit:
+            return None if vs <= target < ve else "gap target outside the window"
+        a, b = hit[0]
+        return "highlighted show outside the window" if (b <= vs or a >= ve) else None
+
+    broken = []
+    for seed in range(120):
+        rng = random.Random(seed)
+        for c in range(5, 9):
+            scheds[str(c).zfill(2)] = make_schedule(rng)
+        clock["t"] = datetime.datetime(2026, 10, 12, 14, 10, 0)
+        state.clear()
+        state.update({"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0})
+        refresh()
+        ns["_resync_guide_stop_after_row_switch"]()
+        ns["_guide_keep_highlight_in_view"]()
+        history = ""
+        for _ in range(60):
+            act = rng.choice("LRRUDT")
+            history += act
+            if act == "T":
+                clock["t"] += datetime.timedelta(minutes=rng.choice([5, 20, 30, 45]))
+            elif act in "LR":
+                ns["_guide_jump_col"](1 if act == "R" else -1)
+            else:
+                state["selected_guide_channel"] = 5 + ((state["selected_guide_channel"] - 5 + (1 if act == "D" else -1)) % 4)
+                ns["_resync_guide_stop_after_row_switch"]()
+            ns["_guide_keep_highlight_in_view"]()
+            problem = visible_problem()
+            if problem:
+                broken.append("seed %d after %s: %s" % (seed, history[-10:], problem))
+                break
+    check(not broken, "guide highlight left the window: %s" % broken[:3])
+
+    main_src = MAIN_SRC
+    frame_block = main_src.index('    if app_state["current_channel"] == "04":\n        _guide_keep_highlight_in_view()\n        if (now_ticks >= app_state.get("guide_inactivity_timer", 0)')
+    check(frame_block > 0, "the per-frame guide block calls the keeper before the inactivity check")
+    check('app_state["_guide_live_idx_seen"] = None\n        app_state["guide_inactivity_timer"]' in main_src, "entering the guide clears the keeper's last seen column")
+
+
+class TestGuideHighlightInView(_SectionCase):
+    """The TV guide highlight never ends up outside the visible columns, including when the live clock slides the window"""
+
+    def test_guide_highlight_in_view(self):
+        self.run_section(guide_highlight_case)
+
+
+# ============================================================================
+# SECTION: Scan of every block of a block-mode channel
+# ============================================================================
+
+
+def _block_scan_ns(block_mode, now_hour, schedules, scanned=()):
+    """Real scan-snapshot, progress and deep-queue functions cut out of retro_tv_emulator.py, run against a fake one-channel database."""
+    fake_db = types.SimpleNamespace(channels_db={"05": {
+        "active": True, "block_mode": block_mode, "scheduling_mode": "random_slots",
+        "schedules": schedules, "commercials_enabled": False}}, config={})
+    fixed_now = datetime.datetime(2026, 10, 13, now_hour, 30)
+
+    def lineup(ch, info, block, now, peek_only=False):
+        files = [item["path"] for item in info["schedules"].get(block, [])]
+        return [{"path": f, "duration": 1800} for f in files], block
+
+    ns = {"db": fake_db, "time": time, "os": os, "log": MagicMock(), "copy": __import__("copy"),
+          "SIX_HOUR_BLOCK_NAMES": list(media.SIX_HOUR_BLOCK_NAMES),
+          "SCAN_GATHER_LIBRARY_LOOKUPS": 400,
+          "broadcast_clock": types.SimpleNamespace(now=lambda: fixed_now),
+          "_get_channel_ordered_content": lambda ch, info: lineup(ch, info, _airing_block(block_mode, now_hour), fixed_now),
+          "_get_probe_now_state": lambda ch: {"file": ""},
+          "_get_block_ordered_content": lineup,
+          "_paths_from_entry": lambda e: [e["path"]] if isinstance(e, dict) else [str(e)],
+          "_cached_path_exists": lambda p: True,
+          "_scan_stages_pending": lambda p, g, d, lk: os.path.normpath(p) not in {os.path.normpath(x) for x in scanned},
+          "_scan_file_is_done": lambda p, g, d, mo, lk: os.path.normpath(p) in {os.path.normpath(x) for x in scanned},
+          "_scan_snapshot_channel": lambda ch: ns["_build_scan_snapshot"]()["channels"].get(ch),
+          "_front_load_watched_channel": lambda items: items}
+    for name in ("_block_names_after_airing", "_get_block_ordered_content_peek", "_build_scan_snapshot",
+                 "_compute_channel_scan_progress", "_gather_deep_backlog_queue"):
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    return ns, fixed_now
+
+
+def _airing_block(block_mode, hour):
+    if block_mode == "six_block":
+        return media.SIX_HOUR_BLOCKS[hour // 4][0]
+    if block_mode == "full_day":
+        return "Full Day"
+    return "Morning" if 4 <= hour < 12 else ("Evening" if 12 <= hour < 20 else "Night")
+
+
+def suite_block_scan():
+    def sched(names):
+        return {n: [{"path": "/m/%s_%d.mkv" % (n.replace(" ", ""), i)} for i in range(2)] for n in names}
+
+    eight = ["Morning", "Evening", "Night"]
+    six = list(media.SIX_HOUR_BLOCK_NAMES)
+
+    ns, now = _block_scan_ns("eight_hour", 9, sched(eight))
+    check(ns["_block_names_after_airing"](ns["db"].channels_db["05"], now) == ["Evening", "Night"], "8 hour at 09:30 (Morning): Evening then Night follow")
+    ns2, now2 = _block_scan_ns("eight_hour", 21, sched(eight))
+    check(ns2["_block_names_after_airing"](ns2["db"].channels_db["05"], now2) == ["Morning", "Evening"], "8 hour at 21:30 (Night): Morning then Evening follow")
+    ns3, now3 = _block_scan_ns("six_block", 17, sched(six))
+    check(ns3["_block_names_after_airing"](ns3["db"].channels_db["05"], now3) == ["8-12am", "12-4am", "4-8am", "8-12pm", "12-4pm"], "4 hour at 17:30 (4-8pm): the other five blocks follow in airing order")
+    for mode in ("full_day",):
+        nsf, nowf = _block_scan_ns(mode, 9, sched(["Full Day"]))
+        check(nsf["_block_names_after_airing"](nsf["db"].channels_db["05"], nowf) == [], "Full Day has no other blocks")
+    nsm, nowm = _block_scan_ns("eight_hour", 9, sched(eight))
+    nsm["db"].channels_db["05"]["scheduling_mode"] = "marathon"
+    check(nsm["_block_names_after_airing"](nsm["db"].channels_db["05"], nowm) == [], "Marathon has no other blocks")
+    nsv, nowv = _block_scan_ns("eight_hour", 9, sched(eight))
+    nsv["db"].channels_db["05"]["is_visualizer"] = True
+    check(nsv["_block_names_after_airing"](nsv["db"].channels_db["05"], nowv) == [], "a visualizer has no other blocks")
+
+    for label, mode, hour, names, total in (("8 hour", "eight_hour", 9, eight, 6), ("4 hour", "six_block", 17, six, 12)):
+        n, _ = _block_scan_ns(mode, hour, sched(names))
+        snap = n["_build_scan_snapshot"]()
+        done, tot = n["_compute_channel_scan_progress"](snap, [400])["05"]
+        check(tot == total, "%s: the bar counts every block's files (%d, got %d)" % (label, total, tot))
+        queue = n["_gather_deep_backlog_queue"]()
+        queued = [it[3] for it in queue]
+        check(len(queued) == total - 2 and len(set(queued)) == len(queued), "%s: the deep queue holds every off-air block's file once, the airing block's two files stay in the priority tiers (%d, got %d)" % (label, total - 2, len(queued)))
+
+    n, _ = _block_scan_ns("six_block", 17, sched(six))
+    blocks_in_queue = [it[2] for it in n["_gather_deep_backlog_queue"]()]
+    first_seen = list(dict.fromkeys(blocks_in_queue))
+    check(first_seen[0] == "8-12am" and first_seen[-1] == "12-4pm", "4 hour: the other blocks are queued by how soon they air, next block first (got %s)" % first_seen)
+
+    n, _ = _block_scan_ns("eight_hour", 9, sched(eight), scanned=["/m/Evening_0.mkv", "/m/Night_1.mkv"])
+    queued = [it[3] for it in n["_gather_deep_backlog_queue"]()]
+    check("/m/Evening_0.mkv" not in queued and "/m/Night_1.mkv" not in queued, "files already scanned are not queued again")
+    done, tot = n["_compute_channel_scan_progress"](n["_build_scan_snapshot"](), [400])["05"]
+    check((done, tot) == (2, 6), "scanned files count as done in the bar (got %s)" % ((done, tot),))
+
+    shared = sched(eight)
+    shared["Night"][0] = dict(shared["Morning"][0])
+    n, _ = _block_scan_ns("eight_hour", 9, shared)
+    done, tot = n["_compute_channel_scan_progress"](n["_build_scan_snapshot"](), [400])["05"]
+    queued = [it[3] for it in n["_gather_deep_backlog_queue"]()]
+    check(tot == 5, "a file reused in two blocks counts once in the bar (got %d)" % tot)
+    ns_order = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3}
+    exec(compile(get_function_source("_order_scan_pipeline"), "<extracted:_order_scan_pipeline>", "exec"), ns_order)
+    tiers = [[("channel", "05", "Morning", os.path.normpath("/m/Morning_0.mkv"))], [], [], []]
+    items = ns_order["_order_scan_pipeline"](tiers, [("channel", "05", it[2], it[3]) for it in n["_gather_deep_backlog_queue"]()])
+    paths = [it[5] for it in items]
+    check(len(paths) == len(set(paths)), "the pipeline scans a file reused across blocks once")
+    check(items[0][0] == 0, "the airing file still comes first, ahead of every off-air block file")
+
+
+class TestBlockScan(_SectionCase):
+    """8 hour and 4 hour channels count and scan every block, in airing order, skipping scanned files"""
+
+    def test_block_scan(self):
+        self.run_section(suite_block_scan)
+
+
+
+def suite_block_peek_isolated():
+    plog = {"show_pos": {"__FAIRNESS__": {"run": 3, "used": {"Show A": 2}}, "Show A": 1}}
+    eps = lambda name, n: [{"path": "/m/%s S01E%02d.mkv" % (name, i + 1), "duration": 1500} for i in range(n)]
+    info = {"scheduling_mode": "random_slots", "block_mode": "eight_hour", "playback_log": plog,
+            "schedules": {"Evening": eps("Show A", 6) + eps("Show B", 6)}, "pair_threshold_minutes": 0}
+    fake_db = types.SimpleNamespace(config={"media_probe_cache": {}}, channels_db={"05": info}, save_settings_async=lambda **k: None)
+    ns = {"db": fake_db, "time": time, "os": os, "datetime": datetime, "log": MagicMock(), "copy": __import__("copy"),
+          "_ORDERED_CONTENT_CACHE": {}, "_ORDERED_CONTENT_CACHE_TTL_MS": 8000,
+          "_prune_ordered_content_cache": lambda ms: None, "_cached_path_exists": lambda p: True,
+          "resolve_track_duration": media.resolve_track_duration, "track_duration_is_estimated": media.track_duration_is_estimated,
+          "SIX_HOUR_BLOCK_NAMES": list(media.SIX_HOUR_BLOCK_NAMES), "_start_order_seed": lambda i, o: "1:%d" % o,
+          "SHORT_EPISODE_PAIRING_VERSION": media.SHORT_EPISODE_PAIRING_VERSION,
+          "_reconcile_cached_lineup": lambda *a, **k: ([], None), "_apply_cached_durations": lambda t, d: t,
+          "pair_short_episodes": media.pair_short_episodes, "build_show_rotation": media.build_show_rotation}
+    exec(compile(get_function_source("_get_block_ordered_content"), "<extracted:_get_block_ordered_content>", "exec"), ns)
+    before = __import__("copy").deepcopy(plog)
+    lineup, name = ns["_get_block_ordered_content"]("05", info, "Evening", datetime.datetime(2026, 10, 13, 9, 30), peek_only=True)
+    check(name == "Evening" and len(lineup) > 0, "an off-air block's lineup is built from the real rotation")
+    check(plog == before, "reading an off-air block leaves the saved show positions and fairness counters unchanged")
+
+
+class TestBlockPeekIsolated(_SectionCase):
+    """Reading a block that is not on air never moves the real scheduler's saved state"""
+
+    def test_block_peek_isolated(self):
+        self.run_section(suite_block_peek_isolated)
+
 
 
 # ============================================================================

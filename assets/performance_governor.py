@@ -695,6 +695,39 @@ STICK_DZ_OFF_DINPUT_THRESHOLD = 0
 STICK_DZ_TEST_HOLD_SECONDS = 0.25
 STICK_DZ_TEST_RADIUS = 50
 
+# VALUES CHANGE HERE (stick activity numbers: how far a stick must move, out of 32767, to wake the screensaver while a game plays; the same for the multitap controller-activity check; how far a joystick axis must move, 0 to 1, to wake the Channel 03 screensaver; how far a joystick axis must move, 0 to 1, to press a menu direction)
+STICK_SS_ACTIVITY_DEADZONE = 6000
+STICK_MULTITAP_ACTIVITY_DEADZONE = 6000
+STICK_CH03_AXIS_ACTIVITY_DEADZONE = 8000 / 32767.0
+STICK_MENU_AXIS_THRESHOLD = 0.6
+
+
+# ============================================================================
+# SECTION: Controller read values
+# ============================================================================
+# VALUES CHANGE HERE (trigger travel, 0 to 255, that counts as a button press in the Controller Map and the DVD button map; trigger travel for the in-game hotkey; milliseconds before that hotkey can fire again; how far, in raw DirectInput units, an axis must move to show a pad is alive)
+TRIGGER_PRESS_THRESHOLD = 30
+GAME_HOTKEY_TRIGGER_THRESHOLD = 128
+GAME_HOTKEY_COOLDOWN_MS = 2000
+DINPUT_AXIS_LIVENESS_THRESHOLD = 1500
+
+# VALUES CHANGE HERE (seconds a pad identity scan is reused; seconds a DirectInput read is reused within one frame; seconds a Linux joystick may stay silent before it is dropped; menu pad polls per second; seconds between polls with no pad; polls with no pad before the slow rate)
+HID_IDENTITY_CACHE_TTL_SECONDS = 2.0
+DINPUT_FRAME_CACHE_WINDOW_SECONDS = 0.008
+JS_DEAD_TIMEOUT_SECONDS = 5.0
+XI_NAV_POLL_HZ = 30
+XI_NAV_NO_PAD_INTERVAL_SECONDS = 0.25
+XI_NAV_MISSES_BEFORE_SLOW = 30
+
+
+# ============================================================================
+# SECTION: Broadcast clock values
+# ============================================================================
+# VALUES CHANGE HERE (seconds between clock resyncs; size of a clock step that forces a resync; size of a backward jitter the clock absorbs)
+BROADCAST_CLOCK_RESYNC_SECONDS = 60.0
+BROADCAST_CLOCK_STEP_TOLERANCE_SECONDS = 2.0
+BROADCAST_CLOCK_JITTER_TOLERANCE_SECONDS = 0.25
+
 
 # ============================================================================
 # SECTION: Video decode canvas
@@ -709,6 +742,13 @@ VIDEO_DECODE_CANVAS_HD = (1280, 720)
 # ============================================================================
 # VALUES CHANGE HERE
 PICTURE_STANDARD_ASPECTS = (16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0)
+
+
+# ============================================================================
+# SECTION: Game picture shapes
+# ============================================================================
+# VALUES CHANGE HERE (the shape a console's picture is laid out as in Normal, width divided by height; a console not listed keeps the shape of its own frame)
+GAME_DISPLAY_ASPECTS = {"NES": 4.0 / 3.0, "SNES": 4.0 / 3.0}
 
 
 # ============================================================================
