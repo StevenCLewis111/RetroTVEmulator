@@ -101,6 +101,8 @@ if performance_governor is not None:
     performance_governor.set_shell_mode("--as-shell" in sys.argv)
 # WARNING: the 400 fallback must match MENU_NAV_REPEAT_DELAY_MS in performance_governor.py; it is used only when that module fails to import.
 _MENU_NAV_REPEAT_DELAY_MS = performance_governor.MENU_NAV_REPEAT_DELAY_MS if performance_governor is not None else 400
+# WARNING: the 400 fallback must match CHANNEL_SURF_HESITATE_MS in performance_governor.py; it is used only when that module fails to import.
+_CHANNEL_SURF_HESITATE_MS = performance_governor.CHANNEL_SURF_HESITATE_MS if performance_governor is not None else 400
 from media import resolve_main_dir, resolve_loudness_dir, resolve_bezel_dir, discover_bezel_style_files, LOUDNESS_PROBE_MAX_CONCURRENT, get_music_loudness_gain
 media.set_caption_memory_refusal_handler(lambda total_gb, available_gb, needed_gb: _on_caption_memory_refused(total_gb, available_gb, needed_gb))
 
@@ -1865,8 +1867,9 @@ def _bezel_led_stem():
 
 
 def _bezel_led_channel_text():
-    """Return the text shown after CH on the bezel LED: the digits being typed, else the current channel."""
-    return app_state.get("digit_buffer") or app_state["current_channel"]
+    """Return the channel text shown on the bezel LED and on the picture: the digits being typed, else the channel being flipped to, else the current channel."""
+    flipped_to = app_state.get("surf_target", "") if app_state.get("osd_channel_pending", False) else ""
+    return app_state.get("digit_buffer") or flipped_to or app_state["current_channel"]
 
 
 def _record_led_text_top_y(text_top_y, stem):
@@ -2898,6 +2901,23 @@ def _blit_video_with_screen_mode(screen, surf, rect, mode=None, analysis_surf=No
     _last_screen_mode_picture_rect = pygame.Rect(dest_x, dest_y, draw_w, draw_h).clip(rect)
 
     return scaled
+
+
+def _draw_video_picture(screen, surf, rect, *, mode=None, analysis_surf=None,
+                        geom_out=None, pixel_aspect=1.0, timing_out=None,
+                        fit_aspect=None):
+    """Draw a TV picture through the single Screen Mode path used by station and guide preview."""
+    return _blit_video_with_screen_mode(
+        screen,
+        surf,
+        pygame.Rect(rect),
+        mode=mode,
+        analysis_surf=analysis_surf,
+        geom_out=geom_out,
+        pixel_aspect=pixel_aspect,
+        timing_out=timing_out,
+        fit_aspect=fit_aspect,
+    )
 
 
 def _watermark_bounds_rect(fallback_rect):
@@ -4256,7 +4276,7 @@ def _apply_static_noise_effect(screen, rect, ch_str):
         if w < 8 or h < 8:
             return
         now = pygame.time.get_ticks()
-        severity = _STATIC_HEAVY
+        severity = _static_noise_severity_at(now)
         tint_style = _current_noise_tint_style()
         tint_hue = db.config.get("theme_bg_hue", 220) if (db is not None and tint_style == "theme") else 0
         cache = _static_noise_overlay_cache
@@ -5405,11 +5425,9 @@ def _caption_cues_for(path):
                     pass
                 if start_sec <= 0.0:
                     try:
-                        vlc = globals().get("vlc_engine")
-                        if vlc is not None and vlc.player is not None:
-                            pos_ms = vlc.player.get_time()
-                            if pos_ms and pos_ms > 0:
-                                start_sec = pos_ms / 1000.0
+                        pos_sec = _tv_playback_seconds()
+                        if pos_sec is not None and pos_sec > 0:
+                            start_sec = pos_sec
                     except Exception:
                         pass
                 live_session = LiveCaptionSession(
@@ -5978,6 +5996,27 @@ def _confirm_playback_started(ch_key, attempt_id, file_path, seek_offset, slot_s
             log.warning("_confirm_playback_started: failed to persist playback_anchor for ch%s: %s", ch_key, e)
 
 
+def _make_live_playback_start_callback(ch_key, state, start_reason):
+    _state = dict(state)
+    _key = str(ch_key).zfill(2)
+
+    def _on_confirmed(success, attempt_id, deferred):
+        if success:
+            _confirm_playback_started(
+                _key, attempt_id, _state.get("file"), _state.get("seek", 0),
+                _state.get("seek_slot_offset", 0), _state.get("duration", 1800),
+                _state.get("mode", "Video"), _state.get("block", "Morning"),
+                _state.get("interior_cut", False), deferred,
+            )
+        else:
+            _confirm_playback_failed(
+                _key, attempt_id, _state.get("file"), deferred,
+                reason=start_reason,
+            )
+
+    return _on_confirmed
+
+
 def _confirm_playback_failed(ch_key, attempt_id, file_path, deferred,
                               reason="deferred_open_failed", clear_live_channel=False):
     """Records a failed open that VLC never accepted; companion to _confirm_playback_started."""
@@ -6137,6 +6176,14 @@ def _seed_last_video_frame(dst_context, src_context):
 STATIC_TRANSITION_MS = 1500
 
 
+def _configured_transition_style():
+    """Return the transition style using one normalized value everywhere."""
+    try:
+        return str(db.config.get("transition_type", "black")).strip().lower()
+    except Exception:
+        return "black"
+
+
 _guide_dirty_event = threading.Event()
 
 GUIDE_PREVIEW_SETTLE_MS = 500
@@ -6210,22 +6257,11 @@ def _start_guide_preview_load(hl_ch, hl_state):
     # WARNING: do not add a fixed startup pad; buffering time varies, so it would make every guide preview seek inaccurate.
     _VLC_STARTUP_LATENCY_S = 0.0
 
-    def _gp_on_confirmed(success, attempt_id, deferred,
-                          _hl_ch=hl_ch, _hl_state=dict(hl_state)):
-        if success:
-            _confirm_playback_started(
-                _hl_ch, attempt_id, _hl_state["file"],
-                _hl_state.get("seek", 0) + _VLC_STARTUP_LATENCY_S,
-                _hl_state.get("seek_slot_offset", 0),
-                _hl_state.get("duration", 1800),
-                _hl_state.get("mode", "Video"),
-                _hl_state.get("block", "Morning"),
-                _hl_state.get("interior_cut", False),
-                deferred,
-            )
-        else:
-            _confirm_playback_failed(_hl_ch, attempt_id, _hl_state.get("file"), deferred,
-                                      reason="guide_preview_open_failed")
+    _gp_state = dict(hl_state)
+    _gp_state["seek"] = _gp_state.get("seek", 0) + _VLC_STARTUP_LATENCY_S
+    _gp_on_confirmed = _make_live_playback_start_callback(
+        hl_ch, _gp_state, "guide_preview_open_failed"
+    )
 
     app_state["last_video_play_started_at"] = pygame.time.get_ticks()
     vlc_engine.play_file_segmented(
@@ -6260,7 +6296,7 @@ def _arm_warm_transition_shield(engine, burst_ms):
 
 
 def _arm_guide_preview_transition():
-    _transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+    _transition_style = _configured_transition_style()
     if _transition_style == "static":
         app_state["guide_preview_black_until"] = 0
         app_state["guide_preview_static_until"] = pygame.time.get_ticks() + STATIC_TRANSITION_MS
@@ -6328,50 +6364,33 @@ def _capture_guide_preview_position(ch_key):
 
 
 def _get_guide_hl_playback_state(ch_key, slot="hl"):
-    ch_key = str(ch_key).zfill(2)
-    now_ticks = pygame.time.get_ticks()
+    """Return the exact scheduled state used by the station playback resolver.
 
-    preview_cache = app_state.get("_guide_preview_position_cache", {})
-    preview_resume = preview_cache.get(ch_key)
-    if preview_resume and preview_resume.get("file"):
-        _resume_seek = preview_resume.get("seek", 0) + (
-            now_ticks - preview_resume.get("captured_ticks", now_ticks)
-        ) / 1000.0
-        _resume_dur = preview_resume.get("duration", 0)
-        if _resume_dur > 1.0 and _resume_seek < _resume_dur:
-            resumed = dict(preview_resume)
-            resumed["mode"] = (
-                "Commercial"
-                if _is_commercial_file_for_channel(ch_key, preview_resume["file"])
-                else "Video"
-            )
-            resumed["seek"] = _resume_seek
-            resumed["block"] = ""
-            return resumed
-        preview_cache.pop(ch_key, None)
+    Guide preview must not maintain a second resume/cache timeline. The selected
+    station and its guide preview both resolve through calculate_slotted_playback_state,
+    so schedule boundaries, Static recovery, and Visualizer timing stay identical.
+    """
+    return calculate_slotted_playback_state(str(ch_key).zfill(2))
 
-    _live_ch_now = app_state.get("_live_playback_channel", "")
-    if _live_ch_now and ch_key == str(_live_ch_now).zfill(2):
-        return calculate_slotted_playback_state(ch_key)
 
-    cache_key = f"_guide_hl_state_cache_{slot}"
-    cache = app_state.get(cache_key)
-    if cache is not None and cache.get("ch") == ch_key:
-        age_ms = now_ticks - cache.get("ts", -_GUIDE_HL_STATE_HOLD_MS)
-        cached_state = cache.get("state", {})
-        if (cached_state.get("mode") in ("Video", "Commercial")
-                and cached_state.get("file")
-                and age_ms < _GUIDE_HL_STATE_HOLD_MS):
-            ridden_state = dict(cached_state)
-            ridden_state["seek"] = cached_state.get("seek", 0) + (age_ms / 1000.0)
-            return ridden_state
-        if age_ms < _GUIDE_HL_STATE_REFRESH_MS:
-            return cached_state
-    state = calculate_slotted_playback_state(ch_key)
-    app_state[cache_key] = {"ch": ch_key, "state": state, "ts": now_ticks}
-    return state
+def _render_visualizer_frame(surface, theme, amplitude, style_override=None):
+    """Draw one visualizer frame through the shared deck path."""
+    visualizer_deck.render_active_engine(
+        surface,
+        theme,
+        mock_amplitude=amplitude,
+        style_override=style_override,
+    )
+    if hasattr(visualizer_deck, "flash_intensity"):
+        visualizer_deck.flash_intensity = 0.0
+    if hasattr(visualizer_deck, "bg_flash"):
+        visualizer_deck.bg_flash = 0
+    if hasattr(visualizer_deck, "galaxy_glow"):
+        visualizer_deck.galaxy_glow = 0
+
 
 pygame_hwnd = pygame.display.get_wm_info().get("window")
+
 
 print("Initial window created successfully! at", time.time(), flush=True)
 
@@ -6528,7 +6547,7 @@ if sys.platform == "win32" and pygame_hwnd:
         if _orig_wndproc_ptr:
             print("[BOOT] WM_APPCOMMAND diagnostic subclass installed.", flush=True)
         else:
-            print("[APPCOMMAND] SetWindowLongPtrW returned NULL — subclass inactive.", flush=True)
+            print("[APPCOMMAND] SetWindowLongPtrW returned NULL ������� subclass inactive.", flush=True)
     except Exception as _subclass_err:
         log.warning(f"[APPCOMMAND] subclass install failed: {_subclass_err}")
 
@@ -6664,6 +6683,10 @@ app_state = {
     "_live_playback_channel": "",
     "osd_channel_timer": 0,
     "osd_channel_pending": False,
+    "surf_target": "",
+    "surf_commit_at": 0,
+    "surf_origin": "",
+    "surf_leave_position": None,
     "osd_volume_timer": 0,
     "active_menu_tab": "System",
     "selected_guide_channel": 5,
@@ -6700,6 +6723,7 @@ app_state = {
     "_hold_volume": menu_nav.HoldState(),
     "_transition_static_fired": False,
     "_warm_static_mute_active": False,
+    "channel_switch_static_until": 0,
     "_pending_channel_activation": None,
     "_boot_suppress_static": False,
     "_crt_power_on_started_at": 0,
@@ -6828,7 +6852,7 @@ print("Basic app state created.")
 
 print("Starting minimal imports...")
 
-from media import RetroDatabase, get_media_duration, get_media_video_dimensions, get_media_loudness_gain, get_pair_loudness_gain, build_show_rotation, fast_forward_show_pos, pair_short_episodes, build_ordered_tracks, build_block_timeline, split_movies_and_series, note_random_episode_played, resolve_track_duration, track_duration_is_estimated, SIX_HOUR_BLOCKS, SIX_HOUR_BLOCK_NAMES, NoAudioStreamError, UnplayableMediaError, LoudnessProbeTimeoutError, LOUDNESS_GAIN_CEILING, LOUDNESS_CONVERGENCE_DB, _movie_part_info, _probe_duration_seconds_fast, SHORT_EPISODE_PAIRING_VERSION, check_media_truly_ended
+from media import read_block_lineup, build_raw_tracks, build_pending_tracks, build_commercial_tracks, block_seed_offset, block_day_seed, block_start_date, block_key_for, block_length_seconds, build_block_rotation, build_channel_timeline, reconcile_cached_lineup, apply_cached_durations, saved_block_lineup, lineup_paths, lineup_groups, RetroDatabase, get_media_duration, get_media_video_dimensions, get_media_loudness_gain, get_pair_loudness_gain, build_show_rotation, fast_forward_show_pos, pair_short_episodes, build_ordered_tracks, build_block_timeline, split_movies_and_series, note_random_episode_played, resolve_track_duration, track_duration_is_estimated, SIX_HOUR_BLOCKS, SIX_HOUR_BLOCK_NAMES, NoAudioStreamError, UnplayableMediaError, LoudnessProbeTimeoutError, LOUDNESS_GAIN_CEILING, LOUDNESS_CONVERGENCE_DB, _movie_part_info, _probe_duration_seconds_fast, SHORT_EPISODE_PAIRING_VERSION, check_media_truly_ended
 from media import (
     TARGET_LUFS,
     _season_folder_base,
@@ -7147,6 +7171,13 @@ def _fe_open(title, valid_exts, context):
             _fe_navigate(remembered)
 
 
+def _fe_request_close():
+    """Close the file explorer when its asynchronous work has finished."""
+    if app_state.get("file_explorer_done_requested", False):
+        app_state["file_explorer_done_requested"] = False
+        _fe_close(True)
+
+
 def _fe_navigate(path):
     app_state["file_explorer_cwd"]        = path
     app_state["file_explorer_scroll"]     = 0
@@ -7200,10 +7231,8 @@ def _fe_poll_scan():
         app_state["file_explorer_items"]          = result
         app_state["file_explorer_scan_pending"]    = False
         app_state["file_explorer_scan_started_ms"] = 0
-        if (app_state.get("file_explorer_done_requested", False)
-                and app_state.get("file_explorer_expand_pending", 0) <= 0):
-            app_state["file_explorer_done_requested"] = False
-            _fe_close(True)
+        if app_state.get("file_explorer_expand_pending", 0) <= 0:
+            _fe_request_close()
         return
 
     started_ms = app_state.get("file_explorer_scan_started_ms", 0)
@@ -7212,9 +7241,7 @@ def _fe_poll_scan():
         app_state["file_explorer_scan_request_id"] += 1
         app_state["file_explorer_scan_pending"]    = False
         app_state["file_explorer_scan_started_ms"] = 0
-        if app_state.get("file_explorer_done_requested", False):
-            app_state["file_explorer_done_requested"] = False
-            _fe_close(True)
+        _fe_request_close()
 
 
 def _fe_poll_expand():
@@ -7231,9 +7258,7 @@ def _fe_poll_expand():
             app_state["file_explorer_expand_request_id"] += 1
             app_state["file_explorer_expand_pending"]    = 0
             app_state["file_explorer_expand_started_ms"] = 0
-            if app_state.get("file_explorer_done_requested", False):
-                app_state["file_explorer_done_requested"] = False
-                _fe_close(True)
+            _fe_request_close()
         return
     op, found, session_id = result
     if session_id != app_state.get("file_explorer_session_id", 0):
@@ -7258,10 +7283,8 @@ def _fe_poll_expand():
         checked = app_state.get("file_explorer_checked", [])
         app_state["file_explorer_checked"] = [f for f in checked if f not in to_remove]
 
-    if (app_state.get("file_explorer_done_requested", False)
-            and app_state.get("file_explorer_expand_pending", 0) <= 0):
-        app_state["file_explorer_done_requested"] = False
-        _fe_close(True)
+    if app_state.get("file_explorer_expand_pending", 0) <= 0:
+        _fe_request_close()
 
 
 def _fe_go_up():
@@ -7355,6 +7378,20 @@ def _set_dvd_volume(raw_vol, muted=False):
         log.warning("_set_dvd_volume: set_volume failed: %s", e)
 
 
+def _refresh_live_file_gain():
+    """Restore the scanned-plus-manual gain for the file currently airing before a master-volume refresh."""
+    if vlc_engine is None or db is None:
+        return
+    _current_path = getattr(vlc_engine, "current_filepath", None)
+    if not _current_path:
+        return
+    try:
+        _channel = str(app_state.get("current_channel", "")).zfill(2)
+        vlc_engine.file_gain = _lookup_file_gain(_channel, _current_path)
+    except Exception as _gain_error:
+        log.warning("_refresh_live_file_gain: could not restore gain for %s: %s", _current_path, _gain_error)
+
+
 def _apply_loudness_setting_live():
     """Reapplies the current loudness policy to every active audio path."""
     if db is None:
@@ -7368,6 +7405,7 @@ def _apply_loudness_setting_live():
 
     try:
         if vlc_engine is not None:
+            _refresh_live_file_gain()
             vlc_engine.set_volume(_raw_volume, _muted)
     except Exception as e:
         log.warning("_apply_loudness_setting_live: main VLC refresh failed: %s", e)
@@ -7534,6 +7572,9 @@ def _start_ch03_menu_music():
         if cand_path and os.path.isfile(cand_path):
             track = cand_path
             track_gain = candidate.get("gain", 1.0) if isinstance(candidate, dict) else 1.0
+            # The per-file manual adjustment is applied after the scanned gain so
+            # a later song start or volume-slider refresh cannot discard it.
+            track_gain *= 10 ** (_get_audio_gain_db(cand_path) / 20.0)
             break
         app_state["ch03_menu_music_idx"] = (idx + 1) % playlist_len
     if track is None:
@@ -7547,7 +7588,7 @@ def _start_ch03_menu_music():
         app_state["ch03_menu_music_gain"] = track_gain
         _mm_burst_active = (
             (db.config.get("transition_type", "black") if db else "black") == "static"
-            and pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+            and pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
         )
         _set_ch03_menu_music_volume(
             db.config.get("global_volume", 70),
@@ -8333,6 +8374,43 @@ def _probe_duration_and_dims_combined_impl(norm_p):
         duration = result.duration
     dims = (result.width, result.height) if result.width and result.height else None
     return duration, dims
+
+
+def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tracks):
+    """Resolve newly discovered scheduled files before playback may fall back to Static."""
+    if db is None or not pending_tracks or _channel_is_server_streamed(ch_key):
+        return
+    initialize_vlc_on_demand()
+    # Live admission gets one uninterrupted priority window. Duration and video
+    # dimensions are mandatory before the item enters the locked schedule;
+    # loudness remains asynchronous and may engage after playback starts.
+    with _governor_priority_scope():
+        set_live_playback_priority(True)
+        try:
+            for track in pending_tracks:
+                path = track.get("path") if isinstance(track, dict) else None
+                if not path:
+                    continue
+                norm_path = os.path.normpath(path)
+                cached = _get_cached_media_probe(norm_path)
+                if cached.get("duration") and cached.get("dims"):
+                    continue
+                try:
+                    duration, dimensions = _probe_duration_and_dims_combined(norm_path)
+                except Exception as exc:
+                    log.warning("[SCHEDULER] immediate duration/dimensions probe failed for %s: %s",
+                                os.path.basename(norm_path), exc)
+                    continue
+                if duration and duration > 0:
+                    _patch_probed_gain("channel", ch_key, sub_key, norm_path,
+                                       duration=duration,
+                                       dims=dimensions)
+        finally:
+            set_live_playback_priority(False)
+    try:
+        db.save_settings_async(force=True)
+    except Exception as exc:
+        log.warning("[SCHEDULER] could not persist immediate duration probes: %s", exc)
 
 
 SHOW_SMOOTH_TOLERANCE_DB = 0.3
@@ -9316,8 +9394,7 @@ def _fe_close(commit):
                 if str(app_state.get("current_channel", "")).zfill(2) == str(ch_key).zfill(2):
                     _plog = ch_data.setdefault("playback_log", {})
                     _plog["sched_block_key"] = ""
-                    _plog["sched_cached_tracks"] = []
-                    _plog["sched_cached_durations"] = {}
+                    _set_saved_lineup(_plog, [], {}, groups=None)
             elif mode == "holiday" and ch_key and hkey:
                 ch_data  = db.channels_db.setdefault(ch_key, {})
                 existing = ch_data.setdefault("holiday_schedules", {}).get(hkey, [])
@@ -9336,8 +9413,7 @@ def _fe_close(commit):
                 if str(app_state.get("current_channel", "")).zfill(2) == str(ch_key).zfill(2):
                     _plog = ch_data.setdefault("playback_log", {})
                     _plog["sched_block_key"] = ""
-                    _plog["sched_cached_tracks"] = []
-                    _plog["sched_cached_durations"] = {}
+                    _set_saved_lineup(_plog, [], {}, groups=None)
         elif mode == "scan_for_roms":
             picked = context.get("picked_rom_folder", "") or app_state.get("file_explorer_cwd", "")
             if not picked:
@@ -10374,6 +10450,73 @@ def _save_audio_track_pref(filepath, track_id, track_name):
     db.save_settings()
 
 
+def _get_manual_audio_gain_db(filepath):
+    if db is None or not filepath:
+        return 0
+    value = db.config.get("audio_gain_db_by_file", {}).get(_audio_track_pref_key(filepath), 0)
+    try:
+        return max(-12, min(12, int(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_scanned_audio_gain_db(filepath, ch_key=None):
+    """Return the loudness-scan gain for one file, before its saved manual adjustment."""
+    if db is None or not filepath:
+        return 0
+    norm_target = os.path.normpath(filepath)
+    channel_items = []
+    if ch_key is not None:
+        channel_items.append(db.channels_db.get(str(ch_key).zfill(2), {}))
+    else:
+        channel_items.extend(db.channels_db.values())
+    for ch_info in channel_items:
+        pools = list(ch_info.get("schedules", {}).values()) + list(ch_info.get("holiday_schedules", {}).values())
+        for pool in pools:
+            if not isinstance(pool, list):
+                continue
+            for entry in pool:
+                if not isinstance(entry, dict):
+                    continue
+                entry_path = entry.get("path", entry.get("file", ""))
+                gain = None
+                if entry_path and os.path.normpath(entry_path) == norm_target:
+                    gain = entry.get("gain")
+                elif entry.get("is_pair"):
+                    if os.path.normpath(entry.get("pair_ep1_path", "")) == norm_target:
+                        gain = entry.get("pair_ep1_gain") or entry.get("gain")
+                    elif os.path.normpath(entry.get("pair_ep2_path", "")) == norm_target:
+                        gain = entry.get("pair_ep2_gain") or entry.get("gain")
+                if gain is not None:
+                    try:
+                        gain = float(gain)
+                        if gain > 0:
+                            return max(-12, min(12, int(round(20.0 * math.log10(gain)))))
+                    except (TypeError, ValueError):
+                        pass
+    try:
+        cached_gain = _get_cached_media_probe(norm_target).get("gain")
+        if cached_gain and float(cached_gain) > 0:
+            return max(-12, min(12, int(round(20.0 * math.log10(float(cached_gain))))))
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _get_audio_gain_db(filepath, ch_key=None):
+    """Return the displayed/applied total gain: scan baseline plus this file's manual correction."""
+    scanned_db = _get_scanned_audio_gain_db(filepath, ch_key)
+    return max(-12, min(12, scanned_db + _get_manual_audio_gain_db(filepath)))
+
+
+def _save_audio_gain_db(filepath, gain_db):
+    if db is None or not filepath:
+        return
+    gains = db.config.setdefault("audio_gain_db_by_file", {})
+    gains[_audio_track_pref_key(filepath)] = max(-12, min(12, int(gain_db)))
+    db.save_settings()
+
+
 def _open_audio_track_picker(target_ch_str):
     is_live = str(app_state.get("current_channel", "")).zfill(2) == target_ch_str
     if not is_live or vlc_engine is None:
@@ -10396,6 +10539,8 @@ def _open_audio_track_picker(target_ch_str):
     app_state["audio_track_list"] = tracks
     app_state["audio_track_source_channel"] = target_ch_str
     app_state["audio_track_active_id"] = current_id
+    app_state["audio_track_gain_db"] = _get_audio_gain_db(getattr(vlc_engine, "current_filepath", None))
+    app_state["visualizer_gain_db"] = _get_audio_gain_db(app_state.get("_vis_target_filepath", ""))
     app_state["audio_track_context"] = "channel"
     app_state["menu_layer"] = "AUDIO_TRACK_PICKER"
     app_state["sub_menu_row_index"] = highlight
@@ -12889,6 +13034,16 @@ def _start_visualizer_music(file_path, seek_seconds):
     return False
 
 
+def _visualizer_admission_inputs():
+    """Returns (unseekable song paths, unseekable extensions) that decide which songs a Visualizer lineup admits."""
+    unseekable = _visualizer_unseekable_paths()
+    unseekable_exts = {ext for ext, ok in _mixer_seekable_formats().items() if ok is False}
+    return unseekable, unseekable_exts
+
+
+app_state["visualizer_admission_inputs"] = _visualizer_admission_inputs
+
+
 _visualizer_lineup_lock = threading.Lock()
 
 
@@ -12897,17 +13052,9 @@ def _visualizer_frozen_lineup(ch_key, ch_info, now):
     # WARNING: this is the ONLY place a Visualizer lineup is built; the scheduler, guide, watchdog, and scan threads all read it so they can never disagree.
     # WARNING: the lineup changes mid-day only when the channel's files change or a scanned length replaces an unmeasured one; the order is kept and the origin is recomputed then so the song airing right now keeps its exact position.
     stack = ch_info.get("schedules", {}).get("Music Tracks", [])
-    assets = []
-    for asset in stack:
-        path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-        if path:
-            assets.append((path, asset if isinstance(asset, dict) else {}))
-    unseekable = _visualizer_unseekable_paths()
-    unseekable_exts = {ext for ext, ok in _mixer_seekable_formats().items() if ok is False}
-    if unseekable or unseekable_exts:
-        assets = [(p, a) for p, a in assets
-                  if os.path.normpath(str(p)) not in unseekable
-                  and os.path.splitext(str(p))[1].lower() not in unseekable_exts]
+    unseekable, unseekable_exts = _visualizer_admission_inputs()
+    probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
+    assets = media.admit_visualizer_assets(stack, probe_cache, unseekable, unseekable_exts)
     if not assets:
         return [], 0, 0.0
 
@@ -12915,7 +13062,6 @@ def _visualizer_frozen_lineup(ch_key, ch_info, now):
                        + now.microsecond / 1_000_000.0)
     day_key = "%d-%03d" % (now.year, now.timetuple().tm_yday)
     members = sorted({p for p, _a in assets})
-    probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
     day_seed = now.year * 1000 + now.timetuple().tm_yday + int(str(ch_key).zfill(2)) + 400
 
     def _scanned_length(path):
@@ -12935,7 +13081,8 @@ def _visualizer_frozen_lineup(ch_key, ch_info, now):
         lineup = vlog.get("visualizer_lineup")
         changed = False
         if (not isinstance(lineup, dict) or lineup.get("day") != day_key
-                or not lineup.get("order")):
+                or not lineup.get("order")
+                or any(not lineup.get("durations", {}).get(p, 0) for p in lineup.get("order", []))):
             order = [p for p, _a in assets]
             random.Random(day_seed).shuffle(order)
             lineup = {"day": day_key, "members": members, "order": order,
@@ -12951,7 +13098,7 @@ def _visualizer_frozen_lineup(ch_key, ch_info, now):
                 old_order = lineup["order"]
                 old_durs = lineup["durations"]
                 old_members = set(lineup.get("members", []))
-                old_total = sum(old_durs.get(p, 210) for p in old_order)
+                old_total = sum(old_durs.get(p, 210) or 210 for p in old_order)
                 old_pos = (current_seconds - lineup.get("origin", 0.0)) % old_total
                 airing_idx, airing_seek, walked = 0, 0.0, 0
                 for i, p in enumerate(old_order):
@@ -13001,6 +13148,18 @@ def _visualizer_frozen_lineup(ch_key, ch_info, now):
         return track_list, sum(t["duration"] for t in track_list), float(lineup.get("origin", 0.0))
 
 
+def _airing_block_name(ch_info, now):
+    """The name of the block airing now on a channel: Marathon, Full Day, the four-hour block or the eight-hour block."""
+    if ch_info.get("scheduling_mode", "random_slots") == "marathon":
+        return "Marathon"
+    block_mode = ch_info.get("block_mode", "full_day")
+    if block_mode == "full_day":
+        return "Full Day"
+    if block_mode == "six_block":
+        return SIX_HOUR_BLOCKS[now.hour // 4][0]
+    return "Morning" if 4 <= now.hour < 12 else ("Evening" if 12 <= now.hour < 20 else "Night")
+
+
 def _get_channel_ordered_content(ch_key, ch_info):
     now = broadcast_clock.now().replace(tzinfo=None)
 
@@ -13010,22 +13169,9 @@ def _get_channel_ordered_content(ch_key, ch_info):
             return [], None
         return track_list, "Music Tracks"
 
-    scheduling_mode = ch_info.get("scheduling_mode", "random_slots")
-    is_marathon = scheduling_mode == "marathon"
-    is_full_day = (not is_marathon) and (ch_info.get("block_mode", "full_day") == "full_day")
-    is_six_block = (not is_marathon) and (ch_info.get("block_mode", "full_day") == "six_block")
+    block_name = _airing_block_name(ch_info, now)
 
-    if is_marathon:
-        block_name = "Marathon"
-    elif is_full_day:
-        block_name = "Full Day"
-    elif is_six_block:
-        block_name = SIX_HOUR_BLOCKS[now.hour // 4][0]
-    else:
-        hr = now.hour
-        block_name = "Morning" if 4 <= hr < 12 else ("Evening" if 12 <= hr < 20 else "Night")
-
-    if is_marathon:
+    if block_name == "Marathon":
         folder_items = ch_info.get("schedules", {}).get("Marathon", [])
         ordered = build_ordered_tracks(folder_items, "marathon", _marathon_start_seed(ch_info) if folder_items else 0)
         if not ordered:
@@ -13059,9 +13205,7 @@ def _block_names_after_airing(ch_info, now):
 
 
 def _get_block_ordered_content(ch_key, ch_info, block_name, now, peek_only=False):
-    """The airing-order lineup of one named block of a channel; peek_only reads a block that is not on air and leaves the channel's saved show positions untouched."""
-    # WARNING: peek_only must deep-copy the show positions; build_show_rotation edits nested entries such as __FAIRNESS__ in place, which would move the real scheduler's counters.
-    scheduling_mode = ch_info.get("scheduling_mode", "random_slots")
+    """The airing-order lineup of one named block of a channel, kept for a few seconds; it never changes the channel's saved show positions, and peek_only is accepted and changes nothing."""
     folder_items = ch_info.get("schedules", {}).get(block_name, [])
 
     _occ_now_ms = time.monotonic() * 1000.0
@@ -13073,69 +13217,13 @@ def _get_block_ordered_content(ch_key, ch_info, block_name, now, peek_only=False
         if (_occ_now_ms - _occ_ts) < _ORDERED_CONTENT_CACHE_TTL_MS:
             return _occ_tracks, _occ_bname
 
-    raw_tracks = []
     _media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
-    for item in folder_items:
-        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
-        if p and _cached_path_exists(p):
-            stored = item.get("duration", 0) if isinstance(item, dict) else 0
-            d = resolve_track_duration(_media_probe_cache, p, stored)
-            track = {"path": p, "duration": d}
-            if track_duration_is_estimated(_media_probe_cache, p, stored):
-                track["_duration_estimated"] = True
-            if isinstance(item, dict) and "gain" in item:
-                track["gain"] = item["gain"]
-            raw_tracks.append(track)
-    if not raw_tracks:
-        _ORDERED_CONTENT_CACHE[_occ_key] = (_occ_now_ms, [], None)
-        return [], None
-    _seed_now = (now - datetime.timedelta(days=1)) if (block_name == "Night" and now.hour < 4) else now
-
-    _peek_offsets = {"Morning": 100, "Evening": 200, "Night": 300, "Full Day": 500}
-    for _pbi, _pbn in enumerate(SIX_HOUR_BLOCK_NAMES):
-        _peek_offsets[_pbn] = 600 + _pbi * 100
-    block_offset = _peek_offsets.get(block_name, 400)
-    day_seed = _seed_now.year * 1000 + _seed_now.timetuple().tm_yday + int(str(ch_key).zfill(2)) + block_offset
-    _order_seed = _start_order_seed(ch_info, block_offset)
-    playback_log = ch_info.get("playback_log", {})
-    pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
-
-    block_key = f"{_seed_now.year}_{_seed_now.timetuple().tm_yday}_{block_name}"
-    if (playback_log.get("sched_block_key") == block_key
-            and playback_log.get("sched_pairing_rule_version")
-                == SHORT_EPISODE_PAIRING_VERSION):
-        _cached_paths = playback_log.get("sched_cached_tracks", [])
-        _cached_paths = list(dict.fromkeys(_cached_paths))
-        _raw_ordered, _ = _reconcile_cached_lineup(
-            _cached_paths, raw_tracks, folder_items, ch_info.get("broken_files", []),
-            playback_log.get("sched_cached_durations", {}),
-            log_label=f"ch{ch_key} block={block_name}",
-        )
-        if _raw_ordered:
-            _raw_ordered = _apply_cached_durations(
-                _raw_ordered, playback_log.get("sched_cached_durations", {}))
-            video_tracks = pair_short_episodes(_raw_ordered, threshold_seconds=pair_thresh_sec)
-            if video_tracks:
-                _ORDERED_CONTENT_CACHE[_occ_key] = (_occ_now_ms, video_tracks, block_name)
-                return video_tracks, block_name
-
-    show_pos_copy = copy.deepcopy(playback_log.get("show_pos", {})) if peek_only else dict(playback_log.get("show_pos", {}))
-    fixed_order = playback_log.get("show_order", {}).get(block_name)
-    _block_len_lut = {"Marathon": 86400, "Full Day": 86400, "Morning": 8 * 3600, "Evening": 8 * 3600, "Night": 8 * 3600}
-    for _blkn in SIX_HOUR_BLOCK_NAMES:
-        _block_len_lut[_blkn] = 4 * 3600
-    block_duration_seconds = _block_len_lut.get(block_name, 8 * 3600)
-    video_tracks, _, _ = build_show_rotation(
-        raw_tracks, scheduling_mode, show_pos_copy, day_seed,
-        pair_threshold_seconds=pair_thresh_sec,
-        episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
-        fixed_show_order=fixed_order,
-         block_duration_seconds=block_duration_seconds,
-         channel_id=ch_key,
-        order_seed=_order_seed,
+    video_tracks, _lineup_block = read_block_lineup(
+        ch_key, ch_info, block_name, now, _media_probe_cache, _cached_path_exists, _start_order_seed,
+        peek_only=peek_only,
     )
-    _ORDERED_CONTENT_CACHE[_occ_key] = (_occ_now_ms, video_tracks, block_name)
-    return video_tracks, block_name
+    _ORDERED_CONTENT_CACHE[_occ_key] = (_occ_now_ms, video_tracks, _lineup_block)
+    return video_tracks, _lineup_block
 
 
 _intro_seed_lock = threading.Lock()
@@ -13260,23 +13348,36 @@ def _prime_channel_block_durations(ch_key, synchronous=False):
     except Exception as e:
         log.warning("_prime_channel_block_durations: ordered-content peek failed for ch%s: %s", ch_str, e)
         return
-    if not ordered:
-        return
-
-    _now_state = _get_probe_now_state(ch_str)
-    _current_file = _now_state.get("file", "")
-    near_term = _next_n_from_ordered(ordered, _current_file, n=_PRIME_DURATIONS_NEAR_TERM_N)
-
     paths = []
     _seen = set()
-    for entry in near_term:
-        for p in _paths_from_entry(entry):
-            if not p:
+    if not ordered:
+        # WARNING: a channel with no lineup has no file with a known duration; its first unscanned files are probed so it can leave Static.
+        if ch_info.get("is_visualizer", False):
+            return
+        _no_lineup_broken = set(ch_info.get("broken_files", []))
+        _no_lineup_block = _airing_block_name(ch_info, broadcast_clock.now().replace(tzinfo=None))
+        for _track in build_pending_tracks(ch_info.get("schedules", {}).get(_no_lineup_block, []),
+                                           db.config.get("media_probe_cache", {}), _cached_path_exists):
+            if _track["path"] in _no_lineup_broken:
                 continue
-            np_ = os.path.normpath(p)
+            np_ = os.path.normpath(_track["path"])
             if np_ not in _seen:
                 _seen.add(np_)
-                paths.append((p, np_))
+                paths.append((_track["path"], np_))
+            if len(paths) >= _PRIME_DURATIONS_NEAR_TERM_N:
+                break
+    else:
+        _now_state = _get_probe_now_state(ch_str)
+        _current_file = _now_state.get("file", "")
+        near_term = _next_n_from_ordered(ordered, _current_file, n=_PRIME_DURATIONS_NEAR_TERM_N)
+        for entry in near_term:
+            for p in _paths_from_entry(entry):
+                if not p:
+                    continue
+                np_ = os.path.normpath(p)
+                if np_ not in _seen:
+                    _seen.add(np_)
+                    paths.append((p, np_))
 
     missing = []
     for p, np_ in paths:
@@ -13420,7 +13521,7 @@ def _prime_visualizer_lookahead_loudness(ch_key, current_file):
 
 def _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, tag, chunk_timeout=None,
                                         semaphore_timeout=None, priority=False):
-    """Blocking single-file scan-and-apply shared by the tune-in priority prime and the first-pass now-playing sweep."""
+    """Blocking single-file scan-and-apply for TV stations and TV guide previews."""
     if not norm_p or not _cached_path_exists(norm_p):
         return None
     if _get_cached_media_probe(norm_p).get("gain") is not None:
@@ -13428,14 +13529,12 @@ def _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, tag, chu
     if _loudness_probe_in_cooldown(norm_p):
         return None
     if _is_drive_degraded(norm_p):
-        log.info("_probe_and_apply_loudness_blocking: skipping %s -- its drive looks "
-                 "degraded right now (%s); playing at fallback gain instead of blocking "
-                 "on a probe against a struggling drive", os.path.basename(norm_p),
-                 _drive_latency_summary(norm_p))
+        log.info("_probe_and_apply_loudness_blocking: skipping %s -- its drive looks degraded", os.path.basename(norm_p))
         return None
     _picture_box_before_loudness(norm_p)
     try:
         _shortfall = {}
+        _scan_duration = {}
         _extra_kwargs = {}
         if chunk_timeout is not None:
             _extra_kwargs["chunk_timeout"] = chunk_timeout
@@ -13446,37 +13545,36 @@ def _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, tag, chu
         _extra_kwargs["parallel_windows"] = True
         _extra_kwargs["raise_on_no_audio"] = (kind == "channel")
         with _governor_priority_scope():
-            gain = _probe_loudness_guarded(norm_p, out_shortfall=_shortfall, treat_fallback_as_unknown=True,
-                                            **_extra_kwargs)
+            gain = _probe_loudness_guarded(norm_p, out_shortfall=_shortfall,
+                                           treat_fallback_as_unknown=True, **_extra_kwargs)
     except NoAudioStreamError as _naerr:
         _no_audio_reason = getattr(_naerr, "reason", "no audio track")
         if kind == "channel":
-            # WARNING: same rejection the Commercials batch applies; keeps a no-audio file from being the first thing to play and bypassing the pool safeties.
             if _drop_media_from_pool(ch_key, block_key, norm_p, _no_audio_reason):
                 print(f"[LOUDNESS PROBE] ch{ch_key} {tag}: '{os.path.basename(norm_p)}' rejected from the pool -- {_no_audio_reason}")
                 try:
                     db.save_settings_async()
                 except Exception as _save_err:
                     log.warning("_probe_and_apply_loudness_blocking: settings save after no-audio rejection failed: %s", _save_err)
-        else:
-            _mark_confirmed_no_audio(norm_p, _no_audio_reason)
+            else:
+                _mark_confirmed_no_audio(norm_p, _no_audio_reason)
         return None
     except Exception as e:
-        log.warning("_probe_and_apply_loudness_blocking: probe failed for %s (%s): %s",
-                    ch_key, norm_p, e)
+        log.warning("_probe_and_apply_loudness_blocking: probe failed for %s (%s): %s", ch_key, norm_p, e)
         return None
     if gain:
         _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=gain, duration=None)
+    if gain:
         _label = f"ch{ch_key}" if ch_key else kind
         _measured = _shortfall.get("measured_lufs")
-        _lufs_note = f" (measured {_measured:.1f} LUFS)" if _measured is not None else " (reused sibling scan)"
-        print(f"[LOUDNESS PROBE] {_label} {tag}: "
-              f"'{os.path.basename(norm_p)}' -> gain x{gain:.2f}{_lufs_note}")
+        _lufs_note = f" (measured {_measured:.1f} LUFS)" if _measured is not None else ""
+        print(f"[LOUDNESS PROBE] {_label} {tag}: '{os.path.basename(norm_p)}' -> gain x{gain:.2f}{_lufs_note}")
     return gain
 
 
+
 def _probe_and_apply_music_loudness_blocking(kind, ch_key, block_key, norm_p, tag):
-    """Music counterpart to _probe_and_apply_loudness_blocking(); dispatches through _probe_music_loudness_guarded()."""
+    """Music counterpart using the dedicated music loudness scanner."""
     if not norm_p or not _cached_path_exists(norm_p):
         return None
     _blocking_cached = _get_cached_media_probe(norm_p)
@@ -13489,8 +13587,9 @@ def _probe_and_apply_music_loudness_blocking(kind, ch_key, block_key, norm_p, ta
     try:
         _shortfall = {}
         _scan_duration = {}
-        gain = _probe_music_loudness_guarded(norm_p, out_shortfall=_shortfall, treat_fallback_as_unknown=True,
-                                             duration_out=_scan_duration)
+        gain = _probe_music_loudness_guarded(
+            norm_p, out_shortfall=_shortfall,
+            treat_fallback_as_unknown=True, duration_out=_scan_duration)
     except Exception as e:
         log.warning("_probe_and_apply_music_loudness_blocking: probe failed for %s (%s): %s",
                     ch_key, norm_p, e)
@@ -13503,8 +13602,7 @@ def _probe_and_apply_music_loudness_blocking(kind, ch_key, block_key, norm_p, ta
         _label = f"ch{ch_key}" if ch_key else kind
         _measured = _shortfall.get("measured_lufs")
         _lufs_note = f" (measured {_measured:.1f} LUFS)" if _measured is not None else ""
-        print(f"[LOUDNESS PROBE] {_label} {tag}: "
-              f"'{os.path.basename(norm_p)}' -> gain x{gain:.2f} (music target){_lufs_note}")
+        print(f"[LOUDNESS PROBE] {_label} {tag}: '{os.path.basename(norm_p)}' -> gain x{gain:.2f} (music target){_lufs_note}")
     return gain
 
 
@@ -13741,9 +13839,33 @@ def _build_scan_snapshot():
         except Exception as e:
             log.warning("[SCAN SNAPSHOT] ch%s other-block gather failed (airing block kept): %s", ch_str, e)
             other_blocks = []
+        _pending_block, _pending_airing, _pending_other = "", [], []
+        if not ch_info.get("is_visualizer", False):
+            try:
+                _pend_now = broadcast_clock.now().replace(tzinfo=None)
+                _pend_cache = db.config.get("media_probe_cache", {})
+                _pend_broken = set(ch_info.get("broken_files", []))
+                _pend_schedules = ch_info.get("schedules", {})
+
+                def _pending_paths(_name):
+                    return [t["path"] for t in build_pending_tracks(_pend_schedules.get(_name, []), _pend_cache, _cached_path_exists)
+                            if t["path"] not in _pend_broken]
+
+                _pending_block = _airing_block_name(ch_info, _pend_now)
+                _pending_airing = _pending_paths(_pending_block)
+                for _dist, _other_name in enumerate(_block_names_after_airing(ch_info, _pend_now)):
+                    _other_pending = _pending_paths(_other_name)
+                    if _other_pending:
+                        _pending_other.append({"block_key": _other_name, "distance": _dist, "paths": _other_pending})
+            except Exception as e:
+                log.warning("[SCAN SNAPSHOT] ch%s pending-file gather failed (lineup kept): %s", ch_str, e)
+                _pending_block, _pending_airing, _pending_other = "", [], []
         channels[ch_str] = {
             "ordered": list(ordered or []),
             "block_key": block_key,
+            "pending_block": _pending_block,
+            "pending": _pending_airing,
+            "pending_other": _pending_other,
             "other_blocks": other_blocks,
             "current_file": current_file,
             "is_visualizer": bool(ch_info.get("is_visualizer", False)),
@@ -13796,14 +13918,12 @@ def _scan_file_is_done(norm_p, sched_has_gain, sched_has_dur, music_only, lookup
     cached = _get_cached_media_probe(norm_p)
     if cached.get("confirmed_unplayable") or cached.get("confirmed_no_audio"):
         return True
-    gain_ok = ("gain" in cached or sched_has_gain
-               or cached.get("loudness_timeout_streak", 0) >= len(_LOUDNESS_TIMEOUT_BACKOFF_S))
+    gain_ok = ("gain" in cached or sched_has_gain)
     if not gain_ok:
         return False
     if music_only:
-        return (cached.get("duration") or 0) > 0 or norm_p in _music_duration_scan_attempted
-    dur_ok = ((cached.get("duration") or 0) > 0 or sched_has_dur
-              or _duration_precache_failures.get(norm_p, (0, 0.0))[0] >= len(_DURATION_PRECACHE_RETRY_BACKOFF_S))
+        return (cached.get("duration") or 0) > 0
+    dur_ok = ((cached.get("duration") or 0) > 0 or sched_has_dur)
     if not dur_ok:
         return False
     if os.path.splitext(norm_p)[1].lower() in media.VIDEO_DISPLAY_EXTS:
@@ -13913,6 +14033,14 @@ def _gather_probe_priority_queue():
             continue
         current_file = _snap_rec["current_file"]
         ordered, block_key = _snap_rec["ordered"], _snap_rec["block_key"]
+
+        # WARNING: a channel with no lineup has no file with a known duration; its first unscanned file goes in the airing tier so the channel can leave Static, the rest of its files follow in the deep backlog.
+        if not ordered:
+            for _pend_path in _snap_rec.get("pending", []):
+                _pend_norm = os.path.normpath(_pend_path)
+                if _cached_path_exists(_pend_norm) and _scan_stages_pending(_pend_norm, False, False, _pb_lookups):
+                    tiers[0].append(("channel", ch_str, _snap_rec.get("pending_block") or "", _pend_norm))
+                    break
 
         tl_upcoming = None
         if ch_info.get("commercials_enabled", False):
@@ -14166,6 +14294,26 @@ def _gather_deep_backlog_queue():
                     continue
                 out_commercials.append(("channel", ch_str, "Commercials", _cnorm))
 
+        _lineup_paths = set()
+        for _lineup_entry in list(ordered or []) + [_e for _ob in _snap_rec.get("other_blocks", []) for _e in _ob["ordered"]]:
+            _lineup_paths.update(os.path.normpath(_lp) for _lp in _paths_from_entry(_lineup_entry) if _lp)
+        _airing_pending_items = []
+        for _pend_path in _snap_rec.get("pending", []):
+            _pend_norm = os.path.normpath(_pend_path)
+            if _pend_norm in _lineup_paths or not _cached_path_exists(_pend_norm):
+                continue
+            if _scan_stages_pending(_pend_norm, False, False, _pb_lookups):
+                _airing_pending_items.append(("channel", ch_str, _snap_rec.get("pending_block") or "", _pend_norm))
+        out_content = _airing_pending_items + out_content if not ordered else out_content + _airing_pending_items
+        for _pob in _snap_rec.get("pending_other", []):
+            _pob_items = []
+            for _pend_path in _pob["paths"]:
+                _pend_norm = os.path.normpath(_pend_path)
+                if _pend_norm in _lineup_paths or not _cached_path_exists(_pend_norm):
+                    continue
+                if _scan_stages_pending(_pend_norm, False, False, _pb_lookups):
+                    _pob_items.append(("channel", ch_str, _pob["block_key"], _pend_norm))
+            out_other_blocks.append((_pob["distance"] + 0.5, _pob_items))
         for _dist, _ob in enumerate(_snap_rec.get("other_blocks", [])):
             _ob_items = []
             for entry in _ob["ordered"]:
@@ -14204,8 +14352,27 @@ def _hot_patch_live_gain(norm_p, gain):
         log.warning("_hot_patch_live_gain: live gain hot-patch failed for %s: %s", norm_p, _hp_e)
 
 
-def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None):
-    _store_cached_media_probe(norm_p, duration=duration, gain=gain)
+def _request_schedule_rebuild(ch_key, block_key):
+    """Mark one channel block for an immediate unaired-tail schedule rebuild."""
+    if db is None or not ch_key or not block_key:
+        return
+    ch_str = str(ch_key).zfill(2)
+    ch_info = db.channels_db.get(ch_str, {})
+    playback_log = ch_info.get("playback_log") if isinstance(ch_info, dict) else None
+    if isinstance(playback_log, dict):
+        playback_log["_sched_rebuild_requested"] = True
+        playback_log["_sched_rebuild_block"] = block_key
+    for cache_key in list(_ORDERED_CONTENT_CACHE):
+        if str(cache_key[0]).zfill(2) == ch_str:
+            _ORDERED_CONTENT_CACHE.pop(cache_key, None)
+    _probe_block_timeline_cache.pop(ch_str, None)
+    app_state["guide_channel_stamps"] = dict(app_state.get("guide_channel_stamps", {}))
+    app_state["guide_channel_stamps"][ch_str] = app_state["guide_channel_stamps"].get(ch_str, 0) + 1
+    _guide_dirty_event.set()
+
+
+def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None, dims=None):
+    _store_cached_media_probe(norm_p, duration=duration, gain=gain, dims=dims)
     if kind == "dvd":
         if gain is not None:
             db.config.setdefault("dvd_gain_cache", {})[norm_p] = gain
@@ -14312,9 +14479,10 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
             if _ep == norm_p:
                 if gain is not None:
                     entry["gain"] = gain
-                if duration is not None and duration > 0:
-                    entry["duration"] = int(duration)
-                return
+                    if duration is not None and duration > 0:
+                        entry["duration"] = int(duration)
+                        _request_schedule_rebuild(ch_key, block_key)
+                    return
             if entry.get("is_pair"):
                 _p1 = os.path.normpath(entry.get("pair_ep1_path", ""))
                 _p2 = os.path.normpath(entry.get("pair_ep2_path", ""))
@@ -14331,6 +14499,7 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
                             entry["pair_ep1_duration"] = int(duration)
                         else:
                             entry["pair_ep2_duration"] = int(duration)
+                        _request_schedule_rebuild(ch_key, block_key)
                     return
 
 
@@ -14390,6 +14559,7 @@ def _guide_preload_worker():
     GUIDE_POLL_S = 0.5
     _tick_count = 0
     _winsize_wait_since = None
+    _initial_build_pending = True
     while True:
         try:
             if _app_shutting_down.is_set():
@@ -14401,8 +14571,11 @@ def _guide_preload_worker():
             if not pygame.display.get_init() or not pygame.font.get_init():
                 time.sleep(GUIDE_POLL_S)
                 continue
-            _guide_dirty_event.wait(timeout=GUIDE_POLL_S)
-            _guide_dirty_event.clear()
+            if _initial_build_pending:
+                _initial_build_pending = False
+            else:
+                _guide_dirty_event.wait(timeout=GUIDE_POLL_S)
+                _guide_dirty_event.clear()
             if _app_shutting_down.is_set():
                 return
             if db is None or not pygame.display.get_init() or not pygame.font.get_init():
@@ -14751,27 +14924,9 @@ def _probe_upcoming_media():
                     _pass_stats["n"] += 1
 
         def _pipeline_stage_duration(tier_idx, kind, ch_key, block_key, norm_p):
-            """Stage 2 of a file's scan chain: duration, then the video dimensions. True when the duration is stored; False when the drive is on hold, the file was removed as broken, or the scan is tried again next pass."""
+            """Stage 2 of a file's scan chain: the video dimensions, once the duration scan has stored the duration. False while no duration is stored."""
             if (_get_cached_media_probe(norm_p).get("duration") or 0) <= 0:
-                try:
-                    _dur = _probe_duration_gated(norm_p) or 0
-                except Exception as e:
-                    log.warning("[SCAN PIPELINE] duration probe of %s crashed: %s", os.path.basename(norm_p), e)
-                    _dur = 0
-                if _dur > 0:
-                    _duration_precache_failures.pop(norm_p, None)
-                    _scan_retry_counts.pop((norm_p, "duration"), None)
-                    _duration_precache_done.add(norm_p)
-                    with _pass_state_lock:
-                        _this_pass_results.setdefault(norm_p, {})["duration"] = _dur
-                        _pass_stats["n"] += 1
-                    _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=_dur)
-                    try:
-                        app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
-                    except Exception:
-                        pass
-                else:
-                    return _scan_duration_failed(norm_p)
+                return False
             if (os.path.splitext(norm_p)[1].lower() in media.VIDEO_DISPLAY_EXTS
                     and not is_dvd_disc_source(norm_p)
                     and not _get_cached_media_probe(norm_p).get("dims")):
@@ -14784,7 +14939,7 @@ def _probe_upcoming_media():
             return True
 
         def _pipeline_scan_file(item):
-            """One file's whole scan chain, in order: picture box, then duration, then loudness. A stage that has to wait stops the chain for this file, so a later stage never runs ahead of an earlier one."""
+            """One file's scan chain, in order: picture box, then the stored-duration check and video dimensions, then loudness. The duration itself is stored by the duration scan; a stage that has to wait stops the chain for this file."""
             cls, tier_idx, kind, ch_key, block_key, norm_p = item
             if _app_shutting_down.is_set() or not _cached_path_exists(norm_p):
                 return
@@ -16127,7 +16282,8 @@ def _background_subsystem_worker():
 
     threading.Thread(target=_caption_precache_worker, daemon=True, name="CaptionPrecache").start()
 
-    # WARNING: picture box and duration are stages of the single scan chain in _probe_upcoming_media; starting _picture_box_precache_worker or _duration_precache_worker here would scan the same files out of priority order.
+    # WARNING: duration has its own scan thread in the same order as the chain in _probe_upcoming_media; starting _picture_box_precache_worker or _duration_precache_worker as well would scan files out of priority order.
+    threading.Thread(target=_duration_scan_worker, daemon=True, name="DurationScan").start()
 
     threading.Thread(target=_legacy_cache_migration_worker, daemon=True, name="LibraryMigration").start()
 
@@ -16173,6 +16329,8 @@ def _safe_gain(entry, default=1.0):
 def _lookup_file_gain(ch_key, file_path, default=1.0):
     if not file_path or db is None:
         return default
+    manual_db = _get_manual_audio_gain_db(file_path)
+    manual_gain = 10 ** (manual_db / 20.0)
     norm_target = os.path.normpath(file_path)
     ch_info = db.channels_db.get(str(ch_key).zfill(2), {})
     pools = list(ch_info.get("schedules", {}).values()) + list(ch_info.get("holiday_schedules", {}).values())
@@ -16184,7 +16342,7 @@ def _lookup_file_gain(ch_key, file_path, default=1.0):
                 continue
             if os.path.normpath(entry.get("path", entry.get("file", ""))) == norm_target:
                 if "gain" in entry:
-                    return _safe_gain(entry, default)
+                    return _safe_gain(entry, default) * manual_gain
                 break
             if entry.get("is_pair"):
                 _p1 = entry.get("pair_ep1_path", "")
@@ -16192,20 +16350,20 @@ def _lookup_file_gain(ch_key, file_path, default=1.0):
                 if _p1 and os.path.normpath(_p1) == norm_target:
                     g = entry.get("pair_ep1_gain") or entry.get("gain")
                     if g and float(g) > 0:
-                        return float(g)
+                        return float(g) * manual_gain
                     break
                 if _p2 and os.path.normpath(_p2) == norm_target:
                     g = entry.get("pair_ep2_gain") or entry.get("gain")
                     if g and float(g) > 0:
-                        return float(g)
+                        return float(g) * manual_gain
                     break
         else:
             continue
         break
     _cached_gain = _get_cached_media_probe(norm_target).get("gain")
     if _cached_gain and float(_cached_gain) > 0:
-        return float(_cached_gain)
-    return default
+        return float(_cached_gain) * manual_gain
+    return default * manual_gain
 
 def _reset_marathon_anchor(ch_info):
     _n = broadcast_clock.now().replace(tzinfo=None)
@@ -16213,11 +16371,18 @@ def _reset_marathon_anchor(ch_info):
     ch_info["marathon_anchor_epoch"] = _n.toordinal() * 86400 + (_cs // 1800) * 1800
 
 
-def _get_or_set_block_anchor(ch_info, block_key, blk_clock_now):
-    anchors = ch_info.setdefault("playback_log", {}).setdefault("block_anchors", {})
+def _get_or_set_block_anchor(ch_info, block_key, blk_clock_now, real_start_seconds=None):
+    """The second of the day a block's schedule is measured from, saved on first sight: its real clock start for a channel that has aired before, the half hour the channel first went on air for a new channel."""
+    # WARNING: the saved anchor must never change once set; the scheduler and the guide both measure the block from it.
+    playback_log = ch_info.setdefault("playback_log", {})
+    anchors = playback_log.setdefault("block_anchors", {})
     anchor = anchors.get(block_key)
     if anchor is None:
-        anchor = (int(blk_clock_now) // 1800) * 1800
+        _last_built = playback_log.get("sched_block_key")
+        if real_start_seconds is not None and _last_built and _last_built != block_key:
+            anchor = int(real_start_seconds)
+        else:
+            anchor = (int(blk_clock_now) // 1800) * 1800
         anchors[block_key] = anchor
         if len(anchors) > 12:
             for _old_key in sorted(anchors.keys())[:-12]:
@@ -16252,7 +16417,7 @@ def _missed_block_day_seeds(prev_block_key, block_name, channel_num, block_offse
     seeds = []
     for i in range(n_missed):
         d = prev_date + datetime.timedelta(days=start_offset + i)
-        seeds.append(d.year * 1000 + d.timetuple().tm_yday + int(channel_num) + block_offset)
+        seeds.append(block_day_seed(d, channel_num, block_offset))
     return seeds
 
 
@@ -16357,6 +16522,11 @@ def _snapshot_track_durations(video_tracks):
                 _d2 = _best_dur(p2)
                 if _d2 is not None:
                     out[p2] = _d2
+        elif t.get("is_bundle"):
+            for p in lineup_paths([t]):
+                _d = _best_dur(p)
+                if _d is not None:
+                    out[p] = _d
         else:
             p = t.get("path", "")
             if p:
@@ -16366,11 +16536,34 @@ def _snapshot_track_durations(video_tracks):
     return out
 
 
+def _timeline_whole_episode_durations(timeline):
+    """Maps the index of each non-pair show entry to the whole length of the episode it belongs to, adding up its commercial-split pieces."""
+    whole = {}
+    open_run = {}
+    for idx, entry in enumerate(timeline or []):
+        if entry.get("is_commercial") or entry.get("is_pair") or entry.get("is_bundle"):
+            continue
+        p = entry.get("path", "")
+        if not p:
+            continue
+        end = (entry.get("seek_offset", 0) or 0) + (entry.get("duration", 0) or 0)
+        run = open_run.get(p)
+        if run is None or not (entry.get("seek_offset", 0) or 0):
+            run = {"indexes": [], "end": 0}
+            open_run[p] = run
+        run["indexes"].append(idx)
+        run["end"] = max(run["end"], end)
+        for i in run["indexes"]:
+            whole[i] = run["end"]
+    return whole
+
+
 def _freeze_aired_prefix_durations(timeline, target_show, cached_durations,
                                     frozen_paths):
-    """Freezes the duration of every track at or before the one airing so it never changes."""
+    """Freezes the whole duration of every episode at or before the one airing so it never changes."""
     changed = False
-    for entry in (timeline or []):
+    _whole = _timeline_whole_episode_durations(timeline)
+    for _idx, entry in enumerate(timeline or []):
         if entry.get("is_pair"):
             for p, d in ((entry.get("pair_ep1_path", ""), entry.get("pair_ep1_duration", 0)),
                          (entry.get("pair_ep2_path", ""), entry.get("pair_ep2_duration", 0))):
@@ -16378,9 +16571,15 @@ def _freeze_aired_prefix_durations(timeline, target_show, cached_durations,
                     cached_durations[p] = d
                     frozen_paths.add(p)
                     changed = True
+        elif entry.get("is_bundle"):
+            for p, d in zip(entry.get("bundle_item_paths", []), entry.get("bundle_item_durations", [])):
+                if p and p not in frozen_paths and d and d > 0:
+                    cached_durations[p] = d
+                    frozen_paths.add(p)
+                    changed = True
         else:
             p = entry.get("path", "")
-            d = entry.get("duration", 0)
+            d = _whole.get(_idx, entry.get("duration", 0))
             if p and p not in frozen_paths and d and d > 0:
                 cached_durations[p] = d
                 frozen_paths.add(p)
@@ -16390,59 +16589,6 @@ def _freeze_aired_prefix_durations(timeline, target_show, cached_durations,
                 and entry.get("path") == target_show.get("path")):
             break
     return cached_durations, frozen_paths, changed
-
-
-def _apply_cached_durations(raw_ordered, cached_durations):
-    if not cached_durations:
-        return raw_ordered
-    out = []
-    for t in raw_ordered:
-        cached_dur = cached_durations.get(t.get("path", ""))
-        if cached_dur and cached_dur > 0:
-            t2 = dict(t)
-            t2["duration"] = cached_dur
-            out.append(t2)
-        else:
-            out.append(t)
-    return out
-
-
-def _reconcile_cached_lineup(cached_paths, raw_tracks, folder_items, broken_files,
-                              sched_cached_durations, log_label=""):
-    """Reuses a persisted schedule lineup against this pass's freshly built raw_tracks without reshaping the currently airing timeline."""
-    by_path = {t["path"]: t for t in (raw_tracks or [])}
-    broken_set = set(broken_files or [])
-    scheduled_paths = set()
-    for asset in (folder_items or []):
-        p = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-        if p:
-            scheduled_paths.add(p)
-
-    ordered = []
-    dropped_transient = []
-    for p in cached_paths or []:
-        if not p:
-            continue
-        hit = by_path.get(p)
-        if hit is not None:
-            ordered.append(hit)
-            continue
-        if p not in scheduled_paths or p in broken_set:
-            continue
-        cached_dur = (sched_cached_durations or {}).get(p)
-        if cached_dur:
-            ordered.append({"path": p, "duration": cached_dur})
-            dropped_transient.append(p)
-
-    if dropped_transient:
-        log.warning(
-            "[SCHEDULER]%s kept %d cached-lineup entry(ies) that missed this "
-            "pass's path check but are still scheduled and not blacklisted "
-            "-- treating as transient rather than reshaping the "
-            "currently-airing lineup: %s",
-            f" {log_label}" if log_label else "", len(dropped_transient), dropped_transient,
-        )
-    return ordered, dropped_transient
 
 
 def _cached_lineup_durations_stale(cached_durations, media_probe_cache,
@@ -16923,6 +17069,26 @@ def _scan_handle_failure(norm_p, stage, reason, timed_out=False, corrupt=False):
 
 def _scan_retries_exhausted(norm_p, stage):
     return _scan_retry_counts.get((norm_p, stage), 0) >= SCAN_RETRY_LIMIT
+
+
+def _scan_store_duration(kind, ch_key, block_key, norm_p):
+    """Probes one file's duration and stores it everywhere the schedule and guide read it; returns the duration, or 0 when there is none."""
+    try:
+        _dur = _probe_duration_gated(norm_p) or 0
+    except Exception as e:
+        log.warning("[DURATION SCAN] duration probe of %s crashed: %s", os.path.basename(norm_p), e)
+        return 0
+    if _dur <= 0:
+        return 0
+    _duration_precache_failures.pop(norm_p, None)
+    _scan_retry_counts.pop((norm_p, "duration"), None)
+    _duration_precache_done.add(norm_p)
+    _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=_dur)
+    try:
+        app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
+    except Exception:
+        pass
+    return _dur
 
 
 def _scan_duration_failed(norm_p):
@@ -17518,6 +17684,71 @@ def _duration_precache_worker():
 
 
 # ============================================================================
+# SECTION: Duration scan (runs ahead of the scan chain)
+# ============================================================================
+
+
+def _duration_scan_worker():
+    """Background thread: stores the duration of every scheduled file in the scan chain's order, without waiting for any file's picture box or loudness scan."""
+    if db is None:
+        return
+    log.info("[DURATION SCAN] ahead-of-chain scan starting")
+    _attempted = set()
+    while not _app_shutting_down.is_set():
+        if _background_scan_should_pause():
+            if _app_shutting_down.wait(DURATION_PRECACHE_PAUSE_RECHECK_SECONDS):
+                return
+            continue
+        try:
+            _items = _order_scan_pipeline(_gather_probe_priority_queue(), _gather_deep_backlog_queue())
+        except Exception as e:
+            log.warning("[DURATION SCAN] gather failed: %s", e)
+            _items = []
+        _gathered_at = time.monotonic()
+        _stored = 0
+        _regather = False
+        for _cls, _tier_idx, _kind, _ch_key, _block_key, _norm_p in _items:
+            if _app_shutting_down.is_set():
+                return
+            if _norm_p in _attempted or (_get_cached_media_probe(_norm_p).get("duration") or 0) > 0:
+                continue
+            if not _cached_path_exists(_norm_p):
+                continue
+            while _background_scan_should_pause():
+                if _app_shutting_down.wait(DURATION_PRECACHE_PAUSE_RECHECK_SECONDS):
+                    return
+            if _is_drive_degraded(_norm_p):
+                _scan_hold_drive(_norm_p, _drive_latency_summary(_norm_p) or "drive degraded")
+            if _scan_drive_on_hold(_norm_p):
+                continue
+            _attempted.add(_norm_p)
+            try:
+                with (_governor_priority_scope() if _cls == SCAN_CLASS_NOW else _governor_nullscope()):
+                    if _scan_store_duration(_kind, _ch_key, _block_key, _norm_p) > 0:
+                        _stored += 1
+                    else:
+                        _scan_duration_failed(_norm_p)
+            except Exception as e:
+                log.warning("[DURATION SCAN] %s failed (next file continues): %s", os.path.basename(_norm_p), e)
+            _pace = 0.0 if _cls == SCAN_CLASS_NOW else _background_scan_pace_seconds(BETWEEN_LOUDNESS_PROBES_SECONDS)
+            if _pace > 0 and _app_shutting_down.wait(_pace):
+                return
+            if time.monotonic() - _gathered_at >= SCAN_PIPELINE_PREEMPT_CHECK_SECONDS:
+                _regather = True
+                break
+        if _stored:
+            try:
+                db.save_settings_async()
+            except Exception as e:
+                log.warning("[DURATION SCAN] settings save failed: %s", e)
+        if _regather:
+            continue
+        _attempted.clear()
+        if _app_shutting_down.wait(DURATION_PRECACHE_IDLE_SLEEP_SECONDS if _items else DURATION_PRECACHE_PAUSE_RECHECK_SECONDS):
+            return
+
+
+# ============================================================================
 # SECTION: Legacy cache migration
 # ============================================================================
 
@@ -17582,6 +17813,34 @@ _EMPTY_FOLDER_DIAG_LOGGED = set()
 
 
 _resolve_log_state = {}
+
+
+def _note_aired_cycle(playback_log, block_name, block_key, now, current_seconds, seconds_into_block, cycle_boundary, timeline, total):
+    """Records one scheduler cycle in the channel's guide ledger; a failure is logged and never reaches the scheduler."""
+    try:
+        _block_abs_start = now.toordinal() * 86400 + current_seconds - seconds_into_block
+        media.aired_ledger_upsert(playback_log, block_name, block_key, _block_abs_start + cycle_boundary, timeline, total, now)
+    except Exception as e:
+        log.warning("[SCHEDULER] guide ledger record failed (non-fatal): %s", e)
+
+
+def _note_missed_blocks(ch_info, channel_key, show_pos, prev_block_key, block_key, now, media_probe_cache,
+                        commercial_tracks, is_holiday_date):
+    """Records in the channel's guide ledger the cycles that should have aired since the last block the scheduler built; a failure is logged and never reaches the scheduler."""
+    try:
+        _replay_t0 = time.perf_counter()
+        playback_log = ch_info.setdefault("playback_log", {})
+        records = media.replay_missed_blocks(
+            channel_key, ch_info, show_pos, prev_block_key, block_key, now, media_probe_cache,
+            _cached_path_exists, commercial_tracks, lambda _offset: _start_order_seed(ch_info, _offset),
+            is_holiday_date)
+        for _name, _key, _abs_start, _timeline, _total in records:
+            media.aired_ledger_upsert(playback_log, _name, _key, _abs_start, _timeline, _total, now)
+        if records:
+            log.info("[GUIDE HISTORY] ch%s rebuilt %d missed cycle(s) since block %s in %.1f ms",
+                     channel_key, len(records), prev_block_key, (time.perf_counter() - _replay_t0) * 1000.0)
+    except Exception as e:
+        log.warning("[SCHEDULER] guide past rebuild failed (non-fatal): %s", e)
 
 
 def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, trust_recent_stop=False,
@@ -17725,7 +17984,10 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           # WARNING: the schedule is the only authority on what plays and where; no mixer state, skip, or resume position may feed back into it.
           track_list, total_playlist_seconds, _lineup_origin = _visualizer_frozen_lineup(target_clean_key, ch_info, now)
           if not track_list or total_playlist_seconds <= 0:
-              return {"mode": "Visualizer_Empty", "file": "", "seek": 0}
+              return {
+                  "mode": "Static", "file": "", "seek": 0,
+                  "reason": "visualizer_no_admitted_media",
+              }
 
           position_in_playlist = (current_seconds - _lineup_origin) % total_playlist_seconds
 
@@ -17772,16 +18034,25 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           h_entries = holiday_schedules[holiday_key]
 
           h_media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
-          h_raw_tracks = []
-          for asset in h_entries:
-              path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-              if path and _cached_path_exists(path):
-                  stored = asset.get("duration", 0) if isinstance(asset, dict) else 0
-                  duration = resolve_track_duration(h_media_probe_cache, path, stored)
-                  _h_track = {"path": path, "duration": duration}
-                  if track_duration_is_estimated(h_media_probe_cache, path, stored):
-                      _h_track["_duration_estimated"] = True
-                  h_raw_tracks.append(_h_track)
+          h_raw_tracks = build_raw_tracks(h_entries, h_media_probe_cache, _cached_path_exists)
+          h_pending_tracks = build_pending_tracks(h_entries, h_media_probe_cache, _cached_path_exists)
+          if h_pending_tracks:
+              _priority_probe_pending_schedule(
+                  target_clean_key, "holiday_schedules", holiday_key, h_pending_tracks
+              )
+              h_media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
+              h_raw_tracks = build_raw_tracks(h_entries, h_media_probe_cache, _cached_path_exists)
+              h_pending_tracks = build_pending_tracks(h_entries, h_media_probe_cache, _cached_path_exists)
+              if not h_raw_tracks and h_pending_tracks:
+                  return {
+                      "mode": "Static", "file": "", "seek": 0,
+                      "reason": "probe_failed",
+                      "reason_detail": (
+                          f"CH{target_clean_key} holiday {holiday_key}: immediate duration "
+                          f"probe failed for {len(h_pending_tracks)} scheduled file(s)"
+                      ),
+                  }
+
 
           if h_raw_tracks:
               h_log = ch_info.setdefault("holiday_playback_log", {}).setdefault(holiday_key, {})
@@ -17794,26 +18065,13 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                   h_seconds_into_block += 86400
 
               h_commercials_enabled  = ch_info.get("commercials_enabled", False)
-              h_commercial_placement = ch_info.get("commercial_placement", "interrupt_half_hour")
               h_commercial_items     = ch_info.get("schedules", {}).get("Commercials", [])
-              _H_COMMERCIAL_MAX_SECONDS = media.COMMERCIAL_MAX_SECONDS
 
               h_commercial_tracks = []
               if h_commercials_enabled and h_commercial_items:
-                  for asset in h_commercial_items:
-                      path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-                      if path and _cached_path_exists(path):
-                          stored = asset.get("duration", 30) if isinstance(asset, dict) else 30
-                          duration = resolve_track_duration(h_media_probe_cache, path, stored, default=30)
-                          if not duration or duration <= 0:
-                              duration = 30
-                          if duration > _H_COMMERCIAL_MAX_SECONDS:
-                              continue
-                          h_commercial_tracks.append({"path": path, "duration": int(duration)})
+                  h_commercial_tracks = build_commercial_tracks(h_commercial_items, h_media_probe_cache, _cached_path_exists)
 
               _pair_thresh_sec_h = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
-              _pair_thresh_min_h = ch_info.get("pair_threshold_minutes", 15)
-              INTERRUPT_FLOOR_SECONDS_H = (_pair_thresh_min_h if _pair_thresh_min_h > 0 else 15) * 60
 
               h_day_seed = (now.year * 1000 + now.timetuple().tm_yday + int(target_clean_key)
                             + 9000 + (sum(ord(c) for c in holiday_key) % 1000))
@@ -17846,6 +18104,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                            block_duration_seconds=86400,
                            channel_id=target_clean_key,
                           order_seed=_h_order_seed,
+                          pending_tracks=h_pending_tracks,
                       )
                       h_show_pos.clear()
                       h_show_pos.update(_fwd_h_show_pos)
@@ -17870,13 +18129,14 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                            block_duration_seconds=86400,
                            channel_id=target_clean_key,
                       order_seed=_h_order_seed,
+                      pending_tracks=h_pending_tracks,
                   )
                   h_log["show_pos"] = h_new_show_pos
                   h_log["show_order"] = h_new_show_order
                   h_log["cached_durations"] = _snapshot_track_durations(h_video_tracks)
-                  h_timeline, h_total, h_new_commercial_state = build_block_timeline(
-                      h_video_tracks, h_commercial_tracks, h_commercial_placement, h_day_seed,
-                      interrupt_floor_seconds=INTERRUPT_FLOOR_SECONDS_H,
+                  h_timeline, h_total, h_new_commercial_state = build_channel_timeline(
+                      h_video_tracks, h_commercial_tracks, ch_info, h_day_seed,
+                      media_probe_cache=h_media_probe_cache,
                       commercial_state=h_log.get("commercial_pos"),
                   )
                   h_log["timeline"] = h_timeline
@@ -17903,12 +18163,13 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                           block_duration_seconds=86400,
                           channel_id=target_clean_key,
                           order_seed=_h_order_seed,
+                          pending_tracks=h_pending_tracks,
                       )
                       h_log["show_pos"] = h_new_show_pos
                       h_log["show_order"] = h_new_show_order
-                      h_timeline, h_total, h_new_commercial_state = build_block_timeline(
-                          h_video_tracks, h_commercial_tracks, h_commercial_placement, h_day_seed + _h_guard,
-                          interrupt_floor_seconds=INTERRUPT_FLOOR_SECONDS_H,
+                      h_timeline, h_total, h_new_commercial_state = build_channel_timeline(
+                          h_video_tracks, h_commercial_tracks, ch_info, h_day_seed + _h_guard,
+                          media_probe_cache=h_media_probe_cache,
                           commercial_state=h_log.get("commercial_pos"),
                       )
                       h_log["timeline"] = h_timeline
@@ -17956,7 +18217,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       if _marathon_mode:
           current_block = "Marathon"
           block_start_seconds = 0
-          block_duration_seconds = 86400
+          block_duration_seconds = block_length_seconds(current_block)
           epoch_now = now.toordinal() * 86400 + current_seconds
           anchor = ch_info.get("marathon_anchor_epoch")
           if not anchor:
@@ -17967,12 +18228,12 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           seconds_into_block = epoch_now - anchor
       elif _full_day_mode:
           current_block = "Full Day"
-          _this_block_key = f"{now.year}_{now.timetuple().tm_yday}_Full Day"
-          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, current_seconds)
+          _this_block_key = block_key_for(now, current_block)
+          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, current_seconds, real_start_seconds=0)
           seconds_into_block = current_seconds - block_start_seconds
           if seconds_into_block < 0:
               seconds_into_block += 86400
-          block_duration_seconds = 86400
+          block_duration_seconds = block_length_seconds(current_block)
       elif _six_block_mode:
           current_hour = now.hour
           current_block, block_start_hour, block_end_hour = SIX_HOUR_BLOCKS[current_hour // 4]
@@ -17996,24 +18257,23 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       elif _full_day_mode:
           pass
       elif current_block == "Night" and current_hour < 4:
-          _yesterday = now - datetime.timedelta(days=1)
-          _this_block_key = f"{_yesterday.year}_{_yesterday.timetuple().tm_yday}_Night"
+          _this_block_key = block_key_for(now, current_block)
           _blk_clock = 24 * 3600 + current_seconds
-          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, _blk_clock)
+          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, _blk_clock, real_start_seconds=block_start_hour * 3600)
           seconds_into_block = _blk_clock - block_start_seconds
-          block_duration_seconds = 8 * 3600
+          block_duration_seconds = block_length_seconds(current_block)
       elif current_block == "Night":
-          _this_block_key = f"{now.year}_{now.timetuple().tm_yday}_Night"
+          _this_block_key = block_key_for(now, current_block)
           _blk_clock = current_seconds
-          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, _blk_clock)
+          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, _blk_clock, real_start_seconds=block_start_hour * 3600)
           seconds_into_block = _blk_clock - block_start_seconds
-          block_duration_seconds = 8 * 3600
+          block_duration_seconds = block_length_seconds(current_block)
       else:
-          _this_block_key = f"{now.year}_{now.timetuple().tm_yday}_{current_block}"
+          _this_block_key = block_key_for(now, current_block)
           _blk_clock = current_seconds
-          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, _blk_clock)
+          block_start_seconds = _get_or_set_block_anchor(ch_info, _this_block_key, _blk_clock, real_start_seconds=block_start_hour * 3600)
           seconds_into_block = _blk_clock - block_start_seconds
-          block_duration_seconds = (block_end_hour - block_start_hour) * 3600
+          block_duration_seconds = block_length_seconds(current_block)
 
       folder_items = ch_info.get("schedules", {}).get(current_block, [])
 
@@ -18048,21 +18308,10 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       else:
           _EMPTY_FOLDER_DIAG_LOGGED.discard(_diag_key)
 
-      raw_tracks = []
       _media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
-      for asset in folder_items:
-          path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-          if path and _cached_path_exists(path):
-              stored = asset.get("duration", 0) if isinstance(asset, dict) else 0
-              duration = resolve_track_duration(_media_probe_cache, path, stored)
-              _track = {"path": path, "duration": duration}
-              if track_duration_is_estimated(_media_probe_cache, path, stored):
-                  _track["_duration_estimated"] = True
-              raw_tracks.append(_track)
+      raw_tracks = build_raw_tracks(folder_items, _media_probe_cache, _cached_path_exists)
+      _pending_tracks = build_pending_tracks(folder_items, _media_probe_cache, _cached_path_exists)
 
-      _block_seed_offsets = {"Morning": 100, "Evening": 200, "Night": 300, "Full Day": 500}
-      for _sbi, _sbn in enumerate(SIX_HOUR_BLOCK_NAMES):
-          _block_seed_offsets[_sbn] = 600 + _sbi * 100
       _real_into_block = None
       if not _marathon_mode and not _full_day_mode:
           _real_into_block = current_seconds - block_start_hour * 3600
@@ -18073,16 +18322,19 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           if _six_block_mode:
               _pi = SIX_HOUR_BLOCK_NAMES.index(current_block)
               _prev_name = SIX_HOUR_BLOCK_NAMES[(_pi - 1) % len(SIX_HOUR_BLOCK_NAMES)]
-              _prev_block_secs = 14400
+              _prev_block_secs = block_length_seconds(_prev_name)
               _prev_date = (now - datetime.timedelta(days=1)) if _pi == 0 else now
           else:
               _prev_name = {"Morning": "Night", "Evening": "Morning", "Night": "Evening"}[current_block]
-              _prev_block_secs = 28800
+              _prev_block_secs = block_length_seconds(_prev_name)
               _prev_date = (now - datetime.timedelta(days=1)) if current_block == "Morning" else now
-          _prev_offset = _block_seed_offsets.get(_prev_name, 0)
-          _prev_seed   = _prev_date.year * 1000 + _prev_date.timetuple().tm_yday + int(target_clean_key) + _prev_offset
+          _prev_offset = block_seed_offset(_prev_name, 0)
+          _prev_seed   = block_day_seed(_prev_date, target_clean_key, _prev_offset)
           _prev_sched  = ch_info.get("scheduling_mode", "random_slots")
           _prev_items  = ch_info.get("schedules", {}).get(_prev_name, [])
+          _prev_unscanned = {t["path"] for t in build_pending_tracks(_prev_items, _media_probe_cache, _cached_path_exists)}
+          _prev_items  = [i for i in _prev_items
+                          if (i.get("path", i.get("file", "")) if isinstance(i, dict) else str(i)) not in _prev_unscanned]
           _prev_ordered = build_ordered_tracks(_prev_items, _prev_sched, _prev_seed)
           if _prev_ordered:
               _prev_total = sum(t["duration"] for t in _prev_ordered)
@@ -18108,6 +18360,23 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                                   "seek": _inner + _real_into_block,
                                   "duration": _ov_target["duration"],
                                   "block": current_block}
+
+      if _pending_tracks:
+          _priority_probe_pending_schedule(target_clean_key, "schedules", current_block, _pending_tracks)
+          _media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
+
+      raw_tracks = build_raw_tracks(folder_items, _media_probe_cache, _cached_path_exists)
+      _pending_tracks = build_pending_tracks(folder_items, _media_probe_cache, _cached_path_exists)
+      if not raw_tracks and _pending_tracks:
+          return {
+              "mode": "Static", "file": "", "seek": 0,
+              "reason": "probe_failed",
+              "reason_detail": (
+                  f"CH{target_clean_key} {current_block}: immediate duration probe "
+                  f"failed for {len(_pending_tracks)} scheduled file(s)"
+              ),
+          }
+
 
       if not raw_tracks:
           if folder_items:
@@ -18136,27 +18405,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                               _path_exists_cache.pop(_path, None)
                   _retry_found = any(_cached_path_exists(_path) for _path in _retry_paths)
                   if _retry_found:
-                      raw_tracks = []
-                      for _asset in folder_items:
-                          _path = (
-                              _asset.get("path", _asset.get("file", ""))
-                              if isinstance(_asset, dict)
-                              else str(_asset)
-                          )
-                          if _path and _cached_path_exists(_path):
-                              _stored = _asset.get("duration", 0) if isinstance(_asset, dict) else 0
-                              _track = {
-                                  "path": _path,
-                                  "duration": resolve_track_duration(
-                                      _media_probe_cache, _path, _stored
-                                  ),
-                              }
-                              if track_duration_is_estimated(
-                                      _media_probe_cache, _path, _stored):
-                                  _track["_duration_estimated"] = True
-                              raw_tracks.append({
-                                  **_track,
-                              })
+                      raw_tracks = build_raw_tracks(folder_items, _media_probe_cache, _cached_path_exists)
 
               if raw_tracks:
                   log.warning(
@@ -18196,8 +18445,9 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
 
       scheduling_mode = ch_info.get("scheduling_mode", "random_slots")
       
-      block_offset = _block_seed_offsets.get(current_block, 0)
-      day_seed = now.year * 1000 + now.timetuple().tm_yday + int(target_clean_key) + block_offset
+      block_offset = block_seed_offset(current_block, 0)
+      _seed_date = block_start_date(now, current_block)
+      day_seed = block_day_seed(_seed_date, target_clean_key, block_offset)
       _order_seed = _start_order_seed(ch_info, block_offset)
 
       playback_log = ch_info.setdefault("playback_log", {})
@@ -18206,31 +18456,11 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       _pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
 
       commercials_enabled  = ch_info.get("commercials_enabled", False)
-      commercial_placement = ch_info.get("commercial_placement", "interrupt_half_hour")
       commercial_items     = ch_info.get("schedules", {}).get("Commercials", [])
-
-      _pair_thresh_min = ch_info.get("pair_threshold_minutes", 15)
-      INTERRUPT_FLOOR_SECONDS = (_pair_thresh_min if _pair_thresh_min > 0 else 15) * 60
-
-      # VALUES CHANGE HERE
-      COMMERCIAL_DEFAULT_DUR = 30
-
-      _COMMERCIAL_MAX_SECONDS = media.COMMERCIAL_MAX_SECONDS
 
       commercial_tracks = []
       if commercials_enabled and commercial_items:
-          for asset in commercial_items:
-              path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-              if path and _cached_path_exists(path):
-                  stored = asset.get("duration", COMMERCIAL_DEFAULT_DUR) if isinstance(asset, dict) else COMMERCIAL_DEFAULT_DUR
-                  duration = resolve_track_duration(
-                      _media_probe_cache, path, stored, default=COMMERCIAL_DEFAULT_DUR
-                  )
-                  if not duration or duration <= 0:
-                      duration = COMMERCIAL_DEFAULT_DUR
-                  if duration > _COMMERCIAL_MAX_SECONDS:
-                      continue
-                  commercial_tracks.append({"path": path, "duration": int(duration)})
+          commercial_tracks = build_commercial_tracks(commercial_items, _media_probe_cache, _cached_path_exists)
 
       if _marathon_mode:
         _marathon_ordered = build_ordered_tracks(raw_tracks, "marathon", _marathon_start_seed(ch_info) if raw_tracks else 0)
@@ -18240,7 +18470,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
         _mara_live_paths   = [t["path"] for t in _marathon_ordered] if _marathon_ordered else []
 
         if _mara_cached_paths is not None:
-            _mara_reconciled_ordered, _mara_dropped_transient = _reconcile_cached_lineup(
+            _mara_reconciled_ordered, _mara_dropped_transient = reconcile_cached_lineup(
                 _mara_cached_paths, raw_tracks, folder_items, ch_info.get("broken_files", []),
                 _mara_cached_durs, log_label=f"ch{target_clean_key} marathon",
             )
@@ -18272,12 +18502,12 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
             _mara_log["marathon_cached_durations"]  = _mara_cached_durs
             try: db.save_settings_async()
             except Exception as e: log.warning("calculate_slotted_playback_state: failed to persist marathon_cached_durations: %s", e)
-            video_tracks = _apply_cached_durations(_marathon_ordered, _mara_cached_durs) if _marathon_ordered else []
+            video_tracks = apply_cached_durations(_marathon_ordered, _mara_cached_durs) if _marathon_ordered else []
         else:
-            video_tracks = (_apply_cached_durations(_mara_reconciled_ordered, _mara_cached_durs)
+            video_tracks = (apply_cached_durations(_mara_reconciled_ordered, _mara_cached_durs)
                              if _mara_reconciled_ordered else _marathon_ordered)
         _is_new_block = False
-        block_key = f"{now.year}_{now.timetuple().tm_yday}_Marathon"
+        block_key = block_key_for(now, current_block)
       else:
         block_key = _this_block_key
         _prev_sched_block_key = playback_log.get("sched_block_key")
@@ -18287,9 +18517,21 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                 != SHORT_EPISODE_PAIRING_VERSION
         )
 
-        _durations_stale_raw = (not _is_new_block) and _cached_lineup_durations_stale(
-            playback_log.get("sched_cached_durations", {}), _media_probe_cache,
-            frozen_aired_paths=set(playback_log.get("sched_frozen_aired_paths", [])))
+        _pending_signature = tuple(sorted(t.get("path", "") for t in _pending_tracks if t.get("path")))
+        _pending_changed = (
+            not _is_new_block
+            and tuple(playback_log.get("sched_pending_signature", ())) != _pending_signature
+        )
+        _durations_stale_raw = (
+            (not _is_new_block)
+            and (
+                bool(playback_log.get("_sched_rebuild_requested"))
+                or _cached_lineup_durations_stale(
+                    playback_log.get("sched_cached_durations", {}), _media_probe_cache,
+                    frozen_aired_paths=set(playback_log.get("sched_frozen_aired_paths", [])))
+            )
+        )
+
         if _durations_stale_raw:
             _durations_stale_since = playback_log.get("_sched_durations_stale_since")
             if _durations_stale_since is None:
@@ -18308,25 +18550,22 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
             _pending_since is not None
             and pygame.time.get_ticks() - _pending_since >= 5000
         )
-        if _mode_change_ready or _durations_stale:
+        if _mode_change_ready or _durations_stale or _pending_changed:
             if _mode_change_ready:
                 ch_info["_sched_debounce_pending_since"] = None
             if not _is_new_block:
                 _old_cached = playback_log.get("sched_cached_tracks", [])
-                _old_raw_ordered, _ = _reconcile_cached_lineup(
-                    _old_cached, raw_tracks, folder_items, ch_info.get("broken_files", []),
-                    playback_log.get("sched_cached_durations", {}),
+                _old_video_tracks = saved_block_lineup(
+                    _old_cached, playback_log.get("sched_cached_durations", {}), raw_tracks, folder_items,
+                    ch_info.get("broken_files", []), _pair_thresh_sec,
                     log_label=f"ch{target_clean_key} block={current_block} (re-flavor)",
+                    cached_groups=playback_log.get("sched_cached_groups"),
                 )
-                _old_raw_ordered = _apply_cached_durations(
-                    _old_raw_ordered, playback_log.get("sched_cached_durations", {}))
-                _old_video_tracks = (pair_short_episodes(_old_raw_ordered, threshold_seconds=_pair_thresh_sec)
-                                     if _old_raw_ordered else [])
                 _keep_n = 0
                 if _old_video_tracks:
-                    _old_timeline, _old_total, _ = build_block_timeline(
-                        _old_video_tracks, commercial_tracks, commercial_placement, day_seed,
-                        interrupt_floor_seconds=INTERRUPT_FLOOR_SECONDS,
+                    _old_timeline, _old_total, _ = build_channel_timeline(
+                        _old_video_tracks, commercial_tracks, ch_info, day_seed,
+                        media_probe_cache=_media_probe_cache,
                         commercial_state=playback_log.get("commercial_pos"),
                     )
                     if _old_total > 0:
@@ -18334,52 +18573,52 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                         _vt_idx = -1
                         _last_path = None
                         _found = False
+                        _last_completed_video_idx = -1
                         for _item in _old_timeline:
-                            if _item["is_commercial"]:
-                                continue
-                            if _item["path"] != _last_path:
-                                _vt_idx += 1
-                                _last_path = _item["path"]
-                            if _item["start_time"] <= _old_pos < _item["start_time"] + _item["duration"]:
-                                _keep_n = _vt_idx + 1
+                            if not _item.get("is_commercial"):
+                                if _item["path"] != _last_path:
+                                    _vt_idx += 1
+                                    _last_path = _item["path"]
+                                if (_item["start_time"] + _item["duration"]) <= _old_pos:
+                                    _last_completed_video_idx = _vt_idx
+                                if _item["start_time"] <= _old_pos < _item["start_time"] + _item["duration"]:
+                                    _keep_n = _vt_idx + 1
+                                    _found = True
+                                    break
+                            elif _item["start_time"] <= _old_pos < _item["start_time"] + _item["duration"]:
+                                _keep_n = max(0, _last_completed_video_idx + 1)
                                 _found = True
                                 break
                         if not _found:
                             _keep_n = len(_old_video_tracks)
-                if 0 < _keep_n < len(_old_video_tracks):
+                if 0 < _keep_n <= len(_old_video_tracks):
                     _kept_video_tracks = _old_video_tracks[:_keep_n]
                     _kept_paths = []
-                    for _ct in _kept_video_tracks:
-                        if _ct.get("is_pair"):
-                            _kept_paths.append(_ct.get("pair_ep1_path", _ct["path"]))
-                            _kept_paths.append(_ct.get("pair_ep2_path", ""))
-                        else:
-                            _kept_paths.append(_ct.get("path", ""))
+                    _kept_paths.extend(lineup_paths(_kept_video_tracks))
                     _show_order_by_block = playback_log.setdefault("show_order", {})
-                    _new_tail_tracks, _new_show_pos, _new_show_order = build_show_rotation(
-                        raw_tracks, scheduling_mode, _show_pos, day_seed,
-                        pair_threshold_seconds=_pair_thresh_sec,
-                        episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
-                        fixed_show_order=_show_order_by_block.get(current_block),
-                        block_duration_seconds=block_duration_seconds,
-                        channel_id=target_clean_key,
-                        order_seed=_order_seed,
+                    _new_tail_tracks, _new_show_pos, _new_show_order = build_block_rotation(
+                        raw_tracks, ch_info, _show_pos, day_seed, block_duration_seconds,
+                        target_clean_key, _show_order_by_block.get(current_block), _order_seed,
+                        pending_tracks=_pending_tracks,
                     )
                     playback_log["show_pos"] = _new_show_pos
                     _show_order_by_block[current_block] = _new_show_order
                     _tail_paths = []
-                    for _ct in _new_tail_tracks:
-                        if _ct.get("is_pair"):
-                            _tail_paths.append(_ct.get("pair_ep1_path", _ct["path"]))
-                            _tail_paths.append(_ct.get("pair_ep2_path", ""))
-                        else:
-                            _tail_paths.append(_ct.get("path", ""))
-                    playback_log["sched_cached_tracks"] = [p for p in (_kept_paths + _tail_paths) if p]
+                    _tail_paths.extend(lineup_paths(_new_tail_tracks))
                     _old_durs = playback_log.get("sched_cached_durations", {})
-                    playback_log["sched_cached_durations"] = {
-                        **{p: _old_durs[p] for p in _kept_paths if p in _old_durs},
-                        **_snapshot_track_durations(_new_tail_tracks),
-                    }
+                    _new_saved_tracks = [p for p in (_kept_paths + _tail_paths) if p]
+                    _new_saved_groups = lineup_groups(
+                        list(_kept_video_tracks) + list(_new_tail_tracks), _pair_thresh_sec)
+                    _set_saved_lineup(
+                        playback_log, _new_saved_tracks,
+                        {
+                            **{p: _old_durs[p] for p in _kept_paths if p in _old_durs},
+                            **_snapshot_track_durations(_new_tail_tracks),
+                        },
+                        _new_saved_groups,
+                    )
+                    playback_log["sched_pending_signature"] = _pending_signature
+
                     _kept_paths_set = set(_kept_paths)
                     playback_log["sched_frozen_aired_paths"] = [
                         p for p in playback_log.get("sched_frozen_aired_paths", [])
@@ -18390,11 +18629,13 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                     _blk_rot_cache_d[block_key] = {
                         "tracks":    list(playback_log["sched_cached_tracks"]),
                         "durations": dict(playback_log["sched_cached_durations"]),
+                        "groups":    copy.deepcopy(playback_log.get("sched_cached_groups")),
                         "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
                     }
                     if len(_blk_rot_cache_d) > 12:
                         for _prune_bk_d in sorted(_blk_rot_cache_d.keys())[:-12]:
                             _blk_rot_cache_d.pop(_prune_bk_d, None)
+                    playback_log["_sched_rebuild_requested"] = False
                     if db is not None:
                         try: db.save_settings()
                         except Exception as e: log.warning("calculate_slotted_playback_state: failed to persist re-flavored sched_cached_tracks: %s", e)
@@ -18407,76 +18648,85 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
         video_tracks = []
         if not _is_new_block:
           _cached = playback_log.get("sched_cached_tracks", [])
-          _raw_ordered, _ = _reconcile_cached_lineup(
-              _cached, raw_tracks, folder_items, ch_info.get("broken_files", []),
-              playback_log.get("sched_cached_durations", {}),
+          video_tracks = saved_block_lineup(
+              _cached, playback_log.get("sched_cached_durations", {}), raw_tracks, folder_items,
+              ch_info.get("broken_files", []), _pair_thresh_sec,
               log_label=f"ch{target_clean_key} block={current_block}",
+              cached_groups=playback_log.get("sched_cached_groups"),
           )
-          _raw_ordered = _apply_cached_durations(
-              _raw_ordered, playback_log.get("sched_cached_durations", {}))
-          video_tracks = pair_short_episodes(_raw_ordered, threshold_seconds=_pair_thresh_sec) if _raw_ordered else []
           if not video_tracks:
               _is_new_block = True
 
         if _is_new_block:
           _show_order_by_block = playback_log.setdefault("show_order", {})
 
-          _missed_seeds = _missed_block_day_seeds(
-              _prev_sched_block_key, current_block, target_clean_key, block_offset, now)
-          if _missed_seeds:
-              _fwd_show_pos, _fwd_order, _catchup_report = fast_forward_show_pos(
-                  raw_tracks, scheduling_mode, _show_pos, _missed_seeds,
-                  pair_threshold_seconds=_pair_thresh_sec,
-                  episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
-                  fixed_show_order=_show_order_by_block.get(current_block),
-                   block_duration_seconds=block_duration_seconds,
-                   channel_id=target_clean_key,
-                  order_seed=_order_seed,
-              )
+          _note_missed_blocks(
+              ch_info, target_clean_key, _show_pos, _prev_sched_block_key, block_key, now,
+              _media_probe_cache, commercial_tracks,
+              lambda _d: bool(_get_holiday_key(_d) and holiday_schedules.get(_get_holiday_key(_d))))
+
+          _catch_up_t0 = time.perf_counter()
+          try:
+              _catch_up = media.catch_up_state(
+                  target_clean_key, ch_info, _show_pos, _prev_sched_block_key, block_key,
+                  _media_probe_cache, _cached_path_exists, commercial_tracks,
+                  lambda _offset: _start_order_seed(ch_info, _offset),
+                  lambda _d: bool(_get_holiday_key(_d) and holiday_schedules.get(_get_holiday_key(_d))))
+          except Exception as _catch_up_err:
+              _catch_up = None
+              log.warning("[CATCH-UP] ch%s replay of missed blocks failed, positions left as saved: %s",
+                          target_clean_key, _catch_up_err)
+          if _catch_up is not None:
+              _fwd_show_pos, _fwd_commercial, _fwd_orders, _fwd_blocks = _catch_up
               _show_pos.clear()
               _show_pos.update(_fwd_show_pos)
               playback_log["show_pos"] = _show_pos
+              if _fwd_commercial is not None:
+                  playback_log["commercial_next_pos"] = _fwd_commercial
+              for _fwd_name, _fwd_order in _fwd_orders.items():
+                  _show_order_by_block.setdefault(_fwd_name, _fwd_order)
               playback_log["last_gap_catchup"] = {
                   "channel": target_clean_key,
                   "block": current_block,
-                  "missed_occurrences": len(_missed_seeds),
+                  "missed_blocks": _fwd_blocks,
                   "caught_up_at": now.isoformat(),
-                  "shows": _catchup_report,
               }
               log.info(
-                  "[CATCH-UP] ch%s block=%s was offline across %d missed occurrence(s) "
-                  "of this block -- fast-forwarded show_pos: %s",
-                  target_clean_key, current_block, len(_missed_seeds), _catchup_report,
+                  "[CATCH-UP] ch%s block=%s replayed %d missed block(s) since %s -- show_pos advanced in %.1f ms",
+                  target_clean_key, current_block, _fwd_blocks, _prev_sched_block_key,
+                  (time.perf_counter() - _catch_up_t0) * 1000.0,
               )
 
-          video_tracks, _new_show_pos, _new_show_order = build_show_rotation(
-              raw_tracks, scheduling_mode, _show_pos, day_seed,
-              pair_threshold_seconds=_pair_thresh_sec,
-              episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
-              fixed_show_order=_show_order_by_block.get(current_block),
-              block_duration_seconds=block_duration_seconds,
-              channel_id=target_clean_key,
-              order_seed=_order_seed,
+          video_tracks, _new_show_pos, _new_show_order = build_block_rotation(
+              raw_tracks, ch_info, _show_pos, day_seed, block_duration_seconds,
+              target_clean_key, _show_order_by_block.get(current_block), _order_seed,
+              pending_tracks=_pending_tracks,
           )
+          if not video_tracks and _pending_tracks:
+              return {
+                  "mode": "Static", "file": "", "seek": 0,
+                  "reason": "not_scanned",
+                  "reason_detail": (
+                      f"CH{target_clean_key} {current_block}: nothing scanned to air yet, "
+                      f"{len(_pending_tracks)} file(s) not scanned"
+                  ),
+              }
           playback_log["show_pos"] = _new_show_pos
           _show_order_by_block[current_block] = _new_show_order
           playback_log["sched_block_key"] = block_key
           playback_log["sched_pairing_rule_version"] = SHORT_EPISODE_PAIRING_VERSION
-          _cache_paths = []
-          for _ct in video_tracks:
-              if _ct.get("is_pair"):
-                  _cache_paths.append(_ct.get("pair_ep1_path", _ct["path"]))
-                  _cache_paths.append(_ct.get("pair_ep2_path", ""))
-              else:
-                  _cache_paths.append(_ct.get("path", ""))
-          playback_log["sched_cached_tracks"] = list(dict.fromkeys(
-              p for p in _cache_paths if p))
-          playback_log["sched_cached_durations"] = _snapshot_track_durations(video_tracks)
+          _cache_paths = lineup_paths(video_tracks)
+          _set_saved_lineup(
+              playback_log, _cache_paths, _snapshot_track_durations(video_tracks),
+              lineup_groups(video_tracks, _pair_thresh_sec))
+          playback_log["sched_pending_signature"] = _pending_signature
           playback_log["sched_frozen_aired_paths"] = []
+
           _blk_rot_cache_n = playback_log.setdefault("block_rotation_cache", {})
           _blk_rot_cache_n[block_key] = {
               "tracks":    list(playback_log["sched_cached_tracks"]),
               "durations": dict(playback_log["sched_cached_durations"]),
+              "groups":    copy.deepcopy(playback_log.get("sched_cached_groups")),
               "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
           }
           # VALUES CHANGE HERE
@@ -18493,14 +18743,15 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           target_clean_key, current_block, video_tracks, seconds_into_block,
       )
 
-      timeline, total_block_content, _new_commercial_state = build_block_timeline(
-          video_tracks, commercial_tracks, commercial_placement, day_seed,
-          interrupt_floor_seconds=INTERRUPT_FLOOR_SECONDS,
+      if _is_new_block:
+          playback_log["commercial_pos"] = copy.deepcopy(media.carried_commercial_state(playback_log) or {})
+      timeline, total_block_content, _new_commercial_state = build_channel_timeline(
+          video_tracks, commercial_tracks, ch_info, day_seed,
           media_probe_cache=_media_probe_cache,
           commercial_state=playback_log.get("commercial_pos"),
       )
       if _is_new_block:
-          playback_log["commercial_pos"] = _new_commercial_state
+          playback_log["commercial_next_pos"] = _new_commercial_state
 
       if timeline:
           try:
@@ -18529,7 +18780,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           )
           return {
               "mode": "Static", "file": "", "seek": 0,
-              "reason": "timeline_build_failed",
+              "reason": "not_scanned" if _pending_tracks else "timeline_build_failed",
               "reason_detail": (
                   f"CH{target_clean_key} {current_block}: schedule builder produced "
                   f"no playable timeline from {len(video_tracks or [])} track(s)"
@@ -18539,6 +18790,9 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       if not _marathon_mode:
           _cyc_boundary = playback_log.get("sched_cycle_boundary", 0)
           _cyc_total    = playback_log.get("sched_cycle_total", 0) or total_block_content
+          if _pending_changed and total_block_content > 0:
+              _cyc_boundary = seconds_into_block - (seconds_into_block % total_block_content)
+              _cyc_total = total_block_content
           if _cyc_boundary > seconds_into_block:
               _cyc_boundary = 0
               _cyc_total    = total_block_content
@@ -18562,26 +18816,32 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           _sp2              = dict(playback_log.get("show_pos", {}))
           _new_show_order2  = _show_order_by_block2.get(current_block)
           _cp2              = dict(_new_commercial_state or {})
+          _live_cp2         = playback_log.get("commercial_pos")
           _good_timeline, _good_total, _good_video_tracks = timeline, total_block_content, video_tracks
           _good_sp2, _good_show_order2, _good_cyc_total = _sp2, _new_show_order2, _cyc_total
           _good_cp2 = _cp2
+          _good_live_cp2 = _live_cp2
           while total_block_content > 0 and seconds_into_block >= _cyc_boundary + _cyc_total:
               _try_boundary = _cyc_boundary + _cyc_total
-              _try_video_tracks, _try_sp2, _try_show_order2 = build_show_rotation(
-                  raw_tracks, scheduling_mode, _sp2, day_seed,
-                  pair_threshold_seconds=_pair_thresh_sec,
-                  episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
-                  fixed_show_order=_show_order_by_block2.get(current_block),
-                  block_duration_seconds=block_duration_seconds,
-                  channel_id=target_clean_key,
-                  order_seed=_order_seed,
+              _try_video_tracks, _try_sp2, _try_show_order2 = build_block_rotation(
+                  raw_tracks, ch_info, _sp2, day_seed, block_duration_seconds,
+                  target_clean_key, _show_order_by_block2.get(current_block), _order_seed,
+                  pending_tracks=_pending_tracks,
               )
-              _try_timeline, _try_total, _try_cp2 = build_block_timeline(
-                  _try_video_tracks, commercial_tracks, commercial_placement, day_seed,
-                  interrupt_floor_seconds=INTERRUPT_FLOOR_SECONDS,
+              _try_timeline, _try_total, _try_cp2 = build_channel_timeline(
+                  _try_video_tracks, commercial_tracks, ch_info, day_seed,
                   media_probe_cache=_media_probe_cache,
                   commercial_state=_cp2,
               )
+              if (not _try_timeline or _try_total <= 0) and _pending_tracks:
+                  return {
+                      "mode": "Static", "file": "", "seek": 0,
+                      "reason": "not_scanned",
+                      "reason_detail": (
+                          f"CH{target_clean_key} {current_block}: the next cycle has nothing "
+                          f"scanned to air, {len(_pending_tracks)} file(s) not scanned"
+                      ),
+                  }
               if not _try_timeline or _try_total <= 0:
                   log.warning(
                       "calculate_slotted_playback_state: ch%s cycle rebuild came back "
@@ -18591,39 +18851,41 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                       target_clean_key, len(raw_tracks), len(_try_video_tracks or []),
                       scheduling_mode, day_seed, _try_sp2)
                   break
+              _note_aired_cycle(playback_log, current_block, block_key, now, current_seconds,
+                                seconds_into_block, _cyc_boundary, timeline, _cyc_total)
               _cyc_boundary = _try_boundary
               _cycle_changed = True
               video_tracks, timeline, total_block_content = _try_video_tracks, _try_timeline, _try_total
               _sp2, _new_show_order2 = _try_sp2, _try_show_order2
+              _live_cp2 = _cp2
               _cp2 = _try_cp2
               _cyc_total = total_block_content
               _good_timeline, _good_total, _good_video_tracks = timeline, total_block_content, video_tracks
               _good_sp2, _good_show_order2, _good_cyc_total = _sp2, _new_show_order2, _cyc_total
               _good_cp2 = _cp2
+              _good_live_cp2 = _live_cp2
           if not timeline or total_block_content <= 0:
               timeline, total_block_content, video_tracks = _good_timeline, _good_total, _good_video_tracks
               _sp2, _new_show_order2, _cyc_total = _good_sp2, _good_show_order2, _good_cyc_total
               _cp2 = _good_cp2
+              _live_cp2 = _good_live_cp2
           if _cycle_changed and timeline and total_block_content > 0:
               playback_log["show_pos"] = _sp2
-              playback_log["commercial_pos"] = _cp2
+              playback_log["commercial_pos"] = _live_cp2
+              playback_log["commercial_next_pos"] = _cp2
               if _new_show_order2 is not None:
                   _show_order_by_block2[current_block] = _new_show_order2
-              _cache_paths2 = []
-              for _ct2 in video_tracks:
-                  if _ct2.get("is_pair"):
-                      _cache_paths2.append(_ct2.get("pair_ep1_path", _ct2["path"]))
-                      _cache_paths2.append(_ct2.get("pair_ep2_path", ""))
-                  else:
-                      _cache_paths2.append(_ct2.get("path", ""))
-              playback_log["sched_cached_tracks"] = list(dict.fromkeys(
-                  p for p in _cache_paths2 if p))
-              playback_log["sched_cached_durations"] = _snapshot_track_durations(video_tracks)
+              _cache_paths2 = lineup_paths(video_tracks)
+              _set_saved_lineup(
+                  playback_log, _cache_paths2, _snapshot_track_durations(video_tracks),
+                  lineup_groups(video_tracks, _pair_thresh_sec))
               playback_log["sched_frozen_aired_paths"] = []
               _blk_rot_cache_c = playback_log.setdefault("block_rotation_cache", {})
               _blk_rot_cache_c[block_key] = {
                   "tracks":    list(playback_log["sched_cached_tracks"]),
                   "durations": dict(playback_log["sched_cached_durations"]),
+                  "groups":    copy.deepcopy(playback_log.get("sched_cached_groups")),
+                  "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
               }
               if len(_blk_rot_cache_c) > 12:
                   for _prune_bk_c in sorted(_blk_rot_cache_c.keys())[:-12]:
@@ -18633,6 +18895,8 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
               app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
           playback_log["sched_cycle_boundary"] = _cyc_boundary
           playback_log["sched_cycle_total"]    = _cyc_total
+          _note_aired_cycle(playback_log, current_block, block_key, now, current_seconds,
+                            seconds_into_block, _cyc_boundary, timeline, _cyc_total)
           if not timeline or total_block_content <= 0:
               log.warning(
                   "[SCHEDULER] ch%s block=%s returned Static: cycle rebuild "
@@ -18687,7 +18951,12 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           _, _, _freeze_changed = _freeze_aired_prefix_durations(
               timeline, target_show, _cached_durs_ref, _frozen_paths_set)
           if _freeze_changed:
-              playback_log["sched_cached_durations"] = _cached_durs_ref
+              _set_saved_lineup(
+                  playback_log,
+                  playback_log.get("sched_cached_tracks", []),
+                  _cached_durs_ref,
+                  playback_log.get("sched_cached_groups"),
+              )
               playback_log["sched_frozen_aired_paths"] = sorted(_frozen_paths_set)
               try:
                   db.save_settings()
@@ -18719,16 +18988,9 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       resolved_file = target_show["path"]
       resolved_seek = actual_seek
       resolved_dur  = target_show["duration"]
-      if target_show.get("is_pair") and mode == "Video":
-          ep1_dur = target_show.get("pair_ep1_duration", 0)
-          if actual_seek >= ep1_dur:
-              resolved_file = target_show.get("pair_ep2_path", resolved_file)
-              resolved_seek = actual_seek - ep1_dur
-              resolved_dur  = target_show.get("pair_ep2_duration",
-                                              max(0, target_show["duration"] - ep1_dur))
-          else:
-              resolved_file = target_show.get("pair_ep1_path", resolved_file)
-              resolved_dur  = ep1_dur
+      if mode == "Video":
+          resolved_file, resolved_seek, resolved_dur = media.resolve_lineup_playback(
+              target_show, actual_seek)
       _resolve_sig = (current_block, resolved_file)
       _resolve_now = time.monotonic()
       if target_clean_key == "05" and (
@@ -18771,6 +19033,36 @@ def _note_playback_succeeded(file_path):
     """Called when a file is confirmed playing (state leaves Opening/Buffering cleanly, or a normal end-of-episode)."""
     if file_path:
         _transient_failure_state.pop(file_path, None)
+
+
+def _remove_confirmed_file_from_saved_lineups(file_path):
+    """Remove one confirmed-broken path from saved lineups without changing clock state."""
+    if db is None or not file_path:
+        return False
+    changed = False
+    for _ch_info in db.channels_db.values():
+        _log = _ch_info.get("playback_log") or {}
+        _tracks = _log.get("sched_cached_tracks")
+        if not isinstance(_tracks, list) or file_path not in _tracks:
+            continue
+        _new_tracks = [p for p in _tracks if p != file_path]
+        _durations = dict(_log.get("sched_cached_durations") or {})
+        _durations.pop(file_path, None)
+        _record = copy.deepcopy(_log.get("sched_cached_groups"))
+        if isinstance(_record, dict) and isinstance(_record.get("groups"), list):
+            _groups = []
+            for _group in _record["groups"]:
+                _paths = [p for p in (_group.get("paths") or []) if p != file_path]
+                if not _paths:
+                    continue
+                _kind = _group.get("kind", "single")
+                if _kind == "pair" and len(_paths) != 2:
+                    _kind = "single"
+                _groups.append({"kind": _kind, "paths": _paths})
+            _record["groups"] = _groups
+        _set_saved_lineup(_log, _new_tracks, _durations, _record)
+        changed = True
+    return changed
 
 
 def _mark_file_broken(ch_info, file_path, reason=None):
@@ -18816,6 +19108,7 @@ def _mark_file_broken(ch_info, file_path, reason=None):
     if file_path not in broken:
         broken.append(file_path)
         log.warning("Marking file unplayable, removing from future scheduling: %s (reason=%s)", file_path, _reason)
+    _remove_confirmed_file_from_saved_lineups(file_path)
     try:
         if db is not None:
             db.save_settings()
@@ -18871,6 +19164,8 @@ def _get_show_episode_context(ch_info, current_block, file_path):
             _log_info_throttled("path_unknown:" + str(path), "[PATH STATUS] %s: UNKNOWN (drive unresponsive or probe timed out) -- "
                                 "keeping eligible for substitution rather than dropping it", path)
         stored = asset.get("duration", 0) if isinstance(asset, dict) else 0
+        if media.track_duration_is_estimated(_media_probe_cache_ctx, path, stored):
+            continue
         raw.append({"path": path, "duration": resolve_track_duration(_media_probe_cache_ctx, path, stored)})
     _movie_pool, show_names, show_episodes = split_movies_and_series(raw)
     for sn in show_names:
@@ -18878,6 +19173,70 @@ def _get_show_episode_context(ch_info, current_block, file_path):
         if any(e["path"] == file_path for e in eps):
             return sn, eps
     return None, []
+
+
+def _show_rotation_entries(ch_info, current_block, show_name):
+    """The show's entries exactly as the block rotation lists them: existing files only, broken ones included, short episodes paired."""
+    _probe = (db.config.get("media_probe_cache", {}) if db is not None else {})
+    _raw = build_raw_tracks(ch_info.get("schedules", {}).get(current_block, []), _probe, _cached_path_exists)
+    _movies, _names, _show_eps = split_movies_and_series(_raw)
+    _eps = _show_eps.get(show_name, [])
+    _pair_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
+    return pair_short_episodes(_eps, threshold_seconds=_pair_sec) if _pair_sec > 0 else list(_eps)
+
+
+def _show_raw_episodes(ch_info, current_block, show_name):
+    """The show's episodes in rotation order: existing files only, broken ones included, short episodes not paired."""
+    _probe = (db.config.get("media_probe_cache", {}) if db is not None else {})
+    _raw = build_raw_tracks(ch_info.get("schedules", {}).get(current_block, []), _probe, _cached_path_exists)
+    _movies, _names, _show_eps = split_movies_and_series(_raw)
+    return list(_show_eps.get(show_name, []))
+
+
+def _set_saved_lineup(playback_log, tracks, durations=None, groups=None):
+    """Store the saved lineup fields together and keep the active block cache synchronized."""
+    _tracks = list(dict.fromkeys(p for p in (tracks or []) if p))
+    _durations = dict(durations or {})
+    playback_log["sched_cached_tracks"] = _tracks
+    playback_log["sched_cached_durations"] = {
+        p: _durations[p] for p in _tracks if p in _durations
+    }
+    if groups is not None:
+        playback_log["sched_cached_groups"] = copy.deepcopy(groups)
+    _block_key = playback_log.get("sched_block_key")
+    _block_cache = playback_log.get("block_rotation_cache")
+    if _block_key and isinstance(_block_cache, dict):
+        _cached_block = _block_cache.get(_block_key)
+        if isinstance(_cached_block, dict):
+            _cached_block["tracks"] = list(playback_log["sched_cached_tracks"])
+            _cached_block["durations"] = dict(playback_log["sched_cached_durations"])
+            _cached_block["groups"] = copy.deepcopy(playback_log.get("sched_cached_groups"))
+
+
+def _keep_swap_groups(playback_log, ch_info, old_paths, new_paths, replacements, eps):
+    """Rewrites the block's saved groups to match a swapped path list, or drops them when they cannot describe it."""
+    durations = {e["path"]: e.get("duration") for e in eps}
+    for _paths in (r["paths"] for r in replacements.values()):
+        for _p in _paths:
+            durations.setdefault(_p, None)
+    record = media.swap_lineup_groups(
+        playback_log.get("sched_cached_groups"), old_paths, new_paths, replacements,
+        max(0, ch_info.get("pair_threshold_minutes", 15)) * 60, lambda p: durations.get(p))
+    if record is None:
+        playback_log.pop("sched_cached_groups", None)
+    else:
+        playback_log["sched_cached_groups"] = record
+
+    _durations = dict(playback_log.get("sched_cached_durations") or {})
+    _replacement_durations = {
+        path: duration for path, duration in durations.items()
+        if path in set(new_paths)
+    }
+    _durations.update(_replacement_durations)
+    _set_saved_lineup(
+        playback_log, new_paths, _durations,
+        playback_log.get("sched_cached_groups"),
+    )
 
 
 def _resolve_broken_episode(ch_info, failed_file, current_block, channel_id=None):
@@ -18899,20 +19258,104 @@ def _resolve_broken_episode(ch_info, failed_file, current_block, channel_id=None
     episode_order_mode = ch_info.get("episode_order_mode", "sequential")
 
     if episode_order_mode == "random":
-        already_in_block = {p for p in cached if p in show_paths}
-        candidates = [e for e in playable_eps if e["path"] not in already_in_block]
+        _rot_eps = _show_rotation_entries(ch_info, current_block, show_name)
+        _show_pos_map = playback_log.setdefault("show_pos", {})
+        _bag = set(media.random_bag_entry_indices(_show_pos_map, show_name, _rot_eps, channel_id=channel_id))
+        _in_block = set(cached)
+        candidates = []
+        for _i, _e in enumerate(_rot_eps):
+            if _i not in _bag:
+                continue
+            if _e.get("is_pair"):
+                _e_paths = [_e.get("pair_ep1_path"), _e.get("pair_ep2_path")]
+            elif _e.get("is_bundle"):
+                _e_paths = list(_e.get("bundle_item_paths") or media.lineup_paths([_e]))
+            else:
+                _e_paths = [_e.get("path")]
+            if any((not _p) or _p == failed_file or _p in broken or _p in _in_block for _p in _e_paths):
+                continue
+            candidates.append((_i, _e, _e_paths))
         if not candidates:
-            cached = [p for p in cached if p not in show_paths]
-            candidates = list(playable_eps)
-        substitute = random.choice(candidates)
-        cached = [substitute["path"] if p == failed_file else p for p in cached]
-        playback_log["sched_cached_tracks"] = cached
-        _idx = next((i for i, e in enumerate(eps) if e["path"] == substitute["path"]), 0)
-        note_random_episode_played(
-            playback_log.setdefault("show_pos", {}),
-            show_name, len(eps), _idx, channel_id=channel_id
-        )
+            return None
+        _idx, _entry, _entry_paths = random.choice(candidates)
+        if _entry.get("is_pair"):
+            _replacement_kind = "pair"
+            _replacement_duration = _entry.get("pair_ep1_duration", 1800)
+        elif _entry.get("is_bundle"):
+            _replacement_kind = "bundle"
+            _replacement_duration = _entry.get("duration", 1800)
+        else:
+            _replacement_kind = "single"
+            _replacement_duration = _entry.get("duration", 1800)
+        substitute = {"path": _entry_paths[0], "duration": _replacement_duration}
+        _new_cached = []
+        _replaced = False
+        for _p in cached:
+            if _p == failed_file and not _replaced:
+                _new_cached.extend(_entry_paths)
+                _replaced = True
+            else:
+                _new_cached.append(_p)
+        playback_log["sched_cached_tracks"] = _new_cached
+        _keep_swap_groups(playback_log, ch_info, cached, _new_cached,
+                          {failed_file: {"kind": _replacement_kind,
+                                         "paths": list(_entry_paths)}}, eps)
+        note_random_episode_played(_show_pos_map, show_name, _rot_eps, _idx, channel_id=channel_id)
     else:
+        _pair_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
+        _raw_eps = _show_raw_episodes(ch_info, current_block, show_name)
+        _rotation_entries = media.pair_short_episodes(_raw_eps, _pair_sec) if _pair_sec > 0 else list(_raw_eps)
+        _failed_entry_index = next(
+            (i for i, entry in enumerate(_rotation_entries)
+             if failed_file in media.lineup_paths([entry])),
+            None,
+        )
+        if _pair_sec > 0 and _failed_entry_index is not None:
+            _cached_set = set(cached)
+            _replacement = None
+            for _offset in range(1, len(_rotation_entries) + 1):
+                _candidate_index = (_failed_entry_index + _offset) % len(_rotation_entries)
+                _candidate = _rotation_entries[_candidate_index]
+                _candidate_paths = media.lineup_paths([_candidate])
+                if (_candidate_paths and all(
+                        path not in broken and path != failed_file
+                        for path in _candidate_paths
+                )):
+                    _replacement = (_candidate_index, _candidate, _candidate_paths)
+                    break
+            if _replacement is not None:
+                _replacement_index, _replacement_entry, _replacement_paths = _replacement
+                _failed_paths = media.lineup_paths([_rotation_entries[_failed_entry_index]])
+                _insert_at = min((cached.index(path) for path in _failed_paths if path in cached), default=None)
+                if _insert_at is not None:
+                    _new_cached = [path for path in cached if path not in _failed_paths]
+                    _new_cached[_insert_at:min(_insert_at, len(_new_cached))] = _replacement_paths
+                    playback_log["sched_cached_tracks"] = _new_cached
+                    _keep_swap_groups(
+                        playback_log, ch_info, cached, _new_cached,
+                        {failed_file: {"kind": "pair", "paths": list(_replacement_paths)}}, eps,
+                    )
+                    _state_key = media.stable_series_id(show_name, channel_id)
+                    _show_pos_map = playback_log.setdefault("show_pos", {})
+                    _show_pos_map[_state_key] = media.sequential_state_from_entry_index(
+                        _raw_eps, _rotation_entries,
+                        (_replacement_index + 1) % len(_rotation_entries),
+                    )
+                    substitute = {"path": _replacement_paths[0], "duration": _replacement_entry.get("duration", 1800)}
+                else:
+                    substitute = None
+            else:
+                substitute = None
+        else:
+            substitute = None
+        if substitute is not None:
+            try:
+                if db is not None:
+                    db.save_settings()
+            except Exception as e:
+                log.warning("_resolve_broken_episode: failed to persist paired reschedule for show '%s': %s", show_name, e)
+            return {"file": substitute["path"], "seek": 0, "duration": substitute.get("duration", 1800)}
+
         n = len(eps)
         try:
             failed_idx = next(i for i, e in enumerate(eps) if e["path"] == failed_file)
@@ -18953,9 +19396,34 @@ def _resolve_broken_episode(ch_info, failed_file, current_block, channel_id=None
                 new_cached.append(_shift_forward(p, step))
             else:
                 new_cached.append(p)
+        if any(new_cached.count(_p) > 1 and new_cached.count(_p) > cached.count(_p) for _p in set(show_paths)):
+            return None
         playback_log["sched_cached_tracks"] = new_cached
-        _cur_pos = playback_log.setdefault("show_pos", {}).get(show_name, 0)
-        playback_log["show_pos"][show_name] = (_cur_pos + step) % n
+        _keep_swap_groups(playback_log, ch_info, cached, new_cached,
+                          {_old: {"kind": "member", "paths": [_new]}
+                           for _old, _new in zip(cached, new_cached) if _old != _new}, eps)
+        _raw_eps = _show_raw_episodes(ch_info, current_block, show_name)
+        _pair_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
+        _state_key = media.stable_series_id(show_name, channel_id)
+        _show_pos_map = playback_log.setdefault("show_pos", {})
+        _prior_state = _show_pos_map.get(_state_key, 0)
+        _rotation_entries = media.pair_short_episodes(_raw_eps, _pair_sec)
+        _entry_by_path = {}
+        for _entry_index, _entry in enumerate(_rotation_entries):
+            for _entry_path in media.lineup_paths([_entry]):
+                _entry_by_path[_entry_path] = _entry_index
+        _last_entry_index = None
+        for _p in reversed(new_cached):
+            if _p in _entry_by_path:
+                _last_entry_index = _entry_by_path[_p]
+                break
+        if _last_entry_index is not None and _rotation_entries:
+            _new_state = media.sequential_state_from_entry_index(
+                _raw_eps, _rotation_entries, (_last_entry_index + 1) % len(_rotation_entries))
+        else:
+            _new_state = media.sequential_state_shifted(_raw_eps, _prior_state, step, _pair_sec)
+        _show_pos_map[_state_key] = _new_state
+
 
     try:
         if db is not None:
@@ -19123,7 +19591,18 @@ def _render_transition_static(screen, rect, target_aspect=None):
         screen.fill((1, 1, 1), rect)
 
 
+def _static_transition_running():
+    """True while a Static-style transition is on screen: its burst timer is running or a channel flip is waiting."""
+    if _configured_transition_style() != "static":
+        return False
+    return (pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
+            or _surf_origin_active())
+
+
 def _stop_transition_static():
+    # WARNING: this must do nothing while a Static-style burst or flip is running, or the noise is cut every frame and never heard.
+    if _static_transition_running():
+        return
     if 'static_audio' in globals() and static_audio is not None:
         static_audio.stop()
 
@@ -19253,7 +19732,9 @@ def _note_fresh_live_video_frame(ch):
     """Bookkeeping for a newly decoded live-TV frame, run by the render pass that consumes it."""
     app_state["_last_new_frame_ticks"] = pygame.time.get_ticks()
     app_state["_had_first_frame_this_tune"] = True
-    if pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0):
+    _now_ticks = pygame.time.get_ticks()
+    if (_now_ticks >= app_state.get("channel_switch_static_until", 0)
+            and _now_ticks >= app_state.get("channel_switch_black_until", 0)):
         _stop_transition_static()
         _lift_buffering_mute(ch, "first-frame")
         app_state["_video_audio_hold_until"] = 0
@@ -19263,6 +19744,45 @@ def _note_fresh_live_video_frame(ch):
 # ============================================================================
 # SECTION: Channel change
 # ============================================================================
+
+
+def _quiet_game_channel():
+    """Stops the game channel's menu music and pauses, hides and mutes its running game or disc."""
+    global _ch03_audio_generation
+    with _ch03_audio_lock:
+        _ch03_audio_generation += 1
+    _stop_ch03_menu_music()
+    if game_deck is not None:
+        try:
+            game_deck.set_audio_state(muted=True)
+            if hasattr(game_deck, "set_libretro_volume"):
+                game_deck.set_libretro_volume(db.config.get("global_volume", 70) if db else 70, True)
+            if hasattr(game_deck, "set_audio_volume"):
+                game_deck.set_audio_volume(db.config.get("global_volume", 70) if db else 70, True)
+        except Exception as _game_mute_err:
+            log.warning("[GAME AUDIO] channel-leave mute failed: %s", _game_mute_err)
+    if game_deck is not None and game_deck.is_process_running():
+        _lr = getattr(game_deck, "_libretro_core", None)
+        if _lr is not None and _lr.is_loaded:
+            game_deck.set_paused(True, hard=True, reason="channel")
+        else:
+            import threading as _t
+            _t.Thread(
+                target=lambda: (
+                    game_deck.set_viewport_state(visible=False),
+                    game_deck.set_audio_state(muted=True)
+                ),
+                daemon=True
+            ).start()
+    if (game_deck is not None and game_deck.dvd_playback_active
+            and dvd_engine is not None):
+        try:
+            dvd_engine.player.audio_set_mute(True)
+            game_deck.dvd_iso_backgrounded = True
+            print("[DVD] Backgrounded on channel leave -- dvd_engine muted, "
+                  "left running as-is (unmute-in-place on return, no reopen).")
+        except Exception as _me:
+            log.warning(f"[DVD] Failed to mute backgrounded DVD on channel leave: {_me}")
 
 
 def _run_pending_channel_activation():
@@ -19314,7 +19834,11 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         print("[HARDWARE SHIELD] Refusing channel switch pass: Surface layout is uninitialized.")
         return
 
-    _mid_static_burst = pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+    _mid_static_burst = (
+        _configured_transition_style() == "static"
+        and (pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
+             or _surf_origin_active())
+    )
     if (not _mid_static_burst and not internal_advance
             and 'static_audio' in globals() and static_audio is not None):
         static_audio.stop()
@@ -19351,30 +19875,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         global _last_screen_mode_picture_rect
         _last_screen_mode_picture_rect = None
 
-    if old_ch == "03" and new_ch != "03":
-        _stop_ch03_menu_music()
-        if game_deck is not None and game_deck.is_process_running():
-            _lr = getattr(game_deck, "_libretro_core", None)
-            if _lr is not None and _lr.is_loaded:
-                game_deck.set_paused(True, hard=True, reason="channel")
-            else:
-                import threading as _t
-                _t.Thread(
-                    target=lambda: (
-                        game_deck.set_viewport_state(visible=False),
-                        game_deck.set_audio_state(muted=True)
-                    ),
-                    daemon=True
-                ).start()
-        if (game_deck is not None and game_deck.dvd_playback_active
-                and dvd_engine is not None):
-            try:
-                dvd_engine.player.audio_set_mute(True)
-                game_deck.dvd_iso_backgrounded = True
-                print("[DVD] Backgrounded on channel leave -- dvd_engine muted, "
-                      "left running as-is (unmute-in-place on return, no reopen).")
-            except Exception as _me:
-                log.warning(f"[DVD] Failed to mute backgrounded DVD on channel leave: {_me}")
+    if old_ch == "03" and new_ch != "03" and app_state.get("surf_origin") != "03":
+        _quiet_game_channel()
     
     app_state["current_channel"] = new_ch
     app_state["_live_playback_channel"] = ""
@@ -19405,7 +19907,7 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                 def _ch03_activate(_muted=_muted, _wants_menu_music=_wants_menu_music):
                     _burst_active = (
                         _transition_style_now == "static"
-                        and pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+                        and pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
                     )
                     _effective_muted = _muted or _burst_active
                     game_deck.set_paused(False, reason="channel", muted=_effective_muted)
@@ -19418,7 +19920,7 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                 def _ch03_activate(_muted=_muted, _wants_menu_music=_wants_menu_music):
                     _burst_active = (
                         _transition_style_now == "static"
-                        and pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+                        and pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
                     )
                     _effective_muted = _muted or _burst_active
                     if _burst_active:
@@ -19511,11 +20013,15 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                     }
 
                 if _old_anc.get("file"):
-                    _old_anc["wall_start"]  = broadcast_clock.seconds_since_midnight()
+                    _old_anc["wall_start"]  = (
+                        pre_captured_position.get("wall_start", broadcast_clock.seconds_since_midnight())
+                        if pre_captured_position is not None else broadcast_clock.seconds_since_midnight())
                     _old_anc["seek_offset"] = _pos_ms / 1000.0
                     if _dur_ms and _dur_ms > 0:
                         _old_anc["duration"] = max(_old_anc.get("duration", 1800), int(_dur_ms // 1000))
-                    _old_anc["anchor_written_at"] = broadcast_clock.now().timestamp()
+                    _old_anc["anchor_written_at"] = (
+                        pre_captured_position.get("written_at", broadcast_clock.now().timestamp())
+                        if pre_captured_position is not None else broadcast_clock.now().timestamp())
                     _old_ch_entry["playback_anchor"] = _old_anc
                     print(f"[ANCHOR] Snapped ch{_old_snap_key} leave-position to {_old_anc['seek_offset']:.3f}s.")
                     if str(new_ch).zfill(2) == _old_snap_key:
@@ -19612,9 +20118,14 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                 _guide_exit_warm_skip_stop = False
             if _guide_exit_warm_skip_stop:
                 _seed_last_video_frame("fullscreen", "preview")
-                _warm_transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+                _warm_transition_style = _configured_transition_style()
                 _warm_burst_ms = STATIC_TRANSITION_MS if _warm_transition_style == "static" else GUIDE_PREVIEW_SETTLE_MS
-                app_state["channel_switch_black_until"] = pygame.time.get_ticks() + _warm_burst_ms
+                if _warm_transition_style == "static":
+                    app_state["channel_switch_black_until"] = 0
+                    app_state["channel_switch_static_until"] = pygame.time.get_ticks() + _warm_burst_ms
+                else:
+                    app_state["channel_switch_static_until"] = 0
+                    app_state["channel_switch_black_until"] = pygame.time.get_ticks() + _warm_burst_ms
                 # WARNING: the shield's own timer owns unmuting here, not the readiness lifter.
                 app_state["_video_pending_unmute"] = False
                 _arm_warm_transition_shield(vlc_engine, _warm_burst_ms)
@@ -19663,17 +20174,19 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
     if not internal_advance and not _warm_continue_skip_stop:
         _clear_last_video_frame(context="fullscreen")
 
-    _transition_style_now = db.config.get("transition_type", "black") if db is not None else "black"
+    _transition_style_now = _configured_transition_style()
     if is_boot:
         app_state["_boot_suppress_static"] = True
     elif internal_advance:
         app_state["_boot_suppress_static"] = True
     elif _transition_style_now == "static":
         app_state["_boot_suppress_static"] = False
-        app_state["channel_switch_black_until"] = pygame.time.get_ticks() + STATIC_TRANSITION_MS
+        app_state["channel_switch_black_until"] = 0
+        app_state["channel_switch_static_until"] = pygame.time.get_ticks() + STATIC_TRANSITION_MS
         if new_ch == "04" and old_ch != "04":
-            app_state["guide_entry_static_suppress_until"] = (
-                app_state["channel_switch_black_until"] + 1500)
+            app_state["guide_entry_static_suppress_until"] = app_state["channel_switch_static_until"]
+            app_state["guide_preview_black_until"] = 0
+            app_state["guide_preview_static_until"] = app_state["channel_switch_static_until"]
         if _warm_continue_skip_stop and vlc_engine is not None:
             try:
                 vlc_engine.player.audio_set_mute(True)
@@ -19683,11 +20196,13 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
             _mute_guard_log("ARM (warm static transition duck)", ch=new_ch)
     elif is_surfing:
         app_state["_boot_suppress_static"] = False
+        app_state["channel_switch_static_until"] = 0
         # WARNING: do not overwrite the shield the guide-exit warm-continuation branch above already armed.
         if not _guide_exit_warm_skip_stop:
             app_state["channel_switch_black_until"] = pygame.time.get_ticks() + 200
     else:
         app_state["_boot_suppress_static"] = False
+        app_state["channel_switch_static_until"] = 0
         if not _guide_exit_warm_skip_stop:
             app_state["channel_switch_black_until"] = pygame.time.get_ticks() + 150
 
@@ -19763,6 +20278,10 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         pass
     else:
         app_state["osd_channel_pending"] = False
+        app_state["surf_target"] = ""
+        app_state["surf_commit_at"] = 0
+        app_state["surf_origin"] = ""
+        app_state["surf_leave_position"] = None
         app_state["osd_channel_timer"] = pygame.time.get_ticks() + 2500
     if not internal_advance:
         app_state["visualizer_osd_timer"] = pygame.time.get_ticks() + 10000
@@ -19836,7 +20355,7 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                   f"skipping reload for {_guide_entry_warm_target_file}")
 
             # WARNING: this is the one transition path that never calls play_file_segmented() again.
-            _warm_transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+            _warm_transition_style = _configured_transition_style()
             if _warm_transition_style == "static":
                 _warm_burst_ms = STATIC_TRANSITION_MS
                 app_state["guide_preview_static_until"] = pygame.time.get_ticks() + _warm_burst_ms
@@ -19919,19 +20438,9 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                     _cc_ch_key = str(new_ch).zfill(2)
 
                     def _make_cc_on_confirmed(_snap):
-                        def _cc_on_confirmed(success, attempt_id, deferred, _s=_snap):
-                            if success:
-                                _confirm_playback_started(
-                                    _cc_ch_key, attempt_id, _s.get("file"),
-                                    _s.get("seek", 0), _s.get("seek_slot_offset", 0),
-                                    _s.get("duration", 1800), _s.get("mode", "Video"),
-                                    _s.get("block", "Morning"), _s.get("interior_cut", False),
-                                    deferred,
-                                )
-                            else:
-                                _confirm_playback_failed(_cc_ch_key, attempt_id, _s.get("file"), deferred,
-                                                          reason="change_channel_open_failed")
-                        return _cc_on_confirmed
+                        return _make_live_playback_start_callback(
+                            _cc_ch_key, _snap, "change_channel_open_failed"
+                        )
 
                     _played_ok = True
                     if _should_play:
@@ -19999,6 +20508,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                             pygame.time.get_ticks() + AUDIO_SYNC_HOLD_MS,
                         )
                         app_state["last_video_play_started_at"] = pygame.time.get_ticks()
+                        if internal_advance:
+                            _hold_picture_through_advance()
                         _mute_guard_log("ARM (real channel change)", ch=new_ch, filepath=t_state["file"])
                         _played_ok = vlc_engine.play_file_segmented(
                             t_state["file"], t_state["seek"],
@@ -20112,6 +20623,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                     app_state.get("_video_audio_hold_until", 0),
                     pygame.time.get_ticks() + AUDIO_SYNC_HOLD_MS,
                 )
+                if internal_advance:
+                    _hold_picture_through_advance()
     else:
         if t_state["mode"] == "Visualizer":
             track_file_path = t_state.get("file", "")
@@ -20267,6 +20780,167 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
 
 
 # ============================================================================
+# SECTION: Channel Up/Down hesitation
+# ============================================================================
+
+
+def _surf_allowed_channels():
+    """The channel numbers Up and Down step through, in order: the game channel, the guide, then every active channel 05 to 44."""
+    allowed = []
+    if db is not None and db.config.get("game_channel_enabled", True):
+        allowed.append("03")
+    if db is not None and db.config.get("tv_guide_enabled", True):
+        allowed.append("04")
+    for i in range(5, 45):
+        ch_key = str(i).zfill(2)
+        if db is not None and db.channels_db.get(ch_key, {}).get("active", False):
+            allowed.append(ch_key)
+    return allowed
+
+
+def _surf_origin_active():
+    """True while the channel that was on air at the first Up or Down press has been shut down and no channel has replaced it."""
+    return bool(app_state.get("surf_origin", ""))
+
+
+def _surf_cancel():
+    """Drops the flipped-to number; the shut-down show of the channel flipped from stays down until a channel is tuned."""
+    app_state["osd_channel_pending"] = False
+    app_state["surf_target"] = ""
+    app_state["surf_commit_at"] = 0
+
+
+def _surf_capture_leave_position(origin):
+    """Reads the file, position and length VLC holds for the channel on air, stamped with the wall time of the read."""
+    if origin in ("03", "04") or vlc_engine is None or not app_state.get("is_playing_video", False):
+        return None
+    try:
+        _state = vlc_engine.player.get_state()
+        _pos = vlc_engine.player.get_time()
+        _media = vlc_engine.player.get_media()
+        _mrl = _media.get_mrl() if _media else ""
+        if not _mrl or _pos is None or _pos < 0 or _state in (vlc.State.Ended, vlc.State.Error):
+            return None
+        from urllib.parse import unquote as _unquote_leave
+        return {
+            "file": os.path.normpath(_unquote_leave(_mrl.replace("file:///", ""))),
+            "pos_ms": _pos,
+            "dur_ms": vlc_engine.player.get_length() or 0,
+            "wall_start": broadcast_clock.seconds_since_midnight(),
+            "written_at": broadcast_clock.now().timestamp(),
+        }
+    except Exception as _leave_err:
+        log.debug("surf: leave position unavailable: %s", _leave_err)
+        return None
+
+
+def _surf_begin_quiet():
+    """Hides, mutes and starts shutting down the channel on air at the first Up or Down press, and keeps its position for the tune that follows."""
+    origin = str(app_state.get("current_channel", "05")).zfill(2)
+    app_state["surf_origin"] = origin
+    app_state["surf_leave_position"] = _surf_capture_leave_position(origin)
+    if _configured_transition_style() != "static":
+        if 'static_audio' in globals() and static_audio is not None:
+            static_audio.stop()
+        _stop_transition_static()
+    app_state["channel_switch_black_until"] = 0
+    app_state["channel_switch_static_until"] = 0
+    if origin == "03":
+        _quiet_game_channel()
+    if vlc_engine is not None:
+        try:
+            vlc_engine.player.audio_set_mute(True)
+        except Exception as _mute_err:
+            log.warning(f"[SURF] mute failed: {_mute_err}")
+        try:
+            vlc_engine.stop(block=False)
+        except Exception as _stop_err:
+            log.warning(f"[SURF] outgoing vlc stop failed: {_stop_err}")
+    if pygame.mixer.music.get_busy():
+        pygame.mixer.music.stop()
+    if db is not None and db.channels_db.get(origin, {}).get("is_visualizer", False):
+        pygame.mixer.Channel(1).stop()
+    app_state["music_owner"] = ""
+    app_state["guide_preview_music_track"] = ""
+    _clear_last_video_frame(context="fullscreen")
+
+
+def _surf_step(step):
+    """Moves the flipped-to channel one place up (+1) or down (-1) from where the last press left it and arms the hesitation wait; the first press shuts the channel on air down."""
+    allowed = _surf_allowed_channels()
+    if not allowed:
+        return
+    now = pygame.time.get_ticks()
+    if not _surf_origin_active():
+        _surf_begin_quiet()
+    base = app_state.get("surf_target", "") if app_state.get("osd_channel_pending", False) else ""
+    base = base or str(app_state["current_channel"]).zfill(2)
+    if base not in allowed:
+        base = allowed[0]
+    app_state["digit_buffer"] = ""
+    app_state["digit_timer"] = 0
+    app_state["surf_target"] = allowed[(allowed.index(base) + step) % len(allowed)]
+    app_state["osd_channel_pending"] = True
+    app_state["surf_commit_at"] = now + _CHANNEL_SURF_HESITATE_MS
+    app_state["osd_channel_timer"] = now + _CHANNEL_SURF_HESITATE_MS + 2500
+
+
+def _typed_channel_valid(channel):
+    """True when a typed two-character channel number is one that can be tuned: the game channel and guide when enabled, or an active channel 05 to 44."""
+    if db is None:
+        return channel in ("04", "05", "06", "07")
+    return channel in _surf_allowed_channels()
+
+
+def _surf_digit_typed(digit, now_ticks):
+    """Adds a typed digit to the channel number; a full number that can be tuned hides, mutes and shuts down the show on air, a full number that cannot be tuned is dropped, and a short number leaves the show playing."""
+    _surf_cancel()
+    app_state["digit_buffer"], app_state["digit_timer"] = menu_nav.digit_entry_step(
+        app_state.get("digit_buffer", ""), digit, now_ticks)
+    if len(app_state["digit_buffer"]) >= menu_nav.DIGIT_ENTRY_MAX and not _typed_channel_valid(menu_nav.digit_entry_channel(app_state["digit_buffer"])):
+        app_state["digit_buffer"] = ""
+        app_state["digit_timer"] = 0
+        return
+    app_state["osd_channel_timer"] = now_ticks + 2500
+    if len(app_state["digit_buffer"]) >= menu_nav.DIGIT_ENTRY_MAX and not _surf_origin_active():
+        _surf_begin_quiet()
+
+
+def _tune_after_flip(target_ch, is_surfing=False):
+    """Tunes the channel a flip came to rest on, or brings back the shut-down channel when target_ch is blank or is that channel."""
+    origin = app_state.get("surf_origin", "")
+    target_ch = target_ch or origin
+    position = app_state.get("surf_leave_position") if origin else None
+    if not target_ch:
+        return
+    target_track_state = calculate_slotted_playback_state(target_ch)
+    if target_track_state.get("mode") == "Visualizer":
+        if pygame.mixer.music.get_busy():
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        app_state["active_music_track_file"] = target_track_state.get("file", "")
+    change_channel(target_ch, is_surfing=is_surfing, force_reload=(target_ch == origin), pre_captured_position=position)
+    app_state["surf_origin"] = ""
+    app_state["surf_leave_position"] = None
+
+
+def _surf_commit_if_due(now_ticks):
+    """Tunes the flipped-to channel once Up and Down have been left alone for the hesitation time."""
+    if not app_state.get("osd_channel_pending", False) or now_ticks < app_state.get("surf_commit_at", 0):
+        return
+    target_ch = app_state.get("surf_target", "")
+    _surf_cancel()
+    app_state["osd_channel_timer"] = now_ticks + 2500
+    _tune_after_flip(target_ch)
+
+
+def _surf_recover_if_stuck():
+    """Brings back the shut-down channel when nothing is left that could still tune another one (no flip waiting, no digits typed)."""
+    if _surf_origin_active() and not app_state.get("osd_channel_pending", False) and not app_state.get("digit_buffer", ""):
+        _tune_after_flip("")
+
+
+# ============================================================================
 # SECTION: Channel counts & surf-up helpers
 # ============================================================================
 
@@ -20416,6 +21090,14 @@ def _loudness_hold_last_frame_ms():
 def _loudness_hold_last_frame_active():
     """True while the last picture stays on screen because a loudness engine rebuild is reopening the show."""
     return pygame.time.get_ticks() < app_state.get("_hold_last_frame_until", 0)
+
+
+def _hold_picture_through_advance():
+    """Keeps the last picture on screen while the next show or commercial on the same channel settles its audio."""
+    app_state["_hold_last_frame_until"] = max(
+        app_state.get("_hold_last_frame_until", 0),
+        pygame.time.get_ticks() + AUDIO_SYNC_HOLD_MS,
+    )
 
 
 def _loudness_retune_kind(ch):
@@ -21419,7 +22101,13 @@ def _guide_jump_col(direction, _source="unknown"):
                          "if it ever shows up)", edge_col)
 
     if direction > 0:
-        target = next((s for s in stops if s.get("abs", 0) > curr_abs), None)
+        # Move directly to the next program boundary. A variable-width block may
+        # span several half-hour columns, so never step through its grid cells.
+        target = next((s for s in stops
+                       if s.get("abs", 0) > curr_abs
+                       and s.get("col", 0) > curr_col), None)
+        if target is None:
+            target = next((s for s in stops if s.get("abs", 0) > curr_abs), None)
         if target is not None:
             app_state["guide_col_pos"] = min(target.get("col", 0), _guide_last_col)
             app_state["guide_selected_stop_key"] = target.get("key")
@@ -21780,20 +22468,15 @@ while True:
         app_state["digit_buffer"] = ""
         app_state["digit_timer"] = 0
         
-        valid_set = []
-        if db is not None:
-            if db.config.get("game_channel_enabled", True): valid_set.append("03")
-            if db.config.get("tv_guide_enabled", True): valid_set.append("04")
-            for i in range(5, 45):
-                ch_key_str = str(i).zfill(2)
-                if db.channels_db.get(ch_key_str, {}).get("active", False):
-                    valid_set.append(ch_key_str)
-        else:
-            valid_set = ["04", "05", "06", "07"]
-            
-        if final_ch in valid_set: 
+        if _typed_channel_valid(final_ch):
             print(f"[TUNER] digit_buffer resolved ({_digit_count} digit(s)): tuning to {final_ch}")
-            change_channel(final_ch, is_surfing=True)
+            if _surf_origin_active():
+                _tune_after_flip(final_ch, is_surfing=True)
+            else:
+                change_channel(final_ch, is_surfing=True)
+
+    _surf_commit_if_due(now_ticks)
+    _surf_recover_if_stuck()
 
     if app_state["current_channel"] == "04":
         _guide_keep_highlight_in_view()
@@ -21951,73 +22634,46 @@ while True:
                             _plog_add   = _ch_info_add.setdefault("playback_log", {})
                             _scheds_add = _ch_info_add.get("schedules", {})
                             _items_add  = _scheds_add.get(active_b, [])
-                            _mpc_add    = db.config.get("media_probe_cache", {})
-                            _raw_add    = []
-                            for _item_a in _items_add:
-                                _p_a = (_item_a.get("path", _item_a.get("file", ""))
-                                        if isinstance(_item_a, dict) else str(_item_a))
-                                if _p_a:
-                                    _stored_a = (_item_a.get("duration", 0)
-                                                 if isinstance(_item_a, dict) else 0)
-                                    _d_a = resolve_track_duration(
-                                        _mpc_add, _p_a, _stored_a)
-                                    _raw_add.append({"path": _p_a, "duration": _d_a})
+                            _mpc_add = db.config.get("media_probe_cache", {})
+                            _path_exists_add = os.path.exists
+                            _raw_add = build_raw_tracks(
+                                _items_add, _mpc_add, _path_exists_add)
+                            _pend_add = build_pending_tracks(
+                                _items_add, _mpc_add, _path_exists_add)
                             if _raw_add:
-                                _now_add  = broadcast_clock.now().replace(tzinfo=None)
+                                _now_add = broadcast_clock.now().replace(tzinfo=None)
                                 _boff_add = _bseed_offsets_add.get(active_b, 0)
-                                _seed_add = (
-                                    _now_add.year * 1000
-                                    + _now_add.timetuple().tm_yday
-                                    + int(str(target_ch).lstrip("0") or "0")
-                                    + _boff_add
-                                )
-                                _order_seed_add = _start_order_seed(_ch_info_add, _boff_add)
+                                _seed_date_add = block_start_date(_now_add, active_b)
+                                _seed_add = block_day_seed(
+                                    _seed_date_add, target_ch, _boff_add)
+                                _order_seed_add = _start_order_seed(
+                                    _ch_info_add, _boff_add)
                                 _sp_snap_add = dict(_plog_add.get("show_pos", {}))
-                                _pt_add  = max(0, _ch_info_add.get(
+                                _pt_add = max(0, _ch_info_add.get(
                                     "pair_threshold_minutes", 15)) * 60
                                 _eom_add = _ch_info_add.get(
                                     "episode_order_mode", "sequential")
-                                _so_add  = (_plog_add.get("show_order", {})
-                                            .get(active_b))
-                                _bdur_map_add = {
-                                    "Morning":  8 * 3600,
-                                    "Evening":  8 * 3600,
-                                    "Night":    8 * 3600,
-                                    "Full Day": 86400,
-                                }
-                                for _sbn_add2 in SIX_HOUR_BLOCK_NAMES:
-                                    _bdur_map_add[_sbn_add2] = 4 * 3600
-                                _bdur_add = _bdur_map_add.get(active_b, 8 * 3600)
+                                _so_add = (_plog_add.get("show_order", {})
+                                           .get(active_b))
+                                _bdur_add = block_length_seconds(active_b)
 
-                                _vt_add, _, _ = build_show_rotation(
-                                    _raw_add, _smode_add, _sp_snap_add, _seed_add,
-                                    pair_threshold_seconds=_pt_add,
-                                    episode_order_mode=_eom_add,
-                                    fixed_show_order=_so_add,
-                                    block_duration_seconds=_bdur_add,
-                                    channel_id=target_ch,
-                                    order_seed=_order_seed_add,
+                                _vt_add, _, _ = build_block_rotation(
+                                    _raw_add, _ch_info_add, _sp_snap_add,
+                                    _seed_add, _bdur_add, target_ch,
+                                    _so_add, _order_seed_add,
+                                    pending_tracks=_pend_add,
                                 )
                                 if _vt_add:
-                                    _day_add  = _now_add.timetuple().tm_yday
-                                    _bkey_add = f"{_now_add.year}_{_day_add}_{active_b}"
-                                    _cpaths_add = []
-                                    for _ct_a in _vt_add:
-                                        if _ct_a.get("is_pair"):
-                                            _cpaths_add.append(
-                                                _ct_a.get("pair_ep1_path",
-                                                          _ct_a["path"]))
-                                            _cpaths_add.append(
-                                                _ct_a.get("pair_ep2_path", ""))
-                                        else:
-                                            _cpaths_add.append(
-                                                _ct_a.get("path", ""))
+                                    _bkey_add = block_key_for(_now_add, active_b)
+                                    _cpaths_add = lineup_paths(_vt_add)
                                     _cdur_add = _snapshot_track_durations(_vt_add)
-                                    _brc_add  = _plog_add.setdefault(
+                                    _brc_add = _plog_add.setdefault(
                                         "block_rotation_cache", {})
                                     _brc_add[_bkey_add] = {
-                                        "tracks":    [p for p in _cpaths_add if p],
+                                        "tracks": [p for p in _cpaths_add if p],
                                         "durations": _cdur_add,
+                                        "groups": lineup_groups(_vt_add, _pt_add),
+                                        "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
                                     }
                                     # VALUES CHANGE HERE
                                     if len(_brc_add) > 12:
@@ -23075,9 +23731,7 @@ while True:
                 pressed_digit = menu_nav.key_to_digit(event.key)
 
                 if pressed_digit is not None:
-                    app_state["digit_buffer"], app_state["digit_timer"] = menu_nav.digit_entry_step(
-                        app_state.get("digit_buffer", ""), pressed_digit, now_ticks)
-                    app_state["osd_channel_timer"] = now_ticks + 2500
+                    _surf_digit_typed(pressed_digit, now_ticks)
                     continue
 
                 if event.key == pygame.K_n:
@@ -23091,7 +23745,8 @@ while True:
                     target_gain = _perceptual_volume_pct(current_vol) / 100.0
                     music_target_gain = _perceptual_volume_pct(current_vol, min_db=STACKED_GAIN_MIN_DB) / 100.0
                     
-                    if vlc_engine is not None: 
+                    if vlc_engine is not None:
+                        _refresh_live_file_gain()
                         vlc_engine.set_volume(current_vol, safe_mute_flag)
                     _set_dvd_volume(int(db.config.get("global_volume", 70)), safe_mute_flag)
                     if static_audio is not None: 
@@ -23125,7 +23780,8 @@ while True:
                     target_gain = _perceptual_volume_pct(db.config["global_volume"]) / 100.0
                     music_target_gain = _perceptual_volume_pct(db.config["global_volume"], min_db=STACKED_GAIN_MIN_DB) / 100.0
                     
-                    if vlc_engine is not None: 
+                    if vlc_engine is not None:
+                        _refresh_live_file_gain()
                         vlc_engine.set_volume(int(db.config["global_volume"]), False)
                     _set_dvd_volume(int(db.config["global_volume"]), False)
                     if static_audio is not None: 
@@ -23151,64 +23807,14 @@ while True:
                     if app_state.get("_chsurf_display_gate", False):
                         continue
                     app_state["_chsurf_display_gate"] = True
-                    allowed_channels = []
-                    if db is not None and db.config.get("game_channel_enabled", True):
-                        allowed_channels.append("03")
-                    if db is not None and db.config.get("tv_guide_enabled", True):
-                        allowed_channels.append("04")
-                    for i in range(5, 45):
-                        ch_key = str(i).zfill(2)
-                        if db.channels_db.get(ch_key, {}).get("active", False):
-                            allowed_channels.append(ch_key)
-                            
-                    current_lookup = str(app_state["current_channel"]).zfill(2)
-                    if current_lookup not in allowed_channels:
-                        current_lookup = allowed_channels[0] if allowed_channels else "05"
-                    
-                    if allowed_channels:
-                        curr_pos = allowed_channels.index(current_lookup)
-                        target_ch = allowed_channels[(curr_pos + 1) % len(allowed_channels)]
-                        
-                        target_track_state = calculate_slotted_playback_state(target_ch)
-                        if target_track_state.get("mode") == "Visualizer":
-                            if pygame.mixer.music.get_busy():
-                                pygame.mixer.music.stop()
-                                pygame.mixer.music.unload()
-                            app_state["active_music_track_file"] = target_track_state.get("file", "")
-                            
-                        change_channel(target_ch)
+                    _surf_step(1)
                     continue
-                    
+
                 elif event.key == pygame.K_DOWN:
                     if app_state.get("_chsurf_display_gate", False):
                         continue
                     app_state["_chsurf_display_gate"] = True
-                    allowed_channels = []
-                    if db is not None and db.config.get("game_channel_enabled", True):
-                        allowed_channels.append("03")
-                    if db is not None and db.config.get("tv_guide_enabled", True):
-                        allowed_channels.append("04")
-                    for i in range(5, 45):
-                        ch_key = str(i).zfill(2)
-                        if db.channels_db.get(ch_key, {}).get("active", False):
-                            allowed_channels.append(ch_key)
-                            
-                    current_lookup = str(app_state["current_channel"]).zfill(2)
-                    if current_lookup not in allowed_channels:
-                        current_lookup = allowed_channels[0] if allowed_channels else "05"
-                    
-                    if allowed_channels:
-                        curr_pos = allowed_channels.index(current_lookup)
-                        target_ch = allowed_channels[(curr_pos - 1) % len(allowed_channels)]
-                        
-                        target_track_state = calculate_slotted_playback_state(target_ch)
-                        if target_track_state.get("mode") == "Visualizer":
-                            if pygame.mixer.music.get_busy():
-                                pygame.mixer.music.stop()
-                                pygame.mixer.music.unload()
-                            app_state["active_music_track_file"] = target_track_state.get("file", "")
-                            
-                        change_channel(target_ch)
+                    _surf_step(-1)
                     continue
 
             if app_state.get("show_menu", False):
@@ -23958,7 +24564,7 @@ while True:
                         if db.channels_db.get(str(_n).zfill(2), {}).get("active", str(_n).zfill(2) == "05")
                     )
 
-                    _clear_row = 3
+                    _clear_row = 4
 
                     if is_server_locked and menu_nav.is_accept(event.key):
                         if sub_row == max_close_row:
@@ -23972,6 +24578,22 @@ while True:
                         pygame.event.clear(pygame.KEYDOWN)
                         continue
 
+                    if is_music_mode and sub_row == 3 and event.key in (pygame.K_a, pygame.K_d):
+                        _vis_file = app_state.get("_vis_target_filepath", "")
+                        _vis_step = -1 if event.key == pygame.K_a else 1
+                        _vis_gain = max(-12, min(12, _get_audio_gain_db(_vis_file, target_ch_str) + _vis_step))
+                        app_state["visualizer_gain_db"] = _vis_gain
+                        _vis_scan_db = _get_scanned_audio_gain_db(_vis_file, target_ch_str)
+                        _save_audio_gain_db(_vis_file, _vis_gain - _vis_scan_db)
+                        _base_music_gain = app_state.get("ch03_menu_music_gain", 1.0) if target_ch_str == "03" else 1.0
+                        app_state["active_music_gain"] = _base_music_gain * 10 ** (_vis_gain / 20.0)
+                        if pygame.mixer.music.get_busy():
+                            pygame.mixer.music.set_volume(
+                                max(0.0, min(1.0, _effective_loudness_gain(app_state.get("active_music_gain", 1.0)) * MUSIC_GAIN))
+                            )
+                        db.save_settings()
+                        continue
+
                     _cm_dir = menu_nav.key_to_direction(event.key)
                     if _cm_dir is not None:
                         _cm_layout = menu_nav.channel_sub_layout(ch_info, _active_count_r0h)
@@ -23981,7 +24603,7 @@ while True:
                         continue
 
                     if menu_nav.is_accept(event.key):
-                        if sub_row == max_close_row and (is_music_mode or not ch_info.get("active", True) or sub_col == 1):
+                        if sub_row == max_close_row and (not is_music_mode or sub_col == 1):
                             print("[SUB-MENU CONTROLLER] Close button triggered. Returning to main Channels tab layout.")
                             app_state["menu_layer"] = "CHANNEL_LIST"
                             app_state["menu_selection_index"] = max(0, min(39, app_state.get("selected_channel_row", 5) - 5))
@@ -24042,6 +24664,8 @@ while True:
                                     continue
                                 elif sub_row == 2:
                                     active_block = "Music Tracks"
+                                elif sub_row == 4:
+                                    continue
                                 elif sub_row == _clear_row:
                                     _has_music_content = len(ch_info.get("schedules", {}).get("Music Tracks", [])) > 0
                                     if _has_music_content:
@@ -24184,13 +24808,41 @@ while True:
                 elif app_state["menu_layer"] == "AUDIO_TRACK_PICKER":
                     sub_row  = app_state.get("sub_menu_row_index", 0)
                     tracks   = app_state.get("audio_track_list", [])
-                    close_row = len(tracks)
+                    gain_row = len(tracks)
+                    close_row = gain_row + 1
                     _audio_ctx = app_state.get("audio_track_context", "channel")
                     _target_engine = dvd_engine if _audio_ctx == "dvd" else vlc_engine
 
                     _at_dir = menu_nav.key_to_direction(event.key)
                     if _at_dir is not None:
-                        app_state["sub_menu_row_index"] = menu_nav.column_move(app_state, "AUDIO_TRACK_PICKER", sub_row, close_row + 1, _at_dir)
+                        if sub_row == gain_row and _at_dir in (menu_nav.LEFT, menu_nav.RIGHT) and _audio_ctx == "channel":
+                            _step = -1 if _at_dir == menu_nav.LEFT else 1
+                            _cur_file = getattr(_target_engine, "current_filepath", None)
+                            _new_gain = max(-12, min(12, int(app_state.get("audio_track_gain_db", 0)) + _step))
+                            app_state["audio_track_gain_db"] = _new_gain
+                            _gain_channel = str(app_state.get("audio_track_source_channel", "")).zfill(2)
+                            _gain_scan_db = _get_scanned_audio_gain_db(_cur_file, _gain_channel)
+                            _save_audio_gain_db(_cur_file, _new_gain - _gain_scan_db)
+                            if _cur_file:
+                                _ch = str(app_state.get("audio_track_source_channel", "")).zfill(2)
+                                _target_engine.file_gain = _lookup_file_gain(_ch, _cur_file)
+                                _target_engine.set_volume(db.config.get("global_volume", 70), db.config.get("is_muted", False))
+                                # Keep the pygame visualizer path on the same persisted gain as VLC.
+                                _active_music_file = app_state.get("active_music_track_file", "") or ""
+                                if (os.path.normpath(_active_music_file) == os.path.normpath(_cur_file)
+                                        and pygame.mixer.music.get_busy()):
+                                    app_state["active_music_gain"] = _target_engine.file_gain
+                                    _visualizer_volume = (
+                                        _effective_audio_gain(min_db=STACKED_GAIN_MIN_DB)
+                                        * MUSIC_GAIN
+                                        * _effective_loudness_gain(app_state["active_music_gain"])
+                                    )
+                                    pygame.mixer.music.set_volume(_visualizer_volume)
+                                    pygame.mixer.Channel(1).set_volume(_visualizer_volume)
+                                    log.info("[AUDIO GAIN] Applied visualizer gain x%.3f live for %s",
+                                             app_state["active_music_gain"], os.path.basename(_cur_file))
+                        else:
+                            app_state["sub_menu_row_index"] = menu_nav.column_move(app_state, "AUDIO_TRACK_PICKER", sub_row, close_row + 1, _at_dir)
                         continue
 
                     if menu_nav.is_accept(event.key):
@@ -25154,6 +25806,7 @@ while True:
     w_w, w_h = screen.get_size()
     app_state["_window_size"] = (w_w, w_h)
     ch = app_state["current_channel"]
+    _surf_quiet = _surf_origin_active()
 
     app_state["_video_painted_this_frame"] = False
 
@@ -25218,7 +25871,7 @@ while True:
     _switch_pending = app_state.get("_pending_channel_activation") is not None
     _open_confirm_pending = vlc_engine is not None and getattr(vlc_engine, "_open_confirm_pending_attempt", None) is not None
     _finish_reason = None
-    if vlc_engine is not None and app_state.get("is_playing_video", False) and not _switch_pending and not _open_confirm_pending and not _engine_wedged_this_frame:
+    if vlc_engine is not None and app_state.get("is_playing_video", False) and not _switch_pending and not _open_confirm_pending and not _engine_wedged_this_frame and not _surf_quiet:
         try:
             vlc_state, _len_ms = vlc_engine.get_playback_state()
             if vlc_state in ("opening", "buffering"):
@@ -25267,6 +25920,7 @@ while True:
     if _bg_ch:
         _bg_ch = _bg_ch.zfill(2)
     if (_bg_ch and ch in ("03", "04") and _bg_ch != ch
+            and not _surf_quiet
             and is_video_finished
             and vlc_engine is not None
             and getattr(vlc_engine, "ready_flag", False)
@@ -25344,6 +25998,7 @@ while True:
                 log.warning("BG WATCHDOG: advance failed for ch%s: %s", _bg_ch, e)
 
     if (ch not in ("03", "04")
+            and not _surf_quiet
             and current_playback_state["mode"] in ("Video", "Commercial")
             and (not app_state.get("is_playing_video", False) or is_video_finished)
             and vlc_engine is not None
@@ -25654,6 +26309,7 @@ while True:
                 app_state["_video_audio_hold_until"] = (
                     pygame.time.get_ticks() + AUDIO_SYNC_HOLD_MS
                 )
+                _hold_picture_through_advance()
                 _mute_guard_log(
                     "ARM (mid-stream content change)",
                     ch=ch,
@@ -25756,7 +26412,12 @@ while True:
     # SECTION: Video render (TV channels)
     # ========================================================================
 
-    if ch != "04":
+    if _surf_quiet and ch not in ("03", "04"):
+        if _configured_transition_style() == "static":
+            _render_transition_static(screen, _full_window_rect)
+        else:
+            screen.fill(_TRANSITION_GRAY, _full_window_rect)
+    elif ch != "04":
         if ch == "03":
             # WARNING: a file picker left open by an earlier settings action must not paint over this frame or consume DVD navigation keys on the next one.
             _dvd_layer_active = (
@@ -25818,8 +26479,11 @@ while True:
                 lbl = font_loading.render("Game frontend unavailable", True, theme_color)
                 screen.blit(lbl, (content_rect.centerx - lbl.get_width() // 2, content_rect.centery - 12))
         elif current_playback_state["mode"] == "Video":
-            if pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0):
-                # WARNING: the between-channel gap always wins here, even on a channel flagged as a known playback failure.
+            _transition_now = pygame.time.get_ticks()
+            if _transition_now < app_state.get("channel_switch_static_until", 0):
+                _render_transition_static(screen, _full_window_rect)
+            elif _transition_now < app_state.get("channel_switch_black_until", 0):
+                # Black is used only when Black is the selected transition style.
                 pass
             elif pygame.time.get_ticks() < app_state.get("_video_audio_hold_until", 0):
                 if _loudness_hold_last_frame_active():
@@ -25854,11 +26518,11 @@ while True:
                                     or _video_target_rect.height < content_rect.height):
                                 screen.fill(_video_bar_color(), content_rect)
                             _real_blit_geom = {}
-                            _blit_video_with_screen_mode(screen, effected_surf, _video_target_rect,
-                                                          mode=_bezel_video_fit_mode(),
-                                                          analysis_surf=video_surf, geom_out=_real_blit_geom,
-                                                          pixel_aspect=_video_pixel_aspect(w_w, w_h, _video_sa),
-                                                          fit_aspect=_video_sa)
+                            _draw_video_picture(screen, effected_surf, _video_target_rect,
+                                                mode=_bezel_video_fit_mode(),
+                                                analysis_surf=video_surf, geom_out=_real_blit_geom,
+                                                pixel_aspect=_video_pixel_aspect(w_w, w_h, _video_sa),
+                                                fit_aspect=_video_sa)
                             _rbg_key = (tuple(content_rect), tuple(_video_target_rect),
                                         video_surf.get_size(), tuple(sorted(_real_blit_geom.items())) if _real_blit_geom else None)
                             if _real_video_blit_log_state.get("key") != _rbg_key:
@@ -25966,7 +26630,7 @@ while True:
 
         px, py, pw, ph = app_state.get("guide_preview_bounds", (w_w // 2 - 400, 15, 800, 450))
 
-        _guide_transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+        _guide_transition_style = _configured_transition_style()
         _preview_base_color = (0, 0, 0) if _guide_transition_style == "black" else (1, 1, 1)
         pygame.draw.rect(screen, _preview_base_color, (px, py, pw, ph))
 
@@ -26015,8 +26679,9 @@ while True:
                             processed_surf = apply_video_effects(video_surf, brightness, contrast, color_sat, sharpness, tint)
                         else:
                             processed_surf = video_surf
-                        _blit_video_with_screen_mode(
+                        _draw_video_picture(
                             screen, processed_surf, pygame.Rect(px, py, pw, ph),
+                            mode=_bezel_video_fit_mode(),
                             analysis_surf=video_surf, fit_aspect=_pv_fit_aspect)
                         _last_guide_preview_picture_rect = _last_screen_mode_picture_rect
                         _store_last_video_frame(processed_surf, context="preview", fit_aspect=_pv_fit_aspect)
@@ -26048,7 +26713,7 @@ while True:
                             )
                             if _guide_load_gave_up:
                                 _lift_buffering_mute(hl_ch, "guide-preview-shield-end")
-                            _guide_transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+                            _guide_transition_style = _configured_transition_style()
                             _hl_ch_confirmed_failed = (
                                 hl_ch in _channel_playback_failures
                                 or hl_ch in _station_confirmed_dead_drive
@@ -26056,8 +26721,12 @@ while True:
                             if _hl_ch_confirmed_failed:
                                 _render_transition_static(screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
                             elif _guide_transition_style == "static":
-                                _stop_transition_static()
-                                screen.fill((1, 1, 1), (px, py, pw, ph))
+                                if _ch04_preview_static_visual_active:
+                                    _render_transition_static(
+                                        screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
+                                else:
+                                    _stop_transition_static()
+                                    screen.fill((1, 1, 1), (px, py, pw, ph))
                             else:
                                 _stop_transition_static()
                                 # WARNING: keep this fill identical to the other transition/buffering fills.
@@ -26079,7 +26748,7 @@ while True:
                 if not _ch04_shield_active:
                     _stop_transition_static()
                     if not _blit_last_video_frame(screen, px, py, pw, ph, apply_screen_mode=True, context="preview"):
-                        _guide_transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+                        _guide_transition_style = _configured_transition_style()
                         _fallback_color = (1, 1, 1) if _guide_transition_style == "static" else (15, 15, 15)
                         screen.fill(_fallback_color, (px, py, pw, ph))
 
@@ -26185,11 +26854,12 @@ while True:
                     else:
                         p_amp = 25 + int(math.sin(pygame.time.get_ticks() * 0.008) * 20)
 
-                    visualizer_deck.render_active_engine(mini, active_theme, mock_amplitude=p_amp, style_override=preview_render_style)
-
-                    if hasattr(visualizer_deck, "flash_intensity"): visualizer_deck.flash_intensity = 0.0
-                    if hasattr(visualizer_deck, "bg_flash"): visualizer_deck.bg_flash = 0
-                    if hasattr(visualizer_deck, "galaxy_glow"): visualizer_deck.galaxy_glow = 0
+                    _render_visualizer_frame(
+                        mini,
+                        active_theme,
+                        p_amp,
+                        style_override=preview_render_style,
+                    )
 
                     brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
 
@@ -26284,8 +26954,8 @@ while True:
                         hl_state.get("reason"), hl_state.get("reason_detail"),
                         scale=0.5)
 
-    if pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0):
-        _transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+    if pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0):
+        _transition_style = _configured_transition_style()
         if _transition_style == "static":
             _render_transition_static(screen, _full_window_rect)
         else:
@@ -26346,7 +27016,9 @@ while True:
     # SECTION: Game deck render (CH 03)
     # ========================================================================
 
-    if ch == "03":
+    if _surf_quiet and ch not in ("03", "04"):
+        pass
+    elif ch == "03":
         if pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0):
             _stop_transition_static()
         _run_pending_channel_activation()
@@ -26395,7 +27067,7 @@ while True:
                 _recover_from_playback_stall(ch, _stalled_ms)
                 continue
 
-            _transition_style_wait = db.config.get("transition_type", "black") if db is not None else "black"
+            _transition_style_wait = _configured_transition_style()
             _stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS
             app_state["_stall_is_now_static"] = _stall_is_now_static
 
@@ -26403,7 +27075,7 @@ while True:
                 try:
                     _static_transition_active = (
                         _transition_style_wait == "static"
-                        and pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+                        and pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
                     )
                     _audio_sync_hold_active = (
                         pygame.time.get_ticks()
@@ -26649,7 +27321,7 @@ while True:
                 _vis_static_burst_active = (
                     db is not None
                     and db.config.get("transition_type", "black") == "static"
-                    and pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+                    and pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
                 )
 
                 if not _vis_content_ok or _vis_static_burst_active:
@@ -26666,7 +27338,7 @@ while True:
                     else:
                         vis_w, vis_h = 960, 540
                     vis_surf = pygame.Surface((vis_w, vis_h))
-                    visualizer_deck.render_active_engine(vis_surf, active_theme, mock_amplitude=calc_amp)
+                    _render_visualizer_frame(vis_surf, active_theme, calc_amp)
                     
                     brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
                     
@@ -26702,8 +27374,8 @@ while True:
             _render_transition_static(screen, pygame.Rect(0, 0, *screen.get_size()))
 
     else:
-        if pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0):
-            _transition_style = db.config.get("transition_type", "black") if db is not None else "black"
+        if pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0):
+            _transition_style = _configured_transition_style()
             if _transition_style == "static":
                 _render_transition_static(screen, _full_window_rect)
             else:
@@ -26753,62 +27425,63 @@ while True:
     # WARNING: paint the bad-reception overlay right after the video and before any menu or dialog, so it distorts the picture but never touches menu pixels.
     _static_rect = None
     _lines_rect = None
-    _draw_caption_overlay(screen, content_rect=content_rect)
-    if db is not None and db.config.get("fake_static_noise_enabled", False):
-        _static_cur_ch = app_state.get("current_channel")
-        _static_live_tv = _is_live_tv_broadcast_channel(_static_cur_ch)
-        _static_ch_info = db.channels_db.get(str(_static_cur_ch).zfill(2), {}) if _static_live_tv else {}
-        _static_transition_over = pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)
-        _static_content_active = _static_transition_over and (
-            (app_state.get("is_playing_video", False) and app_state.get("_had_first_frame_this_tune", False))
-            or (_static_ch_info.get("is_visualizer", False)
-                and pygame.mixer.music.get_busy())
-        )
-        if (_static_live_tv
-                and _static_content_active
-                and not app_state.get("file_explorer_active", False)
-                and app_state.get("crt_anim") is None):
-            _static_rect = _full_window_rect
-            _apply_static_noise_effect(screen, _static_rect, str(_static_cur_ch).zfill(2))
-
-    if db is not None and db.config.get("fake_reception_lines_enabled", False):
-        _lines_cur_ch = app_state.get("current_channel")
-        _lines_live_tv = _is_live_tv_broadcast_channel(_lines_cur_ch)
-        _lines_ch_info = db.channels_db.get(str(_lines_cur_ch).zfill(2), {}) if _lines_live_tv else {}
-        _lines_transition_over = pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)
-        _lines_content_active = _lines_transition_over and (
-            (app_state.get("is_playing_video", False) and app_state.get("_had_first_frame_this_tune", False))
-            or (_lines_ch_info.get("is_visualizer", False) and pygame.mixer.music.get_busy())
-        )
-        if (_lines_live_tv
-                and _lines_content_active
-                and not app_state.get("file_explorer_active", False)
-                and app_state.get("crt_anim") is None):
-            _lines_rect = pygame.Rect(0, 0, *screen.get_size())
-            _apply_reception_lines_effect(screen, _lines_rect)
-
-    if db is not None and db.config.get("watermark_enabled", False):
-        _wm_cur_ch = app_state.get("current_channel")
-        _wm_ch_info = (db.channels_db.get(str(_wm_cur_ch).zfill(2), {})
-                       if _is_live_tv_broadcast_channel(_wm_cur_ch) else {})
-        if (_is_live_tv_broadcast_channel(_wm_cur_ch)
-                and not _wm_ch_info.get("is_visualizer", False)
-                and current_playback_state.get("mode") == "Video"
-                and not app_state.get("file_explorer_active", False)
-                and app_state.get("crt_anim") is None
-                and not app_state.get("show_splash", False)
-                and pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)):
-            _wm_bounds = _watermark_bounds_rect(content_rect)
-            _draw_watermark(screen, bounds_rect=_wm_bounds)
-            if db.config.get("fake_static_noise_enabled", False) and _static_rect is not None:
+    if not _surf_quiet:
+        _draw_caption_overlay(screen, content_rect=content_rect)
+        if db is not None and db.config.get("fake_static_noise_enabled", False):
+            _static_cur_ch = app_state.get("current_channel")
+            _static_live_tv = _is_live_tv_broadcast_channel(_static_cur_ch)
+            _static_ch_info = db.channels_db.get(str(_static_cur_ch).zfill(2), {}) if _static_live_tv else {}
+            _static_transition_over = pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)
+            _static_content_active = _static_transition_over and (
+                (app_state.get("is_playing_video", False) and app_state.get("_had_first_frame_this_tune", False))
+                or (_static_ch_info.get("is_visualizer", False)
+                    and pygame.mixer.music.get_busy())
+            )
+            if (_static_live_tv
+                    and _static_content_active
+                    and not app_state.get("file_explorer_active", False)
+                    and app_state.get("crt_anim") is None):
+                _static_rect = _full_window_rect
                 _apply_static_noise_effect(screen, _static_rect, str(_static_cur_ch).zfill(2))
-            if db.config.get("fake_reception_lines_enabled", False) and _lines_rect is not None:
+
+        if db is not None and db.config.get("fake_reception_lines_enabled", False):
+            _lines_cur_ch = app_state.get("current_channel")
+            _lines_live_tv = _is_live_tv_broadcast_channel(_lines_cur_ch)
+            _lines_ch_info = db.channels_db.get(str(_lines_cur_ch).zfill(2), {}) if _lines_live_tv else {}
+            _lines_transition_over = pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)
+            _lines_content_active = _lines_transition_over and (
+                (app_state.get("is_playing_video", False) and app_state.get("_had_first_frame_this_tune", False))
+                or (_lines_ch_info.get("is_visualizer", False) and pygame.mixer.music.get_busy())
+            )
+            if (_lines_live_tv
+                    and _lines_content_active
+                    and not app_state.get("file_explorer_active", False)
+                    and app_state.get("crt_anim") is None):
+                _lines_rect = pygame.Rect(0, 0, *screen.get_size())
                 _apply_reception_lines_effect(screen, _lines_rect)
 
-    if pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0):
-        _transition_style_cap = db.config.get("transition_type", "black") if db is not None else "black"
-        if _transition_style_cap == "static":
-            _render_transition_static(screen, _full_window_rect)
+        if db is not None and db.config.get("watermark_enabled", False):
+            _wm_cur_ch = app_state.get("current_channel")
+            _wm_ch_info = (db.channels_db.get(str(_wm_cur_ch).zfill(2), {})
+                           if _is_live_tv_broadcast_channel(_wm_cur_ch) else {})
+            if (_is_live_tv_broadcast_channel(_wm_cur_ch)
+                    and not _wm_ch_info.get("is_visualizer", False)
+                    and current_playback_state.get("mode") == "Video"
+                    and not app_state.get("file_explorer_active", False)
+                    and app_state.get("crt_anim") is None
+                    and not app_state.get("show_splash", False)
+                    and pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)):
+                _wm_bounds = _watermark_bounds_rect(content_rect)
+                _draw_watermark(screen, bounds_rect=_wm_bounds)
+                if db.config.get("fake_static_noise_enabled", False) and _static_rect is not None:
+                    _apply_static_noise_effect(screen, _static_rect, str(_static_cur_ch).zfill(2))
+                if db.config.get("fake_reception_lines_enabled", False) and _lines_rect is not None:
+                    _apply_reception_lines_effect(screen, _lines_rect)
+
+        if pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0):
+            _transition_style_cap = db.config.get("transition_type", "black") if db is not None else "black"
+            if _transition_style_cap == "static":
+                _render_transition_static(screen, _full_window_rect)
 
     _prof_mark("overlays")
 
@@ -27006,7 +27679,7 @@ while True:
             if (_channel_transition_active
                     or now < app_state.get("osd_channel_timer", 0)):
                 f_osd = _cached_sys_font("Arial Black", _cs(54), bold=False)
-                display_txt = app_state.get("digit_buffer") or app_state["current_channel"]
+                display_txt = _bezel_led_channel_text()
                 _osd_surf = f_osd.render(display_txt, True, OSD_COLOR)
                 if _active_bezel_stem_if_on() == "bezel2":
                     _osd_surf = _osd_anisotropic_correct(
@@ -27410,13 +28083,13 @@ while True:
         if _overlay_active and _game_live:
             game_deck.freeze_inputs()
 
-    if app_state.get("current_channel") == "03" and not app_state.get("is_loading", False) and game_deck is not None:
+    if app_state.get("current_channel") == "03" and not app_state.get("is_loading", False) and game_deck is not None and not _surf_quiet:
         _mm_mode = getattr(game_deck, "mode", "BROWSE")
         _mm_dvd  = getattr(game_deck, "dvd_playback_active", False)
         _mm_prev = app_state.get("_ch03_mm_last_mode", "BROWSE")
         _mm_browsing      = _mm_mode in ("BROWSE", "ROMLIST")
         _mm_prev_browsing = _mm_prev in ("BROWSE", "ROMLIST")
-        _mm_shield_active = pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+        _mm_shield_active = pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
         if (_mm_mode in ("GAME", "DVD_PLAYER") or _mm_dvd) and _mm_prev_browsing:
             _stop_ch03_menu_music()
         elif _mm_browsing and not _mm_dvd and not _mm_prev_browsing and not _mm_shield_active:
@@ -27680,6 +28353,18 @@ while True:
     # ========================================================================
     # SECTION: Final compositing & present
     # ========================================================================
+
+    if (_surf_quiet
+            and not app_state.get("show_menu", False)
+            and not app_state.get("show_splash", False)
+            and not app_state.get("show_quit_confirm", False)
+            and not app_state.get("show_restart_confirm", False)
+            and not app_state.get("file_explorer_active", False)):
+        # WARNING: the grey cover is Black-style only; painting it in Static style hides the static the flip must show.
+        if _configured_transition_style() != "static":
+            screen.fill(_TRANSITION_GRAY)
+        elif ch in ("03", "04"):
+            _render_transition_static(screen, _full_window_rect)
 
     _draw_channel_volume_osd("picture")
 

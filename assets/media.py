@@ -8,6 +8,7 @@ import sys
 import json
 import contextlib
 import copy
+import datetime
 import ctypes
 import difflib
 import threading
@@ -392,6 +393,31 @@ def clean_display_title_for_ext(name, ext):
         return clean_music_display_title(name)
     base = os.path.splitext(name)[0] if ext else name
     return base
+
+
+def guide_display_title(entry):
+    """Build a guide title as SERIES plus the episode name, without file-name IDs."""
+    if not isinstance(entry, dict):
+        return clean_video_display_title(entry)
+    path = str(entry.get("path", entry.get("file", "")))
+    series = str(entry.get("_series_title", "")).strip()
+    if not series and path:
+        series, _season, _episode = _flex_series_and_season({"path": path})
+    series = _flex_clean_series_title(series) if series else ""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    episode = stem.replace("_", " ")
+    if series:
+        episode = re.sub(re.escape(series), " ", episode, count=1, flags=re.IGNORECASE)
+    episode = re.sub(r"(?i)\\b(?:season|series)[\\s._-]*\\d+\\b", " ", episode)
+    episode = re.sub(r"(?i)\\bs\\d{1,2}[\\s._-]*e\\d{1,3}\\b", " ", episode)
+    episode = re.sub(r"(?i)\\b(?:episode|ep)[\\s._-]*\\d+\\b", " ", episode)
+    episode = re.sub(r"(?<![A-Za-z])\\d{1,3}(?:[\\s._-]+|$)", " ", episode)
+    episode = re.sub(r"[\\(\\[][^\\)\\]]*(?:480p|720p|1080p|dvdrip|webrip|x264|h264)[^\\)\\]]*[\\)\\]]", " ", episode, flags=re.IGNORECASE)
+    episode = re.sub(r"\\s+", " ", episode).strip(" .-_:")
+    episode = clean_video_display_title(episode)
+    if not episode or _normalize_show_key(episode) == _normalize_show_key(series):
+        return series or clean_video_display_title(stem)
+    return (series + " — " + episode) if series else episode
 
 
 # ============================================================================
@@ -1240,6 +1266,9 @@ def _get_duration_probe_slot():
 def _natural_ep_key(item):
     p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
     name = os.path.splitext(os.path.basename(p))[0].lower()
+    # A pilot is the first aired episode, even when the filename has no numeric marker.
+    if re.search(r"(?:^|[ ._()\[\]-])pilot(?:$|[ ._()\[\]-])", name):
+        return (-1, 0, 0, name)
     m = re.search(r's(\d+)[\s._-]*[ex][\s._-]*(\d+)', name)
     if m: return (0, int(m.group(1)), int(m.group(2)), name)
     m = re.search(r'season[\s._-]*(\d+).*?episode[\s._-]*(\d+)', name)
@@ -1432,8 +1461,8 @@ def group_shows_flexible(raw_tracks):
                     best[identity] = item
         clean = [best[k] for k in order]
         clean.sort(key=lambda x: (
-            x["_season_number"], x["_episode_number"],
-            _natural_ep_key(x),
+            x["_season_number"],
+            _natural_ep_key(x) if x["_episode_number"] == 0 else (0, x["_episode_number"], 0, _natural_ep_key(x)),
         ))
         result[display_names[key]] = clean
 
@@ -1492,7 +1521,7 @@ SIX_HOUR_BLOCKS = [
 SIX_HOUR_BLOCK_NAMES = [b[0] for b in SIX_HOUR_BLOCKS]
 
 
-def resolve_track_duration(media_probe_cache, path, stored_duration, default=1800):
+def resolve_track_duration(media_probe_cache, path, stored_duration, default=0):
     if path:
         try:
             norm = os.path.normpath(str(path))
@@ -1517,6 +1546,616 @@ def track_duration_is_estimated(media_probe_cache, path, stored_duration):
     except Exception:
         pass
     return not (stored_duration and stored_duration > 0)
+
+
+def _series_duration_guesses(items, media_probe_cache, path_exists):
+    known_by_series = {}
+    pending = []
+    for item in items or []:
+        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
+        if not p or not path_exists(p):
+            continue
+        normalized_path = str(p).replace("\\\\", "/").lower()
+        title, _season, _episode = _flex_series_and_season({"path": p})
+        non_guessable = (
+            "/movies/" in normalized_path
+            or "/commercials/" in normalized_path
+            or "/commercial/" in normalized_path
+            or "/ads/" in normalized_path
+        )
+        if not title or _flex_is_non_episode_track({"path": p}) or non_guessable:
+            continue
+        stored = item.get("duration", 0) if isinstance(item, dict) else 0
+        duration = resolve_track_duration(media_probe_cache, p, stored, default=0)
+        if duration > 0 and not track_duration_is_estimated(media_probe_cache, p, stored):
+            known_by_series.setdefault(_normalize_show_key(title), []).append(duration)
+        else:
+            pending.append((p, _normalize_show_key(title)))
+    guesses = {}
+    for path, series_key in pending:
+        durations = known_by_series.get(series_key, [])
+        if len(durations) >= 2:
+            ordered = sorted(durations)
+            guesses[path] = ordered[len(ordered) // 2]
+    return guesses
+
+
+def build_raw_tracks(items, media_probe_cache, path_exists, keep_gain=False, include_unknown=False):
+    """Turns schedule entries into tracks with a resolved duration; entries whose path does not exist are left out, and so is a file whose duration is not known yet unless include_unknown is set (then it is marked estimated)."""
+    # WARNING: a file with an unknown duration must never be placed; it is listed by build_pending_tracks and the rotation waits for it.
+    guesses = _series_duration_guesses(items, media_probe_cache, path_exists)
+    tracks = []
+    for item in items:
+        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
+        if p and path_exists(p):
+            stored = item.get("duration", 0) if isinstance(item, dict) else 0
+            estimated = track_duration_is_estimated(media_probe_cache, p, stored)
+            resolved_duration = resolve_track_duration(
+                media_probe_cache, p, stored, default=0
+            )
+            if estimated and p in guesses:
+                resolved_duration = guesses[p]
+                estimated = False
+            if estimated and not include_unknown:
+                continue
+            track = {"path": p, "duration": int(resolved_duration or 0)}
+            if estimated:
+                track["_duration_estimated"] = True
+            if keep_gain and isinstance(item, dict) and "gain" in item:
+                track["gain"] = item["gain"]
+            tracks.append(track)
+    return tracks
+
+
+def build_pending_tracks(items, media_probe_cache, path_exists):
+    """The schedule entries whose path exists but whose duration is not known yet, as tracks with a path only, in schedule order."""
+    pending = []
+    for item in items:
+        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
+        if p and path_exists(p):
+            stored = item.get("duration", 0) if isinstance(item, dict) else 0
+            if track_duration_is_estimated(media_probe_cache, p, stored):
+                pending.append({"path": p})
+    return pending
+
+
+# ============================================================================
+# SECTION: Aired-cycle ledger (guide history)
+# ============================================================================
+GUIDE_AIRED_LEDGER_KEY = "guide_aired_ledger"
+
+
+def _ledger_record_end(rec):
+    """The last second a ledger record covers, in absolute seconds."""
+    tl_end = max((e.get("start_time", 0) + e.get("duration", 0) for e in rec.get("timeline") or []), default=0)
+    return rec.get("start", 0) + max(rec.get("total", 0) or 0, tl_end)
+
+
+def aired_ledger_upsert(playback_log, block_name, block_key, cycle_start_abs, timeline, total, now):
+    """Stores one scheduler cycle's timeline in the channel's ledger, replacing the same cycle's older copy, and drops cycles that ended before the previous midnight."""
+    # WARNING: the ledger only records what the scheduler already decided; nothing here may change what airs.
+    if not timeline or not total or total <= 0:
+        return
+    ledger = playback_log.setdefault(GUIDE_AIRED_LEDGER_KEY, {})
+    start = int(round(cycle_start_abs))
+    rec_id = "%s@%d" % (block_key, start)
+    stored = ledger.get(rec_id)
+    fresh = list(timeline)
+    if stored is None or stored.get("total") != total or stored.get("timeline") != fresh:
+        ledger[rec_id] = {"block": block_name, "start": start, "total": total,
+                          "timeline": copy.deepcopy(fresh)}
+    floor_abs = (now.toordinal() - 1) * 86400
+    for old_id in [k for k, r in ledger.items() if _ledger_record_end(r) < floor_abs]:
+        ledger.pop(old_id, None)
+
+
+def aired_ledger_entries(playback_log, today_ordinal):
+    """The ledger's entries as (entry, start, end, block) with times in seconds from today's midnight, in start order; an entry overlapping an earlier one is dropped."""
+    base = today_ordinal * 86400
+    rows = []
+    for rec in (playback_log.get(GUIDE_AIRED_LEDGER_KEY) or {}).values():
+        for e in rec.get("timeline") or []:
+            start = rec.get("start", 0) - base + e.get("start_time", 0)
+            rows.append((dict(e), start, start + e.get("duration", 0), rec.get("block", "")))
+    rows.sort(key=lambda r: r[1])
+    out, last_end = [], None
+    for row in rows:
+        if last_end is not None and row[1] < last_end - 0.5:
+            continue
+        out.append(row)
+        last_end = row[2]
+    return out
+
+
+# ============================================================================
+# SECTION: Guide past rebuild (missed blocks)
+# ============================================================================
+# WARNING: the fallback numbers must match GUIDE_REPLAY_* and CATCH_UP_* in performance_governor.py; they are used only when that module fails to import.
+try:
+    import performance_governor as _guide_governor
+    GUIDE_REPLAY_MAX_BLOCKS = int(_guide_governor.GUIDE_REPLAY_MAX_BLOCKS)
+    GUIDE_REPLAY_EPISODE_GUESS_SECONDS = int(_guide_governor.GUIDE_REPLAY_EPISODE_GUESS_SECONDS)
+    CATCH_UP_MAX_BLOCKS = int(_guide_governor.CATCH_UP_MAX_BLOCKS)
+    CATCH_UP_MAX_CYCLES_PER_BLOCK = int(_guide_governor.CATCH_UP_MAX_CYCLES_PER_BLOCK)
+except Exception:
+    GUIDE_REPLAY_MAX_BLOCKS = 60
+    GUIDE_REPLAY_EPISODE_GUESS_SECONDS = 1800
+    CATCH_UP_MAX_BLOCKS = 3000
+    CATCH_UP_MAX_CYCLES_PER_BLOCK = 1000
+
+_GUIDE_EIGHT_HOUR_BLOCKS = (("Morning", 4, 12), ("Evening", 12, 20), ("Night", 20, 28))
+
+
+def _middle_length(durations):
+    """The middle value of a list of lengths, the same pick the scheduler's series guess makes; None for an empty list."""
+    if not durations:
+        return None
+    return sorted(durations)[len(durations) // 2]
+
+
+def estimated_track_durations(items, media_probe_cache, path_exists):
+    """For every scheduled file whose duration is not known yet, a guessed length in seconds: the middle length of its series' scanned episodes, else of every scanned episode on the channel, else the default episode length; a movie takes the middle of the scanned movies, else the movie default, and a commercial the commercial default."""
+    known_by_series, known_episodes, known_movies, pending = {}, [], [], []
+    for item in items or []:
+        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
+        if not p or not path_exists(p):
+            continue
+        normalized_path = str(p).replace("\\", "/").lower()
+        is_commercial = any(k in normalized_path for k in ("/commercials/", "/commercial/", "/ads/"))
+        title, _season, _episode = _flex_series_and_season({"path": p})
+        is_episode = (bool(title) and not is_commercial and "/movies/" not in normalized_path
+                      and not _flex_is_non_episode_track({"path": p}))
+        stored = item.get("duration", 0) if isinstance(item, dict) else 0
+        duration = resolve_track_duration(media_probe_cache, p, stored, default=0)
+        if duration > 0 and not track_duration_is_estimated(media_probe_cache, p, stored):
+            if is_episode:
+                known_by_series.setdefault(_normalize_show_key(title), []).append(duration)
+                known_episodes.append(duration)
+            elif not is_commercial:
+                known_movies.append(duration)
+        else:
+            pending.append((p, _normalize_show_key(title) if is_episode else None, is_episode, is_commercial))
+    channel_episode = _middle_length(known_episodes) or GUIDE_REPLAY_EPISODE_GUESS_SECONDS
+    movie_guess = _middle_length(known_movies) or _MOVIE_DURATION_FALLBACK_SECONDS
+    guesses = {}
+    for path, series_key, is_episode, is_commercial in pending:
+        if is_commercial:
+            guesses[path] = COMMERCIAL_DEFAULT_SECONDS
+        elif is_episode:
+            guesses[path] = int(_middle_length(known_by_series.get(series_key)) or channel_episode)
+        else:
+            guesses[path] = int(movie_guess)
+    return guesses
+
+
+def build_guess_filled_tracks(items, media_probe_cache, path_exists):
+    """Turns schedule entries into tracks like build_raw_tracks, except that a file whose duration is not known yet is kept with its guessed length instead of left out."""
+    # WARNING: for the guide's past only; the scheduler must keep using build_raw_tracks, where a file with an unknown duration is never placed.
+    guesses = estimated_track_durations(items, media_probe_cache, path_exists)
+    tracks = build_raw_tracks(items, media_probe_cache, path_exists, include_unknown=True)
+    for track in tracks:
+        track.pop("_duration_estimated", None)
+        if track["path"] in guesses:
+            track["duration"] = guesses[track["path"]]
+    return tracks
+
+
+def _parse_block_key(block_key):
+    """(date ordinal, block name) from a saved block key, or None when it cannot be read."""
+    try:
+        year, yday, name = str(block_key).split("_", 2)
+        started = datetime.date(int(year), 1, 1) + datetime.timedelta(days=int(yday) - 1)
+        return started.toordinal(), name
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _block_layout(block_mode):
+    """The (name, start hour, end hour) of every block of a day for a channel's block mode; the Night block ends past 24."""
+    if block_mode == "six_block":
+        return list(SIX_HOUR_BLOCKS)
+    if block_mode == "full_day":
+        return [("Full Day", 0, 24)]
+    return list(_GUIDE_EIGHT_HOUR_BLOCKS)
+
+
+def _missed_occurrences(prev_block_key, block_key, block_mode, limit):
+    """The blocks that fall wholly between the end of the last built block and the start of the current one, in time order, as ((name, date ordinal, start second, end second) list, end of the last built block, start of the current block); the most recent limit of them."""
+    prev, cur = _parse_block_key(prev_block_key), _parse_block_key(block_key)
+    layout = _block_layout(block_mode)
+    hours = {name: (start, end) for name, start, end in layout}
+    if not prev or not cur or prev[1] not in hours or cur[1] not in hours:
+        return [], 0, 0
+    prev_end = prev[0] * 86400 + hours[prev[1]][1] * 3600
+    cur_start = cur[0] * 86400 + hours[cur[1]][0] * 3600
+    if cur_start <= prev_end + 0.5:
+        return [], prev_end, cur_start
+    first_ordinal = max(prev[0], cur[0] - (limit // len(layout)) - 2)
+    occurrences = []
+    for ordinal in range(first_ordinal, cur[0] + 1):
+        for name, start_hour, end_hour in layout:
+            start_abs, end_abs = ordinal * 86400 + start_hour * 3600, ordinal * 86400 + end_hour * 3600
+            if start_abs >= prev_end - 0.5 and end_abs <= cur_start + 0.5:
+                occurrences.append((name, ordinal, start_abs, end_abs))
+    return (occurrences[-limit:] if limit > 0 else []), prev_end, cur_start
+
+
+def carried_commercial_state(playback_log):
+    """The commercial state left after the airing cycle, which the next cycle or block is built from; a save from before commercial_next_pos existed holds it in commercial_pos."""
+    state = playback_log.get("commercial_next_pos")
+    if isinstance(state, dict):
+        return state
+    return playback_log.get("commercial_pos")
+
+
+def catch_up_state(channel_key, ch_info, show_pos, prev_block_key, block_key, media_probe_cache, path_exists,
+                   commercial_tracks, order_seed_for, is_holiday_date=None):
+    """The show positions, commercial state and first show orders the scheduler would hold had it kept running from the last block it built to the current block: first the cycles still unplayed in that last block, then every block missed after it, each block repeated in cycles until its length is filled; (positions, commercial state, first show orders, blocks replayed) or None when nothing was left to replay."""
+    # WARNING: show_pos and the commercial state are deep-copied and nothing in ch_info is changed here; build_block_rotation edits nested entries such as __FAIRNESS__ in place.
+    # WARNING: only files with a known duration are placed, as the scheduler does; a block's cycles are not carried across its end, because the next block starts at its own clock start.
+    if ch_info.get("is_visualizer", False) or ch_info.get("scheduling_mode", "random_slots") == "marathon":
+        return None
+    block_mode = ch_info.get("block_mode", "full_day")
+    occurrences, _prev_end, _cur_start = _missed_occurrences(prev_block_key, block_key, block_mode, CATCH_UP_MAX_BLOCKS)
+    playback_log = ch_info.get("playback_log", {})
+    prev, cur = _parse_block_key(prev_block_key), _parse_block_key(block_key)
+    layout_hours = {name: (start, end) for name, start, end in _block_layout(block_mode)}
+    finish = None
+    if prev and cur and prev[1] in layout_hours and cur[1] in layout_hours:
+        prev_secs = block_length_seconds(prev[1])
+        cycle_end = float(playback_log.get("sched_cycle_boundary") or 0) + float(playback_log.get("sched_cycle_total") or 0)
+        follows = cur[0] * 86400 + layout_hours[cur[1]][0] * 3600 >= prev[0] * 86400 + layout_hours[prev[1]][1] * 3600 - 0.5
+        if follows and 0 < cycle_end < prev_secs:
+            finish = (prev[1], prev[0], cycle_end)
+    if not occurrences and finish is None:
+        return None
+    sim_pos = copy.deepcopy(show_pos or {})
+    sim_commercial = copy.deepcopy(carried_commercial_state(playback_log))
+    show_orders = copy.deepcopy(playback_log.get("show_order", {}))
+    new_orders = {}
+    broken = set(ch_info.get("broken_files", []))
+    blocks = {}
+
+    def _admitted(track):
+        cached = media_probe_cache.get(os.path.normpath(str(track["path"])), {}) if isinstance(media_probe_cache, dict) else {}
+        return (track["path"] not in broken
+                and not cached.get("confirmed_unplayable")
+                and not cached.get("confirmed_no_audio"))
+
+    def _run_cycles(name, ordinal, cursor):
+        nonlocal sim_pos, sim_commercial
+        date = datetime.date.fromordinal(ordinal)
+        if is_holiday_date is not None and is_holiday_date(date):
+            return False
+        if name not in blocks:
+            items = ch_info.get("schedules", {}).get(name, [])
+            blocks[name] = (
+                [t for t in build_raw_tracks(items, media_probe_cache, path_exists) if _admitted(t)],
+                build_pending_tracks(items, media_probe_cache, path_exists),
+            )
+        raw_tracks, pending_tracks = blocks[name]
+        if not raw_tracks:
+            return False
+        offset = block_seed_offset(name, 0)
+        day_seed = block_day_seed(date, channel_key, offset)
+        order_seed = order_seed_for(offset)
+        block_secs = block_length_seconds(name)
+        for _cycle in range(CATCH_UP_MAX_CYCLES_PER_BLOCK):
+            lineup, sim_pos, used_order = build_block_rotation(
+                raw_tracks, ch_info, sim_pos, day_seed, block_secs, channel_key,
+                show_orders.get(name), order_seed, pending_tracks=pending_tracks)
+            if show_orders.get(name) is None and used_order is not None:
+                show_orders[name] = used_order
+                new_orders[name] = used_order
+            if not lineup:
+                break
+            timeline, total, sim_commercial = build_channel_timeline(
+                lineup, commercial_tracks, ch_info, day_seed,
+                media_probe_cache=media_probe_cache, commercial_state=sim_commercial)
+            if not timeline or total <= 0:
+                break
+            cursor += total
+            if cursor >= block_secs:
+                break
+        return True
+
+    replayed = 0
+    if finish is not None:
+        _run_cycles(finish[0], finish[1], finish[2])
+    for name, ordinal, _start_abs, _end_abs in occurrences:
+        if _run_cycles(name, ordinal, 0):
+            replayed += 1
+    return sim_pos, sim_commercial, new_orders, replayed
+
+
+def replay_missed_blocks(channel_key, ch_info, show_pos, prev_block_key, block_key, now, media_probe_cache,
+                         path_exists, commercial_tracks, order_seed_for, is_holiday_date=None, max_blocks=None):
+    """The cycles that should have aired between the last block the scheduler built and the current block, rebuilt with the scheduler's own rotation and timeline builders on copies of the saved positions, as (block name, block key, absolute cycle start, timeline, total) in time order; a file not scanned yet is placed at its guessed length, and nothing in ch_info is changed."""
+    # WARNING: show_pos and the commercial state are always deep-copied; build_block_rotation edits nested entries such as __FAIRNESS__ in place, which would move the real scheduler's counters.
+    if ch_info.get("is_visualizer", False) or ch_info.get("scheduling_mode", "random_slots") == "marathon":
+        return []
+    limit = GUIDE_REPLAY_MAX_BLOCKS if max_blocks is None else max_blocks
+    occurrences, prev_end, cur_start = _missed_occurrences(prev_block_key, block_key, ch_info.get("block_mode", "full_day"), limit)
+    if not occurrences:
+        return []
+
+    playback_log = ch_info.get("playback_log", {})
+    sim_pos = copy.deepcopy(show_pos or {})
+    sim_commercial = copy.deepcopy(carried_commercial_state(playback_log))
+    show_orders = copy.deepcopy(playback_log.get("show_order", {}))
+    broken = set(ch_info.get("broken_files", []))
+    floor_abs = (now.toordinal() - 1) * 86400
+    pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
+
+    def _admitted(track):
+        cached = media_probe_cache.get(os.path.normpath(str(track["path"])), {}) if isinstance(media_probe_cache, dict) else {}
+        return (track["path"] not in broken
+                and not cached.get("confirmed_unplayable")
+                and not cached.get("confirmed_no_audio"))
+
+    tracks_by_block = {}
+    records = []
+    overflow_abs = 0
+    for name, ordinal, start_abs, end_abs in occurrences:
+        date = datetime.date.fromordinal(ordinal)
+        if is_holiday_date is not None and is_holiday_date(date):
+            continue
+        if name not in tracks_by_block:
+            items = ch_info.get("schedules", {}).get(name, [])
+            tracks_by_block[name] = [t for t in build_guess_filled_tracks(items, media_probe_cache, path_exists) if _admitted(t)]
+        raw_tracks = tracks_by_block[name]
+        if not raw_tracks:
+            continue
+        offset = block_seed_offset(name, 0)
+        day_seed = block_day_seed(date, channel_key, offset)
+        order_seed = order_seed_for(offset)
+        block_secs = block_length_seconds(name)
+        cursor_abs = max(start_abs, overflow_abs)
+        for _cycle in range(64):
+            lineup, sim_pos, used_order = build_block_rotation(
+                raw_tracks, ch_info, sim_pos, day_seed, block_secs, channel_key,
+                show_orders.get(name), order_seed, pending_tracks=[])
+            if show_orders.get(name) is None:
+                show_orders[name] = used_order
+            if not lineup:
+                break
+            timeline, total, sim_commercial = build_channel_timeline(
+                lineup, commercial_tracks, ch_info, day_seed,
+                media_probe_cache=media_probe_cache, commercial_state=sim_commercial)
+            if not timeline or total <= 0:
+                break
+            if cursor_abs + total > floor_abs:
+                records.append((name, "%d_%d_%s" % (date.year, date.timetuple().tm_yday, name), cursor_abs, timeline, total))
+            cursor_abs += total
+            if cursor_abs >= end_abs:
+                overflow_abs = cursor_abs
+                break
+    return records
+
+
+def apply_cached_durations(raw_ordered, cached_durations):
+    """Returns the tracks with each stored positive duration in cached_durations put in place of the track's own; tracks with none are kept as they are."""
+    if not cached_durations:
+        return raw_ordered
+    out = []
+    for t in raw_ordered:
+        cached_dur = cached_durations.get(t.get("path", ""))
+        if cached_dur and cached_dur > 0:
+            t2 = dict(t)
+            t2["duration"] = cached_dur
+            out.append(t2)
+        else:
+            out.append(t)
+    return out
+
+
+def reconcile_cached_lineup(cached_paths, raw_tracks, folder_items, broken_files,
+                            sched_cached_durations, log_label=""):
+    """Reuses a persisted schedule lineup against this pass's freshly built raw_tracks without reshaping the currently airing timeline; returns (ordered tracks, paths kept only from the stored durations)."""
+    by_path = {t["path"]: t for t in (raw_tracks or [])}
+    broken_set = set(broken_files or [])
+    scheduled_paths = set()
+    for asset in (folder_items or []):
+        p = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
+        if p:
+            scheduled_paths.add(p)
+
+    ordered = []
+    dropped_transient = []
+    for p in cached_paths or []:
+        if not p:
+            continue
+        hit = by_path.get(p)
+        if hit is not None:
+            ordered.append(hit)
+            continue
+        if p not in scheduled_paths or p in broken_set:
+            continue
+        cached_dur = (sched_cached_durations or {}).get(p)
+        if cached_dur:
+            ordered.append({"path": p, "duration": cached_dur})
+            dropped_transient.append(p)
+
+    if dropped_transient:
+        log.warning(
+            "[SCHEDULER]%s kept %d cached-lineup entry(ies) that missed this "
+            "pass's path check but are still scheduled and not blacklisted "
+            "-- treating as transient rather than reshaping the "
+            "currently-airing lineup: %s",
+            f" {log_label}" if log_label else "", len(dropped_transient), dropped_transient,
+        )
+    return ordered, dropped_transient
+
+
+def saved_block_lineup(cached_paths, cached_durations, raw_tracks, folder_items, broken_files,
+                       pair_threshold_seconds, log_label="", cached_groups=None):
+    """The airing-order lineup of a block from its saved paths: kept against the current files, given the saved durations, grouped as the saved groups say when they still match, otherwise short episodes paired; empty when nothing is left."""
+    ordered, _ = reconcile_cached_lineup(
+        cached_paths, raw_tracks, folder_items, broken_files, cached_durations, log_label=log_label)
+    if not ordered:
+        return []
+    timed = apply_cached_durations(ordered, cached_durations)
+    groups = _matching_lineup_groups(cached_groups, cached_paths, pair_threshold_seconds)
+    if groups is not None:
+        lineup = _lineup_from_groups(groups, timed)
+        if lineup:
+            return lineup
+    return pair_short_episodes(timed, threshold_seconds=pair_threshold_seconds)
+
+
+def lineup_groups(tracks, pair_threshold_seconds):
+    """The saved record of how a lineup is grouped: each entry's kind (single, pair or bundle) and its files, with the pairing rule version and threshold it was built under."""
+    groups = []
+    for t in tracks or []:
+        paths = lineup_paths([t])
+        if not paths:
+            continue
+        kind = "pair" if t.get("is_pair") else ("bundle" if t.get("is_bundle") else "single")
+        groups.append({"kind": kind, "paths": paths})
+    record = {"version": LINEUP_GROUPS_VERSION,
+              "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
+              "threshold": pair_threshold_seconds,
+              "groups": groups}
+    record["state_hash"] = zlib.crc32(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ) & 0xffffffff
+    return record
+
+
+def _matching_lineup_groups(record, cached_paths, pair_threshold_seconds):
+    """The groups of a saved record when it was built under the current rules and describes exactly the saved path list; None otherwise."""
+    if not isinstance(record, dict):
+        return None
+    if (record.get("version") != LINEUP_GROUPS_VERSION
+            or record.get("pairing_rule_version") != SHORT_EPISODE_PAIRING_VERSION
+            or record.get("threshold") != pair_threshold_seconds):
+        return None
+    groups = record.get("groups")
+    if not isinstance(groups, list) or not groups:
+        return None
+    flat = []
+    for g in groups:
+        if (not isinstance(g, dict) or g.get("kind") not in LINEUP_GROUP_KINDS
+                or not isinstance(g.get("paths"), list)):
+            return None
+        flat.extend(p for p in g["paths"] if isinstance(p, str) and p)
+    if list(dict.fromkeys(flat)) != list(dict.fromkeys(p for p in (cached_paths or []) if p)):
+        return None
+    return groups
+
+
+def swap_lineup_groups(record, cached_paths, new_paths, replacements, pair_threshold_seconds, duration_of):
+    """The saved groups after a broken file is replaced: each replacement is {"kind": "member" (takes the old file's place in its group, kept in a pair or bundle only while short), "single" or "pair" (its own entry), "paths": [...]}; a pair or bundle that loses a file keeps its other files in place; None when the record does not match the saved list or the result does not describe new_paths exactly."""
+    groups = _matching_lineup_groups(record, cached_paths, pair_threshold_seconds)
+    if groups is None:
+        return None
+
+    def short(path):
+        dur = duration_of(path)
+        return bool(dur) and 0 < dur < pair_threshold_seconds
+
+    out = []
+    for g in groups:
+        kind = g["kind"]
+        run = []
+
+        def flush():
+            if not run:
+                return
+            if kind == "pair" and len(run) == 2:
+                out.append({"kind": "pair", "paths": list(run)})
+            elif kind == "bundle":
+                out.append({"kind": "bundle", "paths": list(run)})
+            else:
+                out.extend({"kind": "single", "paths": [p]} for p in run)
+            del run[:]
+
+        for p in g["paths"]:
+            rep = replacements.get(p)
+            if rep is None:
+                run.append(p)
+            elif rep["kind"] == "member":
+                new = rep["paths"][0]
+                if short(new):
+                    run.append(new)
+                else:
+                    flush()
+                    out.append({"kind": "single", "paths": [new]})
+            else:
+                flush()
+                out.append({"kind": rep["kind"], "paths": list(rep["paths"])})
+        flush()
+    flat = list(dict.fromkeys(p for g in out for p in g["paths"] if p))
+    if flat != list(dict.fromkeys(p for p in new_paths if p)):
+        return None
+    return {"version": LINEUP_GROUPS_VERSION,
+            "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
+            "threshold": pair_threshold_seconds,
+            "groups": out}
+
+
+def _lineup_from_groups(groups, timed):
+    """The lineup the saved groups describe, built from the current tracks; a file that is gone shrinks its own group."""
+    by_path = {t["path"]: t for t in timed}
+    seen = set()
+    lineup = []
+    for g in groups:
+        members = []
+        for p in g["paths"]:
+            if p in by_path and p not in seen:
+                seen.add(p)
+                members.append(by_path[p])
+        if not members:
+            continue
+        if g["kind"] == "pair" and len(members) == 2:
+            lineup.append(_build_pair_track(members[0], members[1]))
+        elif g["kind"] == "bundle":
+            lineup.append(_build_bundle_track(members))
+        else:
+            lineup.extend(members)
+    return lineup
+
+
+def lineup_paths(tracks):
+    """Every file of a lineup in airing order: a pair gives both its files and a leftover bundle gives all of its files; empty paths are left out."""
+    out = []
+    for t in tracks or []:
+        if t.get("is_pair"):
+            out.append(t.get("pair_ep1_path", t.get("path", "")))
+            out.append(t.get("pair_ep2_path", ""))
+        elif t.get("is_bundle"):
+            for item in t.get("bundle_items") or []:
+                out.append(item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item))
+        else:
+            out.append(t.get("path", ""))
+    return [p for p in out if p]
+
+
+def resolve_lineup_playback(entry, offset_seconds):
+    """Resolve a timeline entry offset to its source file, seek and duration."""
+    offset = max(0.0, float(offset_seconds or 0.0))
+    if entry.get("is_pair"):
+        items = [
+            (entry.get("pair_ep1_path", entry.get("path", "")), entry.get("pair_ep1_duration", 0)),
+            (entry.get("pair_ep2_path", ""), entry.get("pair_ep2_duration", 0)),
+        ]
+    elif entry.get("is_bundle"):
+        items = list(zip(
+            entry.get("bundle_item_paths") or lineup_paths([entry]),
+            entry.get("bundle_item_durations") or [],
+        ))
+    else:
+        items = [(entry.get("path", ""), entry.get("duration", 0))]
+
+    for path, duration in items:
+        duration = max(0.0, float(duration or 0.0))
+        if path and offset < duration:
+            return path, offset, duration
+        offset -= duration
+    if items:
+        path, duration = items[-1]
+        return path, max(0.0, float(duration or 0.0)), max(0.0, float(duration or 0.0))
+    return entry.get("path", ""), 0.0, max(0.0, float(entry.get("duration", 0) or 0.0))
 
 
 def _cached_lineup_durations_stale(cached_durations, media_probe_cache,
@@ -1622,7 +2261,14 @@ def _movie_part_info(track):
     return base, int(m.group(2))
 
 
+def track_duration_is_known(track):
+    """True when the track has a real duration: a positive length that did not come from the fallback."""
+    return (isinstance(track, dict) and not track.get("_duration_estimated")
+            and (track.get("duration") or 0) > 0)
+
+
 def pair_movie_parts(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECONDS):
+    """Joins Part 1 and Part 2 of one movie into one pair entry when together they reach the movie length; a part whose duration is not known yet is not placed, and neither is the other part of its movie."""
     import collections as _col
     by_base = _col.defaultdict(dict)
     untouched = []
@@ -1639,27 +2285,15 @@ def pair_movie_parts(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECOND
     result = list(untouched)
     for base, parts in by_base.items():
         ambiguous = parts.pop("_ambiguous", False)
+        known = {num: t for num, t in parts.items() if track_duration_is_known(t)}
         if not ambiguous and set(parts.keys()) == {1, 2}:
-            p1, p2 = parts[1], parts[2]
-            p1_path = p1.get("path", p1.get("file", ""))
-            p2_path = p2.get("path", p2.get("file", ""))
-            p1_dur  = p1.get("duration", 0) or 0
-            p2_dur  = p2.get("duration", 0) or 0
-            combined_dur = p1_dur + p2_dur
-            if combined_dur >= threshold_seconds:
-                result.append({
-                    "path":              p1_path,
-                    "duration":          combined_dur,
-                    "is_pair":           True,
-                    "pair_ep1":          p1,
-                    "pair_ep2":          p2,
-                    "pair_ep1_path":     p1_path,
-                    "pair_ep1_duration": p1_dur,
-                    "pair_ep2_path":     p2_path,
-                    "pair_ep2_duration": p2_dur,
-                })
+            if len(known) < 2:
                 continue
-        result.extend(parts.values())
+            pair = _build_pair_track(parts[1], parts[2])
+            if pair["duration"] >= threshold_seconds:
+                result.append(pair)
+                continue
+        result.extend(known.values())
     return result
 
 
@@ -1740,7 +2374,8 @@ def _split_movies_fingerprint(raw_tracks, threshold_seconds):
     try:
         return (threshold_seconds, tuple(
             (t.get("path", t.get("file", "")) if isinstance(t, dict) else str(t),
-             t.get("duration", 0) if isinstance(t, dict) else 0)
+             t.get("duration", 0) if isinstance(t, dict) else 0,
+             bool(t.get("_duration_estimated")) if isinstance(t, dict) else False)
             for t in raw_tracks
         ))
     except Exception:
@@ -1790,6 +2425,8 @@ def split_movies_and_series(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD
 
 
 SHORT_EPISODE_PAIRING_VERSION = 3
+LINEUP_GROUPS_VERSION = 1
+LINEUP_GROUP_KINDS = ("single", "pair", "bundle")
 LEFTOVERS_TITLE = "The Leftovers"
 
 
@@ -1812,6 +2449,41 @@ def _episode_series_key(episode):
         return ""
 
 
+def _build_pair_track(ep, nxt):
+    """The one lineup entry that airs two episodes back to back."""
+    dur = ep.get("duration", 1800) if isinstance(ep, dict) else 1800
+    nxt_dur = nxt.get("duration", 1800) if isinstance(nxt, dict) else 1800
+    ep_path = ep.get("path", ep.get("file", "")) if isinstance(ep, dict) else str(ep)
+    nxt_path = nxt.get("path", nxt.get("file", "")) if isinstance(nxt, dict) else str(nxt)
+    return {"path": ep_path, "duration": dur + nxt_dur,
+            "is_pair": True, "pair_ep1": ep, "pair_ep2": nxt,
+            "pair_ep1_path": ep_path, "pair_ep1_duration": dur,
+            "pair_ep2_path": nxt_path, "pair_ep2_duration": nxt_dur}
+
+
+def _build_bundle_track(leftovers):
+    """The one lineup entry that airs a group of leftover short episodes."""
+    return {"path": leftovers[0].get("path", ""),
+            "duration": sum(e.get("duration", 0) for e in leftovers),
+            "title": LEFTOVERS_TITLE, "_series_title": LEFTOVERS_TITLE,
+            "is_bundle": True, "bundle_items": leftovers}
+
+
+def _episode_duration(ep):
+    return ep.get("duration", 1800) if isinstance(ep, dict) else 1800
+
+
+def _episode_path(ep):
+    return ep.get("path", ep.get("file", "")) if isinstance(ep, dict) else str(ep)
+
+
+def _pairs_with_next(ep, nxt, threshold_seconds):
+    """True when the short episode ep and the episode after it are both under the threshold and of the same series."""
+    if _episode_duration(ep) >= threshold_seconds or _episode_duration(nxt) >= threshold_seconds:
+        return False
+    return bool(_episode_series_key(ep)) and _episode_series_key(ep) == _episode_series_key(nxt)
+
+
 def pair_short_episodes(episodes, threshold_seconds=900):
     if threshold_seconds <= 0:
         return list(episodes)
@@ -1820,32 +2492,166 @@ def pair_short_episodes(episodes, threshold_seconds=900):
     i = 0
     while i < len(episodes):
         ep = episodes[i]
-        dur = ep.get("duration", 1800) if isinstance(ep, dict) else 1800
-        if dur < threshold_seconds and i + 1 < len(episodes):
-            nxt = episodes[i + 1]
-            nxt_dur = nxt.get("duration", 1800) if isinstance(nxt, dict) else 1800
-            same_series = (_episode_series_key(ep) and
-                           _episode_series_key(ep) == _episode_series_key(nxt))
-            if nxt_dur < threshold_seconds and same_series:
-                ep_path = ep.get("path", ep.get("file", "")) if isinstance(ep, dict) else str(ep)
-                nxt_path = nxt.get("path", nxt.get("file", "")) if isinstance(nxt, dict) else str(nxt)
-                result.append({"path": ep_path, "duration": dur + nxt_dur,
-                               "is_pair": True, "pair_ep1": ep, "pair_ep2": nxt,
-                               "pair_ep1_path": ep_path, "pair_ep1_duration": dur,
-                               "pair_ep2_path": nxt_path, "pair_ep2_duration": nxt_dur})
-                i += 2
-                continue
-        if dur < threshold_seconds:
+        if i + 1 < len(episodes) and _pairs_with_next(ep, episodes[i + 1], threshold_seconds):
+            result.append(_build_pair_track(ep, episodes[i + 1]))
+            i += 2
+            continue
+        if _episode_duration(ep) < threshold_seconds:
             leftovers.append(ep)
         else:
             result.append(ep)
         i += 1
     if leftovers:
-        result.append({"path": leftovers[0].get("path", ""),
-                       "duration": sum(e.get("duration", 0) for e in leftovers),
-                       "title": LEFTOVERS_TITLE, "_series_title": LEFTOVERS_TITLE,
-                       "is_bundle": True, "bundle_items": leftovers})
+        result.append(_build_bundle_track(leftovers))
     return result
+
+
+# ============================================================================
+# SECTION: Sequential show position
+# ============================================================================
+
+
+def _order_key_for_path(path):
+    """The sort key a show's episode list uses, worked out from a path alone; None when it cannot be."""
+    try:
+        _title, season, episode = _flex_series_and_season({"path": path})
+        return (season if season is not None else 0, episode if episode is not None else 0,
+                _natural_ep_key({"path": path}))
+    except Exception:
+        return None
+
+
+def _first_index_after(episodes, path):
+    """The index of the first episode that sorts after a path no longer in the list; len(episodes) when none does."""
+    missing_key = _order_key_for_path(path)
+    if missing_key is None:
+        return len(episodes)
+    for index, ep in enumerate(episodes):
+        key = _order_key_for_path(_episode_path(ep))
+        try:
+            if key is not None and key > missing_key:
+                return index
+        except TypeError:
+            continue
+    return len(episodes)
+
+
+def sequential_state_from_entry_index(episodes, entries, entry_index):
+    """The saved position that stands for an entry of the show's paired list: the file that airs next and the short episodes the pass's leftover bundle still owes."""
+    paths = [_episode_path(ep) for ep in episodes]
+    if not entries or not paths:
+        return {"next": None, "owed": []}
+    entry = entries[entry_index % len(entries)]
+    bundle = entries[-1] if entries[-1].get("is_bundle") else None
+    bundle_paths = [_episode_path(item) for item in bundle.get("bundle_items", [])] if bundle else []
+    if entry.get("is_bundle"):
+        return {"next": None, "owed": bundle_paths}
+    first_path = _episode_path(entry)
+    if first_path not in paths:
+        return {"next": None, "owed": []}
+    k = paths.index(first_path)
+    if k == 0:
+        return {"next": None, "owed": []}
+    return {"next": first_path, "owed": [p for p in bundle_paths if p in paths and paths.index(p) < k]}
+
+
+def _read_sequential_state(episodes, stored, threshold_seconds):
+    """Turns a saved sequential position into (k, owed paths): k is the index in the show's list of the file that airs next, len(episodes) when the leftover bundle is next."""
+    paths = [_episode_path(ep) for ep in episodes]
+    n = len(paths)
+    if isinstance(stored, dict) and "next" in stored:
+        owed = [p for p in (stored.get("owed") or []) if p in paths]
+        nxt = stored.get("next")
+        if nxt is None:
+            return (n if owed else 0), owed
+        if nxt in paths:
+            return paths.index(nxt), owed
+        k = _first_index_after(episodes, nxt)
+        return k, (owed if k >= n else [p for p in owed if paths.index(p) < k])
+    if isinstance(stored, int) and not isinstance(stored, bool):
+        entries = pair_short_episodes(episodes, threshold_seconds)
+        state = sequential_state_from_entry_index(episodes, entries, stored % len(entries))
+        return _read_sequential_state(episodes, state, threshold_seconds)
+    return 0, []
+
+
+def take_sequential_entries(episodes, stored, count, threshold_seconds, blocked=None):
+    """Takes the next `count` lineup entries of a show in its list order, pairing short episodes forward from the file that airs next; stops at the first file in `blocked` (not scanned yet) and at a short episode whose partner is blocked; returns (entries, the new saved position)."""
+    # WARNING: pairing must start at the file that airs next, never at the top of the list, or an episode that already aired can be pulled into a pair and air twice.
+    n = len(episodes)
+    if n == 0:
+        return [], {"next": None, "owed": []}
+    k, owed = _read_sequential_state(episodes, stored, threshold_seconds)
+    owed_set = set(owed)
+    blocked_set = set(blocked or ())
+    pairing = threshold_seconds > 0
+    entries = []
+    guard = 0
+    while len(entries) < count and guard < 4 * (n + count) + 8:
+        guard += 1
+        if k >= n:
+            bundle = _owed_episodes(episodes, owed)
+            if bundle:
+                entries.append(_build_bundle_track(bundle))
+            owed, owed_set = [], set()
+            k = 0
+            continue
+        ep = episodes[k]
+        path = _episode_path(ep)
+        if path in owed_set:
+            k += 1
+            continue
+        if path in blocked_set:
+            break
+        if pairing and _episode_duration(ep) < threshold_seconds:
+            if k + 1 < n and _episode_path(episodes[k + 1]) in blocked_set:
+                break
+            if k + 1 < n and _episode_path(episodes[k + 1]) not in owed_set \
+                    and _pairs_with_next(ep, episodes[k + 1], threshold_seconds):
+                entries.append(_build_pair_track(ep, episodes[k + 1]))
+                k += 2
+            else:
+                owed.append(path)
+                owed_set.add(path)
+                k += 1
+            continue
+        entries.append(ep)
+        k += 1
+    while k < n and _episode_path(episodes[k]) in owed_set:
+        k += 1
+    if k >= n:
+        return entries, {"next": None, "owed": list(owed)}
+    return entries, {"next": _episode_path(episodes[k]), "owed": list(owed)}
+
+
+def sequential_state_after_path(episodes, path, stored, threshold_seconds):
+    """The saved position that follows the file `path` having aired; None when the path is not in the show's list."""
+    paths = [_episode_path(ep) for ep in episodes]
+    if path not in paths:
+        return None
+    k = paths.index(path) + 1
+    _k_old, prior_owed = _read_sequential_state(episodes, stored, threshold_seconds)
+    owed = [p for p in prior_owed if p != path and paths.index(p) < k]
+    owed_set = set(owed)
+    while k < len(paths) and paths[k] in owed_set:
+        k += 1
+    return {"next": paths[k] if k < len(paths) else None, "owed": owed}
+
+
+def sequential_state_shifted(episodes, stored, steps, threshold_seconds):
+    """Return the saved position after advancing by rotation entries."""
+    if not episodes or steps <= 0:
+        return dict(stored) if isinstance(stored, dict) else {"next": None, "owed": []}
+    _entries, state = take_sequential_entries(
+        episodes, stored, steps, threshold_seconds
+    )
+    return state
+
+
+def _owed_episodes(episodes, owed):
+    """The owed episodes in the order they were set aside."""
+    by_path = {_episode_path(ep): ep for ep in episodes}
+    return [by_path[p] for p in owed if p in by_path]
 
 
 MOVIE_HEAVY_RATIO = 2
@@ -1935,14 +2741,166 @@ def _draw_from_shuffle_bag(state, n, count, seed_prefix, hold_back=RANDOM_REPEAT
     return picked, {"bag": bag, "cycle": cycle, "last": last, "recent": recent}
 
 
-def _rotation_take_random(show_pos, name, count, eps, day_seed):
+# ============================================================================
+# SECTION: Shuffle bag by file
+# ============================================================================
+RANDOM_STATE_VERSION = 2
+
+LEFTOVERS_ENTRY_KEY = "__LEFTOVERS__"
+
+
+def _bag_entry_key(entry):
+    """The name a lineup entry is saved under in a shuffle bag: its path, or one fixed name for the leftover bundle."""
+    if isinstance(entry, dict) and entry.get("is_bundle"):
+        return LEFTOVERS_ENTRY_KEY
+    return _episode_path(entry)
+
+
+def _bag_entry_files(entry):
+    """Every file a lineup entry airs."""
+    if isinstance(entry, dict):
+        if entry.get("is_bundle"):
+            return [_episode_path(item) for item in entry.get("bundle_items", [])]
+        if entry.get("is_pair"):
+            return [entry.get("pair_ep1_path"), entry.get("pair_ep2_path")]
+    return [_episode_path(entry)]
+
+
+def _bag_keys_and_files(entries):
+    """The unique bag key and the files of each entry, in the entries' order."""
+    seen = {}
+    keys = []
+    for entry in entries:
+        base = _bag_entry_key(entry)
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+        keys.append(base if count == 0 else f"{base}#{count}")
+    return keys, [_bag_entry_files(entry) for entry in entries]
+
+
+def _is_list_number(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _bag_state_from_saved(state, keys, entry_files):
+    """Turns a saved shuffle bag into one made of keys: a bag saved by file is cleaned of entries that left, an old bag of list numbers is turned into keys once against the current list."""
+    key_set = set(keys)
+    pool_files = set(f for files in entry_files for f in files)
+    if isinstance(state, dict) and state.get("v") == RANDOM_STATE_VERSION:
+        last = state.get("last")
+        return {"bag": [k for k in state.get("bag", []) if k in key_set],
+                "cycle": int(state.get("cycle", 0) or 0),
+                "last": last if last in key_set else None,
+                "recent": [k for k in state.get("recent", []) if k in key_set],
+                "drawn": [f for f in state.get("drawn", []) if f in pool_files]}
+
+    def _key_of(index):
+        return keys[index] if _is_list_number(index) and 0 <= index < len(keys) else None
+
+    if isinstance(state, dict) and "bag" in state:
+        bag = [k for k in (_key_of(i) for i in state.get("bag", [])) if k]
+        cycle = int(state.get("cycle", 0) or 0)
+        in_bag = set(bag)
+        drawn = []
+        if cycle > 0:
+            for key, files in zip(keys, entry_files):
+                if key not in in_bag:
+                    drawn.extend(f for f in files if f not in drawn)
+        return {"bag": bag, "cycle": cycle, "last": _key_of(state.get("last")),
+                "recent": [k for k in (_key_of(i) for i in state.get("recent", [])) if k],
+                "drawn": drawn}
+    last = _key_of(state)
+    return {"bag": [], "cycle": 0, "last": last, "recent": [last] if last else [], "drawn": []}
+
+
+def _bag_with_joiners(bag_state, keys, entry_files, seed_prefix):
+    """Adds every entry that is new to the current pass to its bag at a seeded place, so it airs once before any file repeats; an entry holding a file that already aired this pass waits for the next pass."""
+    # WARNING: an entry with a file that already aired this pass must stay out of the bag, or that file airs twice before the rest of the show has aired.
+    if bag_state["cycle"] <= 0:
+        return bag_state
+    import random as _random
+
+    in_bag = set(bag_state["bag"])
+    drawn = set(bag_state["drawn"])
+    joiners = [key for key, files in zip(keys, entry_files)
+               if key not in in_bag and not any(f in drawn for f in files)]
+    if joiners:
+        rng = _random.Random(f"{seed_prefix}:join:{bag_state['cycle']}:{len(bag_state['bag'])}")
+        bag = list(bag_state["bag"])
+        for key in joiners:
+            bag.insert(rng.randint(0, len(bag)), key)
+        bag_state = dict(bag_state, bag=bag)
+    return bag_state
+
+
+def draw_from_shuffle_bag_by_file(state, entries, count, seed_prefix, hold_back=RANDOM_REPEAT_HOLD_BACK, hold_new_pass=False):
+    """Draws `count` entries from a show's (or the movie list's) shuffle bag saved by file; with hold_new_pass set, nothing is drawn once every entry of the pass has aired; returns (entries, the new saved bag)."""
+    # WARNING: hold_new_pass is set while files of the show are not scanned, so a new pass cannot start before each of them has aired once.
+    if not entries:
+        return [], state
+    keys, entry_files = _bag_keys_and_files(entries)
+    n = len(entries)
+    bag_state = _bag_with_joiners(_bag_state_from_saved(state, keys, entry_files), keys, entry_files, seed_prefix)
+    index_of = {key: i for i, key in enumerate(keys)}
+    current = {"bag": [index_of[k] for k in bag_state["bag"]], "cycle": bag_state["cycle"],
+               "last": index_of.get(bag_state["last"]),
+               "recent": [index_of[k] for k in bag_state["recent"]]}
+    drawn = list(bag_state["drawn"])
+    picked = []
+    for _ in range(count):
+        if hold_new_pass and not current["bag"] and current["cycle"] > 0:
+            break
+        cycle_before = current["cycle"]
+        (index,), current = _draw_from_shuffle_bag(current, n, 1, seed_prefix, hold_back)
+        if current["cycle"] != cycle_before:
+            drawn = []
+        if n == 1 and current["cycle"] < 1:
+            current = dict(current, cycle=1)
+        drawn.extend(f for f in entry_files[index] if f not in drawn)
+        picked.append(index)
+    new_state = {"v": RANDOM_STATE_VERSION,
+                 "bag": [keys[i] for i in current["bag"]], "cycle": current["cycle"],
+                 "last": keys[current["last"]] if current["last"] is not None else None,
+                 "recent": [keys[i] for i in current["recent"]], "drawn": drawn}
+    return [entries[i] for i in picked], new_state
+
+
+def random_bag_entry_indices(show_pos, show_name, entries, channel_id=None):
+    """The indexes of the entries still in a random show's bag, read the way a draw reads it."""
+    keys, entry_files = _bag_keys_and_files(entries)
+    state = show_pos.get(stable_series_id(show_name, channel_id), show_pos.get(show_name))
+    bag_state = _bag_with_joiners(_bag_state_from_saved(state, keys, entry_files), keys, entry_files,
+                                  f"swap:{show_name}")
+    in_bag = set(bag_state["bag"])
+    return [i for i, key in enumerate(keys) if key in in_bag]
+
+
+def random_last_entry(state, entries):
+    """The entry that aired last according to a saved bag (by file, or an old list number); None when unknown."""
+    keys, _files = _bag_keys_and_files(entries)
+    last = state.get("last") if isinstance(state, dict) else (state if _is_list_number(state) else None)
+    if isinstance(last, str):
+        return entries[keys.index(last)] if last in keys else None
+    if _is_list_number(last) and 0 <= last < len(entries):
+        return entries[last]
+    return None
+
+
+def _rotation_take_random(show_pos, name, count, eps, day_seed, hold_new_pass=False,
+                          state_key=None):
+    """Draw from a file-anchored bag while keeping each channel's movie bag separate."""
     if not eps:
         return []
-    n = len(eps)
-    state = show_pos.get(name)
-    idxs, new_state = _draw_from_shuffle_bag(state, n, count, f"{day_seed}:{name}")
-    show_pos[name] = new_state
-    return [eps[i] for i in idxs]
+    key = state_key or name
+    saved = show_pos.get(key)
+    if saved is None and key != name:
+        # Read older unscoped movie state once, then write the migrated state under the scoped key.
+        saved = show_pos.get(name)
+    picked, show_pos[key] = draw_from_shuffle_bag_by_file(
+        saved, eps, count, f"{day_seed}:{name}", hold_new_pass=hold_new_pass)
+    if key != name and name in show_pos:
+        del show_pos[name]
+    return picked
 
 
 def _movie_slot_count(movie_pool, block_duration_seconds, series_total_episodes,
@@ -2014,6 +2972,61 @@ def _place_movies_in_block(video_tracks, picked_movies, day_seed, movie_heavy,
 
 
 # ============================================================================
+# SECTION: Files not scanned yet
+# ============================================================================
+
+
+def _episode_sort_key(ep):
+    """The order a show's episode list keeps: season, episode, then the natural file name."""
+    return (ep.get("_season_number", 0), ep.get("_episode_number", 0), _natural_ep_key(ep))
+
+
+def group_pending_tracks(pending_tracks, show_names, show_episodes):
+    """Ties the files that are not scanned yet to their shows: returns (pending episodes by show name, True when a movie is pending); a pending file of a show with no scanned episode is not placed."""
+    by_show = {}
+    movie_pending = False
+    if not pending_tracks:
+        return by_show, movie_pending
+    key_to_show = {_normalize_show_key(sn): sn for sn in show_names}
+    episode_files = []
+    for track in pending_tracks:
+        if is_movie_track(track):
+            movie_pending = True
+        else:
+            episode_files.append(track)
+    _names, grouped = group_shows_flexible(episode_files)
+    for _pending_name, items in grouped.items():
+        for item in items:
+            show = key_to_show.get(item.get("_series_key"))
+            if show is None:
+                continue
+            known_ids = {(ep.get("_season_number", 0), ep.get("_episode_number", 0))
+                         for ep in show_episodes.get(show, []) if isinstance(ep, dict)}
+            if item.get("_episode_number") and (item.get("_season_number", 0), item["_episode_number"]) in known_ids:
+                continue
+            by_show.setdefault(show, []).append(item)
+    return by_show, movie_pending
+
+
+def _drop_parts_of_pending_movies(raw_tracks, pending_tracks):
+    """Leaves out a movie's known part while its other part is not scanned yet, so neither part is placed."""
+    bases = set()
+    for track in pending_tracks or []:
+        info = _movie_part_info(track)
+        if info is not None:
+            bases.add(info[0])
+    if not bases:
+        return raw_tracks
+    kept = []
+    for track in raw_tracks:
+        info = _movie_part_info(track)
+        if info is not None and info[0] in bases:
+            continue
+        kept.append(track)
+    return kept
+
+
+# ============================================================================
 # SECTION: Show rotation
 # ============================================================================
 
@@ -2025,13 +3038,17 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
                          fixed_show_order=None,
                          block_duration_seconds=None,
                          channel_id=None,
-                         order_seed=None):
+                         order_seed=None,
+                         pending_tracks=None):
     import random as _random
 
     show_pos = dict(show_pos or {})
+    raw_tracks = _drop_parts_of_pending_movies(raw_tracks, pending_tracks)
     movie_pool, show_names, show_episodes = split_movies_and_series(raw_tracks, movie_threshold_seconds, channel_id=channel_id)
     show_pos = migrate_show_positions(show_pos, show_names, channel_id)[0]
+    pending_by_show, movie_pending = group_pending_tracks(pending_tracks, show_names, show_episodes)
 
+    show_raw_episodes = dict(show_episodes)
     if pair_threshold_seconds > 0:
         show_episodes = {
             sn: pair_short_episodes(eps, threshold_seconds=pair_threshold_seconds)
@@ -2046,18 +3063,26 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
     def _take_sequential(show_name, count, eps):
         state_key = stable_series_id(show_name, channel_id)
         stored = show_pos.get(state_key, show_pos.get(show_name, 0))
-        pos = stored % len(eps) if isinstance(stored, int) else 0
-        out = [eps[(pos + n) % len(eps)] for n in range(count)]
-        show_pos[state_key] = (pos + count) % len(eps)
+        known = show_raw_episodes.get(show_name) or []
+        waiting = pending_by_show.get(show_name)
+        if waiting:
+            if state_key not in show_pos and show_name not in show_pos:
+                stored = {"next": None, "owed": []}
+            elif _is_list_number(stored) and known:
+                known_entries = pair_short_episodes(known, pair_threshold_seconds) if pair_threshold_seconds > 0 else known
+                stored = sequential_state_from_entry_index(known, known_entries, stored % len(known_entries))
+            known = sorted(known + waiting, key=_episode_sort_key)
+        out, show_pos[state_key] = take_sequential_entries(
+            known, stored, count, pair_threshold_seconds,
+            blocked=[_episode_path(w) for w in waiting] if waiting else None)
         return out
 
     def _take_random(show_name, count, eps):
-        n = len(eps)
         state_key = stable_series_id(show_name, channel_id)
         state = show_pos.get(state_key, show_pos.get(show_name))
-        idxs, new_state = _draw_from_shuffle_bag(state, n, count, f"{day_seed}:{show_name}")
-        show_pos[state_key] = new_state
-        return [eps[i] for i in idxs]
+        picked, show_pos[state_key] = draw_from_shuffle_bag_by_file(
+            state, eps, count, f"{day_seed}:{show_name}", hold_new_pass=bool(pending_by_show.get(show_name)))
+        return picked
 
     def _take(show_name, count):
         eps = show_episodes.get(show_name) or []
@@ -2066,6 +3091,10 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
         if _order_mode_for(show_name) == "random":
             return _take_random(show_name, count, eps)
         return _take_sequential(show_name, count, eps)
+
+    def _fair_show_size(show_name):
+        """Returns a show's size for the fairness step: its placed entries plus its files not scanned yet, never below 1."""
+        return max(1, len(show_episodes.get(show_name) or []) + len(pending_by_show.get(show_name) or []))
 
     def _fair_show_order(order, requested_counts):
         """Skip over-visited small shows without creating empty schedules."""
@@ -2085,7 +3114,7 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
 
         ratios = []
         for sn in usable:
-            n = max(1, len(show_episodes.get(sn) or []))
+            n = _fair_show_size(sn)
             ratios.append(float(usage.get(sn, 0) or 0) / n)
         ratios.sort()
         baseline = ratios[len(ratios) // 2] if ratios else 0.0
@@ -2093,7 +3122,7 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
 
         eligible = []
         for sn in usable:
-            n = max(1, len(show_episodes.get(sn) or []))
+            n = _fair_show_size(sn)
             projected = (float(usage.get(sn, 0) or 0) +
                          requested_counts.get(sn, 1)) / n
             if projected <= pressure_limit:
@@ -2127,7 +3156,7 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
             video_tracks.extend(_take(sn, requested_counts[sn]))
 
     elif scheduling_mode == "two_slots":
-        requested_counts = {sn: 2 for sn in order}
+        requested_counts = {sn: min(2, len(show_episodes.get(sn) or [])) for sn in order}
         for sn in _fair_show_order(order, requested_counts):
             video_tracks.extend(_take(sn, requested_counts[sn]))
 
@@ -2162,7 +3191,11 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
         )
         _ordered_pool = sorted(movie_pool, key=lambda t: t.get("path", ""))
         _movie_seed = order_seed if (order_seed is not None and show_pos.get(MOVIE_ROTATION_KEY) is None) else day_seed
-        picked_movies = _rotation_take_random(show_pos, MOVIE_ROTATION_KEY, n_movie_pick, _ordered_pool, _movie_seed)
+        _movie_state_key = stable_series_id(MOVIE_ROTATION_KEY, channel_id) if channel_id is not None else MOVIE_ROTATION_KEY
+        picked_movies = _rotation_take_random(
+            show_pos, MOVIE_ROTATION_KEY, n_movie_pick, _ordered_pool, _movie_seed,
+            hold_new_pass=movie_pending, state_key=_movie_state_key,
+        )
         movie_budget = _movie_runtime_budget(
             movie_pool, _bds, series_total, series_runtime
         )
@@ -2174,6 +3207,21 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
                                                scheduling_mode=scheduling_mode)
 
     return video_tracks, show_pos, show_order_used
+
+
+def build_block_rotation(raw_tracks, ch_info, show_pos, day_seed, block_duration_seconds,
+                         channel_id, fixed_show_order, order_seed, pending_tracks=None):
+    """build_show_rotation for one block of a channel, with the channel's scheduling mode, pairing threshold and episode order taken from its settings; returns (lineup, show positions, show order)."""
+    return build_show_rotation(
+        raw_tracks, ch_info.get("scheduling_mode", "random_slots"), show_pos, day_seed,
+        pair_threshold_seconds=max(0, ch_info.get("pair_threshold_minutes", 15)) * 60,
+        episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
+        fixed_show_order=fixed_show_order,
+        block_duration_seconds=block_duration_seconds,
+        channel_id=channel_id,
+        order_seed=order_seed,
+        pending_tracks=pending_tracks,
+    )
 
 
 def _episode_label(path):
@@ -2208,7 +3256,7 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
                            episode_order_mode="sequential", pair_threshold_seconds=900,
                            fixed_show_order=None, block_duration_seconds=None,
                            movies_per_block=MOVIES_PER_BLOCK, max_simulated_blocks=21900,
-                           channel_id=None, order_seed=None):
+                           channel_id=None, order_seed=None, pending_tracks=None):
     show_pos = dict(show_pos or {})
     if not day_seeds:
         return show_pos, fixed_show_order, {}
@@ -2219,6 +3267,7 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
     movie_pool, show_names, show_episodes = split_movies_and_series(
         raw_tracks, channel_id=channel_id
     )
+    raw_show_episodes = dict(show_episodes)
     if pair_threshold_seconds > 0:
         # WARNING: count paired short episodes the same way normal scheduling does or a block catch-up shifts the saved position.
         show_episodes = {
@@ -2231,34 +3280,40 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
             return episode_order_mode.get(show_name, episode_order_mode.get("__default__", "sequential"))
         return episode_order_mode
 
+    def _sequential_label(show_name, before):
+        raw_eps = raw_show_episodes.get(show_name) or []
+        if not raw_eps:
+            return None
+        state = show_pos.get(stable_series_id(show_name, channel_id),
+                             show_pos.get(show_name))
+        k, _owed = _read_sequential_state(raw_eps, state, pair_threshold_seconds)
+        if before:
+            k -= 1
+        if not (0 <= k < len(raw_eps)):
+            return None
+        return _episode_label(_episode_path(raw_eps[k]))
+
+    def _random_label(show_name, eps):
+        state = show_pos.get(stable_series_id(show_name, channel_id),
+                             show_pos.get(show_name))
+        entry = random_last_entry(state, eps)
+        return _episode_label(entry.get("path", "")) if entry else None
+
     def _label_before(show_name):
         eps = show_episodes.get(show_name) or []
         if not eps:
             return None
-        state = show_pos.get(stable_series_id(show_name, channel_id),
-                             show_pos.get(show_name))
-        if _order_mode_for(show_name) == "random":
-            idx = state.get("last") if isinstance(state, dict) else (state if isinstance(state, int) else None)
-        else:
-            nxt = state if isinstance(state, int) else 0
-            idx = (nxt - 1) % len(eps)
-        if idx is None or not (0 <= idx < len(eps)):
-            return None
-        return _episode_label(eps[idx].get("path", ""))
+        if _order_mode_for(show_name) != "random":
+            return _sequential_label(show_name, True)
+        return _random_label(show_name, eps)
 
     def _label_after(show_name):
         eps = show_episodes.get(show_name) or []
         if not eps:
             return None
-        state = show_pos.get(stable_series_id(show_name, channel_id),
-                             show_pos.get(show_name))
-        if _order_mode_for(show_name) == "random":
-            idx = state.get("last") if isinstance(state, dict) else (state if isinstance(state, int) else None)
-        else:
-            idx = state if isinstance(state, int) else 0
-        if idx is None or not (0 <= idx < len(eps)):
-            return None
-        return _episode_label(eps[idx % len(eps)].get("path", ""))
+        if _order_mode_for(show_name) != "random":
+            return _sequential_label(show_name, False)
+        return _random_label(show_name, eps)
 
     before_labels = {sn: _label_before(sn) for sn in show_names}
 
@@ -2273,6 +3328,7 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
             movies_per_block=movies_per_block,
             channel_id=channel_id,
             order_seed=order_seed,
+            pending_tracks=pending_tracks,
         )
         order = order or used_order
 
@@ -2287,20 +3343,143 @@ def fast_forward_show_pos(raw_tracks, scheduling_mode, show_pos, day_seeds,
     return show_pos, order, report
 
 
-def note_random_episode_played(show_pos, show_name, episode_count, played_index,
-                               channel_id=None):
+def note_random_episode_played(show_pos, show_name, entries, played_index, channel_id=None):
+    """Records that the entry at `played_index` of a random show's entries aired: it leaves the bag and joins the recent list."""
     state_key = stable_series_id(show_name, channel_id)
+    keys, entry_files = _bag_keys_and_files(entries)
     state = show_pos.get(state_key, show_pos.get(show_name))
-    if isinstance(state, dict) and "bag" in state:
-        bag = [i for i in state.get("bag", []) if 0 <= i < episode_count and i != played_index]
-        cycle = int(state.get("cycle", 0) or 0)
-        recent = [i for i in state.get("recent", []) if 0 <= i < episode_count]
-    else:
-        bag = []
-        cycle = 0
-        recent = []
-    recent = (recent + [played_index])[-RANDOM_REPEAT_HOLD_BACK:]
-    show_pos[state_key] = {"bag": bag, "cycle": cycle, "last": played_index, "recent": recent}
+    bag_state = _bag_state_from_saved(state, keys, entry_files)
+    played_key = keys[played_index]
+    drawn = list(bag_state["drawn"])
+    drawn.extend(f for f in entry_files[played_index] if f not in drawn)
+    show_pos[state_key] = {
+        "v": RANDOM_STATE_VERSION,
+        "bag": [k for k in bag_state["bag"] if k != played_key],
+        "cycle": bag_state["cycle"], "last": played_key,
+        "recent": (bag_state["recent"] + [played_key])[-RANDOM_REPEAT_HOLD_BACK:],
+        "drawn": drawn}
+
+
+# ============================================================================
+# SECTION: Block seeds
+# ============================================================================
+BLOCK_SEED_OFFSETS = {"Morning": 100, "Evening": 200, "Night": 300, "Full Day": 500}
+for _seed_index, _seed_name in enumerate(SIX_HOUR_BLOCK_NAMES):
+    BLOCK_SEED_OFFSETS[_seed_name] = 600 + _seed_index * 100
+
+
+def block_seed_offset(block_name, default=0):
+    """The number a block name adds to its day seed; default for a name with none."""
+    return BLOCK_SEED_OFFSETS.get(block_name, default)
+
+
+def block_start_date(now, block_name):
+    """The date a block started: yesterday for the 8 hour Night block between midnight and 04:00, otherwise now."""
+    return (now - datetime.timedelta(days=1)) if (block_name == "Night" and now.hour < 4) else now
+
+
+# VALUES CHANGE HERE
+BLOCK_LENGTH_SECONDS = {"Marathon": 86400, "Full Day": 86400, "Morning": 8 * 3600, "Evening": 8 * 3600, "Night": 8 * 3600}
+for _length_name, _length_start, _length_end in SIX_HOUR_BLOCKS:
+    BLOCK_LENGTH_SECONDS[_length_name] = (_length_end - _length_start) * 3600
+
+
+def block_length_seconds(block_name, default=8 * 3600):
+    """How long a block airs, in seconds; default for a name with none."""
+    return BLOCK_LENGTH_SECONDS.get(block_name, default)
+
+
+def block_key_for(now, block_name):
+    """The saved key of the block on air: the date it started, then its name."""
+    started = block_start_date(now, block_name)
+    return f"{started.year}_{started.timetuple().tm_yday}_{block_name}"
+
+
+def block_day_seed(seed_date, channel_num, block_offset):
+    """The date-and-channel seed a block's show order is drawn from; seed_date is any date or datetime."""
+    return seed_date.year * 1000 + seed_date.timetuple().tm_yday + int(str(channel_num)) + block_offset
+
+
+# ============================================================================
+# SECTION: Read-only block lineup
+# ============================================================================
+
+
+def read_block_lineup(ch_key, ch_info, block_name, now, media_probe_cache, path_exists, start_order_seed, peek_only=False):
+    """The airing-order lineup of one named block of a channel as (tracks, block_name), or ([], None) when none of its files exist; each track keeps its schedule entry's gain, a saved lineup is read with each saved path once, and nothing is written to the channel; the saved show positions are always read from a deep copy, and peek_only is accepted and changes nothing."""
+    # WARNING: the show positions must always be deep-copied; build_show_rotation edits nested entries such as __FAIRNESS__ in place, which would move the real scheduler's counters.
+    # WARNING: start_order_seed is called only after the block is known to have files, because the first call for a channel draws and saves its start number.
+    folder_items = ch_info.get("schedules", {}).get(block_name, [])
+    raw_tracks = build_raw_tracks(folder_items, media_probe_cache, path_exists, keep_gain=True)
+    pending_tracks = build_pending_tracks(folder_items, media_probe_cache, path_exists)
+
+    # Only admitted files may reach the guide or scheduler. A confirmed-bad movie
+    # is replaced by another valid movie in the lineup; a confirmed-bad episode
+    # disappears so the series rotation advances to the next episode.
+    _broken = set(ch_info.get("broken_files", []))
+    def _admitted(track):
+        _path = track.get("path", track.get("file", "")) if isinstance(track, dict) else str(track)
+        _cached = media_probe_cache.get(os.path.normpath(str(_path)), {}) if isinstance(media_probe_cache, dict) else {}
+        return (_path not in _broken
+                and not _cached.get("confirmed_unplayable")
+                and not _cached.get("confirmed_no_audio"))
+    raw_tracks = [track for track in raw_tracks if _admitted(track)]
+    pending_tracks = [track for track in pending_tracks if _admitted(track)]
+    if not raw_tracks:
+        return [], None
+    block_offset = block_seed_offset(block_name, 400)
+    day_seed = block_day_seed(block_start_date(now, block_name), str(ch_key).zfill(2), block_offset)
+    order_seed = start_order_seed(ch_info, block_offset)
+    playback_log = ch_info.get("playback_log", {})
+    pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
+
+    if (playback_log.get("sched_block_key") == block_key_for(now, block_name)
+            and playback_log.get("sched_pairing_rule_version") == SHORT_EPISODE_PAIRING_VERSION):
+        cached_paths = list(dict.fromkeys(playback_log.get("sched_cached_tracks", [])))
+        saved = saved_block_lineup(
+            cached_paths, playback_log.get("sched_cached_durations", {}), raw_tracks, folder_items,
+            ch_info.get("broken_files", []), pair_thresh_sec, log_label=f"ch{ch_key} block={block_name}",
+            cached_groups=playback_log.get("sched_cached_groups"),
+        )
+        if saved:
+            return saved, block_name
+
+    show_pos = playback_log.get("show_pos", {})
+    show_pos_copy = copy.deepcopy(show_pos)
+    lineup, _, _ = build_block_rotation(
+        raw_tracks, ch_info, show_pos_copy, day_seed, block_length_seconds(block_name),
+        ch_key, playback_log.get("show_order", {}).get(block_name), order_seed,
+        pending_tracks=pending_tracks,
+    )
+    return lineup, block_name
+
+
+def read_holiday_lineup(ch_key, ch_info, holiday_key, now, media_probe_cache, path_exists,
+                        show_pos=None, fixed_show_order=None, seed_bump=0):
+    """Read one holiday lineup without changing channel state."""
+    entries = ch_info.get("holiday_schedules", {}).get(holiday_key, [])
+    if not entries:
+        return [], None
+    admitted = []
+    broken = set(ch_info.get("broken_files", []))
+    for entry in entries:
+        path = entry.get("path", entry.get("file", "")) if isinstance(entry, dict) else str(entry)
+        cached = media_probe_cache.get(os.path.normpath(str(path)), {}) if isinstance(media_probe_cache, dict) else {}
+        if (path and path_exists(path) and path not in broken
+                and not cached.get("confirmed_unplayable")
+                and not cached.get("confirmed_no_audio")):
+            admitted.append(entry)
+    if not admitted:
+        return [], None
+    seed = (now.year * 1000 + now.timetuple().tm_yday + int(ch_key) + 9000
+            + (sum(ord(c) for c in str(holiday_key)) % 1000) + int(seed_bump or 0))
+    lineup = build_scheduled_block_content(
+        admitted, f"Holiday:{holiday_key}", ch_info, media_probe_cache, path_exists,
+        seed, show_pos=copy.deepcopy(show_pos or {}), channel_id=ch_key,
+        block_duration_seconds=86400, fixed_show_order=fixed_show_order,
+        include_unknown=False,
+    )
+    return lineup[0], holiday_key if lineup[0] else None
 
 
 # ============================================================================
@@ -2317,6 +3496,26 @@ def commercial_bundle_ceiling(duration):
         if duration <= ceiling:
             return ceiling
     return COMMERCIAL_BUNDLE_CEILINGS[-1]
+
+
+# VALUES CHANGE HERE
+COMMERCIAL_DEFAULT_SECONDS = 30
+
+
+def build_commercial_tracks(items, media_probe_cache, path_exists, max_seconds=COMMERCIAL_MAX_SECONDS):
+    """Turns the Commercials schedule entries into tracks with a whole-second duration; entries whose path does not exist, or that run longer than max_seconds (None keeps every length), are left out."""
+    tracks = []
+    for asset in items:
+        path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
+        if path and path_exists(path):
+            stored = asset.get("duration", 0) if isinstance(asset, dict) else 0
+            duration = resolve_track_duration(media_probe_cache, path, stored, default=0)
+            if not duration or duration <= 0:
+                continue
+            if max_seconds is not None and duration > max_seconds:
+                continue
+            tracks.append({"path": path, "duration": int(duration)})
+    return tracks
 
 
 def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, day_seed,
@@ -2481,6 +3680,11 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             e["pair_ep1_duration"] = show.get("pair_ep1_duration", 0)
             e["pair_ep2_path"]     = show.get("pair_ep2_path", "")
             e["pair_ep2_duration"] = show.get("pair_ep2_duration", 0)
+        if show.get("is_bundle"):
+            e["is_bundle"]              = True
+            e["bundle_item_paths"]      = lineup_paths([show])
+            e["bundle_item_durations"]  = [item.get("duration", 0) if isinstance(item, dict) else 0
+                                           for item in show.get("bundle_items") or []]
         return e
 
     def _pack_break(budget_seconds):
@@ -2832,6 +4036,77 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         "last": _last_played_path,
     }
     return timeline, total_block_content, new_commercial_state
+
+
+# VALUES CHANGE HERE
+COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES = 15
+
+
+def commercial_interrupt_floor_seconds(ch_info):
+    """The shortest show, in seconds, a commercial break may interrupt: the channel's pairing threshold, or the default when it is 0."""
+    minutes = ch_info.get("pair_threshold_minutes", COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES)
+    return (minutes if minutes > 0 else COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES) * 60
+
+
+def admit_visualizer_assets(stack, media_probe_cache, unseekable_paths, unseekable_extensions):
+    """Returns the (path, asset) songs a Visualizer channel may air: not unseekable, not confirmed unplayable or silent, and with a known length."""
+    # WARNING: the station's Visualizer lineup and the Guide both call this; a second copy of these rules lets the Guide show music while the station airs Static.
+    admitted = []
+    for asset in stack or []:
+        path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
+        if not path:
+            continue
+        asset_dict = asset if isinstance(asset, dict) else {}
+        norm = os.path.normpath(str(path))
+        if norm in unseekable_paths or os.path.splitext(str(path))[1].lower() in unseekable_extensions:
+            continue
+        cached = (media_probe_cache or {}).get(norm, {})
+        if not isinstance(cached, dict):
+            cached = {}
+        if cached.get("confirmed_unplayable") or cached.get("confirmed_no_audio"):
+            continue
+    # Duration probing is asynchronous. An unmeasured but otherwise valid music
+    # file must still enter the lineup; the scheduler uses its fallback duration
+    # and replaces it when the probe completes. Rejecting it here turns a newly
+    # scanned visualizer station into Static until every file finishes probing.
+    admitted.append((path, asset_dict))
+
+    return admitted
+
+
+def build_scheduled_block_content(folder_items, block_name, ch_info, media_probe_cache,
+                                  path_exists, day_seed, show_pos=None,
+                                  channel_id=None, block_duration_seconds=None,
+                                  fixed_show_order=None, include_unknown=False):
+    """Builds the admitted, ordered block lineup for one block of a channel."""
+    raw_tracks = build_raw_tracks(folder_items or [], media_probe_cache or {}, path_exists,
+                                  include_unknown=include_unknown)
+    if not raw_tracks:
+        return [], dict(show_pos or {})
+    pending_tracks = [] if include_unknown else build_pending_tracks(
+        folder_items or [], media_probe_cache or {}, path_exists)
+    playback_log = ch_info.get("playback_log", {})
+    positions = dict(show_pos if show_pos is not None else playback_log.get("show_pos", {}))
+    if block_duration_seconds is None:
+        block_duration_seconds = block_length_seconds(block_name)
+    tracks, positions, _ = build_show_rotation(
+        raw_tracks, ch_info.get("scheduling_mode", "random_slots"), positions, day_seed,
+        pair_threshold_seconds=max(0, ch_info.get("pair_threshold_minutes", 15)) * 60,
+        episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
+        fixed_show_order=fixed_show_order, block_duration_seconds=block_duration_seconds,
+        channel_id=channel_id, pending_tracks=pending_tracks,
+    )
+    return tracks, positions
+
+
+def build_channel_timeline(video_tracks, commercial_tracks, ch_info, day_seed, media_probe_cache=None, commercial_state=None):
+    """Builds a block's timeline with the channel's own commercial placement and interrupt floor."""
+    return build_block_timeline(
+        video_tracks, commercial_tracks, ch_info.get("commercial_placement", "interrupt_half_hour"), day_seed,
+        interrupt_floor_seconds=commercial_interrupt_floor_seconds(ch_info),
+        media_probe_cache=media_probe_cache,
+        commercial_state=commercial_state,
+    )
 
 
 # ============================================================================
@@ -5995,7 +7270,8 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
         stderr_for_stream_checks = ""
         any_timeout = False
         for _fp in (path1, path2):
-            _r, _tp_r, _lra_r, _stderr, _timed_out = _sample_lufs_readings(_fp, target_lufs)
+            _r, _tp_r, _lra_r, _stderr, _timed_out = _sample_lufs_readings(
+                _fp, target_lufs, semaphore=_LOUDNESS_PROBE_SEMAPHORE)
             readings.extend(_r)
             tp_readings.extend(_tp_r)
             lra_readings.extend(_lra_r)
@@ -7169,15 +8445,15 @@ __all__ = [
     "check_media_truly_ended", "clean_display_title_for_ext", "clean_music_display_title",
     "clean_video_display_title", "commercial_bundle_ceiling", "dedupe_duplicate_episode_files",
     "dedupe_same_name_different_extension", "discover_bezel_style_files", "dvd_disc_mrl",
-    "fast_forward_show_pos", "generate_captions_via_asr_chunked", "get_cached_compressor_bake",
+    "fast_forward_show_pos", "sequential_state_after_path", "sequential_state_shifted", "take_sequential_entries", "generate_captions_via_asr_chunked", "get_cached_compressor_bake",
     "get_disc_info", "get_media_duration", "get_media_loudness_gain",
     "get_media_video_dimensions", "get_music_loudness_gain", "get_pair_loudness_gain",
     "group_shows_flexible", "is_dvd_disc_source", "is_movie_track", "is_optical_drive_root",
     "is_shortcut_path", "iter_files_resolving_shortcuts", "migrate_show_positions",
-    "note_random_episode_played", "pair_movie_parts", "pair_short_episodes",
+    "note_random_episode_played", "draw_from_shuffle_bag_by_file", "random_bag_entry_indices", "random_last_entry", "lineup_groups", "swap_lineup_groups", "pair_movie_parts", "track_duration_is_known", "pair_short_episodes",
     "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_caption_source",
     "resolve_captions_dir", "resolve_dir_entry", "resolve_loudness_dir", "resolve_main_dir",
-    "resolve_shortcut_chain", "resolve_shortcut_target", "resolve_track_duration",
+    "build_pending_tracks", "group_pending_tracks", "resolve_shortcut_chain", "resolve_shortcut_target", "resolve_track_duration",
     "resolve_whisper_model_dir", "set_caption_memory_refusal_handler", "set_live_playback_priority", "split_movies_and_series",
     "stable_series_id", "strip_shortcut_display_suffix", "track_duration_is_estimated",
 ]

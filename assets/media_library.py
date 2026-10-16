@@ -30,19 +30,18 @@ log = logging.getLogger(__name__)
 # SECTION: Storage location & database
 # ============================================================================
 
-_library_dir_ready = False
+_library_dirs_ready = set()
 
 
 def resolve_media_library_dir(main_dir_resolver: Optional[Callable[[], str]] = None) -> str:
     """Return the program's own folder for the persistent probe library."""
-    global _library_dir_ready
     if main_dir_resolver is None:
         import media as _media
         main_dir_resolver = _media.resolve_main_dir
     path = os.path.join(main_dir_resolver(), "media_library")
-    if not _library_dir_ready:
+    if path not in _library_dirs_ready:
         os.makedirs(path, exist_ok=True)
-        _library_dir_ready = True
+        _library_dirs_ready.add(path)
     return path
 
 

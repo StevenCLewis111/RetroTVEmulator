@@ -34,6 +34,7 @@ import collections
 import contextlib
 import ctypes
 import datetime
+import inspect
 import io
 import itertools
 import math
@@ -64,6 +65,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ASSETS_DIR = os.path.join(ROOT, "assets")
 MAIN_SCRIPT = os.path.join(ROOT, "retro_tv_emulator.py")
+
+
+def _media_script_path():
+    root_copy = os.path.join(ROOT, "media.py")
+    return root_copy if os.path.exists(root_copy) else os.path.join(ASSETS_DIR, "media.py")
+
+
 TEMP_DIR = os.path.join(ROOT, "temp")
 
 for _sub in ("server", "updater", "assets", "GPU"):
@@ -405,6 +413,36 @@ class TestSubtitleProbeParity(unittest.TestCase):
 # ============================================================================
 # SECTION: Independent fallback probes
 # ============================================================================
+
+
+class TestSeriesDurationGuess(unittest.TestCase):
+    def test_unknown_episode_uses_median_after_two_scanned_episodes(self):
+        items = [
+            {"path": "/tv/Show/Show S01E01.mkv"},
+            {"path": "/tv/Show/Show S01E02.mkv"},
+            {"path": "/tv/Show/Show S01E03.mkv"},
+        ]
+        cache = {
+            items[0]["path"]: {"duration": 1200},
+            items[1]["path"]: {"duration": 1500},
+        }
+        tracks = media.build_raw_tracks(items, cache, lambda _path: True)
+        self.assertEqual([t["path"] for t in tracks], [item["path"] for item in items])
+        self.assertEqual(tracks[-1]["duration"], 1500)
+        self.assertNotIn("_duration_estimated", tracks[-1])
+
+    def test_movies_and_commercials_are_not_guessed(self):
+        items = [
+            {"path": "/movies/Film Part 1.mkv"},
+            {"path": "/movies/Film Part 2.mkv"},
+            {"path": "/commercials/Show S01E03.mkv"},
+        ]
+        cache = {
+            items[0]["path"]: {"duration": 5000},
+            items[1]["path"]: {"duration": 5100},
+        }
+        tracks = media.build_raw_tracks(items, cache, lambda _path: True)
+        self.assertEqual([t["path"] for t in tracks], items[0:2])
 
 
 class TestDimsAndDurationUntouched(unittest.TestCase):
@@ -783,6 +821,15 @@ class TestResetAllSettingsLeavesLibraryIntact(unittest.TestCase):
         path = ml.resolve_media_library_dir(fake_main_dir)
         self.assertTrue(path.endswith("media_library"))
         self.assertTrue(os.path.isdir(path))
+
+    def test_resolve_media_library_dir_makes_each_folder_it_is_given(self):
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, True)
+        first = ml.resolve_media_library_dir(lambda: other)
+        self.assertTrue(os.path.isdir(first))
+        second = ml.resolve_media_library_dir(lambda: self.tmp)
+        self.assertNotEqual(first, second)
+        self.assertTrue(os.path.isdir(second))
 
 
 class TestLegacyCacheMigration(unittest.TestCase):
@@ -5224,7 +5271,7 @@ def n8_case_digit_entry():
 
 
     def old_digit_block(buffer, digit, now):
-        """The v93 inline code, written out."""
+        """The digit rule written out: a full number waits the confirm time, a short one waits the single-digit time."""
         state = {"digit_buffer": buffer}
         if len(state.get("digit_buffer", "")) < 2:
             state["digit_buffer"] = state.get("digit_buffer", "") + digit
@@ -5243,7 +5290,7 @@ def n8_case_digit_entry():
             for now in (0, 99, 100, 101, 5000, 6000):
                 check(mn.digit_entry_due(buffer, deadline, now) == bool(buffer and now >= deadline), f"digit due {buffer!r} {deadline} {now}")
         check(mn.digit_entry_channel(buffer) == buffer.zfill(2), f"digit channel {buffer!r}")
-    check((mn.DIGIT_ENTRY_MAX, mn.DIGIT_ENTRY_SINGLE_MS, mn.DIGIT_ENTRY_CONFIRM_MS) == (2, 2500, 350), "digit numbers unchanged")
+    check((mn.DIGIT_ENTRY_MAX, mn.DIGIT_ENTRY_SINGLE_MS, mn.DIGIT_ENTRY_CONFIRM_MS) == (2, 2500, 350), "digit numbers match the rule: two digits, 2.5 seconds for a single digit, 0.35 seconds after the second digit")
 
 
 def n8_case_dvd_controls():
@@ -7551,6 +7598,8 @@ def _block_scan_ns(block_mode, now_hour, schedules, scanned=()):
 
     ns = {"db": fake_db, "time": time, "os": os, "log": MagicMock(), "copy": __import__("copy"),
           "SIX_HOUR_BLOCK_NAMES": list(media.SIX_HOUR_BLOCK_NAMES),
+          "SIX_HOUR_BLOCKS": list(media.SIX_HOUR_BLOCKS),
+          "build_pending_tracks": media.build_pending_tracks,
           "SCAN_GATHER_LIBRARY_LOOKUPS": 400,
           "broadcast_clock": types.SimpleNamespace(now=lambda: fixed_now),
           "_get_channel_ordered_content": lambda ch, info: lineup(ch, info, _airing_block(block_mode, now_hour), fixed_now),
@@ -7562,8 +7611,8 @@ def _block_scan_ns(block_mode, now_hour, schedules, scanned=()):
           "_scan_file_is_done": lambda p, g, d, mo, lk: os.path.normpath(p) in {os.path.normpath(x) for x in scanned},
           "_scan_snapshot_channel": lambda ch: ns["_build_scan_snapshot"]()["channels"].get(ch),
           "_front_load_watched_channel": lambda items: items}
-    for name in ("_block_names_after_airing", "_get_block_ordered_content_peek", "_build_scan_snapshot",
-                 "_compute_channel_scan_progress", "_gather_deep_backlog_queue"):
+    for name in ("_airing_block_name", "_block_names_after_airing", "_get_block_ordered_content_peek", "_build_scan_snapshot",
+                 "_compute_channel_scan_progress", "_gather_deep_backlog_queue", "_gather_probe_priority_queue"):
         exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
     return ns, fixed_now
 
@@ -7631,6 +7680,65 @@ def suite_block_scan():
     items = ns_order["_order_scan_pipeline"](tiers, [("channel", "05", it[2], it[3]) for it in n["_gather_deep_backlog_queue"]()])
     paths = [it[5] for it in items]
     check(len(paths) == len(set(paths)), "the pipeline scans a file reused across blocks once")
+
+    def stuck_ns(block_mode, hour, names):
+        n, now_ = _block_scan_ns(block_mode, hour, sched(names))
+        n["_get_channel_ordered_content"] = lambda ch, info: ([], None)
+        n["_get_block_ordered_content"] = lambda ch, info, block, now_, peek_only=False: ([], None)
+        n["_next_n_from_ordered"] = lambda ordered, cur, n=4: []
+        n["_next_n_from_block_timeline"] = lambda ch, cur, n=4: None
+        n["_log_missing_probe_path_once"] = lambda *a: None
+        return n, now_
+
+    n, now_ = stuck_ns("eight_hour", 9, eight)
+    snap_rec = n["_build_scan_snapshot"]()["channels"]["05"]
+    check(snap_rec["pending_block"] == "Morning" and len(snap_rec["pending"]) == 2,
+          "a channel with no lineup still lists its airing block's unscanned files in schedule order (got %s)" % snap_rec["pending"])
+    check([o["block_key"] for o in snap_rec["pending_other"]] == ["Evening", "Night"],
+          "its other blocks' unscanned files are listed by how soon they air")
+    tiers = n["_gather_probe_priority_queue"]()
+    check([it[3] for it in tiers[0]] == [os.path.normpath("/m/Morning_0.mkv")] and tiers[0][0][2] == "Morning",
+          "a channel with no lineup has its first unscanned file in the airing tier so it can leave Static (got %s)" % tiers[0])
+    deep_blocks = list(dict.fromkeys(it[2] for it in n["_gather_deep_backlog_queue"]()))
+    check(deep_blocks == ["Morning", "Evening", "Night"],
+          "the deep queue follows with the rest of the airing block, then the next blocks by distance (got %s)" % deep_blocks)
+
+    n, now_ = stuck_ns("six_block", 17, six)
+    deep_blocks = list(dict.fromkeys(it[2] for it in n["_gather_deep_backlog_queue"]()))
+    check(deep_blocks[0] == _airing_block("six_block", 17),
+          "4 hour: the airing block is queued before the others (got %s)" % deep_blocks)
+
+    n, now_ = stuck_ns("eight_hour", 9, eight)
+    n["_scan_stages_pending"] = lambda p, g, d, lk: False
+    check(not n["_gather_probe_priority_queue"]()[0] and not n["_gather_deep_backlog_queue"](),
+          "files already scanned are not queued for a channel with no lineup")
+
+    n, now_ = stuck_ns("eight_hour", 9, eight)
+    n["db"].channels_db["05"]["broken_files"] = ["/m/Morning_0.mkv"]
+    check("/m/Morning_0.mkv" not in n["_build_scan_snapshot"]()["channels"]["05"]["pending"], "a file confirmed broken is not queued")
+
+    def prime_ns(stuck, broken=()):
+        n, now_ = stuck_ns("eight_hour", 9, eight) if stuck else _block_scan_ns("eight_hour", 9, sched(eight))
+        info = n["db"].channels_db["05"]
+        info["broken_files"] = list(broken)
+        probed = []
+        n.update({"_priming_inflight": set(), "_priming_inflight_lock": __import__("threading").Lock(),
+                  "_PRIME_DURATIONS_NEAR_TERM_N": 8, "threading": types.SimpleNamespace(Thread=lambda **kw: types.SimpleNamespace(start=lambda: probed.append(kw["args"][1]))),
+                  "_prime_channel_block_durations_worker": lambda *a: None, "_get_cached_media_probe": lambda p: {}, "_get_probe_now_state": lambda ch: {"file": ""},
+                  "_next_n_from_ordered": lambda ordered, cur, n=4: ordered[:n]})
+        exec(compile(get_function_source("_prime_channel_block_durations"), "<extracted:_prime_channel_block_durations>", "exec"), n)
+        return n, probed
+
+    n, probed = prime_ns(True)
+    n["_prime_channel_block_durations"]("05")
+    check([p for p, _np in probed[0]] == ["/m/Morning_0.mkv", "/m/Morning_1.mkv"],
+          "tuning to a channel with no lineup probes the unscanned files of its airing block in schedule order (got %s)" % probed)
+    n, probed = prime_ns(True, broken=["/m/Morning_0.mkv"])
+    n["_prime_channel_block_durations"]("05")
+    check([p for p, _np in probed[0]] == ["/m/Morning_1.mkv"], "a confirmed broken file is not probed")
+    n, probed = prime_ns(False)
+    n["_prime_channel_block_durations"]("05")
+    check(len(probed) == 1 and len(probed[0]) == 2, "a channel with a lineup still probes its near-term files as before")
     check(items[0][0] == 0, "the airing file still comes first, ahead of every off-air block file")
 
 
@@ -7648,14 +7756,10 @@ def suite_block_peek_isolated():
     info = {"scheduling_mode": "random_slots", "block_mode": "eight_hour", "playback_log": plog,
             "schedules": {"Evening": eps("Show A", 6) + eps("Show B", 6)}, "pair_threshold_minutes": 0}
     fake_db = types.SimpleNamespace(config={"media_probe_cache": {}}, channels_db={"05": info}, save_settings_async=lambda **k: None)
-    ns = {"db": fake_db, "time": time, "os": os, "datetime": datetime, "log": MagicMock(), "copy": __import__("copy"),
+    ns = {"db": fake_db, "time": time, "log": MagicMock(),
           "_ORDERED_CONTENT_CACHE": {}, "_ORDERED_CONTENT_CACHE_TTL_MS": 8000,
           "_prune_ordered_content_cache": lambda ms: None, "_cached_path_exists": lambda p: True,
-          "resolve_track_duration": media.resolve_track_duration, "track_duration_is_estimated": media.track_duration_is_estimated,
-          "SIX_HOUR_BLOCK_NAMES": list(media.SIX_HOUR_BLOCK_NAMES), "_start_order_seed": lambda i, o: "1:%d" % o,
-          "SHORT_EPISODE_PAIRING_VERSION": media.SHORT_EPISODE_PAIRING_VERSION,
-          "_reconcile_cached_lineup": lambda *a, **k: ([], None), "_apply_cached_durations": lambda t, d: t,
-          "pair_short_episodes": media.pair_short_episodes, "build_show_rotation": media.build_show_rotation}
+          "_start_order_seed": lambda i, o: "1:%d" % o, "read_block_lineup": media.read_block_lineup}
     exec(compile(get_function_source("_get_block_ordered_content"), "<extracted:_get_block_ordered_content>", "exec"), ns)
     before = __import__("copy").deepcopy(plog)
     lineup, name = ns["_get_block_ordered_content"]("05", info, "Evening", datetime.datetime(2026, 10, 13, 9, 30), peek_only=True)
@@ -7668,6 +7772,2236 @@ class TestBlockPeekIsolated(_SectionCase):
 
     def test_block_peek_isolated(self):
         self.run_section(suite_block_peek_isolated)
+
+
+
+# ============================================================================
+# SECTION: Broken episode swap, sequential order
+# ============================================================================
+
+def suite_broken_swap_sequential():
+    import copy as _cp
+    PATH_MISSING, PATH_UNKNOWN = "missing", "unknown"
+    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
+          "log": MagicMock(), "media": media, "random": __import__("random"),
+          "PATH_MISSING": PATH_MISSING, "PATH_UNKNOWN": PATH_UNKNOWN,
+          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
+          "_mark_file_broken": lambda *a, **k: None,
+          "resolve_track_duration": media.resolve_track_duration,
+          "split_movies_and_series": media.split_movies_and_series,
+          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
+          "_cached_path_exists": lambda p: True,
+          "note_random_episode_played": media.note_random_episode_played}
+    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
+        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
+
+    def eps(name, n, dur):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": dur} for i in range(n)]
+
+    def expand(lineup):
+        out = []
+        for t in lineup:
+            out += [t.get("pair_ep1_path", t["path"]), t.get("pair_ep2_path", "")] if t.get("is_pair") else [t["path"]]
+        return [p for p in out if p]
+
+    def alpha(paths):
+        return [p for p in paths if "/Alpha/" in p]
+
+    for pair_minutes, dur, count, broken_first in ((0, 1500, 12, False), (15, 600, 24, False), (0, 1500, 12, True)):
+        raw = eps("Alpha", count, dur) + eps("Beta", count, dur)
+        info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": pair_minutes, "episode_order_mode": "sequential",
+                "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+        lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
+        info["playback_log"]["show_pos"] = show_pos
+        info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
+        label = "pairing %d min" % pair_minutes + (", another file of the show already broken" if broken_first else "")
+        if broken_first:
+            first = alpha(info["playback_log"]["sched_cached_tracks"])[0]
+            info["broken_files"] = [first]
+            info["playback_log"]["sched_cached_tracks"] = [p for p in info["playback_log"]["sched_cached_tracks"] if p != first]
+        planned = alpha(info["playback_log"]["sched_cached_tracks"])
+        failed = planned[1] if not broken_first else planned[0]
+        sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
+        check(sub is not None and sub["file"] != failed, label + ": a substitute is chosen")
+        swapped = alpha(info["playback_log"]["sched_cached_tracks"])
+        check(failed not in swapped and sub["file"] in swapped, label + ": the saved lineup holds the substitute, not the failed file")
+        pos = info["playback_log"]["show_pos"]
+        check("Alpha" not in pos and isinstance(pos.get("05:alpha"), dict) and "next" in pos.get("05:alpha"), label + ": the position is kept under the channel-scoped key only, as the file that airs next")
+        nxt, _, _ = media.build_block_rotation(raw, info, _cp.deepcopy(pos), 2026101, 28800, "05", None, "1:200")
+        again = set(alpha(expand(nxt))) & set(swapped)
+        check(not again, label + ": the next block does not start on an episode that already aired (%s)" % sorted(again))
+
+    raw = eps("Paired", 4, 600)
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential",
+            "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+    lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
+    info["playback_log"]["show_pos"] = show_pos
+    info["playback_log"]["sched_cached_tracks"] = expand(lineup)
+    failed = raw[0]["path"]
+    replacement = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
+    paired_paths = [raw[2]["path"], raw[3]["path"]]
+    check(replacement is not None and replacement["file"] == paired_paths[0], "paired sequential swap: replaces the failed pair with the next rotation entry")
+    check(info["playback_log"]["sched_cached_tracks"] == paired_paths, "paired sequential swap: saved lineup contains the replacement pair once")
+    check(info["playback_log"]["show_pos"]["05:paired"]["next"] is None, "paired sequential swap: saved position advances by rotation entry")
+
+
+class TestBrokenSwapSequential(_SectionCase):
+    """A broken episode in sequential order moves the show's real position, so the substitute never airs twice"""
+
+    def test_broken_swap_sequential(self):
+        self.run_section(suite_broken_swap_sequential)
+
+
+# ============================================================================
+# SECTION: Broken episode swap, sequential order, show fills its block
+# ============================================================================
+
+def suite_broken_swap_sequential_full():
+    import copy as _cp
+    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
+          "log": MagicMock(), "media": media, "random": __import__("random"),
+          "PATH_MISSING": "missing", "PATH_UNKNOWN": "unknown",
+          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
+          "_mark_file_broken": lambda *a, **k: None,
+          "resolve_track_duration": media.resolve_track_duration,
+          "split_movies_and_series": media.split_movies_and_series,
+          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
+          "_cached_path_exists": lambda p: True,
+          "note_random_episode_played": media.note_random_episode_played}
+    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
+        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
+
+    def expand(lineup):
+        out = []
+        for t in lineup:
+            out += [t.get("pair_ep1_path", t["path"]), t.get("pair_ep2_path", "")] if t.get("is_pair") else [t["path"]]
+        return [p for p in out if p]
+
+    refused = swapped_count = 0
+    for mode in ("random_slots", "two_slots"):
+        for count in (2, 3, 4, 5, 6):
+            raw = [{"path": "/m/tv/Solo/Solo S01E%02d.mkv" % (i + 1), "duration": 1500} for i in range(count)]
+            base = {"scheduling_mode": mode, "pair_threshold_minutes": 0, "episode_order_mode": "sequential",
+                    "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+            lineup, show_pos, _ = media.build_block_rotation(raw, base, {}, 2026100, 28800, "05", None, "1:200")
+            base["playback_log"]["show_pos"] = show_pos
+            base["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
+            planned = list(base["playback_log"]["sched_cached_tracks"])
+            for failed in planned:
+                label = "%s, %d episodes, %s fails" % (mode, count, failed[-7:-4])
+                info = _cp.deepcopy(base)
+                before_lineup = list(info["playback_log"]["sched_cached_tracks"])
+                before_pos = _cp.deepcopy(info["playback_log"]["show_pos"])
+                sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
+                after = info["playback_log"]["sched_cached_tracks"]
+                check(len(after) == len(set(after)), label + ": no episode is in the saved lineup twice (%s)" % [p[-7:-4] for p in after])
+                if sub is None:
+                    refused += 1
+                    check(after == before_lineup and info["playback_log"]["show_pos"] == before_pos,
+                          label + ": a refused swap leaves the saved lineup and positions unchanged")
+                else:
+                    swapped_count += 1
+                    check(sub["file"] in after and sub["file"] != failed, label + ": the saved lineup holds the substitute")
+    check(refused > 0 and swapped_count > 0, "both refused and made swaps were exercised (%d refused, %d made)" % (refused, swapped_count))
+
+    raw = eps("Paired", 4, 600)
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential",
+            "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+    lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
+    info["playback_log"]["show_pos"] = show_pos
+    info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
+    failed = info["playback_log"]["sched_cached_tracks"][0]
+    sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
+    check(sub is not None, "paired sequential swap chooses a substitute")
+    state = info["playback_log"]["show_pos"]["05:paired"]
+    entries = media.pair_short_episodes(raw, 900)
+    expected = media.sequential_state_from_entry_index(raw, entries, 1)
+    check(state == expected, "paired sequential swap advances the saved position by rotation entry")
+
+
+# ============================================================================
+# SECTION: Saved lineup keeps every file of a leftover bundle
+# ============================================================================
+
+def suite_lineup_paths_bundle():
+    def eps(name, durs):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": d} for i, d in enumerate(durs)]
+
+    def aired(lineup):
+        out = []
+        for t in lineup:
+            if t.get("is_pair"):
+                out += [t["pair_ep1_path"], t["pair_ep2_path"]]
+            elif t.get("is_bundle"):
+                out += [e["path"] for e in t["bundle_items"]]
+            else:
+                out.append(t["path"])
+        return out
+
+    plain = [{"path": "/m/a.mkv", "duration": 1500}, {"path": "/m/b.mkv", "duration": 1500}]
+    check(media.lineup_paths(plain) == ["/m/a.mkv", "/m/b.mkv"], "plain entries give their own path, in order")
+    pair = media.pair_short_episodes(eps("P", [600, 600]), threshold_seconds=900)
+    check(media.lineup_paths(pair) == [pair[0]["pair_ep1_path"], pair[0]["pair_ep2_path"]], "a pair gives both of its files")
+    bundle = media.pair_short_episodes(eps("B", [600, 1500, 600, 1500, 600]), threshold_seconds=900)
+    got = media.lineup_paths(bundle)
+    check(all(p in got for p in aired(bundle)) and len(got) == len(aired(bundle)),
+          "a leftover bundle gives every one of its files, not only the first (%s)" % [p[-7:-4] for p in got])
+    check(media.lineup_paths([]) == [] and media.lineup_paths(None) == [], "no tracks give no paths")
+    check(media.lineup_paths([{"path": ""}]) == [], "an empty path is left out")
+
+    raw = eps("Alt", [600, 1500] * 6)
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential",
+            "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+    seen_bundle = False
+    for b in range(12):
+        lineup, sp, _ = media.build_block_rotation(raw, info, info["playback_log"].get("show_pos", {}), 2026100 + b, 28800, "05", None, "1:200")
+        info["playback_log"]["show_pos"] = sp
+        saved = list(dict.fromkeys(media.lineup_paths(lineup)))
+        seen_bundle = seen_bundle or any(t.get("is_bundle") for t in lineup)
+        missing = [p[-7:-4] for p in aired(lineup) if p not in saved]
+        check(not missing, "block %d: every file the first pass airs is in the saved list (missing %s)" % (b, missing))
+    check(seen_bundle, "the test blocks included a leftover bundle")
+
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(src.count("lineup_paths(") >= 5, "the scheduler saves its lineups through media.lineup_paths")
+    check(src.count('_ct.get("pair_ep2_path", "")') == 0 and src.count('_ct2.get("pair_ep2_path", "")') == 0,
+          "the scheduler holds no hand-written flatten of a lineup into saved paths")
+
+
+class TestLineupPathsBundle(_SectionCase):
+    """A block's saved path list holds every file of a leftover bundle"""
+
+    def test_lineup_paths_bundle(self):
+        self.run_section(suite_lineup_paths_bundle)
+
+
+def _lineup_signature(lineup):
+    return [("pair" if x.get("is_pair") else "bundle" if x.get("is_bundle") else "single", tuple(media.lineup_paths([x]))) for x in lineup]
+
+
+def _mixed_short_content():
+    def eps(name, durs):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": d} for i, d in enumerate(durs)]
+    return eps("X", [600, 1500, 600, 600, 600, 1500, 600]) + eps("Y", [600, 600, 600, 1500, 600, 1500, 600, 600, 600])
+
+
+def _mixed_short_channel(content):
+    _, _, ads = _sched_record_library()
+    info = {"active": True, "scheduling_mode": "random_slots", "commercials_enabled": True,
+            "commercial_placement": "interrupt_half_hour", "pair_threshold_minutes": 15, "block_mode": "eight_hour",
+            "schedules": {n: [dict(x) for x in content] for n in ("Morning", "Evening", "Night")},
+            "playback_log": {"intro_seed": 123456789}}
+    info["schedules"]["Commercials"] = ads
+    return info
+
+
+def suite_lineup_groups():
+    import copy as _copy
+
+    def eps(name, durs):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": d} for i, d in enumerate(durs)]
+
+    content = _mixed_short_content()
+    raw = [dict(x) for x in content]
+    info = _mixed_short_channel(content)
+    differ = 0
+    for b in range(12):
+        lineup, sp, _ = media.build_block_rotation(raw, info, info["playback_log"].get("show_pos", {}), 2026100 + b, 28800, "05", None, "1:200")
+        info["playback_log"]["show_pos"] = sp
+        paths = list(dict.fromkeys(media.lineup_paths(lineup)))
+        record = media.lineup_groups(lineup, 900)
+        folder = info["schedules"]["Evening"]
+        re_paired = media.saved_block_lineup(paths, {}, raw, folder, [], 900)
+        with_groups = media.saved_block_lineup(paths, {}, raw, folder, [], 900, cached_groups=record)
+        differ += _lineup_signature(re_paired) != _lineup_signature(lineup)
+        check(_lineup_signature(with_groups) == _lineup_signature(lineup),
+              "block %d: a lineup read back with its saved groups is exactly the lineup the rotation built" % b)
+    check(differ > 0, "the test blocks include lineups that pairing the saved path list again would change (%d of 12)" % differ)
+
+    lineup = media.pair_short_episodes(eps("Q", [600, 600, 1500, 600, 600, 600]), threshold_seconds=900)
+    paths = list(dict.fromkeys(media.lineup_paths(lineup)))
+    raw_q = eps("Q", [600, 600, 1500, 600, 600, 600])
+    folder_q = [dict(x) for x in raw_q]
+    record = media.lineup_groups(lineup, 900)
+    check(record["version"] == media.LINEUP_GROUPS_VERSION and record["threshold"] == 900
+          and record["pairing_rule_version"] == media.SHORT_EPISODE_PAIRING_VERSION, "the record holds its version, the pairing rule version and the threshold")
+    check([g["kind"] for g in record["groups"]] == ["pair", "single", "pair", "bundle"][:len(record["groups"])] or len(record["groups"]) == len(lineup),
+          "the record has one group per lineup entry")
+    check(sorted(sum((g["paths"] for g in record["groups"]), [])) == sorted(paths), "the groups hold exactly the saved paths")
+
+    def read(rec, saved=paths, thresh=900, broken=()):
+        live = [x for x in raw_q if x["path"] not in broken]
+        folder_live = [x for x in folder_q if x["path"] not in broken]
+        return _lineup_signature(media.saved_block_lineup(saved, {}, live, folder_live, list(broken), thresh, cached_groups=rec))
+
+    base = _lineup_signature(lineup)
+    check(read(record) == base, "matching groups give the saved lineup")
+    check(read(record, thresh=1800) != base or read(record, thresh=1800) == _lineup_signature(media.pair_short_episodes(raw_q, threshold_seconds=1800)),
+          "a changed threshold ignores the groups and pairs the list again")
+
+    paired = eps("Swap", [600, 600, 1500, 600, 600])
+    first_entries, first_state = media.take_sequential_entries(paired, {"next": None, "owed": []}, 1, 900)
+    second_entries, second_state = media.take_sequential_entries(paired, first_state, 1, 900)
+    shifted = media.sequential_state_shifted(paired, {"next": None, "owed": []}, 2, 900)
+    check(len(first_entries) == 1 and first_entries[0].get("is_pair"), "sequential rotation starts with the paired entry")
+    check(len(second_entries) == 1 and second_entries[0].get("path") == paired[2]["path"], "the next sequential entry follows the pair")
+    check(shifted == second_state, "sequential swap advances by rotation entries, not raw episode indexes")
+    check(read(record, saved=paths[:-1]) == _lineup_signature(media.saved_block_lineup(paths[:-1], {}, raw_q, folder_q, [], 900)),
+          "groups that no longer describe the saved path list are ignored")
+    stale = _copy.deepcopy(record)
+    stale["pairing_rule_version"] = media.SHORT_EPISODE_PAIRING_VERSION + 1
+    check(read(stale) == _lineup_signature(media.saved_block_lineup(paths, {}, raw_q, folder_q, [], 900)), "groups from another pairing rule version are ignored")
+    for bad in (None, {}, {"version": media.LINEUP_GROUPS_VERSION}, "x", {"version": media.LINEUP_GROUPS_VERSION, "pairing_rule_version": media.SHORT_EPISODE_PAIRING_VERSION, "threshold": 900, "groups": [{"kind": "nope", "paths": paths}]}):
+        check(read(bad) == _lineup_signature(media.saved_block_lineup(paths, {}, raw_q, folder_q, [], 900)), "a damaged record is ignored: %s" % (str(bad)[:30],))
+
+    pair_group = next(g for g in record["groups"] if g["kind"] == "pair")
+    shrunk = read(record, broken=[pair_group["paths"][0]])
+    check(("single", (pair_group["paths"][1],)) in shrunk, "a pair that loses a file airs the other file alone, in its place")
+    check(len(shrunk) == len(base), "a lost file shrinks only its own group; no other entry moves")
+    raw_r = eps("R", [600, 1500, 600, 1500, 600])
+    lineup_r = media.pair_short_episodes(raw_r, threshold_seconds=900)
+    paths_r = list(dict.fromkeys(media.lineup_paths(lineup_r)))
+    record_r = media.lineup_groups(lineup_r, 900)
+    bundle_group = next(g for g in record_r["groups"] if g["kind"] == "bundle")
+    check(len(bundle_group["paths"]) == 3, "the test show leaves a bundle of three files")
+    live_r = [x for x in raw_r if x["path"] != bundle_group["paths"][0]]
+    left = _lineup_signature(media.saved_block_lineup(paths_r, {}, live_r, live_r, [bundle_group["paths"][0]], 900, cached_groups=record_r))
+    check(any(k == "bundle" and tuple(p) == tuple(bundle_group["paths"][1:]) for k, p in left), "a bundle that loses a file keeps the rest as one bundle")
+
+    channels = {"05": _mixed_short_channel(content)}
+    times = [datetime.datetime(2026, 10, 13, 12, 0, 5) + datetime.timedelta(minutes=37 * i) for i in range(13)]
+    clock, ticks = [times[0]], [0]
+    ns = _sched_record_ns(channels, clock, ticks)
+    built, used = [], []
+    real_rotation, real_timeline = ns["build_block_rotation"], ns["build_channel_timeline"]
+
+    def spy_rotation(*args, **kwargs):
+        out = real_rotation(*args, **kwargs)
+        built.append(_lineup_signature(out[0]))
+        return out
+
+    def spy_timeline(video_tracks, *args, **kwargs):
+        used.append(_lineup_signature(video_tracks))
+        return real_timeline(video_tracks, *args, **kwargs)
+
+    ns["build_block_rotation"], ns["build_channel_timeline"] = spy_rotation, spy_timeline
+    for moment in times:
+        clock[0] = moment
+        ticks[0] += 10000
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            ns["calculate_slotted_playback_state"]("05")
+    check(len(used) >= len(times) and len(built) >= 1, "the scheduler ran on the mixed short-episode channel")
+    stray = [i for i, s in enumerate(used) if s not in built]
+    check(not stray, "every pass of the scheduler airs a lineup the rotation built, never a re-paired one (passes %s)" % stray[:5])
+    plog = channels["05"]["playback_log"]
+    saved = plog.get("sched_cached_groups")
+    check(isinstance(saved, dict) and saved.get("groups"), "the scheduler saves the groups with the block")
+    check(list(dict.fromkeys(sum((g["paths"] for g in saved["groups"]), []))) == list(plog["sched_cached_tracks"]), "the saved groups describe exactly the saved path list")
+
+    now = times[-1]
+    probe = {os.path.normpath(x["path"]): {"duration": x["duration"]} for x in content}
+    with patch.object(media, "_cached_path_exists", lambda p: True):
+        read_back, _ = media.read_block_lineup("05", channels["05"], "Evening", now, probe, lambda p: True, lambda ci, off: 1)
+    last_used = used[-1]
+    check(_lineup_signature(read_back) == last_used, "the read-only read of the block on air gives the lineup the station airs")
+
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(src.count("lineup_groups(") >= 3, "the scheduler saves the groups at its new-block, re-flavor and cycle saves")
+    check(src.count('cached_groups=playback_log.get("sched_cached_groups")') >= 2, "both scheduler reads give the saved groups to the shared function")
+    check('cached_groups=playback_log.get("sched_cached_groups")' in open(_media_script_path(), encoding="utf-8").read(), "the read-only read gives the saved groups to the shared function")
+
+    ns2 = _sched_record_ns({"05": _sched_record_channel("full_day", "interrupt_half_hour", "random_slots", True)}, [datetime.datetime(2026, 10, 13, 0, 0, 5)], [0])
+    freeze = ns2["_freeze_aired_prefix_durations"]
+    pieces = [{"path": "/m/a.mkv", "duration": 880, "start_time": 0, "is_commercial": False, "seek_offset": 0},
+              {"path": "/m/ad.mkv", "duration": 30, "start_time": 880, "is_commercial": True, "seek_offset": 0},
+              {"path": "/m/a.mkv", "duration": 880, "start_time": 910, "is_commercial": False, "seek_offset": 880},
+              {"path": "/m/ad.mkv", "duration": 30, "start_time": 1790, "is_commercial": True, "seek_offset": 0},
+              {"path": "/m/a.mkv", "duration": 880, "start_time": 1820, "is_commercial": False, "seek_offset": 1760},
+              {"path": "/m/b.mkv", "duration": 1500, "start_time": 2700, "is_commercial": False, "seek_offset": 0}]
+    durs, frozen = {}, set()
+    freeze(pieces, pieces[0], durs, frozen)
+    check(durs == {"/m/a.mkv": 2640}, "an episode airing in commercial-split pieces is frozen at its whole length, not the first piece's (%s)" % durs)
+    durs, frozen = {}, set()
+    freeze(pieces, pieces[5], durs, frozen)
+    check(durs == {"/m/a.mkv": 2640, "/m/ad.mkv": 30, "/m/b.mkv": 1500} or durs.get("/m/a.mkv") == 2640 and durs.get("/m/b.mkv") == 1500,
+          "every episode up to the one airing is frozen at its whole length")
+
+
+def suite_lineup_groups_swap():
+    import copy as _cp
+    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
+          "log": MagicMock(), "media": media, "random": __import__("random"),
+          "PATH_MISSING": "missing", "PATH_UNKNOWN": "unknown",
+          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
+          "_mark_file_broken": lambda *a, **k: None,
+          "resolve_track_duration": media.resolve_track_duration,
+          "split_movies_and_series": media.split_movies_and_series,
+          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
+          "_cached_path_exists": lambda p: True,
+          "note_random_episode_played": media.note_random_episode_played}
+    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
+        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
+
+    def eps(name, durs):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": d} for i, d in enumerate(durs)]
+
+    checked = 0
+    survived = 0
+    for order_mode in ("sequential", "random"):
+        for block in range(8):
+            raw = eps("Alpha", [600] * 8 + [1500, 600, 600, 1500, 600] ) + eps("Beta", [600] * 7)
+            info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": order_mode,
+                    "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+            lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100 + block, 28800, "05", None, "1:200")
+            plog = info["playback_log"]
+            plog["show_pos"] = show_pos
+            plog["sched_cached_tracks"] = list(dict.fromkeys(media.lineup_paths(lineup)))
+            plog["sched_cached_groups"] = media.lineup_groups(lineup, 900)
+            before_sig = _lineup_signature(lineup)
+            alpha_paths = [p for p in plog["sched_cached_tracks"] if "/Alpha/" in p]
+            if not alpha_paths:
+                continue
+            failed = alpha_paths[len(alpha_paths) // 2]
+            result = ns["_resolve_broken_episode"](info, failed, "Evening", "05")
+            info["broken_files"] = [failed]
+            if result is None:
+                check("sched_cached_groups" not in plog or media._matching_lineup_groups(plog["sched_cached_groups"], plog["sched_cached_tracks"], 900) is not None,
+                      "%s block %d: a refused swap leaves matching groups" % (order_mode, block))
+                continue
+            checked += 1
+            new_paths = plog["sched_cached_tracks"]
+            record = plog.get("sched_cached_groups")
+            check(record is not None and media._matching_lineup_groups(record, new_paths, 900) is not None,
+                  "%s block %d: after a swap the saved groups describe exactly the saved path list" % (order_mode, block))
+            if record is None:
+                continue
+            live = [x for x in raw if x["path"] not in info["broken_files"]]
+            after = media.saved_block_lineup(new_paths, {}, live, live, info["broken_files"], 900, cached_groups=record)
+            after_sig = _lineup_signature(after)
+            flat = list(dict.fromkeys(p for _, ps in after_sig for p in ps))
+            check(flat == list(dict.fromkeys(new_paths)), "%s block %d: the swapped lineup airs every saved file once, in the saved order" % (order_mode, block))
+            check(failed not in flat, "%s block %d: the broken file is gone from the lineup" % (order_mode, block))
+            beta_before = [e for e in before_sig if "/Beta/" in e[1][0]]
+            beta_after = [e for e in after_sig if "/Beta/" in e[1][0]]
+            check(beta_before == beta_after, "%s block %d: another show's entries are untouched by the swap" % (order_mode, block))
+            idx = next(i for i, (k, ps) in enumerate(before_sig) if failed in ps)
+            check(after_sig[:idx] == before_sig[:idx], "%s block %d: nothing before the failed entry moves" % (order_mode, block))
+            survived += 1
+    check(checked > 0 and survived > 0, "the swap blocks ran (%d swapped)" % checked)
+
+    raw_b = eps("Gamma", [600, 1500, 600, 1500, 600])
+    lineup_b = media.pair_short_episodes(raw_b, threshold_seconds=900)
+    cached_b = list(dict.fromkeys(media.lineup_paths(lineup_b)))
+    record_b = media.lineup_groups(lineup_b, 900)
+    first = next(g for g in record_b["groups"] if g["kind"] == "bundle")["paths"]
+    swapped = media.swap_lineup_groups(record_b, cached_b, [p for p in cached_b if p != first[1]] if False else cached_b,
+                                       {}, 900, lambda p: 600)
+    check(swapped is not None and swapped["groups"] == record_b["groups"], "a swap with no replacement keeps every group")
+    check(media.swap_lineup_groups(None, cached_b, cached_b, {}, 900, lambda p: 600) is None, "no record gives no groups")
+    wrong = media.swap_lineup_groups(record_b, cached_b, cached_b[:-1], {}, 900, lambda p: 600)
+    check(wrong is None, "a result that does not describe the new path list is dropped")
+
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(src.count("_keep_swap_groups(") >= 3, "both swap branches rewrite the saved groups")
+
+
+def suite_bundle_freeze():
+    ns = _sched_record_ns({"05": _sched_record_channel("full_day", "interrupt_half_hour", "random_slots", True)}, [datetime.datetime(2026, 10, 13, 0, 0, 5)], [0])
+    items = [{"path": "/m/s/a.mkv", "duration": 600}, {"path": "/m/s/x.mkv", "duration": 1500}, {"path": "/m/s/b.mkv", "duration": 540},
+             {"path": "/m/s/y.mkv", "duration": 1500}, {"path": "/m/s/c.mkv", "duration": 660}]
+    bundle = media.pair_short_episodes(items, threshold_seconds=900)
+    bundle = [b for b in bundle if b.get("is_bundle")]
+    check(len(bundle) == 1, "three separated short episodes make one leftover bundle")
+    timeline, total, _ = media.build_channel_timeline(bundle, [], {"commercial_placement": "end_of_show", "block_mode": "full_day"}, 1)
+    entry = next(e for e in timeline if not e.get("is_commercial"))
+    check(entry.get("is_bundle") and entry.get("bundle_item_paths") == ["/m/s/a.mkv", "/m/s/b.mkv", "/m/s/c.mkv"]
+          and entry.get("bundle_item_durations") == [600, 540, 660], "a bundle's timeline entry carries each of its files and its own length")
+    durs, frozen = {}, set()
+    ns["_freeze_aired_prefix_durations"](timeline, entry, durs, frozen)
+    check(durs == {"/m/s/a.mkv": 600, "/m/s/b.mkv": 540, "/m/s/c.mkv": 660}, "the freeze stores each bundle file's own length, not the sum under the first file (%s)" % durs)
+
+
+class TestLineupGroupsSwap(_SectionCase):
+    """A swap keeps the saved groups in step with the saved path list, and a bundle freezes each of its files"""
+
+    def test_lineup_groups_swap(self):
+        self.run_section(suite_lineup_groups_swap)
+
+    def test_bundle_freeze(self):
+        self.run_section(suite_bundle_freeze)
+
+
+class TestLineupGroups(_SectionCase):
+    """A block's saved groups make every pass air the lineup the rotation built, and the freeze keeps whole episode lengths"""
+
+    def test_lineup_groups(self):
+        self.run_section(suite_lineup_groups)
+
+
+class TestBrokenSwapSequentialFull(_SectionCase):
+    """A sequential swap on a show that fills its block never puts an episode in the block twice; it refuses instead"""
+
+    def test_broken_swap_sequential_full(self):
+        self.run_section(suite_broken_swap_sequential_full)
+
+
+# ============================================================================
+# SECTION: Broken episode swap, random order
+# ============================================================================
+
+def suite_broken_swap_random():
+    import copy as _cp
+    import random as _rnd
+    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
+          "log": MagicMock(), "media": media, "random": _rnd, "PATH_MISSING": "missing", "PATH_UNKNOWN": "unknown",
+          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
+          "_mark_file_broken": lambda *a, **k: None,
+          "resolve_track_duration": media.resolve_track_duration, "split_movies_and_series": media.split_movies_and_series,
+          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
+          "_cached_path_exists": lambda p: True, "note_random_episode_played": media.note_random_episode_played}
+    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
+        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
+
+    def eps(name, n, dur):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": dur} for i in range(n)]
+
+    def expand(lineup):
+        out = []
+        for t in lineup:
+            out += [t.get("pair_ep1_path", t["path"]), t.get("pair_ep2_path", "")] if t.get("is_pair") else [t["path"]]
+        return [p for p in out if p]
+
+    for pair_minutes, dur, count in ((0, 1500, 12), (15, 600, 24)):
+        raw = eps("Alpha", count, dur) + eps("Beta", count, dur)
+        info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": pair_minutes, "episode_order_mode": "random",
+                "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+        _, pos1, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
+        lineup2, pos2, _ = media.build_block_rotation(raw, info, pos1, 2026101, 28800, "05", None, "1:200")
+        info["playback_log"]["show_pos"] = pos2
+        info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup2)))
+        label = "pairing %d min" % pair_minutes
+        entries = ns["_show_rotation_entries"](info, "Evening", "Alpha")
+        in_bag = {p for i, e in enumerate(entries) if i in set(media.random_bag_entry_indices(pos2, "Alpha", entries, channel_id="05"))
+                  for p in ([e.get("pair_ep1_path"), e.get("pair_ep2_path")] if e.get("is_pair") else [e["path"]])}
+        before = list(info["playback_log"]["sched_cached_tracks"])
+        planned = [p for p in before if "/Alpha/" in p]
+        for trial in range(25):
+            trial_info = _cp.deepcopy(info)
+            _rnd.seed(trial)
+            failed = planned[trial % len(planned)]
+            sub = ns["_resolve_broken_episode"](trial_info, failed, "Evening", channel_id="05")
+            after = trial_info["playback_log"]["sched_cached_tracks"]
+            ok = (sub is not None and sub["file"] in in_bag and sub["file"] not in before and sub["file"] != failed)
+            check(ok, label + ", trial %d: the substitute is an episode still in the shuffle bag and not in this block" % trial)
+            if not ok:
+                break
+            at = before.index(failed)
+            new_paths = after[at:at + (len(after) - len(before) + 1)]
+            check(after[:at] == before[:at] and after[at + len(new_paths):] == before[at + 1:] and new_paths[0] == sub["file"],
+                  label + ", trial %d: only the failed file is replaced, nothing aired is removed" % trial)
+            bag_after = trial_info["playback_log"]["show_pos"]["05:alpha"]["bag"]
+            check(len(bag_after) == len(pos2["05:alpha"]["bag"]) - 1,
+                  label + ", trial %d: the substitute leaves the bag, so it cannot be drawn again this cycle" % trial)
+
+    tiny = eps("Tiny", 3, 1500)
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 0, "episode_order_mode": "random",
+            "schedules": {"Evening": tiny}, "playback_log": {}, "broken_files": []}
+    lineup, pos, _ = media.build_block_rotation(tiny, info, {}, 2026100, 28800, "05", None, "1:200")
+    info["playback_log"]["show_pos"] = pos
+    info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
+    saved = list(info["playback_log"]["sched_cached_tracks"])
+    failed = next(p for p in saved if "/Tiny/" in p)
+    sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
+    check(sub is None and info["playback_log"]["sched_cached_tracks"] == saved,
+          "a show whose other episodes are all in this block or already aired gets no substitute and its saved lineup is left as it was")
+
+
+class TestBrokenSwapRandom(_SectionCase):
+    """A broken episode in random order is replaced only by an episode still in the shuffle bag"""
+
+    def test_broken_swap_random(self):
+        self.run_section(suite_broken_swap_random)
+
+
+# ============================================================================
+# SECTION: Two slot mode with small shows
+# ============================================================================
+
+def suite_two_slots_small_shows():
+    sizes = {"S1": 1, "S2": 2, "S3": 3, "S5": 5}
+    raw = [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": 1500}
+           for name, n in sizes.items() for i in range(n)]
+    for order_mode in ("sequential", "random"):
+        info = {"scheduling_mode": "two_slots", "pair_threshold_minutes": 0, "episode_order_mode": order_mode}
+        pos, drawn, dup_in_block = {}, {name: [] for name in sizes}, []
+        for block in range(12):
+            lineup, pos, _ = media.build_block_rotation(raw, info, pos, 2026100 + block, 28800, "05", None, "1:200")
+            paths = [t["path"] for t in lineup]
+            if len(paths) != len(set(paths)):
+                dup_in_block.append(block)
+            for path in paths:
+                drawn[path.split("/")[3]].append(path)
+        check(not dup_in_block, "%s: no file airs twice inside one block (blocks %s)" % (order_mode, dup_in_block))
+        check(all(len(drawn[name]) > 0 for name in sizes), "%s: every show airs" % order_mode)
+        for name, n in sizes.items():
+            seq = drawn[name]
+            cycles_ok = all(len(set(seq[k:k + n])) == len(seq[k:k + n]) for k in range(0, len(seq) - n + 1, n))
+            check(cycles_ok, "%s: show %s (%d episodes) airs every episode once before any comes round again" % (order_mode, name, n))
+    info = {"scheduling_mode": "two_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential"}
+    paired = [{"path": "/m/tv/Tiny/Tiny S01E%02d.mkv" % (i + 1), "duration": 600} for i in range(2)]
+    paired += [{"path": "/m/tv/Big/Big S01E%02d.mkv" % (i + 1), "duration": 1500} for i in range(6)]
+    lineup, _, _ = media.build_block_rotation(paired, info, {}, 2026100, 28800, "05", None, "1:200")
+    tiny = [t for t in lineup if "/Tiny/" in t["path"]]
+    check(len(tiny) == 1 and tiny[0].get("is_pair"), "two short episodes that pair into one entry give that entry once, not twice")
+
+
+class TestTwoSlotsSmallShows(_SectionCase):
+    """In two slot mode a show never gets more entries in a block than it has"""
+
+    def test_two_slots_small_shows(self):
+        self.run_section(suite_two_slots_small_shows)
+
+
+# ============================================================================
+# SECTION: Commercial tracks (one shared builder)
+# ============================================================================
+
+def suite_commercial_tracks():
+    cache = {os.path.normpath("/c/probed.mp4"): {"duration": 45.7}}
+    items = [
+        {"path": "/c/probed.mp4", "duration": 10},
+        {"path": "/c/stored.mp4", "duration": 62},
+        {"path": "/c/nostore.mp4"},
+        {"path": "/c/zero.mp4", "duration": 0},
+        {"path": "/c/long.mp4", "duration": 301},
+        {"path": "/c/missing.mp4", "duration": 20},
+        "/c/plain.mp4",
+        {"file": "/c/viafile.mp4", "duration": 15},
+        {"path": "", "duration": 15},
+    ]
+    exists = lambda p: "missing" not in p
+    out = media.build_commercial_tracks(items, cache, exists)
+    got = {t["path"]: t["duration"] for t in out}
+    check(got.get("/c/probed.mp4") == 45, "a probed duration wins over the stored one and is a whole number")
+    check(got.get("/c/stored.mp4") == 62, "the stored duration is used when nothing was probed")
+    check(got.get("/c/nostore.mp4") == 30 and got.get("/c/zero.mp4") == 30, "no duration or zero becomes the 30 second default")
+    check("/c/long.mp4" not in got, "a commercial over the longest allowed length is left out")
+    check("/c/missing.mp4" not in got, "a path that does not exist is left out")
+    check(got.get("/c/plain.mp4") == 30 and got.get("/c/viafile.mp4") == 15, "a plain string and a file key are both read")
+    check(len(out) == 6 and [t["path"] for t in out] == [p for p in ["/c/probed.mp4", "/c/stored.mp4", "/c/nostore.mp4", "/c/zero.mp4", "/c/plain.mp4", "/c/viafile.mp4"]], "order is kept and nothing else is added")
+    check(all(set(t) == {"path", "duration"} and isinstance(t["duration"], int) for t in out), "each track holds only a path and an int duration")
+    uncapped = media.build_commercial_tracks(items, cache, exists, max_seconds=None)
+    check(any(t["path"] == "/c/long.mp4" and t["duration"] == 301 for t in uncapped), "with no cap the long commercial is kept")
+    check(media.COMMERCIAL_DEFAULT_SECONDS == 30 and media.COMMERCIAL_MAX_SECONDS == 300, "default and longest length are 30 and 300 seconds")
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(src.count("build_commercial_tracks(") == 2, "the main script builds commercial tracks only through the shared function")
+    check("COMMERCIAL_DEFAULT_DUR" not in src and "_H_COMMERCIAL_MAX_SECONDS" not in src, "the old local copies are gone from the main script")
+
+
+class TestCommercialTracks(_SectionCase):
+    """One function builds the commercial tracks for the scheduler"""
+
+    def test_commercial_tracks(self):
+        self.run_section(suite_commercial_tracks)
+
+
+# ============================================================================
+# SECTION: Block seeds (one shared seed maths)
+# ============================================================================
+
+def suite_block_seeds():
+    expected = {"Morning": 100, "Evening": 200, "Night": 300, "Full Day": 500}
+    for i, name in enumerate(media.SIX_HOUR_BLOCK_NAMES):
+        expected[name] = 600 + i * 100
+    check(media.BLOCK_SEED_OFFSETS == expected, "the offset table holds the three blocks, Full Day and the six 4 hour blocks")
+    check(all(media.block_seed_offset(n) == v for n, v in expected.items()), "every block name gives its offset")
+    check(media.block_seed_offset("Marathon", 0) == 0 and media.block_seed_offset("Marathon", 400) == 400, "a name with no offset gives the caller's default")
+    d = datetime.date(2026, 10, 13)
+    check(media.block_day_seed(d, "05", 300) == 2026 * 1000 + 286 + 5 + 300, "the seed is year x 1000 + day of year + channel + offset")
+    check(media.block_day_seed(datetime.datetime(2026, 1, 1, 3, 0), 7, 0) == 2026 * 1000 + 1 + 7, "a datetime and a plain channel number work too")
+    check(media.block_day_seed(d, 5, 100) == media.block_day_seed(d, "05", 100), "channel 5 and 05 give the same seed")
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check("_block_seed_offsets" not in src and "_peek_offsets" not in src, "the main script keeps no offset table of its own")
+    check(src.count("block_day_seed(") == 3, "the scheduler, the overlap and the catch-up use the shared seed; the read-only lineup in media.py uses it too")
+    check("tm_yday + int(target_clean_key) + block_offset" not in src, "the scheduler no longer works out its seed by hand")
+
+
+def suite_block_rotation():
+    d = datetime.datetime(2026, 10, 13, 2, 30)
+    check(media.block_start_date(d, "Night") == datetime.datetime(2026, 10, 12, 2, 30), "the Night block between midnight and 04:00 started yesterday")
+    check(media.block_start_date(datetime.datetime(2026, 10, 13, 4, 0), "Night") == datetime.datetime(2026, 10, 13, 4, 0), "at 04:00 and after it is today")
+    check(media.block_start_date(d, "Morning") == d and media.block_start_date(d, "Block 1") == d, "every other block and name starts today")
+    eps = [{"path": "/m/A/S01E%02d.mkv" % i, "duration": 1500} for i in range(1, 7)] + [{"path": "/m/B/S01E%02d.mkv" % i, "duration": 1500} for i in range(1, 7)]
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 0, "episode_order_mode": "sequential"}
+    direct = media.build_show_rotation(eps, "random_slots", {}, 123, pair_threshold_seconds=0, episode_order_mode="sequential",
+                                       fixed_show_order=None, block_duration_seconds=8 * 3600, channel_id="05", order_seed="1:200")
+    wrapped = media.build_block_rotation(eps, info, {}, 123, 8 * 3600, "05", None, "1:200")
+    check(wrapped == direct, "the wrapper gives what build_show_rotation gives with the channel's settings")
+    info2 = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 30, "episode_order_mode": "random"}
+    direct2 = media.build_show_rotation(eps, "random_slots", {}, 123, pair_threshold_seconds=1800, episode_order_mode="random",
+                                        fixed_show_order=None, block_duration_seconds=8 * 3600, channel_id="05", order_seed="1:200")
+    check(media.build_block_rotation(eps, info2, {}, 123, 8 * 3600, "05", None, "1:200") == direct2, "pairing threshold and episode order come from the channel")
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(src.count("build_block_rotation(") == 3, "the scheduler (three places) builds a rotation through the wrapper; the read-only lineup in media.py does too")
+    check("_seed_now = (now - datetime.timedelta" not in src, "the next-up builder takes the block's start date from the shared function")
+
+
+class TestBlockRotation(_SectionCase):
+    """One wrapper builds a block's rotation from the channel's settings"""
+
+    def test_block_rotation(self):
+        self.run_section(suite_block_rotation)
+
+
+class TestBlockSeeds(_SectionCase):
+    """One shared function holds the block offsets and the date-and-channel seed"""
+
+    def test_block_seeds(self):
+        self.run_section(suite_block_seeds)
+
+
+# ============================================================================
+# SECTION: Sequential position follows the file
+# ============================================================================
+
+def _seq_paths(entry):
+    if entry.get("is_pair"):
+        return [entry["pair_ep1_path"], entry["pair_ep2_path"]]
+    if entry.get("is_bundle"):
+        return [item["path"] for item in entry["bundle_items"]]
+    return [entry["path"]]
+
+
+def _seq_show(durations, name="Show X"):
+    return [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (name, name, i + 1), "duration": d} for i, d in enumerate(durations)]
+
+
+def suite_sequential_position_by_file():
+    import random as _rnd
+    mismatches = 0
+    for seed in range(300):
+        rng = _rnd.Random(seed)
+        eps = _seq_show([rng.choice([600, 700, 800, 1500, 1800, 2700]) for _ in range(rng.randint(1, 12))])
+        thr = rng.choice([0, 900])
+        paired = media.pair_short_episodes(eps, thr) if thr > 0 else list(eps)
+        old = new = rng.randrange(len(paired))
+        for _ in range(8):
+            count = rng.randint(1, 3)
+            expected = [_seq_paths(paired[(old + i) % len(paired)]) for i in range(count)]
+            old = (old + count) % len(paired)
+            got, new = media.take_sequential_entries(eps, new, count, thr)
+            mismatches += expected != [_seq_paths(e) for e in got]
+    check(mismatches == 0, "with no file joining or leaving, 2400 blocks give the lineups the list-number position gave (%d differ)" % mismatches)
+
+    long_eps = _seq_show([1800] * 6)
+    entries, state = media.take_sequential_entries(long_eps, 0, 2, 900)
+    check(isinstance(state, dict) and state["next"] == long_eps[2]["path"] and state["owed"] == [], "the saved position is the file that airs next, with nothing owed")
+    entries, state = media.take_sequential_entries(long_eps, 4, 3, 900)
+    check([_seq_paths(e)[0] for e in entries] == [long_eps[4]["path"], long_eps[5]["path"], long_eps[0]["path"]] and state["next"] == long_eps[1]["path"], "an old saved number is turned into the file it pointed at and the show carries on")
+    check(media.take_sequential_entries([], {"next": None, "owed": []}, 2, 900) == ([], {"next": None, "owed": []}), "an empty show gives nothing and keeps an empty position")
+
+    violations = skips = 0
+    for seed in range(400):
+        rng = _rnd.Random(seed)
+        pool = list(range(1, 15))
+        present = sorted(rng.sample(pool, rng.randint(3, 8)))
+        make = lambda ids: [{"path": "/m/Show X/Season 1/Show X S01E%02d.mkv" % i, "duration": 1800} for i in ids]
+        state = 0
+        aired = set()
+        pass_start = set(present)
+        for _ in range(25):
+            roll = rng.random()
+            if roll < 0.25 and len(present) < 12:
+                present = sorted(present + [rng.choice([i for i in pool if i not in present])])
+            elif roll < 0.45 and len(present) > 3:
+                gone = rng.choice(present)
+                present = [i for i in present if i != gone]
+                aired.discard("/m/Show X/Season 1/Show X S01E%02d.mkv" % gone)
+                pass_start.discard("/m/Show X/Season 1/Show X S01E%02d.mkv" % gone)
+            eps2 = make(present)
+            current = {e["path"] for e in eps2}
+            got, state = media.take_sequential_entries(eps2, state, rng.randint(1, 3), 900)
+            for entry in got:
+                for path in _seq_paths(entry):
+                    if path in aired:
+                        needed = pass_start & current
+                        skips += not needed <= aired
+                        aired = set()
+                        pass_start = set(current)
+                    aired.add(path)
+                    violations += path not in current
+    check(violations == 0 and skips == 0, "with files joining and leaving between blocks, a file never airs again before the others of its pass (repeats or gone files %d, skipped %d)" % (violations, skips))
+
+    shorts = _seq_show([600, 600, 600, 600, 1500, 600])
+    entries, state = media.take_sequential_entries(shorts, 0, 1, 900)
+    check(_seq_paths(entries[0]) == [shorts[0]["path"], shorts[1]["path"]] and state["next"] == shorts[2]["path"], "a short episode takes the next episode in line and they air as one guide block")
+    joined = _seq_show([600, 600, 600, 600, 1500, 600], "Show X")
+    joined.insert(0, {"path": "/m/Show X/Season 1/Show X S00E09.mkv", "duration": 600})
+    entries, state = media.take_sequential_entries(joined, {"next": shorts[2]["path"], "owed": []}, 1, 900)
+    check(_seq_paths(entries[0]) == [shorts[2]["path"], shorts[3]["path"]], "an episode that already aired is never pulled into a pair when a short file joins before it")
+    entries, state = media.take_sequential_entries(shorts, {"next": shorts[2]["path"], "owed": []}, 3, 900)
+    check([p for e in entries for p in _seq_paths(e)] == [shorts[2]["path"], shorts[3]["path"], shorts[4]["path"], shorts[5]["path"]], "pairing runs forward from the file that airs next, and the leftover short file airs in the bundle after the long one")
+    flat = [p for e in entries for p in _seq_paths(e)]
+    check(len(flat) == len(set(flat)), "no file is in the lineup twice in one take")
+
+    odd = _seq_show([600, 600, 600])
+    seen = []
+    state = 0
+    for _ in range(4):
+        got, state = media.take_sequential_entries(odd, state, 1, 900)
+        seen.append([os.path.basename(p)[-10:-4] for p in _seq_paths(got[0])])
+    check(seen == [["S01E01", "S01E02"], ["S01E03"], ["S01E01", "S01E02"], ["S01E03"]], "a short episode with no partner airs once per pass in the leftover bundle (%s)" % seen)
+
+    swapped = media.sequential_state_after_path(long_eps, long_eps[2]["path"], 0, 900)
+    check(swapped == {"next": long_eps[3]["path"], "owed": []}, "after a swap the position is the file after the last one aired")
+    check(media.sequential_state_after_path(long_eps, long_eps[5]["path"], 0, 900) == {"next": None, "owed": []}, "after the last file of the show the position wraps to the top")
+    check(media.sequential_state_after_path(long_eps, "/m/gone.mkv", 0, 900) is None, "a path that is not in the show gives no position")
+    shifted = media.sequential_state_shifted(long_eps, {"next": long_eps[1]["path"], "owed": []}, 2, 900)
+    check(shifted == {"next": long_eps[3]["path"], "owed": []}, "a shifted position moves forward by files")
+
+    show_pos = {}
+    block_a = long_eps
+    block_b = long_eps[1:]
+    info = {"scheduling_mode": "one_slot", "pair_threshold_minutes": 15, "episode_order_mode": "sequential"}
+    order = []
+    for index in range(10):
+        raw = block_a if index % 2 == 0 else block_b
+        lineup, show_pos, _ = media.build_block_rotation(raw, info, show_pos, 2026100 + index, 28800, "05", None, "1:200")
+        order.append(os.path.basename(lineup[0]["path"])[-10:-4])
+    check(order == ["S01E01", "S01E02", "S01E03", "S01E04", "S01E05", "S01E06", "S01E01", "S01E02", "S01E03", "S01E04"], "two blocks with different file lists share one position that follows the file (%s)" % order)
+
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check("def _show_raw_episodes(" in src and "sequential_state_after_path(" in src, "the broken-episode swap sets the position by file")
+    check("% _rot_n" not in src, "the swap writes no list number as a position any more")
+
+
+class TestSequentialPositionByFile(_SectionCase):
+    """A sequential show's saved position is the file that airs next, and pairing runs forward from it"""
+
+    def test_sequential_position_by_file(self):
+        self.run_section(suite_sequential_position_by_file)
+
+
+# ============================================================================
+# SECTION: Random show and movie list position by file
+# ============================================================================
+
+def suite_random_position_by_file():
+    import random as _rnd
+    import copy as _cp
+
+    def entries_for(numbers, name="Show X"):
+        return [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (name, name, n), "duration": 1800} for n in numbers]
+
+    def paths(picked):
+        return [e["path"] for e in picked]
+
+    mismatches = 0
+    for seed in range(300):
+        rng = _rnd.Random(seed)
+        pool = entries_for(range(1, rng.randint(1, 14) + 1))
+        old_state = new_state = None
+        for block in range(10):
+            count = rng.randint(1, 4)
+            prefix = "%d:%d:S" % (seed, block)
+            idxs, old_state = media._draw_from_shuffle_bag(old_state, len(pool), count, prefix)
+            picked, new_state = media.draw_from_shuffle_bag_by_file(new_state, pool, count, prefix)
+            mismatches += paths(picked) != [pool[i]["path"] for i in idxs]
+    check(mismatches == 0, "with no file joining or leaving, 3000 blocks give the lineups the list-number bag gave (%d differ)" % mismatches)
+
+    mismatches = 0
+    for seed in range(300):
+        rng = _rnd.Random(seed)
+        pool = entries_for(range(1, rng.randint(2, 14) + 1))
+        old_state = None
+        for block in range(rng.randint(1, 6)):
+            _idx, old_state = media._draw_from_shuffle_bag(old_state, len(pool), rng.randint(1, 4), "%d:%d:S" % (seed, block))
+        idxs, _ = media._draw_from_shuffle_bag(_cp.deepcopy(old_state), len(pool), 3, "%d:x:S" % seed)
+        picked, saved = media.draw_from_shuffle_bag_by_file(_cp.deepcopy(old_state), pool, 3, "%d:x:S" % seed)
+        mismatches += paths(picked) != [pool[i]["path"] for i in idxs]
+    check(mismatches == 0, "an old saved bag of list numbers is turned into files once and carries on identically (%d of 300 differ)" % mismatches)
+    check(isinstance(saved, dict) and saved.get("v") == media.RANDOM_STATE_VERSION
+          and all(isinstance(k, str) for k in saved["bag"] + saved["recent"]), "the saved bag holds file paths, not numbers")
+
+    duplicates = skipped = passes = 0
+    for seed in range(400):
+        rng = _rnd.Random(seed)
+        numbers = list(range(1, rng.randint(4, 12) + 1))
+        next_number = max(numbers) + 1
+        state = None
+        aired, start_pool = {}, {}
+        for block in range(25):
+            roll = rng.random()
+            if roll < 0.25:
+                numbers.append(next_number)
+                next_number += 1
+            elif roll < 0.45 and len(numbers) > 3:
+                numbers.pop(rng.randrange(len(numbers)))
+            numbers.sort()
+            pool = entries_for(numbers)
+            for _ in range(rng.randint(1, 3)):
+                picked, state = media.draw_from_shuffle_bag_by_file(state, pool, 1, "%d:%d:S" % (seed, block))
+                cycle = state["cycle"]
+                aired.setdefault(cycle, [])
+                start_pool.setdefault(cycle, set(paths(pool)))
+                duplicates += picked[0]["path"] in aired[cycle]
+                aired[cycle].append(picked[0]["path"])
+        for cycle in aired:
+            if cycle + 1 in aired:
+                passes += 1
+                skipped += not start_pool[cycle + 1] <= set(aired[cycle])
+    check(passes > 1500 and duplicates == 0 and skipped == 0,
+          "in 400 random shows where files join and leave between blocks, no file airs twice in a pass and none is skipped (%d passes, %d repeats, %d skipped)" % (passes, duplicates, skipped))
+
+    pool = entries_for(range(1, 7))
+    _picked, state = media.draw_from_shuffle_bag_by_file(None, pool, 2, "j:S")
+    joined = pool + entries_for([7])
+    seen = []
+    for _ in range(len(state["bag"]) + 1):
+        picked, state = media.draw_from_shuffle_bag_by_file(state, joined, 1, "j:S")
+        seen.append(picked[0]["path"])
+    check(joined[-1]["path"] in seen[:len(seen)], "a file that joins mid-pass airs in that pass")
+    check(len(set(seen)) == len(seen) and len(seen) == 5, "the pass finishes with each file once, the joined file included (%s)" % [x[-6:-4] for x in seen])
+
+    pool = entries_for(range(1, 6))
+    _picked, state = media.draw_from_shuffle_bag_by_file(None, pool, 3, "l:S")
+    gone = pool[:2] + pool[3:]
+    picked, state = media.draw_from_shuffle_bag_by_file(state, gone, 1, "l:S")
+    check(pool[2]["path"] not in state["bag"] + state["recent"] + state["drawn"] + [state["last"]] and pool[2]["path"] not in paths(picked),
+          "a file that leaves is taken out of the bag, the recent list and the last played")
+
+    pool = entries_for(range(1, 7))
+    _picked, state = media.draw_from_shuffle_bag_by_file(None, pool, 3, "p:S")
+    aired_alone = state["drawn"][0]
+    other = next(e for e in pool if e["path"] not in state["drawn"])
+    pair_entry = media._build_pair_track(next(e for e in pool if e["path"] == aired_alone), other)
+    changed = [pair_entry if e["path"] == aired_alone else e for e in pool if e["path"] != other["path"]]
+    drawn_after = []
+    for _ in range(3):
+        picked, state = media.draw_from_shuffle_bag_by_file(state, changed, 1, "p:S")
+        drawn_after.append(picked[0])
+    check(not any(e.get("is_pair") for e in drawn_after), "an entry that holds a file already aired this pass is kept out of the bag until the next pass")
+
+    played_pool = entries_for(range(1, 6))
+    show_pos = {}
+    _picked, show_pos["05:show-x"] = media.draw_from_shuffle_bag_by_file(None, played_pool, 1, "n:S")
+    target = next(i for i, e in enumerate(played_pool) if e["path"] in show_pos["05:show-x"]["bag"])
+    key = played_pool[target]["path"]
+    media.note_random_episode_played(show_pos, "Show X", played_pool, target, channel_id="05")
+    saved = show_pos["05:show-x"]
+    check(key not in saved["bag"] and saved["last"] == key and saved["recent"][-1] == key and key in saved["drawn"],
+          "a swapped-in episode leaves the bag, becomes the last played and counts as aired in the pass")
+    in_bag_state = {"05:show-x": {"v": media.RANDOM_STATE_VERSION, "bag": [key], "cycle": 1, "last": None, "recent": [],
+                                "drawn": [e["path"] for e in played_pool if e["path"] != key]}}
+    check(media.random_bag_entry_indices(in_bag_state, "Show X", played_pool, channel_id="05") == [target],
+          "the swap reads the entries still in the bag by file")
+    old_style = {"05:show-x": {"bag": [1, 3], "cycle": 1, "last": 0, "recent": [0]}}
+    check(media.random_bag_entry_indices(old_style, "Show X", played_pool, channel_id="05") == [1, 3],
+          "the swap reads an old bag of list numbers once, as the files they pointed at")
+    check(media.random_last_entry({"last": 2}, played_pool) is played_pool[2] and media.random_last_entry({"last": played_pool[4]["path"]}, played_pool) is played_pool[4]
+          and media.random_last_entry({"last": None}, played_pool) is None, "the catch-up label finds the last played by file or by an old number")
+
+    movies = [{"path": "/m/Movies/Movie %d (200%d).mkv" % (i, i), "duration": 6000} for i in range(1, 6)]
+    show_pos = {}
+    picked = media._rotation_take_random(show_pos, media.MOVIE_ROTATION_KEY, 2, movies, 123)
+    state = show_pos[media.MOVIE_ROTATION_KEY]
+    check(len(picked) == 2 and state["v"] == media.RANDOM_STATE_VERSION and all(k.startswith("/m/Movies/") for k in state["bag"]),
+          "the movie list saves its bag by file")
+    movies2 = movies + [{"path": "/m/Movies/Movie 0 (1999).mkv", "duration": 6000}]
+    movies2.sort(key=lambda t: t["path"])
+    seen = []
+    for _ in range(4):
+        seen += paths(media._rotation_take_random(show_pos, media.MOVIE_ROTATION_KEY, 1, movies2, 124))
+    check(len(set(seen)) == len(seen) and "/m/Movies/Movie 0 (1999).mkv" in seen and not set(seen) & set(paths(picked)),
+          "a movie added at the front of the list airs once before any movie repeats (%s)" % [x[-14:-4] for x in seen])
+    show_pos = {media.MOVIE_ROTATION_KEY: {"bag": [3, 1], "cycle": 1, "last": 0, "recent": [0]}}
+    picked = media._rotation_take_random(show_pos, media.MOVIE_ROTATION_KEY, 2, movies, 125)
+    check(paths(picked) == [movies[3]["path"], movies[1]["path"]], "an old movie bag of list numbers carries on from the same movies")
+
+    raw = entries_for(range(1, 9), "Alpha") + entries_for(range(1, 9), "Beta") + movies
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "random",
+            "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
+    show_pos = {}
+    for block in range(4):
+        _lineup, show_pos, _order = media.build_block_rotation(raw, info, show_pos, 2026100 + block, 28800, "05", None, "1:200")
+    states = [v for k, v in show_pos.items() if k != "__FAIRNESS__"]
+    check(len(states) >= 3 and all(isinstance(v, dict) and v.get("v") == media.RANDOM_STATE_VERSION
+                                   and all(isinstance(k, str) for k in v["bag"] + v["recent"]) for v in states),
+          "a block build saves every random show and the movie list by file")
+
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check("random_bag_entry_indices(" in src and "len(_rot_eps), _idx" not in src,
+          "the broken-episode swap reads and writes the bag through the shared functions")
+
+
+class TestRandomPositionByFile(_SectionCase):
+    """A random show's shuffle bag and the movie list's are saved by file, so a file joining or leaving never makes another air twice or be skipped"""
+
+    def test_random_position_by_file(self):
+        self.run_section(suite_random_position_by_file)
+
+
+# ============================================================================
+# SECTION: Files not scanned yet are not placed
+# ============================================================================
+
+def suite_unscanned_not_placed():
+    import copy as _cp
+
+    def exists(_p):
+        return True
+
+    def names(tracks):
+        return [os.path.basename(t["path"]).replace(".mkv", "") for t in tracks]
+
+    items = [{"path": "/m/A/Season 1/A S01E01.mkv", "duration": 1800},
+             {"path": "/m/A/Season 1/A S01E02.mkv", "duration": 0},
+             {"path": "/m/Movies/Big (1999).mkv", "duration": 0}]
+    raw = media.build_raw_tracks(items, {}, exists)
+    check([t["path"] for t in raw] == [items[0]["path"]], "a file with no known duration is left out of the raw tracks")
+    check(all(not t.get("_duration_estimated") for t in raw), "no placed track carries the estimated mark")
+    check([t["path"] for t in media.build_pending_tracks(items, {}, exists)] == [items[1]["path"], items[2]["path"]], "the files not scanned yet are listed, in schedule order")
+    check(len(media.build_raw_tracks(items, {}, exists, include_unknown=True)) == 3, "include_unknown puts every file back, marked estimated")
+    probe = {os.path.normpath(items[1]["path"]): {"duration": 1500}}
+    check(len(media.build_raw_tracks(items, probe, exists)) == 2 and len(media.build_pending_tracks(items, probe, exists)) == 1, "a duration from the probe cache makes the file known")
+    check(media.build_raw_tracks(items, {}, lambda p: "E01" in p) == media.build_raw_tracks(items[:1], {}, exists), "a path that does not exist is neither placed nor pending")
+    check(media.build_pending_tracks(items, {}, lambda p: "E01" in p) == [], "a missing file is not listed as pending")
+
+    def run_sequential(known_numbers, pending_numbers, passes, mode="one_slot", thr=900, durations=None, show="Show X"):
+        durations = durations or {}
+        known = [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (show, show, n), "duration": durations.get(n, 1800)} for n in known_numbers]
+        pending = [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (show, show, n)} for n in pending_numbers]
+        state = {}
+        aired = []
+        for _ in range(passes):
+            lineup, state, _o = media.build_show_rotation(known, mode, state, 5, pair_threshold_seconds=thr, channel_id="05", pending_tracks=pending)
+            aired.append(names(lineup))
+        return aired, state
+
+    aired, _ = run_sequential([1, 2, 4, 5], [3], 4)
+    check(aired == [["Show X S01E01"], ["Show X S01E02"], [], []], "a sequential show waits at its first unscanned file and does not step over it: %s" % aired)
+    known = [{"path": "/m/Show X/Season 1/Show X S01E%02d.mkv" % n, "duration": 1800} for n in (1, 2, 4, 5)]
+    pending = [{"path": "/m/Show X/Season 1/Show X S01E03.mkv"}]
+    state = {}
+    for _ in range(2):
+        _l, state, _o = media.build_show_rotation(known, "one_slot", state, 5, channel_id="05", pending_tracks=pending)
+    known.insert(2, {"path": "/m/Show X/Season 1/Show X S01E03.mkv", "duration": 1800})
+    out = []
+    for _ in range(5):
+        lineup, state, _o = media.build_show_rotation(known, "one_slot", state, 5, channel_id="05", pending_tracks=[])
+        out.append(names(lineup))
+    check(out == [["Show X S01E03"], ["Show X S01E04"], ["Show X S01E05"], ["Show X S01E01"], ["Show X S01E02"]], "when the file is scanned the show carries on with it, then the rest, then starts over: %s" % out)
+
+    aired, _ = run_sequential([1, 2, 3], [4, 5], 5, mode="two_slots")
+    check(aired == [["Show X S01E01", "Show X S01E02"], ["Show X S01E03"], [], [], []], "two slots: the show airs what is scanned and waits at the first unscanned file: %s" % aired)
+
+    aired, _ = run_sequential([1, 2, 3], [], 4, mode="two_slots")
+    check(aired == [["Show X S01E01", "Show X S01E02"], ["Show X S01E03", "Show X S01E01"], ["Show X S01E02", "Show X S01E03"], ["Show X S01E01", "Show X S01E02"]], "with nothing pending the show wraps as it did before: %s" % aired)
+
+    aired, _ = run_sequential([1, 2, 3], [], 3, mode="one_slot", durations={1: 600})
+    short_pending, _ = run_sequential([1], [2], 3, mode="one_slot", durations={1: 600})
+    check(short_pending == [[], [], []], "a short episode whose partner is not scanned waits and airs nothing: %s" % short_pending)
+    paired, _ = run_sequential([1, 2], [], 1, mode="one_slot", durations={1: 600, 2: 600})
+    check(paired == [["Show X S01E01"]], "a short episode and its scanned partner air as one pair")
+
+    lineup, _s, _o = media.build_show_rotation([], "one_slot", {}, 5, channel_id="05", pending_tracks=[{"path": "/m/Show Y/Season 1/Show Y S01E01.mkv"}])
+    check(lineup == [], "a series with no scanned episode is not placed")
+
+    def run_random(pool_numbers, pending_numbers, passes, count_mode="one_slot"):
+        known = [{"path": "/m/Show R/Season 1/Show R S01E%02d.mkv" % n, "duration": 1800} for n in pool_numbers]
+        pending = [{"path": "/m/Show R/Season 1/Show R S01E%02d.mkv" % n} for n in pending_numbers]
+        state = {}
+        out = []
+        for i in range(passes):
+            lineup, state, _o = media.build_show_rotation(known, count_mode, state, 7 + i, episode_order_mode="random", channel_id="05", pending_tracks=pending)
+            out.append(names(lineup))
+        return out, state, known
+
+    out, state, known = run_random([1, 2, 3, 4], [5], 7)
+    flat = [n for block in out for n in block]
+    check(len(flat) == 4 and len(set(flat)) == 4, "a random show holds its pass: each scanned file airs once, then nothing until the last file is scanned: %s" % out)
+    known.append({"path": "/m/Show R/Season 1/Show R S01E05.mkv", "duration": 1800})
+    after = []
+    for i in range(5):
+        lineup, state, _o = media.build_show_rotation(known, "one_slot", state, 40 + i, episode_order_mode="random", channel_id="05", pending_tracks=[])
+        after.append(names(lineup))
+    flat_after = [n for block in after for n in block]
+    check(flat_after[0] == "Show R S01E05" and len(set(flat_after[:5])) == 5, "the file scanned late airs once before any file repeats: %s" % after)
+
+    out, _st, _k = run_random([1], [2], 4)
+    check([n for block in out for n in block] == ["Show R S01E01"], "a one-file random show airs it once and holds while another file is not scanned: %s" % out)
+
+    def movie_runs(known_names, pending_names, passes):
+        known = [{"path": "/m/Movies/%s.mkv" % n, "duration": 6000} for n in known_names]
+        pending = [{"path": "/m/Movies/%s.mkv" % n} for n in pending_names]
+        state = {}
+        out = []
+        for i in range(passes):
+            lineup, state, _o = media.build_show_rotation(known, "one_slot", state, 9 + i, channel_id="05", pending_tracks=pending, block_duration_seconds=8 * 3600)
+            out.append(names(lineup))
+        return out, state, known
+
+    out, state, known = movie_runs(["M1", "M2"], ["M3"], 6)
+    flat = [n for block in out for n in block]
+    check(len(flat) == 2 and set(flat) == {"M1", "M2"}, "the movie list holds its pass while a movie is not scanned: %s" % out)
+    known.append({"path": "/m/Movies/M3.mkv", "duration": 6000})
+    lineup, state, _o = media.build_show_rotation(known, "one_slot", state, 99, channel_id="05", pending_tracks=[], block_duration_seconds=8 * 3600)
+    check(names(lineup)[0] == "M3", "the movie scanned late airs before any movie repeats: %s" % names(lineup))
+
+    parts = [{"path": "/m/Movies/Epic Part 1.mkv", "duration": 4000}]
+    lineup, _s, _o = media.build_show_rotation(parts, "one_slot", {}, 3, channel_id="05", pending_tracks=[{"path": "/m/Movies/Epic Part 2.mkv"}])
+    check(lineup == [], "a movie part is not placed while the other part is not scanned")
+
+    old_style = {"next": None, "owed": []}
+    migrated, _o = run_sequential([1, 2, 3], [4], 1)[0], None
+    known3 = [{"path": "/m/Show X/Season 1/Show X S01E%02d.mkv" % n, "duration": 1800} for n in (1, 2, 3)]
+    lineup, state, _o = media.build_show_rotation(known3, "one_slot", {"05:show-x": 2}, 5, channel_id="05", pending_tracks=[{"path": "/m/Show X/Season 1/Show X S01E04.mkv"}])
+    check(names(lineup) == ["Show X S01E03"] and state["05:show-x"]["next"].endswith("E04.mkv"), "an old saved list number turns into the file it pointed at, with the pending file ignored in the count")
+
+    fix = media.group_pending_tracks([{"path": "/m/Show X/Season 1/Show X S01E02.mkv"}], ["Show X"], {"Show X": [{"path": "/m/Show X/Season 1/Show X S01E02.mkv", "_season_number": 1, "_episode_number": 2}]})
+    check(fix[0] == {}, "a pending file that is the same episode as a scanned one does not block the show")
+
+    main_src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(main_src.count('"reason": "not_scanned"') >= 5, "the scheduler returns Static with the reason not_scanned in every case it has nothing scanned to air")
+    check("build_pending_tracks(folder_items" in main_src and "pending_tracks=_pending_tracks" in main_src, "the scheduler passes the files not scanned to every rotation call")
+    ui_src = open(os.path.join(os.path.dirname(MAIN_SCRIPT), "ui.py"), encoding="utf-8").read() if os.path.exists(os.path.join(os.path.dirname(MAIN_SCRIPT), "ui.py")) else ""
+    if ui_src:
+        check("media.build_raw_tracks(" in ui_src and "_duration_estimated" not in ui_src, "the guide builds its tracks through the shared function and holds no copy of the estimated mark")
+
+    rec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler_scan_record.json")
+    if os.path.exists(rec_path):
+        import json as _json
+        rec = _json.load(open(rec_path, encoding="utf-8"))
+        check(all(calls[0]["result"].get("mode") == "Static" and calls[0]["result"].get("reason") == "not_scanned" for calls in rec.values()), "in every scan scenario the first call, with nothing scanned, is Static")
+
+
+class TestUnscannedNotPlaced(_SectionCase):
+    """A file whose duration is not known is not placed: the rotation waits for it and the station falls back to Static"""
+
+    def test_unscanned_not_placed(self):
+        self.run_section(suite_unscanned_not_placed)
+
+
+def suite_fairness_counts_unscanned():
+    def mk(show, nums):
+        return [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (show, show, n), "duration": 1500} for n in nums]
+
+    def run(c_known, c_pending, cycles, mode):
+        raw = mk("Show A", range(1, 9)) + mk("Show B", range(1, 9)) + mk("Show C", c_known)
+        pend = [{"path": "/m/Show C/Season 1/Show C S01E%02d.mkv" % n} for n in c_pending]
+        state = {}
+        out = []
+        for _ in range(cycles):
+            lineup, state, _o = media.build_show_rotation(raw, mode, state, 5, channel_id="05", pending_tracks=pend,
+                                                          fixed_show_order=["Show A", "Show B", "Show C"])
+            out.append([os.path.basename(t["path"])[:-4] for t in lineup])
+        return out
+
+    partial = run([1, 2], [3, 4, 5, 6], 3, "one_slot")
+    whole = run([1, 2, 3, 4, 5, 6], [], 3, "one_slot")
+    check(partial == whole, "one slot: a show with 2 of its 6 files scanned joins the same cycles as when all 6 are scanned: %s" % partial)
+    check("Show C S01E01" in partial[0], "one slot: the partly scanned show airs in the first cycle, not two cycles late")
+    partial = run([1, 2], [3, 4, 5, 6], 2, "two_slots")
+    whole = run([1, 2, 3, 4, 5, 6], [], 2, "two_slots")
+    check(partial == whole, "two slots: a partly scanned show joins the same cycles as when all its files are scanned: %s" % partial)
+    check(run([1, 2, 3, 4, 5, 6], [], 6, "one_slot") == run([1, 2, 3, 4, 5, 6], [], 6, "one_slot"), "with nothing unscanned the result is unchanged between runs")
+    late = run([1, 2], [3, 4, 5, 6], 5, "one_slot")
+    check(all("Show C S01E03" not in cyc for cyc in late), "the partly scanned show still waits at its first unscanned file")
+
+
+class TestFairnessCountsUnscanned(_SectionCase):
+    """A show's size for the fairness step counts its files not scanned yet, so a partly scanned show is not held out"""
+
+    def test_fairness_counts_unscanned(self):
+        self.run_section(suite_fairness_counts_unscanned)
+
+
+# ============================================================================
+# SECTION: Saved block lineups (one shared function)
+# ============================================================================
+
+def suite_saved_lineup():
+    ep = lambda n, d: {"path": "/m/Show/S01E%02d.mkv" % n, "duration": d}
+    raw = [ep(1, 1500), ep(2, 1500), ep(3, 1500)]
+    folder = [{"path": t["path"]} for t in raw] + [{"path": "/m/Show/S01E04.mkv"}, {"path": "/m/Show/S01E05.mkv"}]
+    saved = [t["path"] for t in raw] + ["/m/Show/S01E04.mkv", "/m/Show/S01E05.mkv", "/m/Gone/x.mkv", ""]
+    durs = {"/m/Show/S01E02.mkv": 1320, "/m/Show/S01E04.mkv": 1400, "/m/Show/S01E05.mkv": 1400}
+    out, kept = media.reconcile_cached_lineup(saved, raw, folder, ["/m/Show/S01E05.mkv"], durs)
+    check([t["path"] for t in out] == [t["path"] for t in raw] + ["/m/Show/S01E04.mkv"], "reconcile keeps files still present, keeps a scheduled file that missed the path check, drops broken, unscheduled and empty paths")
+    check(kept == ["/m/Show/S01E04.mkv"] and out[-1] == {"path": "/m/Show/S01E04.mkv", "duration": 1400}, "a file kept only from its stored duration is reported and carries that duration")
+    check(media.apply_cached_durations(raw, {}) is raw, "no stored durations returns the same list")
+    applied = media.apply_cached_durations(raw, durs)
+    check([t["duration"] for t in applied] == [1500, 1320, 1500] and raw[1]["duration"] == 1500, "a stored duration replaces the track's own on a copy and leaves the input alone")
+    lineup = media.saved_block_lineup(saved, durs, raw, folder, ["/m/Show/S01E05.mkv"], 0)
+    check([t["path"] for t in lineup] == [t["path"] for t in out], "with pairing off the lineup is the reconciled tracks in order")
+    check(lineup[1]["duration"] == 1320, "the saved duration is in the lineup")
+    paired = media.saved_block_lineup(saved, durs, raw, folder, [], 1800)
+    check(any(t.get("is_pair") for t in paired) and len(paired) < 4, "short episodes are paired under the threshold")
+    check(media.saved_block_lineup([], {}, raw, folder, [], 900) == [], "no saved paths gives an empty lineup")
+    check(media.saved_block_lineup(["/m/Gone/x.mkv"], {}, raw, folder, [], 900) == [], "a lineup with nothing left gives an empty lineup")
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check("def _reconcile_cached_lineup" not in src and "def _apply_cached_durations" not in src, "the main script keeps no copy of the two helpers")
+    check(src.count("saved_block_lineup(") == 2, "the scheduler (twice) builds a saved lineup through the shared function; the read-only lineup in media.py does too")
+
+
+class TestSavedLineup(_SectionCase):
+    """One shared function turns a block's saved paths into its lineup"""
+
+    def test_saved_lineup(self):
+        self.run_section(suite_saved_lineup)
+
+
+# ============================================================================
+# SECTION: Scheduler record (what calculate_slotted_playback_state returns today)
+# ============================================================================
+
+SCHED_RECORD_PATH = os.path.join(HERE, "scheduler_record.json")
+
+SCHED_RECORD_FUNCS = [
+    "_apply_repeat_guard", "_cached_lineup_durations_stale", "_channel_intro_seed",
+    "_channel_schedule_path_set", "_checkpoint_probe_cache", "_file_in_channel_schedule", "_freeze_aired_prefix_durations",
+    "_get_cached_media_probe", "_get_or_set_block_anchor", "_get_probe_library", "_governor_priority_scope",
+    "_log_info_throttled", "_log_probe_failure", "_log_warn_throttled", "_marathon_start_seed",
+    "_maybe_correct_estimated_target_duration", "_missed_block_day_seeds", "_mixer_seekable_formats",
+    "_prime_block_durations_on_cold_start", "_probe_and_persist_duration", "_probe_checkpoint_save_now",
+    "_snapshot_track_durations", "_start_order_seed", "_store_cached_media_probe", "_timeline_whole_episode_durations",
+    "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "calculate_slotted_playback_state",
+]
+
+SCHED_RECORD_GLOBALS = [
+    "_EMPTY_FOLDER_DIAG_LOGGED", "_ONDEMAND_DURATION_PROBE_COOLDOWN_S", "_PROBE_CHECKPOINT_MIN_INTERVAL_S",
+    "_SCHED_MEMBERSHIP_CACHE_SECONDS", "_THROTTLED_LOG_INTERVAL_S", "_cold_primed_channels", "_cold_primed_channels_lock",
+    "_duration_precache_inflight", "_intro_seed_lock", "_ondemand_duration_probe_next", "_probe_block_timeline_cache",
+    "_probe_checkpoint_last", "_probe_checkpoint_lock", "_probe_checkpoint_timer", "_probe_library_lock",
+    "_probe_library_singleton", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
+]
+
+SCHED_RECORD_SCENARIOS = [
+    ("eight_hour_interrupt_random", "eight_hour", "interrupt_half_hour", "random_slots", True),
+    ("eight_hour_end_of_show_random", "eight_hour", "end_of_show", "random_slots", True),
+    ("eight_hour_no_ads_one_slot", "eight_hour", "interrupt_half_hour", "one_slot", False),
+    ("eight_hour_two_slots", "eight_hour", "interrupt_half_hour", "two_slots", True),
+    ("six_block_random", "six_block", "interrupt_half_hour", "random_slots", True),
+    ("full_day_random", "full_day", "interrupt_half_hour", "random_slots", True),
+    ("marathon", "full_day", "interrupt_half_hour", "marathon", True),
+]
+
+
+def _sched_record_times(kind):
+    base = datetime.datetime(2026, 10, 13, 0, 0, 5)
+    if kind == "continuous":
+        marks = [base + datetime.timedelta(minutes=37 * i) for i in range(0, 58)]
+        for hh, mm, ss in ((3, 59, 30), (4, 0, 5), (19, 59, 50), (20, 0, 5), (23, 59, 59)):
+            marks.append(datetime.datetime(2026, 10, 13, hh, mm, ss))
+            marks.append(datetime.datetime(2026, 10, 14, hh, mm, ss))
+        marks.append(datetime.datetime(2026, 10, 14, 0, 0, 5))
+        return sorted(set(marks))
+    return [datetime.datetime(2026, 10, 13, 9, 0, 0), datetime.datetime(2026, 10, 13, 21, 0, 0),
+            datetime.datetime(2026, 10, 16, 3, 0, 0), datetime.datetime(2026, 10, 16, 10, 0, 0),
+            datetime.datetime(2026, 10, 16, 10, 20, 0), datetime.datetime(2026, 10, 18, 22, 0, 0),
+            datetime.datetime(2026, 10, 19, 2, 0, 0), datetime.datetime(2026, 10, 19, 13, 0, 0)]
+
+
+def _sched_record_library():
+    def eps(name, n, dur):
+        return [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (name, name, i + 1), "duration": dur} for i in range(n)]
+    shows = eps("Show A", 8, 1320) + eps("Show B", 8, 1500) + eps("Show C", 6, 2640)
+    movies = [{"path": "/m/Movies/Big Movie (1999).mkv", "duration": 6300},
+              {"path": "/m/Movies/Long Movie (2004).mkv", "duration": 7500}]
+    ads = [{"path": "/m/Ads/ad%d.mkv" % i, "duration": d} for i, d in enumerate((15, 30, 30, 45, 60, 30, 15, 60))]
+    return shows, movies, ads
+
+
+def _sched_record_channel(block_mode, placement, sched, commercials):
+    shows, movies, ads = _sched_record_library()
+    content = shows + movies
+    info = {"active": True, "scheduling_mode": sched, "commercials_enabled": commercials,
+            "commercial_placement": placement, "pair_threshold_minutes": 15, "block_mode": block_mode,
+            "schedules": {}, "playback_log": {"intro_seed": 123456789}}
+    names = {"eight_hour": ["Morning", "Evening", "Night"], "six_block": list(media.SIX_HOUR_BLOCK_NAMES),
+             "full_day": ["Full Day"]}[block_mode]
+    if sched == "marathon":
+        names = ["Marathon"]
+    for i, name in enumerate(names):
+        info["schedules"][name] = [dict(x) for x in (content if block_mode == "full_day" else content[i % 3:])]
+    info["schedules"]["Commercials"] = ads
+    return info
+
+
+def _sched_record_ns(channels, clock, ticks):
+    probe = {}
+    for info in channels.values():
+        for items in info["schedules"].values():
+            for item in items:
+                probe[os.path.normpath(item["path"])] = {"duration": item["duration"]}
+    fake_db = types.SimpleNamespace(channels_db=channels, config={"media_probe_cache": probe},
+                                    save_settings_async=lambda **k: None, save_settings=lambda **k: None, config_path=None)
+    ns = {"db": fake_db, "app_state": {"guide_refresh_token": 0},
+          "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]), "log": MagicMock(), "vlc_engine": None,
+          "vlc": None, "datetime": datetime, "os": os, "random": random, "threading": threading, "time": time,
+          "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0])), "media": media,
+          "SHORT_EPISODE_PAIRING_VERSION": media.SHORT_EPISODE_PAIRING_VERSION, "SIX_HOUR_BLOCKS": media.SIX_HOUR_BLOCKS,
+          "SIX_HOUR_BLOCK_NAMES": media.SIX_HOUR_BLOCK_NAMES, "build_block_timeline": media.build_block_timeline,
+          "build_ordered_tracks": media.build_ordered_tracks, "build_show_rotation": media.build_show_rotation,
+          "fast_forward_show_pos": media.fast_forward_show_pos, "pair_short_episodes": media.pair_short_episodes,
+          "resolve_track_duration": media.resolve_track_duration,
+          "track_duration_is_estimated": media.track_duration_is_estimated,
+          "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks, "build_commercial_tracks": media.build_commercial_tracks,
+          "block_seed_offset": media.block_seed_offset, "block_day_seed": media.block_day_seed,
+          "block_start_date": media.block_start_date, "block_key_for": media.block_key_for, "block_length_seconds": media.block_length_seconds,
+          "build_block_rotation": media.build_block_rotation,
+          "build_channel_timeline": media.build_channel_timeline,
+          "reconcile_cached_lineup": media.reconcile_cached_lineup, "apply_cached_durations": media.apply_cached_durations,
+          "saved_block_lineup": media.saved_block_lineup, "lineup_paths": media.lineup_paths, "lineup_groups": media.lineup_groups,
+          "_cached_path_exists": lambda p: True, "_is_drive_responsive": lambda p: True,
+          "_path_exists_cache": {}, "_path_exists_cache_lock": threading.Lock(), "_unresponsive_drive_roots": set(),
+          "PATH_MISSING": 0, "PATH_UNKNOWN": 2}
+    assigns = {}
+    for node in MAIN_TREE.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigns.setdefault(target.id, node)
+    lines = MAIN_SRC.splitlines(keepends=True)
+    for name in SCHED_RECORD_GLOBALS:
+        node = assigns[name]
+        exec(compile("".join(lines[node.lineno - 1:node.end_lineno]), "<global:%s>" % name, "exec"), ns)
+    for name in SCHED_RECORD_FUNCS:
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    return ns
+
+
+def _sched_record_round(value):
+    if isinstance(value, float):
+        return round(value, 3)
+    if isinstance(value, dict):
+        return {str(k): _sched_record_round(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_sched_record_round(v) for v in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _sched_record_run(scenario, kind):
+    import hashlib
+    import json
+    name, block_mode, placement, sched, commercials = scenario
+    channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+    times = _sched_record_times(kind)
+    clock, ticks = [times[0]], [0]
+    ns = _sched_record_ns(channels, clock, ticks)
+    out = []
+    for moment in times:
+        clock[0] = moment
+        ticks[0] += 10000
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            result = _sched_record_round(ns["calculate_slotted_playback_state"]("05"))
+        plog = _sched_record_round(channels["05"]["playback_log"])
+        digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k != "sched_cached_groups"}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        out.append({"at": moment.isoformat(), "result": result, "state_sha": digest,
+                    "show_pos": plog.get("show_pos"), "show_order": plog.get("show_order"),
+                    "block_key": plog.get("sched_block_key"), "cycle_total": plog.get("sched_cycle_total"),
+                    "commercial_pos": plog.get("commercial_pos"), "refresh": ns["app_state"]["guide_refresh_token"]})
+    return out
+
+
+def _sched_record_all():
+    return {"%s/%s" % (s[0], kind): _sched_record_run(s, kind)
+            for s in SCHED_RECORD_SCENARIOS for kind in ("continuous", "gappy")}
+
+
+def suite_scheduler_record():
+    import json
+    needed = set()
+    tops = {n.name: n for n in MAIN_TREE.body if isinstance(n, ast.FunctionDef)}
+    pending = ["calculate_slotted_playback_state"]
+    while pending:
+        current = pending.pop()
+        if current in needed or current not in tops:
+            continue
+        needed.add(current)
+        pending.extend(x.id for x in ast.walk(tops[current]) if isinstance(x, ast.Name))
+    missing = sorted(needed - set(SCHED_RECORD_FUNCS))
+    check(not missing, "the record harness holds every function the scheduler reaches (missing: %s)" % missing)
+    extra = sorted(set(SCHED_RECORD_FUNCS) - needed)
+    check(not extra, "the record harness holds no function the scheduler no longer reaches (extra: %s)" % extra)
+
+    first = _sched_record_all()
+    second = _sched_record_all()
+    check(first == second, "the scheduler record is the same on two fresh runs")
+
+    for key, rows in first.items():
+        videos = [r for r in rows if r["result"].get("mode") == "Video"]
+        check(len(videos) > 0, "%s: the channel plays video at some moment" % key)
+        for row in rows:
+            res = row["result"]
+            check(res.get("mode") in ("Video", "Commercial", "Static", "Visualizer"), "%s %s: a known mode (%s)" % (key, row["at"], res.get("mode")))
+            if res.get("mode") in ("Video", "Commercial"):
+                check(res.get("file") and res.get("seek", 0) >= 0, "%s %s: a file and a seek of zero or more" % (key, row["at"]))
+
+    if os.environ.get("SCHED_RECORD_WRITE"):
+        with open(SCHED_RECORD_PATH, "w", encoding="utf-8") as handle:
+            json.dump(first, handle, indent=1, sort_keys=True)
+    check(os.path.exists(SCHED_RECORD_PATH), "the stored scheduler record exists at %s" % SCHED_RECORD_PATH)
+    if os.path.exists(SCHED_RECORD_PATH):
+        with open(SCHED_RECORD_PATH, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        check(sorted(stored) == sorted(first), "the stored record covers the same scenarios")
+        for key in sorted(set(stored) & set(first)):
+            same = json.loads(json.dumps(first[key])) == stored[key]
+            if not same:
+                bad = next((i for i, (a, b) in enumerate(zip(json.loads(json.dumps(first[key])), stored[key])) if a != b), None)
+                where = "" if bad is None else " first difference at %s" % stored[key][bad]["at"]
+                check(False, "%s: the scheduler now returns something different from the stored record.%s" % (key, where))
+            else:
+                check(True, "%s matches the stored record" % key)
+
+
+class TestSchedulerRecord(_SectionCase):
+    """The scheduler's output on a fixed library, channels and clock matches the stored record"""
+
+    def test_scheduler_record(self):
+        self.run_section(suite_scheduler_record)
+
+
+# ============================================================================
+# SECTION: Scheduler scan record (files scanned one at a time)
+# ============================================================================
+
+SCHED_SCAN_RECORD_PATH = os.path.join(HERE, "scheduler_scan_record.json")
+
+SCHED_SCAN_SCENARIOS = [
+    ("scan_eight_hour_two_slots", "eight_hour", "interrupt_half_hour", "two_slots", True, "sequential"),
+    ("scan_eight_hour_one_slot", "eight_hour", "interrupt_half_hour", "one_slot", False, "sequential"),
+    ("scan_eight_hour_random_slots", "eight_hour", "interrupt_half_hour", "random_slots", True, "sequential"),
+    ("scan_eight_hour_two_slots_random_order", "eight_hour", "end_of_show", "two_slots", True, "random"),
+    ("scan_six_block_random_slots", "six_block", "interrupt_half_hour", "random_slots", True, "sequential"),
+    ("scan_full_day_one_slot", "full_day", "interrupt_half_hour", "one_slot", True, "sequential"),
+]
+
+
+def _sched_scan_order(content):
+    """The files in the order their scans arrive: one file of each show and the movies in turn, so no show is scanned whole before the next starts."""
+    groups = {}
+    for item in content:
+        key = item["path"].split("/")[2]
+        groups.setdefault(key, []).append(item)
+    order = []
+    for rank in range(max(len(v) for v in groups.values())):
+        for key in sorted(groups):
+            if rank < len(groups[key]):
+                order.append(groups[key][rank])
+    return order
+
+
+def _sched_scan_channel(block_mode, placement, sched, commercials, order_mode):
+    info = _sched_record_channel(block_mode, placement, sched, commercials)
+    info["episode_order_mode"] = order_mode
+    known = {}
+    for items in info["schedules"].values():
+        for item in items:
+            known[item["path"]] = item["duration"]
+            if not item["path"].startswith("/m/Ads/"):
+                item["duration"] = 0
+    return info, known
+
+
+def _sched_scan_ns(channels, clock, ticks):
+    ns = _sched_record_ns(channels, clock, ticks)
+    ns["db"].config["media_probe_cache"].clear()
+    no_probe = types.SimpleNamespace(get_or_probe_sync=lambda path, max_age_s=None: None)
+    ns["shared_probe_library"] = lambda: no_probe
+    return ns
+
+
+def _sched_scan_run(scenario):
+    import hashlib
+    import json
+    name, block_mode, placement, sched, commercials, order_mode = scenario
+    info, known = _sched_scan_channel(block_mode, placement, sched, commercials, order_mode)
+    channels = {"05": info}
+    shows, movies, ads = _sched_record_library()
+    scan_order = _sched_scan_order(shows + movies)
+    times = _sched_record_times("continuous")
+    clock, ticks = [times[0]], [0]
+    ns = _sched_scan_ns(channels, clock, ticks)
+    probe = ns["db"].config["media_probe_cache"]
+    for ad in ads:
+        probe[os.path.normpath(ad["path"])] = {"duration": ad["duration"]}
+    out = []
+    scanned = 0
+    for index, moment in enumerate(times):
+        if index > 0 and scanned < len(scan_order):
+            item = scan_order[scanned]
+            probe[os.path.normpath(item["path"])] = {"duration": known[item["path"]]}
+            scanned += 1
+        clock[0] = moment
+        ticks[0] += 10000
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            result = _sched_record_round(ns["calculate_slotted_playback_state"]("05"))
+        plog = _sched_record_round(channels["05"]["playback_log"])
+        digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k != "sched_cached_groups"}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        out.append({"at": moment.isoformat(), "scanned": scanned, "result": result, "state_sha": digest,
+                    "show_pos": plog.get("show_pos"), "show_order": plog.get("show_order"),
+                    "block_key": plog.get("sched_block_key"), "cycle_total": plog.get("sched_cycle_total"),
+                    "commercial_pos": plog.get("commercial_pos"), "refresh": ns["app_state"]["guide_refresh_token"]})
+    return out
+
+
+def _sched_scan_all():
+    return {s[0]: _sched_scan_run(s) for s in SCHED_SCAN_SCENARIOS}
+
+
+def suite_scheduler_scan_record():
+    import json
+    first = _sched_scan_all()
+    second = _sched_scan_all()
+    check(first == second, "the scan record is the same on two fresh runs")
+
+    for key, rows in first.items():
+        check(rows[0]["scanned"] == 0 and rows[-1]["scanned"] == 24, "%s: the run starts with no file scanned and ends with all 24 scanned" % key)
+        check(len({r["scanned"] for r in rows}) == 25, "%s: every step of the scan is seen by at least one scheduler call" % key)
+        for row in rows:
+            res = row["result"]
+            check(res.get("mode") in ("Video", "Commercial", "Static", "Visualizer"), "%s %s: a known mode (%s)" % (key, row["at"], res.get("mode")))
+            if res.get("mode") in ("Video", "Commercial"):
+                check(res.get("file") and res.get("seek", 0) >= 0, "%s %s: a file and a seek of zero or more" % (key, row["at"]))
+
+    if os.environ.get("SCHED_RECORD_WRITE"):
+        with open(SCHED_SCAN_RECORD_PATH, "w", encoding="utf-8") as handle:
+            json.dump(first, handle, indent=1, sort_keys=True)
+    check(os.path.exists(SCHED_SCAN_RECORD_PATH), "the stored scan record exists at %s" % SCHED_SCAN_RECORD_PATH)
+    if os.path.exists(SCHED_SCAN_RECORD_PATH):
+        with open(SCHED_SCAN_RECORD_PATH, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        check(sorted(stored) == sorted(first), "the stored scan record covers the same scenarios")
+        for key in sorted(set(stored) & set(first)):
+            now_rows = json.loads(json.dumps(first[key]))
+            if now_rows != stored[key]:
+                bad = next((i for i, (a, b) in enumerate(zip(now_rows, stored[key])) if a != b), None)
+                where = "" if bad is None else " first difference at %s" % stored[key][bad]["at"]
+                check(False, "%s: the scheduler now returns something different from the stored scan record.%s" % (key, where))
+            else:
+                check(True, "%s matches the stored scan record" % key)
+
+
+class TestSchedulerScanRecord(_SectionCase):
+    """The scheduler's output while files are scanned one at a time matches the stored scan record"""
+
+    def test_scheduler_scan_record(self):
+        self.run_section(suite_scheduler_scan_record)
+
+
+# ============================================================================
+# SECTION: Night block date
+# ============================================================================
+
+NIGHT_DATE_SCENARIOS = [s for s in SCHED_RECORD_SCENARIOS if s[1] == "eight_hour"]
+NIGHT_STATE_KEYS = ("sched_block_key", "sched_cached_tracks", "sched_cached_durations", "show_pos", "show_order",
+                    "commercial_pos", "sched_cycle_total")
+
+
+def _night_date_run(channels, moments):
+    clock, ticks = [moments[0]], [0]
+    ns = _sched_record_ns(channels, clock, ticks)
+    caught = []
+    real_fast_forward = ns["fast_forward_show_pos"]
+
+    def spy(raw, mode, show_pos, seeds, *args, **kwargs):
+        caught.append(list(seeds))
+        return real_fast_forward(raw, mode, show_pos, seeds, *args, **kwargs)
+
+    ns["fast_forward_show_pos"] = spy
+    for moment in moments:
+        clock[0] = moment
+        ticks[0] += 10000
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            ns["calculate_slotted_playback_state"]("05")
+    plog = _sched_record_round(channels["05"]["playback_log"])
+    return {key: plog.get(key) for key in NIGHT_STATE_KEYS}, caught
+
+
+def suite_night_block_date():
+    library_ready = set(ml._library_dirs_ready)
+    try:
+        _night_block_date_checks()
+    finally:
+        ml._library_dirs_ready.clear()
+        ml._library_dirs_ready.update(library_ready)
+
+
+def _night_block_date_checks():
+    import copy
+    source = main_function_source("calculate_slotted_playback_state")
+    check("_seed_date = block_start_date(now, current_block)" in source, "the scheduler takes its seed date from block_start_date")
+    check("block_day_seed(_seed_date, target_clean_key, block_offset)" in source, "the scheduler seeds the block from that date")
+    check(re.search(r"_missed_block_day_seeds\(\s*_prev_sched_block_key, current_block, target_clean_key, block_offset, _seed_date\)", source) is not None,
+          "the catch-up is given the same date as the seed")
+    check("block_day_seed(now," not in source, "no seed in the scheduler is made from the clock's date")
+
+    evening = datetime.datetime(2026, 10, 13, 22, 30, 0)
+    after_midnight = datetime.datetime(2026, 10, 14, 1, 0, 0)
+    for name, block_mode, placement, sched, commercials in NIGHT_DATE_SCENARIOS:
+        def fresh():
+            return {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+
+        at_twenty, _ = _night_date_run(fresh(), [evening])
+        at_one, _ = _night_date_run(fresh(), [after_midnight])
+        for key in NIGHT_STATE_KEYS:
+            check(at_twenty[key] == at_one[key], "%s: a Night block built at 01:00 has the same %s as one built at 22:30" % (name, key))
+
+        first = fresh()
+        _night_date_run(first, [datetime.datetime(2026, 10, 10, 21, 0, 0)])
+        before_state, before_seeds = _night_date_run(copy.deepcopy(first), [datetime.datetime(2026, 10, 13, 23, 0, 0)])
+        after_state, after_seeds = _night_date_run(copy.deepcopy(first), [datetime.datetime(2026, 10, 14, 1, 0, 0)])
+        expected = [[media.block_day_seed(datetime.date(2026, 10, day), "05", media.block_seed_offset("Night", 0)) for day in (11, 12)]]
+        check(before_seeds == expected, "%s: starting at 23:00 catches up over the two missed Night blocks" % name)
+        check(after_seeds == expected, "%s: starting at 01:00 catches up over the same two Night blocks, not three" % name)
+        for key in NIGHT_STATE_KEYS:
+            check(before_state[key] == after_state[key], "%s: after the same time off, 23:00 and 01:00 leave the same %s" % (name, key))
+
+
+class TestNightBlockDate(_SectionCase):
+    """A Night block keeps one date, one lineup and one catch-up from 20:00 to 04:00"""
+
+    def test_night_block_date(self):
+        self.run_section(suite_night_block_date)
+
+
+# ============================================================================
+# SECTION: Block key and block length
+# ============================================================================
+
+
+def suite_movie_part_duration():
+    def part(name, dur, est=False):
+        t = {"path": "/m/%s.mkv" % name, "duration": dur}
+        if est:
+            t["_duration_estimated"] = True
+        return t
+
+    def paths(tracks):
+        return [t["path"] for t in tracks]
+
+    thr = media.MOVIE_LENGTH_THRESHOLD_SECONDS
+    half = thr // 2 + 600
+    both = media.pair_movie_parts([part("Big Movie Part 1", half), part("Big Movie Part 2", half)])
+    check(len(both) == 1 and both[0].get("is_pair") and both[0]["duration"] == 2 * half, "two parts with known durations make one pair of the summed length")
+    check(both[0] == media._build_pair_track(part("Big Movie Part 1", half), part("Big Movie Part 2", half)), "the movie pair is the entry the shared pair builder makes")
+
+    one_est = media.pair_movie_parts([part("Big Movie Part 1", half), part("Big Movie Part 2", 1800, est=True)])
+    check(one_est == [], "a movie with one part of unknown length is not placed at all, neither part")
+    both_est = media.pair_movie_parts([part("Big Movie Part 1", 1800, est=True), part("Big Movie Part 2", 1800, est=True)])
+    check(both_est == [], "a movie with both parts of unknown length is not placed")
+    no_dur = media.pair_movie_parts([{"path": "/m/Big Movie Part 1.mkv"}, part("Big Movie Part 2", half)])
+    check(no_dur == [], "a part with no duration at all is not placed")
+    zero = media.pair_movie_parts([part("Big Movie Part 1", 0), part("Big Movie Part 2", half)])
+    check(zero == [], "a part with a zero duration is not placed")
+
+    short = media.pair_movie_parts([part("Tiny Part 1", 600), part("Tiny Part 2", 600)])
+    check(paths(short) == ["/m/Tiny Part 1.mkv", "/m/Tiny Part 2.mkv"], "known parts that stay under the movie length are placed as they were")
+
+    lone_known = media.pair_movie_parts([part("Solo Part 1", half)])
+    lone_unknown = media.pair_movie_parts([part("Solo Part 1", 1800, est=True)])
+    check(paths(lone_known) == ["/m/Solo Part 1.mkv"], "a lone part with a known length is placed")
+    check(lone_unknown == [], "a lone part with an unknown length is not placed")
+
+    other = part("Plain Movie", 1800, est=True)
+    check(media.pair_movie_parts([other]) == [other], "a file that is not a movie part is left to the rest of the rotation")
+
+    media._split_movies_cache.pop("cache_test", None)
+    est = [part("Big Movie Part 1", 1800, est=True), part("Big Movie Part 2", 1800, est=True)]
+    first = media.split_movies_and_series(est, channel_id="cache_test")
+    check(first[0] == [], "the splitter places nothing while both parts are unknown")
+    known = [part("Big Movie Part 1", 1800), part("Big Movie Part 2", 1800)]
+    second = media.split_movies_and_series(known, channel_id="cache_test", threshold_seconds=3000)
+    check(len(second[0]) == 1 and second[0][0].get("is_pair"), "the same durations, now known, are placed (the cache does not hold the old answer)")
+    third = media.split_movies_and_series(known, channel_id="cache_test", threshold_seconds=3000)
+    check(third[0] == second[0], "a repeat read with nothing changed gives the same movie list")
+    media._split_movies_cache.pop("cache_test", None)
+
+    check(media.track_duration_is_known(part("X", 100)) and not media.track_duration_is_known(part("X", 100, est=True))
+          and not media.track_duration_is_known({"path": "x"}) and not media.track_duration_is_known(None), "track_duration_is_known says known only for a positive length that is not an estimate")
+
+
+def suite_block_key_length():
+    d = datetime.datetime
+    check(media.block_key_for(d(2026, 10, 14, 1, 0), "Night") == "2026_286_Night", "the Night block before 04:00 is keyed by the date it started")
+    check(media.block_key_for(d(2026, 10, 14, 4, 0), "Night") == "2026_287_Night", "from 04:00 a Night block is keyed by today")
+    check(media.block_key_for(d(2026, 10, 14, 1, 0), "Morning") == "2026_287_Morning", "every other block is keyed by today")
+    check(media.block_key_for(d(2026, 10, 14, 9, 0), "Full Day") == "2026_287_Full Day", "the Full Day key")
+    check(media.block_key_for(d(2026, 10, 14, 9, 0), "Marathon") == "2026_287_Marathon", "the Marathon key")
+    check(media.block_key_for(d(2027, 1, 1, 2, 0), "Night") == "2026_365_Night", "a Night block after midnight on New Year's Day is keyed by the old year")
+    check(media.block_key_for(d(2024, 1, 1, 2, 0), "Night") == "2023_365_Night", "the same across a leap year boundary")
+    for name, start, end in media.SIX_HOUR_BLOCKS:
+        check(media.block_length_seconds(name) == (end - start) * 3600 == 14400, "%s airs for 4 hours" % name)
+        check(media.block_key_for(d(2026, 10, 14, 1, 0), name) == "2026_287_%s" % name, "%s is keyed by today" % name)
+    for name in ("Morning", "Evening", "Night"):
+        check(media.block_length_seconds(name) == 28800, "%s airs for 8 hours" % name)
+    check(media.block_length_seconds("Full Day") == 86400 and media.block_length_seconds("Marathon") == 86400, "Full Day and Marathon air for 24 hours")
+    check(media.block_length_seconds("Nothing") == 28800 and media.block_length_seconds("Nothing", 100) == 100, "an unknown name gets the default")
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    calls = lambda fn: sum(1 for n in ast.walk(MAIN_TREE) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == fn)
+    check(calls("block_key_for") == 5, "the scheduler (five places) takes a block's key from the shared function; the read-only lineup in media.py does too")
+    check(calls("block_length_seconds") == 7, "the scheduler (five places, two for the previous block) takes a block's length from the shared table; the read-only lineup in media.py does too")
+    check("_block_len_lut" not in src and "_prev_block_secs = 14400" not in src and "_prev_block_secs = 28800" not in src, "the main script keeps no length table of its own")
+    check("tm_yday}_Night" not in src and "tm_yday}_Full Day" not in src and "tm_yday}_Marathon" not in src and "tm_yday}_{current_block}" not in src, "no block key is built by hand")
+    check("block_duration_seconds = 8 * 3600" not in src and "block_duration_seconds = 86400" not in src and "(block_end_hour - block_start_hour) * 3600" not in src,
+          "the scheduler sets no block length by hand")
+
+
+class TestBlockKeyLength(_SectionCase):
+    """One function gives a block's saved key and one table gives its length"""
+
+    def test_block_key_length(self):
+        self.run_section(suite_block_key_length)
+
+
+# ============================================================================
+# SECTION: Read-only block lineup
+# ============================================================================
+
+
+def suite_block_lineup():
+    import copy as _copy
+    exists = lambda p: "gone" not in p
+    series = {name: [{"path": "/m/%s/S01E%02d.mkv" % (name, i + 1), "duration": 1500} for i in range(6)] for name in ("A", "B", "C", "D", "E")}
+    schedule = [dict(t) for name in series for t in series[name]]
+    schedule[0]["gain"] = 1.25
+    schedule[7]["gain"] = 0.8
+    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 0, "episode_order_mode": "sequential",
+            "schedules": {"Evening": schedule, "Night": schedule, "Odd": schedule, "Empty": [{"path": "/m/gone/x.mkv"}]},
+            "playback_log": {"show_pos": {"A": 2, "__FAIRNESS__": {"run": 3, "used": {"A": 2}}}, "show_order": {"Evening": ["C", "A", "B", "E", "D"]}}}
+    seeds = []
+
+    def start_seed(ch_info, offset):
+        seeds.append(offset)
+        return "1:%d" % offset
+
+    def read(block, now, ch_info=None, peek=False, probe=None):
+        seeds.clear()
+        return media.read_block_lineup("5", ch_info or info, block, now, probe or {}, exists, start_seed, peek_only=peek)
+
+    evening = datetime.datetime(2026, 10, 13, 14, 0)
+    before = _copy.deepcopy(info)
+    lineup, name = read("Empty", evening)
+    check(lineup == [] and name is None, "a block with no existing file gives an empty lineup and no name")
+    check(seeds == [] and info == before, "an empty block never asks for the start number and writes nothing")
+
+    raw = media.build_raw_tracks(info["schedules"]["Evening"], {}, exists, keep_gain=True)
+    expected = media.build_block_rotation(raw, info, _copy.deepcopy(info["playback_log"]["show_pos"]),
+                                          media.block_day_seed(evening, "05", 200), 28800, "5", ["C", "A", "B", "E", "D"], "1:200")[0]
+    lineup, name = read("Evening", evening, peek=True)
+    check(name == "Evening" and lineup == expected and len(lineup) > 0, "with no saved lineup the block is built from the block's own date seed, offset, length, show order and start number")
+    check(seeds == [200], "the start number is asked for once, for the block's offset")
+    check(any("gain" in t for t in lineup) and not all("gain" in t for t in lineup), "each track keeps its schedule entry's gain and tracks with none get none")
+
+    lineup, _ = read("Odd", evening, peek=True)
+    odd_raw = media.build_raw_tracks(info["schedules"]["Odd"], {}, exists, keep_gain=True)
+    odd_expected = media.build_block_rotation(odd_raw, info, _copy.deepcopy(info["playback_log"]["show_pos"]),
+                                              media.block_day_seed(evening, "05", 400), 28800, "5", None, "1:400")[0]
+    check(lineup == odd_expected and seeds == [400], "an unknown block name gets the offset 400 and the 8 hour length")
+
+    target = expected[0]["path"]
+    probed, _ = read("Evening", evening, peek=True, probe={os.path.normpath(target): {"duration": 1111}})
+    check(any(t["path"] == target and t["duration"] == 1111 for t in probed), "a probed duration is used in place of the stored one")
+
+    snapshot = _copy.deepcopy(info)
+    read("Evening", evening, peek=True)
+    check(info == snapshot, "peek_only leaves the channel's saved state, including the nested fairness counters, unchanged")
+    read("Evening", evening)
+    check(info == snapshot, "a read without peek_only also leaves the channel's saved state, including the nested fairness counters, unchanged")
+
+    paths = [schedule[i]["path"] for i in (9, 3, 15)]
+    saved_info = _copy.deepcopy(info)
+    saved_info["playback_log"].update({
+        "sched_block_key": media.block_key_for(evening, "Evening"),
+        "sched_pairing_rule_version": media.SHORT_EPISODE_PAIRING_VERSION,
+        "sched_cached_tracks": [paths[0], paths[1], paths[0], paths[2], "/m/gone/x.mkv"],
+        "sched_cached_durations": {paths[1]: 1320},
+    })
+    lineup, name = read("Evening", evening, ch_info=saved_info)
+    expected_saved = media.saved_block_lineup(paths, {paths[1]: 1320}, raw, info["schedules"]["Evening"], [], 0)
+    check(name == "Evening" and lineup == expected_saved, "a saved lineup for the block on air is read back, with the saved durations")
+    check([t["path"] for t in lineup] == paths, "a path saved twice is listed once")
+    check(any(t["path"] == paths[0] and t.get("gain") == schedule[9].get("gain") for t in lineup), "a track read from a saved lineup keeps its schedule entry's gain")
+    check(saved_info["playback_log"]["show_pos"] == info["playback_log"]["show_pos"], "reading a saved lineup writes nothing")
+
+    stale = _copy.deepcopy(saved_info)
+    stale["playback_log"]["sched_block_key"] = media.block_key_for(evening - datetime.timedelta(days=1), "Evening")
+    lineup, _ = read("Evening", evening, ch_info=stale, peek=True)
+    check(lineup == expected, "a saved lineup with another block's key is not used")
+    old_rule = _copy.deepcopy(saved_info)
+    old_rule["playback_log"]["sched_pairing_rule_version"] = media.SHORT_EPISODE_PAIRING_VERSION - 1
+    lineup, _ = read("Evening", evening, ch_info=old_rule, peek=True)
+    check(lineup == expected, "a saved lineup from an older pairing rule is not used")
+    gone = _copy.deepcopy(saved_info)
+    gone["playback_log"]["sched_cached_tracks"] = ["/m/gone/x.mkv"]
+    lineup, _ = read("Evening", evening, ch_info=gone, peek=True)
+    check(lineup == expected, "a saved lineup with nothing left falls through to a fresh build")
+
+    night_early = datetime.datetime(2026, 10, 14, 1, 0)
+    night_info = _copy.deepcopy(info)
+    night_info["playback_log"]["sched_block_key"] = "2026_286_Night"
+    night_info["playback_log"]["sched_pairing_rule_version"] = media.SHORT_EPISODE_PAIRING_VERSION
+    night_info["playback_log"]["sched_cached_tracks"] = paths
+    lineup, _ = read("Night", night_early, ch_info=night_info)
+    check([t["path"] for t in lineup] == paths, "the Night block after midnight is found under the key of the date it started")
+    night_fresh = _copy.deepcopy(info)
+    night_fresh["episode_order_mode"] = "random"
+    started = datetime.datetime(2026, 10, 13, 1, 0)
+    night_expected = media.build_block_rotation(raw, night_fresh, _copy.deepcopy(info["playback_log"]["show_pos"]),
+                                                media.block_day_seed(started, "05", 300), 28800, "5", None, "1:300")[0]
+    night_today = media.build_block_rotation(raw, night_fresh, _copy.deepcopy(info["playback_log"]["show_pos"]),
+                                             media.block_day_seed(night_early, "05", 300), 28800, "5", None, "1:300")[0]
+    lineup, _ = read("Night", night_early, ch_info=night_fresh, peek=True)
+    check(night_expected != night_today, "the two dates give different lineups, so the check below can tell them apart")
+    check(lineup == night_expected, "a Night block built after midnight is seeded with the date it started")
+
+    with open(_media_script_path(), encoding="utf-8") as handle:
+        media_tree = ast.parse(handle.read())
+    fn = next(n for n in media_tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_block_lineup")
+    names = {getattr(n.func, "id", "") for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    check({"build_raw_tracks", "block_seed_offset", "block_day_seed", "block_start_date", "block_key_for", "block_length_seconds",
+           "saved_block_lineup", "build_block_rotation"} <= names, "the read-only lineup is built only from the shared functions")
+
+    main_fn = next(n for n in MAIN_TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_get_block_ordered_content")
+    main_calls = [getattr(n.func, "id", "") for n in ast.walk(main_fn) if isinstance(n, ast.Call)]
+    check(main_calls.count("read_block_lineup") == 1, "the next-up builder in the main script calls the shared lineup function once")
+    check(not ({"build_raw_tracks", "build_block_rotation", "saved_block_lineup", "block_day_seed", "block_seed_offset", "block_key_for",
+                "block_length_seconds", "block_start_date", "deepcopy", "fromkeys"} & set(main_calls)),
+          "the main script's next-up builder holds no lineup code of its own")
+
+    calls_seen = []
+
+    def fake_lineup(ch_key, ch_info, block_name, now, media_probe_cache, path_exists, start_order_seed, peek_only=False):
+        calls_seen.append((ch_key, block_name, media_probe_cache, path_exists, start_order_seed, peek_only))
+        return (([], None) if block_name == "Empty" else ([{"path": "/m/a.mkv", "duration": 1}], block_name))
+
+    sentinel_exists, sentinel_seed = (lambda p: True), (lambda i, o: "x")
+    probe_cache = {"/m/a.mkv": {"duration": 1}}
+    wns = {"db": types.SimpleNamespace(config={"media_probe_cache": probe_cache}), "time": time, "log": MagicMock(),
+           "_ORDERED_CONTENT_CACHE": {}, "_ORDERED_CONTENT_CACHE_TTL_MS": 8000, "_prune_ordered_content_cache": lambda ms: None,
+           "_cached_path_exists": sentinel_exists, "_start_order_seed": sentinel_seed, "read_block_lineup": fake_lineup}
+    exec(compile(get_function_source("_get_block_ordered_content"), "<extracted:_get_block_ordered_content>", "exec"), wns)
+    wrapper = wns["_get_block_ordered_content"]
+    one = {"schedules": {"Evening": [{"path": "/m/a.mkv"}], "Empty": []}}
+    first = wrapper("05", one, "Evening", evening, peek_only=True)
+    second = wrapper("05", one, "Evening", evening, peek_only=True)
+    check(first == second == ([{"path": "/m/a.mkv", "duration": 1}], "Evening") and len(calls_seen) == 1, "the result is kept for a few seconds, so the second read does not build again")
+    check(calls_seen[0][2] is probe_cache and calls_seen[0][3] is sentinel_exists and calls_seen[0][4] is sentinel_seed and calls_seen[0][5] is True,
+          "the probe cache, the path check, the start number function and peek_only are handed through")
+    empty_a = wrapper("05", one, "Empty", evening)
+    empty_b = wrapper("05", one, "Empty", evening)
+    check(empty_a == empty_b == ([], None) and len(calls_seen) == 2, "an empty block is kept for a few seconds too")
+    one["schedules"]["Evening"].append({"path": "/m/b.mkv"})
+    wrapper("05", one, "Evening", evening)
+    check(len(calls_seen) == 3, "a change in the block's file count is read again at once")
+
+
+class TestMoviePartDuration(_SectionCase):
+    """A movie part is placed only when its duration is known"""
+
+    def test_movie_part_duration(self):
+        self.run_section(suite_movie_part_duration)
+
+
+class TestBlockLineup(_SectionCase):
+    """One read-only function gives a block's lineup for the next-up lists and the scan"""
+
+    def test_block_lineup(self):
+        self.run_section(suite_block_lineup)
+
+
+# ============================================================================
+# SECTION: Channel timeline
+# ============================================================================
+
+
+def suite_channel_timeline():
+    check(media.commercial_interrupt_floor_seconds({"pair_threshold_minutes": 0}) == 900, "a pairing threshold of 0 gives the 15 minute floor")
+    check(media.commercial_interrupt_floor_seconds({}) == 900, "no pairing threshold gives the 15 minute floor")
+    check(media.commercial_interrupt_floor_seconds({"pair_threshold_minutes": 20}) == 1200, "the floor is the channel's pairing threshold in seconds")
+    shows = [{"path": "/m/S/S01E%02d.mkv" % i, "duration": d} for i, d in enumerate((1320, 1500, 2640, 600, 1500, 7000), 1)]
+    ads = [{"path": "/m/Ads/ad%d.mkv" % i, "duration": d} for i, d in enumerate((15, 30, 30, 45, 60, 90), 1)]
+    cache = {os.path.normpath(t["path"]): {"duration": t["duration"]} for t in shows}
+    for placement in ("interrupt_half_hour", "end_of_show"):
+        for minutes in (0, 15, 25, 45):
+            info = {"commercial_placement": placement, "pair_threshold_minutes": minutes}
+            floor = (minutes if minutes > 0 else 15) * 60
+            direct = media.build_block_timeline(shows, ads, placement, 4242, interrupt_floor_seconds=floor, media_probe_cache=cache, commercial_state=None)
+            wrapped = media.build_channel_timeline(shows, ads, info, 4242, media_probe_cache=cache)
+            check(wrapped == direct, "%s, threshold %s: the wrapper gives what build_block_timeline gives with the channel's placement and floor" % (placement, minutes))
+            state = direct[2]
+            again = media.build_block_timeline(shows, ads, placement, 4243, interrupt_floor_seconds=floor, commercial_state=state)
+            check(media.build_channel_timeline(shows, ads, info, 4243, commercial_state=state) == again,
+                  "%s, threshold %s: the saved commercial state and a missing probe cache pass straight through" % (placement, minutes))
+    default = media.build_block_timeline(shows, ads, "interrupt_half_hour", 7, interrupt_floor_seconds=900)
+    check(media.build_channel_timeline(shows, ads, {}, 7) == default, "a channel with no settings uses interrupt placement and the 15 minute floor")
+    src = open(MAIN_SCRIPT, encoding="utf-8").read()
+    check(src.count("build_channel_timeline(") == 5, "the scheduler builds all five timelines (two holiday, three main) through the wrapper")
+    check("build_block_timeline(" not in src, "the main script no longer calls build_block_timeline itself")
+    check("INTERRUPT_FLOOR_SECONDS" not in src and "h_commercial_placement" not in src, "the scheduler keeps no floor or placement of its own")
+    calls = [n for n in ast.walk(MAIN_TREE) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "build_channel_timeline"]
+    check(len(calls) == 5 and all("media_probe_cache" in [k.arg for k in n.keywords] for n in calls),
+          "all five scheduler timelines are built with the probe cache")
+
+
+class TestChannelTimeline(_SectionCase):
+    """One wrapper builds a block's timeline from the channel's own settings"""
+
+    def test_channel_timeline(self):
+        self.run_section(suite_channel_timeline)
+
+
+# ============================================================================
+# SECTION: Channel Up/Down hesitation
+# ============================================================================
+
+
+def _surf_ns(active, current="05", game=True, guide=True, music_busy=False, mode="Video", visualizer=False, playing=True, transition="black"):
+    clock = [10_000]
+    calls = {"change": [], "music_stop": 0, "music_unload": 0, "vlc_mute": [], "vlc_stop": 0, "static_stop": 0,
+             "transition_static_stop": 0, "game_quiet": 0, "ch1_stop": 0, "frame_clear": 0}
+    chans = {str(i).zfill(2): {"active": str(i).zfill(2) in active} for i in range(5, 45)}
+    if visualizer:
+        chans[current.zfill(2)] = {"active": True, "is_visualizer": True}
+    fake_db = types.SimpleNamespace(channels_db=chans, config={"game_channel_enabled": game, "tv_guide_enabled": guide, "transition_type": transition})
+    busy = [music_busy]
+    def _music_stop():
+        calls["music_stop"] += 1
+        busy[0] = False
+    music = types.SimpleNamespace(get_busy=lambda: busy[0], stop=_music_stop,
+                                  unload=lambda: calls.__setitem__("music_unload", calls["music_unload"] + 1))
+    mixer = types.SimpleNamespace(music=music, Channel=lambda n: types.SimpleNamespace(
+        stop=lambda: calls.__setitem__("ch1_stop", calls["ch1_stop"] + 1)))
+    fake_pygame = types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: clock[0]), mixer=mixer)
+    media_obj = types.SimpleNamespace(get_mrl=lambda: "file:///m/show%20one.mkv")
+    player = types.SimpleNamespace(
+        get_state=lambda: "playing", get_time=lambda: 61_000, get_length=lambda: 1_500_000, get_media=lambda: media_obj,
+        audio_set_mute=lambda v: calls["vlc_mute"].append(v))
+    engine = types.SimpleNamespace(player=player, stop=lambda block=True: calls.__setitem__("vlc_stop", calls["vlc_stop"] + 1))
+    fake_vlc = types.SimpleNamespace(State=types.SimpleNamespace(Ended="ended", Error="error"))
+    fake_clock = types.SimpleNamespace(seconds_since_midnight=lambda: 5000.0,
+                                       now=lambda: types.SimpleNamespace(timestamp=lambda: 1_700_000_000.0))
+    state = {"current_channel": current, "osd_channel_pending": False, "surf_target": "", "surf_commit_at": 0,
+             "surf_origin": "", "surf_leave_position": None, "is_playing_video": playing,
+             "channel_switch_black_until": 777, "music_owner": "live_visualizer", "guide_preview_music_track": "x",
+             "osd_channel_timer": 0, "digit_buffer": "", "digit_timer": 0}
+    ns = {"db": fake_db, "pygame": fake_pygame, "app_state": state, "_CHANNEL_SURF_HESITATE_MS": 400,
+          "vlc": fake_vlc, "vlc_engine": engine, "static_audio": types.SimpleNamespace(
+              stop=lambda: calls.__setitem__("static_stop", calls["static_stop"] + 1)),
+          "broadcast_clock": fake_clock, "os": os, "log": MagicMock(),
+          "menu_nav": mn,
+          "_stop_transition_static": lambda: calls.__setitem__("transition_static_stop", calls["transition_static_stop"] + 1),
+          "_quiet_game_channel": lambda: calls.__setitem__("game_quiet", calls["game_quiet"] + 1),
+          "_clear_last_video_frame": lambda **k: calls.__setitem__("frame_clear", calls["frame_clear"] + 1),
+          "calculate_slotted_playback_state": lambda ch: {"mode": mode, "file": "/m/song.mp3"},
+          "change_channel": lambda ch, **k: (calls["change"].append((ch, k)),
+                                             state.update(surf_origin="", surf_leave_position=None))}
+    for name in ("_surf_allowed_channels", "_surf_origin_active", "_surf_cancel", "_surf_capture_leave_position",
+                 "_surf_begin_quiet", "_surf_step", "_surf_digit_typed", "_typed_channel_valid", "_tune_after_flip", "_surf_commit_if_due",
+                 "_surf_recover_if_stuck", "_bezel_led_channel_text", "_configured_transition_style"):
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    return ns, state, clock, calls
+
+
+def _tuned(calls):
+    return [c[0] for c in calls["change"]]
+
+
+def suite_channel_surf():
+    ns, st, clock, calls = _surf_ns(["05", "06", "07"])
+    check(ns["_surf_allowed_channels"]() == ["03", "04", "05", "06", "07"], "Up and Down step through game, guide, then active channels")
+
+    ns["_surf_step"](1)
+    check(st["surf_origin"] == "05", "the first press marks the channel on air as shut down")
+    check(calls["vlc_mute"] == [True] and calls["vlc_stop"] == 1, "the first press mutes VLC and starts stopping it")
+    check(calls["static_stop"] == 1 and calls["transition_static_stop"] == 1 and st["channel_switch_black_until"] == 0,
+          "the first press silences any static and ends a running transition")
+    check(calls["frame_clear"] == 1 and st["music_owner"] == "", "the first press hides the last picture and drops the music owner")
+    check(st["surf_leave_position"] == {"file": os.path.normpath("m/show one.mkv"),
+                                         "pos_ms": 61_000, "dur_ms": 1_500_000, "wall_start": 5000.0, "written_at": 1_700_000_000.0},
+          "the first press keeps the file, position, length and wall time of the show (got %s)" % st["surf_leave_position"])
+    clock[0] += 50
+    ns["_surf_step"](1)
+    clock[0] += 50
+    last_press = clock[0] - 50
+    check(calls["vlc_stop"] == 1 and calls["vlc_mute"] == [True] and calls["frame_clear"] == 1, "only the first press shuts the show down")
+    check(calls["change"] == [], "flipping fast loads nothing")
+    check(st["osd_channel_pending"] and st["surf_target"] == "07", "two quick Up presses land two channels up (got %s)" % st["surf_target"])
+    check(st["current_channel"] == "05", "the channel on air does not change while flipping")
+    check(ns["_bezel_led_channel_text"]() == "07", "the letters show the channel being flipped to")
+    ns["_surf_commit_if_due"](last_press + 399)
+    check(calls["change"] == [], "still waiting before the hesitation time has passed")
+    ns["_surf_commit_if_due"](last_press + 400)
+    check(_tuned(calls) == ["07"], "one channel change to the flipped-to channel once you hesitate (got %s)" % _tuned(calls))
+    kw = calls["change"][0][1]
+    check(kw["force_reload"] is False and kw["pre_captured_position"] is not None and kw["pre_captured_position"]["pos_ms"] == 61_000,
+          "the tune hands the old show's saved position to change_channel")
+    check(not st["osd_channel_pending"] and st["surf_target"] == "" and st["surf_origin"] == "", "the flip state is cleared after tuning")
+    ns["_surf_commit_if_due"](last_press + 5000)
+    check(_tuned(calls) == ["07"], "it does not tune twice")
+
+    ns2, st2, clock2, calls2 = _surf_ns(["05", "06"], current="03")
+    ns2["_surf_step"](-1)
+    check(st2["surf_target"] == "06", "Down from the first channel wraps to the last (got %s)" % st2["surf_target"])
+    check(calls2["game_quiet"] == 1 and st2["surf_leave_position"] is None, "flipping from the game channel pauses, hides and mutes the game; it has no show position")
+
+    ns3, st3, clock3, calls3 = _surf_ns(["05", "06"], current="05")
+    ns3["_surf_step"](1)
+    ns3["_surf_step"](-1)
+    check(calls3["game_quiet"] == 0, "the game channel is left alone when it is not the one on air")
+    ns3["_surf_commit_if_due"](clock3[0] + 1000)
+    check(_tuned(calls3) == ["05"] and calls3["change"][0][1]["force_reload"] is True and calls3["change"][0][1]["pre_captured_position"] is not None,
+          "flipping away and back brings the shut-down show back (reload, with its saved position)")
+    check(not st3["osd_channel_pending"] and st3["surf_origin"] == "", "the flip state is cleared after the show returns")
+
+    ns4, st4, clock4, calls4 = _surf_ns(["05", "06"], current="05", mode="Visualizer", music_busy=True, visualizer=True)
+    ns4["_surf_step"](1)
+    check(calls4["music_stop"] == 1 and calls4["ch1_stop"] == 1, "the first press stops a visualizer channel's music")
+    ns4["_surf_commit_if_due"](clock4[0] + 1000)
+    check(_tuned(calls4) == ["06"] and st4["active_music_track_file"] == "/m/song.mp3",
+          "a visualizer target names its song before tuning")
+
+    ns5, st5, clock5, calls5 = _surf_ns(["05", "06"], current="05")
+    st5["digit_buffer"] = "12"
+    check(ns5["_bezel_led_channel_text"]() == "12", "typed digits show over the current channel")
+    ns5["_surf_step"](1)
+    check(st5["digit_buffer"] == "" and ns5["_bezel_led_channel_text"]() == "06", "a flip replaces typed digits")
+    ns5["_surf_cancel"]()
+    check(ns5["_bezel_led_channel_text"]() == "05", "cancelling shows the current channel again")
+    check(st5["surf_origin"] == "05", "cancelling the flip does not bring the shut-down show back by itself")
+
+    ns6, st6, clock6, calls6 = _surf_ns(["05", "06"], current="05")
+    ns6["_surf_step"](1)
+    ns6["_surf_cancel"]()
+    st6["digit_buffer"] = "9"
+    ns6["_surf_recover_if_stuck"]()
+    check(calls6["change"] == [], "while digits are being typed the shut-down show waits")
+    st6["digit_buffer"] = ""
+    ns6["_surf_recover_if_stuck"]()
+    check(_tuned(calls6) == ["05"] and calls6["change"][0][1]["force_reload"] is True, "digits that come to nothing bring the shut-down show back")
+    ns6["_surf_recover_if_stuck"]()
+    check(_tuned(calls6) == ["05"], "the safety net fires once")
+
+    ns7, st7, clock7, calls7 = _surf_ns(["05", "06"], current="05")
+    ns7["_surf_step"](1)
+    ns7["_surf_cancel"]()
+    ns7["_tune_after_flip"]("06", is_surfing=True)
+    check(calls7["change"][0][0] == "06" and calls7["change"][0][1]["is_surfing"] is True and calls7["change"][0][1]["pre_captured_position"] is not None,
+          "typed digits that resolve after a flip tune with the saved position")
+
+    ns8, st8, clock8, calls8 = _surf_ns(["05", "06"], current="05", playing=False)
+    ns8["_surf_step"](1)
+    check(st8["surf_leave_position"] is None, "a channel with no show playing has no position to keep")
+
+    src = MAIN_SRC
+    up = src[src.index("elif event.key == pygame.K_UP:"):src.index("elif event.key == pygame.K_DOWN:")]
+    down = src[src.index("elif event.key == pygame.K_DOWN:"):src.index("game_ch_on = db.config.get(\"game_channel_enabled\"")]
+    check("_surf_step(1)" in up and "change_channel(" not in up and "calculate_slotted_playback_state" not in up, "the Up key only steps the flip; it does not tune or work out the schedule")
+    check("_surf_step(-1)" in down and "change_channel(" not in down and "calculate_slotted_playback_state" not in down, "the Down key only steps the flip; it does not tune or work out the schedule")
+    digit_helper = get_function_source("_surf_digit_typed")
+    check(digit_helper.index("_surf_cancel()") < digit_helper.index("menu_nav.digit_entry_step("), "typing a digit drops the flipped-to number")
+    check("    _surf_commit_if_due(now_ticks)\n    _surf_recover_if_stuck()\n" in src, "the main loop checks every frame whether the flip is due and whether the shut-down show must come back")
+    cc = get_function_source("change_channel")
+    check(cc.count('app_state["surf_target"] = ""') == 1 and cc.index('app_state["osd_channel_pending"] = False') < cc.index('app_state["surf_target"] = ""')
+          and 'app_state["surf_origin"] = ""' in cc, "any real tune clears a flip in progress")
+    check('app_state.get("surf_origin") != "03"' in cc and "_quiet_game_channel()" in cc, "leaving the game channel after a flip does not pause it a second time")
+    check("pre_captured_position.get(\"wall_start\"" in cc and "pre_captured_position.get(\"written_at\"" in cc, "a flip's saved leave time is the one written into the anchor")
+
+    loop = src[src.index("while True:"):]
+    check("_surf_quiet = _surf_origin_active()" in loop, "the loop reads once per frame whether a show is shut down")
+    stall = loop[loop.index("# SECTION: Video end & stall detection"):loop.index("# SECTION: Video render (TV channels)")]
+    check(stall.count("not _surf_quiet") == 3, "end detection, the background watchdog and the restart watchdog all stand down while flipping (%d)" % stall.count("not _surf_quiet"))
+    check('if _surf_quiet and ch not in ("03", "04"):\n        if _configured_transition_style() == "static":\n            _render_transition_static(screen, _full_window_rect)\n        else:\n            screen.fill(_TRANSITION_GRAY, _full_window_rect)\n    elif ch != "04":' in loop,
+          "the picture draw shows static for a shut-down show in Static style and grey otherwise")
+    check('if _surf_quiet and ch not in ("03", "04"):\n        pass\n    elif ch == "03":' in loop, "the playback and stall-recovery section does nothing for a shut-down show")
+    ov = loop[loop.index("# SECTION: Overlays: captions"):loop.index('_prof_mark("overlays")')]
+    check("    if not _surf_quiet:\n        _draw_caption_overlay(" in ov and ov.count("_apply_static_noise_effect(") >= 1 and ov.index("if not _surf_quiet:") < ov.index("_apply_static_noise_effect("),
+          "captions, static noise, reception lines, the watermark and the static transition are not drawn while flipping")
+    check(ov.index("if not _surf_quiet:") < ov.index("_render_transition_static("), "the static transition is inside the flipping gate")
+    grey = loop[loop.index("# SECTION: Final compositing & present"):]
+    check(grey.index("if (_surf_quiet") < grey.index("screen.fill(_TRANSITION_GRAY)") < grey.index('_draw_channel_volume_osd("picture")'), "the grey cover is drawn for a shut-down show, before the channel letters")
+    cover = grey[grey.index("if (_surf_quiet"):grey.index('_draw_channel_volume_osd("picture")')]
+    check('if _configured_transition_style() != "static":\n            screen.fill(_TRANSITION_GRAY)' in cover,
+          "the grey cover is drawn only when the transition style is not Static")
+    check('elif ch in ("03", "04"):\n            _render_transition_static(screen, _full_window_rect)' in cover,
+          "in Static style the game channel and guide are covered with static, not grey")
+    _mid = cc[cc.index("_mid_static_burst = ("):cc.index("if (not _mid_static_burst")]
+    check('== "static"' in _mid and "_surf_origin_active()" in _mid,
+          "a flip in progress counts as a running static burst, so the static sound is not cut at the tune")
+    check("if _surf_origin_active():\n                _tune_after_flip(final_ch, is_surfing=True)" in src, "typed digits tune through the flip so the old show's position is kept")
+    gov = __import__("performance_governor")
+    check(gov.CHANNEL_SURF_HESITATE_MS == 400 and "if performance_governor is not None else 400" in src.split("_CHANNEL_SURF_HESITATE_MS =", 1)[1].split("\n", 1)[0], "the hesitation time lives in the governor table and its fallback matches")
+
+    nss, sts, clocks, callss = _surf_ns(["05", "06", "07"], transition="static")
+    sts["channel_switch_static_until"] = 99_999
+    nss["_surf_step"](1)
+    check(callss["static_stop"] == 0 and callss["transition_static_stop"] == 0,
+          "in Static style the first press leaves the running static sound alone")
+    check(sts["channel_switch_black_until"] == 0 and sts["channel_switch_static_until"] == 0 and sts["surf_origin"] == "05",
+          "in Static style the first press clears both transition timers and shuts the show down")
+    check(callss["vlc_mute"] == [True] and callss["vlc_stop"] == 1 and callss["frame_clear"] == 1,
+          "in Static style the first press still mutes, stops and hides the show")
+    _mm_line = 'if app_state.get("current_channel") == "03" and not app_state.get("is_loading", False) and game_deck is not None and not _surf_quiet:\n        _mm_mode ='
+    check(_mm_line in loop, "the game channel's menu music is not restarted while a flip has the channel shut down")
+    _stop_src = get_function_source("_stop_transition_static")
+    check("_static_transition_running()" in _stop_src and _stop_src.index("_static_transition_running()") < _stop_src.index("static_audio.stop()"),
+          "stopping the transition static checks first that no Static-style burst or flip is running")
+
+    def _static_ns(style, static_until, origin, now=10_000):
+        _stops = []
+        _ns = {"db": types.SimpleNamespace(config={"transition_type": style}),
+               "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: now)),
+               "app_state": {"channel_switch_static_until": static_until, "surf_origin": origin},
+               "static_audio": types.SimpleNamespace(stop=lambda: _stops.append(1))}
+        for _name in ("_configured_transition_style", "_surf_origin_active", "_static_transition_running", "_stop_transition_static"):
+            exec(compile(get_function_source(_name), "<extracted:%s>" % _name, "exec"), _ns)
+        return _ns, _stops
+    _n1, _s1 = _static_ns("static", 11_000, "")
+    _n1["_stop_transition_static"]()
+    check(_n1["_static_transition_running"]() and _s1 == [], "a running Static burst keeps the static sound playing")
+    _n2, _s2 = _static_ns("static", 0, "03")
+    _n2["_stop_transition_static"]()
+    check(_n2["_static_transition_running"]() and _s2 == [], "a Static-style flip keeps the static sound playing")
+    _n3, _s3 = _static_ns("static", 9_000, "")
+    _n3["_stop_transition_static"]()
+    check(not _n3["_static_transition_running"]() and _s3 == [1], "the static sound is stopped once the burst is over and no flip is waiting")
+    _n4, _s4 = _static_ns("black", 11_000, "03")
+    _n4["_stop_transition_static"]()
+    check(not _n4["_static_transition_running"]() and _s4 == [1], "in Black style the static sound is always stopped")
+
+    nsb, stb, clockb, callsb = _surf_ns(["05", "06", "07"], transition="black")
+    nsb["_surf_step"](1)
+    check(callsb["static_stop"] == 1 and callsb["transition_static_stop"] == 1,
+          "in Black style the first press still silences any static")
+
+
+def suite_channel_digits():
+    ns, st, clock, calls = _surf_ns(["05", "06", "12"])
+    now = clock[0]
+    ns["_surf_digit_typed"]("1", now)
+    check(st["digit_buffer"] == "1" and st["digit_timer"] == now + 2500, "the first digit waits the single-digit time for a second digit")
+    check(st["surf_origin"] == "" and calls["vlc_stop"] == 0 and calls["vlc_mute"] == [] and calls["frame_clear"] == 0,
+          "the first digit leaves the show on air playing")
+    check(ns["_bezel_led_channel_text"]() == "1", "the letters show the digit typed so far")
+
+    ns["_surf_digit_typed"]("2", now + 300)
+    check(st["digit_buffer"] == "12" and st["digit_timer"] == now + 300 + 350, "the second digit sets the tune time to the confirm time after it")
+    check(st["surf_origin"] == "05", "a second digit that makes a channel that exists marks the show on air as shut down")
+    check(calls["vlc_mute"] == [True] and calls["vlc_stop"] == 1, "the second digit mutes VLC and starts stopping it")
+    check(calls["static_stop"] == 1 and calls["transition_static_stop"] == 1 and st["channel_switch_black_until"] == 0,
+          "the second digit silences any static and ends a running transition")
+    check(calls["frame_clear"] == 1 and st["music_owner"] == "", "the second digit hides the last picture and drops the music owner")
+    check(st["surf_leave_position"] is not None and st["surf_leave_position"]["pos_ms"] == 61_000, "the second digit keeps the show's position for the tune")
+    check(ns["_bezel_led_channel_text"]() == "12", "the letters show the full number while the show is down")
+    check(calls["change"] == [], "the second digit tunes nothing itself")
+
+    ns["_surf_digit_typed"]("3", now + 500)
+    check(st["digit_buffer"] == "12" and calls["vlc_stop"] == 1 and calls["frame_clear"] == 1, "a third digit changes nothing and shuts the show down only once")
+    check(not mn.digit_entry_due(st["digit_buffer"], st["digit_timer"], now + 500 + 349), "the number is not due before the confirm time has passed")
+    check(mn.digit_entry_due(st["digit_buffer"], st["digit_timer"], now + 500 + 350), "the number is due when the confirm time has passed")
+    ns["_surf_recover_if_stuck"]()
+    check(calls["change"] == [], "while the typed number waits, the shut-down show is not brought back")
+
+    ns1, st1, clock1, calls1 = _surf_ns(["05", "06", "12"])
+    for first, second in (("0", "0"), ("0", "1"), ("0", "2"), ("1", "3"), ("0", "7"), ("4", "4")):
+        ns1["_surf_digit_typed"](first, clock1[0])
+        ns1["_surf_digit_typed"](second, clock1[0] + 50)
+        label = first + second
+        check(st1["digit_buffer"] == "" and st1["digit_timer"] == 0, "%s: a full number that cannot be tuned is dropped at once" % label)
+        check(st1["surf_origin"] == "" and calls1["vlc_stop"] == 0 and calls1["vlc_mute"] == [] and calls1["frame_clear"] == 0 and calls1["change"] == [],
+              "%s: the show is never stopped, muted, hidden or reloaded" % label)
+    check(ns1["_bezel_led_channel_text"]() == "05", "after a number that cannot be tuned the letters show the channel on air")
+
+    ns1b, st1b, clock1b, calls1b = _surf_ns(["05", "06"])
+    ns1b["_surf_step"](1)
+    ns1b["_surf_cancel"]()
+    ns1b["_surf_digit_typed"]("0", clock1b[0] + 10)
+    ns1b["_surf_digit_typed"]("1", clock1b[0] + 20)
+    check(st1b["digit_buffer"] == "", "after a flip, a number that cannot be tuned is still dropped")
+    ns1b["_surf_recover_if_stuck"]()
+    check(_tuned(calls1b) == ["05"] and calls1b["change"][0][1]["force_reload"] is True and calls1b["change"][0][1]["pre_captured_position"] is not None,
+          "after a flip, a number that cannot be tuned brings the shut-down show back with its saved position")
+    check(st1b["surf_origin"] == "", "the shut-down state is cleared once the show is back")
+
+    ns1c, st1c, clock1c, calls1c = _surf_ns(["05", "06"])
+    ns1c["_surf_digit_typed"]("6", clock1c[0])
+    check(st1c["digit_buffer"] == "6" and st1c["surf_origin"] == "" and calls1c["vlc_stop"] == 0, "a single digit alone leaves the show playing while it waits")
+    ns1c["_surf_recover_if_stuck"]()
+    check(calls1c["change"] == [], "a single digit waiting does nothing to the show")
+
+    for digit in "012":
+        check(not ns["_typed_channel_valid"](digit.zfill(2)), "single digit %s makes channel 0%s, which does not exist" % (digit, digit))
+    nsv, stv, clockv, callsv = _surf_ns(["05", "06", "09"])
+    check([ns_ch for ns_ch in ("03", "04", "05", "06", "07", "08", "09") if nsv["_typed_channel_valid"](ns_ch)] == ["03", "04", "05", "06", "09"],
+          "a single digit tunes the single-digit channels that are on: the game channel, the guide and the active channels")
+    nsg, stg, clockg, callsg = _surf_ns(["05"], game=False, guide=False)
+    check(not nsg["_typed_channel_valid"]("03") and not nsg["_typed_channel_valid"]("04") and nsg["_typed_channel_valid"]("05"),
+          "the game channel and the guide are not tunable while turned off in the menu")
+    check(nsv["_typed_channel_valid"]("05") and not nsv["_typed_channel_valid"]("45") and not nsv["_typed_channel_valid"]("99"),
+          "numbers above 44 cannot be tuned")
+
+    ns2, st2, clock2, calls2 = _surf_ns(["05", "06", "12"])
+    ns2["_surf_digit_typed"]("1", clock2[0])
+    ns2["_surf_digit_typed"]("2", clock2[0] + 100)
+    ns2["_tune_after_flip"]("12", is_surfing=True)
+    check(_tuned(calls2) == ["12"] and calls2["change"][0][1]["force_reload"] is False and calls2["change"][0][1]["pre_captured_position"] is not None,
+          "a number that exists tunes through the shut-down path and keeps the old show's position")
+
+    ns3, st3, clock3, calls3 = _surf_ns(["05", "06", "12"])
+    ns3["_surf_digit_typed"]("0", clock3[0])
+    ns3["_surf_digit_typed"]("5", clock3[0] + 100)
+    ns3["_tune_after_flip"]("05", is_surfing=True)
+    check(_tuned(calls3) == ["05"] and calls3["change"][0][1]["force_reload"] is True, "typing the number of the channel on air reloads it, because the show was shut down")
+
+    ns4, st4, clock4, calls4 = _surf_ns(["05", "06"], current="03")
+    ns4["_surf_digit_typed"]("0", clock4[0])
+    check(calls4["game_quiet"] == 0, "the game channel keeps running after only a first digit")
+    ns4["_surf_digit_typed"]("6", clock4[0] + 100)
+    check(calls4["game_quiet"] == 1 and st4["surf_origin"] == "03", "the second digit pauses, hides and mutes the game channel")
+
+    ns5, st5, clock5, calls5 = _surf_ns(["05", "06"])
+    ns5["_surf_step"](1)
+    ns5["_surf_digit_typed"]("0", clock5[0] + 10)
+    ns5["_surf_digit_typed"]("6", clock5[0] + 20)
+    check(calls5["vlc_stop"] == 1 and calls5["frame_clear"] == 1 and st5["surf_origin"] == "05",
+          "digits typed after a flip do not shut the show down a second time")
+    check(not st5["osd_channel_pending"] and st5["surf_target"] == "", "typing digits drops the flipped-to number")
+
+    src = MAIN_SRC
+    handler = src[src.index("pressed_digit = menu_nav.key_to_digit(event.key)"):]
+    handler = handler[:handler.index("if event.key == pygame.K_n:")]
+    check("_surf_digit_typed(pressed_digit, now_ticks)" in handler and "digit_entry_step(" not in handler,
+          "the digit key handler only calls the shared digit helper")
+    resolve = src[src.index("if menu_nav.digit_entry_due("):src.index("_surf_commit_if_due(now_ticks)\n    _surf_recover_if_stuck()")]
+    check("if _typed_channel_valid(final_ch):" in resolve and "valid_set" not in resolve and "range(5, 45)" not in resolve,
+          "the main loop uses the shared check for which numbers can be tuned")
+    check("if _surf_origin_active():\n                _tune_after_flip(final_ch, is_surfing=True)" in resolve,
+          "a number that exists tunes through the shut-down path in the main loop")
+    gov = __import__("performance_governor")
+    with open(os.path.abspath(mn.__file__), encoding="utf-8") as nav_file:
+        nav_src = nav_file.read()
+    fallback = nav_src.split("DIGIT_ENTRY_CONFIRM_MS = int(", 1)[1].split("except Exception:", 1)[1].split("\n")[1]
+    check(gov.CHANNEL_DIGIT_TUNE_DELAY_MS == 350 and mn.DIGIT_ENTRY_CONFIRM_MS == gov.CHANNEL_DIGIT_TUNE_DELAY_MS,
+          "the delay after the second digit lives in the governor table and menu_nav reads it")
+    check("DIGIT_ENTRY_CONFIRM_MS = 350" in fallback, "the menu_nav fallback matches the governor value")
+
+
+class TestChannelDigits(_SectionCase):
+    """A full typed channel number that can be tuned hides, mutes and shuts the show down; one that cannot be tuned leaves the show alone"""
+
+    def test_channel_digits(self):
+        self.run_section(suite_channel_digits)
+
+
+class TestChannelSurf(_SectionCase):
+    """Up and Down only flip the number on a grey screen; the channel loads once you hesitate"""
+
+    def test_channel_surf(self):
+        self.run_section(suite_channel_surf)
 
 
 
@@ -7725,6 +10059,523 @@ def run_logged(script_path, run):
 
 def tearDownModule():
     print("\n%d checks ran inside the menu / media sections, %d failed" % (_CHECKS[0], len(_FAILED)))
+
+
+# ============================================================================
+# SECTION: Visualizer guide row follows the station's admission rules
+# ============================================================================
+
+def suite_visualizer_guide_admission():
+    import inspect
+    A, B, C, D, E = ("/m/a.mp3", "/m/b.mp3", "/m/c.mp3", "/m/d.flac", "/m/e.mp3")
+    stack = [{"path": p} for p in (A, B, C, D, E)]
+    probe = {os.path.normpath(A): {"duration": 200}, os.path.normpath(B): {"duration": 0},
+             os.path.normpath(C): {"duration": 180, "confirmed_unplayable": True},
+             os.path.normpath(D): {"duration": 150}, os.path.normpath(E): {"duration": 120, "confirmed_no_audio": True}}
+    got = [p for p, _a in media.admit_visualizer_assets(stack, probe, {}, set())]
+    check(got == [A, D], "only measured, playable songs with audio are admitted")
+    got = [p for p, _a in media.admit_visualizer_assets(stack, probe, {os.path.normpath(A): True}, set())]
+    check(got == [D], "a song the mixer cannot seek is not admitted")
+    got = [p for p, _a in media.admit_visualizer_assets(stack, probe, {}, {".flac"})]
+    check(got == [A], "a song in an unseekable format is not admitted")
+    got = [p for p, _a in media.admit_visualizer_assets([{"path": B, "duration": 90}], {}, {}, set())]
+    check(got == [B], "a stored duration admits a song the probe cache has not measured")
+    got = [p for p, _a in media.admit_visualizer_assets([A, D], probe, {}, set())]
+    check(got == [A, D], "plain path strings are read the same as asset dictionaries")
+    check(media.admit_visualizer_assets([], probe, {}, set()) == [] and media.admit_visualizer_assets(None, probe, {}, set()) == [],
+          "an empty channel admits nothing")
+
+    for label, cache, unseek, exts in (
+        ("measured and playable", probe, {}, set()),
+        ("one unseekable", probe, {os.path.normpath(A): True}, set()),
+        ("an unseekable format", probe, {}, {".flac"}),
+        ("nothing measured", {}, {}, set()),
+        ("everything unplayable", {os.path.normpath(p): {"duration": 100, "confirmed_unplayable": True} for p in (A, B, C, D, E)}, {}, set()),
+    ):
+        channels = {"08": {"name": "Music", "is_visualizer": True, "schedules": {"Music Tracks": [{"path": p, "duration": 0} for p in (A, B, C, D, E)]},
+                           "playback_log": {}}}
+        clock, ticks = [datetime.datetime(2026, 10, 15, 12, 0, 0)], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        ns["db"].config["media_probe_cache"] = cache
+        ns["_visualizer_unseekable_paths"] = lambda u=unseek: u
+        ns["_mixer_seekable_formats"] = lambda e=exts: {x: False for x in e}
+        track_list, total, _origin = ns["_visualizer_frozen_lineup"]("08", channels["08"], clock[0])
+        station = sorted(t["path"] for t in track_list)
+        guide = sorted(p for p, _a in media.admit_visualizer_assets(channels["08"]["schedules"]["Music Tracks"], cache, unseek, exts))
+        check(station == guide, "%s: the guide admits exactly the songs the station airs" % label)
+        check(bool(guide) == bool(track_list) and (total > 0) == bool(track_list), "%s: the guide shows music exactly when the station airs music" % label)
+
+    ch_info = {"is_visualizer": True, "schedules": {"Music Tracks": [{"path": A}, {"path": D}]}}
+    fake_db = types.SimpleNamespace(config={"media_probe_cache": probe})
+    state = {"visualizer_admission_inputs": lambda: ({os.path.normpath(A): True}, {".flac"})}
+    check(ui._guide_visualizer_admitted(ch_info, state, fake_db) == [], "the guide row is empty when the station publishes every song as unseekable")
+    state = {"visualizer_admission_inputs": lambda: ({}, set())}
+    check(len(ui._guide_visualizer_admitted(ch_info, state, fake_db)) == 2, "the guide row has music when the station admits the songs")
+    check(len(ui._guide_visualizer_admitted(ch_info, {}, fake_db)) == 2, "a missing station publication applies no unseekable filter")
+    check(ui._guide_visualizer_admitted(ch_info, state, types.SimpleNamespace(config={})) == [],
+          "songs with no measured length leave the guide row empty")
+
+    ui_src = inspect.getsource(ui)
+    check("_row_viz_admitted" in ui_src, "the guide row cache key carries whether the Visualizer admits music")
+    check("sched_cached_tracks" not in ui_src and "build_scheduled_block_content" not in ui_src,
+          "the unreachable lineup builder is gone from the guide")
+    app_src = MAIN_SRC
+    check('app_state["visualizer_admission_inputs"] = _visualizer_admission_inputs' in app_src, "the station publishes the admission inputs to the guide")
+
+
+class TestVisualizerGuideAdmission(_SectionCase):
+    """The guide's Visualizer row shows music only when the station's lineup admits a song"""
+
+    def test_visualizer_guide_admission(self):
+        self.run_section(suite_visualizer_guide_admission)
+
+
+# ============================================================================
+# SECTION: Duration scan runs ahead of the scan chain
+# ============================================================================
+
+def suite_duration_scan_ahead():
+    class _Stop:
+        def __init__(self):
+            self.waits = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            return seconds == 20.0
+
+    probed, failed, order_log = [], [], []
+    cache = {"/m/known.mkv": {"duration": 1200}}
+    items = [
+        (0, 0, "channel", "05", "Full Day", "/m/known.mkv"),
+        (0, 0, "channel", "05", "Full Day", "/m/now.mkv"),
+        (2, 1, "channel", "05", "Full Day", "/m/next.mkv"),
+        (3, 4, "channel", "06", "Full Day", "/m/bad.mkv"),
+        (3, 4, "channel", "06", "Full Day", "/m/deep.mkv"),
+    ]
+    stop = _Stop()
+
+    def fake_store(kind, ch, block, p):
+        probed.append(p)
+        if p == "/m/bad.mkv":
+            return 0
+        cache[p] = {"duration": 900}
+        return 900
+
+    ns = {
+        "db": types.SimpleNamespace(save_settings_async=lambda **k: order_log.append("saved")),
+        "log": MagicMock(), "time": time, "os": os,
+        "_app_shutting_down": stop,
+        "_background_scan_should_pause": lambda: False,
+        "_order_scan_pipeline": lambda tiers, deep: items,
+        "_gather_probe_priority_queue": lambda: [[], [], [], []],
+        "_gather_deep_backlog_queue": lambda: [],
+        "_get_cached_media_probe": lambda p: cache.get(p, {}),
+        "_cached_path_exists": lambda p: True,
+        "_is_drive_degraded": lambda p: False,
+        "_scan_hold_drive": lambda p, w: None,
+        "_drive_latency_summary": lambda p: "",
+        "_scan_drive_on_hold": lambda p: False,
+        "_governor_priority_scope": contextlib.nullcontext,
+        "_governor_nullscope": contextlib.nullcontext,
+        "_scan_store_duration": fake_store,
+        "_scan_duration_failed": lambda p: failed.append(p) or False,
+        "_background_scan_pace_seconds": lambda base: base,
+        "SCAN_CLASS_NOW": 0,
+        "BETWEEN_LOUDNESS_PROBES_SECONDS": 0.5,
+        "SCAN_PIPELINE_PREEMPT_CHECK_SECONDS": 5.0,
+        "DURATION_PRECACHE_PAUSE_RECHECK_SECONDS": 5.0,
+        "DURATION_PRECACHE_IDLE_SLEEP_SECONDS": 20.0,
+    }
+    exec(compile(get_function_source("_duration_scan_worker"), "<extracted:_duration_scan_worker>", "exec"), ns)
+    ns["_duration_scan_worker"]()
+    check(probed == ["/m/now.mkv", "/m/next.mkv", "/m/bad.mkv", "/m/deep.mkv"],
+          "durations are stored in the scan chain's order, files with a stored duration skipped (got %s)" % probed)
+    check(failed == ["/m/bad.mkv"], "a file with no duration goes to the failure handling once")
+    check(order_log == ["saved"], "stored durations are saved once the pass ends")
+    check(stop.waits[0] == 0.5 and stop.waits[-1] == 20.0, "the airing file is not paced, later files are, and the pass ends idle")
+    worker_src = get_function_source("_duration_scan_worker")
+    check("_probe_one_loudness" not in worker_src and "_pipeline_stage_picture_box" not in worker_src,
+          "the duration scan never waits for a picture box or loudness scan")
+    check("threading.Thread(target=_duration_scan_worker" in MAIN_SRC, "the duration scan thread is started with the other scans")
+    chain_stage_src = MAIN_SRC.split("def _pipeline_stage_duration")[1].split("def _pipeline_scan_file")[0]
+    check("_probe_duration_gated" not in chain_stage_src, "the scan chain no longer probes duration itself")
+
+
+class TestDurationScanAhead(_SectionCase):
+    """Duration is stored by its own scan, in the chain's order, ahead of picture box and loudness"""
+
+    def test_duration_scan_ahead(self):
+        self.run_section(suite_duration_scan_ahead)
+
+
+# ============================================================================
+# SECTION: Guide history ledger and 7-day window
+# ============================================================================
+
+def suite_guide_history_ledger():
+    day = datetime.datetime(2026, 10, 15, 19, 52, 54)
+    today = day.toordinal()
+    base = today * 86400
+
+    def tl(*items):
+        t, out = 0, []
+        for path, dur in items:
+            out.append({"path": path, "duration": dur, "start_time": t, "is_commercial": False, "seek_offset": 0})
+            t += dur
+        return out
+
+    plog = {}
+    media.aired_ledger_upsert(plog, "Full Day", "2026_288_Full Day", base + 70521, tl(("/m/FG106.mkv", 1320), ("/m/FG101.mkv", 1320)), 2640, day)
+    ledger = plog[media.GUIDE_AIRED_LEDGER_KEY]
+    check(len(ledger) == 1, "a cycle is recorded once")
+    first = next(iter(ledger.values()))
+    media.aired_ledger_upsert(plog, "Full Day", "2026_288_Full Day", base + 70521, tl(("/m/FG106.mkv", 1320), ("/m/FG101.mkv", 1320)), 2640, day)
+    check(next(iter(plog[media.GUIDE_AIRED_LEDGER_KEY].values())) is first, "an unchanged cycle is not copied again")
+    media.aired_ledger_upsert(plog, "Full Day", "2026_288_Full Day", base + 70521, tl(("/m/FG106.mkv", 1320), ("/m/FG102.mkv", 1320)), 2640, day)
+    check(next(iter(plog[media.GUIDE_AIRED_LEDGER_KEY].values()))["timeline"][1]["path"] == "/m/FG102.mkv", "a changed cycle replaces its older copy")
+
+    media.aired_ledger_upsert(plog, "Full Day", "2026_287_Full Day", base - 86400 + 3600, tl(("/m/Old.mkv", 1800)), 1800, day)
+    media.aired_ledger_upsert(plog, "Full Day", "2026_286_Full Day", base - 2 * 86400 + 3600, tl(("/m/TooOld.mkv", 1800)), 1800, day)
+    paths = sorted(e["path"] for r in plog[media.GUIDE_AIRED_LEDGER_KEY].values() for e in r["timeline"])
+    check("/m/Old.mkv" in paths and "/m/TooOld.mkv" not in paths, "cycles back to the previous midnight are kept, older ones are dropped")
+
+    next_day = datetime.datetime(2026, 10, 16, 0, 0, 5)
+    media.aired_ledger_upsert(plog, "Full Day", "2026_289_Full Day", next_day.toordinal() * 86400, tl(("/m/New.mkv", 1800)), 1800, next_day)
+    paths = sorted(e["path"] for r in plog[media.GUIDE_AIRED_LEDGER_KEY].values() for e in r["timeline"])
+    check("/m/Old.mkv" not in paths and "/m/New.mkv" in paths, "at midnight the oldest day falls out of the ledger")
+
+    rows = media.aired_ledger_entries(plog, next_day.toordinal())
+    check([r[3] for r in rows][:1] == ["Full Day"] and rows == sorted(rows, key=lambda r: r[1]), "ledger entries come back in start order with their block name")
+    check(any(r[1] == -86400 + 70521 for r in rows) or any(abs(r[1] - (70521 - 86400)) < 1 for r in rows), "ledger times are seconds from today's midnight, negative for yesterday")
+
+    overlap = {}
+    media.aired_ledger_upsert(overlap, "A", "k1", base + 0, tl(("/m/a.mkv", 3600)), 3600, day)
+    media.aired_ledger_upsert(overlap, "B", "k2", base + 1800, tl(("/m/b.mkv", 3600)), 3600, day)
+    check(len(media.aired_ledger_entries(overlap, today)) == 1, "an entry overlapping an earlier one is dropped")
+
+    ns = {"media": media, "log": MagicMock()}
+    exec(compile(get_function_source("_note_aired_cycle"), "<extracted:_note_aired_cycle>", "exec"), ns)
+    plog2 = {}
+    ns["_note_aired_cycle"](plog2, "Full Day", "2026_288_Full Day", day, 71574.0, 71574.0 - 12600, 57921, tl(("/m/FG106.mkv", 1320)), 1320)
+    rec = next(iter(plog2[media.GUIDE_AIRED_LEDGER_KEY].values()))
+    check(rec["start"] == base + 70521, "the cycle's absolute start is the block anchor plus the cycle boundary (19:35:21)")
+    ns["_note_aired_cycle"](plog2, "Full Day", "k", day, 0, 0, 0, None, 0)
+    ns["media"] = types.SimpleNamespace(aired_ledger_upsert=lambda *a: (_ for _ in ()).throw(RuntimeError("x")))
+    exec(compile(get_function_source("_note_aired_cycle"), "<extracted:_note_aired_cycle>", "exec"), ns)
+    ns["_note_aired_cycle"](plog2, "Full Day", "k", day, 0, 0, 0, tl(("/m/x.mkv", 60)), 60)
+    check(True, "a ledger failure never reaches the scheduler")
+
+    cols = 6
+    check(ui.clamp_guide_time_idx(-500, cols) == -48, "the guide stops at the previous midnight")
+    check(ui.clamp_guide_time_idx(10000, cols) == 336 - 48 - cols, "the last visible column ends 6 days after today's midnight")
+    check(ui.GUIDE_TOTAL_HALF_HOURS * 1800 == 7 * 86400, "7 days are always visible")
+    ui_src = inspect.getsource(ui)
+    check("aired_ledger_entries" in ui_src, "the guide draws past cells from the ledger")
+    check(MAIN_SRC.count("_note_aired_cycle(playback_log, current_block, block_key") == 2,
+          "the scheduler records a cycle when it ends and every call for the live cycle")
+
+
+class TestGuideHistoryLedger(_SectionCase):
+    """The guide remembers back to the previous midnight and always shows 7 days"""
+
+    def test_guide_history_ledger(self):
+        self.run_section(suite_guide_history_ledger)
+
+
+# ============================================================================
+# SECTION: Guide past rebuild from the schedule
+# ============================================================================
+
+def suite_guide_past_replay():
+    import copy as _copy
+
+    def eps(show, n):
+        return [{"path": "/m/%s/S01E%02d.mkv" % (show, i)} for i in range(1, n + 1)]
+
+    items = eps("Alpha", 6) + eps("Beta", 5)
+    cache = {}
+    for it in items:
+        p = it["path"]
+        if "Alpha" in p and not p.endswith(("E05.mkv", "E06.mkv")):
+            cache[p] = {"duration": 1320}
+        if "Beta" in p and not p.endswith("E05.mkv"):
+            cache[p] = {"duration": 2700}
+    exists = lambda p: True
+
+    guesses = media.estimated_track_durations(items + [{"path": "/m/Gamma/S01E01.mkv"}, {"path": "/m/Movies/Heat.mkv"}], cache, exists)
+    check(guesses["/m/Alpha/S01E05.mkv"] == 1320 and guesses["/m/Beta/S01E05.mkv"] == 2700,
+          "an unscanned episode is guessed from its own series' scanned episodes")
+    check(guesses["/m/Gamma/S01E01.mkv"] in (1320, 2700),
+          "an unscanned episode of a series with nothing scanned takes the channel's middle episode length")
+    check(guesses["/m/Movies/Heat.mkv"] == media._MOVIE_DURATION_FALLBACK_SECONDS,
+          "an unscanned movie takes the movie default")
+    check(media.estimated_track_durations([{"path": "/m/Solo/S01E01.mkv"}], {}, exists)["/m/Solo/S01E01.mkv"] == media.GUIDE_REPLAY_EPISODE_GUESS_SECONDS,
+          "with nothing scanned anywhere an episode takes the default episode length")
+    filled = {t["path"]: t for t in media.build_guess_filled_tracks(items, cache, exists)}
+    check(len(filled) == len(items) and filled["/m/Alpha/S01E05.mkv"]["duration"] == 1320 and "_duration_estimated" not in filled["/m/Alpha/S01E05.mkv"],
+          "the guess-filled tracks keep every file, unscanned ones at their guessed length")
+    check("/m/Gamma/S01E01.mkv" not in {t["path"] for t in media.build_raw_tracks(items + [{"path": "/m/Gamma/S01E01.mkv"}], cache, exists)},
+          "the scheduler's own builder still leaves out an unscanned file it cannot guess")
+    check("/m/Gamma/S01E01.mkv" in {t["path"] for t in media.build_guess_filled_tracks(items + [{"path": "/m/Gamma/S01E01.mkv"}], cache, exists)},
+          "the guess-filled builder keeps it")
+
+    ch = {"scheduling_mode": "one_slot", "block_mode": "full_day", "schedules": {"Full Day": items},
+          "playback_log": {"show_pos": {}}, "pair_threshold_minutes": 15}
+    now = datetime.datetime(2026, 10, 15, 19, 0, 0)
+    key = lambda d, name: "%d_%d_%s" % (d.year, d.timetuple().tm_yday, name)
+    d = datetime.date
+    before = _copy.deepcopy(ch)
+    recs = media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
+                                      now, cache, exists, [], lambda off: "7:%d" % off)
+    check(ch == before, "the rebuild changes nothing in the channel")
+    check(recs and all(r[2] + r[4] > (now.toordinal() - 1) * 86400 for r in recs),
+          "only cycles that reach back no further than the previous midnight are returned")
+    check(all(a[2] + a[4] <= b[2] + 0.5 for a, b in zip(recs, recs[1:])), "rebuilt cycles follow each other without overlap")
+    check(recs[-1][2] // 86400 == d(2026, 10, 14).toordinal() and recs[-1][2] + recs[-1][4] <= d(2026, 10, 15).toordinal() * 86400 + 7200,
+          "the last rebuilt cycle is on the day before the current block")
+    placed = {e["path"]: e["duration"] for r in recs for e in r[3]}
+    check(placed.get("/m/Alpha/S01E05.mkv") == 1320, "an unscanned file is placed in the past at its guessed length")
+    again = media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
+                                       now, cache, exists, [], lambda off: "7:%d" % off)
+    check([(r[1], r[2], r[3]) for r in again] == [(r[1], r[2], r[3]) for r in recs], "the same gap always rebuilds the same past")
+
+    check(media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 14), "Full Day"), key(d(2026, 10, 15), "Full Day"),
+                                     now, cache, exists, [], lambda off: "x") == [], "no gap, nothing to rebuild")
+    check(media.replay_missed_blocks("05", ch, {}, "", key(d(2026, 10, 15), "Full Day"),
+                                     now, cache, exists, [], lambda off: "x") == [], "a channel with no earlier block has no past to rebuild")
+    marathon = dict(ch, scheduling_mode="marathon")
+    check(media.replay_missed_blocks("05", marathon, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
+                                     now, cache, exists, [], lambda off: "x") == [], "marathon channels are left alone")
+    holiday = media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
+                                         now, cache, exists, [], lambda off: "7:%d" % off, is_holiday_date=lambda dd: dd == d(2026, 10, 14))
+    check(all(r[2] // 86400 != d(2026, 10, 14).toordinal() or r[2] % 86400 < 7200 for r in holiday),
+          "a holiday day is not rebuilt from the normal schedule")
+
+    eight = dict(ch, block_mode="eight_hour", schedules={n: items for n in ("Morning", "Evening", "Night")})
+    night = media.replay_missed_blocks("05", eight, {}, key(d(2026, 10, 14), "Evening"), key(d(2026, 10, 15), "Morning"),
+                                       now, cache, exists, [], lambda off: "7:%d" % off)
+    check(night and all(r[0] == "Night" for r in night) and night[0][2] == d(2026, 10, 14).toordinal() * 86400 + 20 * 3600,
+          "after an evening and a morning start, the missed Night block is rebuilt from 20:00")
+    six = dict(ch, block_mode="six_block", schedules={n: items for n in media.SIX_HOUR_BLOCK_NAMES})
+    missed = media.replay_missed_blocks("05", six, {}, key(d(2026, 10, 15), "12-4am"), key(d(2026, 10, 15), "8-12pm"),
+                                        now, cache, exists, [], lambda off: "7:%d" % off)
+    check({r[0] for r in missed} == {"4-8am"}, "six-block channels rebuild exactly the blocks that were missed")
+
+    ns = {"media": media, "time": time, "log": MagicMock(), "_cached_path_exists": exists,
+          "_start_order_seed": lambda c, o: "7:%d" % o}
+    exec(compile(get_function_source("_note_missed_blocks"), "<extracted:_note_missed_blocks>", "exec"), ns)
+    plog_ch = _copy.deepcopy(ch)
+    ns["_note_missed_blocks"](plog_ch, "05", {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
+                              now, cache, [], lambda dd: False)
+    check(plog_ch["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY), "the rebuilt cycles are written to the channel's guide ledger")
+    check(plog_ch["playback_log"]["show_pos"] == {}, "writing the ledger leaves the saved show positions alone")
+    ns["media"] = types.SimpleNamespace(replay_missed_blocks=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    exec(compile(get_function_source("_note_missed_blocks"), "<extracted:_note_missed_blocks>", "exec"), ns)
+    ns["_note_missed_blocks"](_copy.deepcopy(ch), "05", {}, "a", "b", now, cache, [], None)
+    check(True, "a rebuild failure never reaches the scheduler")
+
+    sched_src = get_function_source("calculate_slotted_playback_state")
+    check(sched_src.index("_note_missed_blocks(") < sched_src.index("media.catch_up_state("),
+          "the past is rebuilt from the saved positions before the catch-up moves them")
+    check("GUIDE_REPLAY_MAX_BLOCKS" in inspect.getsource(__import__("performance_governor")),
+          "the rebuild's numbers live in the governor table")
+
+
+def suite_scheduler_catch_up():
+    import copy as _copy
+
+    sched_src = get_function_source("calculate_slotted_playback_state")
+    items = [{"path": "/m/%s/S01E%02d.mkv" % (show, i), "duration": 1500} for show in ("Alpha", "Beta") for i in range(1, 31)]
+    cache = {os.path.normpath(it["path"]): {"duration": 1500} for it in items}
+    exists = lambda p: True
+    order_seed = lambda offset: "7:%d" % offset
+
+    def channel(mode):
+        return {"scheduling_mode": "random_slots", "block_mode": mode, "episode_order_mode": "sequential",
+                "schedules": {n: list(items) for n in ("Morning", "Evening", "Night", "Full Day") + tuple(media.SIX_HOUR_BLOCK_NAMES)},
+                "playback_log": {"show_pos": {}}}
+
+    eight = channel("eight_hour")
+    before = _copy.deepcopy(eight)
+    state = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_283_Morning", cache, exists, [], order_seed)
+    check(state is not None and state[3] == 8,
+          "an 8 hour channel off for two and a half days replays all 8 missed blocks, not one per missed day")
+    check(eight == before, "the catch-up changes nothing in the channel")
+    again = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_283_Morning", cache, exists, [], order_seed)
+    check(again[0] == state[0], "the same gap always replays to the same positions")
+    one_block = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_280_Evening", cache, exists, [], order_seed)
+    check(one_block is None, "blocks that follow each other have nothing missed between them")
+    full = media.catch_up_state("07", channel("full_day"), {}, "2026_280_Full Day", "2026_283_Full Day", cache, exists, [], order_seed)
+    check(full is not None and full[3] == 2, "a Full Day channel replays each missed day")
+    six = media.catch_up_state("07", channel("six_block"), {}, "2026_280_%s" % media.SIX_HOUR_BLOCK_NAMES[0], "2026_282_%s" % media.SIX_HOUR_BLOCK_NAMES[0], cache, exists, [], order_seed)
+    check(six is not None and six[3] == len(media.SIX_HOUR_BLOCK_NAMES) * 2 - 1, "a six block channel replays every missed block of its day")
+    marathon = channel("full_day")
+    marathon["scheduling_mode"] = "marathon"
+    check(media.catch_up_state("07", marathon, {}, "2026_280_Full Day", "2026_283_Full Day", cache, exists, [], order_seed) is None,
+          "marathon channels are not replayed")
+    mixed = [{"path": "/m/%s/%s S01E%02d.mkv" % (s, s, i), "duration": d} for s, d in (("Alpha", 1320), ("Beta", 2700), ("Gamma", 1500)) for i in range(1, 26)]
+    mixed_cache = {os.path.normpath(it["path"]): {"duration": it["duration"]} for it in mixed}
+
+    def run_continuous(ch_info, name, ordinal):
+        date = datetime.date.fromordinal(ordinal)
+        offset = media.block_seed_offset(name, 0)
+        seed = media.block_day_seed(date, "07", offset)
+        secs = media.block_length_seconds(name)
+        raw = media.build_raw_tracks(ch_info["schedules"][name], mixed_cache, exists)
+        pos, commercial, cursor, first = {}, None, 0, None
+        while cursor < secs:
+            lineup, pos, _o = media.build_block_rotation(raw, ch_info, pos, seed, secs, "07", None, order_seed(offset), pending_tracks=[])
+            timeline, total, commercial = media.build_channel_timeline(lineup, [], ch_info, seed, media_probe_cache=mixed_cache, commercial_state=commercial)
+            first = first or (_copy.deepcopy(pos), total, commercial)
+            cursor += total
+        return pos, first
+
+    for mode, name, prev_key, next_key in (("full_day", "Full Day", "2026_289_Full Day", "2026_290_Full Day"),
+                                           ("eight_hour", "Morning", "2026_289_Morning", "2026_289_Evening"),
+                                           ("eight_hour", "Night", "2026_289_Night", "2026_290_Morning")):
+        ch_info = {"scheduling_mode": "random_slots", "block_mode": mode, "episode_order_mode": "sequential",
+                   "schedules": {name: list(mixed)}, "playback_log": {"show_pos": {}}}
+        ordinal = (datetime.date(2026, 1, 1) + datetime.timedelta(days=int(prev_key.split("_")[1]) - 1)).toordinal()
+        whole, first = run_continuous(ch_info, name, ordinal)
+        ch_info["playback_log"].update({"sched_cycle_boundary": 0, "sched_cycle_total": first[1], "commercial_pos": first[2]})
+        resumed = media.catch_up_state("07", ch_info, first[0], prev_key, next_key, mixed_cache, exists, [], order_seed)
+        check(resumed is not None and resumed[0] == whole,
+              "%s: stopping after a block's first cycle and catching up lands on the same positions as running it all the way through" % name)
+        ch_info["playback_log"]["sched_cycle_boundary"] = media.block_length_seconds(name)
+        check(media.catch_up_state("07", ch_info, whole, prev_key, next_key, mixed_cache, exists, [], order_seed) is None,
+              "%s: a block that already ran to its end has nothing left to catch up" % name)
+    check("media.catch_up_state(" in sched_src and "CATCH_UP_MAX_BLOCKS" in inspect.getsource(__import__("performance_governor")),
+          "the scheduler uses the replay and its numbers live in the governor table")
+
+
+class TestSchedulerCatchUp(_SectionCase):
+    """When a block starts, every block missed since the last one built is replayed, so series positions follow the schedule"""
+
+    def test_scheduler_catch_up(self):
+        self.run_section(suite_scheduler_catch_up)
+
+
+def suite_commercial_cycle_state():
+    import copy as _copy
+    import math as _math
+    import re as _re
+
+    scenario = ("eight_hour_two_slots", "eight_hour", "interrupt_half_hour", "two_slots", True)
+
+    def build():
+        channels = {"05": _sched_record_channel(*scenario[1:])}
+        clock, ticks = [datetime.datetime(2026, 10, 13, 0, 0, 5)], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        for mod in (_copy, _math, _re):
+            ns.setdefault(mod.__name__, mod)
+        return channels, clock, ticks, ns
+
+    def poll(ctx, moment):
+        channels, clock, ticks, ns = ctx
+        clock[0] = moment
+        ticks[0] += 10000
+        while True:
+            try:
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    result = ns["calculate_slotted_playback_state"]("05")
+                return (result.get("mode"), os.path.basename(str(result.get("file", ""))), round(float(result.get("seek", 0) or 0)))
+            except NameError as missing:
+                name = str(missing).split("'")[1]
+                exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+
+    step = datetime.timedelta(minutes=3)
+    start, off_at, back_at, until = (datetime.datetime(2026, 10, 13, 0, 0, 5), datetime.datetime(2026, 10, 13, 21, 0, 5),
+                                     datetime.datetime(2026, 10, 14, 1, 18, 5), datetime.datetime(2026, 10, 14, 4, 0, 5))
+    always_on, restarted = build(), build()
+    aired, moment = {}, start
+    while moment <= until:
+        aired[moment] = poll(always_on, moment)
+        if moment <= off_at:
+            poll(restarted, moment)
+        moment += step
+    moment, differing, polls = back_at, [], 0
+    while moment <= until:
+        polls += 1
+        if poll(restarted, moment) != aired[moment]:
+            differing.append(moment)
+        moment += step
+    check(polls > 40 and not differing,
+          "an app that was off across a block change airs exactly what an app that kept running airs, commercials included (%d polls, %d differ)" % (polls, len(differing)))
+
+    plog = always_on[0]["05"]["playback_log"]
+    check(isinstance(plog.get("commercial_pos"), dict) and isinstance(plog.get("commercial_next_pos"), dict)
+          and plog["commercial_pos"] != plog["commercial_next_pos"],
+          "the scheduler saves the state the airing cycle was built from and, apart, the state left after it")
+
+    held = build()
+    poll(held, datetime.datetime(2026, 10, 13, 4, 0, 5))
+    poll(held, datetime.datetime(2026, 10, 13, 4, 21, 5))
+    first_poll_state = _copy.deepcopy(held[0]["05"]["playback_log"]["commercial_pos"])
+    poll(held, datetime.datetime(2026, 10, 13, 4, 42, 5))
+    check(held[0]["05"]["playback_log"]["commercial_pos"] == first_poll_state,
+          "later polls of the same cycle keep building it from the state it started from")
+
+    check(media.carried_commercial_state({"commercial_pos": {"a": 1}, "commercial_next_pos": {"b": 2}}) == {"b": 2}
+          and media.carried_commercial_state({"commercial_pos": {"a": 1}}) == {"a": 1}
+          and media.carried_commercial_state({}) is None,
+          "the carried commercial state is the one left after the cycle, and an older save falls back to its single saved state")
+
+
+class TestCommercialCycleState(_SectionCase):
+    """A block's commercials come from the state it started with on every poll, so a restart airs what continuous running would"""
+
+    def test_commercial_cycle_state(self):
+        self.run_section(suite_commercial_cycle_state)
+
+
+def suite_block_anchor_real_start():
+    import logging as _logging
+
+    class _Db:
+        saves = 0
+
+        def save_settings(self):
+            _Db.saves += 1
+
+    anchor_for = load_function("_get_or_set_block_anchor", {"db": _Db(), "log": _logging.getLogger("anchor_test")})
+    noon_ish = 12 * 3600 + 17 * 60
+    aired = {"playback_log": {"sched_block_key": "2026_288_Full Day"}}
+    check(anchor_for(aired, "2026_289_Full Day", noon_ish, real_start_seconds=0) == 0,
+          "a channel that has aired before starts a new block at its real clock start, not at the half hour the app first saw it")
+    check(anchor_for(aired, "2026_289_Full Day", 15 * 3600, real_start_seconds=0) == 0 and aired["playback_log"]["block_anchors"]["2026_289_Full Day"] == 0,
+          "the anchor is saved and never changes once set")
+    night = {"playback_log": {"sched_block_key": "2026_288_Evening"}}
+    check(anchor_for(night, "2026_289_Night", 24 * 3600 + 1800, real_start_seconds=20 * 3600) == 20 * 3600,
+          "a Night block seen after midnight is still measured from 20:00")
+    fresh = {}
+    check(anchor_for(fresh, "2026_289_Full Day", noon_ish, real_start_seconds=0) == 12 * 3600,
+          "a channel that never aired before starts at the half hour it went on air")
+    same = {"playback_log": {"sched_block_key": "2026_289_Full Day"}}
+    check(anchor_for(same, "2026_289_Full Day", noon_ish, real_start_seconds=0) == 12 * 3600,
+          "a block that is already the last one built keeps the old half hour anchor instead of moving mid-block")
+    holiday = {"playback_log": {"sched_block_key": "2026_288_Full Day"}}
+    check(anchor_for(holiday, "2026_289_holiday", noon_ish) == 12 * 3600,
+          "a caller that gives no clock start gets the old behaviour")
+    sched = get_function_source("calculate_slotted_playback_state")
+    check(sched.count("real_start_seconds=0)") == 1 and sched.count("real_start_seconds=block_start_hour * 3600)") == 3,
+          "every scheduler block passes its real clock start")
+
+
+class TestBlockAnchorRealStart(_SectionCase):
+    """A block the app first sees late is measured from its real clock start once the channel has aired before"""
+
+    def test_block_anchor_real_start(self):
+        self.run_section(suite_block_anchor_real_start)
+
+
+class TestGuidePastReplay(_SectionCase):
+    """The guide's past is rebuilt from the schedule for time the app was off, with guessed lengths for unscanned files"""
+
+    def test_guide_past_replay(self):
+        self.run_section(suite_guide_past_replay)
 
 
 if __name__ == "__main__":

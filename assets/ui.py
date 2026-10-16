@@ -390,6 +390,15 @@ _guide_timeline_cache = {}
 
 _guide_exists_state = {"token": None, "cache": {}}
 
+def _guide_visualizer_admitted(ch_info, app_state, db):
+    """Returns the songs the station's Visualizer lineup admits for this channel right now."""
+    _inputs = app_state.get("visualizer_admission_inputs") if app_state is not None else None
+    _unseekable, _unseekable_exts = _inputs() if callable(_inputs) else ({}, set())
+    _probe = (db.config.get("media_probe_cache", {}) if db is not None else {})
+    return media.admit_visualizer_assets(
+        ch_info.get("schedules", {}).get("Music Tracks", []), _probe, _unseekable, _unseekable_exts)
+
+
 def _guide_path_exists(path, app_state):
     import os
     token = app_state.get("guide_refresh_token", 0) if app_state is not None else 0
@@ -444,10 +453,13 @@ def get_guide_visible_rows(db):
 def get_guide_num_cols(db):
     return GUIDE_NUM_COLS_4_3 if _guide_aspect_is_4_3(db) else GUIDE_NUM_COLS_16_9
 
+# VALUES CHANGE HERE
 GUIDE_TOTAL_HALF_HOURS = 336
+GUIDE_PAST_HALF_HOURS = 48
 
 def clamp_guide_time_idx(raw_idx, num_cols):
-    return max(0, min(raw_idx, GUIDE_TOTAL_HALF_HOURS - num_cols))
+    """Keeps the guide's first column between the previous midnight and the last visible half hour; the 7 visible days run from the previous midnight."""
+    return max(-GUIDE_PAST_HALF_HOURS, min(raw_idx, GUIDE_TOTAL_HALF_HOURS - GUIDE_PAST_HALF_HOURS - num_cols))
 
 
 # VALUES CHANGE HERE
@@ -1272,6 +1284,8 @@ def _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th):
         app_state.get("guide_selected_abs_time"),
         db.config.get("theme_bg_hue") if db is not None else None,
         db.config.get("theme_ui_hue") if db is not None else None,
+        app_state.get("guide_refresh_token", 0),
+        repr(sorted((app_state.get("guide_channel_stamps") or {}).items())),
         _now.date(),
         _now_bucket,
     )
@@ -1300,7 +1314,13 @@ def _build_and_cache_guide_frame(surface, app_state, db, theme, target_rect=None
 
                 return cache_key, cached["canvas"], cached["preview_bounds"]
 
+        _guide_build_started = time.perf_counter()
         _render_tv_guide_impl(surface, app_state, db, theme, target_rect=target_rect, present=False)
+        log.info("[GUIDE BUILD] elapsed_ms=%.1f selected_channel=%s row_offset=%s col_pos=%s",
+                 (time.perf_counter() - _guide_build_started) * 1000.0,
+                 app_state.get("selected_guide_channel"),
+                 app_state.get("guide_row_offset"),
+                 app_state.get("guide_col_pos"))
         design_canvas = _get_guide_canvas_43() if is_4_3 else _get_guide_canvas()
         canvas_copy = design_canvas.copy()
         preview_bounds = app_state.get("guide_preview_bounds")
@@ -1610,6 +1630,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
         is_4_3, real_w, real_h, w, h, col_width, row_height, num_cols, time_idx,
         now_dt.date(), (now_dt.hour * 2) + (1 if now_dt.minute >= 30 else 0),
         app_state.get("guide_refresh_token", 0),
+        repr(sorted((app_state.get("guide_channel_stamps") or {}).items())),
         db.config.get("theme_bg_hue"), db.config.get("theme_ui_hue"),
     )
 
@@ -1637,7 +1658,9 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
 
         _row_cache_key = None
         if not is_highlighted_row:
-            _row_cache_key = _row_cache_base + (ch_str, str(ch_info.get("name")), repr(ch_info.get("playback_anchor")))
+            _row_viz_admitted = (bool(_guide_visualizer_admitted(ch_info, app_state, db))
+                                 if ch_info.get("is_visualizer", False) else None)
+            _row_cache_key = _row_cache_base + (ch_str, str(ch_info.get("name")), repr(ch_info.get("playback_anchor")), _row_viz_admitted)
             _row_hit = _guide_row_cache.get(_row_cache_key)
             if (_row_hit is not None and _row_hit["gen"] == _row_cache_gen
                     and _row_cache_now - _row_hit["ts"] < _GUIDE_ROW_CACHE_TTL_S):
@@ -1677,7 +1700,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
         current_row_stops_list = []
         
         if ch_info.get("is_visualizer", False):
-            s_list = ch_info.get("schedules", {}).get("Music Tracks", [])
+            s_list = _guide_visualizer_admitted(ch_info, app_state, db)
             for col in range(num_cols):
                 _viz_block_abs = viewport_start_seconds + col * 1800
                 current_row_blocks_list.append(col)
@@ -1828,159 +1851,38 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 return _m.get(bn, 400)
 
             def _build_commercial_tracks():
-                COMMERCIAL_DEFAULT_DUR = 30
                 commercials_enabled = ch_info.get("commercials_enabled", False)
                 commercial_items = ch_info.get("schedules", {}).get("Commercials", [])
                 _com_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
-                tracks = []
-                if commercials_enabled and commercial_items:
-                    for asset in commercial_items:
-                        path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-                        if path and _guide_path_exists(path, app_state):
-                            stored = asset.get("duration", COMMERCIAL_DEFAULT_DUR) if isinstance(asset, dict) else COMMERCIAL_DEFAULT_DUR
-                            duration = media.resolve_track_duration(
-                                _com_probe_cache, path, stored, default=COMMERCIAL_DEFAULT_DUR
-                            )
-                            if not duration or duration <= 0:
-                                duration = COMMERCIAL_DEFAULT_DUR
-                            tracks.append({"path": path, "duration": int(duration)})
-                return tracks
+                if not commercials_enabled or not commercial_items:
+                    return []
+                return media.build_commercial_tracks(
+                    commercial_items,
+                    _com_probe_cache,
+                    lambda _p: _guide_path_exists(_p, app_state),
+                )
 
             def get_block_content(block_name, _override_sp=None):
-                is_vis_chan = ch_info.get("is_visualizer", False)
                 schedules = ch_info.get("schedules", {})
-                folder_items = schedules.get("Music Tracks" if is_vis_chan else block_name, [])
+                folder_items = schedules.get(block_name, [])
                 if not folder_items:
                     return [], {}
 
-                raw_tracks = []
                 _media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
-                for item in folder_items:
-                    p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
-                    if p and _guide_path_exists(p, app_state):
-                        stored = item.get("duration", 0) if isinstance(item, dict) else 0
-                        d = media.resolve_track_duration(_media_probe_cache, p, stored)
-                        _track = {"path": p, "duration": d}
-                        if media.track_duration_is_estimated(_media_probe_cache, p, stored):
-                            _track["_duration_estimated"] = True
-                        raw_tracks.append(_track)
-                if not raw_tracks:
-                    return [], {}
-
-                block_offset = _guide_block_seed_offset(block_name)
-                day_seed = now_dt.year * 1000 + now_dt.timetuple().tm_yday + int(ch_str) + block_offset
-                sched_mode = ch_info.get("scheduling_mode", "random_slots")
-
-                playback_log = ch_info.get("playback_log", {})
-                _show_pos_copy = dict(_override_sp if _override_sp is not None
-                                      else playback_log.get("show_pos", {}))
-                _pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
-
-                if not is_vis_chan and _override_sp is None:
-                    if _is_full_day_guide:
-                        _live_block = "Full Day"
-                    elif _is_six_block_guide:
-                        _live_block = media.SIX_HOUR_BLOCKS[now_dt.hour // 4][0]
-                    else:
-                        _gh = now_dt.hour
-                        if 4 <= _gh < 12:
-                            _live_block = "Morning"
-                        elif 12 <= _gh < 20:
-                            _live_block = "Evening"
-                        else:
-                            _live_block = "Night"
-                    if (not _is_six_block_guide
-                            and _live_block == "Night"
-                            and now_dt.hour < 4):
-                        _live_block_key = (
-                            f"{_seg_yesterday.year}_"
-                            f"{_seg_yesterday.timetuple().tm_yday}_Night"
-                        )
-                    else:
-                        _live_block_key = (
-                            f"{now_dt.year}_{now_dt.timetuple().tm_yday}_{_live_block}"
-                        )
-                    if (block_name == _live_block
-                            and playback_log.get("sched_block_key") == _live_block_key
-                            and playback_log.get("sched_pairing_rule_version")
-                                == media.SHORT_EPISODE_PAIRING_VERSION):
-                        _cached = playback_log.get("sched_cached_tracks", [])
-                        _by_path = {t["path"]: t for t in raw_tracks}
-                        _raw_ordered = [_by_path[p] for p in _cached if p in _by_path]
-                        _cached_durs = playback_log.get("sched_cached_durations", {})
-                        _cached_durs_stale = media._cached_lineup_durations_stale(
-                            _cached_durs, _media_probe_cache
-                        )
-                        if _cached_durs and not _cached_durs_stale:
-                            _raw_ordered = [
-                                {**t, "duration": _cached_durs[t["path"]]}
-                                if t["path"] in _cached_durs and _cached_durs[t["path"]] > 0
-                                else t
-                                for t in _raw_ordered
-                            ]
-                        if _raw_ordered:
-                            return (media.pair_short_episodes(_raw_ordered, threshold_seconds=_pair_thresh_sec),
-                                    dict(playback_log.get("show_pos", {})))
-
-                    _blk_rot_cache_g = playback_log.get("block_rotation_cache", {})
-                    if (not _is_six_block_guide
-                            and block_name == "Night"
-                            and now_dt.hour < 4):
-                        _blk_key_g = (
-                            f"{_seg_yesterday.year}_"
-                            f"{_seg_yesterday.timetuple().tm_yday}_Night"
-                        )
-                    else:
-                        _blk_key_g = (
-                            f"{now_dt.year}_{now_dt.timetuple().tm_yday}_{block_name}"
-                        )
-                    _blk_entry_g = _blk_rot_cache_g.get(_blk_key_g)
-                    if (_blk_entry_g
-                            and _blk_entry_g.get("pairing_rule_version")
-                                == media.SHORT_EPISODE_PAIRING_VERSION):
-                        _cached_g     = _blk_entry_g.get("tracks", [])
-                        _cached_durs_g = _blk_entry_g.get("durations", {})
-                        _by_path_g    = {t["path"]: t for t in raw_tracks}
-                        _raw_ordered_g = [_by_path_g[p] for p in _cached_g if p in _by_path_g]
-                        if _cached_durs_g:
-                            _cached_durs_g_stale = media._cached_lineup_durations_stale(
-                                _cached_durs_g, _media_probe_cache
-                            )
-                            if not _cached_durs_g_stale:
-                                _raw_ordered_g = [
-                                    {**t, "duration": _cached_durs_g[t["path"]]}
-                                    if t["path"] in _cached_durs_g and _cached_durs_g[t["path"]] > 0
-                                    else t
-                                    for t in _raw_ordered_g
-                                ]
-                        if _raw_ordered_g:
-                            return (
-                                media.pair_short_episodes(
-                                    _raw_ordered_g, threshold_seconds=_pair_thresh_sec),
-                                dict(playback_log.get("show_pos", {}))
-                            )
-
-                    _show_pos_copy = dict(playback_log.get("show_pos", {}))
-
-                _fixed_order = playback_log.get("show_order", {}).get(block_name)
-                _block_dur_lut = {
-                    "Morning": 8 * 3600,
-                    "Evening": 8 * 3600,
-                    "Night":   8 * 3600,
-                    "Full Day": 86400,
-                }
-                for _bdn in media.SIX_HOUR_BLOCK_NAMES:
-                    _block_dur_lut[_bdn] = 4 * 3600
-                _block_dur_sec = _block_dur_lut.get(block_name, 8 * 3600)
-                video_tracks, _show_pos_copy, _ = media.build_show_rotation(
-                    raw_tracks, sched_mode, _show_pos_copy, day_seed,
-                    pair_threshold_seconds=_pair_thresh_sec,
-                    episode_order_mode=ch_info.get("episode_order_mode", "sequential"),
-                    fixed_show_order=_fixed_order,
-                    block_duration_seconds=_block_dur_sec,
-                    channel_id=ch_str,
+                _playback_log = ch_info.get("playback_log", {})
+                _start_seed = lambda _info, _offset: "%s:%d" % (
+                    _info.get("playback_log", {}).get(
+                        "intro_seed",
+                        _info.get("playback_log", {}).get("start_number", 0),
+                    ),
+                    int(_offset),
                 )
-                return video_tracks, _show_pos_copy
+                _lineup, _lineup_block = media.read_block_lineup(
+                    ch_str, ch_info, block_name, now_dt, _media_probe_cache,
+                    lambda _p: _guide_path_exists(_p, app_state), _start_seed,
+                    peek_only=True,
+                )
+                return _lineup, _lineup_block
 
             def get_block_timeline(block_name, _override_sp=None):
                 block_content, _new_sp = get_block_content(block_name, _override_sp)
@@ -2002,7 +1904,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
 
             def get_marathon_content():
                 folder_items = ch_info.get("schedules", {}).get("Marathon", [])
-                ordered = media.build_ordered_tracks(folder_items, "marathon", int(ch_str))
+                _marathon_seed = ch_info.get("playback_log", {}).get(
+                    "intro_seed",
+                    ch_info.get("playback_log", {}).get("start_number", 0),
+                )
+                ordered = media.build_ordered_tracks(folder_items, "marathon", "%s:marathon" % _marathon_seed)
                 if not ordered:
                     return []
                 _mara_cached_durs = ch_info.get("playback_log", {}).get("marathon_cached_durations", {})
@@ -2050,7 +1956,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             viewport_end_hour = (viewport_adjusted_end - 1) // 3600
             
             _tl_key = (ch_str, now_dt.year, now_dt.timetuple().tm_yday, viewport_start_seconds,
-                       app_state.get("guide_refresh_token", 0))
+                       app_state.get("guide_refresh_token", 0),
+                       (app_state.get("guide_channel_stamps") or {}).get(ch_str, 0))
             _tl_hit = _guide_timeline_cache.get(_tl_key)
             if _tl_hit is not None:
                 _cached_sources_ok = True
@@ -2076,20 +1983,16 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             _media_probe_cache_h = (db.config.get("media_probe_cache", {}) if db is not None else {})
 
             if _tl_hit is None and _is_holiday_guide:
-                _h_raw_tracks = []
-                for _asset in _holiday_entries_guide:
-                    _p = _asset.get("path", _asset.get("file", "")) if isinstance(_asset, dict) else str(_asset)
-                    if _p and _guide_path_exists(_p, app_state):
-                        _stored = _asset.get("duration", 0) if isinstance(_asset, dict) else 0
-                        _d = media.resolve_track_duration(_media_probe_cache_h, _p, _stored)
-                        _h_track = {"path": _p, "duration": _d}
-                        if media.track_duration_is_estimated(
-                                _media_probe_cache_h, _p, _stored):
-                            _h_track["_duration_estimated"] = True
-                        _h_raw_tracks.append(_h_track)
+                _h_log = ch_info.get("holiday_playback_log", {}).get(_holiday_key_guide, {})
+                _h_pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
+                _h_raw_tracks, _h_initial_sp = media.read_holiday_lineup(
+                    ch_str, ch_info, _holiday_key_guide, now_dt, _media_probe_cache_h,
+                    lambda _p: _guide_path_exists(_p, app_state),
+                    show_pos=_h_log.get("show_pos", {}),
+                    fixed_show_order=_h_log.get("show_order"),
+                )
 
                 if _h_raw_tracks:
-                    _h_log = ch_info.get("holiday_playback_log", {}).get(_holiday_key_guide, {})
                     _h_pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
                     _h_pair_thresh_min = ch_info.get("pair_threshold_minutes", 15)
                     _h_interrupt_floor = (_h_pair_thresh_min if _h_pair_thresh_min > 0 else 15) * 60
@@ -2101,15 +2004,12 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         _sp_copy = dict(_override_sp if _override_sp is not None
                                         else _h_log.get("show_pos", {}))
                         _fixed_order = None if _override_sp is not None else _h_log.get("show_order")
-                        _tracks, _new_sp, _ = media.build_show_rotation(
-                            _h_raw_tracks, "random_slots", _sp_copy, _h_day_seed + _seed_bump,
-                            pair_threshold_seconds=_h_pair_thresh_sec,
-                            episode_order_mode="random",
-                            fixed_show_order=_fixed_order,
-                            block_duration_seconds=86400,
-                            channel_id=ch_str,
+                        return media.read_holiday_lineup(
+                            ch_str, ch_info, _holiday_key_guide, now_dt, _media_probe_cache_h,
+                            lambda _p: _guide_path_exists(_p, app_state),
+                            show_pos=_sp_copy, fixed_show_order=_fixed_order,
+                            seed_bump=_seed_bump,
                         )
-                        return _tracks, _new_sp
 
                     def _get_holiday_timeline(_override_sp=None, _seed_bump=0):
                         _content, _new_sp = _get_holiday_content(_override_sp, _seed_bump)
@@ -2363,6 +2263,20 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                       timeline_entries = timeline_entries + _shifted
                       _day_start += _real_day_len
                       _day_num += 1
+
+            if _tl_hit is None and not _is_holiday_guide and not _is_marathon:
+                _now_rel_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+                _past_rows = [
+                    _r for _r in media.aired_ledger_entries(ch_info.get("playback_log", {}), now_dt.toordinal())
+                    if _r[2] <= _now_rel_secs + 0.5
+                    and _r[2] > viewport_adjusted_start and _r[1] < viewport_adjusted_end + 3600
+                ]
+                if _past_rows:
+                    timeline_entries = sorted(
+                        [_t for _t in timeline_entries
+                         if not any(_t[1] < _p[2] - 0.5 and _p[1] < _t[2] - 0.5 for _p in _past_rows)]
+                        + _past_rows,
+                        key=lambda _t: _t[1])
 
             if _tl_hit is None:
                 _merged_entries = []
@@ -2702,12 +2616,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     _n2 = _clean_show_title(_p2) if _p2 else ""
                     cleaned_title = ((_n1 + " + " + _n2) if (_n2 and _n2 != _n1) else _n1).upper()
                 else:
-                    raw_title = ""
-                    if isinstance(show, dict):
-                        raw_title = show.get("title", show.get("path", ""))
-                    else:
-                        raw_title = str(show)
-                    cleaned_title = _clean_show_title(raw_title).upper()
+                    cleaned_title = media.guide_display_title(show).upper() if isinstance(show, dict) else _clean_show_title(show).upper()
                 
                 if cell_x + 8 < w:
                     max_txt_w = current_draw_w - 15
@@ -2989,6 +2898,7 @@ def _compute_settings_menu_cache_key(app_state, db, real_w, real_h):
         app_state.get("_games_menu_flash_msg"),
         app_state.get("_games_menu_flash_at"),
         app_state.get("audio_track_active_id"),
+        app_state.get("audio_track_gain_db"),
         app_state.get("audio_track_context"),
         app_state.get("audio_track_source_channel"),
         app_state.get("dvd_audio_track_count"),
@@ -4596,7 +4506,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             vis_row_h = 40
             vis_gap = 20
 
-            _clear_row_idx = 3
+            _gain_row_idx = 3
+            _clear_row_idx = 4
             close_row_idx = 4
             is_close_focused = (sub_r == close_row_idx)
 
@@ -4619,18 +4530,31 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
 
-            clear_h = 40
-            clear_y = _cb_y - vis_gap - clear_h
-            is_clear_focused = (sub_r == _clear_row_idx)
             _has_music_content = len(ch_info.get("schedules", {}).get("Music Tracks", [])) > 0
+            clear_h = 40
+            clear_y = _cb_y
+            is_clear_focused = (sub_r == _clear_row_idx)
             _clear_txt_col = (NEON_GREEN if is_clear_focused else TEXT_WHITE) if _has_music_content else (105, 105, 115)
             _clear_bg_col  = (OFF_RED if is_clear_focused else (45, 20, 25)) if _has_music_content else (32, 32, 40)
-            lbl_clr = f_ch_label.render("CLEAR MUSIC TRACKS PROFILE MEMORY SELECTIONS", True, _clear_txt_col)
+            lbl_clr = f_ch_label.render("REMOVE MUSIC MEDIA", True, _clear_txt_col)
             clear_w = min(lbl_clr.get_width() + 40, row_w)
             clear_x = row_x
             pygame.draw.rect(menu_canvas, _clear_bg_col, (clear_x, clear_y, clear_w, clear_h), border_radius=6)
             if is_clear_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (clear_x, clear_y, clear_w, clear_h), SELECTION_BORDER_WIDTH, border_radius=6)
             menu_canvas.blit(lbl_clr, (clear_x + clear_w // 2 - lbl_clr.get_width() // 2, clear_y + clear_h // 2 - lbl_clr.get_height() // 2))
+
+            _vis_gain_db = int(app_state.get("visualizer_gain_db", 0))
+            _vis_gain_path = app_state.get("_vis_target_filepath", "")
+            if _vis_gain_path and hasattr(__import__("__main__"), "_get_audio_gain_db"):
+                _vis_gain_db = __import__("__main__")._get_audio_gain_db(_vis_gain_path)
+            gain_h = 40
+            gain_y = audio_y + vis_row_h + vis_gap
+            is_gain_focused = (sub_r == _gain_row_idx)
+            gain_label = f_ch_label.render(f"LOUDNESS GAIN: {_vis_gain_db:+d} dB  A/D TO ADJUST", True, NEON_GREEN if is_gain_focused else TEXT_WHITE)
+            pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, gain_y, row_w, gain_h), border_radius=6)
+            if is_gain_focused:
+                _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, gain_y, row_w, gain_h), SELECTION_BORDER_WIDTH, border_radius=6)
+            menu_canvas.blit(gain_label, (row_x + 20, gain_y + gain_h // 2 - gain_label.get_height() // 2))
 
             pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
             if is_close_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
@@ -4980,7 +4904,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         sub_r  = app_state.get("sub_menu_row_index", 0)
         tracks = app_state.get("audio_track_list", [])
         active_id = app_state.get("audio_track_active_id")
-        close_row = len(tracks)
+        gain_row = len(tracks)
+        close_row = gain_row + 1
+        gain_db = int(app_state.get("audio_track_gain_db", 0))
 
         row_h  = 40
         row_gap = 8
@@ -5015,6 +4941,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     True, NEON_GREEN if is_focused else TEXT_WHITE
                 )
                 menu_canvas.blit(lbl_track, (box_x + box_size + 14, ty + row_h // 2 - lbl_track.get_height() // 2))
+
+        is_gain_focused = (sub_r == gain_row)
+        gain_y = list_top + len(tracks) * (row_h + row_gap)
+        pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, gain_y, row_w, row_h), border_radius=6)
+        if is_gain_focused:
+            _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, gain_y, row_w, row_h), SELECTION_BORDER_WIDTH, border_radius=6)
+        lbl_gain = f_ch_label.render(
+            f"LOUDNESS GAIN: {gain_db:+d} dB  LEFT/RIGHT TO ADJUST",
+            True, NEON_GREEN if is_gain_focused else TEXT_WHITE
+        )
+        menu_canvas.blit(lbl_gain, (row_x + 15, gain_y + row_h // 2 - lbl_gain.get_height() // 2))
 
         is_close_focused = (sub_r == close_row)
         _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
@@ -6642,6 +6579,7 @@ __all__ = [
     "GUIDE_DESIGN_W_4_3",
     "GUIDE_NUM_COLS_16_9",
     "GUIDE_NUM_COLS_4_3",
+    "GUIDE_PAST_HALF_HOURS",
     "GUIDE_TOTAL_HALF_HOURS",
     "GUIDE_VISIBLE_ROWS_16_9",
     "GUIDE_VISIBLE_ROWS_4_3",

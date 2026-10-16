@@ -1408,7 +1408,7 @@ def _channel_sub_target(layout, close, row, col, direction):
         return row + 1, 0
     if direction == RIGHT:
         if row == close:
-            limit = 1 if (not music) and on else None
+            limit = 1 if on else None
         elif row == 0:
             limit = 2 if on else None
         elif not music and row == 1:
@@ -1423,7 +1423,7 @@ def _channel_sub_target(layout, close, row, col, direction):
             limit = None
         return None if limit is None else (row, min(limit, col + 1))
     if row == close:
-        floor = 0 if (not music) and on else None
+        floor = 0 if on else None
     elif row == 0:
         floor = only_off_at_row0 if on else None
     elif not music and row == 3:
@@ -1952,10 +1952,15 @@ def joystick_action(event):
 # ============================================================================
 
 
+# WARNING: the fallback number must match CHANNEL_DIGIT_TUNE_DELAY_MS in performance_governor.py; it is used only when that module fails to import.
+try:
+    import performance_governor as _digit_governor
+    DIGIT_ENTRY_CONFIRM_MS = int(_digit_governor.CHANNEL_DIGIT_TUNE_DELAY_MS)
+except Exception:
+    DIGIT_ENTRY_CONFIRM_MS = 350
 # VALUES CHANGE HERE
 DIGIT_ENTRY_MAX = 2
 DIGIT_ENTRY_SINGLE_MS = 2500
-DIGIT_ENTRY_CONFIRM_MS = 350
 
 
 def key_to_digit(key):

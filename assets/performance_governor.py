@@ -176,6 +176,12 @@ MEDIA_START_GRACE_SECONDS = 3.0
 # VALUES CHANGE HERE (held W/A/S/D key: milliseconds before a hold in a menu or the guide starts repeating)
 MENU_NAV_REPEAT_DELAY_MS = 400
 
+# VALUES CHANGE HERE (channel Up/Down: milliseconds you must stay on a channel number before that channel is tuned; presses faster than this only change the number shown on the grey screen)
+CHANNEL_SURF_HESITATE_MS = 400
+
+# VALUES CHANGE HERE (typed channel number: milliseconds between the second digit and the tune; the show on air is hidden, muted and shut down the moment the second digit is typed)
+CHANNEL_DIGIT_TUNE_DELAY_MS = 350
+
 # VALUES CHANGE HERE (logging)
 STATUS_LOG_INTERVAL_SECONDS = 5.0
 
@@ -269,6 +275,14 @@ GPU_FRAME_LOG_INTERVAL_FRAMES = 600
 # VALUES CHANGE HERE (menu key trace: key events landing in one frame that write a [MENU NAV BURST] warning; loop profile: frames collected before a [LOOP PROFILE] line is written, 0 = off)
 MENU_NAV_BURST_WARN_EVENTS = 3
 LOOP_PROFILE_LOG_INTERVAL_FRAMES = 600
+
+# VALUES CHANGE HERE (guide past rebuild: most recent missed block occurrences replayed per channel at a block change; length in seconds guessed for an unscanned episode with no scanned episode of its series or channel to average)
+GUIDE_REPLAY_MAX_BLOCKS = 60
+GUIDE_REPLAY_EPISODE_GUESS_SECONDS = 1800
+
+# VALUES CHANGE HERE (scheduler catch-up: most recent missed blocks replayed per channel at a block change; most cycles replayed inside one missed block)
+CATCH_UP_MAX_BLOCKS = 3000
+CATCH_UP_MAX_CYCLES_PER_BLOCK = 1000
 
 
 # ============================================================================
