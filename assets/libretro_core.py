@@ -26,6 +26,17 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+try:
+    from performance_governor import log_swallowed as _log_swallowed
+except Exception:
+    def _log_swallowed(where, error):
+        """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
+        return None
+
 try:
     import performance_governor as _timing_governor
 except Exception:
@@ -62,7 +73,8 @@ class GameFrameTimer:
     def _read_pad_src(self):
         try:
             return self._pad_src() if self._pad_src is not None else None
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_read_pad_src: return self._pad_src() if self._pad_src is not None else Non", _swallowed_error)
             return None
 
     def _reset_window(self):
@@ -75,8 +87,8 @@ class GameFrameTimer:
         """Starts a fresh timing session; called when a ROM load begins."""
         try:
             self._flush()
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("new_session: self._flush()", _swallowed_error)
         self._session_t0 = time.monotonic()
         self._phase = None
         self._prev_t0 = None
@@ -680,7 +692,8 @@ class LibretroAudio:
             try:
                 self._channel = pygame.mixer.Channel(self.CHANNEL_ID)
                 self._channel.set_volume(self._volume)
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("tick: self._channel = pygame.mixer.Channel(self.CHANNEL_ID)", _swallowed_error)
                 return
 
         with self._buf_lock:

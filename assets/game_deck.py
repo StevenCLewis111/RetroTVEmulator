@@ -20,6 +20,7 @@ import pygame
 import pygame.gfxdraw
 import menu_nav as _nav
 import performance_governor as _gov
+import media as _media_listing
 
 from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info,
                     is_dvd_disc_source, apply_video_effects,
@@ -33,12 +34,22 @@ from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_ro
 
 log = logging.getLogger(__name__)
 
+
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+try:
+    from performance_governor import log_swallowed as _log_swallowed
+except Exception:
+    def _log_swallowed(where, error):
+        """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
+        return None
+
+
 try:
     from dvdnav_highlight import DvdnavShadowSession
-except Exception as _e:
+except Exception:
     DvdnavShadowSession = None
-    log.warning(f"[DVD HIGHLIGHT] dvdnav_highlight module unavailable ({_e}) -- "
-          f"menu highlight overlay disabled, playback unaffected.")
 
 
 # ============================================================================
@@ -219,8 +230,8 @@ def _gd_is_drive_responsive(path):
         fn = getattr(main_module, "_is_drive_responsive", None)
         if fn is not None:
             return fn(path)
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_gd_is_drive_responsive: main_module = sys.modules.get('__main__')", _swallowed_error)
     return True
 
 
@@ -855,7 +866,8 @@ def _xinput_handle():
     for lib in _XI_LIB_NAMES:
         try:
             xi = ctypes.windll.LoadLibrary(lib)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_xinput_handle: xi = ctypes.windll.LoadLibrary(lib)", _swallowed_error)
             continue
         _xinput_dll["handle"] = xi
         return xi
@@ -890,7 +902,8 @@ def _try_xinput_read():
                 if _xinput_last_raw.get(idx) != snap:
                     _xinput_last_raw[idx] = snap
                 return g
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_try_xinput_read: rc = xi.XInputGetState(idx, ctypes.byref(state))", _swallowed_error)
             continue
     return None
 
@@ -918,7 +931,8 @@ def _try_xinput_read_all():
                 g.sRY = state.Gamepad.sRY
                 apply_stick_correction(g, idx)
                 out[idx] = g
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_try_xinput_read_all: g = _GPState() g.wButtons = state.Gamepad.wButtons g.bLT = s", _swallowed_error)
             continue
 
     _now_connected = set(out.keys())
@@ -1085,8 +1099,8 @@ def _scan_hid_identities():
                         ctypes.sizeof(loc_buf), ctypes.byref(loc_needed)):
                     first = ctypes.wstring_at(loc_buf)
                     entry["location"] = first or None
-            except Exception:
-                pass
+            except Exception as _swallowed_error:
+                _log_swallowed("_scan_hid_identities: loc_buf = ctypes.create_unicode_buffer(512)", _swallowed_error)
 
             handle = None
             try:
@@ -1106,14 +1120,14 @@ def _scan_hid_identities():
                         s = (ser_buf.value or "").strip()
                         if s:
                             entry["serial"] = s
-            except Exception:
-                pass
+            except Exception as _swallowed_error:
+                _log_swallowed("_scan_hid_identities: handle = kernel32.CreateFileW(device_path, _GENERIC_READ | _GENERIC_WRITE, _FILE_SHARE_...", _swallowed_error)
             finally:
                 if handle and handle != _INVALID_HANDLE_VALUE:
                     try:
                         kernel32.CloseHandle(handle)
-                    except Exception:
-                        pass
+                    except Exception as _swallowed_error:
+                        _log_swallowed("_scan_hid_identities: kernel32.CloseHandle(handle)", _swallowed_error)
 
             if entry["vid"] is not None:
                 out.append(entry)
@@ -1124,8 +1138,8 @@ def _scan_hid_identities():
         if h_devinfo:
             try:
                 setupapi.SetupDiDestroyDeviceInfoList(h_devinfo)
-            except Exception:
-                pass
+            except Exception as _swallowed_error:
+                _log_swallowed("_scan_hid_identities: setupapi.SetupDiDestroyDeviceInfoList(h_devinfo)", _swallowed_error)
     return out
 
 
@@ -1525,7 +1539,8 @@ def pad_snapshot_begin():
     t0 = time.perf_counter()
     try:
         slots = _player_connected_slots_scan()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("pad_snapshot_begin: slots = _player_connected_slots_scan()", _swallowed_error)
         return
     _pad_snapshot["slots"] = slots
     ms = (time.perf_counter() - t0) * 1000.0
@@ -1564,8 +1579,8 @@ def _player_connected_slots_scan(parts=None):
     _t0 = time.perf_counter()
     try:
         out.update(_try_xinput_read_all())
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_player_connected_slots_scan: out.update(_try_xinput_read_all())", _swallowed_error)
     if parts is not None:
         parts["xinput"] = (time.perf_counter() - _t0) * 1000.0
     _t0 = time.perf_counter()
@@ -1579,8 +1594,8 @@ def _player_connected_slots_scan(parts=None):
                     "xbox series", "microsoft")):
                 continue
             out[f"di{did}"] = gp
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_player_connected_slots_scan: for did, gp in _try_dinput_read_all().items():", _swallowed_error)
     if parts is not None:
         parts["joy"] = (time.perf_counter() - _t0) * 1000.0
     if _is_running_under_wine():
@@ -1589,8 +1604,8 @@ def _player_connected_slots_scan(parts=None):
                 gp = reader.read()
                 if gp is not None:
                     out[f"js:{path}"] = gp
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_player_connected_slots_scan: for path, reader in _get_all_linux_joystick_readers().items():", _swallowed_error)
     return out
 
 
@@ -1782,8 +1797,8 @@ def _candidate_joystick_paths():
         )
         if nodes:
             return [f"Z:\\dev\\input\\{n}" for n in nodes]
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_candidate_joystick_paths: entries = os.listdir('Z:\\\\dev\\\\input')", _swallowed_error)
     return [f"Z:\\dev\\input\\js{i}" for i in range(8)]
 
 
@@ -1801,11 +1816,12 @@ def _linux_js_serial(path):
                     s = f.read().strip()
                     if s:
                         return s
-            except Exception:
-                pass
+            except Exception as _swallowed_error:
+                _log_swallowed("_linux_js_serial: with open(cur + '\\\\serial', 'r') as f:", _swallowed_error)
             cur += "\\.."
         return None
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_linux_js_serial: m = re.search(r'js(/d+)$', path)", _swallowed_error)
         return None
 
 
@@ -1818,7 +1834,8 @@ def _linux_js_port_path(path):
         target = os.readlink(f"Z:\\sys\\class\\input\\js{js_num}\\device")
         m2 = re.search(r"/(\d+-[\d.]+)(?::[\d.]+)?/", target.replace("\\", "/") + "/")
         return m2.group(1) if m2 else None
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_linux_js_port_path: m = re.search(r'js(/d+)$', path)", _swallowed_error)
         return None
 
 
@@ -1837,8 +1854,8 @@ def _linux_js_sysfs_signature(path):
         try:
             with open(base + "\\name", "r") as f:
                 name = f.read().strip()
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_linux_js_sysfs_signature: with open(base + '\\\\name', 'r') as f:", _swallowed_error)
         base_sig = f"linux:{vendor}:{product}:{name}"
         serial = _linux_js_serial(path)
         if serial:
@@ -1847,7 +1864,8 @@ def _linux_js_sysfs_signature(path):
         if port:
             return f"{base_sig}:port:{port}"
         return base_sig
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_linux_js_sysfs_signature: m = re.search(r'js(/d+)$', path)", _swallowed_error)
         return None
 
 
@@ -2149,7 +2167,8 @@ def stick_test_sticks(player=1):
     """Returns ((left x, left y), (right x, right y)) of a player's pad, or None when there is no pad."""
     try:
         gp = player1_gpstate() if player == 1 else player_gpstate(player)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("stick_test_sticks: gp = player1_gpstate() if player == 1 else player_gpstate(pl", _swallowed_error)
         return None
     if gp is None:
         return None
@@ -2908,6 +2927,39 @@ def apply_menu_nav_mapping(bit_by_button):
         _NAV_MAP[bit] = _nav.action_key(action)
 
 
+# ============================================================================
+# SECTION: Controller keystroke guard
+# ============================================================================
+
+_BRIDGE_KEY_GRACE_MS = _gov.BRIDGE_KEY_GRACE_MS
+
+_bridge_keys_lock = threading.Lock()
+_bridge_keys_down = set()
+_bridge_keys_released_at = {}
+
+
+def bridge_note_key(vk, key_up):
+    """Records that a controller-to-keyboard bridge key press or release was just sent, so the TV can ignore the matching keyboard event."""
+    pg_key = _nav.bridge_vk_to_key(vk)
+    if pg_key is None:
+        return
+    with _bridge_keys_lock:
+        if key_up:
+            _bridge_keys_down.discard(pg_key)
+            _bridge_keys_released_at[pg_key] = time.monotonic()
+        else:
+            _bridge_keys_down.add(pg_key)
+
+
+def bridge_key_is_injected(pg_key):
+    """Returns True while a pygame key is held by the controller bridge, or was released by it within the grace window."""
+    with _bridge_keys_lock:
+        if pg_key in _bridge_keys_down:
+            return True
+        released = _bridge_keys_released_at.get(pg_key)
+    return released is not None and (time.monotonic() - released) * 1000.0 <= _BRIDGE_KEY_GRACE_MS
+
+
 _xi_nav_state = {
     "ch03_active":   False,
     "game_running":  False,
@@ -2970,7 +3022,7 @@ def _xi_nav_worker():
         try:
             pygame.event.post(pygame.event.Event(
                 pygame.KEYDOWN,
-                key=key, mod=0, scancode=0, unicode="", synthetic=True
+                key=key, mod=0, scancode=0, unicode="", synthetic=True, controller=True
             ))
         except Exception as e:
             log.warning("Failed to post synthetic KEYDOWN for ch03 nav key %s: %s", key, e)
@@ -2979,7 +3031,7 @@ def _xi_nav_worker():
         try:
             pygame.event.post(pygame.event.Event(
                 pygame.KEYUP,
-                key=key, mod=0, scancode=0, unicode="", synthetic=True
+                key=key, mod=0, scancode=0, unicode="", synthetic=True, controller=True
             ))
         except Exception as e:
             log.warning("Failed to post synthetic KEYUP for ch03 nav key %s: %s", key, e)
@@ -3030,7 +3082,8 @@ def _xi_nav_worker():
             nav_mask |= _mapped_bit
         nav_bits = buttons & nav_mask
 
-        if _xi_nav_state.get("dvd_active", False):
+        # WARNING: dvd_in_menu is also true while a DVD Yes / No confirm is open, so left and right pick the answer instead of seeking.
+        if _xi_nav_state.get("dvd_active", False) and not _xi_nav_state.get("dvd_in_menu", False):
             _xi_nav_state["dvd_left_held"]  = bool(nav_bits & _XI_LEFT)
             _xi_nav_state["dvd_right_held"] = bool(nav_bits & _XI_RIGHT)
         else:
@@ -3173,6 +3226,11 @@ class ExternalGameDeck:
 
         self._romlist_error_msg   = ""
         self._romlist_error_until = 0
+        self._drive_launch_failed = {}
+        self._scan_revalidating   = False
+        self._scan_path           = ""
+        self._console_read_ahead_at = -1_000_000
+        self._console_warm_done   = set()
 
         self._rom_hold = _nav.HoldState()
 
@@ -3850,8 +3908,8 @@ class ExternalGameDeck:
             _main = _sys.modules.get("__main__")
             if _main and hasattr(_main, "db") and _main.db:
                 return bool(_main.db.config.get("fake_43_border_enabled", False))
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._outer_tv_bezel_blocks_console_bezel: import sys as _sys", _swallowed_error)
         return False
 
     def _blit_libretro_frame(self, screen, surf, dest_rect):
@@ -3919,7 +3977,8 @@ class ExternalGameDeck:
             if not _main.db.config.get("warp_screen_enabled", False) or _main._feature_locked("warp_screen_enabled"):
                 return False
             return True
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_console_bezel_shader_enabled: import sys as _sys", _swallowed_error)
             return False
 
     def _draw_console_bezel_channel_led(self, screen, border_rect):
@@ -3993,8 +4052,8 @@ class ExternalGameDeck:
                     _bezel_bar_fn = getattr(_main_gd, "_video_bar_color", None)
                     if callable(_bezel_bar_fn):
                         _bezel_bar_color = _bezel_bar_fn()
-                except Exception:
-                    pass
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._blit_bordered_cached: _main_gd = sys.modules.get('__main__')", _swallowed_error)
                 screen.fill(_bezel_bar_color, (inner_x, inner_y, inner_w, inner_h))
             if _fit_w > 0 and _fit_h > 0:
                 _gft_t0 = time.perf_counter()
@@ -4384,7 +4443,7 @@ class ExternalGameDeck:
             self.rom_index += 1
 
     def _poll_dvd_hold(self):
-        if self.dvd_in_menu:
+        if self.dvd_in_menu or getattr(self, "dvd_exit_confirm", False) or getattr(self, "dvd_return_menu_confirm", False):
             self._dvd_skip_hold_start = 0
             self._dvd_skip_dir = 0
             return
@@ -4717,6 +4776,14 @@ class ExternalGameDeck:
         return 0
 
     def _dvd_folder_has_content(self, folder_path, exts):
+        _memo = _media_listing.listing_dvd_has_content_get(folder_path)
+        if _memo is not None:
+            return _memo
+        _answer = self._dvd_folder_has_content_live(folder_path, exts)
+        _media_listing.listing_dvd_has_content_put(folder_path, _answer)
+        return _answer
+
+    def _dvd_folder_has_content_live(self, folder_path, exts):
         try:
             with os.scandir(folder_path) as it:
                 for entry in it:
@@ -4758,6 +4825,7 @@ class ExternalGameDeck:
 
     def add_manual_roms(self, console, paths):
         """Append file paths to this console's manually-added ROM list."""
+        _media_listing.listing_cache_invalidate()
         existing_paths = set(self.console_roms_manual.get(console, []))
         existing_titles = {self._normalize_rom_title(p) for p in existing_paths}
 
@@ -4767,8 +4835,8 @@ class ExternalGameDeck:
                 for entry in os.scandir(rom_dir):
                     if entry.is_file():
                         existing_titles.add(self._normalize_rom_title(entry.name))
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck.add_manual_roms: rom_dir = self._get_console_rom_dir(console)", _swallowed_error)
 
         new_paths = []
         skipped = 0
@@ -4790,7 +4858,7 @@ class ExternalGameDeck:
             self.console_roms_manual[console].extend(new_paths)
         return len(new_paths), skipped
 
-    def bulk_scan_for_roms(self, parent_folder, max_depth=4, progress_cb=None):
+    def bulk_scan_for_roms(self, parent_folder, max_depth=4, progress_cb=None, cancel_cb=None, commit_cb=None):
         """"Scan For Roms": walk `parent_folder` for console-named subfolders and collect their ROMs."""
         matches = {}
         unresponsive_roots = set()
@@ -4829,7 +4897,8 @@ class ExternalGameDeck:
                 return
             try:
                 entries = list(os.scandir(folder))
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_iter_matched_folders: entries = list(os.scandir(folder))", _swallowed_error)
                 return
             for entry in entries:
                 try:
@@ -4841,6 +4910,8 @@ class ExternalGameDeck:
         candidates_by_folder = []
         total = 0
         for folder, console in _iter_matched_folders(parent_folder, 0):
+            if cancel_cb is not None and cancel_cb():
+                return {}, []
             files = _candidate_files(folder, console)
             if files:
                 candidates_by_folder.append((console, files))
@@ -4853,6 +4924,8 @@ class ExternalGameDeck:
         for console, files in candidates_by_folder:
             kept = []
             for full_path in files:
+                if cancel_cb is not None and cancel_cb():
+                    return {}, []
                 ext = os.path.splitext(full_path)[1].lower()
                 if ext not in (".zip", ".7z", ".rar") or _archive_matches_console(full_path, console):
                     kept.append(full_path)
@@ -4862,6 +4935,8 @@ class ExternalGameDeck:
             if kept:
                 matches.setdefault(console, []).extend(kept)
 
+        if commit_cb is not None and not commit_cb():
+            return {}, []
         results = {}
         for console, paths in matches.items():
             n_added, n_skipped = self.add_manual_roms(console, paths)
@@ -4882,7 +4957,8 @@ class ExternalGameDeck:
                 return
             try:
                 entries = list(os.scandir(folder))
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_walk: entries = list(os.scandir(folder))", _swallowed_error)
                 return
             for entry in entries:
                 try:
@@ -4962,8 +5038,8 @@ class ExternalGameDeck:
         is_background = self._scan_is_background
         self._scan_is_background = False
 
-        if console == "DVD":
-            self.dvd_last_dir = target_folder
+        if console == "DVD" and target_folder == "":
+            self.dvd_last_dir = ""
 
         exts = ROM_EXTENSIONS.get(console, [])
 
@@ -4982,6 +5058,7 @@ class ExternalGameDeck:
                         self.roms.append((f"[DRIVE] {shown} ({letter})", drive))
                 else:
                     self.roms.append((f"[DRIVE] {drive}", drive))
+            self.roms = self._without_failed_drives(self.roms)
             self.status_msg = ""
             self._scan_pending = False
             if self.roms:
@@ -4995,6 +5072,17 @@ class ExternalGameDeck:
         req_id = self._scan_request_id
         with self._scan_lock:
             self._scan_result = None
+        self._scan_revalidating = False
+        self._scan_path = target_folder
+        if not is_background and not _media_listing.is_drive_held(target_folder):
+            _cached = _media_listing.listing_cache_get(self._listing_kind(console), target_folder)
+            if _cached is not None:
+                self.roms = self._without_failed_drives(_cached[0])
+                self.status_msg = ""
+                self.rom_index = self._first_content_index()
+                self.rom_scroll = 0
+                self._scan_revalidating = True
+                is_background = True
         self._scan_pending = True
         self._scan_started_ticks = pygame.time.get_ticks()
         self._pending_scan_is_background = is_background
@@ -5019,10 +5107,28 @@ class ExternalGameDeck:
         cleaned = re.sub(r"\s{2,}", " ", cleaned)
         return cleaned if cleaned else name
 
-    def _scan_roms_worker(self, req_id, console, target_folder, exts):
-        roms = []
-        status_msg = ""
+    @staticmethod
+    def _listing_kind(console):
+        return "deck:" + str(console)
 
+    def _back_entries_for(self, console, target_folder):
+        """Returns the way-back line for a folder list (none at the top); it needs no disk access, so a dead folder still has a way out."""
+        if console == "DVD":
+            if not target_folder:
+                return []
+            if len(os.path.abspath(target_folder).strip("\\")) == 2:
+                return [("[.. BACK TO THIS PC]", "")]
+            parent_path = os.path.dirname(target_folder.rstrip("\\"))
+            if parent_path.endswith(":"):
+                parent_path += "\\"
+            return [("[.. BACK TO PREVIOUS FOLDER]", parent_path)]
+        fallback_root = self._get_console_rom_dir(console)
+        if os.path.abspath(target_folder) != os.path.abspath(fallback_root):
+            return [("[.. BACK TO PREVIOUS FOLDER]", os.path.dirname(target_folder))]
+        return []
+
+    def _manual_entries_for(self, console, target_folder):
+        """Returns the manually added ROM entries shown at the top of a console's own ROM folder."""
         manual_entries = []
         if console != "DVD":
             manual_paths = self.console_roms_manual.get(console, [])
@@ -5042,6 +5148,14 @@ class ExternalGameDeck:
                             manual_entries.append((shown, p))
                             continue
                         manual_entries.append((clean_name, p))
+        return manual_entries
+
+    def _scan_roms_worker(self, req_id, console, target_folder, exts):
+        roms = []
+        status_msg = ""
+        status = "ok"
+
+        manual_entries = self._manual_entries_for(console, target_folder)
 
         try:
             if _gd_is_drive_responsive(target_folder) and os.path.exists(target_folder):
@@ -5102,10 +5216,13 @@ class ExternalGameDeck:
 
                 roms = dir_entries + manual_entries + file_entries
                 status_msg = "" if roms else f"No files found in: {console}"
-            elif manual_entries:
-                roms = manual_entries
-                status_msg = ""
+            else:
+                status = "unresponsive" if not _gd_is_drive_responsive(target_folder) else "missing"
+                roms = self._back_entries_for(console, target_folder) + manual_entries
+                status_msg = {"unresponsive": "Folder not responding", "missing": "Folder not found"}[status]
         except Exception as e:
+            status = "error"
+            roms = self._back_entries_for(console, target_folder) + manual_entries
             status_msg = "Access Error"
             log.warning(f"[GAMEDECK CRITICAL BUG] Directory index scan failed! Error details: {e}")
         else:
@@ -5114,9 +5231,11 @@ class ExternalGameDeck:
                       f"{target_folder!r} -- nothing to scan (check the console's ROM folder "
                       f"was actually created / spelled correctly under main/roms/{console})")
 
+        if status == "ok":
+            _media_listing.listing_cache_put(self._listing_kind(console), target_folder, roms)
         with self._scan_lock:
             if req_id == self._scan_request_id:
-                self._scan_result = (roms, status_msg)
+                self._scan_result = (roms, status_msg, status)
 
     def _refresh_dvd_root_labels(self):
         if self.active_console != "DVD" or self.current_browse_dir != "":
@@ -5138,8 +5257,20 @@ class ExternalGameDeck:
             result = self._scan_result
 
         if result is not None:
-            roms, status_msg = result
+            roms, status_msg, *_rest = result
+            status = _rest[0] if _rest else "ok"
+            if status != "ok":
+                self._scan_pending = False
+                self._scan_revalidating = False
+                self._push_out_of_list(status, roms)
+                return
+            roms = self._without_failed_drives(roms)
             is_background = getattr(self, "_pending_scan_is_background", False)
+            if self.active_console == "DVD":
+                self.dvd_last_dir = self.current_browse_dir
+            if self._scan_revalidating:
+                self._scan_revalidating = False
+                self._read_ahead_after_list(roms)
 
             if is_background:
                 old_path = None
@@ -5173,7 +5304,104 @@ class ExternalGameDeck:
         if elapsed > self._scan_timeout_ms:
             self._scan_request_id += 1
             self._scan_pending = False
+            self._scan_revalidating = False
             pygame.event.clear(pygame.KEYDOWN)
+            self._push_out_of_list("unresponsive")
+
+    def _read_ahead_after_list(self, roms):
+        """Reads ahead the first sub-folders of the list that just landed."""
+        _dirs = [{"type": "dir", "path": p} for (n, p) in roms if p and str(n).startswith("[DIR] ")]
+        console = self.active_console
+        _media_listing.listing_read_ahead_subfolders(
+            self._listing_kind(console), _dirs, lambda path: self._list_for_read_ahead(console, path))
+
+    def _list_for_read_ahead(self, console, path):
+        """Builds a folder's list on the read-ahead thread; the same worker the screen uses, run in place."""
+        return self._scan_folder_entries(console, path, ROM_EXTENSIONS.get(console, []))
+
+    def _scan_folder_entries(self, console, target_folder, exts):
+        """Lists one folder as ROM-list entries and returns (entries, status) without touching the screen's state."""
+        if not _gd_is_drive_responsive(target_folder):
+            return [], "unresponsive"
+        if not os.path.isdir(target_folder):
+            return [], "missing"
+        entries = self._back_entries_for(console, target_folder)
+        file_entries = []
+        try:
+            with os.scandir(target_folder) as _it:
+                scanned = sorted(_it, key=lambda e: e.name.lower())
+            for entry in scanned:
+                if entry.name.startswith(("$", ".")):
+                    continue
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if is_dir:
+                    if console == "DVD" and self._dvd_folder_has_content(entry.path, set(exts)):
+                        entries.append((f"[DIR] {entry.name}", entry.path))
+                    continue
+                base_name_only, ext_only = os.path.splitext(entry.name)
+                if not exts or str(ext_only).lower() in exts:
+                    if (console != "DVD" and str(ext_only).lower() in (".zip", ".7z", ".rar")
+                            and not _archive_matches_console(entry.path, console)):
+                        continue
+                    shown = (self._clean_rom_display_name(str(base_name_only)) if console != "DVD" else str(base_name_only))
+                    file_entries.append((shown, entry.path))
+        except OSError as e:
+            log.warning("[LISTING] _scan_folder_entries(%s): reading %r failed: %s", console, target_folder, e)
+            return [], "error"
+        if console == "PSX" and file_entries:
+            cue_stems = {os.path.splitext(os.path.basename(p))[0].lower() for _n, p in file_entries if os.path.splitext(p)[1].lower() == ".cue"}
+            if cue_stems:
+                file_entries = [(n, p) for n, p in file_entries
+                                if not (os.path.splitext(p)[1].lower() == ".bin" and os.path.splitext(os.path.basename(p))[0].lower() in cue_stems)]
+        return entries + self._manual_entries_for(console, target_folder) + file_entries, "ok"
+
+    def _push_out_of_list(self, status, roms=None):
+        """A list that did not load: a drive that does not answer is hidden and retested and you are moved out of it; a missing or unreadable folder moves you up one folder; a banner says why."""
+        console = self.active_console
+        folder = self.current_browse_dir
+        if not console:
+            return
+        if status == "unresponsive":
+            _media_listing.hold_drive(folder or self._scan_path)
+            self._romlist_error_msg = "Drive not responding"
+        else:
+            self._romlist_error_msg = "Folder not found" if status == "missing" else "Access Error"
+        self._romlist_error_until = pygame.time.get_ticks() + int(float(getattr(_gov, "LISTING_PUSH_OUT_BANNER_SECONDS", 4.0)) * 1000)
+        root_dir = "" if console == "DVD" else self._get_console_rom_dir(console)
+        if status == "unresponsive" or not folder:
+            target = root_dir
+        else:
+            target = os.path.dirname(folder.rstrip("\\/")) or root_dir
+            while (target and target != root_dir and not (_gd_is_drive_responsive(target) and os.path.isdir(target))):
+                nxt = os.path.dirname(target)
+                if nxt == target:
+                    target = root_dir
+                    break
+                target = nxt
+        log.warning("[LISTING] %s list pushed out of %r (%s)", console, folder, status)
+        if target == folder:
+            _usable_manual = [p for (n, p) in (roms or []) if p and not str(n).startswith(("[..", "[OFFLINE]", "[MISSING]")) and _gd_is_drive_responsive(p)]
+            if console != "DVD" and not _usable_manual:
+                self.mode = "BROWSE"
+                self.roms = []
+                self.rom_index = 0
+                self.rom_scroll = 0
+                return
+            self._set_unreadable_list(console, folder, status, roms)
+            return
+        self.current_browse_dir = target
+        self._scan_roms(console)
+        self._snap_rom_cursor_if_scan_landed()
+
+    def _set_unreadable_list(self, console, folder, status, roms=None):
+        """Keeps a way back, and any manual ROMs the worker found, on screen when there is nowhere higher to go."""
+        self.roms = list(roms) if roms else self._back_entries_for(console, folder)
+        self.status_msg = {"unresponsive": "Folder not responding", "missing": "Folder not found"}.get(status, "Access Error")
+        self.rom_index = 0
+        self.rom_scroll = 0
 
     def _poll_live_rescan(self):
         if self._scan_pending or not self.active_console:
@@ -5220,7 +5448,8 @@ class ExternalGameDeck:
             return
 
         if display_name.startswith("[DVD] "):
-            self._start_dvd_playback(full_path)
+            if not self._dvd_launch_blocked_by_drive(full_path):
+                self._start_dvd_playback(full_path)
             pygame.event.clear(pygame.KEYDOWN)
             return
 
@@ -5232,11 +5461,13 @@ class ExternalGameDeck:
 
         console = self.active_console
         if console == "DVD":
-            self._start_dvd_playback(full_path)
+            if not self._dvd_launch_blocked_by_drive(full_path):
+                self._start_dvd_playback(full_path)
             pygame.event.clear(pygame.KEYDOWN)
             return
 
         if not _gd_is_drive_responsive(full_path):
+            self.note_drive_launch_failure(full_path)
             self._romlist_error_msg   = "Drive not responding — can't launch this rom right now"
             self._romlist_error_until = pygame.time.get_ticks() + 4000
             pygame.event.clear(pygame.KEYDOWN)
@@ -6085,6 +6316,7 @@ class ExternalGameDeck:
             if not vk:
                 return
             inp = _INPUT()
+            bridge_note_key(vk, key_up)
             inp.type       = INPUT_KEYBOARD
             inp._.ki.wVk   = vk
             inp._.ki.dwFlags = KEYEVENTF_KEYUP if key_up else 0
@@ -6125,7 +6357,9 @@ class ExternalGameDeck:
             time.sleep(0.016)
 
             _main_mod = sys.modules.get("__main__")
-            _overlay_open = bool(_main_mod and getattr(_main_mod, "app_state", None) and (
+            _off_game_channel = bool(_main_mod and getattr(_main_mod, "app_state", None)
+                                     and _main_mod.app_state.get("current_channel") != "03")
+            _overlay_open = _off_game_channel or bool(_main_mod and getattr(_main_mod, "app_state", None) and (
                 _main_mod.app_state.get("show_menu", False) or
                 _main_mod.app_state.get("show_splash", False) or
                 _main_mod.app_state.get("show_quit_confirm", False) or
@@ -6367,6 +6601,7 @@ class ExternalGameDeck:
             inputs = []
             for vk in sorted(vk_codes):
                 inp = _IN()
+                bridge_note_key(vk, True)
                 inp.type = INPUT_KEYBOARD
                 inp._.ki.wVk = vk
                 inp._.ki.dwFlags = KEYEVENTF_KEYUP
@@ -7556,8 +7791,8 @@ class ExternalGameDeck:
                     if (bounds.width > 0 and bounds.height > 0
                             and (bounds.width != raw.get_width() or bounds.height != raw.get_height())):
                         raw = raw.subsurface(bounds).copy()
-                except Exception:
-                    pass
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._get_boxed_logo: bounds = raw.get_bounding_rect(min_alpha=10)", _swallowed_error)
             self._header_logo_raw_cache[console] = raw
 
         surf = None
@@ -7685,6 +7920,8 @@ class ExternalGameDeck:
             return
 
         if self.mode == "BROWSE":
+            self._poll_console_read_ahead()
+            self._draw_romlist_error_banner(screen, rect[0] + rect[2] // 2, rect[1] + 10)
             if self.scroll_style == "side":
                 self._render_console_side(screen, rect)
             elif self.scroll_style == "updown":
@@ -7692,6 +7929,34 @@ class ExternalGameDeck:
             else:
                 self._render_carousel(screen, rect)
         elif self.mode == "ROMLIST": self._render_romlist(screen, rect)
+
+    def _poll_console_read_ahead(self):
+        """While the console list shows, reads each console's ROM folder ahead (the governor's count and interval) and builds the console pictures at the sizes already in use, one console per frame."""
+        now = pygame.time.get_ticks()
+        every = int(float(getattr(_gov, "LISTING_CONSOLE_READ_AHEAD_SECONDS", 30.0)) * 1000)
+        if now - self._console_read_ahead_at >= every:
+            self._console_read_ahead_at = now
+            limit = int(getattr(_gov, "LISTING_CONSOLE_READ_AHEAD_MAX", 24))
+            for console in list(self.consoles)[:limit]:
+                if console == "DVD":
+                    continue
+                folder = self._get_console_rom_dir(console)
+                _exts = ROM_EXTENSIONS.get(console, [])
+                _media_listing.listing_read_ahead(
+                    self._listing_kind(console), [folder],
+                    lambda path, c=console, e=_exts: self._scan_folder_entries(c, path, e))
+        for console in list(self.consoles):
+            if console in self._console_warm_done:
+                continue
+            self._console_warm_done.add(console)
+            try:
+                for h in list(self._logo_cache.get(next(iter(self._logo_cache), console), {}).keys())[:3]:
+                    self._get_logo(console, h)
+                for (bw, bh) in list(self._boxed_logo_cache.get(next(iter(self._boxed_logo_cache), console), {}).keys())[:3]:
+                    self._get_boxed_logo(console, bw, bh)
+            except Exception as e:
+                log.warning("[LISTING] _poll_console_read_ahead: warming pictures for %s failed: %s", console, e)
+            break
 
     def _render_carousel(self, screen, rect):
         x, y, w, h = rect
@@ -7839,8 +8104,8 @@ class ExternalGameDeck:
             lbl = self._font_mid.render(self._romlist_error_msg, True, (255, 90, 90))
             lbl.set_alpha(alpha)
             screen.blit(lbl, (cx - lbl.get_width() // 2, top_y + 6))
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._draw_romlist_error_banner: FADE_MS = 500", _swallowed_error)
 
     def _draw_romlist_console_arrows(self, screen, x, y, w, h, list_top_offset, groups=None):
         cx = x + w // 2
@@ -8165,15 +8430,15 @@ class ExternalGameDeck:
                     _main = _sys.modules.get("__main__")
                     if _main and getattr(_main, "db", None) is not None:
                         _dvd_mode = _main.db.config.get("dvd_screen_mode", "normal")
-                except Exception:
-                    pass
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._render_dvd_splash_video_frame: import sys as _sys", _swallowed_error)
                 _main_blit = None
                 try:
                     import sys as _sys
                     _main = _sys.modules.get("__main__")
                     _main_blit = getattr(_main, "_blit_video_with_screen_mode", None)
-                except Exception:
-                    pass
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._render_dvd_splash_video_frame: import sys as _sys", _swallowed_error)
                 if callable(_main_blit):
                     _sp_target, _sp_pa = self._dvd_video_fit(screen, surf, pygame.Rect(x, y, w, h), _dvd_mode)
                     _sp_kw = {}
@@ -8340,8 +8605,8 @@ class ExternalGameDeck:
                         _tj_title_now = getattr(vlc, "_current_title", None)
                         try:
                             _tj_title_is_menu = vlc._title_is_menu(_tj_title_now)
-                        except Exception:
-                            pass
+                        except Exception as _swallowed_error:
+                            _log_swallowed("ExternalGameDeck._render_dvd_player: _tj_title_is_menu = vlc._title_is_menu(_tj_title_now)", _swallowed_error)
                         _tj_overridden = False
                         if _tj_title_is_menu is False and _tj_title_now is not None:
                             try:
@@ -8359,8 +8624,8 @@ class ExternalGameDeck:
                             _tail = vlc.get_recent_vlc_log()
                             if _tail:
                                 pass
-                        except Exception:
-                            pass
+                        except Exception as _swallowed_error:
+                            _log_swallowed("ExternalGameDeck._render_dvd_player: _tail = vlc.get_recent_vlc_log()", _swallowed_error)
                 self._dvd_jump_watch_wall = _t_now_wall
                 self._dvd_jump_watch_pos = _t_pos
             except Exception as _e:
@@ -8414,6 +8679,8 @@ class ExternalGameDeck:
                         self.dvd_in_menu = False
                         self._close_dvd_highlight_shadow()
                         self.mode = "ROMLIST"
+                        if not _gd_is_drive_responsive(self.dvd_file_path):
+                            self.note_drive_launch_failure(self.dvd_file_path)
                         _err_lower = (_vlc_err or "").lower() + " " + (_vlc_log_tail or "").lower()
                         if "css" in _err_lower or "scrambl" in _err_lower or "decrypt" in _err_lower:
                             self.status_msg = "Disc is CSS-encrypted -- libdvdcss missing (see log)"
@@ -8468,8 +8735,8 @@ class ExternalGameDeck:
                             _tail = vlc.get_recent_vlc_log()
                             if _tail:
                                 pass
-                        except Exception:
-                            pass
+                        except Exception as _swallowed_error:
+                            _log_swallowed("ExternalGameDeck._render_dvd_player: _tail = vlc.get_recent_vlc_log()", _swallowed_error)
                         self.dvd_playback_active = False
                         self.dvd_splash_done     = False
                         self.dvd_paused_frame    = None
@@ -9087,6 +9354,7 @@ class ExternalGameDeck:
         with self._libretro_launch_lock:
             self._libretro_launch_result = None
         self._libretro_launch_pending = True
+        self._libretro_launch_path = rom_path
         self._libretro_launch_thread = threading.Thread(
             target=self._launch_libretro_worker,
             args=(req_id, console, rom_path, _display_name, _reuse_core),
@@ -9120,6 +9388,7 @@ class ExternalGameDeck:
                 core.set_variable("mgba_sgb_borders", "OFF")
 
             if not _gd_is_drive_responsive(extracted):
+                result["drive_failed_path"] = extracted
                 result["error"] = f"Drive not responding: {display_name}"
                 self._publish_libretro_launch_result(result)
                 return
@@ -9185,7 +9454,8 @@ class ExternalGameDeck:
             _stale_core = result.get("core")
             if _stale_core is not None:
                 try: _stale_core.unload()
-                except Exception: pass
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._poll_libretro_launch: _stale_core.unload()", _swallowed_error)
             return False
 
         if "error" in result:
@@ -9193,6 +9463,8 @@ class ExternalGameDeck:
             self.emulator_loading = False; self._libretro_loading = False
             self._libretro_rom_path = ""
             self.mode = "ROMLIST"
+            if result.get("drive_failed_path"):
+                self.note_drive_launch_failure(result["drive_failed_path"])
             self._romlist_error_msg   = result["error"]
             self._romlist_error_until = pygame.time.get_ticks() + 4000
             return False
@@ -9279,6 +9551,7 @@ class ExternalGameDeck:
                       f"{elapsed}ms waiting on core.load_rom() -- likely a stalled "
                       f"drive; abandoning the launch.")
                 _abandoned_req_id = self._libretro_launch_request_id
+                self.note_drive_launch_failure(getattr(self, "_libretro_launch_path", "") or self._libretro_rom_path)
                 self._libretro_launch_request_id += 1
                 self._libretro_launch_pending = False
                 self.emulator_loading  = False
@@ -9795,25 +10068,70 @@ class ExternalGameDeck:
             self._scan_roms(self.active_console)
         self.rom_index = 0; self.rom_scroll = 0
 
-    def return_active_rom_to_list_for_drive_failure(self):
-        """Stop a loaded libretro ROM whose source drive has failed."""
-        if (self.mode != "GAME"
-                or getattr(self, "emulator_loading", False)
-                or not self._libretro_rom_path):
+    def note_drive_launch_failure(self, path):
+        """Records that a launch or a running game from this path's drive failed and went back to the list."""
+        _root = _gd_drive_root_of(path)
+        if _root and path:
+            self._drive_launch_failed[_root] = str(path)
+
+    def drive_launch_failures(self):
+        """Returns a copy of the failed drive roots, each with the file whose launch failed."""
+        return dict(self._drive_launch_failed)
+
+    def clear_drive_launch_failure(self, root):
+        """Forgets a failed drive root once the drive is confirmed back."""
+        self._drive_launch_failed.pop(root, None)
+
+    def _without_failed_drives(self, roms):
+        """Hides the entries that sit on a drive that failed; the back entries stay."""
+        _failed = self._drive_launch_failed
+        _held = set(_media_listing.held_drive_roots())
+        if not _failed and not _held:
+            return roms
+        return [(n, p) for (n, p) in roms
+                if str(n).startswith("[..") or not p
+                or (_gd_drive_root_of(p) not in _failed and _gd_drive_root_of(p) not in _held)]
+
+    def leave_list_of_failed_drive(self, failed_roots):
+        """Takes the list screen off a drive that failed, hides that drive and notes the failure for the banner."""
+        # WARNING: acts only in the ROM and DVD list; a running game or DVD is never touched, and a drive that returns is listed again by the live rescan once the failure is cleared.
+        if self.mode != "ROMLIST" or not self.active_console or not failed_roots:
             return False
-        core = self._libretro_core
-        if core is None or not getattr(core, "is_loaded", False):
+        _console = self.active_console
+        _browse = self.current_browse_dir
+        if not _browse and _console != "DVD":
+            _browse = self._get_console_rom_dir(_console)
+        _bad = None
+        if _browse:
+            _root = _gd_drive_root_of(_browse)
+            if _root in failed_roots and _root not in self._drive_launch_failed:
+                _bad = (_root, _browse)
+        else:
+            for _n, _p in self.roms:
+                _root = _gd_drive_root_of(_p) if _p and not str(_n).startswith("[..") else None
+                if _root in failed_roots and _root not in self._drive_launch_failed:
+                    _bad = (_root, _p)
+                    break
+        if _bad is None:
             return False
-        rom_name = os.path.basename(self._libretro_rom_path) or "this ROM"
-        try:
-            self._libretro_quit_to_romlist(core)
-        except Exception as e:
-            log.warning("[LIBRETRO] Failed returning to ROM list after drive failure: %s", e)
-            return False
-        self._romlist_error_msg = (
-            f"Drive not responding — can't continue {rom_name}"
-        )
+        self.note_drive_launch_failure(_bad[1])
+        if _browse:
+            self.current_browse_dir = "" if _console == "DVD" else self._get_console_rom_dir(_console)
+        self._romlist_error_msg   = "Drive not responding"
         self._romlist_error_until = pygame.time.get_ticks() + 4000
+        log.warning("[DRIVE HEALTH] %s list left: drive %s failed, hidden until it returns", _console, _bad[0])
+        self._scan_roms(_console)
+        self._snap_rom_cursor_if_scan_landed()
+        return True
+
+    def _dvd_launch_blocked_by_drive(self, path):
+        """Stops a DVD or media player launch from a drive that is not responding and keeps the list on screen."""
+        if _gd_is_drive_responsive(path):
+            return False
+        self.note_drive_launch_failure(path)
+        self._romlist_error_msg   = "Drive not responding — can't play this right now"
+        self._romlist_error_until = pygame.time.get_ticks() + 4000
+        log.warning("[DVD] Launch stopped, drive not responding: %s", path)
         return True
 
     def set_libretro_volume(self, volume_pct, muted=False):
@@ -9867,8 +10185,8 @@ def _active_game_screen_mode():
         if _main and hasattr(_main, "db") and _main.db:
             mode = _main.db.config.get("game_screen_mode", "normal")
             return mode if mode == "stretch" else "normal"
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_active_game_screen_mode: import sys as _sys", _swallowed_error)
     return "normal"
 
 
@@ -9878,7 +10196,8 @@ def _dvd_captions_locked():
         import sys as _sys
         _fn = getattr(_sys.modules.get("__main__"), "_feature_locked", None)
         return bool(_fn and _fn("dvd_captions_enabled"))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_dvd_captions_locked: import sys as _sys", _swallowed_error)
         return False
 
 

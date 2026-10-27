@@ -35,6 +35,18 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+try:
+    from performance_governor import log_swallowed as _log_swallowed
+except Exception:
+    def _log_swallowed(where, error):
+        """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
+        return None
+
+
 SELECTION_BORDER_WIDTH = 3
 
 def _media_warning(_key, message, *args):
@@ -420,6 +432,41 @@ def guide_display_title(entry):
     return (series + " — " + episode) if series else episode
 
 
+def guide_pair_title(entry):
+    """Build the guide title of a cell that combines two episodes: both episodes by name as 'A + B', the series written once when both belong to it, and never one name standing for two episodes."""
+    if not isinstance(entry, dict):
+        return clean_video_display_title(entry)
+    parts = []
+    for key in ("pair_ep1", "pair_ep2"):
+        episode = entry.get(key)
+        path = entry.get(key + "_path", "")
+        if isinstance(episode, dict):
+            piece = dict(episode)
+            piece.setdefault("path", path)
+        else:
+            piece = {"path": path}
+        if piece.get("path"):
+            parts.append(piece)
+    if not parts:
+        return guide_display_title(entry)
+    titles = [guide_display_title(piece) for piece in parts]
+    if len(titles) == 1:
+        return titles[0]
+    separator = " — "
+    first, second = titles
+    if first == second:
+        labels = [_episode_label(piece.get("path", "")) for piece in parts]
+        if all(labels) and labels[0] != labels[1]:
+            return first + separator + labels[0] + " + " + labels[1]
+        return first + " + " + second
+    if separator in first and separator in second:
+        series_1, episode_1 = first.split(separator, 1)
+        series_2, episode_2 = second.split(separator, 1)
+        if series_1 == series_2:
+            return series_1 + separator + episode_1 + " + " + episode_2
+    return first + " + " + second
+
+
 # ============================================================================
 # SECTION: Shared video effects
 # ============================================================================
@@ -460,7 +507,8 @@ def _fx_channel_offsets(surf):
             return None
         offs = tuple(sh // 8 for sh in shifts)
         return offs if sorted(offs) == [0, 1, 2] else None
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_fx_channel_offsets: return None", _swallowed_error)
         return None
 
 
@@ -652,6 +700,10 @@ _FAST_DISK_IO_SEMAPHORE = threading.BoundedSemaphore(FAST_DISK_IO_MAX_CONCURRENT
 LOUDNESS_PROBE_MAX_CONCURRENT = 2
 _LOUDNESS_PROBE_SEMAPHORE = threading.BoundedSemaphore(LOUDNESS_PROBE_MAX_CONCURRENT)
 
+# VALUES CHANGE HERE (fallback only; the governor's FIRST_START_PRIORITY_DISK_SLOTS sets it when the governor loads)
+_FAST_DISK_IO_PRIORITY_SLOTS = 3
+_FAST_DISK_IO_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(_FAST_DISK_IO_PRIORITY_SLOTS)
+
 _LOUDNESS_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(1)
 _LOUDNESS_PARALLEL_SEMAPHORE = threading.BoundedSemaphore(8)
 
@@ -675,6 +727,9 @@ def set_live_playback_priority(active):
 def _yield_to_live_playback(label=""):
     """Wait, bounded, for a live channel change to finish opening its file before a background disk read starts."""
     if not _LIVE_PLAYBACK_PRIORITY.is_set():
+        return
+    # WARNING: first-scan work in a priority scope is the live open itself and must never wait on the flag it is clearing.
+    if _perf_governor is not None and _perf_governor.in_priority_scope():
         return
     _wait_start = _now_ms()
     _deadline_ms = _wait_start + (_LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S * 1000)
@@ -713,12 +768,17 @@ def _fast_disk_io_slot(label=""):
     """Like `with _FAST_DISK_IO_SEMAPHORE:` but first yields to live playback, then asks the governor to admit the job."""
     _yield_to_live_playback(label)
     _lane = _fast_disk_lane(label)
+    _semaphore = _FAST_DISK_IO_SEMAPHORE
+    # WARNING: first-scan work takes its own disk slots only while the governor says this PC can run the first-start scans together; otherwise it shares the background slots.
+    if (_perf_governor is not None and _perf_governor.in_priority_scope()
+            and _perf_governor.first_start_scans_concurrent()):
+        _semaphore = _FAST_DISK_IO_PRIORITY_SEMAPHORE
     if _lane is None:
-        with _FAST_DISK_IO_SEMAPHORE:
+        with _semaphore:
             yield
         return
     with _gov_gate(_lane, label=label):
-        with _FAST_DISK_IO_SEMAPHORE:
+        with _semaphore:
             yield
 
 
@@ -838,6 +898,13 @@ def request_media_shutdown():
     _media_shutting_down.set()
 
 
+# WARNING: the fallback number must match DRIVE_FAILED_AFTER_MS in performance_governor.py; it is used only when that module fails to import.
+try:
+    from performance_governor import DRIVE_FAILED_AFTER_MS as _DRIVE_FAILED_AFTER_MS
+except Exception as _swallowed_error:
+    _log_swallowed("media drive failed-after tunable: import performance_governor", _swallowed_error)
+    _DRIVE_FAILED_AFTER_MS = 7000
+
 _DRIVE_CHECK_TIMEOUT_MS         = 2500
 # VALUES CHANGE HERE
 _DRIVE_RECHECK_INTERVAL_MS      = 4000
@@ -876,8 +943,10 @@ def _drive_probe_worker(root):
         ok = False
     now_ms = _now_ms()
     with _drive_health_lock:
-        _was_responsive = _drive_health.get(root, {}).get("responsive", True)
-        _drive_health[root] = {"responsive": ok, "checked_at": now_ms, "checking_since": None}
+        _previous = _drive_health.get(root, {})
+        _was_responsive = _previous.get("responsive", True)
+        _since = None if ok else (_previous.get("unresponsive_since") or now_ms)
+        _drive_health[root] = {"responsive": ok, "checked_at": now_ms, "checking_since": None, "unresponsive_since": _since}
     if ok and not _was_responsive:
         log.info("[DRIVE HEALTH] %s recovered", root)
         _purge_stale_negative_cache_for_root(root)
@@ -905,6 +974,7 @@ def _drive_health_monitor_loop():
                         with _drive_health_lock:
                             if _drive_health.get(root, {}).get("checking_since") == checking_since:
                                 _drive_health[root]["responsive"] = False
+                                _drive_health[root]["unresponsive_since"] = now_ms
                                 log.warning(
                                     "[DRIVE HEALTH] %s marked unresponsive -- "
                                     "its own os.path.exists() probe took over "
@@ -945,6 +1015,221 @@ def _unresponsive_drive_roots():
         return sorted(r for r, e in _drive_health.items() if not e.get("responsive", True))
 
 
+def _failed_drive_roots():
+    """The unresponsive drives that have stayed unresponsive for at least _DRIVE_FAILED_AFTER_MS; a drive that is only waking up is not in this list."""
+    now_ms = _now_ms()
+    with _drive_health_lock:
+        return sorted(r for r, e in _drive_health.items()
+                      if not e.get("responsive", True) and now_ms - (e.get("unresponsive_since") or now_ms) >= _DRIVE_FAILED_AFTER_MS)
+
+
+# ============================================================================
+# SECTION: Folder listing cache, read-ahead and drive hold (ROM/DVD lists and the file explorer)
+# ============================================================================
+
+try:
+    import performance_governor as _listing_gov
+except Exception as _swallowed_error:
+    _log_swallowed("media listing cache tunables: import performance_governor", _swallowed_error)
+    _listing_gov = None
+
+
+def _listing_value(name, fallback):
+    """Returns a Folder listing cache value from the governor table, or the fallback when the governor is missing."""
+    return getattr(_listing_gov, name, fallback) if _listing_gov is not None else fallback
+
+
+# WARNING: the fallback numbers must match the LISTING_* rows in performance_governor.py; they are used only when that module fails to import.
+import collections as _listing_collections
+
+_listing_cache = _listing_collections.OrderedDict()
+_listing_cache_lock = threading.Lock()
+_listing_read_ahead_lock = threading.Lock()
+_listing_read_ahead_running = False
+_listing_drive_hold = {}
+_listing_drive_hold_lock = threading.Lock()
+_listing_drive_retest_running = False
+_listing_dvd_content = {}
+
+
+def _listing_key(kind, path):
+    return (str(kind), os.path.normcase(os.path.normpath(str(path))))
+
+
+def listing_cache_get(kind, path):
+    """Returns (items, age_seconds) for a cached folder listing, or None when the folder has not been listed before."""
+    if not path:
+        return None
+    key = _listing_key(kind, path)
+    with _listing_cache_lock:
+        entry = _listing_cache.get(key)
+        if entry is None:
+            return None
+        _listing_cache.move_to_end(key)
+        return list(entry[0]), time.monotonic() - entry[1]
+
+
+def listing_cache_put(kind, path, items):
+    """Stores a successful folder listing; the oldest listings are dropped past the governor's limit."""
+    if not path or items is None:
+        return
+    key = _listing_key(kind, path)
+    with _listing_cache_lock:
+        _listing_cache[key] = (list(items), time.monotonic())
+        _listing_cache.move_to_end(key)
+        limit = int(_listing_value("LISTING_CACHE_MAX_FOLDERS", 400))
+        while len(_listing_cache) > limit:
+            _listing_cache.popitem(last=False)
+
+
+def listing_cache_invalidate(path=None):
+    """Forgets the cached listings of one folder (and its parent), or every listing when no path is given."""
+    with _listing_cache_lock:
+        if not path:
+            _listing_cache.clear()
+            _listing_dvd_content.clear()
+            return
+        target = os.path.normcase(os.path.normpath(str(path)))
+        parent = os.path.normcase(os.path.dirname(os.path.normpath(str(path))))
+        for key in [k for k in _listing_cache if k[1] in (target, parent)]:
+            _listing_cache.pop(key, None)
+        _listing_dvd_content.pop(target, None)
+
+
+def listing_dvd_has_content_get(path):
+    """Returns True or False when a recent "folder has something in it" answer is remembered, else None."""
+    with _listing_cache_lock:
+        entry = _listing_dvd_content.get(os.path.normcase(os.path.normpath(str(path))))
+    if entry is None or time.monotonic() - entry[1] > float(_listing_value("LISTING_DVD_HAS_CONTENT_SECONDS", 30.0)):
+        return None
+    return entry[0]
+
+
+def listing_dvd_has_content_put(path, value):
+    """Remembers a "folder has something in it" answer for the DVD list."""
+    with _listing_cache_lock:
+        _listing_dvd_content[os.path.normcase(os.path.normpath(str(path)))] = (bool(value), time.monotonic())
+
+
+def _is_optical_drive_path(path):
+    """True when the path is on a CD/DVD drive; read-ahead never touches those so a disc is never spun up."""
+    if sys.platform != "win32":
+        return False
+    root = _drive_root_of(path)
+    if not root:
+        return False
+    try:
+        return ctypes.windll.kernel32.GetDriveTypeW(root) == 5
+    except Exception as _swallowed_error:
+        _log_swallowed("_is_optical_drive_path: GetDriveTypeW", _swallowed_error)
+        return False
+
+
+def listing_read_ahead(kind, paths, lister):
+    """Lists each folder of paths in one low-priority background thread and caches the result; skips CD/DVD drives, unresponsive drives and folders already cached fresh; returns True when a thread started."""
+    global _listing_read_ahead_running
+    wanted = []
+    fresh = float(_listing_value("LISTING_CACHE_FRESH_SECONDS", 30.0))
+    for p in paths or []:
+        if not p or _is_optical_drive_path(p) or not _is_drive_responsive(p) or is_drive_held(p):
+            continue
+        hit = listing_cache_get(kind, p)
+        if hit is not None and hit[1] < fresh:
+            continue
+        wanted.append(p)
+    if not wanted:
+        return False
+    with _listing_read_ahead_lock:
+        if _listing_read_ahead_running:
+            return False
+        _listing_read_ahead_running = True
+
+    def _run():
+        global _listing_read_ahead_running
+        try:
+            for p in wanted:
+                if _media_shutting_down.is_set():
+                    return
+                try:
+                    items, status = lister(p)
+                except Exception as e:
+                    _media_warning("listing_read_ahead", "listing_read_ahead: listing %r failed: %s", p, e)
+                    continue
+                if status == "ok":
+                    listing_cache_put(kind, p, items)
+        finally:
+            with _listing_read_ahead_lock:
+                _listing_read_ahead_running = False
+
+    threading.Thread(target=_run, daemon=True, name="listing-read-ahead").start()
+    return True
+
+
+def listing_read_ahead_subfolders(kind, items, lister):
+    """Reads ahead the first sub-folders (the governor's count) of a just-listed folder."""
+    limit = int(_listing_value("LISTING_READ_AHEAD_FOLDERS", 12))
+    dirs = [it.get("path") for it in (items or []) if isinstance(it, dict) and it.get("type") == "dir" and it.get("path")]
+    return listing_read_ahead(kind, dirs[:limit], lister)
+
+
+def hold_drive(path):
+    """Hides a drive from the lists after it failed to answer; a background retest shows it again once it works."""
+    root = _drive_root_of(path)
+    if not root:
+        return
+    global _listing_drive_retest_running
+    with _listing_drive_hold_lock:
+        _listing_drive_hold[root] = time.monotonic()
+        if _listing_drive_retest_running:
+            return
+        _listing_drive_retest_running = True
+    threading.Thread(target=_listing_drive_retest_loop, daemon=True, name="listing-drive-retest").start()
+
+
+def is_drive_held(path):
+    """True while the path's drive is hidden after a push-out."""
+    root = _drive_root_of(path)
+    with _listing_drive_hold_lock:
+        return bool(root) and root in _listing_drive_hold
+
+
+def held_drive_roots():
+    """Returns the drive roots currently hidden after a push-out."""
+    with _listing_drive_hold_lock:
+        return sorted(_listing_drive_hold)
+
+
+def release_drive_hold(root):
+    """Shows a held drive again."""
+    with _listing_drive_hold_lock:
+        _listing_drive_hold.pop(root, None)
+
+
+def _listing_drive_retest_loop():
+    global _listing_drive_retest_running
+    try:
+        while not _media_shutting_down.is_set():
+            with _listing_drive_hold_lock:
+                roots = list(_listing_drive_hold)
+                if not roots:
+                    _listing_drive_retest_running = False
+                    return
+            for root in roots:
+                ok = False
+                try:
+                    ok = os.path.isdir(root)
+                except Exception as e:
+                    _media_warning("listing_drive_retest", "_listing_drive_retest_loop: testing %r failed: %s", root, e)
+                if ok and _is_drive_responsive(root):
+                    release_drive_hold(root)
+                    log.info("[LISTING] %s answers again -- shown in the lists", root)
+            if _media_shutting_down.wait(float(_listing_value("LISTING_DRIVE_RETEST_SECONDS", 5.0))):
+                break
+    finally:
+        with _listing_drive_hold_lock:
+            _listing_drive_retest_running = False
+
+
 import collections
 
 
@@ -959,7 +1244,8 @@ _drive_op_latency_lock = threading.Lock()
 _DRIVE_LATENCY_SAMPLE_WINDOW = 6
 _DRIVE_LATENCY_FIXED_OVERHEAD_MS = 2000
 # VALUES CHANGE HERE
-_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = 100.0
+# VALUES CHANGE HERE (background loudness work backs off only when sustained ffmpeg read cost exceeds this; one slow read is not enough)
+_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = 150.0
 _DRIVE_LATENCY_MIN_SAMPLES = 3
 _DRIVE_LATENCY_SAMPLE_MAX_AGE_MS = 120_000
 
@@ -1115,7 +1401,8 @@ def _win_drive_type_raw(drive_root):
         return None
     try:
         return ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(drive_root))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_win_drive_type_raw: return ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p", _swallowed_error)
         return None
 
 
@@ -1141,14 +1428,16 @@ def _get_volume_label_raw(drive_root):
             return None
         label = vol_buf.value.strip()
         return label or None
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_get_volume_label_raw: vol_buf = ctypes.create_unicode_buffer(261)", _swallowed_error)
         return None
 
 
 def _has_video_ts_raw(drive_root):
     try:
         return os.path.isdir(os.path.join(drive_root, "VIDEO_TS"))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_has_video_ts_raw: return os.path.isdir(os.path.join(drive_root, 'VIDEO_TS'))", _swallowed_error)
         return False
 
 
@@ -1266,7 +1555,6 @@ def _get_duration_probe_slot():
 def _natural_ep_key(item):
     p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
     name = os.path.splitext(os.path.basename(p))[0].lower()
-    # A pilot is the first aired episode, even when the filename has no numeric marker.
     if re.search(r"(?:^|[ ._()\[\]-])pilot(?:$|[ ._()\[\]-])", name):
         return (-1, 0, 0, name)
     m = re.search(r's(\d+)[\s._-]*[ex][\s._-]*(\d+)', name)
@@ -1470,6 +1758,24 @@ def group_shows_flexible(raw_tracks):
     return show_names, {sn: result[sn] for sn in show_names}
 
 
+# ============================================================================
+# SECTION: Runtime-only channel keys
+# ============================================================================
+
+# WARNING: keys listed here exist only while the app runs; a saved copy would show a pick at the next start that nothing will ever commit.
+RUNTIME_ONLY_CHANNEL_KEYS = ("_sched_mode_request",)
+
+
+def without_runtime_channel_keys(channels):
+    """Removes the keys that must never be saved from every channel of a copied channels tree."""
+    if isinstance(channels, dict):
+        for info in channels.values():
+            if isinstance(info, dict):
+                for key in RUNTIME_ONLY_CHANNEL_KEYS:
+                    info.pop(key, None)
+    return channels
+
+
 def _strip_leading_index(name):
     return re.sub(r'^\s*\d+\s*[.)\-_]\s+', '', name).strip()
 
@@ -1521,78 +1827,134 @@ SIX_HOUR_BLOCKS = [
 SIX_HOUR_BLOCK_NAMES = [b[0] for b in SIX_HOUR_BLOCKS]
 
 
-def resolve_track_duration(media_probe_cache, path, stored_duration, default=0):
-    if path:
+# ============================================================================
+# SECTION: Duration reader (schedule hub)
+# ============================================================================
+# WARNING: the fallback numbers must match HUB_* in performance_governor.py; they are used only when that module fails to import.
+try:
+    import performance_governor as _hub_governor
+    HUB_SERIES_ESTIMATE_MIN_SCANNED = int(_hub_governor.HUB_SERIES_ESTIMATE_MIN_SCANNED)
+    HUB_MOVIE_ESTIMATE_SECONDS = int(_hub_governor.HUB_MOVIE_ESTIMATE_SECONDS)
+except Exception:
+    HUB_SERIES_ESTIMATE_MIN_SCANNED = 2
+    HUB_MOVIE_ESTIMATE_SECONDS = 5400
+
+# WARNING: these two words are also what media_library.DurationHub returns; changing one without the other makes every saved length read as unknown.
+DURATION_MEASURED = "measured"
+DURATION_ESTIMATED = "estimated"
+ESTIMATE_BASIS_SERIES_AVERAGE = "series_average"
+ESTIMATE_BASIS_MOVIE_DEFAULT = "movie_default"
+
+_duration_hub = None
+
+
+def set_duration_hub(hub):
+    """Installs the schedule hub's duration reader (a media_library.DurationHub), or removes it when None."""
+    global _duration_hub
+    _duration_hub = hub
+
+
+def get_duration_hub():
+    return _duration_hub
+
+
+def read_track_duration(path, stored_duration):
+    """The one place a file's length is read: returns (seconds, kind) where kind is DURATION_MEASURED (the hub, then the schedule entry's own length), DURATION_ESTIMATED (a saved estimate only) or None."""
+    estimate = None
+    hub = _duration_hub
+    if path and hub is not None:
         try:
-            norm = os.path.normpath(str(path))
-            cached = (media_probe_cache or {}).get(norm)
-            cached_dur = cached.get("duration") if isinstance(cached, dict) else None
-            if cached_dur and cached_dur > 0:
-                return int(cached_dur)
-        except Exception:
-            pass
-    d = stored_duration
-    return d if d and d > 0 else default
+            seconds, kind = hub.read(path)
+            if kind == DURATION_MEASURED:
+                return seconds, DURATION_MEASURED
+            if kind == DURATION_ESTIMATED:
+                estimate = seconds
+        except Exception as _swallowed_error:
+            _log_swallowed("read_track_duration: hub.read(path)", _swallowed_error)
+    if stored_duration and stored_duration > 0:
+        return stored_duration, DURATION_MEASURED
+    if estimate:
+        return estimate, DURATION_ESTIMATED
+    return None, None
 
 
-def track_duration_is_estimated(media_probe_cache, path, stored_duration):
-    """Report whether a resolved duration still came from the fallback."""
+def resolve_track_duration(path, stored_duration, default=0):
+    seconds, kind = read_track_duration(path, stored_duration)
+    return seconds if kind == DURATION_MEASURED else default
+
+
+def track_duration_is_estimated(path, stored_duration):
+    """Report whether a file's length is still unmeasured."""
+    return read_track_duration(path, stored_duration)[1] != DURATION_MEASURED
+
+
+def _guess_class(path):
+    """Returns (class, series key) for a file: "commercial", "movie" (in a Movies folder), "episode" (an identifiable series, with its key) or "other"."""
+    normalized_path = str(path).replace("\\", "/").lower()
+    if any(k in normalized_path for k in ("/commercials/", "/commercial/", "/ads/")):
+        return "commercial", None
+    if "/movies/" in normalized_path:
+        return "movie", None
+    title, _season, _episode = _flex_series_and_season({"path": path})
+    if not title or _flex_is_non_episode_track({"path": path}):
+        return "other", None
+    return "episode", _normalize_show_key(title)
+
+
+def _save_estimate(path, seconds, basis):
+    """Saves an estimate in the hub and returns the estimate on record; without a hub the number is used for this call only."""
+    hub = _duration_hub
+    if hub is None:
+        return int(seconds)
     try:
-        if path:
-            cached = (media_probe_cache or {}).get(os.path.normpath(str(path)))
-            cached_dur = cached.get("duration") if isinstance(cached, dict) else None
-            if cached_dur and cached_dur > 0:
-                return False
-    except Exception:
-        pass
-    return not (stored_duration and stored_duration > 0)
+        saved = hub.store_estimate(path, seconds, basis)
+    except Exception as _swallowed_error:
+        _log_swallowed("_save_estimate: hub.store_estimate(path, seconds, basis)", _swallowed_error)
+        return int(seconds)
+    return saved if saved else int(seconds)
 
 
-def _series_duration_guesses(items, media_probe_cache, path_exists):
+def _series_duration_guesses(items, path_exists):
+    """The saved estimate for every unscanned file that may have one: an episode of a series with enough scanned episodes gets their average, a file in a Movies folder gets the movie estimate; an estimate already saved is kept as it is."""
     known_by_series = {}
     pending = []
     for item in items or []:
         p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
         if not p or not path_exists(p):
             continue
-        normalized_path = str(p).replace("\\\\", "/").lower()
-        title, _season, _episode = _flex_series_and_season({"path": p})
-        non_guessable = (
-            "/movies/" in normalized_path
-            or "/commercials/" in normalized_path
-            or "/commercial/" in normalized_path
-            or "/ads/" in normalized_path
-        )
-        if not title or _flex_is_non_episode_track({"path": p}) or non_guessable:
-            continue
+        guess_class, series_key = _guess_class(p)
         stored = item.get("duration", 0) if isinstance(item, dict) else 0
-        duration = resolve_track_duration(media_probe_cache, p, stored, default=0)
-        if duration > 0 and not track_duration_is_estimated(media_probe_cache, p, stored):
-            known_by_series.setdefault(_normalize_show_key(title), []).append(duration)
-        else:
-            pending.append((p, _normalize_show_key(title)))
+        seconds, kind = read_track_duration(p, stored)
+        if kind == DURATION_MEASURED:
+            if guess_class == "episode":
+                known_by_series.setdefault(series_key, []).append(seconds)
+        elif guess_class in ("episode", "movie"):
+            pending.append((p, guess_class, series_key, seconds))
     guesses = {}
-    for path, series_key in pending:
-        durations = known_by_series.get(series_key, [])
-        if len(durations) >= 2:
-            ordered = sorted(durations)
-            guesses[path] = ordered[len(ordered) // 2]
+    for path, guess_class, series_key, saved in pending:
+        if saved:
+            guesses[path] = saved
+        elif guess_class == "movie":
+            guesses[path] = _save_estimate(path, HUB_MOVIE_ESTIMATE_SECONDS, ESTIMATE_BASIS_MOVIE_DEFAULT)
+        else:
+            durations = known_by_series.get(series_key, [])
+            if len(durations) >= HUB_SERIES_ESTIMATE_MIN_SCANNED:
+                guesses[path] = _save_estimate(path, int(round(sum(durations) / float(len(durations)))),
+                                               ESTIMATE_BASIS_SERIES_AVERAGE)
     return guesses
 
 
-def build_raw_tracks(items, media_probe_cache, path_exists, keep_gain=False, include_unknown=False):
+def build_raw_tracks(items, path_exists, keep_gain=False, include_unknown=False):
     """Turns schedule entries into tracks with a resolved duration; entries whose path does not exist are left out, and so is a file whose duration is not known yet unless include_unknown is set (then it is marked estimated)."""
     # WARNING: a file with an unknown duration must never be placed; it is listed by build_pending_tracks and the rotation waits for it.
-    guesses = _series_duration_guesses(items, media_probe_cache, path_exists)
+    guesses = _series_duration_guesses(items, path_exists)
     tracks = []
     for item in items:
         p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
         if p and path_exists(p):
             stored = item.get("duration", 0) if isinstance(item, dict) else 0
-            estimated = track_duration_is_estimated(media_probe_cache, p, stored)
-            resolved_duration = resolve_track_duration(
-                media_probe_cache, p, stored, default=0
-            )
+            estimated = track_duration_is_estimated(p, stored)
+            resolved_duration = resolve_track_duration(p, stored, default=0)
             if estimated and p in guesses:
                 resolved_duration = guesses[p]
                 estimated = False
@@ -1607,14 +1969,14 @@ def build_raw_tracks(items, media_probe_cache, path_exists, keep_gain=False, inc
     return tracks
 
 
-def build_pending_tracks(items, media_probe_cache, path_exists):
+def build_pending_tracks(items, path_exists):
     """The schedule entries whose path exists but whose duration is not known yet, as tracks with a path only, in schedule order."""
     pending = []
     for item in items:
         p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
         if p and path_exists(p):
             stored = item.get("duration", 0) if isinstance(item, dict) else 0
-            if track_duration_is_estimated(media_probe_cache, p, stored):
+            if track_duration_is_estimated(p, stored):
                 pending.append({"path": p})
     return pending
 
@@ -1667,6 +2029,52 @@ def aired_ledger_entries(playback_log, today_ordinal):
     return out
 
 
+def aired_ledger_signature(playback_log):
+    """A small value that changes whenever any timeline recorded in the ledger changes."""
+    sig = []
+    for rec_id, rec in sorted((playback_log.get(GUIDE_AIRED_LEDGER_KEY) or {}).items()):
+        tl = rec.get("timeline") or []
+        sig.append((rec_id, rec.get("total", 0), len(tl),
+                    hash(tuple((e.get("start_time", 0), e.get("duration", 0), e.get("path", "")) for e in tl))))
+    return tuple(sig)
+
+
+def aired_entry_at(playback_log, today_ordinal, now_seconds, block_name=None):
+    """The entry that the ledger says is airing at a second of today (of the named block when one is given), with the seconds into it, as (entry, seconds into it); None when the ledger holds none."""
+    for entry, start, end, name in aired_ledger_entries(playback_log, today_ordinal):
+        if (block_name is None or name == block_name) and start <= now_seconds < end:
+            return entry, now_seconds - start
+    return None
+
+
+def block_overrun_end(playback_log, today_ordinal, boundary_seconds):
+    """The whole second of today at which the entry the ledger says is airing across a block boundary ends, with its parts and commercials; None when no ledger entry runs across the boundary."""
+    run_end = None
+    for _entry, start, end, _name in aired_ledger_entries(playback_log, today_ordinal):
+        if run_end is None:
+            if start < boundary_seconds and end > boundary_seconds + 0.5:
+                run_end = end
+        elif start <= run_end + 0.5:
+            run_end = max(run_end, end)
+        else:
+            break
+    return None if run_end is None else int(math.ceil(run_end - 1e-6))
+
+
+BLOCK_OVERRUN_KEY = "block_overrun_ends"
+
+
+def note_block_overrun(playback_log, block_key, cycle_start_abs, kept_total, cutoff_seconds):
+    """Saves the absolute second at which the last entry of a block ends when it runs past the block end, and clears it when the cycle no longer runs past."""
+    ends = playback_log.setdefault(BLOCK_OVERRUN_KEY, {})
+    if cutoff_seconds is not None and kept_total is not None and kept_total > cutoff_seconds + 0.5:
+        ends[block_key] = int(math.ceil(int(round(cycle_start_abs)) + kept_total - 1e-6))
+        for old_key in sorted(ends.keys())[:-12]:
+            ends.pop(old_key, None)
+    else:
+        ends.pop(block_key, None)
+
+
 # ============================================================================
 # SECTION: Guide past rebuild (missed blocks)
 # ============================================================================
@@ -1674,70 +2082,19 @@ def aired_ledger_entries(playback_log, today_ordinal):
 try:
     import performance_governor as _guide_governor
     GUIDE_REPLAY_MAX_BLOCKS = int(_guide_governor.GUIDE_REPLAY_MAX_BLOCKS)
-    GUIDE_REPLAY_EPISODE_GUESS_SECONDS = int(_guide_governor.GUIDE_REPLAY_EPISODE_GUESS_SECONDS)
     CATCH_UP_MAX_BLOCKS = int(_guide_governor.CATCH_UP_MAX_BLOCKS)
     CATCH_UP_MAX_CYCLES_PER_BLOCK = int(_guide_governor.CATCH_UP_MAX_CYCLES_PER_BLOCK)
 except Exception:
     GUIDE_REPLAY_MAX_BLOCKS = 60
-    GUIDE_REPLAY_EPISODE_GUESS_SECONDS = 1800
     CATCH_UP_MAX_BLOCKS = 3000
     CATCH_UP_MAX_CYCLES_PER_BLOCK = 1000
 
 _GUIDE_EIGHT_HOUR_BLOCKS = (("Morning", 4, 12), ("Evening", 12, 20), ("Night", 20, 28))
 
 
-def _middle_length(durations):
-    """The middle value of a list of lengths, the same pick the scheduler's series guess makes; None for an empty list."""
-    if not durations:
-        return None
-    return sorted(durations)[len(durations) // 2]
-
-
-def estimated_track_durations(items, media_probe_cache, path_exists):
-    """For every scheduled file whose duration is not known yet, a guessed length in seconds: the middle length of its series' scanned episodes, else of every scanned episode on the channel, else the default episode length; a movie takes the middle of the scanned movies, else the movie default, and a commercial the commercial default."""
-    known_by_series, known_episodes, known_movies, pending = {}, [], [], []
-    for item in items or []:
-        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
-        if not p or not path_exists(p):
-            continue
-        normalized_path = str(p).replace("\\", "/").lower()
-        is_commercial = any(k in normalized_path for k in ("/commercials/", "/commercial/", "/ads/"))
-        title, _season, _episode = _flex_series_and_season({"path": p})
-        is_episode = (bool(title) and not is_commercial and "/movies/" not in normalized_path
-                      and not _flex_is_non_episode_track({"path": p}))
-        stored = item.get("duration", 0) if isinstance(item, dict) else 0
-        duration = resolve_track_duration(media_probe_cache, p, stored, default=0)
-        if duration > 0 and not track_duration_is_estimated(media_probe_cache, p, stored):
-            if is_episode:
-                known_by_series.setdefault(_normalize_show_key(title), []).append(duration)
-                known_episodes.append(duration)
-            elif not is_commercial:
-                known_movies.append(duration)
-        else:
-            pending.append((p, _normalize_show_key(title) if is_episode else None, is_episode, is_commercial))
-    channel_episode = _middle_length(known_episodes) or GUIDE_REPLAY_EPISODE_GUESS_SECONDS
-    movie_guess = _middle_length(known_movies) or _MOVIE_DURATION_FALLBACK_SECONDS
-    guesses = {}
-    for path, series_key, is_episode, is_commercial in pending:
-        if is_commercial:
-            guesses[path] = COMMERCIAL_DEFAULT_SECONDS
-        elif is_episode:
-            guesses[path] = int(_middle_length(known_by_series.get(series_key)) or channel_episode)
-        else:
-            guesses[path] = int(movie_guess)
-    return guesses
-
-
-def build_guess_filled_tracks(items, media_probe_cache, path_exists):
-    """Turns schedule entries into tracks like build_raw_tracks, except that a file whose duration is not known yet is kept with its guessed length instead of left out."""
-    # WARNING: for the guide's past only; the scheduler must keep using build_raw_tracks, where a file with an unknown duration is never placed.
-    guesses = estimated_track_durations(items, media_probe_cache, path_exists)
-    tracks = build_raw_tracks(items, media_probe_cache, path_exists, include_unknown=True)
-    for track in tracks:
-        track.pop("_duration_estimated", None)
-        if track["path"] in guesses:
-            track["duration"] = guesses[track["path"]]
-    return tracks
+def estimated_track_durations(items, path_exists):
+    """Returns the saved or hub-supported estimate for each scheduled file that has one."""
+    return _series_duration_guesses(items, path_exists)
 
 
 def _parse_block_key(block_key):
@@ -1788,25 +2145,55 @@ def carried_commercial_state(playback_log):
     return playback_log.get("commercial_pos")
 
 
-def catch_up_state(channel_key, ch_info, show_pos, prev_block_key, block_key, media_probe_cache, path_exists,
+def _last_block_unplayed_tail(playback_log, prev_block_key, block_key, block_mode):
+    """The stretch of the last block the scheduler built that no built cycle covers yet, as (block name, date ordinal, cycle end offset, block end offset, absolute second the offsets count from) with the offsets in seconds from the block's saved anchor; None when the built cycle already reaches the block end or the current block does not follow it."""
+    prev, cur = _parse_block_key(prev_block_key), _parse_block_key(block_key)
+    layout_hours = {name: (start, end) for name, start, end in _block_layout(block_mode)}
+    if not prev or not cur or prev[1] not in layout_hours or cur[1] not in layout_hours:
+        return None
+    prev_anchor = (playback_log.get("block_anchors") or {}).get(prev_block_key)
+    anchor_second = layout_hours[prev[1]][0] * 3600 if not isinstance(prev_anchor, (int, float)) else prev_anchor
+    end_offset = layout_hours[prev[1]][0] * 3600 + block_length_seconds(prev[1]) - anchor_second
+    cycle_end = float(playback_log.get("sched_cycle_boundary") or 0) + float(playback_log.get("sched_cycle_total") or 0)
+    follows = cur[0] * 86400 + layout_hours[cur[1]][0] * 3600 >= prev[0] * 86400 + layout_hours[prev[1]][1] * 3600 - 0.5
+    if follows and 0 < cycle_end < end_offset:
+        return (prev[1], prev[0], cycle_end, end_offset, prev[0] * 86400 + anchor_second)
+    return None
+
+
+def catch_up_state(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
                    commercial_tracks, order_seed_for, is_holiday_date=None):
-    """The show positions, commercial state and first show orders the scheduler would hold had it kept running from the last block it built to the current block: first the cycles still unplayed in that last block, then every block missed after it, each block repeated in cycles until its length is filled; (positions, commercial state, first show orders, blocks replayed) or None when nothing was left to replay."""
+    """Advances schedule positions and commercial state across blocks missed by the clock without playing missed media."""
+    result = _catch_up_replay(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
+                              commercial_tracks, order_seed_for, is_holiday_date)
+    return None if result is None else result[:4]
+
+
+def catch_up_overrun_end(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
+                         commercial_tracks, order_seed_for, is_holiday_date=None):
+    """The absolute whole second at which the entry still airing across the start of the current block ends, as the scheduler's own catch-up places it; None when no entry runs across that start."""
+    block_mode = ch_info.get("block_mode", "full_day")
+    if ch_info.get("is_visualizer", False) or ch_info.get("scheduling_mode", "random_slots") == "marathon":
+        return None
+    _occurrences, _prev_end, cur_start = _missed_occurrences(prev_block_key, block_key, block_mode, CATCH_UP_MAX_BLOCKS)
+    result = _catch_up_replay(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
+                              commercial_tracks, order_seed_for, is_holiday_date)
+    carry_end = (ch_info.get("playback_log", {}).get(BLOCK_OVERRUN_KEY) or {}).get(prev_block_key) if result is None else result[4]
+    return carry_end if carry_end is not None and carry_end > cur_start + 0.5 else None
+
+
+def _catch_up_replay(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
+                     commercial_tracks, order_seed_for, is_holiday_date=None):
+    """Simulates schedule advancement across missed blocks and returns the last scheduled entry end."""
     # WARNING: show_pos and the commercial state are deep-copied and nothing in ch_info is changed here; build_block_rotation edits nested entries such as __FAIRNESS__ in place.
-    # WARNING: only files with a known duration are placed, as the scheduler does; a block's cycles are not carried across its end, because the next block starts at its own clock start.
+    # WARNING: catch-up and guide history must use build_raw_tracks so files without a measured or saved estimate cannot shift the clock.
+    # WARNING: a block's cycles are not carried across its end, and the cycle that runs past the block end counts only the entries that start before it.
     if ch_info.get("is_visualizer", False) or ch_info.get("scheduling_mode", "random_slots") == "marathon":
         return None
     block_mode = ch_info.get("block_mode", "full_day")
     occurrences, _prev_end, _cur_start = _missed_occurrences(prev_block_key, block_key, block_mode, CATCH_UP_MAX_BLOCKS)
     playback_log = ch_info.get("playback_log", {})
-    prev, cur = _parse_block_key(prev_block_key), _parse_block_key(block_key)
-    layout_hours = {name: (start, end) for name, start, end in _block_layout(block_mode)}
-    finish = None
-    if prev and cur and prev[1] in layout_hours and cur[1] in layout_hours:
-        prev_secs = block_length_seconds(prev[1])
-        cycle_end = float(playback_log.get("sched_cycle_boundary") or 0) + float(playback_log.get("sched_cycle_total") or 0)
-        follows = cur[0] * 86400 + layout_hours[cur[1]][0] * 3600 >= prev[0] * 86400 + layout_hours[prev[1]][1] * 3600 - 0.5
-        if follows and 0 < cycle_end < prev_secs:
-            finish = (prev[1], prev[0], cycle_end)
+    finish = _last_block_unplayed_tail(playback_log, prev_block_key, block_key, block_mode)
     if not occurrences and finish is None:
         return None
     sim_pos = copy.deepcopy(show_pos or {})
@@ -1817,30 +2204,27 @@ def catch_up_state(channel_key, ch_info, show_pos, prev_block_key, block_key, me
     blocks = {}
 
     def _admitted(track):
-        cached = media_probe_cache.get(os.path.normpath(str(track["path"])), {}) if isinstance(media_probe_cache, dict) else {}
-        return (track["path"] not in broken
-                and not cached.get("confirmed_unplayable")
-                and not cached.get("confirmed_no_audio"))
+        return track["path"] not in broken and not file_is_confirmed_bad(track["path"])
 
-    def _run_cycles(name, ordinal, cursor):
+    def _run_cycles(name, ordinal, cursor, end_offset, origin_abs):
         nonlocal sim_pos, sim_commercial
         date = datetime.date.fromordinal(ordinal)
         if is_holiday_date is not None and is_holiday_date(date):
-            return False
+            return False, None
         if name not in blocks:
             items = ch_info.get("schedules", {}).get(name, [])
-            blocks[name] = (
-                [t for t in build_raw_tracks(items, media_probe_cache, path_exists) if _admitted(t)],
-                build_pending_tracks(items, media_probe_cache, path_exists),
-            )
+            blocks[name] = ([t for t in build_raw_tracks(items, path_exists) if _admitted(t)], [])
         raw_tracks, pending_tracks = blocks[name]
         if not raw_tracks:
-            return False
+            return False, None
+        overrun_end = None
         offset = block_seed_offset(name, 0)
         day_seed = block_day_seed(date, channel_key, offset)
         order_seed = order_seed_for(offset)
         block_secs = block_length_seconds(name)
+        block_end = end_offset
         for _cycle in range(CATCH_UP_MAX_CYCLES_PER_BLOCK):
+            start_pos = copy.deepcopy(sim_pos)
             lineup, sim_pos, used_order = build_block_rotation(
                 raw_tracks, ch_info, sim_pos, day_seed, block_secs, channel_key,
                 show_orders.get(name), order_seed, pending_tracks=pending_tracks)
@@ -1851,35 +2235,56 @@ def catch_up_state(channel_key, ch_info, show_pos, prev_block_key, block_key, me
                 break
             timeline, total, sim_commercial = build_channel_timeline(
                 lineup, commercial_tracks, ch_info, day_seed,
-                media_probe_cache=media_probe_cache, commercial_state=sim_commercial)
+                commercial_state=sim_commercial)
             if not timeline or total <= 0:
                 break
+            sim_pos, _how = cycle_positions_at_block_end(
+                raw_tracks, ch_info, start_pos, day_seed, block_secs, channel_key,
+                show_orders.get(name), order_seed, lineup, timeline, total,
+                block_end - cursor, sim_pos, pending_tracks=pending_tracks)
+            _kept_timeline, kept_total = timeline_through_block_end(timeline, total, block_end - cursor)
+            if kept_total > block_end - cursor + 0.5:
+                overrun_end = int(math.ceil(int(round(origin_abs + cursor)) + kept_total - 1e-6))
             cursor += total
-            if cursor >= block_secs:
+            if cursor >= block_end:
                 break
-        return True
+        return True, overrun_end
 
     replayed = 0
+    carry_end = None if finish is not None else (playback_log.get(BLOCK_OVERRUN_KEY) or {}).get(prev_block_key)
     if finish is not None:
-        _run_cycles(finish[0], finish[1], finish[2])
-    for name, ordinal, _start_abs, _end_abs in occurrences:
-        if _run_cycles(name, ordinal, 0):
+        _ran, carry_end = _run_cycles(finish[0], finish[1], finish[2], finish[3], finish[4])
+    for name, ordinal, start_abs, end_abs in occurrences:
+        begin = start_abs if carry_end is None else max(start_abs, carry_end)
+        if end_abs - begin <= 0.5:
+            carry_end = carry_end if carry_end is not None and carry_end > end_abs else None
+            continue
+        ran, ran_end = _run_cycles(name, ordinal, begin - start_abs, block_length_seconds(name), start_abs)
+        if ran:
             replayed += 1
-    return sim_pos, sim_commercial, new_orders, replayed
+        if ran_end is not None:
+            carry_end = ran_end
+        elif not (carry_end is not None and carry_end > end_abs):
+            carry_end = None
+    return sim_pos, sim_commercial, new_orders, replayed, carry_end
 
 
-def replay_missed_blocks(channel_key, ch_info, show_pos, prev_block_key, block_key, now, media_probe_cache,
+def replay_missed_blocks(channel_key, ch_info, show_pos, prev_block_key, block_key, now,
                          path_exists, commercial_tracks, order_seed_for, is_holiday_date=None, max_blocks=None):
-    """The cycles that should have aired between the last block the scheduler built and the current block, rebuilt with the scheduler's own rotation and timeline builders on copies of the saved positions, as (block name, block key, absolute cycle start, timeline, total) in time order; a file not scanned yet is placed at its guessed length, and nothing in ch_info is changed."""
+    """Rebuilds past guide entries from clock-scheduled tracks without playing missed media or inventing file durations."""
     # WARNING: show_pos and the commercial state are always deep-copied; build_block_rotation edits nested entries such as __FAIRNESS__ in place, which would move the real scheduler's counters.
     if ch_info.get("is_visualizer", False) or ch_info.get("scheduling_mode", "random_slots") == "marathon":
         return []
     limit = GUIDE_REPLAY_MAX_BLOCKS if max_blocks is None else max_blocks
-    occurrences, prev_end, cur_start = _missed_occurrences(prev_block_key, block_key, ch_info.get("block_mode", "full_day"), limit)
-    if not occurrences:
+    block_mode = ch_info.get("block_mode", "full_day")
+    # WARNING: the blocks before the last `limit` are still stepped through, without records, so the recorded ones start from the show positions the clock reached, the same as the catch-up; skipping them shows other episodes after a gap of more than `limit` blocks.
+    occurrences, prev_end, cur_start = _missed_occurrences(prev_block_key, block_key, block_mode, max(limit, CATCH_UP_MAX_BLOCKS) if limit > 0 else 0)
+    silent_count = max(0, len(occurrences) - limit)
+    playback_log = ch_info.get("playback_log", {})
+    tail = _last_block_unplayed_tail(playback_log, prev_block_key, block_key, block_mode)
+    if not occurrences and tail is None:
         return []
 
-    playback_log = ch_info.get("playback_log", {})
     sim_pos = copy.deepcopy(show_pos or {})
     sim_commercial = copy.deepcopy(carried_commercial_state(playback_log))
     show_orders = copy.deepcopy(playback_log.get("show_order", {}))
@@ -1888,30 +2293,30 @@ def replay_missed_blocks(channel_key, ch_info, show_pos, prev_block_key, block_k
     pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
 
     def _admitted(track):
-        cached = media_probe_cache.get(os.path.normpath(str(track["path"])), {}) if isinstance(media_probe_cache, dict) else {}
-        return (track["path"] not in broken
-                and not cached.get("confirmed_unplayable")
-                and not cached.get("confirmed_no_audio"))
+        return track["path"] not in broken and not file_is_confirmed_bad(track["path"])
 
     tracks_by_block = {}
     records = []
-    overflow_abs = 0
-    for name, ordinal, start_abs, end_abs in occurrences:
+
+    def _replay_block(name, ordinal, cursor_abs, block_span, record=True):
+        nonlocal sim_pos, sim_commercial
         date = datetime.date.fromordinal(ordinal)
         if is_holiday_date is not None and is_holiday_date(date):
-            continue
+            return None
         if name not in tracks_by_block:
             items = ch_info.get("schedules", {}).get(name, [])
-            tracks_by_block[name] = [t for t in build_guess_filled_tracks(items, media_probe_cache, path_exists) if _admitted(t)]
+            tracks_by_block[name] = [t for t in build_raw_tracks(items, path_exists) if _admitted(t)]
         raw_tracks = tracks_by_block[name]
         if not raw_tracks:
-            continue
+            return None
+        overrun_end = None
         offset = block_seed_offset(name, 0)
         day_seed = block_day_seed(date, channel_key, offset)
         order_seed = order_seed_for(offset)
         block_secs = block_length_seconds(name)
-        cursor_abs = max(start_abs, overflow_abs)
+        counted = 0.0
         for _cycle in range(64):
+            start_pos = copy.deepcopy(sim_pos)
             lineup, sim_pos, used_order = build_block_rotation(
                 raw_tracks, ch_info, sim_pos, day_seed, block_secs, channel_key,
                 show_orders.get(name), order_seed, pending_tracks=[])
@@ -1921,15 +2326,185 @@ def replay_missed_blocks(channel_key, ch_info, show_pos, prev_block_key, block_k
                 break
             timeline, total, sim_commercial = build_channel_timeline(
                 lineup, commercial_tracks, ch_info, day_seed,
-                media_probe_cache=media_probe_cache, commercial_state=sim_commercial)
+                commercial_state=sim_commercial)
             if not timeline or total <= 0:
                 break
-            if cursor_abs + total > floor_abs:
-                records.append((name, "%d_%d_%s" % (date.year, date.timetuple().tm_yday, name), cursor_abs, timeline, total))
+            sim_pos, _how = cycle_positions_at_block_end(
+                raw_tracks, ch_info, start_pos, day_seed, block_secs, channel_key,
+                show_orders.get(name), order_seed, lineup, timeline, total,
+                block_span - counted, sim_pos, pending_tracks=[])
+            record_timeline, record_total = timeline_through_block_end(timeline, total, block_span - counted)
+            if record_total > block_span - counted + 0.5:
+                overrun_end = int(math.ceil(int(round(cursor_abs)) + record_total - 1e-6))
+            if record and cursor_abs + record_total > floor_abs:
+                records.append((name, "%d_%d_%s" % (date.year, date.timetuple().tm_yday, name), cursor_abs, record_timeline, record_total))
             cursor_abs += total
-            if cursor_abs >= end_abs:
-                overflow_abs = cursor_abs
+            counted += total
+            if counted >= block_span:
                 break
+        return overrun_end
+
+    carry_end = None if tail is not None else (playback_log.get(BLOCK_OVERRUN_KEY) or {}).get(prev_block_key)
+    if tail is not None:
+        carry_end = _replay_block(tail[0], tail[1], tail[4] + tail[2], tail[3] - tail[2])
+    for index, (name, ordinal, start_abs, end_abs) in enumerate(occurrences):
+        begin = start_abs if carry_end is None else max(start_abs, carry_end)
+        if end_abs - begin <= 0.5:
+            carry_end = carry_end if carry_end is not None and carry_end > end_abs else None
+            continue
+        ran_end = _replay_block(name, ordinal, begin, end_abs - begin, record=index >= silent_count)
+        if ran_end is not None:
+            carry_end = ran_end
+        elif not (carry_end is not None and carry_end > end_abs):
+            carry_end = None
+    return records
+
+
+def future_block_key_after(block_mode, now, hours_ahead):
+    """The key of the first block that starts at or after hours_ahead hours from now, so every block that ends before it is worked out; None when the layout is empty."""
+    layout = _block_layout(block_mode)
+    horizon = now.toordinal() * 86400 + seconds_since_midnight_of(now) + float(hours_ahead) * 3600.0
+    first_ordinal = int(horizon // 86400)
+    for ordinal in range(first_ordinal, first_ordinal + 3):
+        for name, start_hour, _end_hour in layout:
+            if ordinal * 86400 + start_hour * 3600 >= horizon - 0.5:
+                day = datetime.date.fromordinal(ordinal)
+                return "%d_%d_%s" % (day.year, day.timetuple().tm_yday, name)
+    return None
+
+
+def block_key_containing(block_mode, now):
+    """The key of the block the clock is inside, or None when it is inside none (a layout with a gap)."""
+    moment = now.toordinal() * 86400 + seconds_since_midnight_of(now)
+    for ordinal in (now.toordinal(), now.toordinal() - 1):
+        for name, start_hour, end_hour in _block_layout(block_mode):
+            if ordinal * 86400 + start_hour * 3600 <= moment < ordinal * 86400 + end_hour * 3600:
+                day = datetime.date.fromordinal(ordinal)
+                return "%d_%d_%s" % (day.year, day.timetuple().tm_yday, name)
+    return None
+
+
+def seconds_since_midnight_of(moment):
+    return moment.hour * 3600 + moment.minute * 60 + moment.second + moment.microsecond / 1_000_000.0
+
+
+def project_future_blocks(channel_key, ch_info, now, path_exists, commercial_tracks, order_seed_for, is_holiday_date=None, hours_ahead=48.0):
+    """What the channel will air from the end of the cycle on air until hours_ahead hours from now, worked out from the prebuilt order and the saved show positions exactly as the catch-up steps through a gap, as the same (block name, key, start second, timeline, length) records replay_missed_blocks gives; the caller asks only for a channel whose block on air is the last block built, so a channel that has not caught up is left to the scheduler."""
+    # WARNING: this steps forward from the positions the scheduler saved and never changes them (replay_missed_blocks works on copies); it plays nothing and invents no file lengths (R16, R18).
+    playback_log = ch_info.get("playback_log", {}) or {}
+    built = playback_log.get("sched_block_key")
+    target = future_block_key_after(ch_info.get("block_mode", "full_day"), now, hours_ahead)
+    if not built or not target:
+        return []
+    return replay_missed_blocks(channel_key, ch_info, playback_log.get("show_pos") or {}, built, target, now,
+                                path_exists, commercial_tracks, order_seed_for, is_holiday_date,
+                                max_blocks=CATCH_UP_MAX_BLOCKS)
+
+
+def holiday_day_tracks(ch_info, holiday_key, path_exists):
+    """The (tracks, pending tracks) a channel's holiday day is built from, or two empty lists when the channel has no usable file for that holiday."""
+    entries = (ch_info.get("holiday_schedules", {}) or {}).get(holiday_key) or []
+    if not entries:
+        return [], []
+    return build_raw_tracks(entries, path_exists), build_pending_tracks(entries, path_exists)
+
+
+def active_block_overrun_end(playback_log, now_epoch):
+    """The latest saved block overrun that is still airing at now, or None."""
+    ends = (playback_log or {}).get(BLOCK_OVERRUN_KEY, {}) or {}
+    active = [float(end) for end in ends.values() if float(end) > float(now_epoch) + 0.5]
+    return max(active) if active else None
+
+
+def project_holiday_days(channel_key, ch_info, now, path_exists, commercial_tracks, order_seed_for, holiday_key_of, missed_day_seeds, hours_ahead=48.0):
+    """What the channel will air on its holiday days from the end of the holiday cycle on air (or the start of the first later holiday day) until hours_ahead hours from now, as the same (block name, key, start second, timeline, length) records replay_missed_blocks gives, worked out the way the scheduler builds a holiday day: one cycle after another from the day's saved positions, each day carrying on from the one before; an empty list when today is a holiday day the scheduler has not built or has not caught up on."""
+    # WARNING: this works only on copies of the channel's saved holiday state and plays nothing (R16, R18); the scheduler's own holiday branch in calculate_slotted_playback_state is the rule it follows, so a change there must be made here too.
+    if ch_info.get("is_visualizer", False) or ch_info.get("scheduling_mode", "random_slots") == "marathon":
+        return []
+    playback_log = ch_info.get("playback_log", {}) or {}
+    anchors = playback_log.get("block_anchors") or {}
+    saved_logs = ch_info.get("holiday_playback_log", {}) or {}
+    now_seconds = seconds_since_midnight_of(now)
+    horizon = now.toordinal() * 86400 + now_seconds + float(hours_ahead) * 3600.0
+    states = {}
+    records = []
+
+    def _record(day, block_key, anchor, boundary, cycle, cutoff):
+        timeline, total = timeline_through_block_end(cycle["timeline"], cycle["total"], cutoff)
+        records.append(("Holiday", block_key, day.toordinal() * 86400 + int(anchor) + int(round(boundary)), timeline, total))
+
+    for ordinal in range(now.toordinal(), int(horizon // 86400) + 1):
+        day = datetime.date.fromordinal(ordinal)
+        holiday_key = holiday_key_of(day)
+        if not holiday_key:
+            continue
+        raw_tracks, pending_tracks = holiday_day_tracks(ch_info, holiday_key, path_exists)
+        if not raw_tracks:
+            continue
+        salt = 9000 + (sum(ord(c) for c in holiday_key) % 1000)
+        day_seed = day.year * 1000 + day.timetuple().tm_yday + int(channel_key) + salt
+        order_seed = order_seed_for(salt)
+        block_key = "%d_%d_Holiday_%s" % (day.year, day.timetuple().tm_yday, holiday_key)
+        state = states.get(holiday_key)
+        if state is None:
+            state = states[holiday_key] = copy.deepcopy(saved_logs.get(holiday_key) or {})
+        is_today = ordinal == now.toordinal()
+        anchor = anchors.get(block_key)
+        _overrun_anchor = False
+        if is_today and anchor is None:
+            _overrun_end = active_block_overrun_end(playback_log, day.toordinal() * 86400)
+            if _overrun_end is not None:
+                anchor = _overrun_end - day.toordinal() * 86400
+                _overrun_anchor = True
+        if is_today:
+            if state.get("block_key") != block_key or not holiday_cycle_record_ok(state, block_key):
+                if not _overrun_anchor:
+                    return []
+                cycle = build_holiday_cycle(
+                    raw_tracks, ch_info, commercial_tracks, state.get("show_pos") or {},
+                    state.get("commercial_pos"), day_seed, channel_key, state.get("show_order"),
+                    order_seed, 86400 - anchor, pending_tracks=pending_tracks)
+                if not cycle["timeline"] or cycle["total"] <= 0:
+                    return []
+                boundary, index = 0.0, 0
+                store_holiday_cycle(state, cycle, block_key, boundary, index)
+            else:
+                boundary, index = float(state.get("cycle_boundary") or 0), int(state.get("cycle_index") or 0)
+            if now_seconds - anchor >= boundary + float(state.get("total_duration") or 0):
+                return []
+        else:
+            anchor = 0 if anchor is None else anchor
+            seeds = missed_day_seeds(state.get("block_key"), "Holiday_%s" % holiday_key, channel_key, salt,
+                                     datetime.datetime.combine(day, datetime.time()))
+            if seeds:
+                state["show_pos"], _order, _report = fast_forward_show_pos(
+                    raw_tracks, "random_slots", state.get("show_pos") or {}, seeds,
+                    pair_threshold_seconds=max(0, ch_info.get("pair_threshold_minutes", 15)) * 60,
+                    episode_order_mode="random", fixed_show_order=copy.deepcopy(state.get("show_order")),
+                    block_duration_seconds=86400, channel_id=channel_key, order_seed=order_seed,
+                    pending_tracks=pending_tracks)
+            cycle = build_holiday_cycle(
+                raw_tracks, ch_info, commercial_tracks, state.get("show_pos") or {}, state.get("commercial_pos"),
+                day_seed, channel_key, state.get("show_order"), order_seed, 86400 - anchor, pending_tracks=pending_tracks)
+            if not cycle["timeline"] or cycle["total"] <= 0:
+                continue
+            boundary, index = 0.0, 0
+            store_holiday_cycle(state, cycle, block_key, boundary, index)
+            _record(day, block_key, anchor, boundary, cycle, 86400 - anchor - boundary)
+        end_offset = 86400 - anchor
+        for _guard in range(500):
+            next_boundary = boundary + float(state.get("total_duration") or 0)
+            if next_boundary >= end_offset:
+                break
+            cycle = build_holiday_cycle(
+                raw_tracks, ch_info, commercial_tracks, state.get("show_pos") or {}, state.get("commercial_pos"),
+                day_seed + index + 1, channel_key, state.get("show_order"), order_seed, end_offset - next_boundary,
+                pending_tracks=pending_tracks)
+            if not cycle["timeline"] or cycle["total"] <= 0:
+                break
+            boundary, index = next_boundary, index + 1
+            store_holiday_cycle(state, cycle, block_key, boundary, index)
+            _record(day, block_key, anchor, boundary, cycle, end_offset - boundary)
     return records
 
 
@@ -2044,56 +2619,6 @@ def _matching_lineup_groups(record, cached_paths, pair_threshold_seconds):
     return groups
 
 
-def swap_lineup_groups(record, cached_paths, new_paths, replacements, pair_threshold_seconds, duration_of):
-    """The saved groups after a broken file is replaced: each replacement is {"kind": "member" (takes the old file's place in its group, kept in a pair or bundle only while short), "single" or "pair" (its own entry), "paths": [...]}; a pair or bundle that loses a file keeps its other files in place; None when the record does not match the saved list or the result does not describe new_paths exactly."""
-    groups = _matching_lineup_groups(record, cached_paths, pair_threshold_seconds)
-    if groups is None:
-        return None
-
-    def short(path):
-        dur = duration_of(path)
-        return bool(dur) and 0 < dur < pair_threshold_seconds
-
-    out = []
-    for g in groups:
-        kind = g["kind"]
-        run = []
-
-        def flush():
-            if not run:
-                return
-            if kind == "pair" and len(run) == 2:
-                out.append({"kind": "pair", "paths": list(run)})
-            elif kind == "bundle":
-                out.append({"kind": "bundle", "paths": list(run)})
-            else:
-                out.extend({"kind": "single", "paths": [p]} for p in run)
-            del run[:]
-
-        for p in g["paths"]:
-            rep = replacements.get(p)
-            if rep is None:
-                run.append(p)
-            elif rep["kind"] == "member":
-                new = rep["paths"][0]
-                if short(new):
-                    run.append(new)
-                else:
-                    flush()
-                    out.append({"kind": "single", "paths": [new]})
-            else:
-                flush()
-                out.append({"kind": rep["kind"], "paths": list(rep["paths"])})
-        flush()
-    flat = list(dict.fromkeys(p for g in out for p in g["paths"] if p))
-    if flat != list(dict.fromkeys(p for p in new_paths if p)):
-        return None
-    return {"version": LINEUP_GROUPS_VERSION,
-            "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
-            "threshold": pair_threshold_seconds,
-            "groups": out}
-
-
 def _lineup_from_groups(groups, timed):
     """The lineup the saved groups describe, built from the current tracks; a file that is gone shrinks its own group."""
     by_path = {t["path"]: t for t in timed}
@@ -2145,6 +2670,9 @@ def resolve_lineup_playback(entry, offset_seconds):
             entry.get("bundle_item_durations") or [],
         ))
     else:
+        # WARNING: a single-episode entry that starts part-way into its file (seek_offset above 0) is only its part long; clamping the offset to that length freezes the seek.
+        if entry.get("seek_offset", 0) > 0 and entry.get("path"):
+            return entry["path"], offset, max(0.0, float(entry.get("duration", 0) or 0.0))
         items = [(entry.get("path", ""), entry.get("duration", 0))]
 
     for path, duration in items:
@@ -2158,21 +2686,20 @@ def resolve_lineup_playback(entry, offset_seconds):
     return entry.get("path", ""), 0.0, max(0.0, float(entry.get("duration", 0) or 0.0))
 
 
-def _cached_lineup_durations_stale(cached_durations, media_probe_cache,
+def _cached_lineup_durations_stale(cached_durations,
                                     movie_threshold_seconds=None,
                                     material_diff_seconds=60):
-    """True if a frozen {path: duration} schedule snapshot has drifted from the live probe cache."""
+    """True if a frozen {path: duration} schedule snapshot has drifted from the lengths the hub holds."""
     # WARNING: mirrors the same-named helper in retro_tv_emulator.py; keep both in step.
-    if not cached_durations or not isinstance(media_probe_cache, dict):
+    if not cached_durations:
         return False
     if movie_threshold_seconds is None:
         movie_threshold_seconds = MOVIE_LENGTH_THRESHOLD_SECONDS
     for path, frozen in cached_durations.items():
         if not (frozen and frozen > 0):
             continue
-        probed = media_probe_cache.get(path)
-        real = probed.get("duration") if isinstance(probed, dict) else probed
-        if not (real and real > 0):
+        real, real_kind = read_track_duration(path, 0)
+        if real_kind != DURATION_MEASURED or not (real and real > 0):
             continue
         crosses_movie_line = (
             (frozen >= movie_threshold_seconds) != (real >= movie_threshold_seconds))
@@ -2192,8 +2719,8 @@ def is_movie_track(track, threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECONDS):
                 return True
             if any(marker in p for marker in ("/tv/", "/series/", "/shows/")):
                 return False
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("is_movie_track: p = str(path).lower().replace('//', '/')", _swallowed_error)
     dur = track.get("duration", 0)
     return bool(dur and dur >= threshold_seconds)
 
@@ -2378,7 +2905,8 @@ def _split_movies_fingerprint(raw_tracks, threshold_seconds):
              bool(t.get("_duration_estimated")) if isinstance(t, dict) else False)
             for t in raw_tracks
         ))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_split_movies_fingerprint: return (threshold_seconds, tuple( (t.get('path', t.get('file", _swallowed_error)
         return None
 
 
@@ -2424,10 +2952,11 @@ def split_movies_and_series(raw_tracks, threshold_seconds=MOVIE_LENGTH_THRESHOLD
 # ============================================================================
 
 
-SHORT_EPISODE_PAIRING_VERSION = 3
+SHORT_EPISODE_PAIRING_VERSION = 4
 LINEUP_GROUPS_VERSION = 1
 LINEUP_GROUP_KINDS = ("single", "pair", "bundle")
 LEFTOVERS_TITLE = "The Leftovers"
+MOVIE_BUNDLE_KEY = "__movies__"
 
 
 def _episode_series_key(episode):
@@ -2445,20 +2974,26 @@ def _episode_series_key(episode):
             {"path": path}
         )
         return _normalize_show_key(title) if title else ""
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_episode_series_key: title, _season, _episode = _flex_series_and_season( {'path':", _swallowed_error)
         return ""
 
 
-def _build_pair_track(ep, nxt):
-    """The one lineup entry that airs two episodes back to back."""
+def _build_pair_track(ep, nxt, leftover=False, partner_path=None):
+    """The one lineup entry that airs two episodes back to back; leftover marks a pair made of short episodes that had no partner, partner_path the file of it that was not a leftover."""
     dur = ep.get("duration", 1800) if isinstance(ep, dict) else 1800
     nxt_dur = nxt.get("duration", 1800) if isinstance(nxt, dict) else 1800
     ep_path = ep.get("path", ep.get("file", "")) if isinstance(ep, dict) else str(ep)
     nxt_path = nxt.get("path", nxt.get("file", "")) if isinstance(nxt, dict) else str(nxt)
-    return {"path": ep_path, "duration": dur + nxt_dur,
-            "is_pair": True, "pair_ep1": ep, "pair_ep2": nxt,
-            "pair_ep1_path": ep_path, "pair_ep1_duration": dur,
-            "pair_ep2_path": nxt_path, "pair_ep2_duration": nxt_dur}
+    track = {"path": ep_path, "duration": dur + nxt_dur,
+             "is_pair": True, "pair_ep1": ep, "pair_ep2": nxt,
+             "pair_ep1_path": ep_path, "pair_ep1_duration": dur,
+             "pair_ep2_path": nxt_path, "pair_ep2_duration": nxt_dur}
+    if leftover:
+        track["leftover_pair"] = True
+        if partner_path:
+            track["leftover_partner_path"] = partner_path
+    return track
 
 
 def _build_bundle_track(leftovers):
@@ -2485,6 +3020,8 @@ def _pairs_with_next(ep, nxt, threshold_seconds):
 
 
 def pair_short_episodes(episodes, threshold_seconds=900):
+    """The entries of one pass of a show: neighbouring short episodes of one series paired, long episodes alone, and the short episodes that found no neighbour cut into pairs of exactly 2 at the end; an odd one out pairs with the first single episode of the list."""
+    # WARNING: every combined entry holds exactly 2 episodes; a leftover bundle of any other size must never come back.
     if threshold_seconds <= 0:
         return list(episodes)
     result = []
@@ -2501,8 +3038,17 @@ def pair_short_episodes(episodes, threshold_seconds=900):
         else:
             result.append(ep)
         i += 1
-    if leftovers:
-        result.append(_build_bundle_track(leftovers))
+    leftover_pairs = [_build_pair_track(leftovers[j], leftovers[j + 1], leftover=True)
+                      for j in range(0, len(leftovers) - 1, 2)]
+    if len(leftovers) % 2:
+        odd = leftovers[-1]
+        partner_at = next((j for j, e in enumerate(result) if not (isinstance(e, dict) and e.get("is_pair"))), None)
+        if partner_at is not None:
+            partner = result.pop(partner_at)
+            leftover_pairs.append(_build_pair_track(odd, partner, leftover=True, partner_path=_episode_path(partner)))
+        else:
+            leftover_pairs.append(odd)
+    result.extend(leftover_pairs)
     return result
 
 
@@ -2517,7 +3063,8 @@ def _order_key_for_path(path):
         _title, season, episode = _flex_series_and_season({"path": path})
         return (season if season is not None else 0, episode if episode is not None else 0,
                 _natural_ep_key({"path": path}))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_order_key_for_path: _title, season, episode = _flex_series_and_season({'path': p", _swallowed_error)
         return None
 
 
@@ -2536,79 +3083,182 @@ def _first_index_after(episodes, path):
     return len(episodes)
 
 
+def _state_with_done(next_path, owed, done):
+    """A saved sequential position; the count of owed episodes already aired at the end of the pass is written only when it is above 0."""
+    state = {"next": next_path, "owed": list(owed)}
+    if done > 0:
+        state["done"] = int(done)
+    return state
+
+
 def sequential_state_from_entry_index(episodes, entries, entry_index):
-    """The saved position that stands for an entry of the show's paired list: the file that airs next and the short episodes the pass's leftover bundle still owes."""
+    """The saved position that stands for an entry of the show's paired list: the file that airs next and the short episodes the pass's leftover pairs still owe."""
     paths = [_episode_path(ep) for ep in episodes]
     if not entries or not paths:
         return {"next": None, "owed": []}
     entry = entries[entry_index % len(entries)]
-    bundle = entries[-1] if entries[-1].get("is_bundle") else None
-    bundle_paths = [_episode_path(item) for item in bundle.get("bundle_items", [])] if bundle else []
-    if entry.get("is_bundle"):
-        return {"next": None, "owed": bundle_paths}
+    owed_paths = []
+    done_before = 0
+    for e in entries:
+        if e is entry:
+            done_before = len(owed_paths)
+        if not isinstance(e, dict):
+            continue
+        if e.get("leftover_pair"):
+            skip = e.get("leftover_partner_path")
+            owed_paths.extend(p for p in lineup_paths([e]) if p != skip)
+        elif e.get("is_bundle"):
+            owed_paths.extend(_episode_path(item) for item in e.get("bundle_items", []))
+    if isinstance(entry, dict) and (entry.get("leftover_pair") or entry.get("is_bundle")):
+        return _state_with_done(None, owed_paths, done_before)
     first_path = _episode_path(entry)
     if first_path not in paths:
         return {"next": None, "owed": []}
     k = paths.index(first_path)
     if k == 0:
         return {"next": None, "owed": []}
-    return {"next": first_path, "owed": [p for p in bundle_paths if p in paths and paths.index(p) < k]}
+    return {"next": first_path, "owed": [p for p in owed_paths if p in paths and paths.index(p) < k]}
 
 
-def _read_sequential_state(episodes, stored, threshold_seconds):
-    """Turns a saved sequential position into (k, owed paths): k is the index in the show's list of the file that airs next, len(episodes) when the leftover bundle is next."""
+def _read_sequential_state_full(episodes, stored, threshold_seconds):
+    """Turns a saved sequential position into (k, owed paths, done): k is the index in the show's list of the file that airs next, len(episodes) when the leftover pairs of the pass end are next; done is how many of the owed episodes at the front of the owed list have already aired in those pairs."""
     paths = [_episode_path(ep) for ep in episodes]
     n = len(paths)
     if isinstance(stored, dict) and "next" in stored:
-        owed = [p for p in (stored.get("owed") or []) if p in paths]
+        raw_owed = list(stored.get("owed") or [])
+        try:
+            raw_done = max(0, int(stored.get("done", 0) or 0))
+        except (TypeError, ValueError):
+            raw_done = 0
+        aired_at_end = set(raw_owed[:raw_done])
+        owed = [p for p in raw_owed if p in paths]
+        done = sum(1 for p in owed if p in aired_at_end)
         nxt = stored.get("next")
         if nxt is None:
-            return (n if owed else 0), owed
+            if owed[done:]:
+                return n, owed, done
+            return 0, owed, 0
         if nxt in paths:
-            return paths.index(nxt), owed
+            return paths.index(nxt), owed, 0
         k = _first_index_after(episodes, nxt)
-        return k, (owed if k >= n else [p for p in owed if paths.index(p) < k])
+        return k, (owed if k >= n else [p for p in owed if paths.index(p) < k]), 0
     if isinstance(stored, int) and not isinstance(stored, bool):
         entries = pair_short_episodes(episodes, threshold_seconds)
         state = sequential_state_from_entry_index(episodes, entries, stored % len(entries))
-        return _read_sequential_state(episodes, state, threshold_seconds)
-    return 0, []
+        return _read_sequential_state_full(episodes, state, threshold_seconds)
+    return 0, [], 0
+
+
+def _read_sequential_state(episodes, stored, threshold_seconds):
+    """Turns a saved sequential position into (k, owed paths): k is the index in the show's list of the file that airs next, len(episodes) when the leftover pairs of the pass end are next."""
+    k, owed, _done = _read_sequential_state_full(episodes, stored, threshold_seconds)
+    return k, owed
 
 
 def take_sequential_entries(episodes, stored, count, threshold_seconds, blocked=None):
-    """Takes the next `count` lineup entries of a show in its list order, pairing short episodes forward from the file that airs next; stops at the first file in `blocked` (not scanned yet) and at a short episode whose partner is blocked; returns (entries, the new saved position)."""
+    """Takes the next `count` lineup entries of a show in its list order, pairing short episodes forward from the file that airs next; the short episodes that find no neighbour are set aside and air at the end of the pass in pairs of exactly 2, and an odd one out pairs with the first episode of the next pass; stops at the first file in `blocked` (not scanned yet), at a short episode whose partner is blocked, and before any file already taken in the same call; returns (entries, the new saved position)."""
     # WARNING: pairing must start at the file that airs next, never at the top of the list, or an episode that already aired can be pulled into a pair and air twice.
+    # WARNING: every combined entry holds exactly 2 episodes; the odd leftover must pair with the first episode of the next pass, never air alone and never join a group of 3.
     n = len(episodes)
     if n == 0:
         return [], {"next": None, "owed": []}
-    k, owed = _read_sequential_state(episodes, stored, threshold_seconds)
+    k, owed, done = _read_sequential_state_full(episodes, stored, threshold_seconds)
+    owed = list(owed)
     owed_set = set(owed)
     blocked_set = set(blocked or ())
     pairing = threshold_seconds > 0
+    paths = [_episode_path(ep) for ep in episodes]
     entries = []
+    taken = set()
+    rederived = False
     guard = 0
     while len(entries) < count and guard < 4 * (n + count) + 8:
         guard += 1
         if k >= n:
-            bundle = _owed_episodes(episodes, owed)
-            if bundle:
-                entries.append(_build_bundle_track(bundle))
-            owed, owed_set = [], set()
-            k = 0
+            pending = _owed_episodes(episodes, owed[done:])
+            if not pending:
+                done = 0
+                k = 0
+                continue
+            first = pending[0]
+            first_path = _episode_path(first)
+            if first_path in taken or first_path in blocked_set:
+                break
+            if not pairing:
+                entries.append(first)
+                taken.add(first_path)
+                done += 1
+                continue
+            if len(pending) >= 2:
+                second = pending[1]
+                second_path = _episode_path(second)
+                if second_path in taken or second_path in blocked_set:
+                    break
+                entries.append(_build_pair_track(first, second, leftover=True))
+                taken.update((first_path, second_path))
+                done += 2
+                continue
+            partner_at = next((j for j in range(n) if paths[j] not in owed_set), None)
+            if partner_at is None:
+                can_pair_by_walk = any(_pairs_with_next(episodes[j], episodes[j + 1], threshold_seconds) for j in range(n - 1))
+                if can_pair_by_walk and not rederived:
+                    rederived = True
+                    owed = []
+                    owed_set = set()
+                    done = 0
+                    k = 0
+                    continue
+                others = [ep for ep in episodes if _episode_path(ep) != first_path]
+                if not others:
+                    entries.append(first)
+                    taken.add(first_path)
+                    owed = []
+                    owed_set = set()
+                    done = 0
+                    k = 0
+                    continue
+                partner = next((ep for ep in others if _episode_path(ep) not in taken), None)
+                if partner is None:
+                    break
+                entries.append(_build_pair_track(first, partner, leftover=True, partner_path=_episode_path(partner)))
+                taken.add(first_path)
+                owed = []
+                owed_set = set()
+                done = 0
+                k = 0
+                continue
+            partner = episodes[partner_at]
+            partner_path = paths[partner_at]
+            if partner_path in taken or partner_path in blocked_set:
+                break
+            entries.append(_build_pair_track(first, partner, leftover=True, partner_path=partner_path))
+            taken.update((first_path, partner_path))
+            k = partner_at + 1
+            # WARNING: only the owed episodes before the new walk start stay owed; the rest are found again by the walk, or the owed list grows until no episode can pair with its neighbour.
+            owed = [p for p in owed if paths.index(p) < k]
+            owed_set = set(owed)
+            done = 0
             continue
         ep = episodes[k]
-        path = _episode_path(ep)
+        path = paths[k]
         if path in owed_set:
             k += 1
             continue
         if path in blocked_set:
             break
-        if pairing and _episode_duration(ep) < threshold_seconds:
-            if k + 1 < n and _episode_path(episodes[k + 1]) in blocked_set:
+        # WARNING: a file already taken in this call ends the call; the saved lineup keeps each file once, so a second airing would be dropped while the saved position counted it.
+        is_short = pairing and _episode_duration(ep) < threshold_seconds
+        if path in taken and not is_short:
+            break
+        if is_short:
+            if k + 1 < n and paths[k + 1] in blocked_set:
                 break
-            if k + 1 < n and _episode_path(episodes[k + 1]) not in owed_set \
+            if k + 1 < n and paths[k + 1] not in owed_set \
                     and _pairs_with_next(ep, episodes[k + 1], threshold_seconds):
+                if path in taken or paths[k + 1] in taken:
+                    break
                 entries.append(_build_pair_track(ep, episodes[k + 1]))
+                taken.update((path, paths[k + 1]))
                 k += 2
             else:
                 owed.append(path)
@@ -2616,12 +3266,17 @@ def take_sequential_entries(episodes, stored, count, threshold_seconds, blocked=
                 k += 1
             continue
         entries.append(ep)
+        taken.add(path)
         k += 1
-    while k < n and _episode_path(episodes[k]) in owed_set:
+    made = [e for e in entries if isinstance(e, dict) and e.get("leftover_pair")]
+    if made:
+        log.info("[SHORT PAIRING] %d combined cell(s) of exactly 2 made from %d leftover short episode(s); %d episode(s) paired with the first episode of the next pass",
+                 len(made), len(owed), sum(1 for e in made if e.get("leftover_partner_path")))
+    while k < n and paths[k] in owed_set:
         k += 1
     if k >= n:
-        return entries, {"next": None, "owed": list(owed)}
-    return entries, {"next": _episode_path(episodes[k]), "owed": list(owed)}
+        return entries, _state_with_done(None, owed, done)
+    return entries, _state_with_done(paths[k], owed, 0)
 
 
 def sequential_state_after_path(episodes, path, stored, threshold_seconds):
@@ -2660,7 +3315,7 @@ MOVIES_PER_BLOCK = 2
 
 MOVIE_ROTATION_KEY = "__MOVIES__"
 
-_MOVIE_DURATION_FALLBACK_SECONDS = 6000
+_MOVIE_DURATION_FALLBACK_SECONDS = HUB_MOVIE_ESTIMATE_SECONDS
 
 
 def _movie_runtime_budget(movie_pool, block_duration_seconds,
@@ -2814,8 +3469,8 @@ def _bag_state_from_saved(state, keys, entry_files):
 
 
 def _bag_with_joiners(bag_state, keys, entry_files, seed_prefix):
-    """Adds every entry that is new to the current pass to its bag at a seeded place, so it airs once before any file repeats; an entry holding a file that already aired this pass waits for the next pass."""
-    # WARNING: an entry with a file that already aired this pass must stay out of the bag, or that file airs twice before the rest of the show has aired.
+    """Adds every entry that is new to the current pass to its bag at a seeded place, so each of its files airs once before any file repeats; an entry that holds a file that already aired this pass joins too and airs only its files that have not aired."""
+    # WARNING: the joiner is trimmed to its unaired files at draw time (_unaired_part); without that, a file that already aired this pass airs twice before the rest of the show has aired.
     if bag_state["cycle"] <= 0:
         return bag_state
     import random as _random
@@ -2823,7 +3478,7 @@ def _bag_with_joiners(bag_state, keys, entry_files, seed_prefix):
     in_bag = set(bag_state["bag"])
     drawn = set(bag_state["drawn"])
     joiners = [key for key, files in zip(keys, entry_files)
-               if key not in in_bag and not any(f in drawn for f in files)]
+               if key not in in_bag and any(f not in drawn for f in files)]
     if joiners:
         rng = _random.Random(f"{seed_prefix}:join:{bag_state['cycle']}:{len(bag_state['bag'])}")
         bag = list(bag_state["bag"])
@@ -2831,6 +3486,19 @@ def _bag_with_joiners(bag_state, keys, entry_files, seed_prefix):
             bag.insert(rng.randint(0, len(bag)), key)
         bag_state = dict(bag_state, bag=bag)
     return bag_state
+
+
+def _unaired_part(entry, files, drawn):
+    """The part of a drawn entry that has not aired this pass: the entry itself when none of its files aired, None when all aired, otherwise a single (or a smaller bundle) of the files that did not."""
+    pending = [f for f in files if f not in drawn]
+    if len(pending) == len(files):
+        return entry
+    if not pending:
+        return None
+    if entry.get("is_pair"):
+        return entry["pair_ep1"] if pending[0] == entry.get("pair_ep1_path") else entry["pair_ep2"]
+    items = [item for item in entry.get("bundle_items", []) if _episode_path(item) in set(pending)]
+    return items[0] if len(items) == 1 else _build_bundle_track(items)
 
 
 def draw_from_shuffle_bag_by_file(state, entries, count, seed_prefix, hold_back=RANDOM_REPEAT_HOLD_BACK, hold_new_pass=False):
@@ -2847,7 +3515,9 @@ def draw_from_shuffle_bag_by_file(state, entries, count, seed_prefix, hold_back=
                "recent": [index_of[k] for k in bag_state["recent"]]}
     drawn = list(bag_state["drawn"])
     picked = []
-    for _ in range(count):
+    guard = 0
+    while len(picked) < count and guard < 4 * (n + count) + 8:
+        guard += 1
         if hold_new_pass and not current["bag"] and current["cycle"] > 0:
             break
         cycle_before = current["cycle"]
@@ -2856,13 +3526,16 @@ def draw_from_shuffle_bag_by_file(state, entries, count, seed_prefix, hold_back=
             drawn = []
         if n == 1 and current["cycle"] < 1:
             current = dict(current, cycle=1)
+        part = entries[index] if n == 1 else _unaired_part(entries[index], entry_files[index], drawn)
+        if part is None:
+            continue
         drawn.extend(f for f in entry_files[index] if f not in drawn)
-        picked.append(index)
+        picked.append(part)
     new_state = {"v": RANDOM_STATE_VERSION,
                  "bag": [keys[i] for i in current["bag"]], "cycle": current["cycle"],
                  "last": keys[current["last"]] if current["last"] is not None else None,
                  "recent": [keys[i] for i in current["recent"]], "drawn": drawn}
-    return [entries[i] for i in picked], new_state
+    return picked, new_state
 
 
 def random_bag_entry_indices(show_pos, show_name, entries, channel_id=None):
@@ -2872,7 +3545,9 @@ def random_bag_entry_indices(show_pos, show_name, entries, channel_id=None):
     bag_state = _bag_with_joiners(_bag_state_from_saved(state, keys, entry_files), keys, entry_files,
                                   f"swap:{show_name}")
     in_bag = set(bag_state["bag"])
-    return [i for i, key in enumerate(keys) if key in in_bag]
+    drawn = set(bag_state["drawn"])
+    return [i for i, key in enumerate(keys)
+            if key in in_bag and not any(f in drawn for f in entry_files[i])]
 
 
 def random_last_entry(state, entries):
@@ -2894,7 +3569,6 @@ def _rotation_take_random(show_pos, name, count, eps, day_seed, hold_new_pass=Fa
     key = state_key or name
     saved = show_pos.get(key)
     if saved is None and key != name:
-        # Read older unscoped movie state once, then write the migrated state under the scoped key.
         saved = show_pos.get(name)
     picked, show_pos[key] = draw_from_shuffle_bag_by_file(
         saved, eps, count, f"{day_seed}:{name}", hold_new_pass=hold_new_pass)
@@ -3039,7 +3713,8 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
                          block_duration_seconds=None,
                          channel_id=None,
                          order_seed=None,
-                         pending_tracks=None):
+                         pending_tracks=None,
+                         entry_limits=None):
     import random as _random
 
     show_pos = dict(show_pos or {})
@@ -3084,13 +3759,30 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
             state, eps, count, f"{day_seed}:{show_name}", hold_new_pass=bool(pending_by_show.get(show_name)))
         return picked
 
+    def _limited(key, count):
+        """Returns count, or with entry_limits set the most entries key may take (0 when key is not listed)."""
+        if entry_limits is None:
+            return count
+        return max(0, min(count, int(entry_limits.get(key, 0) or 0)))
+
     def _take(show_name, count):
         eps = show_episodes.get(show_name) or []
         if not eps:
             return []
+        count = _limited(show_name, count)
+        if entry_limits is not None and count <= 0:
+            return []
         if _order_mode_for(show_name) == "random":
-            return _take_random(show_name, count, eps)
-        return _take_sequential(show_name, count, eps)
+            taken_entries = _take_random(show_name, count, eps)
+        else:
+            taken_entries = _take_sequential(show_name, count, eps)
+        shortfall = count - len(taken_entries)
+        fairness_now = show_pos.get("__FAIRNESS__")
+        if shortfall > 0 and isinstance(fairness_now, dict) and isinstance(fairness_now.get("used"), dict):
+            used_now = fairness_now["used"]
+            if show_name in used_now:
+                used_now[show_name] = max(0, int(used_now[show_name] or 0) - shortfall)
+        return taken_entries
 
     def _fair_show_size(show_name):
         """Returns a show's size for the fairness step: its placed entries plus its files not scanned yet, never below 1."""
@@ -3132,7 +3824,7 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
             eligible = usable
 
         for sn in eligible:
-            usage[sn] = int(usage.get(sn, 0) or 0) + requested_counts.get(sn, 1)
+            usage[sn] = int(usage.get(sn, 0) or 0) + _limited(sn, requested_counts.get(sn, 1))
         fairness["used"] = usage
         show_pos["__FAIRNESS__"] = fairness
         return [sn for sn in order if sn in set(eligible)]
@@ -3189,13 +3881,17 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
             movie_pool, _bds, series_total, scheduling_mode,
             series_total_runtime_seconds=series_runtime,
         )
+        n_movie_pick = _limited(MOVIE_ROTATION_KEY, n_movie_pick)
         _ordered_pool = sorted(movie_pool, key=lambda t: t.get("path", ""))
         _movie_seed = order_seed if (order_seed is not None and show_pos.get(MOVIE_ROTATION_KEY) is None) else day_seed
         _movie_state_key = stable_series_id(MOVIE_ROTATION_KEY, channel_id) if channel_id is not None else MOVIE_ROTATION_KEY
-        picked_movies = _rotation_take_random(
-            show_pos, MOVIE_ROTATION_KEY, n_movie_pick, _ordered_pool, _movie_seed,
-            hold_new_pass=movie_pending, state_key=_movie_state_key,
-        )
+        if entry_limits is not None and n_movie_pick <= 0:
+            picked_movies = []
+        else:
+            picked_movies = _rotation_take_random(
+                show_pos, MOVIE_ROTATION_KEY, n_movie_pick, _ordered_pool, _movie_seed,
+                hold_new_pass=movie_pending, state_key=_movie_state_key,
+            )
         movie_budget = _movie_runtime_budget(
             movie_pool, _bds, series_total, series_runtime
         )
@@ -3210,7 +3906,8 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
 
 
 def build_block_rotation(raw_tracks, ch_info, show_pos, day_seed, block_duration_seconds,
-                         channel_id, fixed_show_order, order_seed, pending_tracks=None):
+                         channel_id, fixed_show_order, order_seed, pending_tracks=None,
+                         entry_limits=None):
     """build_show_rotation for one block of a channel, with the channel's scheduling mode, pairing threshold and episode order taken from its settings; returns (lineup, show positions, show order)."""
     return build_show_rotation(
         raw_tracks, ch_info.get("scheduling_mode", "random_slots"), show_pos, day_seed,
@@ -3221,7 +3918,336 @@ def build_block_rotation(raw_tracks, ch_info, show_pos, day_seed, block_duration
         channel_id=channel_id,
         order_seed=order_seed,
         pending_tracks=pending_tracks,
+        entry_limits=entry_limits,
     )
+
+
+# ============================================================================
+# SECTION: Cut cycles
+# ============================================================================
+
+
+def aired_entry_limits(raw_tracks, lineup, aired_count, channel_id=None, pending_tracks=None,
+                       movie_threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECONDS):
+    """Counts the first aired_count entries of a lineup per show name and for the movie list (MOVIE_ROTATION_KEY), the entry_limits of a rebuild; None when an entry belongs to no show or movie."""
+    raw_tracks = _drop_parts_of_pending_movies(raw_tracks, pending_tracks)
+    movie_pool, _show_names, show_episodes = split_movies_and_series(
+        raw_tracks, movie_threshold_seconds, channel_id=channel_id)
+    owner = {}
+    for show_name, eps in show_episodes.items():
+        for ep in eps:
+            owner[_episode_path(ep)] = show_name
+    for movie in movie_pool:
+        owner[_episode_path(movie)] = MOVIE_ROTATION_KEY
+    limits = {show_name: 0 for show_name in show_episodes}
+    limits[MOVIE_ROTATION_KEY] = 0
+    for entry in list(lineup or [])[:max(0, int(aired_count))]:
+        paths = lineup_paths([entry])
+        key = owner.get(paths[0]) if paths else None
+        if key is None:
+            return None
+        limits[key] += 1
+    return limits
+
+
+def positions_after_aired_entries(raw_tracks, ch_info, start_pos, day_seed, block_duration_seconds,
+                                  channel_id, fixed_show_order, order_seed, lineup, aired_count,
+                                  pending_tracks=None):
+    """The saved show positions after only the first aired_count entries of `lineup` have aired, rebuilt from start_pos (the positions the lineup was built from); None when an entry cannot be tied to its show."""
+    # WARNING: start_pos must be a copy taken before the lineup was built; a build changes the fairness counters inside the positions it is given.
+    import copy as _copy
+
+    limits = aired_entry_limits(raw_tracks, lineup, aired_count, channel_id=channel_id,
+                                pending_tracks=pending_tracks)
+    if limits is None:
+        return None
+    _rebuilt, positions, _order = build_block_rotation(
+        raw_tracks, ch_info, _copy.deepcopy(start_pos or {}), day_seed, block_duration_seconds,
+        channel_id, fixed_show_order, order_seed, pending_tracks=pending_tracks,
+        entry_limits=limits)
+    return positions
+
+
+def entries_started_before(timeline, lineup, cutoff_seconds):
+    """How many entries of a cycle's lineup start before cutoff_seconds of the cycle; None when the timeline does not hold exactly one first part per lineup entry."""
+    starts = [float(item.get("start_time", 0) or 0) for item in timeline or []
+              if isinstance(item, dict) and not item.get("is_commercial") and not item.get("seek_offset", 0)]
+    if len(starts) != len(lineup or []):
+        return None
+    return sum(1 for start in starts if start < cutoff_seconds)
+
+
+def cycle_positions_at_block_end(raw_tracks, ch_info, start_pos, day_seed, block_duration_seconds,
+                                 channel_id, fixed_show_order, order_seed, lineup, timeline,
+                                 total_seconds, cutoff_seconds, full_positions, pending_tracks=None,
+                                 kept_entries=0):
+    """The positions to save after one cycle and how they were found: (full_positions, "whole") when the cycle ends by cutoff_seconds of the cycle, (positions after only the entries that start before it, "cut") otherwise, (full_positions, "unmapped") when the entries cannot be tied to the timeline; kept_entries is how many first entries of the lineup start_pos already counts."""
+    # WARNING: start_pos must be a copy taken before the cycle's lineup was built; a build changes the fairness counters inside the positions it is given.
+    if cutoff_seconds is None or total_seconds <= cutoff_seconds:
+        return full_positions, "whole"
+    aired = entries_started_before(timeline, lineup, cutoff_seconds)
+    if aired is None:
+        return full_positions, "unmapped"
+    if aired >= len(lineup):
+        return full_positions, "whole"
+    kept_entries = max(0, int(kept_entries or 0))
+    if aired < kept_entries:
+        return full_positions, "unmapped"
+    cut = positions_after_aired_entries(
+        raw_tracks, ch_info, start_pos, day_seed, block_duration_seconds, channel_id,
+        fixed_show_order, order_seed, list(lineup)[kept_entries:], aired - kept_entries, pending_tracks=pending_tracks)
+    if cut is None:
+        return full_positions, "unmapped"
+    return cut, "cut"
+
+
+def timeline_through_block_end(timeline, total_seconds, cutoff_seconds):
+    """The timeline and length of a cycle as it airs when the block ends cutoff_seconds into it: every entry that starts before the cutoff with all its parts and the commercials between them, and the commercials after its last part that start before the cutoff; the arguments unchanged when the cycle ends by then."""
+    if cutoff_seconds is None or not timeline or total_seconds <= cutoff_seconds:
+        return timeline, total_seconds
+    cut_index = None
+    for index, item in enumerate(timeline):
+        if (isinstance(item, dict) and not item.get("is_commercial") and not item.get("seek_offset", 0)
+                and float(item.get("start_time", 0) or 0) >= cutoff_seconds):
+            cut_index = index
+            break
+    if cut_index is None:
+        return timeline, total_seconds
+    head = timeline[:cut_index]
+    last_show = max((i for i, item in enumerate(head) if isinstance(item, dict) and not item.get("is_commercial")), default=None)
+    if last_show is None:
+        return timeline, total_seconds
+    kept = [item for i, item in enumerate(head)
+            if not (i > last_show and item.get("is_commercial") and float(item.get("start_time", 0) or 0) >= cutoff_seconds)]
+    kept_total = max(float(item.get("start_time", 0) or 0) + float(item.get("duration", 0) or 0) for item in kept)
+    return kept, kept_total
+
+
+def guide_cycle_through_block_end(timeline, total_seconds, cycle_start, block_end):
+    """The timeline and length of a cycle that starts at cycle_start as it airs when the block ends at block_end, and the second the block's last entry ends when that is after block_end (None when the cycle ends by then)."""
+    kept, kept_total = timeline_through_block_end(timeline, total_seconds, block_end - cycle_start)
+    end_second = cycle_start + kept_total
+    return kept, kept_total, (end_second if end_second > block_end else None)
+
+
+# ============================================================================
+# SECTION: Holiday day cycles
+# ============================================================================
+
+HOLIDAY_ROTATION_MODE = "random_slots"
+HOLIDAY_EPISODE_ORDER = "random"
+HOLIDAY_DAY_SECONDS = 86400
+HOLIDAY_KEYS = ("halloween", "christmas", "thanksgiving")
+# WARNING: the fallback number must match HOLIDAY_WINDOW_DAYS in performance_governor.py; it is used only when that module fails to import.
+try:
+    from performance_governor import HOLIDAY_WINDOW_DAYS as _HOLIDAY_WINDOW_DAYS
+except Exception as _swallowed_error:
+    _log_swallowed("media holiday window: import performance_governor", _swallowed_error)
+    _HOLIDAY_WINDOW_DAYS = 3
+
+
+def holiday_date(holiday_key, year):
+    """The calendar day of a holiday in a year: Halloween 31 October, Christmas 25 December, Thanksgiving the fourth Thursday of November."""
+    if holiday_key == "halloween":
+        return datetime.date(year, 10, 31)
+    if holiday_key == "christmas":
+        return datetime.date(year, 12, 25)
+    if holiday_key == "thanksgiving":
+        first = datetime.date(year, 11, 1)
+        return first + datetime.timedelta(days=(3 - first.weekday()) % 7 + 21)
+    return None
+
+
+def holiday_key_for_date(day, forced_key=None, today=None):
+    """The holiday a calendar day belongs to (its last HOLIDAY_WINDOW_DAYS days end at midnight after the holiday), else None; a forced key wins for today and every later day, and never changes a past day."""
+    # WARNING: the scheduler, the guide and the bezel must all read holidays through this one function, or they disagree about which day is a holiday.
+    if forced_key in HOLIDAY_KEYS and today is not None and day >= today:
+        return forced_key
+    for key in HOLIDAY_KEYS:
+        ahead = (holiday_date(key, day.year) - day).days
+        if 0 <= ahead < max(1, int(_HOLIDAY_WINDOW_DAYS)):
+            return key
+    return None
+
+
+def holiday_days_until_open(holiday_key, today):
+    """Whole days from today until the holiday's window opens: 0 while the window is open, else the days to its next opening; None for an unknown holiday."""
+    window = max(1, int(_HOLIDAY_WINDOW_DAYS))
+    for year in (today.year, today.year + 1):
+        end_day = holiday_date(holiday_key, year)
+        if end_day is None:
+            return None
+        if today <= end_day:
+            return max(0, (end_day - datetime.timedelta(days=window - 1) - today).days)
+    return None
+
+
+# ============================================================================
+# SECTION: Holiday force toggle (one global holiday, per-channel scheduling)
+# ============================================================================
+
+HOLIDAY_FORCE_KEY_CONFIG = "holiday_force_key"
+HOLIDAY_FORCE_CHANNELS_CONFIG = "holiday_force_channels"
+HOLIDAY_FORCE_DAY_CONFIG = "holiday_force_day"
+
+
+def holiday_force_channels(config):
+    """The channels the forced holiday was switched on for, as two-digit keys; switching it on from any channel lists every channel."""
+    raw = config.get(HOLIDAY_FORCE_CHANNELS_CONFIG, []) if isinstance(config, dict) else []
+    out = []
+    for item in (raw if isinstance(raw, (list, tuple)) else []):
+        key = str(item).zfill(2)
+        if key not in out:
+            out.append(key)
+    return out
+
+
+def holiday_forced_key_global(config):
+    """The holiday that is forced on (for every channel and the bezel), or an empty string when none is."""
+    key = config.get(HOLIDAY_FORCE_KEY_CONFIG, "") if isinstance(config, dict) else ""
+    return key if key in HOLIDAY_KEYS and holiday_force_channels(config) else ""
+
+
+def holiday_forced_key_for_channel(config, channel_key):
+    """The holiday forced on for one channel's schedule: the one forced holiday, the same on every channel (including a channel added later)."""
+    return holiday_forced_key_global(config)
+
+
+def holiday_force_started_today(config, today):
+    """True when the forced holiday was switched on today, so its first day starts when the show on air ends instead of on the half hour."""
+    day = config.get(HOLIDAY_FORCE_DAY_CONFIG, "") if isinstance(config, dict) else ""
+    return bool(holiday_forced_key_global(config)) and day == today.isoformat()
+
+
+def holiday_force_row_states(config, channel_key):
+    """{holiday key: 'on', 'off' or 'greyed'} for the Holiday menu, the same on every channel; greyed means another holiday is forced, so this toggle cannot be selected. A channel needs no holiday files to use its toggles."""
+    forced = holiday_forced_key_global(config)
+    states = {}
+    for key in HOLIDAY_KEYS:
+        if forced == key:
+            states[key] = "on"
+        elif forced:
+            states[key] = "greyed"
+        else:
+            states[key] = "off"
+    return states
+
+
+def holiday_force_enabled_rows(config, channel_key):
+    """The Holiday menu rows (0 to 2) whose force toggle can be selected on this channel."""
+    states = holiday_force_row_states(config, channel_key)
+    return tuple(row for row, key in enumerate(HOLIDAY_KEYS) if states[key] != "greyed")
+
+
+def holiday_force_toggle(config, channel_key, holiday_key, all_channels=None, today=None):
+    """Switches one holiday's force on for every channel, or off for every channel, from any channel's menu; returns False and changes nothing when that toggle is greyed."""
+    if holiday_key not in HOLIDAY_KEYS:
+        return False
+    state = holiday_force_row_states(config, channel_key)[holiday_key]
+    if state == "greyed":
+        return False
+    if state == "on":
+        config[HOLIDAY_FORCE_CHANNELS_CONFIG] = []
+        config[HOLIDAY_FORCE_KEY_CONFIG] = ""
+        config[HOLIDAY_FORCE_DAY_CONFIG] = ""
+        return True
+    channels = []
+    for item in list(all_channels or []) + [channel_key]:
+        key = str(item).zfill(2)
+        if key not in channels:
+            channels.append(key)
+    config[HOLIDAY_FORCE_CHANNELS_CONFIG] = channels
+    config[HOLIDAY_FORCE_KEY_CONFIG] = holiday_key
+    config[HOLIDAY_FORCE_DAY_CONFIG] = today.isoformat() if today is not None else ""
+    return True
+
+
+def holiday_rotation_settings(ch_info):
+    """The channel settings a holiday day is built with: random slots, random order and the channel's own pairing threshold."""
+    return {"scheduling_mode": HOLIDAY_ROTATION_MODE, "episode_order_mode": HOLIDAY_EPISODE_ORDER,
+            "pair_threshold_minutes": (ch_info or {}).get("pair_threshold_minutes", 15)}
+
+
+def build_holiday_cycle(raw_tracks, ch_info, commercial_tracks, tail_start_pos, start_commercial, seed,
+                        channel_id, fixed_show_order, order_seed, cutoff_seconds, kept_lineup=None,
+                        pending_tracks=None):
+    """One cycle of a holiday day: the kept entries followed by a rotation drawn from tail_start_pos, with its timeline and the positions to save after it, cut where the day ends cutoff_seconds into the cycle; returns a dict."""
+    # WARNING: tail_start_pos and start_commercial are copied before the build; a build changes the counters inside the state it is given.
+    settings = holiday_rotation_settings(ch_info)
+    kept = list(kept_lineup or [])
+    start_copy = copy.deepcopy(tail_start_pos or {})
+    commercial_copy = copy.deepcopy(start_commercial) if start_commercial is not None else None
+    tail, full_positions, show_order = build_block_rotation(
+        raw_tracks, settings, copy.deepcopy(start_copy), seed, HOLIDAY_DAY_SECONDS, channel_id,
+        fixed_show_order, order_seed, pending_tracks=pending_tracks)
+    lineup = kept + list(tail)
+    timeline, total, commercial_state = build_channel_timeline(
+        lineup, commercial_tracks, ch_info, seed, commercial_state=copy.deepcopy(commercial_copy))
+    positions, how = cycle_positions_at_block_end(
+        raw_tracks, settings, start_copy, seed, HOLIDAY_DAY_SECONDS, channel_id, fixed_show_order,
+        order_seed, lineup, timeline, total, cutoff_seconds, full_positions,
+        pending_tracks=pending_tracks, kept_entries=len(kept))
+    return {"lineup": lineup, "timeline": timeline, "total": total, "positions": positions, "how": how,
+            "show_order": show_order, "commercial_state": commercial_state, "start_positions": start_copy,
+            "start_commercial": commercial_copy, "kept": len(kept)}
+
+
+def store_holiday_cycle(h_log, cycle, block_key, boundary, index):
+    """Writes one built holiday cycle into the day's saved state: the positions, timeline and commercial state the scheduler reads, and the record a later rebuild starts from."""
+    h_log["show_pos"] = cycle["positions"]
+    h_log["show_order"] = cycle["show_order"]
+    h_log["timeline"] = cycle["timeline"]
+    h_log["total_duration"] = cycle["total"]
+    h_log["block_key"] = block_key
+    h_log["commercial_pos"] = cycle["commercial_state"]
+    h_log["cycle_boundary"] = boundary
+    h_log["cycle_index"] = index
+    h_log["cycle_start_pos"] = {"block_key": block_key, "positions": copy.deepcopy(cycle["start_positions"]),
+                                "kept": cycle["kept"]}
+    h_log["cycle_start_commercial"] = copy.deepcopy(cycle["start_commercial"])
+    h_log["cycle_lineup"] = list(cycle["lineup"])
+    h_log["frozen_aired_paths"] = lineup_paths(cycle["lineup"][:cycle["kept"]])
+
+
+def holiday_cycle_record_ok(h_log, block_key):
+    """True when a holiday day's saved state holds the airing cycle's record for block_key: where it begins, its start positions, its lineup and its timeline."""
+    record = h_log.get("cycle_start_pos")
+    return bool(
+        isinstance(record, dict) and record.get("block_key") == block_key
+        and isinstance(record.get("positions"), dict) and isinstance(record.get("kept"), int)
+        and isinstance(h_log.get("cycle_lineup"), list) and h_log.get("cycle_lineup")
+        and isinstance(h_log.get("timeline"), list) and h_log.get("timeline")
+        and isinstance(h_log.get("cycle_boundary"), (int, float)))
+
+
+def reflavor_holiday_cycle(raw_tracks, ch_info, commercial_tracks, h_log, position_seconds, seed, channel_id,
+                           order_seed, cutoff_seconds, pending_tracks=None):
+    """Rebuilds the airing cycle of a holiday day after durations changed: every entry that has started stays exactly as it was and the rest is drawn again from the positions after them; None when the saved record is missing or its entries cannot be tied to the timeline or their shows."""
+    record = h_log.get("cycle_start_pos")
+    lineup = h_log.get("cycle_lineup")
+    timeline = h_log.get("timeline")
+    if (not isinstance(record, dict) or not isinstance(record.get("positions"), dict)
+            or not isinstance(lineup, list) or not lineup or not timeline):
+        return None
+    prior = record.get("kept")
+    if not isinstance(prior, int) or prior < 0:
+        return None
+    kept = entries_started_before(timeline, lineup, float(position_seconds) + 0.001)
+    if kept is None or kept < prior:
+        return None
+    fixed_order = h_log.get("show_order")
+    if kept == prior:
+        tail_start = copy.deepcopy(record["positions"])
+    else:
+        tail_start = positions_after_aired_entries(
+            raw_tracks, holiday_rotation_settings(ch_info), record["positions"], seed, HOLIDAY_DAY_SECONDS,
+            channel_id, fixed_order, order_seed, lineup[prior:], kept - prior, pending_tracks=pending_tracks)
+        if tail_start is None:
+            return None
+    return build_holiday_cycle(
+        raw_tracks, ch_info, commercial_tracks, tail_start, h_log.get("cycle_start_commercial"), seed,
+        channel_id, fixed_order, order_seed, cutoff_seconds, kept_lineup=lineup[:kept],
+        pending_tracks=pending_tracks)
 
 
 def _episode_label(path):
@@ -3405,24 +4431,18 @@ def block_day_seed(seed_date, channel_num, block_offset):
 # ============================================================================
 
 
-def read_block_lineup(ch_key, ch_info, block_name, now, media_probe_cache, path_exists, start_order_seed, peek_only=False):
+def read_block_lineup(ch_key, ch_info, block_name, now, path_exists, start_order_seed, peek_only=False):
     """The airing-order lineup of one named block of a channel as (tracks, block_name), or ([], None) when none of its files exist; each track keeps its schedule entry's gain, a saved lineup is read with each saved path once, and nothing is written to the channel; the saved show positions are always read from a deep copy, and peek_only is accepted and changes nothing."""
     # WARNING: the show positions must always be deep-copied; build_show_rotation edits nested entries such as __FAIRNESS__ in place, which would move the real scheduler's counters.
     # WARNING: start_order_seed is called only after the block is known to have files, because the first call for a channel draws and saves its start number.
     folder_items = ch_info.get("schedules", {}).get(block_name, [])
-    raw_tracks = build_raw_tracks(folder_items, media_probe_cache, path_exists, keep_gain=True)
-    pending_tracks = build_pending_tracks(folder_items, media_probe_cache, path_exists)
+    raw_tracks = build_raw_tracks(folder_items, path_exists, keep_gain=True)
+    pending_tracks = build_pending_tracks(folder_items, path_exists)
 
-    # Only admitted files may reach the guide or scheduler. A confirmed-bad movie
-    # is replaced by another valid movie in the lineup; a confirmed-bad episode
-    # disappears so the series rotation advances to the next episode.
     _broken = set(ch_info.get("broken_files", []))
     def _admitted(track):
         _path = track.get("path", track.get("file", "")) if isinstance(track, dict) else str(track)
-        _cached = media_probe_cache.get(os.path.normpath(str(_path)), {}) if isinstance(media_probe_cache, dict) else {}
-        return (_path not in _broken
-                and not _cached.get("confirmed_unplayable")
-                and not _cached.get("confirmed_no_audio"))
+        return _path not in _broken and not file_is_confirmed_bad(_path)
     raw_tracks = [track for track in raw_tracks if _admitted(track)]
     pending_tracks = [track for track in pending_tracks if _admitted(track)]
     if not raw_tracks:
@@ -3454,7 +4474,7 @@ def read_block_lineup(ch_key, ch_info, block_name, now, media_probe_cache, path_
     return lineup, block_name
 
 
-def read_holiday_lineup(ch_key, ch_info, holiday_key, now, media_probe_cache, path_exists,
+def read_holiday_lineup(ch_key, ch_info, holiday_key, now, path_exists,
                         show_pos=None, fixed_show_order=None, seed_bump=0):
     """Read one holiday lineup without changing channel state."""
     entries = ch_info.get("holiday_schedules", {}).get(holiday_key, [])
@@ -3464,17 +4484,14 @@ def read_holiday_lineup(ch_key, ch_info, holiday_key, now, media_probe_cache, pa
     broken = set(ch_info.get("broken_files", []))
     for entry in entries:
         path = entry.get("path", entry.get("file", "")) if isinstance(entry, dict) else str(entry)
-        cached = media_probe_cache.get(os.path.normpath(str(path)), {}) if isinstance(media_probe_cache, dict) else {}
-        if (path and path_exists(path) and path not in broken
-                and not cached.get("confirmed_unplayable")
-                and not cached.get("confirmed_no_audio")):
+        if path and path_exists(path) and path not in broken and not file_is_confirmed_bad(path):
             admitted.append(entry)
     if not admitted:
         return [], None
     seed = (now.year * 1000 + now.timetuple().tm_yday + int(ch_key) + 9000
             + (sum(ord(c) for c in str(holiday_key)) % 1000) + int(seed_bump or 0))
     lineup = build_scheduled_block_content(
-        admitted, f"Holiday:{holiday_key}", ch_info, media_probe_cache, path_exists,
+        admitted, f"Holiday:{holiday_key}", ch_info, path_exists,
         seed, show_pos=copy.deepcopy(show_pos or {}), channel_id=ch_key,
         block_duration_seconds=86400, fixed_show_order=fixed_show_order,
         include_unknown=False,
@@ -3486,7 +4503,13 @@ def read_holiday_lineup(ch_key, ch_info, holiday_key, now, media_probe_cache, pa
 # SECTION: Commercial bundles & block timeline
 # ============================================================================
 COMMERCIAL_MAX_SECONDS = 5 * 60
-COMMERCIAL_BUNDLE_CEILINGS = (15, 30, 45, 60, 90, 120, 180, COMMERCIAL_MAX_SECONDS)
+# WARNING: the fallback number must match COMMERCIAL_BUNDLE_STEP_SECONDS in performance_governor.py; it is used only when that module fails to import.
+try:
+    from performance_governor import COMMERCIAL_BUNDLE_STEP_SECONDS as _COMMERCIAL_BUNDLE_STEP_SECONDS
+except Exception as _swallowed_error:
+    _log_swallowed("media commercial bundle step: import performance_governor", _swallowed_error)
+    _COMMERCIAL_BUNDLE_STEP_SECONDS = 15
+COMMERCIAL_BUNDLE_CEILINGS = tuple(range(_COMMERCIAL_BUNDLE_STEP_SECONDS, COMMERCIAL_MAX_SECONDS + 1, _COMMERCIAL_BUNDLE_STEP_SECONDS))
 
 
 def commercial_bundle_ceiling(duration):
@@ -3498,18 +4521,14 @@ def commercial_bundle_ceiling(duration):
     return COMMERCIAL_BUNDLE_CEILINGS[-1]
 
 
-# VALUES CHANGE HERE
-COMMERCIAL_DEFAULT_SECONDS = 30
-
-
-def build_commercial_tracks(items, media_probe_cache, path_exists, max_seconds=COMMERCIAL_MAX_SECONDS):
+def build_commercial_tracks(items, path_exists, max_seconds=COMMERCIAL_MAX_SECONDS):
     """Turns the Commercials schedule entries into tracks with a whole-second duration; entries whose path does not exist, or that run longer than max_seconds (None keeps every length), are left out."""
     tracks = []
     for asset in items:
         path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
         if path and path_exists(path):
             stored = asset.get("duration", 0) if isinstance(asset, dict) else 0
-            duration = resolve_track_duration(media_probe_cache, path, stored, default=0)
+            duration = resolve_track_duration(path, stored, default=0)
             if not duration or duration <= 0:
                 continue
             if max_seconds is not None and duration > max_seconds:
@@ -3522,8 +4541,9 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                           interrupt_floor_seconds=900,
                           max_interrupt_break_seconds=360,
                           max_end_break_seconds=600,
-                          media_probe_cache=None,
-                          commercial_state=None):
+                          commercial_state=None,
+                          fade_in_tracks=None,
+                          fade_out_tracks=None):
     import random as _random
 
     HALF_HOUR         = 1800
@@ -3536,18 +4556,16 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         try:
             if isinstance(show, dict) and show.get("_duration_estimated"):
                 return True
-            if media_probe_cache is None:
-                return False
+            if _duration_hub is not None and isinstance(show, dict) and show.get("path"):
+                if _duration_hub.read(show.get("path"))[1] == DURATION_MEASURED:
+                    return False
             p = show.get("path") if isinstance(show, dict) else None
             if not p:
                 return False
-            cached = media_probe_cache.get(os.path.normpath(str(p)))
-            cdur = cached.get("duration") if isinstance(cached, dict) else None
-            if cdur and cdur > 0:
-                return False
             stored = show.get("duration") if isinstance(show, dict) else None
             return not (stored and stored > 0 and stored != HALF_HOUR)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_dur_is_estimated: return True", _swallowed_error)
             return False
 
     _bundles = {}
@@ -3562,37 +4580,43 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         _saved_bundles = {}
     _bundle_cycle  = {}
     _bundle_recent = {}
-    for _ceiling in _bundles:
+    _bundle_drawn  = {}
+    for _ceiling, _items in _bundles.items():
         _saved = _saved_bundles.get(str(_ceiling))
         if not isinstance(_saved, dict):
             _saved = {}
         _bundle_cycle[_ceiling]  = int(_saved.get("cycle", 0) or 0)
         _bundle_recent[_ceiling] = [p for p in _saved.get("recent", []) if p]
+        _saved_drawn = _saved.get("drawn")
+        _present_paths = {_it["path"] for _it in _items}
+        _bundle_drawn[_ceiling] = [p for p in dict.fromkeys(_saved_drawn) if p in _present_paths] if isinstance(_saved_drawn, list) else []
 
-    def _shuffled_ad_lap(pool_items, ceiling):
-        _bundle_cycle[ceiling] = _bundle_cycle.get(ceiling, 0) + 1
+    def _lap_order(ceiling):
+        """The bundle's commercials not yet aired in its current lap, shuffled; a lap that has just begun holds the latest aired ones to its end."""
+        pool_items = _bundles[ceiling]
+        drawn = set(_bundle_drawn.get(ceiling, []))
+        remaining = [c for c in pool_items if c["path"] not in drawn]
+        _random.Random(f"{day_seed}:__commercials__:{ceiling}:{_bundle_cycle.get(ceiling, 0)}").shuffle(remaining)
         n = len(pool_items)
-        order = list(range(n))
-        lap_rng = _random.Random(f"{day_seed}:__commercials__:{ceiling}:{_bundle_cycle[ceiling]}")
-        lap_rng.shuffle(order)
-        recent = _bundle_recent.get(ceiling, [])
         hold_back = min(RANDOM_REPEAT_HOLD_BACK, n - 1) if n > 1 else 0
-        if hold_back > 0:
-            blocked_paths = set(recent[-hold_back:])
-            blocked = {i for i in order if pool_items[i]["path"] in blocked_paths}
-            if blocked and len(blocked) < len(order):
-                allowed = [i for i in order if i not in blocked]
-                held = [i for i in order if i in blocked]
-                order = allowed + held
-        return [pool_items[i] for i in order]
+        if not drawn and hold_back > 0:
+            blocked_paths = set(_bundle_recent.get(ceiling, [])[-hold_back:])
+            held = [c for c in remaining if c["path"] in blocked_paths]
+            if held and len(held) < len(remaining):
+                remaining = [c for c in remaining if c["path"] not in blocked_paths] + held
+        return remaining
 
-    _bundle_pools = {}
-    _bundle_idx   = {}
-    for _ceiling, _items in _bundles.items():
-        _bundle_pools[_ceiling] = _shuffled_ad_lap(_items, _ceiling)
-        _bundle_idx[_ceiling]   = 0
+    def _restart_lap(ceiling):
+        """Starts the bundle's next lap: every commercial of the bundle is unaired again."""
+        _bundle_cycle[ceiling] = _bundle_cycle.get(ceiling, 0) + 1
+        _bundle_drawn[ceiling] = []
+        _bundle_remaining[ceiling] = _lap_order(ceiling)
 
-    _bundle_order = sorted(_bundle_pools.keys())
+    _bundle_remaining = {}
+    for _ceiling in _bundles:
+        _bundle_remaining[_ceiling] = _lap_order(_ceiling)
+
+    _bundle_order = sorted(_bundle_remaining.keys())
     _saved_turn_ceiling = (commercial_state or {}).get("turn_ceiling")
     _bundle_turn = _bundle_order.index(_saved_turn_ceiling) if _saved_turn_ceiling in _bundle_order else 0
 
@@ -3631,40 +4655,65 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         if len(recent) > RANDOM_REPEAT_HOLD_BACK:
             _bundle_recent[ceiling] = recent[-RANDOM_REPEAT_HOLD_BACK:]
 
-    def _next_from_bundle(ceiling, exclude_paths):
-        """Pull the next unused-in-this-break item from `ceiling`'s rotation, reshuffling when a lap ends."""
-        pool = _bundle_pools.get(ceiling)
-        if not pool:
-            return None
-        n = len(pool)
-        seen = 0
-        while seen < n:
-            idx = _bundle_idx[ceiling]
-            if idx > 0 and idx % n == 0:
-                pool = _bundle_pools[ceiling] = _shuffled_ad_lap(pool, ceiling)
-            com = pool[idx % n]
-            _bundle_idx[ceiling] = idx + 1
-            seen += 1
-            if com["duration"] <= 0 or com["path"] in exclude_paths:
+    def _take_from_bundle(ceiling, exclude_paths):
+        """Takes the next commercial of `ceiling`'s current lap that is not already in this break, and marks it aired in the lap."""
+        remaining = _bundle_remaining.get(ceiling) or []
+        for position, com in enumerate(remaining):
+            if com["path"] in exclude_paths:
                 continue
+            del remaining[position]
+            _bundle_drawn[ceiling].append(com["path"])
             return com
         return None
 
     def _pick_one(budget_seconds, exclude_paths):
-        """Pick one commercial that fits `budget_seconds`, trying bundles in round-robin order."""
+        """Picks one commercial that fits `budget_seconds`: one that finishes the break exactly (alone or with one more) when there is one, otherwise from the fitting bundle with the largest share of its lap still unaired; a bundle's lap restarts only when no fitting bundle has an unaired commercial left."""
+        # WARNING: the pick must depend only on the saved state, the seed and the break so far; the scheduler and the guide must deal the same commercial.
         nonlocal _bundle_turn
         n = len(_bundle_order)
-        for offset in range(n):
-            idx = (_bundle_turn + offset) % n
-            ceiling = _bundle_order[idx]
-            if ceiling > budget_seconds:
-                continue
-            com = _next_from_bundle(ceiling, exclude_paths)
-            if com is None:
-                continue
-            _bundle_turn = (idx + 1) % n
-            return com, ceiling
-        return None, None
+        if not n:
+            return None, None
+        order = [(_bundle_turn + offset) % n for offset in range(n)]
+        fitting = [i for i in order if _bundle_order[i] <= budget_seconds]
+
+        def _open(i):
+            return any(c["path"] not in exclude_paths for c in _bundle_remaining[_bundle_order[i]])
+
+        open_bundles = [i for i in fitting if _open(i)]
+        if not open_bundles and fitting:
+            if all(not _bundle_remaining[c] for c in _bundle_order):
+                for c in _bundle_order:
+                    _restart_lap(c)
+                open_bundles = [i for i in fitting if _open(i)]
+            else:
+                for i in fitting:
+                    if not _bundle_remaining[_bundle_order[i]]:
+                        _restart_lap(_bundle_order[i])
+                        if _open(i):
+                            open_bundles = [i]
+                            break
+        if not open_bundles:
+            return None, None
+
+        def _next_duration(i):
+            for c in _bundle_remaining[_bundle_order[i]]:
+                if c["path"] not in exclude_paths:
+                    return c["duration"], c["path"]
+            return None, None
+
+        _nexts = {i: _next_duration(i) for i in open_bundles}
+        finishing = [i for i in open_bundles if _nexts[i][0] == budget_seconds]
+        if not finishing:
+            finishing = [i for i in open_bundles
+                         if any(j != i and _nexts[j][1] != _nexts[i][1] and _nexts[i][0] + _nexts[j][0] == budget_seconds for j in open_bundles)]
+        candidates = finishing or open_bundles
+        best = max(candidates, key=lambda i: (len(_bundle_remaining[_bundle_order[i]]) / float(len(_bundles[_bundle_order[i]])), -order.index(i)))
+        ceiling = _bundle_order[best]
+        com = _take_from_bundle(ceiling, exclude_paths)
+        if com is None:
+            return None, None
+        _bundle_turn = (best + 1) % n
+        return com, ceiling
 
     def _show_entry(show, duration, start_time, seek_offset=0, interior_cut=False):
         e = {"path": show["path"], "duration": duration,
@@ -3690,7 +4739,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     def _pack_break(budget_seconds):
         picked = []
         used = 0
-        if budget_seconds <= 0 or not _bundle_pools:
+        if budget_seconds <= 0 or not _bundle_remaining:
             return picked, 0
         break_paths = set()
         while True:
@@ -3723,7 +4772,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
 
     def _pack_and_round(budget_seconds, t_block_content, max_seconds=None):
         nonlocal _deferred_fill
-        if budget_seconds <= 0 or not _bundle_pools:
+        if budget_seconds <= 0 or not _bundle_remaining:
             return t_block_content
         capped = min(budget_seconds, max_seconds) if max_seconds is not None else budget_seconds
         if capped < budget_seconds:
@@ -3809,24 +4858,18 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         if isinstance(show, dict) and show.get("is_pair"):
             p1 = show.get("pair_ep1_path", show.get("path", ""))
             p2 = show.get("pair_ep2_path", "")
-            d1 = resolve_track_duration(
-                media_probe_cache, p1, show.get("pair_ep1_duration", 0), default=0
-            )
-            d2 = resolve_track_duration(
-                media_probe_cache, p2, show.get("pair_ep2_duration", 0), default=0
-            )
+            d1 = resolve_track_duration(p1, show.get("pair_ep1_duration", 0), default=0)
+            d2 = resolve_track_duration(p2, show.get("pair_ep2_duration", 0), default=0)
             if d1 > 0 and d2 > 0:
                 return int(d1 + d2)
         p = show.get("path") if isinstance(show, dict) else None
         stored = show.get("duration") if isinstance(show, dict) else None
-        return resolve_track_duration(media_probe_cache, p, stored, default=HALF_HOUR)
+        return resolve_track_duration(p, stored, default=HALF_HOUR)
 
     def _mid_split_point(show, show_dur):
         if isinstance(show, dict) and show.get("is_pair"):
             p1 = show.get("pair_ep1_path", show.get("path", ""))
-            d1 = resolve_track_duration(
-                media_probe_cache, p1, show.get("pair_ep1_duration", 0), default=0
-            )
+            d1 = resolve_track_duration(p1, show.get("pair_ep1_duration", 0), default=0)
             if 0 < d1 < show_dur:
                 raw_mid = show_dur // 2
                 if abs(int(d1) - raw_mid) >= 1:
@@ -4026,10 +5069,48 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             timeline.append(_show_entry(show, _dur, total_block_content, 0))
             total_block_content += _dur
 
+    # WARNING: fade-in and fade-out bumpers stay in the same timeline and extend its duration; they never make a second guide.
+    fade_in_tracks = list(fade_in_tracks or [])
+    fade_out_tracks = list(fade_out_tracks or [])
+    if fade_in_tracks or fade_out_tracks:
+        _bumper_timeline = []
+        _fade_in_pos = 0
+        _fade_out_pos = 0
+        _seen_show = False
+        for _index, _entry in enumerate(timeline):
+            _is_show_start = (not _entry.get("is_commercial") and not _entry.get("seek_offset", 0))
+            if _is_show_start and _seen_show and fade_out_tracks:
+                _bumper = fade_out_tracks[_fade_out_pos % len(fade_out_tracks)]
+                _fade_out_pos += 1
+                _bumper_timeline.append({"path": _bumper["path"], "duration": _bumper["duration"],
+                                         "start_time": 0, "is_commercial": True, "is_fade_out": True,
+                                         "seek_offset": 0})
+            if _is_show_start and fade_in_tracks:
+                _bumper = fade_in_tracks[_fade_in_pos % len(fade_in_tracks)]
+                _fade_in_pos += 1
+                _bumper_timeline.append({"path": _bumper["path"], "duration": _bumper["duration"],
+                                         "start_time": 0, "is_commercial": True, "is_fade_in": True,
+                                         "seek_offset": 0})
+            _bumper_timeline.append(_entry)
+            if _is_show_start:
+                _seen_show = True
+        if _seen_show and fade_out_tracks:
+            _bumper = fade_out_tracks[_fade_out_pos % len(fade_out_tracks)]
+            _bumper_timeline.append({"path": _bumper["path"], "duration": _bumper["duration"],
+                                     "start_time": 0, "is_commercial": True, "is_fade_out": True,
+                                     "seek_offset": 0})
+        _cursor = 0
+        for _entry in _bumper_timeline:
+            _entry["start_time"] = _cursor
+            _cursor += float(_entry.get("duration", 0) or 0)
+        timeline = _bumper_timeline
+        total_block_content = _cursor
+
     new_commercial_state = {
         "bundles": {
             str(_ceiling): {"cycle": _bundle_cycle.get(_ceiling, 0),
-                             "recent": list(_bundle_recent.get(_ceiling, []))}
+                             "recent": list(_bundle_recent.get(_ceiling, [])),
+                             "drawn": list(_bundle_drawn.get(_ceiling, []))}
             for _ceiling in _bundles
         },
         "turn_ceiling": _bundle_order[_bundle_turn] if _bundle_order else None,
@@ -4048,43 +5129,58 @@ def commercial_interrupt_floor_seconds(ch_info):
     return (minutes if minutes > 0 else COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES) * 60
 
 
-def admit_visualizer_assets(stack, media_probe_cache, unseekable_paths, unseekable_extensions):
+def visualizer_asset_status(asset, unseekable_paths, unseekable_extensions):
+    """Returns (path, status) for one Visualizer song: "admitted" when it has a known length, "pending" when only its length is missing, "rejected" when it can never air."""
+    # WARNING: the station's Visualizer lineup, the Guide and the first-scan queue all read this one test; a second copy of these rules lets the Guide show music while the station airs Static.
+    path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
+    if not path:
+        return "", "rejected"
+    asset_dict = asset if isinstance(asset, dict) else {}
+    norm = os.path.normpath(str(path))
+    if norm in unseekable_paths or os.path.splitext(str(path))[1].lower() in unseekable_extensions:
+        return path, "rejected"
+    if file_is_confirmed_bad(path):
+        return path, "rejected"
+    scanned, scanned_kind = read_track_duration(path, 0)
+    if scanned_kind != DURATION_MEASURED:
+        scanned = None
+    stored = asset_dict.get("duration")
+    if (isinstance(scanned, (int, float)) and scanned > 0) or (isinstance(stored, (int, float)) and stored > 0):
+        return path, "admitted"
+    return path, "pending"
+
+
+def admit_visualizer_assets(stack, unseekable_paths, unseekable_extensions):
     """Returns the (path, asset) songs a Visualizer channel may air: not unseekable, not confirmed unplayable or silent, and with a known length."""
-    # WARNING: the station's Visualizer lineup and the Guide both call this; a second copy of these rules lets the Guide show music while the station airs Static.
     admitted = []
     for asset in stack or []:
-        path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
-        if not path:
-            continue
-        asset_dict = asset if isinstance(asset, dict) else {}
-        norm = os.path.normpath(str(path))
-        if norm in unseekable_paths or os.path.splitext(str(path))[1].lower() in unseekable_extensions:
-            continue
-        cached = (media_probe_cache or {}).get(norm, {})
-        if not isinstance(cached, dict):
-            cached = {}
-        if cached.get("confirmed_unplayable") or cached.get("confirmed_no_audio"):
-            continue
-    # Duration probing is asynchronous. An unmeasured but otherwise valid music
-    # file must still enter the lineup; the scheduler uses its fallback duration
-    # and replaces it when the probe completes. Rejecting it here turns a newly
-    # scanned visualizer station into Static until every file finishes probing.
-    admitted.append((path, asset_dict))
-
+        path, status = visualizer_asset_status(asset, unseekable_paths, unseekable_extensions)
+        if status == "admitted":
+            admitted.append((path, asset if isinstance(asset, dict) else {}))
     return admitted
 
 
-def build_scheduled_block_content(folder_items, block_name, ch_info, media_probe_cache,
+def pending_visualizer_paths(stack, unseekable_paths, unseekable_extensions):
+    """Returns the paths of the Visualizer songs that could air but have no known length yet."""
+    pending = []
+    for asset in stack or []:
+        path, status = visualizer_asset_status(asset, unseekable_paths, unseekable_extensions)
+        if status == "pending":
+            pending.append(path)
+    return pending
+
+
+def build_scheduled_block_content(folder_items, block_name, ch_info,
                                   path_exists, day_seed, show_pos=None,
                                   channel_id=None, block_duration_seconds=None,
                                   fixed_show_order=None, include_unknown=False):
     """Builds the admitted, ordered block lineup for one block of a channel."""
-    raw_tracks = build_raw_tracks(folder_items or [], media_probe_cache or {}, path_exists,
+    raw_tracks = build_raw_tracks(folder_items or [], path_exists,
                                   include_unknown=include_unknown)
     if not raw_tracks:
         return [], dict(show_pos or {})
     pending_tracks = [] if include_unknown else build_pending_tracks(
-        folder_items or [], media_probe_cache or {}, path_exists)
+        folder_items or [], path_exists)
     playback_log = ch_info.get("playback_log", {})
     positions = dict(show_pos if show_pos is not None else playback_log.get("show_pos", {}))
     if block_duration_seconds is None:
@@ -4099,14 +5195,118 @@ def build_scheduled_block_content(folder_items, block_name, ch_info, media_probe
     return tracks, positions
 
 
-def build_channel_timeline(video_tracks, commercial_tracks, ch_info, day_seed, media_probe_cache=None, commercial_state=None):
-    """Builds a block's timeline with the channel's own commercial placement and interrupt floor."""
+def bumper_tracks_for_channel(ch_info):
+    """Returns the saved Fade-in and Fade-out schedule media as timeline-ready tracks."""
+    schedules = (ch_info or {}).get("schedules", {}) or {}
+    path_exists = lambda path: bool(path and os.path.isfile(path))
+    fade_in_entries = schedules.get("Fade-in")
+    if fade_in_entries is None:
+        fade_in_entries = schedules.get("Intros", [])
+    fade_out_entries = schedules.get("Fade-out")
+    if fade_out_entries is None:
+        fade_out_entries = schedules.get("Outros", [])
+    return (
+        build_commercial_tracks(fade_in_entries, path_exists),
+        build_commercial_tracks(fade_out_entries, path_exists),
+    )
+
+
+def build_channel_timeline(video_tracks, commercial_tracks, ch_info, day_seed, commercial_state=None):
+    """Builds one guide timeline, including channel-scheduled fade bumpers around each show."""
+    fade_in_tracks, fade_out_tracks = bumper_tracks_for_channel(ch_info)
     return build_block_timeline(
         video_tracks, commercial_tracks, ch_info.get("commercial_placement", "interrupt_half_hour"), day_seed,
         interrupt_floor_seconds=commercial_interrupt_floor_seconds(ch_info),
-        media_probe_cache=media_probe_cache,
         commercial_state=commercial_state,
+        fade_in_tracks=fade_in_tracks,
+        fade_out_tracks=fade_out_tracks,
     )
+
+
+def _entry_row_files(entry):
+    """Every file one lineup or timeline entry airs: both episodes of a pair, every episode of a leftovers bundle, or the one file."""
+    if entry.get("is_pair"):
+        return [p for p in (entry.get("pair_ep1_path"), entry.get("pair_ep2_path")) if p]
+    if entry.get("is_bundle"):
+        return [p for p in (_episode_path(e) for e in entry.get("bundle_items") or ()) if p]
+    return [entry.get("path")] if entry.get("path") else []
+
+
+def bundles_of_tracks(raw_tracks):
+    """Maps each active file to its bundle (its series, or the movie bundle) and lists each bundle's active files, for the round number on hub rows."""
+    movie_pool, show_names, show_episodes = split_movies_and_series(list(raw_tracks or []))
+    members = {}
+    for track in movie_pool:
+        members.setdefault(MOVIE_BUNDLE_KEY, []).extend(_entry_row_files(track))
+    for show_name, episodes in show_episodes.items():
+        key = _normalize_show_key(show_name)
+        for episode in episodes:
+            members.setdefault(key, []).extend(_entry_row_files(episode))
+    return {"members": members, "files": {path: key for key, paths in members.items() for path in paths}}
+
+
+def _bundle_fields(entry, bundles):
+    """The bundle name, the bundle's active files and the files this entry airs, for a hub row; empty when the entry's file is in no bundle."""
+    if not bundles:
+        return {}
+    key = bundles["files"].get(entry.get("path") or "")
+    if not key:
+        return {}
+    return {"bundle": key, "bundle_files": list(bundles["members"][key]), "row_files": _entry_row_files(entry)}
+
+
+_GUIDE_ENTRY_KEYS = ("path", "duration", "is_commercial", "seek_offset", "is_pair", "pair_ep1_path", "pair_ep1_duration",
+                     "pair_ep2_path", "pair_ep2_duration", "is_bundle", "bundle_item_paths", "bundle_item_durations")
+
+
+def guide_entry_facts(entry):
+    """The facts the guide draws one timeline entry's cell from (its file, length, break flag, seek offset, pair parts and leftovers files), as a plain dictionary a hub row can keep."""
+    if not isinstance(entry, dict):
+        return None
+    return {key: copy.deepcopy(entry[key]) for key in _GUIDE_ENTRY_KEYS if key in entry}
+
+
+def schedule_rows_from_timeline(timeline, block_start_epoch, bundles=None):
+    """Turns a built block timeline into the rows the hub keeps: one row per entry with its planned wall-clock start, length, kind and the facts the guide draws its cell from, and the bundle each episode belongs to when bundles are given."""
+    rows = []
+    for position, entry in enumerate(timeline or []):
+        path = entry.get("path") or ""
+        if not path:
+            continue
+        row = {
+            "position": position,
+            "path": path,
+            "kind": "commercial" if entry.get("is_commercial") else "episode",
+            "planned_start": float(block_start_epoch) + float(entry.get("start_time", 0) or 0),
+            "used_length": float(entry.get("duration", 0) or 0),
+            "length_source": "estimate" if entry.get("duration_estimated") else "measured",
+            "continuation": bool(not entry.get("is_commercial") and (entry.get("seek_offset", 0) or 0) > 0),
+            "guide_entry": guide_entry_facts(entry),
+        }
+        if not entry.get("is_commercial"):
+            row.update(_bundle_fields(entry, bundles))
+        rows.append(row)
+    return rows
+
+
+def schedule_rows_from_lineup(lineup, bundles=None):
+    """Turns a block's prebuilt show lineup into hub rows: the order of the shows with their lengths, and no start times or commercials yet."""
+    rows = []
+    for position, track in enumerate(lineup or []):
+        path = track.get("path") or ""
+        if not path:
+            continue
+        row = {
+            "position": position,
+            "path": path,
+            "kind": "episode",
+            "planned_start": None,
+            "used_length": float(track.get("duration", 0) or 0),
+            "length_source": "estimate" if track.get("_duration_estimated") else "measured",
+        }
+        row.update(_bundle_fields(track, bundles))
+        rows.append(row)
+    return rows
 
 
 # ============================================================================
@@ -4126,7 +5326,8 @@ def _duration_looks_implausible(file_path, duration_sec):
         size_bytes = os.path.getsize(file_path)
         implied_mbps = (size_bytes * 8 / 1_000_000) / duration_sec
         return implied_mbps > _DURATION_SANITY_MAX_PLAUSIBLE_MBPS
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_duration_looks_implausible: return False", _swallowed_error)
         return False
 
 
@@ -4230,7 +5431,8 @@ def _get_header_facts(file_path):
         return None
     try:
         return fn(file_path)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_get_header_facts: return fn(file_path)", _swallowed_error)
         return None
 
 
@@ -4479,6 +5681,70 @@ def bezel_style_count():
     return max(1, len(discover_bezel_style_files()))
 
 
+_holiday_bezel_files_cache = {"key": None, "files": {}, "checked_at": 0.0}
+
+
+def discover_holiday_bezel_files():
+    """Holiday bezel images next to the normal bezels, as {(holiday key, '', '1' or '2'): path}; bezelChristmas goes with bezel, bezelChristmas1 with bezel1 and bezelChristmas2 with bezel2."""
+    b_dir = resolve_bezel_dir()
+    cached = _holiday_bezel_files_cache
+    now = time.monotonic()
+    if (cached["key"] is not None and cached["key"][0] == b_dir
+            and (now - cached["checked_at"]) < _BEZEL_STYLE_DISCOVERY_TTL_SEC):
+        return cached["files"]
+    try:
+        fingerprint = (os.path.getmtime(b_dir), len(os.listdir(b_dir))) if os.path.isdir(b_dir) else None
+    except Exception as e:
+        log.warning("discover_holiday_bezel_files: could not read %s: %s", b_dir, e)
+        fingerprint = None
+    cache_key = (b_dir, fingerprint)
+    cached["checked_at"] = now
+    if cached["key"] == cache_key:
+        return cached["files"]
+    files = {}
+    if fingerprint is not None:
+        try:
+            for name in sorted(os.listdir(b_dir)):
+                stem, ext = os.path.splitext(name)
+                if ext.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
+                    continue
+                found = re.match(r"^(?:bezel|border)(halloween|christmas|thanksgiving)([12]?)$", stem, re.IGNORECASE)
+                if found:
+                    files.setdefault((found.group(1).lower(), found.group(2)), os.path.join(b_dir, name))
+        except Exception as e:
+            log.warning("discover_holiday_bezel_files: could not list %s: %s", b_dir, e)
+    cached["key"] = cache_key
+    cached["files"] = files
+    return files
+
+
+def holiday_bezel_path_for(style_path, holiday_key):
+    """The holiday image that replaces a bezel style file (bezel, bezel1 or bezel2) for a holiday, or None when there is none."""
+    if not style_path or holiday_key not in HOLIDAY_KEYS:
+        return None
+    found = re.match(r"^(?:bezel|border)(\d*)$", os.path.splitext(os.path.basename(style_path))[0], re.IGNORECASE)
+    if not found or found.group(1) not in ("", "1", "2"):
+        return None
+    return discover_holiday_bezel_files().get((holiday_key, found.group(1)))
+
+
+def holiday_loading_image_path(loading_dir, holiday_key, base_name="retro_tv_loading"):
+    """The holiday's boot loading image next to the normal one (retro_tv_loadingChristmas.png goes with retro_tv_loading.png), or None when there is none."""
+    if holiday_key not in HOLIDAY_KEYS:
+        return None
+    try:
+        if not os.path.isdir(loading_dir):
+            return None
+        wanted = (str(base_name) + holiday_key).lower()
+        for name in sorted(os.listdir(loading_dir)):
+            stem, ext = os.path.splitext(name)
+            if stem.lower() == wanted and ext.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
+                return os.path.join(loading_dir, name)
+    except Exception as e:
+        log.warning("holiday_loading_image_path: could not list %s: %s", loading_dir, e)
+    return None
+
+
 # ============================================================================
 # SECTION: Data-folder resolution
 # ============================================================================
@@ -4692,7 +5958,60 @@ def _burned_in_verdict(file_path, allow_scan=True):
         return None
 
 
-def resolve_caption_source(file_path, cache_entry=None):
+# ============================================================================
+# SECTION: File facts hub access (caption source, playability verdicts, loudness retry timers)
+# ============================================================================
+
+_file_facts_hub_singleton = None
+_file_facts_hub_failed = False
+_file_facts_hub_lock = threading.Lock()
+_NO_FILE_FACTS = {"caption_kind": None, "caption_srt_path": None, "unplayable_strikes": None,
+                  "unplayable_reason": None, "confirmed_unplayable": False, "confirmed_no_audio": False,
+                  "no_audio_reason": None, "loudness_timeout_streak": None, "loudness_next_retry_ts": None}
+
+
+def get_file_facts_hub():
+    """The one shared FileFactsHub, or None when the library cannot open."""
+    global _file_facts_hub_singleton, _file_facts_hub_failed
+    if _file_facts_hub_singleton is not None or _file_facts_hub_failed:
+        return _file_facts_hub_singleton
+    with _file_facts_hub_lock:
+        if _file_facts_hub_singleton is None and not _file_facts_hub_failed:
+            try:
+                import media_library as _ml
+                _file_facts_hub_singleton = _ml.shared_file_facts_hub()
+            except Exception as e:
+                _file_facts_hub_failed = True
+                log.warning("get_file_facts_hub: the library could not open, so per-file caption, playability and loudness-retry facts are unavailable: %s", e)
+    return _file_facts_hub_singleton
+
+
+def file_facts(file_path):
+    """One file's caption source, playability verdicts and loudness retry timers from the library; every field reads as nothing on record when the library is unavailable."""
+    hub = get_file_facts_hub()
+    if hub is None or not file_path:
+        return dict(_NO_FILE_FACTS)
+    return hub.read(file_path)
+
+
+def file_is_confirmed_bad(file_path):
+    """True when the library holds a confirmed-unplayable or confirmed-no-audio verdict for the file."""
+    facts = file_facts(file_path)
+    return bool(facts["confirmed_unplayable"] or facts["confirmed_no_audio"])
+
+
+def note_caption_source(file_path, kind, srt_path):
+    """Saves where a file's overlay captions come from ("embedded" or "sidecar", and the .srt they are read from) so TV stations and the DVD and media player both find them again."""
+    hub = get_file_facts_hub()
+    if hub is None or not file_path or not srt_path:
+        return False
+    if not hub.note(file_path, caption_kind=kind, caption_srt_path=srt_path):
+        log.warning("note_caption_source: the library could not key %s, so its caption source was not saved", file_path)
+        return False
+    return True
+
+
+def resolve_caption_source(file_path):
     """Looks up the caption source of a file ahead of ASR and returns a dict whose "kind" says where the captions come from, or None when live transcription may take over."""
     result = {"kind": None, "srt_path": None, "stream_index": None,
               "mtime": None, "size": None}
@@ -4708,23 +6027,20 @@ def resolve_caption_source(file_path, cache_entry=None):
         result["kind"] = "baked"
         return result
 
-    if (cache_entry and cache_entry.get("mtime") == result["mtime"]
-            and cache_entry.get("size") == result["size"]):
-        if cache_entry.get("source") == "baked":
-            result["kind"] = "baked"
+    facts = file_facts(file_path)
+    saved_srt = facts["caption_srt_path"]
+    if facts["caption_kind"] in ("embedded", "sidecar") and saved_srt and _cached_path_exists(saved_srt):
+        newer_sidecar = None if facts["caption_kind"] == "sidecar" else _find_sidecar_caption_file(file_path)
+        if not newer_sidecar:
+            result["kind"] = "cache"
+            result["srt_path"] = saved_srt
             return result
-        if cache_entry.get("srt_path") and _cached_path_exists(cache_entry["srt_path"]):
-            cached_is_sidecar = cache_entry.get("source") == "sidecar"
-            newer_sidecar = None if cached_is_sidecar else _find_sidecar_caption_file(file_path)
-            if not newer_sidecar:
-                result["kind"] = "cache"
-                result["srt_path"] = cache_entry["srt_path"]
-                return result
 
     sidecar = _find_sidecar_caption_file(file_path)
     if sidecar:
         result["kind"] = "sidecar"
         result["srt_path"] = sidecar
+        note_caption_source(file_path, "sidecar", sidecar)
         return result
 
     for stream in _probe_embedded_subtitle_streams(file_path):
@@ -4893,6 +6209,8 @@ _ASR_VAD_PARAMETERS = {"min_silence_duration_ms": 500}
 _ASR_CPU_THREADS = max(4, min(8, (os.cpu_count() or 8) // 2))
 try:
     import performance_governor as _perf_governor
+    _FAST_DISK_IO_PRIORITY_SLOTS = int(_perf_governor.FIRST_START_PRIORITY_DISK_SLOTS)
+    _FAST_DISK_IO_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(_FAST_DISK_IO_PRIORITY_SLOTS)
 except Exception:
     _perf_governor = None
 _whisper_model = None
@@ -4905,8 +6223,8 @@ def _asr_thread_count():
     if _perf_governor is not None:
         try:
             return max(1, int(_perf_governor.whisper_threads(_perf_governor.get_profile())))
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_asr_thread_count: return max(1, int(_perf_governor.whisper_threads(_perf_gover", _swallowed_error)
     return _ASR_CPU_THREADS
 
 
@@ -4936,7 +6254,8 @@ def _whisper_gate_hold_seconds(lead, expected_chunk_sec):
     try:
         spare = lead - expected_chunk_sec - _perf_governor.WHISPER_GATE_KEEP_LEAD_SECONDS
         return max(0.0, min(spare, _perf_governor.WHISPER_GATE_MAX_HOLD_SECONDS))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_whisper_gate_hold_seconds: spare = lead - expected_chunk_sec - _perf_governor.WHISPER_G", _swallowed_error)
         return 0.0
 
 
@@ -5264,7 +6583,8 @@ def _asr_prompt_for(file_path):
         if not parts:
             return None
         return (". ".join(parts) + ".")[:120]
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_asr_prompt_for: stem = os.path.splitext(os.path.basename(file_path))[0]", _swallowed_error)
         return None
 
 
@@ -5463,7 +6783,8 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
     def _stopped():
         try:
             return bool(should_stop and should_stop())
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_stopped: return bool(should_stop and should_stop())", _swallowed_error)
             return False
 
     temp_kw = {} if temperature is None else {"temperature": temperature}
@@ -5836,7 +7157,8 @@ def _asr_read_valid(file_path, mtime, size):
         if int(meta.get("cue_count", 0) or 0) > 0 and not srt_exists:
             return None
         return {"srt_path": srt_path, "meta": meta, "srt_exists": srt_exists}
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_asr_read_valid: srt_path, meta_path = _asr_paths(file_path)", _swallowed_error)
         return None
 
 
@@ -5844,7 +7166,8 @@ def _asr_discard_state(file_path):
     """Delete a stale/invalid ASR resume record and its partial transcript."""
     try:
         srt_path, meta_path = _asr_paths(file_path)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_asr_discard_state: srt_path, meta_path = _asr_paths(file_path)", _swallowed_error)
         return
     for p in (srt_path, meta_path, srt_path + ".tmp", meta_path + ".tmp"):
         try:
@@ -5966,20 +7289,19 @@ def _asr_merge_cues(cues, new_cues):
     return added
 
 
-def _asr_probe_media(file_path, timeout=30):
-    """One ffmpeg header read returning {"duration": float|None, "has_audio": bool}, or None if unreadable."""
+def _asr_probe_media(file_path):
+    """The file's length and whether it has an audio stream, from the library, which reads the header only the first time any lane asks; None when the file is unreadable."""
     try:
         import media_library as _ml
+        facts = _ml.shared_probe_library().header_facts(file_path)
     except Exception as e:
-        log.warning("[ASR] probe failed for %s: %s (media_library import)",
-                    os.path.basename(file_path), e)
+        log.warning("[ASR] the library could not give the length of %s: %s", os.path.basename(file_path), e)
         return None
-    result = _shared_header_probe(file_path, timeout)
-    if not result.ok:
-        if result.error != "path_missing":
-            log.warning("[ASR] probe failed for %s: %s", os.path.basename(file_path), result.error)
+    if not facts or not facts.get("ok"):
+        if _cached_path_exists(file_path):
+            log.warning("[ASR] the library has no header facts for %s", os.path.basename(file_path))
         return None
-    return {"duration": result.duration, "has_audio": result.has_audio}
+    return {"duration": facts["duration"], "has_audio": facts["has_audio"]}
 
 
 _ASR_ACCURATE_SEEK_MARGIN_SEC = 15.0
@@ -6047,7 +7369,8 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     def _stopped():
         try:
             return bool(should_stop and should_stop())
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_stopped: return bool(should_stop and should_stop())", _swallowed_error)
             return False
 
     if not file_path or not _cached_path_exists(file_path):
@@ -6204,8 +7527,8 @@ def _live_caption_cadence():
             cadence = _perf_governor.caption_cadence()
             return (float(cadence["first_chunk_sec"]), float(cadence["first_overlap_sec"]),
                     float(cadence["startup_chunk_sec"]))
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_live_caption_cadence: cadence = _perf_governor.caption_cadence()", _swallowed_error)
     return (_LIVE_CAPTION_FIRST_CHUNK_SEC, _LIVE_CAPTION_FIRST_CHUNK_OVERLAP_SEC, _LIVE_CAPTION_STARTUP_CHUNK_SEC)
 
 
@@ -6722,25 +8045,49 @@ LOUDNESS_GAIN_FLOOR_STANDARD = 0.5
 
 MUSIC_GAIN_FLOOR = LOUDNESS_GAIN_FLOOR
 
-LOUDNESS_CONVERGENCE_DB = 1.5
+# WARNING: gains are never nudged past the target or the true-peak ceiling, so this is 0; it stays because every stored gain is stamped with it.
+LOUDNESS_CONVERGENCE_DB = 0.0
 
+# WARNING: raise this number whenever the loudness scan's method or TV target changes; scanned gains stored under an older number are ignored and measured again.
+LOUDNESS_GAIN_SCAN_VERSION = 9
+# WARNING: must match _OWNER_GAIN_SCAN_VERSION in media_library.py; a gain row stamped with this scan version is the owner's own gain and is never rescanned.
+OWNER_GAIN_SCAN_VERSION = 0
 
-def _converge_clamped_gain(gain, clamped_gain, peak_capped, ceiling,
-                           attenuation_floor=None):
-    """Nudge an already target/peak-clamped gain by up to LOUDNESS_CONVERGENCE_DB of extra convergence."""
-    _factor = 10 ** (LOUDNESS_CONVERGENCE_DB / 20.0)
-    if gain > 1.0 and peak_capped:
-        return min(clamped_gain * _factor, ceiling)
-    if gain < 1.0:
-        _floor = LOUDNESS_GAIN_FLOOR_STANDARD if attenuation_floor is None else attenuation_floor
-        return max(_floor, clamped_gain / _factor)
-    return clamped_gain
+# WARNING: every settings key that records the loudness target stored gains were measured under, or a one-time gain-reset flag, must be listed here; Reset All Settings keeps these so the next start does not clear every gain again. The library itself is never reset.
+FACTORY_RESET_KEEPS_FILE_DATA = (
+    "_gain_cache_target_lufs",
+    "_lufs23_migration_done", "_music_target_v2_migration_done",
+)
+
 
 TRUE_PEAK_CEILING_DBTP = -2.0
 
-TARGET_LUFS = -20.5
+# VALUES CHANGE HERE (a file scanned by sample windows gets one whole-file true-peak pass when its gained peak would land within this many dB of the ceiling, because the windows may have missed its loudest moment)
+TRUE_PEAK_CONFIRM_MARGIN_DB = 3.0
+TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS = 600.0
+
+
+def _true_peak_limited_gain(gain, clamped_gain, combined_tp):
+    """Return (gain, capped) with clamped_gain held to the gain that puts the measured true peak exactly on TRUE_PEAK_CEILING_DBTP; a boost is never cut below unity by this and nothing is ever added back on top of the cap."""
+    if combined_tp is None:
+        return clamped_gain, False
+    _peak_gain_cap = 10 ** ((TRUE_PEAK_CEILING_DBTP - combined_tp) / 20.0)
+    if _peak_gain_cap >= clamped_gain:
+        return clamped_gain, False
+    _peak_floor = 1.0 if gain > 1.0 else LOUDNESS_GAIN_FLOOR
+    return max(_peak_floor, _peak_gain_cap), True
+
+# WARNING: -24 is the ATSC A/85 TV baseline (FFmpeg loudnorm reports LKFS as LUFS); it is measured on dialogue when subtitles or a centre channel exist, while true peak and loudness range always come from the whole mix.
+TARGET_LUFS = -24.0
 
 MUSIC_TARGET_LUFS = -18.5
+
+# VALUES CHANGE HERE (calibration offsets applied after the measured LUFS target)
+# WARNING: a negative offset makes every scan under-level on purpose, so keep these at 0 unless the owner asks.
+# VALUES CHANGE HERE (playback calibration: add this many dB to newly scanned TV gains; owner/manual gains are never changed)
+# WARNING: 7.0 (was 3.0) because the owner raised Aladdin and Bob's Burgers by +4 dB each from the 3.0 scan, landing both near -17 LUFS. Files already scanned keep their saved gain until they are scanned again.
+LOUDNESS_GAIN_OFFSET_DB = 7.0
+MUSIC_GAIN_OFFSET_DB = 0.0
 
 COMPRESSOR_ATTACK_MS = 25.0
 COMPRESSOR_RELEASE_MS = 800.0
@@ -6806,13 +8153,14 @@ def _probe_duration_seconds_fast(file_path):
         h, mi, s = m.groups()
         total = int(h) * 3600 + int(mi) * 60 + float(s)
         return total if total > 0 else None
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_probe_duration_seconds_fast: import subprocess, re", _swallowed_error)
         return None
 
 
 def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
-                         semaphore=None, semaphore_timeout=None):
-    """Run one loudness window after the governor admits it; the work is in _lufs_window_ffmpeg_inner."""
+                         semaphore=None, semaphore_timeout=None, pre_filter=None):
+    """Run one loudness window after the governor admits it; the work is in _lufs_window_ffmpeg_inner; pre_filter is an ffmpeg audio filter run before the loudness measurement (used to measure only speech or only the centre channel)."""
     _lane = "music_loudness" if semaphore is _MUSIC_LOUDNESS_PROBE_SEMAPHORE else "loudness_and_bake"
     _prio = semaphore is _LOUDNESS_PRIORITY_SEMAPHORE or semaphore is _LOUDNESS_PARALLEL_SEMAPHORE
     _win_t0 = time.time()
@@ -6823,7 +8171,7 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
         _gate_wait = time.time() - _win_t0
         _result = _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=start_sec, length_sec=length_sec,
                                              timeout=timeout, semaphore=semaphore,
-                                             semaphore_timeout=semaphore_timeout)
+                                             semaphore_timeout=semaphore_timeout, pre_filter=pre_filter)
         _total = time.time() - _win_t0
         if _prio or _total >= LOUDNESS_WINDOW_LOG_MIN_SECONDS:
             log.info("[LOUDNESS WINDOW TIMING] %s start=%s len=%s gate_wait=%.1fs total=%.1fs reading=%s%s",
@@ -6837,7 +8185,8 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
 
 
 def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
-                               semaphore=None, semaphore_timeout=None):
+                               semaphore=None, semaphore_timeout=None, pre_filter=None):
+    """Measure one standards-gated TV loudness pass and its peak/range data."""
     import subprocess, re, json
     popen_kwargs = {}
     if os.name == "nt":
@@ -6850,7 +8199,8 @@ def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec
     cmd += ["-i", file_path, "-vn"]
     if length_sec is not None:
         cmd += ["-t", f"{length_sec:.2f}"]
-    cmd += ["-af", f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DBTP}:LRA=11:print_format=json",
+    _loudnorm = f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DBTP}:LRA=11:print_format=json"
+    cmd += ["-af", f"{pre_filter},{_loudnorm}" if pre_filter else _loudnorm,
             "-f", "null", "-"]
     _probe_t0 = time.time()
     _sem = semaphore or _LOUDNESS_PROBE_SEMAPHORE
@@ -6930,15 +8280,39 @@ def _combine_true_peak_readings(tp_readings):
 # VALUES CHANGE HERE (sample windows that disagree by more than this many LU use the quieter reading)
 LOUDNESS_WINDOW_DISAGREE_LU = 3.0
 
-# VALUES CHANGE HERE (gain scan sampling: files up to the whole-file limit are scanned whole; longer files get
-LOUDNESS_WHOLE_FILE_MAX_SECONDS = 120.0
-LOUDNESS_SAMPLE_WINDOW_SECONDS = 30.0
-LOUDNESS_SAMPLE_CENTERS = (0.25, 0.5, 0.75)
-
 # VALUES CHANGE HERE (a loudness window is logged when it took at least this long, or when it belongs to the playing file's first scan)
 LOUDNESS_WINDOW_LOG_MIN_SECONDS = 5.0
 
 LOUDNESS_WIDE_LRA_FLAG_LU = 15.0
+
+# WARNING: the fallback numbers must match LOUDNESS_SCAN_* and GAIN_CHECK_* in performance_governor.py; they are used only when that module fails to import.
+try:
+    import performance_governor as _gain_check_governor
+    LOUDNESS_SCAN_WINDOW_SECONDS = float(_gain_check_governor.LOUDNESS_SCAN_WINDOW_SECONDS)
+    LOUDNESS_SCAN_WINDOWS_STANDARD = int(_gain_check_governor.LOUDNESS_SCAN_WINDOWS_STANDARD)
+    LOUDNESS_SCAN_WINDOWS_LONG = int(_gain_check_governor.LOUDNESS_SCAN_WINDOWS_LONG)
+    LOUDNESS_SCAN_LONG_SHOW_SECONDS = float(_gain_check_governor.LOUDNESS_SCAN_LONG_SHOW_SECONDS)
+    LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = float(_gain_check_governor.LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS)
+    GAIN_CHECK_DRASTIC_DB = float(_gain_check_governor.GAIN_CHECK_DRASTIC_DB)
+    GAIN_CHECK_DRASTIC_EXTRA_BATCHES = int(_gain_check_governor.GAIN_CHECK_DRASTIC_EXTRA_BATCHES)
+    GAIN_CHECK_NEIGHBOR_DB = float(_gain_check_governor.GAIN_CHECK_NEIGHBOR_DB)
+    GAIN_CHECK_BUNDLE_MIN_SCANNED = int(_gain_check_governor.GAIN_CHECK_BUNDLE_MIN_SCANNED)
+    GAIN_CHECK_RECHECK_EXTRA_BATCHES = int(_gain_check_governor.GAIN_CHECK_RECHECK_EXTRA_BATCHES)
+    GAIN_CHECK_EXTRA_BATCH_WINDOWS = int(_gain_check_governor.GAIN_CHECK_EXTRA_BATCH_WINDOWS)
+    GAIN_CHECK_MAX_OVERLAP = float(_gain_check_governor.GAIN_CHECK_MAX_OVERLAP)
+except Exception:
+    LOUDNESS_SCAN_WINDOW_SECONDS = 60.0
+    LOUDNESS_SCAN_WINDOWS_STANDARD = 5
+    LOUDNESS_SCAN_WINDOWS_LONG = 7
+    LOUDNESS_SCAN_LONG_SHOW_SECONDS = 3600.0
+    LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = 180.0
+    GAIN_CHECK_DRASTIC_DB = 4.0
+    GAIN_CHECK_DRASTIC_EXTRA_BATCHES = 2
+    GAIN_CHECK_NEIGHBOR_DB = 3.0
+    GAIN_CHECK_BUNDLE_MIN_SCANNED = 4
+    GAIN_CHECK_RECHECK_EXTRA_BATCHES = 2
+    GAIN_CHECK_EXTRA_BATCH_WINDOWS = 3
+    GAIN_CHECK_MAX_OVERLAP = 0.5
 
 
 def _lufs_scan_window(duration_sec):
@@ -6947,38 +8321,423 @@ def _lufs_scan_window(duration_sec):
 
 
 def _reconcile_lufs_readings(pass_readings):
-    """Reconcile 2 or 3 window readings into one file-level LUFS basis."""
-    if len(pass_readings) >= 3:
-        r1, r2, r3 = pass_readings[0], pass_readings[1], pass_readings[2]
-        pairs = [(r1, r2), (r1, r3), (r2, r3)]
-        for a, b in pairs:
-            if abs(a - b) <= LOUDNESS_WINDOW_DISAGREE_LU:
-                return _combine_lufs_readings([a, b])
-        return min(r1, r2, r3)
-    if len(pass_readings) == 2:
-        r1, r2 = pass_readings
-        if abs(r1 - r2) > LOUDNESS_WINDOW_DISAGREE_LU:
-            return min(r1, r2)
-        return _combine_lufs_readings(pass_readings)
-    if len(pass_readings) == 1:
-        return pass_readings[0]
-    return None
-
-
-def _lufs_sample_windows(duration_sec):
-    """Return the (start_sec, length_sec) sample windows for a file, or None when the whole file is scanned."""
-    if not duration_sec or duration_sec <= LOUDNESS_WHOLE_FILE_MAX_SECONDS:
+    """Reconcile window readings into one file-level LUFS basis: the largest group of readings within LOUDNESS_WINDOW_DISAGREE_LU of one another is power-averaged (the quieter group when two groups tie), or the quietest reading when no two agree."""
+    readings = [float(r) for r in pass_readings]
+    if not readings:
         return None
-    length = min(LOUDNESS_SAMPLE_WINDOW_SECONDS, duration_sec)
+    if len(readings) == 1:
+        return readings[0]
+    best = None
+    for anchor in readings:
+        group = [r for r in readings if abs(r - anchor) <= LOUDNESS_WINDOW_DISAGREE_LU]
+        if (best is None or len(group) > len(best)
+                or (len(group) == len(best) and sum(group) / len(group) < sum(best) / len(best))):
+            best = group
+    if len(best) >= 2:
+        return _combine_lufs_readings(best)
+    return min(readings)
+
+
+def _standard_window_centers(duration_sec):
+    """The places, as fractions of the file, of a first scan's windows: evenly spaced, each in the middle of its own equal share of the file, with the standard count up to the long-show length and the long count above it."""
+    count = LOUDNESS_SCAN_WINDOWS_LONG if duration_sec > LOUDNESS_SCAN_LONG_SHOW_SECONDS else LOUDNESS_SCAN_WINDOWS_STANDARD
+    return tuple(round((i + 0.5) / count, 4) for i in range(count))
+
+
+def _extra_window_centers(duration_sec, existing_centers, count, place_ok=None):
+    """The places, as fractions of the file, for up to count more windows: each as far from every window already scanned or chosen as the file allows, never overlapping one by more than GAIN_CHECK_MAX_OVERLAP of a window, and never outside the stretch of the file the first scan's windows span; fewer come back when the file has no more room."""
+    if not duration_sec or duration_sec <= 0:
+        return []
+    length = min(LOUDNESS_SCAN_WINDOW_SECONDS, duration_sec)
+    min_gap = length * (1.0 - GAIN_CHECK_MAX_OVERLAP)
+    spread = _standard_window_centers(duration_sec)
+    low = max(length / 2.0, duration_sec * spread[0])
+    high = min(duration_sec - length / 2.0, duration_sec * spread[-1])
+    if high < low:
+        return []
+    taken = [float(c) * duration_sec for c in existing_centers]
+    step = max(1.0, length / 30.0)
+    chosen = []
+    for _ in range(count):
+        best = None
+        place = low
+        while place <= high + 1e-9:
+            gap = min((abs(place - t) for t in taken), default=duration_sec)
+            if gap >= min_gap - 1e-9 and (place_ok is None or place_ok(place)):
+                if (best is None or gap > best[0] + 1e-9
+                        or (abs(gap - best[0]) <= 1e-9 and abs(place - duration_sec / 2.0) < abs(best[1] - duration_sec / 2.0))):
+                    best = (gap, place)
+            place += step
+        if best is None:
+            break
+        taken.append(best[1])
+        chosen.append(best[1])
+    return sorted(round(c / duration_sec, 4) for c in chosen)
+
+
+# ============================================================================
+# SECTION: Dialogue loudness basis
+# ============================================================================
+
+# VALUES CHANGE HERE (a sample window needs at least this many seconds of subtitled speech, and a file at least DIALOGUE_MIN_WINDOWS such windows, before its loudness is measured on dialogue)
+DIALOGUE_MIN_WINDOW_SECONDS = 8.0
+DIALOGUE_MIN_WINDOWS = 2
+# VALUES CHANGE HERE (subtitle lines closer together than this are joined into one stretch of speech)
+DIALOGUE_MERGE_GAP_SECONDS = 0.5
+# WARNING: a window's speech filter is part of one ffmpeg command line; a window with more stretches of speech than this is measured on the whole mix instead so the command never outgrows the operating system's limit.
+DIALOGUE_MAX_SPEECH_STRETCHES = 400
+DIALOGUE_HEADER_TIMEOUT_SECONDS = 30.0
+DIALOGUE_EXTRACT_TIMEOUT_SECONDS = 180.0
+DIALOGUE_SUBTITLE_MAX_BYTES = 8 * 1024 * 1024
+DIALOGUE_CACHE_SECONDS = 600.0
+DIALOGUE_CACHE_MAX_ENTRIES = 64
+DIALOGUE_SUBTITLE_EXTENSIONS = (".srt", ".ass", ".ssa", ".vtt")
+DIALOGUE_TEXT_SUBTITLE_CODECS = ("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
+
+_SUBTITLE_ARROW_RE = re.compile(r"^\s*((?:\d+:)?\d+:\d+[,.]\d+)\s*-->\s*((?:\d+:)?\d+:\d+[,.]\d+)")
+_SUBTITLE_TAG_RE = re.compile(r"<[^>]*>|\{[^}]*\}")
+_SUBTITLE_NON_SPEECH_LINE_RE = re.compile(r"[\[\(].*[\]\)]:?")
+_SUBTITLE_STREAM_RE = re.compile(r"Stream #\d+:(\d+)(?:\[[^\]]*\])?(?:\(([^)]*)\))?[^\n]*?: Subtitle: (\w+)([^\n]*)")
+_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+[^\n]*?: Audio: ([^\n]*)")
+_CENTER_LAYOUT_RE = re.compile(r"(?:^|,\s)(?:3\.0|3\.1|4\.0|4\.1|5\.0|5\.1|6\.0|6\.1|7\.0|7\.1|surround)(?:\((?:side|wide)\))?(?=,|\s|$)")
+
+_dialogue_basis_cache = {}
+_dialogue_basis_cache_lock = threading.Lock()
+
+
+def _subtitle_time_seconds(text):
+    """Seconds for a subtitle time such as 00:01:02,500 or 0:01:02.50."""
+    seconds = 0.0
+    for part in text.strip().replace(",", ".").split(":"):
+        seconds = seconds * 60.0 + float(part)
+    return seconds
+
+
+def _subtitle_cue_is_speech(text):
+    """False for a cue that holds only sound descriptions such as [door slams] or (music) or song marks, which are not people talking."""
+    cleaned = _SUBTITLE_TAG_RE.sub("", text.replace("\\N", "\n").replace("\\n", "\n")).strip()
+    if not cleaned or "\u266a" in cleaned or "\u266b" in cleaned:
+        return False
+    lines = [line.strip().lstrip("-\u2013 ").strip() for line in cleaned.split("\n")]
+    lines = [line for line in lines if line]
+    return bool(lines) and not all(_SUBTITLE_NON_SPEECH_LINE_RE.fullmatch(line) for line in lines)
+
+
+def _merge_speech_spans(spans):
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1] + DIALOGUE_MERGE_GAP_SECONDS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _parse_subtitle_spans(text):
+    """The stretches of speech, as (start_sec, end_sec) pairs in order, from SubRip, WebVTT or ASS/SSA subtitle text; sound-description cues are left out and cues close together are joined."""
+    if not text:
+        return []
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    spans = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        arrow = _SUBTITLE_ARROW_RE.match(line)
+        if arrow:
+            body = []
+            index += 1
+            while index < len(lines) and lines[index].strip():
+                body.append(lines[index])
+                index += 1
+            start, end = _subtitle_time_seconds(arrow.group(1)), _subtitle_time_seconds(arrow.group(2))
+            if end > start and _subtitle_cue_is_speech("\n".join(body)):
+                spans.append((start, end))
+            continue
+        if line.startswith("Dialogue:"):
+            fields = line[len("Dialogue:"):].split(",", 9)
+            if len(fields) == 10:
+                try:
+                    start, end = _subtitle_time_seconds(fields[1]), _subtitle_time_seconds(fields[2])
+                except ValueError:
+                    start = end = 0.0
+                if end > start and _subtitle_cue_is_speech(fields[9]):
+                    spans.append((start, end))
+        index += 1
+    return _merge_speech_spans(spans)
+
+
+def _span_overlap(spans, begin, finish):
+    """Seconds of speech between begin and finish."""
+    return sum(max(0.0, min(end, finish) - max(start, begin)) for start, end in spans)
+
+
+def _dialogue_window_centers(duration_sec, spans):
+    """The places, as fractions of the file, of the sample windows for a subtitled file: the same count as the standard windows, each placed where its own equal share of the file has the most speech; a share with less than DIALOGUE_MIN_WINDOW_SECONDS of speech gets no window."""
+    if not duration_sec or duration_sec <= 0:
+        return []
+    count = LOUDNESS_SCAN_WINDOWS_LONG if duration_sec > LOUDNESS_SCAN_LONG_SHOW_SECONDS else LOUDNESS_SCAN_WINDOWS_STANDARD
+    length = min(LOUDNESS_SCAN_WINDOW_SECONDS, duration_sec)
+    max_start = max(0.0, duration_sec - length)
+    share = duration_sec / count
+    step = max(1.0, length / 12.0)
+    centers = []
+    for i in range(count):
+        low = min(i * share + length / 2.0, (i + 0.5) * share)
+        high = max(low, (i + 1) * share - length / 2.0)
+        best = None
+        place = low
+        while place <= high + 1e-9:
+            start = max(0.0, min(place - length / 2.0, max_start))
+            amount = _span_overlap(spans, start, start + length)
+            if best is None or amount > best[0] + 1e-9:
+                best = (amount, place)
+            place += step
+        if best is not None and best[0] >= DIALOGUE_MIN_WINDOW_SECONDS:
+            centers.append(round(best[1] / duration_sec, 4))
+    return centers
+
+
+def _dialogue_spans_usable(spans, duration_sec):
+    """True when the speech in spans is enough to measure a file of this length on: DIALOGUE_MIN_WINDOWS windows with enough speech, or for a file scanned whole enough speech in total."""
+    if not spans:
+        return False
+    if duration_sec and duration_sec > LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS:
+        return len(_dialogue_window_centers(duration_sec, spans)) >= DIALOGUE_MIN_WINDOWS
+    return _span_overlap(spans, 0.0, duration_sec if duration_sec else float("inf")) >= DIALOGUE_MIN_WINDOW_SECONDS
+
+
+def _dialogue_place_ok(dialogue, duration_sec):
+    """A test for extra windows: True for a window centre with enough speech around it; None when every place is fine."""
+    if dialogue is None or dialogue.get("method") != "subtitle" or not duration_sec:
+        return None
+    length = min(LOUDNESS_SCAN_WINDOW_SECONDS, duration_sec)
+    max_start = max(0.0, duration_sec - length)
+    spans = dialogue["spans"]
+
+    def _ok(place):
+        start = max(0.0, min(place - length / 2.0, max_start))
+        return _span_overlap(spans, start, start + length) >= DIALOGUE_MIN_WINDOW_SECONDS
+    return _ok
+
+
+def _dialogue_pre_filter(dialogue, start_sec, length_sec):
+    """The ffmpeg audio filter that keeps only the dialogue of the window starting at start_sec and lasting length_sec (the whole file when both are None), or None when the window has too little speech to measure."""
+    if dialogue is None:
+        return None
+    if dialogue.get("method") == "center":
+        return "pan=mono|c0=FC"
+    begin = 0.0 if start_sec is None else float(start_sec)
+    finish = float("inf") if length_sec is None else begin + float(length_sec)
+    pieces = []
+    total = 0.0
+    for start, end in dialogue["spans"]:
+        first, last = max(start, begin), min(end, finish)
+        if last - first >= 0.05:
+            pieces.append((first - begin, last - begin))
+            total += last - first
+    if total < DIALOGUE_MIN_WINDOW_SECONDS or len(pieces) > DIALOGUE_MAX_SPEECH_STRETCHES:
+        return None
+    expression = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in pieces)
+    return f"aselect='{expression}',asetpts=N/SR/TB"
+
+
+def _dialogue_reading(file_path, target_lufs, dialogue, start_sec, length_sec, timeout, semaphore, semaphore_timeout):
+    """One window's loudness measured on dialogue only, or None when the window has too little speech, the measurement failed, or nothing audible was left."""
+    pre_filter = _dialogue_pre_filter(dialogue, start_sec, length_sec)
+    if pre_filter is None:
+        return None
+    value = _lufs_window_ffmpeg(
+        file_path, target_lufs, start_sec=start_sec, length_sec=length_sec, timeout=timeout,
+        semaphore=semaphore, semaphore_timeout=semaphore_timeout, pre_filter=pre_filter)[0]
+    if value is None or not math.isfinite(value) or value <= -70.0:
+        return None
+    return value
+
+
+def _file_lufs_basis(values, dialogue):
+    """One file-level loudness from window readings: dialogue readings are all power-averaged (every window already holds only speech), whole-mix readings are reconciled so a stray window is outvoted."""
+    if not values:
+        return None
+    if dialogue is not None:
+        return _combine_lufs_readings(values)
+    return _reconcile_lufs_readings(values)
+
+
+def _dialogue_basis_label(dialogue):
+    if dialogue is None:
+        return "full mix"
+    if dialogue.get("method") == "center":
+        return "center channel"
+    return f"subtitles ({dialogue.get('label', '')})"
+
+
+def _paired_subtitle_paths(file_path):
+    """Subtitle files that sit next to the media file and carry its name (Show.srt, Show.en.srt), best first: not forced, exact name, English."""
+    folder, name = os.path.split(file_path)
+    stem = os.path.splitext(name)[0].lower()
+    try:
+        entries = os.listdir(folder or ".")
+    except OSError:
+        return []
+    found = []
+    for entry in entries:
+        base, extension = os.path.splitext(entry)
+        if extension.lower() not in DIALOGUE_SUBTITLE_EXTENSIONS:
+            continue
+        base = base.lower()
+        if base != stem and not base.startswith(stem + "."):
+            continue
+        tag = base[len(stem):]
+        found.append((("forced" in tag or "signs" in tag), base != stem,
+                      not any(mark in tag for mark in (".en", "eng")), entry))
+    found.sort()
+    return [os.path.join(folder, item[3]) for item in found]
+
+
+def _read_subtitle_text(path):
+    try:
+        if os.path.getsize(path) > DIALOGUE_SUBTITLE_MAX_BYTES:
+            return ""
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def _embedded_text_subtitle_stream(header_text):
+    """The stream number of the best text subtitle stream inside the file (not forced, English, default first), or None; picture subtitles such as PGS are never used."""
+    best = None
+    for match in _SUBTITLE_STREAM_RE.finditer(header_text or ""):
+        index = int(match.group(1))
+        language = (match.group(2) or "").lower()
+        codec = match.group(3).lower()
+        rest = match.group(4).lower()
+        if codec not in DIALOGUE_TEXT_SUBTITLE_CODECS:
+            continue
+        key = ("(forced)" in rest, language not in ("eng", "en"), "(default)" not in rest, index)
+        if best is None or key < best[0]:
+            best = (key, index)
+    return None if best is None else best[1]
+
+
+def _header_has_center_channel(header_text):
+    """True when the file's first audio stream has a front-centre channel (a 3.0, 4.0, 5.1, 7.1 or similar layout)."""
+    match = _AUDIO_STREAM_RE.search(header_text or "")
+    return bool(match and _CENTER_LAYOUT_RE.search(match.group(1)))
+
+
+def _dialogue_popen_kwargs():
+    if os.name == "nt":
+        return {"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def _dialogue_header_text(file_path):
+    """(ffmpeg's stream listing for the file, timed_out)."""
+    try:
+        with _fast_disk_io_slot(f"dialogue_probe({os.path.basename(file_path)})"):
+            result = subprocess.run(
+                [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner", "-i", file_path],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=DIALOGUE_HEADER_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+                **_dialogue_popen_kwargs())
+    except subprocess.TimeoutExpired:
+        return "", True
+    return result.stderr or "", False
+
+
+def _extract_embedded_subtitle_text(file_path, stream_index, semaphore=None, semaphore_timeout=None):
+    """(the subtitle text of one text stream inside the file as SubRip, timed_out)."""
+    _prio = semaphore is _LOUDNESS_PRIORITY_SEMAPHORE or semaphore is _LOUDNESS_PARALLEL_SEMAPHORE
+    with _gov_gate("loudness_and_bake", priority=_prio, timeout=semaphore_timeout,
+                   label=f"subtitle_read({os.path.basename(file_path)})") as _admitted:
+        if not _admitted:
+            return "", True
+        _yield_to_live_playback("subtitle read")
+        try:
+            result = subprocess.run(
+                [_resolve_ffmpeg_path(), "-nostdin", "-hide_banner", "-v", "error", "-i", file_path,
+                 "-map", f"0:{int(stream_index)}", "-f", "srt", "-"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=DIALOGUE_EXTRACT_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+                **_dialogue_popen_kwargs())
+        except subprocess.TimeoutExpired:
+            _media_warning(
+                "dialogue_subtitle_timeout",
+                "[LOUDNESS PROBE] Timed out reading the subtitle stream of %s",
+                os.path.basename(file_path),
+            )
+            return "", True
+    return result.stdout or "", False
+
+
+def _resolve_dialogue_basis(file_path, duration_sec=None, semaphore=None, semaphore_timeout=None):
+    """(dialogue, timed_out): how to measure this file's dialogue loudness, tried in this order: the speech timing of a paired subtitle file, of a text subtitle stream inside the file, then the front-centre channel; dialogue is None when none is usable and the whole mix is measured. Never uses the player's subtitle setup. A timed-out read gives timed_out True so the scan is not saved under the wrong method."""
+    if not file_path:
+        return None, False
+    try:
+        if duration_sec is None:
+            duration_sec = _probe_duration_seconds_fast(file_path)
+            if duration_sec and _duration_looks_implausible(file_path, duration_sec):
+                duration_sec = None
+        try:
+            _stat = os.stat(file_path)
+            _key = (os.path.normpath(os.path.abspath(file_path)), _stat.st_mtime_ns, _stat.st_size)
+        except OSError:
+            _key = None
+        if _key is not None:
+            with _dialogue_basis_cache_lock:
+                _hit = _dialogue_basis_cache.get(_key)
+            if _hit is not None and time.time() - _hit[0] < DIALOGUE_CACHE_SECONDS:
+                return _hit[1], False
+        header, timed_out = _dialogue_header_text(file_path)
+        if timed_out:
+            return None, True
+        sources = [("paired " + os.path.basename(path), "file", path) for path in _paired_subtitle_paths(file_path)]
+        _stream = _embedded_text_subtitle_stream(header)
+        if _stream is not None:
+            sources.append((f"embedded stream {_stream}", "stream", _stream))
+        dialogue = None
+        for label, kind, reference in sources:
+            if kind == "file":
+                text = _read_subtitle_text(reference)
+            else:
+                text, timed_out = _extract_embedded_subtitle_text(
+                    file_path, reference, semaphore=semaphore, semaphore_timeout=semaphore_timeout)
+                if timed_out:
+                    return None, True
+            spans = _parse_subtitle_spans(text)
+            if _dialogue_spans_usable(spans, duration_sec):
+                dialogue = {"method": "subtitle", "spans": spans, "label": label}
+                break
+        if dialogue is None and _header_has_center_channel(header):
+            dialogue = {"method": "center", "label": "center channel"}
+        if _key is not None:
+            with _dialogue_basis_cache_lock:
+                if len(_dialogue_basis_cache) >= DIALOGUE_CACHE_MAX_ENTRIES:
+                    _dialogue_basis_cache.pop(next(iter(_dialogue_basis_cache)))
+                _dialogue_basis_cache[_key] = (time.time(), dialogue)
+        return dialogue, False
+    except Exception as _swallowed_error:
+        _log_swallowed("_resolve_dialogue_basis", _swallowed_error)
+        return None, False
+
+
+def _lufs_sample_windows(duration_sec, centers=None):
+    """Return the (start_sec, length_sec) sample windows for a file at the given centers (the evenly spaced standard ones when none), or None when the whole file is scanned."""
+    if not duration_sec or duration_sec <= LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS:
+        return None
+    length = min(LOUDNESS_SCAN_WINDOW_SECONDS, duration_sec)
     max_start = max(0.0, duration_sec - length)
     return [(max(0.0, min(duration_sec * frac - length / 2.0, max_start)), length)
-            for frac in LOUDNESS_SAMPLE_CENTERS]
+            for frac in (_standard_window_centers(duration_sec) if centers is None else centers)]
 
 
 def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=180, semaphore_timeout=None,
-                          parallel_windows=False, duration_out=None):
-    """Measure a file and return one file-level loudness basis; parallel_windows runs all sample windows at once, and duration_out receives the length measured for the scan as "duration_sec"."""
-    duration_sec = _probe_duration_seconds_fast(file_path)
+                          parallel_windows=False, duration_out=None, centers=None, known_duration=None,
+                          window_out=None, dialogue=None, method_out=None):
+    """Measure a file and return one file-level loudness basis; parallel_windows runs all sample windows at once, duration_out receives the length measured for the scan as "duration_sec", centers puts the sample windows at other places in the file, known_duration skips measuring the length again, and window_out receives one (place in the file as a fraction, LUFS) pair per window that returned a reading. dialogue (from _resolve_dialogue_basis) measures each window on dialogue only while true peak and range still come from the whole mix; method_out receives "method" as "dialogue" or "full" for what the readings are. When centers is given with dialogue, a window with no dialogue reading is left out rather than replaced by a whole-mix reading."""
+    duration_sec = known_duration if known_duration else _probe_duration_seconds_fast(file_path)
     if (duration_out is not None and duration_sec and duration_sec > 0
             and not _duration_looks_implausible(file_path, duration_sec)):
         duration_out["duration_sec"] = float(duration_sec)
@@ -6988,31 +8747,53 @@ def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=
     stderr_for_stream_checks = ""
     any_timeout = False
 
-    windows = _lufs_sample_windows(duration_sec)
+    _centers = centers
+    if (dialogue is not None and dialogue.get("method") == "subtitle" and centers is None
+            and duration_sec and duration_sec > LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS):
+        _centers = _dialogue_window_centers(duration_sec, dialogue["spans"]) or None
+    windows = _lufs_sample_windows(duration_sec, _centers)
     if windows is None:
+        if centers is not None:
+            return readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout
         if duration_sec:
             start, length = _lufs_scan_window(duration_sec)
         else:
             start, length = None, None
+        _whole_length = None if length is None else max(1.0, length)
         m_i, m_tp, m_lra, stderr_for_stream_checks, timed_out = _lufs_window_ffmpeg(
             file_path, target_lufs, start_sec=start,
-            length_sec=(None if length is None else max(1.0, length)), timeout=chunk_timeout,
+            length_sec=_whole_length, timeout=chunk_timeout,
             semaphore=semaphore, semaphore_timeout=semaphore_timeout)
         any_timeout = timed_out
-        if m_i is not None:
+        _spoken_i = None
+        if dialogue is not None and m_i is not None:
+            _spoken_i = _dialogue_reading(file_path, target_lufs, dialogue, start, _whole_length,
+                                          chunk_timeout, semaphore, semaphore_timeout)
+        if method_out is not None:
+            method_out["method"] = "dialogue" if _spoken_i is not None else "full"
+        if _spoken_i is not None:
+            readings.append(_spoken_i)
+        elif m_i is not None:
             readings.append(m_i)
         if m_tp is not None:
             tp_readings.append(m_tp)
         if m_lra is not None:
             lra_readings.append(m_lra)
         return readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout
+    if not windows:
+        return readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout
+    places = _standard_window_centers(duration_sec) if _centers is None else _centers
 
     def _one(window):
-        return _lufs_window_ffmpeg(
+        _window_semaphore = _LOUDNESS_PARALLEL_SEMAPHORE if parallel_windows else semaphore
+        _full = _lufs_window_ffmpeg(
             file_path, target_lufs, start_sec=float(window[0]), length_sec=max(1.0, window[1]),
-            timeout=chunk_timeout,
-            semaphore=(_LOUDNESS_PARALLEL_SEMAPHORE if parallel_windows else semaphore),
-            semaphore_timeout=semaphore_timeout)
+            timeout=chunk_timeout, semaphore=_window_semaphore, semaphore_timeout=semaphore_timeout)
+        _spoken = None
+        if dialogue is not None:
+            _spoken = _dialogue_reading(file_path, target_lufs, dialogue, float(window[0]), max(1.0, window[1]),
+                                        chunk_timeout, _window_semaphore, semaphore_timeout)
+        return _full, _spoken
 
     if parallel_windows:
         with concurrent.futures.ThreadPoolExecutor(
@@ -7022,22 +8803,61 @@ def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=
         results = [_one(w) for w in windows]
 
     pass_readings = []
+    full_places = []
+    spoken_readings = []
+    spoken_places = []
     timeouts = []
-    for m_i, m_tp, m_lra, chunk_stderr, timed_out in results:
+    for index, ((m_i, m_tp, m_lra, chunk_stderr, timed_out), spoken_i) in enumerate(results):
         if not stderr_for_stream_checks and chunk_stderr:
             stderr_for_stream_checks = chunk_stderr
         timeouts.append(timed_out)
         if m_i is not None:
             pass_readings.append(m_i)
+            full_places.append((float(places[index]), float(m_i)))
+        if spoken_i is not None:
+            spoken_readings.append(spoken_i)
+            spoken_places.append((float(places[index]), float(spoken_i)))
         if m_tp is not None:
             tp_readings.append(m_tp)
         if m_lra is not None:
             lra_readings.append(m_lra)
     any_timeout = all(timeouts) if timeouts else False
-    _basis = _reconcile_lufs_readings(pass_readings)
+    _use_spoken = dialogue is not None and bool(spoken_readings)
+    if dialogue is not None and not _use_spoken and centers is not None:
+        pass_readings, full_places = [], []
+    if method_out is not None:
+        method_out["method"] = "dialogue" if _use_spoken else "full"
+    if window_out is not None:
+        window_out.extend(spoken_places if _use_spoken else full_places)
+    _basis = _file_lufs_basis(spoken_readings if _use_spoken else pass_readings, dialogue if _use_spoken else None)
     if _basis is not None:
         readings.append(_basis)
     return readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout
+
+
+def _extra_scan_windows(file_path, target_lufs, duration_sec, windows, batches, batch_windows, semaphore=None,
+                        chunk_timeout=180, semaphore_timeout=None, parallel_windows=False, dialogue=None):
+    """Scans up to `batches` more batches of `batch_windows` windows, each batch placed away from every window already scanned (and, with dialogue, only where there is enough speech); windows (a list of (place, LUFS) pairs) is extended in place; returns (true_peaks, ranges, batches_done, batches_placed), a batch counting as placed when the file had room for at least one window of it and as done when every window placed returned a reading."""
+    tp_all, lra_all = [], []
+    done = 0
+    placed = 0
+    place_ok = _dialogue_place_ok(dialogue, duration_sec)
+    for _ in range(batches):
+        centers = _extra_window_centers(duration_sec, [c for c, _v in windows], batch_windows, place_ok=place_ok)
+        if not centers:
+            break
+        placed += 1
+        batch = []
+        _readings, tp_readings, lra_readings, _stderr, _timed_out = _sample_lufs_readings(
+            file_path, target_lufs, semaphore=semaphore, chunk_timeout=chunk_timeout,
+            semaphore_timeout=semaphore_timeout, parallel_windows=parallel_windows,
+            centers=centers, known_duration=duration_sec, window_out=batch, dialogue=dialogue)
+        windows.extend(batch)
+        tp_all.extend(tp_readings)
+        lra_all.extend(lra_readings)
+        if len(batch) == len(centers):
+            done += 1
+    return tp_all, lra_all, done, placed
 
 
 def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS, *args, **kwargs):
@@ -7060,7 +8880,8 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                              semaphore_timeout=None,
                              attenuation_floor=None,
                              parallel_windows=False,
-                             duration_out=None):
+                             duration_out=None,
+                             prior_windows=None):
     _fallback = None if treat_fallback_as_unknown else 1.0
     _ceiling = LOUDNESS_GAIN_CEILING
     _atten_floor = LOUDNESS_GAIN_FLOOR_STANDARD if attenuation_floor is None else attenuation_floor
@@ -7085,10 +8906,46 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
             if raise_on_no_audio:
                 raise NoAudioStreamError(file_path)
             return _fallback
-        readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout = _sample_lufs_readings(
-            file_path, target_lufs, semaphore=semaphore, chunk_timeout=chunk_timeout,
-            semaphore_timeout=semaphore_timeout, parallel_windows=parallel_windows,
-            duration_out=duration_out)
+        _dialogue = None
+        if target_lufs != MUSIC_TARGET_LUFS:
+            _dialogue, _dialogue_timed_out = _resolve_dialogue_basis(
+                file_path, semaphore=semaphore, semaphore_timeout=semaphore_timeout)
+            if _dialogue_timed_out:
+                _media_warning(
+                    "loudness_timeout",
+                    "[LOUDNESS PROBE] Timed out reading the dialogue timing of %s",
+                    os.path.basename(file_path),
+                )
+                if raise_on_timeout:
+                    raise LoudnessProbeTimeoutError(file_path)
+                return _fallback
+        _scan_method = {}
+        _basis_label = _dialogue_basis_label(_dialogue)
+        _dur_info = duration_out if duration_out is not None else {}
+        _recheck = prior_windows is not None
+        _windows = [(float(c), float(v)) for c, v in (prior_windows or [])]
+        _had_prior = bool(_windows)
+        if _had_prior:
+            tp_readings, lra_readings, stderr_for_stream_checks, any_timeout = [], [], "", False
+            _prior_duration = _probe_duration_seconds_fast(file_path)
+            if _prior_duration and not _duration_looks_implausible(file_path, _prior_duration):
+                _dur_info["duration_sec"] = float(_prior_duration)
+            if not _dur_info.get("duration_sec"):
+                _media_warning(
+                    "loudness_recheck_no_length",
+                    "[LOUDNESS CHECK] could not read the length of %s, so it was not scanned again",
+                    os.path.basename(file_path),
+                )
+                return _fallback
+            readings = [_file_lufs_basis([v for _c, v in _windows], _dialogue)]
+        else:
+            readings, tp_readings, lra_readings, stderr_for_stream_checks, any_timeout = _sample_lufs_readings(
+                file_path, target_lufs, semaphore=semaphore, chunk_timeout=chunk_timeout,
+                semaphore_timeout=semaphore_timeout, parallel_windows=parallel_windows,
+                duration_out=_dur_info, window_out=_windows, dialogue=_dialogue, method_out=_scan_method)
+            if _dialogue is not None and _scan_method.get("method") != "dialogue":
+                _dialogue = None
+                _basis_label = _dialogue_basis_label(None)
 
         if not readings:
             if any_timeout:
@@ -7123,8 +8980,10 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                 return _fallback
             _media_warning(
                 "loudness_no_stats",
-                "[LOUDNESS PROBE] No loudnorm stats returned for %s",
+                "[LOUDNESS PROBE] No loudnorm stats returned for %s; audio_stream=%s stderr_tail=%r",
                 os.path.basename(file_path),
+                _stderr_has_audio_stream(stderr_for_stream_checks),
+                (stderr_for_stream_checks or "")[-500:].replace("\\n", " | "),
             )
             return _fallback
 
@@ -7146,19 +9005,61 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
             )
             return _fallback
         gain_db = target_lufs - measured_i
+        gain_offset_db = MUSIC_GAIN_OFFSET_DB if target_lufs == MUSIC_TARGET_LUFS else LOUDNESS_GAIN_OFFSET_DB
+        gain_db += gain_offset_db
+        # WARNING: safety windows are added only when the first result is far from the target or the file is a bundle outlier; the caller must exclude owner/manual records from prior_windows.
+        _double_checked = False
+        _first_gain_db = gain_db
+        _check_batches = GAIN_CHECK_RECHECK_EXTRA_BATCHES if _recheck else 0
+        if not _recheck and abs(gain_db) >= GAIN_CHECK_DRASTIC_DB:
+            _check_batches = GAIN_CHECK_DRASTIC_EXTRA_BATCHES
+        _check_duration = _dur_info.get("duration_sec")
+        if _check_batches and _windows and _lufs_sample_windows(_check_duration) is not None:
+            _first_window_count = len(_windows)
+            _extra_tp, _extra_lra, _batches_done, _batches_placed = _extra_scan_windows(
+                file_path, target_lufs, _check_duration, _windows, _check_batches,
+                GAIN_CHECK_EXTRA_BATCH_WINDOWS, semaphore=semaphore,
+                chunk_timeout=chunk_timeout, semaphore_timeout=semaphore_timeout,
+                parallel_windows=parallel_windows, dialogue=_dialogue)
+            tp_readings = list(tp_readings) + _extra_tp
+            lra_readings = list(lra_readings) + _extra_lra
+            if len(_windows) > _first_window_count:
+                measured_i = _file_lufs_basis([v for _c, v in _windows], _dialogue)
+                gain_db = target_lufs - measured_i + gain_offset_db
+            elif _recheck and _batches_placed:
+                _media_warning(
+                    "loudness_recheck_no_windows",
+                    "[LOUDNESS CHECK] %s: safety windows returned no readings; saved gain was left unchanged",
+                    os.path.basename(file_path),
+                )
+                return _fallback
+            _double_checked = _batches_done >= _batches_placed and _batches_placed > 0
+            log.info(
+                "[LOUDNESS CHECK] %s: initial gain %+.1f dB; %d/%d safety batch(es) completed; "
+                "%d windows combined; final gain %+.1f dB%s",
+                os.path.basename(file_path), _first_gain_db, _batches_done,
+                _check_batches, len(_windows), gain_db,
+                "" if _double_checked else " (not marked checked)",
+            )
         gain = 10 ** (gain_db / 20.0)
-        _clamped_gain = max(_atten_floor, min(gain, _ceiling))
+        _base_gain = max(_atten_floor, min(gain, _ceiling))
         combined_tp = _combine_true_peak_readings(tp_readings)
-        _peak_capped = False
-        if combined_tp is not None:
-            _peak_headroom_db = TRUE_PEAK_CEILING_DBTP - combined_tp
-            _peak_gain_cap = 10 ** (_peak_headroom_db / 20.0)
-            if _peak_gain_cap < _clamped_gain:
-                _peak_floor = 1.0 if gain > 1.0 else LOUDNESS_GAIN_FLOOR
-                _clamped_gain = max(_peak_floor, _peak_gain_cap)
-                _peak_capped = True
-        _clamped_gain = _converge_clamped_gain(
-            gain, _clamped_gain, _peak_capped, _ceiling, attenuation_floor=_atten_floor)
+        _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _base_gain, combined_tp)
+        if (combined_tp is not None and _lufs_sample_windows(_dur_info.get("duration_sec")) is not None
+                and combined_tp + 20 * math.log10(_clamped_gain) > TRUE_PEAK_CEILING_DBTP - TRUE_PEAK_CONFIRM_MARGIN_DB):
+            _whole_tp = _lufs_window_ffmpeg(
+                file_path, target_lufs, timeout=TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS,
+                semaphore=semaphore, semaphore_timeout=semaphore_timeout)[1]
+            if _whole_tp is None:
+                _whole_tp = combined_tp + TRUE_PEAK_CONFIRM_MARGIN_DB
+                _media_warning(
+                    "true_peak_confirm_failed",
+                    "[LOUDNESS PROBE] could not read the whole-file true peak of %s; "
+                    "its gain was held back %.1f dB to stay under the ceiling",
+                    os.path.basename(file_path), TRUE_PEAK_CONFIRM_MARGIN_DB,
+                )
+            combined_tp = max(combined_tp, _whole_tp)
+            _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _base_gain, combined_tp)
         _max_lra = max(lra_readings) if lra_readings else None
         _wide_lra_flag = _max_lra is not None and _max_lra >= LOUDNESS_WIDE_LRA_FLAG_LU
         if _wide_lra_flag:
@@ -7178,7 +9079,23 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                 "clamped_gain": _clamped_gain,
                 "measured_lra": _max_lra,
                 "wide_lra_flag": _wide_lra_flag,
+                "double_checked": _double_checked,
+                "windows": [[c, v] for c, v in _windows],
+                "basis": _basis_label,
             })
+        log.info(
+            "[LOUDNESS DEBUG] %s target=%.1f measured=%.1f achieved=%.1f "
+            "gain_db=%+.1f gain=%.3f clamped=%.3f peak=%s peak_dbtp=%s "
+            "lra=%s duration=%s windows=%s recheck=%s basis=%s",
+            os.path.basename(file_path), target_lufs,
+            measured_i, measured_i + (20 * math.log10(_clamped_gain)),
+            gain_db, gain, _clamped_gain, _peak_capped,
+            "none" if combined_tp is None else f"{combined_tp:.1f}",
+            "none" if _max_lra is None else f"{_max_lra:.1f}",
+            "none" if not _dur_info.get("duration_sec") else f"{_dur_info['duration_sec']:.1f}s",
+            "[" + ",".join(f"{place:.3f}:{value:.1f}" for place, value in _windows) + "]",
+            _double_checked, _basis_label,
+        )
         if gain != _clamped_gain:
             _achieved_lufs = measured_i + (20 * math.log10(_clamped_gain))
             _shortfall_db = target_lufs - _achieved_lufs
@@ -7270,8 +9187,15 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
         stderr_for_stream_checks = ""
         any_timeout = False
         for _fp in (path1, path2):
+            _pair_dialogue = None
+            if target_lufs != MUSIC_TARGET_LUFS:
+                _pair_dialogue, _pair_dialogue_timed_out = _resolve_dialogue_basis(
+                    _fp, semaphore=_LOUDNESS_PROBE_SEMAPHORE)
+                if _pair_dialogue_timed_out:
+                    any_timeout = True
+                    continue
             _r, _tp_r, _lra_r, _stderr, _timed_out = _sample_lufs_readings(
-                _fp, target_lufs, semaphore=_LOUDNESS_PROBE_SEMAPHORE)
+                _fp, target_lufs, semaphore=_LOUDNESS_PROBE_SEMAPHORE, dialogue=_pair_dialogue)
             readings.extend(_r)
             tp_readings.extend(_tp_r)
             lra_readings.extend(_lra_r)
@@ -7332,18 +9256,11 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
             )
             return _fallback
         gain_db = target_lufs - measured_i
+        gain_db += LOUDNESS_GAIN_OFFSET_DB
         gain = 10 ** (gain_db / 20.0)
         _clamped_gain = max(LOUDNESS_GAIN_FLOOR_STANDARD, min(gain, _ceiling))
         combined_tp = _combine_true_peak_readings(tp_readings)
-        _peak_capped = False
-        if combined_tp is not None:
-            _peak_headroom_db = TRUE_PEAK_CEILING_DBTP - combined_tp
-            _peak_gain_cap = 10 ** (_peak_headroom_db / 20.0)
-            if _peak_gain_cap < _clamped_gain:
-                _peak_floor = 1.0 if gain > 1.0 else LOUDNESS_GAIN_FLOOR
-                _clamped_gain = max(_peak_floor, _peak_gain_cap)
-                _peak_capped = True
-        _clamped_gain = _converge_clamped_gain(gain, _clamped_gain, _peak_capped, _ceiling)
+        _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _clamped_gain, combined_tp)
         _max_lra = max(lra_readings) if lra_readings else None
         if _max_lra is not None and _max_lra >= LOUDNESS_WIDE_LRA_FLAG_LU:
             _media_warning(
@@ -7811,7 +9728,12 @@ class RetroDatabase:
             for channel_num in range(5, 45):
                 channel_key = str(channel_num).zfill(2)
                 if channel_key in locked:
-                    merged[channel_key] = copy.deepcopy(remote_channels[channel_key])
+                    local_record = copy.deepcopy(local_channels.get(channel_key, {}))
+                    remote_record = remote_channels.get(channel_key, {})
+                    for field in ("schedules", "holiday_schedules"):
+                        if field in remote_record:
+                            local_record[field] = copy.deepcopy(remote_record[field])
+                    merged[channel_key] = local_record
                     merged[channel_key]["server_locked"] = True
                 else:
                     local_record = local_channels.get(channel_key)
@@ -7833,8 +9755,8 @@ class RetroDatabase:
             mode = self.remote_playback.get("screen_mode") if self._remote_schedule_active else None
             if mode and str(ch_key).zfill(2) in self._remote_locked_channels:
                 return mode
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("remote_screen_mode_for: mode = self.remote_playback.get('screen_mode') if self._remo", _swallowed_error)
         return None
 
     def disconnect_remote_schedule(self):
@@ -8106,7 +10028,7 @@ class RetroDatabase:
                         and self._remote_local_channels_snapshot is not None
                         else self.channels_db
                     )
-                    return copy.deepcopy(source)
+                    return without_runtime_channel_keys(copy.deepcopy(source))
             except RuntimeError as snapshot_err:
                 if attempt == 7:
                     _media_warning(
@@ -8330,6 +10252,7 @@ class RetroDatabase:
 
     def factory_reset(self):
 
+        kept_file_data = {key: self.config[key] for key in FACTORY_RESET_KEEPS_FILE_DATA if key in self.config}
         game_ch_flag   = self.config.get("game_channel_enabled", True)
         guide_ch_flag  = self.config.get("tv_guide_enabled", True)
         theme_name     = self.config.get("current_theme", "DefaultBlueGreen")
@@ -8410,6 +10333,7 @@ class RetroDatabase:
             "dvd_splash_enabled": dvd_splash_enabled,
             "dvd_splash_path": dvd_splash_path,
         }
+        self.config.update(kept_file_data)
 
         self.channels_db = self._build_channels_db({})
 
@@ -8429,7 +10353,7 @@ __all__ = [
     "FAST_DISK_IO_MAX_CONCURRENT", "LEFTOVERS_TITLE", "LIVE_CAPTION_CHUNK_SEC",
     "LIVE_CAPTION_LEAD_SEC", "LIVE_CAPTION_MAX_LEAD_SEC", "LIVE_CAPTION_READY_DEADLINE_SEC",
     "LOUDNESS_CONVERGENCE_DB", "LOUDNESS_WINDOW_DISAGREE_LU",
-    "LOUDNESS_GAIN_CEILING", "LOUDNESS_GAIN_FLOOR", "LOUDNESS_GAIN_FLOOR_STANDARD",
+    "FACTORY_RESET_KEEPS_FILE_DATA", "LOUDNESS_GAIN_CEILING", "LOUDNESS_GAIN_SCAN_VERSION", "OWNER_GAIN_SCAN_VERSION", "LOUDNESS_GAIN_FLOOR", "LOUDNESS_GAIN_FLOOR_STANDARD",
     "LOUDNESS_PROBE_MAX_CONCURRENT", "LOUDNESS_WIDE_LRA_FLAG_LU",
     "LiveCaptionSession",
     "LoudnessProbeTimeoutError", "MOVIES_PER_BLOCK", "MOVIE_HEAVY_RATIO",
@@ -8444,16 +10368,18 @@ __all__ = [
     "build_block_timeline", "build_ordered_tracks", "build_show_rotation",
     "check_media_truly_ended", "clean_display_title_for_ext", "clean_music_display_title",
     "clean_video_display_title", "commercial_bundle_ceiling", "dedupe_duplicate_episode_files",
-    "dedupe_same_name_different_extension", "discover_bezel_style_files", "dvd_disc_mrl",
-    "fast_forward_show_pos", "sequential_state_after_path", "sequential_state_shifted", "take_sequential_entries", "generate_captions_via_asr_chunked", "get_cached_compressor_bake",
+    "dedupe_same_name_different_extension", "discover_bezel_style_files", "discover_holiday_bezel_files", "holiday_bezel_path_for", "holiday_key_for_date", "holiday_date", "HOLIDAY_KEYS", "holiday_days_until_open", "holiday_force_channels", "holiday_forced_key_global", "holiday_forced_key_for_channel", "holiday_force_row_states", "holiday_force_enabled_rows", "holiday_force_toggle", "holiday_force_started_today", "dvd_disc_mrl",
+    "fast_forward_show_pos", "schedule_rows_from_timeline", "schedule_rows_from_lineup", "bundles_of_tracks", "sequential_state_after_path", "sequential_state_shifted", "take_sequential_entries", "generate_captions_via_asr_chunked", "get_cached_compressor_bake",
     "get_disc_info", "get_media_duration", "get_media_loudness_gain",
     "get_media_video_dimensions", "get_music_loudness_gain", "get_pair_loudness_gain",
     "group_shows_flexible", "is_dvd_disc_source", "is_movie_track", "is_optical_drive_root",
     "is_shortcut_path", "iter_files_resolving_shortcuts", "migrate_show_positions",
-    "note_random_episode_played", "draw_from_shuffle_bag_by_file", "random_bag_entry_indices", "random_last_entry", "lineup_groups", "swap_lineup_groups", "pair_movie_parts", "track_duration_is_known", "pair_short_episodes",
-    "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_caption_source",
+    "note_random_episode_played", "draw_from_shuffle_bag_by_file", "random_bag_entry_indices", "random_last_entry", "lineup_groups", "pair_movie_parts", "track_duration_is_known", "pair_short_episodes", "guide_pair_title",
+    "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_caption_source", "get_file_facts_hub", "file_facts", "file_is_confirmed_bad", "note_caption_source",
     "resolve_captions_dir", "resolve_dir_entry", "resolve_loudness_dir", "resolve_main_dir",
     "build_pending_tracks", "group_pending_tracks", "resolve_shortcut_chain", "resolve_shortcut_target", "resolve_track_duration",
     "resolve_whisper_model_dir", "set_caption_memory_refusal_handler", "set_live_playback_priority", "split_movies_and_series",
     "stable_series_id", "strip_shortcut_display_suffix", "track_duration_is_estimated",
+    "read_track_duration", "set_duration_hub", "get_duration_hub", "DURATION_MEASURED", "DURATION_ESTIMATED",
+    "HUB_SERIES_ESTIMATE_MIN_SCANNED", "HUB_MOVIE_ESTIMATE_SECONDS",
 ]

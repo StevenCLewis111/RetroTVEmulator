@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import os
 import re
 import shutil
@@ -168,6 +169,21 @@ def current_version(base_dir, config=None):
         if value:
             return str(value).strip()
 
+    # PyInstaller release folders/executables commonly carry the release version.
+    # Use that as a fallback so a packaged build does not report its own version as
+    # available merely because version.json was not copied beside the exe.
+    _base_abs = os.path.abspath(base_dir)
+    _candidates = [
+        os.path.basename(_base_abs),
+        os.path.basename(os.path.dirname(_base_abs)),
+        os.path.basename(os.path.abspath(sys.argv[0])),
+        os.path.basename(os.path.abspath(sys.executable)),
+    ]
+    for candidate in _candidates:
+        match = re.search(r"(?:v|version[ _-]*)?(\d+\.\d+\.\d+)", candidate, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
     # NOTE: development/source copies have no release stamp, so 0.0.0 is the
     # "no update" baseline.
     return "0.0.0"
@@ -178,7 +194,7 @@ def manifest_url(config=None):
     return (
         os.environ.get("RETRO_TV_UPDATE_MANIFEST_URL")
         or config.get("update_manifest_url")
-        or ""
+        or "https://retrotvemulator.com/update-manifest.json"
     ).strip()
 
 
@@ -281,7 +297,7 @@ def check_for_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
 # ============================================================================
 
 
-def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS):
+def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progress_callback=None):
     _validate_url(url, "Update package URL")
     request = urllib.request.Request(
         url,
@@ -301,6 +317,9 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS):
                         raise UpdateError("Update package exceeds the 1 GiB safety limit")
                     digest.update(block)
                     output.write(block)
+                    if progress_callback is not None:
+                        content_length = int(response.headers.get("Content-Length", "0") or 0)
+                        progress_callback(total, content_length)
     except UpdateError:
         raise
     except (urllib.error.URLError, OSError) as exc:
@@ -355,7 +374,7 @@ def _extract_package(package_path, stage_root):
 # ============================================================================
 
 
-def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS):
+def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS, progress_callback=None):
     """Download, hash-check, zip-check, and atomically record a staged update."""
     manifest = validate_manifest(manifest)
     update_dir = _update_dir(base_dir)
@@ -364,7 +383,7 @@ def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS):
     package_path = os.path.join(work_dir, manifest["package_name"])
     stage_path = os.path.join(work_dir, "payload")
     try:
-        _bytes, digest = _download_package(manifest["url"], package_path, timeout=timeout)
+        _bytes, digest = _download_package(manifest["url"], package_path, timeout=timeout, progress_callback=progress_callback)
         if digest.lower() != manifest["sha256"].lower():
             _server_breadcrumb(
                 log, logging.WARNING, f"update-sha-mismatch:{manifest['version']}",
@@ -446,12 +465,36 @@ def background_check_loop(base_dir, config_provider, result_callback, stop_event
 # ============================================================================
 
 
+HELPER_EXE_NAME = "RetroTVUpdateHelper.exe"
+
+
+def _helper_exe_candidates(base_dir):
+    # NOTE: PyInstaller 6 onedir builds put add-data folders under _internal,
+    # so the helper can sit beside the exe, in updater/, or in _internal/updater/.
+    roots = [base_dir, os.path.join(base_dir, "_internal")]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    roots.append(os.path.dirname(os.path.abspath(sys.executable)))
+    candidates = []
+    for root in roots:
+        for path in (os.path.join(root, HELPER_EXE_NAME),
+                     os.path.join(root, "updater", HELPER_EXE_NAME)):
+            path = os.path.abspath(path)
+            if path not in candidates:
+                candidates.append(path)
+    return candidates
+
+
 def _helper_command(base_dir):
     if getattr(sys, "frozen", False):
-        helper = os.path.join(base_dir, "RetroTVUpdateHelper.exe")
-        if not os.path.isfile(helper):
-            raise UpdateError("The update helper is missing from this installation")
-        return [helper]
+        for helper in _helper_exe_candidates(base_dir):
+            if os.path.isfile(helper):
+                return [helper]
+        raise UpdateError(
+            f"{HELPER_EXE_NAME} is missing from this installation. Build it from "
+            "update_helper.py and place it in the updater folder."
+        )
     helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_helper.py")
     if not os.path.isfile(helper):
         raise UpdateError("update_helper.py is missing")
@@ -481,13 +524,23 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
     _atomic_json_write(pending_path, pending)
     command = _helper_command(base_dir) + ["--apply", pending_path]
     kwargs = {"cwd": base_dir, "close_fds": True}
+    _detached = 0
     if os.name == "nt":
-        kwargs["creationflags"] = (
+        _detached = (
             getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         )
+        # WARNING: the app puts itself and its children in a kill-on-close job object, so a helper started without breakaway dies the moment the app exits and never swaps the files.
+        kwargs["creationflags"] = _detached | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
     try:
-        process = subprocess.Popen(command, **kwargs)
+        try:
+            process = subprocess.Popen(command, **kwargs)
+        except OSError:
+            if os.name != "nt":
+                raise
+            # NOTE: a job that does not allow breakaway refuses the flag; start without it rather than not at all.
+            kwargs["creationflags"] = _detached
+            process = subprocess.Popen(command, **kwargs)
     except (OSError, ValueError) as exc:
         _server_breadcrumb(
             log, logging.WARNING, "update-helper-launch",

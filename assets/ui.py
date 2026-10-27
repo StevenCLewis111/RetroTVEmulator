@@ -19,6 +19,17 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+try:
+    from performance_governor import log_swallowed as _log_swallowed
+except Exception:
+    def _log_swallowed(where, error):
+        """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
+        return None
+
+
+# ============================================================================
 # SECTION: Drawing & canvas-fit helpers
 # ============================================================================
 
@@ -218,8 +229,8 @@ def _remote_key_label(key_code):
         name = pygame.key.name(key_code)
         if name and name not in ("", "unknown key"):
             return name.upper()[:8]
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_remote_key_label: name = pygame.key.name(key_code)", _swallowed_error)
     return f"#{key_code & 0xFFFF}"[:8]
 
 
@@ -358,8 +369,8 @@ def _crop_logo_to_artwork(logo_surface):
             if (bounds.width != logo_surface.get_width()
                     or bounds.height != logo_surface.get_height()):
                 return logo_surface.subsurface(bounds).copy()
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_crop_logo_to_artwork: bounds = logo_surface.get_bounding_rect(min_alpha=10)", _swallowed_error)
     return logo_surface
 
 def _fit_logo_to_box(logo_surface, box_w, box_h):
@@ -377,7 +388,8 @@ def _fit_logo_to_box(logo_surface, box_w, box_h):
         scaled_w = max(1, int(round(raw_w * ratio)))
         scaled_h = max(1, int(round(raw_h * ratio)))
         return pygame.transform.smoothscale(logo_surface, (scaled_w, scaled_h))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_fit_logo_to_box: raw_w = logo_surface.get_width()", _swallowed_error)
         return None
 
 
@@ -388,15 +400,15 @@ def _fit_logo_to_box(logo_surface, box_w, box_h):
 
 _guide_timeline_cache = {}
 
+
 _guide_exists_state = {"token": None, "cache": {}}
 
 def _guide_visualizer_admitted(ch_info, app_state, db):
     """Returns the songs the station's Visualizer lineup admits for this channel right now."""
     _inputs = app_state.get("visualizer_admission_inputs") if app_state is not None else None
     _unseekable, _unseekable_exts = _inputs() if callable(_inputs) else ({}, set())
-    _probe = (db.config.get("media_probe_cache", {}) if db is not None else {})
     return media.admit_visualizer_assets(
-        ch_info.get("schedules", {}).get("Music Tracks", []), _probe, _unseekable, _unseekable_exts)
+        ch_info.get("schedules", {}).get("Music Tracks", []), _unseekable, _unseekable_exts)
 
 
 def _guide_path_exists(path, app_state):
@@ -415,6 +427,252 @@ def _guide_path_exists(path, app_state):
 GUIDE_DESIGN_W, GUIDE_DESIGN_H = 1920, 1080
 GUIDE_VISIBLE_ROWS_16_9 = 8
 _guide_canvas = None
+
+# WARNING: the fallback number must match GUIDE_HUB_FILL_CACHE_SECONDS in performance_governor.py; it is used only when that module fails to import.
+try:
+    from performance_governor import GUIDE_HUB_FILL_CACHE_SECONDS as _GUIDE_HUB_FILL_TTL_SECONDS
+except Exception as _import_error:
+    log.warning("[GUIDE HUB FILL] could not read GUIDE_HUB_FILL_CACHE_SECONDS from performance_governor, using 2.0: %s", _import_error)
+    _GUIDE_HUB_FILL_TTL_SECONDS = 2.0
+
+_guide_hub_fill_cache = {}
+
+
+def _guide_entry_parts(entry):
+    """The files one guide entry airs, in order, as (normalised path, duration) pairs: a pair gives both episodes, a leftovers bundle all of its files, anything else its one file; empty when the entry has no path."""
+    import os
+    if not isinstance(entry, dict):
+        return []
+    if entry.get("is_pair"):
+        raw = [(entry.get("pair_ep1_path", entry.get("path", "")), entry.get("pair_ep1_duration", 0)),
+               (entry.get("pair_ep2_path", ""), entry.get("pair_ep2_duration", 0))]
+    elif entry.get("is_bundle"):
+        _paths = entry.get("bundle_item_paths") or media.lineup_paths([entry])
+        _durs = list(entry.get("bundle_item_durations") or [])
+        _durs += [0] * (len(_paths) - len(_durs))
+        raw = list(zip(_paths, _durs))
+    else:
+        raw = [(entry.get("path", ""), entry.get("duration", 0))]
+    return [(os.path.normcase(os.path.normpath(str(p))), d) for p, d in raw if p]
+
+
+def _guide_entry_airs_file(entry, file_path):
+    """True when the guide entry airs the given file, as any of its episodes."""
+    import os
+    _want = os.path.normcase(os.path.normpath(str(file_path)))
+    return any(p == _want for p, _d in _guide_entry_parts(entry))
+
+
+def _guide_aired_rows_in_view(aired_rows, view_start, view_end):
+    """Hub rows that touch the guide viewport, past, airing and upcoming alike."""
+    return [_r for _r in aired_rows if _r[2] > view_start and _r[1] < view_end + 3600]
+
+
+def _guide_splice_aired(timeline_entries, aired_rows):
+    """The timeline with the aired rows laid over it; an entry they only partly cover keeps its uncovered part."""
+    # WARNING: the rows must cover their whole span; cutting them at the clock leaves a hole where the guide's own break differs from the scheduler's, and that splits pairs and draws OFF-AIR.
+    if not aired_rows:
+        return timeline_entries
+    _rows = sorted(aired_rows, key=lambda _p: _p[1])
+    _runs = []
+    for _p in _rows:
+        if _runs and _p[1] <= _runs[-1][1] + 0.5:
+            _runs[-1][1] = max(_runs[-1][1], _p[2])
+        else:
+            _runs.append([_p[1], _p[2]])
+    _kept = []
+    for _entry, _t_start, _t_end, _t_block in timeline_entries:
+        _pieces = [(_t_start, _t_end)]
+        for _rs, _re in _runs:
+            _next = []
+            for _ps, _pe in _pieces:
+                if not (_ps < _re - 0.5 and _rs < _pe - 0.5):
+                    _next.append((_ps, _pe))
+                    continue
+                if _ps < _rs - 0.5:
+                    _next.append((_ps, min(_pe, _rs)))
+                if _pe > _re + 0.5:
+                    _next.append((max(_ps, _re), _pe))
+            _pieces = _next
+        for _ps, _pe in _pieces:
+            if _pe - _ps > 0.5:
+                _kept.append((_entry, _ps, _pe, _t_block))
+    return sorted(_kept + _rows, key=lambda _t: _t[1])
+
+
+def _guide_merge_cells(timeline_entries):
+    """The timeline with each commercial joined to the show before it and each pair's parts joined into one cell."""
+    _merged_entries = []
+    for _entry, _e_start, _e_end, _e_block in timeline_entries:
+        if _entry is None:
+            _merged_entries.append((_entry, _e_start, _e_end, _e_block))
+            continue
+        _is_com = isinstance(_entry, dict) and _entry.get("is_commercial")
+        if _merged_entries:
+            _p_entry, _p_start, _p_end, _p_block = _merged_entries[-1]
+            _p_valid = _p_entry is not None
+            _same_show = (not _is_com and _p_valid
+                          and isinstance(_entry, dict) and isinstance(_p_entry, dict)
+                          and not _p_entry.get("is_commercial")
+                          and _entry.get("path") == _p_entry.get("path")
+                          and _entry.get("seek_offset", 0) > 0)
+            _contiguous = _p_valid and abs(_e_start - _p_end) < 1
+            if _contiguous and (_is_com or _same_show):
+                _merged_entries[-1] = (_p_entry, _p_start, _e_end, _p_block)
+                continue
+        _merged_entries.append((_entry, _e_start, _e_end, _e_block))
+    return _merged_entries
+
+
+_guide_hub_past_cache = {}
+
+
+def _guide_hub_past_signature(ch_str, now_dt, hub=None):
+    """A small value that changes when the hub's aired, airing or Static rows of the channel change, for the guide's timeline cache key; None when the hub cannot be read."""
+    try:
+        _bucket = int(now_dt.timestamp() // _GUIDE_HUB_FILL_TTL_SECONDS)
+        _key = (ch_str, _bucket, id(hub))
+        if _key in _guide_hub_past_cache:
+            return _guide_hub_past_cache[_key]
+        if hub is None:
+            import media_library as _ml
+            hub = _ml.shared_schedule_hub()
+        _sig = hub.past_signature(ch_str)
+        if len(_guide_hub_past_cache) > 64:
+            _guide_hub_past_cache.clear()
+        _guide_hub_past_cache[_key] = _sig
+        return _sig
+    except Exception as error:
+        log.warning("[GUIDE HUB PAST] ch%s: could not read the hub's past rows signature; the generated guide fallback remains active: %s", ch_str, error)
+        return None
+
+
+def _guide_hub_aired_cells(ch_str, now_dt, view_start, view_end, hub=None):
+    """The hub's airing, aired and Static rows that touch the viewport, as (entry, start, end, block) rows built from each row's saved guide facts, commercials included and in start order; rows without guide facts are left to the generated fallback timeline, and overlaps are dropped."""
+    # WARNING: only the guide's drawing is read from the hub; a failure must return no rows so the generated timeline remains the safe fallback.
+    try:
+        now_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second + now_dt.microsecond / 1_000_000.0
+        now_epoch = now_dt.timestamp()
+        midnight = now_epoch - now_secs
+        if hub is None:
+            import media_library as _ml
+            hub = _ml.shared_schedule_hub()
+        found = hub.rows_between(ch_str, midnight + view_start, midnight + view_end + 3600, now_epoch, full=True)
+        out, last_end = [], None
+        for row in found:
+            facts = row.get("guide_entry")
+            if not facts or not row.get("path"):
+                continue
+            start = float(row["planned_start"]) - midnight
+            length = float(row["used_length"] or 0)
+            if length <= 0:
+                continue
+            if last_end is not None and start < last_end - 0.5:
+                continue
+            entry = dict(facts)
+            entry.setdefault("path", row["path"])
+            entry["duration"] = length
+            entry.setdefault("is_commercial", row.get("kind") == "commercial")
+            out.append((entry, start, start + length, ""))
+            last_end = start + length
+        return out
+    except Exception as error:
+        log.warning("[GUIDE HUB PAST] ch%s: could not read the guide's past from the hub, the ledger and the rebuilt timeline draw it: %s", ch_str, error)
+        return []
+
+
+_guide_hub_future_sig_cache = {}
+
+
+def _guide_hub_future_signature(ch_str, now_dt, hub=None):
+    """A small value that changes when the hub's projected future rows of the channel are replaced, for the guide's timeline cache key; None when the hub cannot be read."""
+    try:
+        _bucket = int(now_dt.timestamp() // _GUIDE_HUB_FILL_TTL_SECONDS)
+        _key = (ch_str, _bucket, id(hub))
+        if _key in _guide_hub_future_sig_cache:
+            return _guide_hub_future_sig_cache[_key]
+        if hub is None:
+            import media_library as _ml
+            hub = _ml.shared_schedule_hub()
+        _sig = hub.future_signature(ch_str)
+        if len(_guide_hub_future_sig_cache) > 64:
+            _guide_hub_future_sig_cache.clear()
+        _guide_hub_future_sig_cache[_key] = _sig
+        return _sig
+    except Exception as error:
+        log.warning("[GUIDE HUB FUTURE] ch%s: could not read the hub's future rows signature, the guide's saved future is not refreshed from the hub: %s", ch_str, error)
+        return None
+
+
+def _guide_hub_future_cells(ch_str, now_dt, view_start, view_end, hub=None):
+    """The hub's projected future rows that touch the viewport, as (entry, start, end, block) rows built from each row's saved guide facts, commercials included and in start order; a row without readable facts is left out so the guide's own future covers it, and an overlapping row is dropped."""
+    # WARNING: only the guide's drawing is read from the hub; a failure must return no rows so the guide draws its own future as before.
+    try:
+        now_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second + now_dt.microsecond / 1_000_000.0
+        midnight = now_dt.timestamp() - now_secs
+        if hub is None:
+            import media_library as _ml
+            hub = _ml.shared_schedule_hub()
+        found = hub.future_rows_between(ch_str, midnight + view_start, midnight + view_end + 3600)
+        out, last_end = [], None
+        for row in found:
+            facts = row.get("guide_entry")
+            if not facts or not row.get("path"):
+                continue
+            start = float(row["planned_start"]) - midnight
+            length = float(row["used_length"] or 0)
+            if length <= 0:
+                continue
+            if last_end is not None and start < last_end - 0.5:
+                continue
+            entry = dict(facts)
+            entry.setdefault("path", row["path"])
+            entry["duration"] = length
+            entry.setdefault("is_commercial", row.get("kind") == "commercial")
+            out.append((entry, start, start + length, ""))
+            last_end = start + length
+        return out
+    except Exception as error:
+        log.warning("[GUIDE HUB FUTURE] ch%s: could not read the guide's future from the hub, the guide draws its own future: %s", ch_str, error)
+        return []
+
+
+def _guide_fill_from_hub(timeline_entries, ch_str, now_dt, view_start, view_end, app_state=None, hub=None):
+    """Adds the hub's airing, aired and Static show rows that no guide entry covers, so the show on air at boot, the shows before it and a slot that went to Static are drawn as the show the clock scheduled and not as OFF-AIR; returns the entries sorted by start."""
+    # WARNING: only the guide's drawing is filled; nothing here may change what airs, and a failure must leave the entries as they were.
+    try:
+        now_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second + now_dt.microsecond / 1_000_000.0
+        now_epoch = now_dt.timestamp()
+        midnight = now_epoch - now_secs
+        cache_key = (ch_str, int(now_epoch // _GUIDE_HUB_FILL_TTL_SECONDS), int(view_start), int(view_end), id(hub))
+        rows = _guide_hub_fill_cache.get(cache_key)
+        if rows is None:
+            if hub is None:
+                import media_library as _ml
+                hub = _ml.shared_schedule_hub()
+            rows = hub.rows_between(ch_str, midnight + view_start, midnight + view_end, now_epoch)
+            if len(_guide_hub_fill_cache) > 64:
+                _guide_hub_fill_cache.clear()
+            _guide_hub_fill_cache[cache_key] = rows
+        added = []
+        for row in rows:
+            start = float(row["planned_start"]) - midnight
+            end = start + float(row["used_length"] or 0)
+            if end - start <= 0 or not row["path"]:
+                continue
+            if any(entry is not None and es < end - 0.5 and start < ee - 0.5 for entry, es, ee, _eb in list(timeline_entries) + added):
+                continue
+            if not _guide_path_exists(row["path"], app_state):
+                continue
+            added.append(({"path": row["path"], "duration": end - start, "is_commercial": False, "_guide_live_override": True,
+                           "_guide_hub_fill": True}, start, end, ""))
+        if not added:
+            return timeline_entries
+        return sorted(list(timeline_entries) + added, key=lambda item: item[1])
+    except Exception as error:
+        log.warning("[GUIDE HUB FILL] ch%s: could not fill the guide row from the hub, the row is drawn as it was: %s", ch_str, error)
+        return timeline_entries
+
 
 def _get_guide_canvas():
     global _guide_canvas
@@ -606,7 +864,8 @@ def _mode_locks(config_key):
     """True while the current performance mode greys out and switches off this setting."""
     try:
         return performance_governor is not None and performance_governor.feature_locked(config_key)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_mode_locks: return performance_governor is not None and performance_gove", _swallowed_error)
         return False
 
 
@@ -706,12 +965,10 @@ def get_channels_settings_menu_rows(db, app_state):
     if media.bezel_style_count() > 1:
         rows.append("bezel_style_select")
     rows.append("warp_screen")
-    rows.append("scan_lines")
-    rows.append("watermark")
-    rows.append("watermark_select")
     rows.append("boot_anim")
     rows.append("static_noise")
     rows.append("reception_lines")
+    rows.append("scan_lines")
     return rows
 
 
@@ -1853,12 +2110,10 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             def _build_commercial_tracks():
                 commercials_enabled = ch_info.get("commercials_enabled", False)
                 commercial_items = ch_info.get("schedules", {}).get("Commercials", [])
-                _com_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
                 if not commercials_enabled or not commercial_items:
                     return []
                 return media.build_commercial_tracks(
                     commercial_items,
-                    _com_probe_cache,
                     lambda _p: _guide_path_exists(_p, app_state),
                 )
 
@@ -1868,7 +2123,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 if not folder_items:
                     return [], {}
 
-                _media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
                 _playback_log = ch_info.get("playback_log", {})
                 _start_seed = lambda _info, _offset: "%s:%d" % (
                     _info.get("playback_log", {}).get(
@@ -1878,7 +2132,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     int(_offset),
                 )
                 _lineup, _lineup_block = media.read_block_lineup(
-                    ch_str, ch_info, block_name, now_dt, _media_probe_cache,
+                    ch_str, ch_info, block_name, now_dt,
                     lambda _p: _guide_path_exists(_p, app_state), _start_seed,
                     peek_only=True,
                 )
@@ -1893,12 +2147,12 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 commercial_placement = ch_info.get("commercial_placement", "interrupt_half_hour")
                 _pair_thresh_min = ch_info.get("pair_threshold_minutes", 15)
                 interrupt_floor_seconds = (_pair_thresh_min if _pair_thresh_min > 0 else 15) * 60
-                _media_probe_cache = (db.config.get("media_probe_cache", {}) if db is not None else {})
+                _fade_in, _fade_out = media.bumper_tracks_for_channel(ch_info)
                 _tl, _tc, _ = media.build_block_timeline(
                     block_content, _build_commercial_tracks(), commercial_placement, day_seed,
                     interrupt_floor_seconds=interrupt_floor_seconds,
-                    media_probe_cache=_media_probe_cache,
                     commercial_state=ch_info.get("playback_log", {}).get("commercial_pos"),
+                    fade_in_tracks=_fade_in, fade_out_tracks=_fade_out,
                 )
                 return _tl, _tc, _new_sp
 
@@ -1924,25 +2178,10 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             _is_marathon = (not ch_info.get("is_visualizer", False)
                             and ch_info.get("scheduling_mode", "random_slots") == "marathon")
 
+            _holiday_forced_guide = media.holiday_forced_key_for_channel(db.config, ch_str) if db is not None else ""
+
             def _get_holiday_key_guide(d):
-                m, day = d.month, d.day
-                if m == 10 and 25 <= day <= 31:
-                    return "halloween"
-                if m == 12 and 20 <= day <= 26:
-                    return "christmas"
-                if m == 2 and day == 14:
-                    return "valentine"
-                if (m == 12 and day == 31) or (m == 1 and day == 1):
-                    return "new_year"
-                if m == 11:
-                    thursdays = [
-                        datetime.date(d.year, 11, x)
-                        for x in range(1, 31)
-                        if datetime.date(d.year, 11, x).weekday() == 3
-                    ]
-                    if len(thursdays) >= 4 and d == thursdays[3]:
-                        return "thanksgiving"
-                return None
+                return media.holiday_key_for_date(d, _holiday_forced_guide, now_dt.date())
 
             _holiday_key_guide = (None if ch_info.get("is_visualizer", False)
                                    else _get_holiday_key_guide(now_dt.date()))
@@ -1955,9 +2194,22 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             viewport_start_hour = viewport_adjusted_start // 3600
             viewport_end_hour = (viewport_adjusted_end - 1) // 3600
             
+            # WARNING: the guide cache key must include the live schedule contents, or a fresh retro_config.json would paint the previous run's programs.
+            _guide_schedule_signature = tuple(
+                repr(_entry) for _entry in (
+                    list(_holiday_entries_guide) if _is_holiday_guide else list(
+                        _item
+                        for _block_items in (ch_info.get("schedules", {}) or {}).values()
+                        for _item in (_block_items if isinstance(_block_items, (list, tuple)) else [])
+                    )
+                )
+            )
             _tl_key = (ch_str, now_dt.year, now_dt.timetuple().tm_yday, viewport_start_seconds,
                        app_state.get("guide_refresh_token", 0),
-                       (app_state.get("guide_channel_stamps") or {}).get(ch_str, 0))
+                       (app_state.get("guide_channel_stamps") or {}).get(ch_str, 0),
+                       _guide_schedule_signature,
+                       _guide_hub_past_signature(ch_str, now_dt),
+                       _guide_hub_future_signature(ch_str, now_dt))
             _tl_hit = _guide_timeline_cache.get(_tl_key)
             if _tl_hit is not None:
                 _cached_sources_ok = True
@@ -1980,13 +2232,12 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             else:
                 _next_block_map = {"Morning": "Evening", "Evening": "Night", "Night": "Morning", "Full Day": "Full Day"}
 
-            _media_probe_cache_h = (db.config.get("media_probe_cache", {}) if db is not None else {})
 
             if _tl_hit is None and _is_holiday_guide:
                 _h_log = ch_info.get("holiday_playback_log", {}).get(_holiday_key_guide, {})
                 _h_pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
                 _h_raw_tracks, _h_initial_sp = media.read_holiday_lineup(
-                    ch_str, ch_info, _holiday_key_guide, now_dt, _media_probe_cache_h,
+                    ch_str, ch_info, _holiday_key_guide, now_dt,
                     lambda _p: _guide_path_exists(_p, app_state),
                     show_pos=_h_log.get("show_pos", {}),
                     fixed_show_order=_h_log.get("show_order"),
@@ -2005,7 +2256,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                                         else _h_log.get("show_pos", {}))
                         _fixed_order = None if _override_sp is not None else _h_log.get("show_order")
                         return media.read_holiday_lineup(
-                            ch_str, ch_info, _holiday_key_guide, now_dt, _media_probe_cache_h,
+                            ch_str, ch_info, _holiday_key_guide, now_dt,
                             lambda _p: _guide_path_exists(_p, app_state),
                             show_pos=_sp_copy, fixed_show_order=_fixed_order,
                             seed_bump=_seed_bump,
@@ -2018,7 +2269,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         _tl, _tc, _ = media.build_block_timeline(
                             _content, _build_commercial_tracks(), _h_commercial_placement,
                             _h_day_seed + _seed_bump, interrupt_floor_seconds=_h_interrupt_floor,
-                            media_probe_cache=_media_probe_cache_h,
                             commercial_state=_h_log.get("commercial_pos"),
                         )
                         return _tl, _tc, _new_sp
@@ -2058,7 +2308,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 m_timeline, m_total, _ = media.build_block_timeline(
                     marathon_content, _build_commercial_tracks(), commercial_placement,
                     day_seed=0, interrupt_floor_seconds=_interrupt_floor,
-                    media_probe_cache=_media_probe_cache_h,
                     commercial_state=ch_info.get("playback_log", {}).get("marathon_commercial_pos"),
                 ) if marathon_content else ([], 0, None)
                 if m_total > 0:
@@ -2105,14 +2354,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                   _guard = 0
                   while abs_pos < block_abs_end and _guard < 10000:
                       cycle_start = abs_pos
-                      for entry in _tl:
-                          e_start = cycle_start + entry["start_time"]
-                          e_end = e_start + entry["duration"]
-                          if e_start >= block_abs_end:
-                              return None
-                          if e_end > block_abs_end:
-                              return e_end
-                          _guard += 1
+                      _kept_tl, _kept_total, _crossing_end = media.guide_cycle_through_block_end(
+                          _tl, _total, cycle_start, block_abs_end)
+                      if _crossing_end is not None:
+                          return _crossing_end
+                      _guard += len(_kept_tl) + 1
                       abs_pos = cycle_start + _total
                   return None
 
@@ -2132,7 +2378,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                       ]
                   for _bname, _bstart, _bend, _nb in _overflow_ring:
                       _bd = _seg_anchor_delta.get(_bname, 0)
-                      _overflow_end = _walk_block_overflow(_bname, _bstart + _bd, _bend + _bd, _bd)
+                      _overflow_end = _walk_block_overflow(_bname, _bstart + _bd, _bend, _bd)
                       if _overflow_end is not None:
                           _block_overflow_end[_nb] = max(
                               _block_overflow_end.get(_nb, 0), _overflow_end)
@@ -2147,27 +2393,27 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     if _sbw is None:
                         continue
                     block_abs_start = _sbw[1] * 3600 + _seg_d
-                    block_abs_end = _sbw[2] * 3600 + _seg_d
+                    block_abs_end = _sbw[2] * 3600
                 elif block_name == "Morning":
                     block_abs_start = 4 * 3600 + _seg_d
-                    block_abs_end = 12 * 3600 + _seg_d
+                    block_abs_end = 12 * 3600
                 elif block_name == "Evening":
                     block_abs_start = 12 * 3600 + _seg_d
-                    block_abs_end = 20 * 3600 + _seg_d
+                    block_abs_end = 20 * 3600
                 elif block_name == "Full Day":
                     if _fd_anchor_secs is not None:
                         block_abs_start = _fd_anchor_secs
-                        block_abs_end = _fd_anchor_secs + 24 * 3600
+                        block_abs_end = 24 * 3600
                     else:
                         block_abs_start = 0
                         block_abs_end = 24 * 3600
                 else:  
                     if hour_mod >= 20:
                         block_abs_start = 20 * 3600 + _seg_d
-                        block_abs_end = 24 * 3600 + 4 * 3600 + _seg_d
+                        block_abs_end = 24 * 3600 + 4 * 3600
                     else:  
                         block_abs_start = 0 + _seg_d
-                        block_abs_end = 5 * 3600 + _seg_d
+                        block_abs_end = 4 * 3600
                 
                 block_already_rendered = any(
                     e[3] == block_name and e[0] is not None
@@ -2195,33 +2441,29 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     loop_start_pos = abs_pos
                     cycle_start = abs_pos
                     hit_block_boundary = False
-                    for entry in block_timeline:
+                    _cycle_tl, _cycle_total, _crossing_end = media.guide_cycle_through_block_end(
+                        block_timeline, total_content, cycle_start, block_abs_end)
+                    if _crossing_end is not None:
+                        _nb = _next_block_map.get(block_name)
+                        if _nb is not None:
+                            _block_overflow_end[_nb] = max(
+                                _block_overflow_end.get(_nb, 0), _crossing_end)
+                    for entry in _cycle_tl:
                         entry_abs_start = cycle_start + entry["start_time"]
                         entry_abs_end = entry_abs_start + entry["duration"]
-
-                        if entry_abs_start >= block_abs_end:
-                            hit_block_boundary = True
-                            break
-
-                        if entry_abs_end > block_abs_end:
-                            _nb = _next_block_map.get(block_name)
-                            if _nb is not None:
-                                _block_overflow_end[_nb] = max(
-                                    _block_overflow_end.get(_nb, 0), entry_abs_end)
 
                         timeline_entries.append((entry, entry_abs_start, entry_abs_end, block_name))
 
                         if entry_abs_end >= viewport_adjusted_end + 3600:
                             abs_pos = entry_abs_end
                             break
-
-                        if entry_abs_end > block_abs_end:
-                            hit_block_boundary = True
-                            abs_pos = entry_abs_end
-                            break
                     else:
-                        abs_pos = cycle_start + total_content
-                        if abs_pos < block_abs_end:
+                        if _crossing_end is not None:
+                            hit_block_boundary = True
+                            abs_pos = _crossing_end
+                        else:
+                            abs_pos = cycle_start + total_content
+                        if _crossing_end is None and abs_pos < block_abs_end:
                             _next_tl, _next_tc, _guide_cycle_sp = get_block_timeline(
                                 block_name, _override_sp=_guide_cycle_sp)
                             if _next_tl and _next_tc > 0:
@@ -2242,16 +2484,16 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
               if _tl_hit is None and _is_full_day_guide:
                   _DAY_SPAN = 86400
                   _base_day_start = _fd_anchor_secs if _fd_anchor_secs is not None else 0
-                  _base_day_end = _base_day_start + _DAY_SPAN
+                  _base_day_end = _DAY_SPAN
                   _base_day_entries = [
                       (_e, _es, _ee, _eb) for _e, _es, _ee, _eb in timeline_entries
                       if _e is not None
                   ]
-                  _base_overflow = _block_overflow_end.get("Full Day", _base_day_end) - _base_day_end
-                  _real_day_len = _DAY_SPAN + _base_overflow
+                  _base_overflow = max(0, _block_overflow_end.get("Full Day", _base_day_end) - _base_day_end)
+                  _real_day_len = max(1, _base_day_end + _base_overflow - _base_day_start)
                   _guide_span_end = min(viewport_adjusted_end + 3600,
                                          GUIDE_TOTAL_HALF_HOURS * 1800)
-                  _day_start = _base_day_start + _real_day_len
+                  _day_start = _base_day_end + _base_overflow
                   _day_num = 2
                   while _day_start < _guide_span_end and _day_num <= 7:
                       _shift = _day_start - _base_day_start
@@ -2264,41 +2506,21 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                       _day_start += _real_day_len
                       _day_num += 1
 
+            if _tl_hit is None and not _is_marathon:
+                timeline_entries = _guide_splice_aired(
+                    timeline_entries,
+                    _guide_aired_rows_in_view(
+                        _guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end),
+                        viewport_adjusted_start, viewport_adjusted_end))
             if _tl_hit is None and not _is_holiday_guide and not _is_marathon:
-                _now_rel_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
-                _past_rows = [
-                    _r for _r in media.aired_ledger_entries(ch_info.get("playback_log", {}), now_dt.toordinal())
-                    if _r[2] <= _now_rel_secs + 0.5
-                    and _r[2] > viewport_adjusted_start and _r[1] < viewport_adjusted_end + 3600
-                ]
-                if _past_rows:
-                    timeline_entries = sorted(
-                        [_t for _t in timeline_entries
-                         if not any(_t[1] < _p[2] - 0.5 and _p[1] < _t[2] - 0.5 for _p in _past_rows)]
-                        + _past_rows,
-                        key=lambda _t: _t[1])
+                timeline_entries = _guide_splice_aired(
+                    timeline_entries,
+                    _guide_aired_rows_in_view(
+                        _guide_hub_aired_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end),
+                        viewport_adjusted_start, viewport_adjusted_end))
 
             if _tl_hit is None:
-                _merged_entries = []
-                for _entry, _e_start, _e_end, _e_block in timeline_entries:
-                    if _entry is None:
-                        _merged_entries.append((_entry, _e_start, _e_end, _e_block))
-                        continue
-                    _is_com = isinstance(_entry, dict) and _entry.get("is_commercial")
-                    if _merged_entries:
-                        _p_entry, _p_start, _p_end, _p_block = _merged_entries[-1]
-                        _p_valid = _p_entry is not None
-                        _same_show = (not _is_com and _p_valid
-                                      and isinstance(_entry, dict) and isinstance(_p_entry, dict)
-                                      and not _p_entry.get("is_commercial")
-                                      and _entry.get("path") == _p_entry.get("path")
-                                      and _entry.get("seek_offset", 0) > 0)
-                        _contiguous = _p_valid and abs(_e_start - _p_end) < 1
-                        if _contiguous and (_is_com or _same_show):
-                            _merged_entries[-1] = (_p_entry, _p_start, _e_end, _p_block)
-                            continue
-                    _merged_entries.append((_entry, _e_start, _e_end, _e_block))
-                timeline_entries = _merged_entries
+                timeline_entries = _guide_merge_cells(timeline_entries)
                 if len(_guide_timeline_cache) > 80:
                     _guide_timeline_cache.clear()
                 _guide_timeline_cache[_tl_key] = list(timeline_entries)
@@ -2320,10 +2542,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 _seek_off = _anchor.get("seek_offset", 0)
                 _a_dur = _anchor.get("duration", 1800)
                 if db is not None:
-                    _probed_real_dur = (db.config.get("media_probe_cache", {})
-                                         .get(os.path.normpath(str(_anchor_file)), {})
-                                         .get("duration"))
-                    if _probed_real_dur and _probed_real_dur > _a_dur:
+                    _probed_real_dur, _probed_kind = media.read_track_duration(_anchor_file, 0)
+                    if _probed_kind == media.DURATION_MEASURED and _probed_real_dur and _probed_real_dur > _a_dur:
                         _a_dur = _probed_real_dur
                 _elapsed = _now_secs - _wall_start
                 if _elapsed < 0:
@@ -2346,9 +2566,30 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         _covers_now = (_es <= _now_secs < _ee) or (_es <= _now_secs + 86400 < _ee)
                         if not _covers_now:
                             continue
-                        _now_is_wrong_title = (
-                            os.path.normpath(str(_e.get("path", "")))
-                            != os.path.normpath(str(_anchor_file)))
+                        _now_is_wrong_title = not _guide_entry_airs_file(_e, _anchor_file)
+                        _multi_parts = _guide_entry_parts(_e)
+                        if len(_multi_parts) > 1 and not _now_is_wrong_title:
+                            _want_a = os.path.normcase(os.path.normpath(str(_anchor_file)))
+                            _before = 0.0
+                            for _pp, _pd in _multi_parts:
+                                if _pp == _want_a:
+                                    break
+                                _before += float(_pd or 0)
+                            _a_start_abs = _a_start_abs_seg - _before
+                            _shift = _a_start_abs - _es
+                            _tail_start = _ee + _shift
+                            if _ch_snaps_grid and (_tail_start % 1800) != 0:
+                                _tail_start = ((_tail_start // 1800) + 1) * 1800
+                            timeline_entries[_idx] = (_e, _a_start_abs, _tail_start, _anchor.get("block", _eb))
+                            _cursor = _tail_start
+                            _j = _idx + 1
+                            while _j < len(timeline_entries):
+                                _ne, _nes, _nee, _neb = timeline_entries[_j]
+                                _seg_len = max(0, _nee - _nes)
+                                timeline_entries[_j] = (_ne, _cursor, _cursor + _seg_len, _neb)
+                                _cursor += _seg_len
+                                _j += 1
+                            break
                         if _now_is_wrong_title:
                             _now_entry = {
                                 "path": _anchor_file, "duration": _a_dur,
@@ -2401,10 +2642,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         except (TypeError, ValueError):
                             _lnp_seek = 0.0
                         _lnp_dur = int(_guide_live_state.get("duration", 0) or 0)
-                        _lnp_real = (db.config.get("media_probe_cache", {})
-                                      .get(os.path.normpath(str(_lnp_file)), {})
-                                      .get("duration") if db is not None else None)
-                        if _lnp_real and _lnp_real > 0:
+                        _lnp_real, _lnp_real_kind = media.read_track_duration(_lnp_file, 0)
+                        if _lnp_real_kind == media.DURATION_MEASURED and _lnp_real and _lnp_real > 0:
                             _lnp_dur = max(_lnp_dur, int(_lnp_real))
                         if _lnp_dur <= 0:
                             _lnp_dur = 1800
@@ -2447,10 +2686,28 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             if _lnp_is_commercial and not (
                                     isinstance(_le, dict) and _le.get("is_commercial")):
                                 break
-                            _same_path = (
-                                os.path.normcase(os.path.normpath(str(_le.get("path", ""))))
-                                == os.path.normcase(os.path.normpath(str(_lnp_file)))
-                            )
+                            _same_path = _guide_entry_airs_file(_le, _lnp_file)
+                            _lnp_parts = _guide_entry_parts(_le)
+                            if _same_path and len(_lnp_parts) > 1 and not _lnp_is_commercial:
+                                _want_l = os.path.normcase(os.path.normpath(str(_lnp_file)))
+                                _before_l = 0.0
+                                for _pp, _pd in _lnp_parts:
+                                    if _pp == _want_l:
+                                        break
+                                    _before_l += float(_pd or 0)
+                                _new_start = _matched_now - _lnp_seek - _before_l
+                                _lc = _lee + (_new_start - _les)
+                                if _ch_snaps_grid and (_lc % 1800) != 0:
+                                    _lc = ((_lc // 1800) + 1) * 1800
+                                timeline_entries[_li] = (_le, _new_start, _lc, _leb)
+                                _lj = _li + 1
+                                while _lj < len(timeline_entries):
+                                    _ne2, _nes2, _nee2, _neb2 = timeline_entries[_lj]
+                                    _sl2 = max(0, _nee2 - _nes2)
+                                    timeline_entries[_lj] = (_ne2, _lc, _lc + _sl2, _neb2)
+                                    _lc += _sl2
+                                    _lj += 1
+                                break
                             if _same_path:
                                 _lnp_entry = dict(_le)
                                 _lnp_entry["duration"] = _lnp_dur
@@ -2499,6 +2756,9 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                                 _guide_live_state.get("block", ""),
                             ))
                             timeline_entries.sort(key=lambda _row: _row[1])
+
+            if not ch_info.get("is_visualizer", False):
+                timeline_entries = _guide_fill_from_hub(timeline_entries, ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end, app_state)
 
             if not ch_info.get("is_visualizer", False):
                 _cutoff_g = None
@@ -2610,11 +2870,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 if isinstance(show, dict) and show.get("is_commercial"):
                     cleaned_title = "COMMERCIAL BREAK"
                 elif isinstance(show, dict) and show.get("is_pair"):
-                    _p1 = show.get("pair_ep1_path", show.get("path", ""))
-                    _p2 = show.get("pair_ep2_path", "")
-                    _n1 = _clean_show_title(_p1) if _p1 else ""
-                    _n2 = _clean_show_title(_p2) if _p2 else ""
-                    cleaned_title = ((_n1 + " + " + _n2) if (_n2 and _n2 != _n1) else _n1).upper()
+                    cleaned_title = media.guide_pair_title(show).upper()
                 else:
                     cleaned_title = media.guide_display_title(show).upper() if isinstance(show, dict) else _clean_show_title(show).upper()
                 
@@ -2769,10 +3025,7 @@ def _safe_state_hash(obj):
         return id(obj)
 
 
-_MENU_IRRELEVANT_CONFIG_KEYS = frozenset({
-    "media_probe_cache", "caption_cache",
-    "dvd_gain_cache", "_part_group_gain_cache",
-})
+_MENU_IRRELEVANT_CONFIG_KEYS = frozenset()
 
 
 def _menu_relevant_config_hash(config):
@@ -4221,12 +4474,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             "warp_screen": "Warp Screen",
             "reception_lines": "Reception Lines",
             "bezel_toggle": "CRT TV Bezels",
-            "watermark": "Water Mark",
             "boot_anim": "Boot Anim",
         }
         _cs_rows = get_channels_settings_menu_rows(db, app_state)
         _cs_cur_row = app_state.get("menu_selection_index", 0)
-        _watermark_on = bool(db.config.get("watermark_enabled", False)) if db is not None else False
         _bezel_on = bool(db.config.get("fake_43_border_enabled", False)) if db is not None else False
         _bezel_style_n = media.bezel_style_count() if db is not None else 1
 
@@ -4238,24 +4489,20 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _cs_bar_w = max(f_ch_label.size(_lbl)[0] for _lbl in _cs_row_labels.values()) + _cs_bar_pad
         _cs_row_content_w = _cs_bar_w + 20 + pill_w
         _cs_add_lbl_w = f_ch_btn.render("Add", True, TEXT_WHITE).get_width() + 28
-        _cs_watermark_row_w = _cs_row_content_w + 20 + _cs_add_lbl_w
         _cs_bstyle_box_w = 18 + 24
         _cs_bezel_row_w = _cs_row_content_w + 20 + _cs_bstyle_box_w
 
-        _cs_watermark_select_idx = _cs_rows.index("watermark_select") if "watermark_select" in _cs_rows else None
         _cs_bezel_style_select_idx = _cs_rows.index("bezel_style_select") if "bezel_style_select" in _cs_rows else None
-        _cs_recep_idx = _cs_rows.index("reception_lines") if "reception_lines" in _cs_rows else None
-        _cs_entries = [(_i, _rid) for _i, _rid in enumerate(_cs_rows)
-                        if _rid not in ("watermark_select", "bezel_style_select", "reception_lines")]
-
-        _cs_left_count = (len(_cs_entries) + 1) // 2
-        _cs_columns = [_cs_entries[:_cs_left_count], _cs_entries[_cs_left_count:]]
+        _cs_columns = [
+            [(_cs_rows.index(_rid), _rid) for _rid in ("bezel_toggle", "warp_screen", "boot_anim") if _rid in _cs_rows],
+            [(_cs_rows.index(_rid), _rid) for _rid in ("static_noise", "reception_lines", "scan_lines") if _rid in _cs_rows],
+        ]
 
         _cs_half_w = content_w // 2
         _cs_col_centers = [cx + _cs_half_w // 2, cx + _cs_half_w + _cs_half_w // 2]
 
         _cs_grid_rows_tall = max((len(_c) for _c in _cs_columns), default=0)
-        _cs_total_rows = _cs_grid_rows_tall + (1 if _cs_recep_idx is not None else 0)
+        _cs_total_rows = _cs_grid_rows_tall
         # VALUES CHANGE HERE
         _cs_header_gap = 40
         _cs_block_h = lbl_hdr.get_height() + _cs_header_gap
@@ -4351,29 +4598,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                      (_cs_bstyle_x + (_cs_bstyle_box_w - _cs_bstyle_lbl.get_width()) // 2,
                                       _cs_bar_y + (box_h_43 - _cs_bstyle_lbl.get_height()) // 2))
 
-        if _cs_recep_idx is not None:
-            _cs_recep_rows_tall = max((len(_c) for _c in _cs_columns), default=0)
-            _cs_recep_y = _cs_top_y + _cs_recep_rows_tall * (_cs_row_h + _cs_row_gap)
-            _cs_recep_bar_y = _cs_recep_y + (_cs_row_h - box_h_43) // 2
-            _cs_recep_col_x = cx + content_w // 2 - _cs_row_content_w // 2
-            _cs_recep_pill_x = _cs_recep_col_x + _cs_bar_w + 20
-            _cs_recep_focused = _cs_cur_row == _cs_recep_idx
-
-            pygame.draw.rect(menu_canvas, (25, 45, 80), (_cs_recep_col_x, _cs_recep_bar_y, _cs_bar_w, box_h_43), border_radius=6)
-            if _cs_recep_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cs_recep_col_x, _cs_recep_bar_y, _cs_bar_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=6)
-
-            _cs_recep_lbl_surf = f_ch_label.render(_cs_row_labels.get("reception_lines", "Reception Lines"), True, TEXT_WHITE)
-            menu_canvas.blit(_cs_recep_lbl_surf, (_cs_recep_col_x + (_cs_bar_w - _cs_recep_lbl_surf.get_width()) // 2,
-                                                    _cs_recep_bar_y + (box_h_43 - _cs_recep_lbl_surf.get_height()) // 2))
-
-            _cs_recep_on = bool(db.config.get("fake_reception_lines_enabled", False)) if db is not None else False
-            _cs_recep_pill_y = _cs_recep_bar_y + (box_h_43 - pill_h) // 2
-            _cs_recep_pill_col = OFF_GREEN if _cs_recep_on else (45, 65, 100)
-            pygame.draw.rect(menu_canvas, _cs_recep_pill_col, (_cs_recep_pill_x, _cs_recep_pill_y, pill_w, pill_h), border_radius=12)
-            _cs_recep_handle_x = _cs_recep_pill_x + pill_w - 12 if _cs_recep_on else _cs_recep_pill_x + 12
-            pygame.draw.circle(menu_canvas, TEXT_WHITE, (_cs_recep_handle_x, _cs_recep_pill_y + pill_h // 2), 9)
-
         _cs_close_idx = len(_cs_rows)
         _cs_close_focused = _cs_cur_row == _cs_close_idx
         _cs_bk_x, _cs_bk_y, _cs_bk_w, _cs_bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
@@ -4421,7 +4645,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         is_toggle_focused = (not _is_last_active) and (sub_r == 0 and _effective_col == 0)
 
         _toggle_label_color = (90, 90, 90) if _is_last_active else (NEON_GREEN if is_toggle_focused else TEXT_WHITE)
-        lbl_toggle_txt = f_ch_label.render("Status:", True, _toggle_label_color)
+        lbl_toggle_txt = f_ch_label.render("On/Off:", True, _toggle_label_color)
         _status_lbl_x = cx + 25
         menu_canvas.blit(lbl_toggle_txt, (_status_lbl_x, top_y + 4))
 
@@ -4447,7 +4671,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         t_vis = ch_info.get("is_visualizer", False)
         if t_active:
             is_vis_mode_focused = (sub_r == 0 and _effective_col == 1)
-            lbl_vis_txt = f_ch_label.render("Mode: MUSIC", True, NEON_GREEN if is_vis_mode_focused else TEXT_WHITE)
+            lbl_vis_txt = f_ch_label.render("Music", True, NEON_GREEN if is_vis_mode_focused else TEXT_WHITE)
             _mode_lbl_x = _status_pill_x + 55 + 40
             menu_canvas.blit(lbl_vis_txt, (_mode_lbl_x, top_y + 4))
             
@@ -4506,9 +4730,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             vis_row_h = 40
             vis_gap = 20
 
-            _gain_row_idx = 3
-            _clear_row_idx = 4
-            close_row_idx = 4
+            _reactive_row_idx = 2
+            _reactive_strength_row_idx = 3
+            _gain_row_idx = 4
+            _audio_row_idx = 5
+            _clear_row_idx = 6
+            close_row_idx = 7
             is_close_focused = (sub_r == close_row_idx)
 
             style_y = grid_y_start
@@ -4521,11 +4748,66 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_style = f_ch_label.render(f"VISUALIZER ENGINE STYLE: < {style_str} >", True, _style_text_col)
             menu_canvas.blit(lbl_style, (row_x + 20, style_y + vis_row_h // 2 - lbl_style.get_height() // 2))
 
-            audio_y = style_y + vis_row_h + vis_gap
-            is_audio_dir_focused = (sub_r == 2)
+            reactive_y = style_y + vis_row_h + vis_gap
+            is_reactive_focused = (sub_r == _reactive_row_idx)
+            reactive_enabled = ch_info.get("reactive_visualizer_enabled", True)
+            # WARNING: Lite mode never produces real-music data (see _visualizer_reactive_frame in retro_tv_emulator.py), so both reactive controls are greyed out and ignore input there.
+            _reactive_mode = performance_governor.get_mode() if performance_governor is not None else "lite"
+            _reactive_available = _reactive_mode in ("standard", "performance")
+            reactive_label = "REACTIVE VISUALIZER"
+            reactive_focused = (sub_r == _reactive_row_idx)
+            reactive_w = row_w
+            reactive_bg = (25, 45, 80) if _reactive_available else (32, 32, 40)
+            pygame.draw.rect(menu_canvas, reactive_bg, (row_x, reactive_y, reactive_w, vis_row_h), border_radius=6)
+            if reactive_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, reactive_y, reactive_w, vis_row_h), SELECTION_BORDER_WIDTH, border_radius=6)
+            _reactive_label_col = (NEON_GREEN if reactive_focused else TEXT_WHITE) if _reactive_available else (105, 105, 115)
+            reactive_text = f_ch_label.render(reactive_label, True, _reactive_label_col)
+            menu_canvas.blit(reactive_text, (row_x + 20, reactive_y + vis_row_h // 2 - reactive_text.get_height() // 2))
+            toggle_w, toggle_h = 78, 24
+            toggle_x = row_x + row_w - toggle_w - 18
+            toggle_y = reactive_y + (vis_row_h - toggle_h) // 2
+            if _reactive_available:
+                _toggle_track_col = (40, 167, 69) if reactive_enabled else (45, 65, 100)
+                _toggle_knob_col = TEXT_WHITE
+                _toggle_text_col = TEXT_WHITE
+            else:
+                _toggle_track_col = (55, 55, 60)
+                _toggle_knob_col = (105, 105, 115)
+                _toggle_text_col = (105, 105, 115)
+            pygame.draw.rect(menu_canvas, _toggle_track_col, (toggle_x, toggle_y, toggle_w, toggle_h), border_radius=12)
+            pygame.draw.circle(menu_canvas, _toggle_knob_col, (toggle_x + toggle_w - 12 if reactive_enabled else toggle_x + 12, toggle_y + toggle_h // 2), 9)
+            toggle_text = f_ch_btn.render("ON" if reactive_enabled else "OFF", True, _toggle_text_col)
+            menu_canvas.blit(toggle_text, (toggle_x + toggle_w // 2 - toggle_text.get_width() // 2, toggle_y + toggle_h // 2 - toggle_text.get_height() // 2))
+
+            strength_y = reactive_y + vis_row_h + vis_gap
+            is_strength_focused = (sub_r == _reactive_strength_row_idx)
+            strength = max(0, min(100, int(ch_info.get("reactive_visualizer_strength", 50))))
+            reactive_enabled = reactive_enabled and _reactive_available
+            strength_color = NEON_GREEN if is_strength_focused and reactive_enabled else ((105, 105, 115) if not reactive_enabled else TEXT_WHITE)
+            strength_label = "REACTIVE STRENGTH"
+            label_w = min(245, max(190, row_w // 2 - vis_gap // 2))
+            slider_x = row_x + label_w + vis_gap
+            slider_w = row_w - label_w - vis_gap
+            strength_text = f_ch_label.render(strength_label, True, strength_color)
+            menu_canvas.blit(strength_text, (row_x + 14, strength_y + vis_row_h // 2 - strength_text.get_height() // 2))
+            slider_y = strength_y + vis_row_h // 2
+            track_x = slider_x + 18
+            track_w = max(20, slider_w - 36)
+            track_color = (25, 45, 80) if reactive_enabled else (55, 55, 60)
+            pygame.draw.rect(menu_canvas, track_color, (track_x, slider_y - 3, track_w, 6), border_radius=3)
+            handle_x = track_x + int(track_w * (strength / 100.0))
+            pygame.draw.circle(menu_canvas, TEXT_WHITE if reactive_enabled else (105, 105, 115), (handle_x, slider_y), 8)
+            if is_strength_focused:
+                pygame.draw.circle(menu_canvas, NEON_GREEN if reactive_enabled else (105, 105, 115), (handle_x, slider_y), 10, SELECTION_BORDER_WIDTH)
+
+            gain_y = strength_y + vis_row_h + vis_gap
+            _vis_audio_min_y = gain_y + vis_row_h + vis_gap
+            _vis_audio_max_y = content_y + content_h - 52 - vis_row_h - 10
+            audio_y = max(_vis_audio_min_y, min(_vis_audio_min_y + vis_gap, _vis_audio_max_y))
+            is_audio_dir_focused = (sub_r == _audio_row_idx)
             pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, audio_y, row_w, vis_row_h), border_radius=6)
             if is_audio_dir_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, audio_y, row_w, vis_row_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            lbl_audio = f_ch_label.render("AUDIO FILES STORAGE PLATFORM: Select Audio Tracks Folder", True, NEON_GREEN if is_audio_dir_focused else TEXT_WHITE)
+            lbl_audio = f_ch_label.render("AUDIO FILES: (ADD)", True, NEON_GREEN if is_audio_dir_focused else TEXT_WHITE)
             menu_canvas.blit(lbl_audio, (row_x + 20, audio_y + vis_row_h // 2 - lbl_audio.get_height() // 2))
 
             _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
@@ -4536,7 +4818,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             is_clear_focused = (sub_r == _clear_row_idx)
             _clear_txt_col = (NEON_GREEN if is_clear_focused else TEXT_WHITE) if _has_music_content else (105, 105, 115)
             _clear_bg_col  = (OFF_RED if is_clear_focused else (45, 20, 25)) if _has_music_content else (32, 32, 40)
-            lbl_clr = f_ch_label.render("REMOVE MUSIC MEDIA", True, _clear_txt_col)
+            lbl_clr = f_ch_label.render("CLEAR ALL SCHEDULED MUSIC", True, _clear_txt_col)
             clear_w = min(lbl_clr.get_width() + 40, row_w)
             clear_x = row_x
             pygame.draw.rect(menu_canvas, _clear_bg_col, (clear_x, clear_y, clear_w, clear_h), border_radius=6)
@@ -4548,7 +4830,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if _vis_gain_path and hasattr(__import__("__main__"), "_get_audio_gain_db"):
                 _vis_gain_db = __import__("__main__")._get_audio_gain_db(_vis_gain_path)
             gain_h = 40
-            gain_y = audio_y + vis_row_h + vis_gap
             is_gain_focused = (sub_r == _gain_row_idx)
             gain_label = f_ch_label.render(f"LOUDNESS GAIN: {_vis_gain_db:+d} dB  A/D TO ADJUST", True, NEON_GREEN if is_gain_focused else TEXT_WHITE)
             pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, gain_y, row_w, gain_h), border_radius=6)
@@ -4570,7 +4851,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 "two_slots":    "TWO SLOTS",
                 "marathon":     "MARATHON",
             }
-            cur_sched = ch_info.get("scheduling_mode", "random_slots")
+            cur_sched = menu_nav.shown_scheduling_mode(ch_info)
             _sched_is_marathon = (cur_sched == "marathon")
 
             _block_mode  = ch_info.get("block_mode", "full_day")
@@ -4671,7 +4952,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 is_com_btn_focused = (sub_r == 3 and sub_c == 1)
                 _com_file_ct = len(ch_info.get("schedules", {}).get("Commercials", []))
                 btn_txt2 = f_ch_label.render(
-                    f"COMMERCIALS ({_com_file_ct})",
+                    f"COMMERCIALS ({'ADD' if _com_file_ct == 0 else _com_file_ct})",
                     True, NEON_GREEN if is_com_btn_focused else TEXT_WHITE)
                 btn_w2 = btn_txt2.get_width() + 40
                 pygame.draw.rect(menu_canvas,
@@ -4705,22 +4986,55 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 block_len_row_bottom = com_row_y + com_h + 16
             else:
                 bl_y = com_row_y + com_h + 16
-                is_bl_focused = (sub_r == 4)
+                is_bl_focused = (sub_r == 4 and sub_c == 0)
                 if _is_full_day:
                     _bl_label = "24-HOUR (FULL DAY)"
                 elif _is_six_block:
                     _bl_label = "4-HOUR BLOCKS"
                 else:
                     _bl_label = "8-HOUR BLOCKS"
-                lbl_bl = f_ch_label.render(
-                    f"BLOCK LENGTH:   \u25c4  {_bl_label}  \u25ba",
-                    True, NEON_GREEN if is_bl_focused else TEXT_WHITE
+                _bl_labels = (
+                    "SCHEDULE LENGTH:   ◄  24-HOUR (FULL DAY)  ►",
+                    "SCHEDULE LENGTH:   ◄  8-HOUR BLOCKS  ►",
+                    "SCHEDULE LENGTH:   ◄  4-HOUR BLOCKS  ►",
                 )
-                bl_w = min(lbl_bl.get_width() + 40, row_w)
+                _bl_label = _bl_labels[0] if _is_full_day else (_bl_labels[2] if _is_six_block else _bl_labels[1])
+                lbl_bl = f_ch_label.render(_bl_label, True, NEON_GREEN if is_bl_focused else TEXT_WHITE)
+                bl_w = min(max(f_ch_label.size(label)[0] for label in _bl_labels) + 40, row_w)
                 pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, bl_y, bl_w, bl_h), border_radius=6)
                 if is_bl_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, bl_y, bl_w, bl_h), SELECTION_BORDER_WIDTH, border_radius=6)
                 menu_canvas.blit(lbl_bl, (row_x + 20, bl_y + bl_h // 2 - lbl_bl.get_height() // 2))
+
+                _wm_enabled = bool(ch_info.get("watermark_enabled", False))
+                is_wm_focused = (sub_r == 4 and sub_c == 1)
+                _wm_label = f_ch_btn.render("Watermark:", True, NEON_GREEN if is_wm_focused else TEXT_WHITE)
+                _wm_pill_w, _wm_pill_h = 55, 24
+                _wm_add_w = 70
+                _wm_label_pad = 14
+                _wm_part_gap = 16
+                _wm_box_w = _wm_label.get_width() + 2 * _wm_label_pad
+                _wm_group_w = _wm_box_w + _wm_part_gap + _wm_pill_w + _wm_part_gap + _wm_add_w
+                _wm_group_x = row_x + bl_w + 16
+                _wm_label_x = _wm_group_x + _wm_label_pad
+                _wm_pill_x = _wm_group_x + _wm_box_w + _wm_part_gap
+                _wm_add_x = _wm_pill_x + _wm_pill_w + _wm_part_gap
+                _wm_y = bl_y
+                pygame.draw.rect(menu_canvas, (25, 45, 80), (_wm_group_x, _wm_y, _wm_box_w, bl_h), border_radius=4)
+                menu_canvas.blit(_wm_label, (_wm_label_x, _wm_y + (bl_h - _wm_label.get_height()) // 2))
+                _wm_pill_y = _wm_y + (bl_h - _wm_pill_h) // 2
+                _wm_pill_bg = OFF_GREEN if _wm_enabled else (45, 65, 100)
+                pygame.draw.rect(menu_canvas, _wm_pill_bg, (_wm_pill_x, _wm_pill_y, _wm_pill_w, _wm_pill_h), border_radius=12)
+                if is_wm_focused:
+                    _aa_rounded_rect(menu_canvas, NEON_GREEN, (_wm_pill_x, _wm_pill_y, _wm_pill_w, _wm_pill_h), SELECTION_BORDER_WIDTH, border_radius=12)
+                _wm_handle_x = _wm_pill_x + 42 if _wm_enabled else _wm_pill_x + 12
+                pygame.draw.circle(menu_canvas, TEXT_WHITE, (_wm_handle_x, _wm_pill_y + _wm_pill_h // 2), 9)
+                is_wm_add_focused = (sub_r == 4 and sub_c == 2)
+                _wm_add_label = f_ch_btn.render("Add", True, TEXT_WHITE)
+                pygame.draw.rect(menu_canvas, (25, 45, 80), (_wm_add_x, _wm_y, _wm_add_w, bl_h), border_radius=4)
+                if is_wm_add_focused:
+                    _aa_rounded_rect(menu_canvas, NEON_GREEN, (_wm_add_x, _wm_y, _wm_add_w, bl_h), SELECTION_BORDER_WIDTH, border_radius=4)
+                menu_canvas.blit(_wm_add_label, (_wm_add_x + (_wm_add_w - _wm_add_label.get_width()) // 2, _wm_y + (bl_h - _wm_add_label.get_height()) // 2))
                 block_len_row_bottom = bl_y + bl_h + 16
 
             folder_y_start = block_len_row_bottom
@@ -4733,7 +5047,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 if is_slot_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, folder_y_start, slots_total_w, f_cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
                 lbl_m = f_ch_label.render(
-                    f"24-HOUR MARATHON  ({file_count} file{'s' if file_count != 1 else ''})",
+                    f"24-HOUR MARATHON  ({'ADD' if file_count == 0 else str(file_count) + (' file' if file_count == 1 else ' files')})",
                     True, NEON_GREEN if is_slot_focused else TEXT_WHITE
                 )
                 menu_canvas.blit(lbl_m, (row_x + slots_total_w // 2 - lbl_m.get_width() // 2,
@@ -4745,7 +5059,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 if is_slot_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, folder_y_start, slots_total_w, f_cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
                 lbl_fd = f_ch_label.render(
-                    f"24-HOUR BLOCK  ({file_count} file{'s' if file_count != 1 else ''})",
+                    f"24-HOUR BLOCK  ({'ADD' if file_count == 0 else str(file_count) + (' file' if file_count == 1 else ' files')})",
                     True, NEON_GREEN if is_slot_focused else TEXT_WHITE
                 )
                 menu_canvas.blit(lbl_fd, (row_x + slots_total_w // 2 - lbl_fd.get_width() // 2,
@@ -4766,7 +5080,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     for _try_size in range(22, 9, -1):
                         _cand_font = _get_font("Courier New", _try_size, bold=True)
                         _widest = max(
-                            _cand_font.render(f"{n.upper()} (00)", True, TEXT_WHITE).get_width()
+                            _cand_font.render(f"{n.upper()} (ADD)", True, TEXT_WHITE).get_width()
                             for n in _slot_names
                         )
                         if _widest <= _cw - _pad:
@@ -4784,7 +5098,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     if is_slot_focused:
                         _aa_rounded_rect(menu_canvas, NEON_GREEN, (item_x, item_y, cell_w, cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
                     lbl_slot = _slot_font.render(
-                        f"{name.upper()} ({file_count})",
+                        f"{name.upper()} ({'ADD' if file_count == 0 else file_count})",
                         True, NEON_GREEN if is_slot_focused else TEXT_WHITE
                     )
                     menu_canvas.blit(lbl_slot, (item_x + cell_w // 2 - lbl_slot.get_width() // 2,
@@ -4823,7 +5137,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _atr_bg = (30, 50, 90) if _atr_enabled else (35, 35, 35)
             _atr_txt_color = TEXT_WHITE if _atr_enabled else (110, 110, 110)
             lbl_atr = f_ch_label.render(
-                "CHANGE CURRENT PLAYING AUDIO TRACK  \u25ba",
+                "CURRENT PLAYING AUDIO SETTINGS  \u25ba",
                 True, NEON_GREEN if (is_atr_focused and _atr_enabled) else _atr_txt_color
             )
             _atr_gap = 0 if _sched_is_marathon else 16
@@ -4833,14 +5147,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if is_atr_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (atr_x, atr_y, atr_w, atr_h), SELECTION_BORDER_WIDTH, border_radius=6)
             menu_canvas.blit(lbl_atr, (atr_x + atr_w // 2 - lbl_atr.get_width() // 2, atr_y + atr_h // 2 - lbl_atr.get_height() // 2))
-            if is_atr_focused and not _atr_enabled:
-                _f_tip2 = _get_font("Courier New", 11, bold=True)
-                _tip2_text = ("Tune to this channel first to change its audio track" if not _is_live_ch_for_audio
-                              else "Add media to this channel's schedule first")
-                _lbl_tip2 = _f_tip2.render(_tip2_text, True, (140, 100, 60))
-                menu_canvas.blit(_lbl_tip2, (atr_x, atr_y + atr_h + 2))
 
-            clear_y = atr_y + atr_h + 20 + (bl_h + 16 if _sched_is_marathon else 0)
+            clear_y = max(atr_y + atr_h + 20 + (bl_h + 16 if _sched_is_marathon else 0),
+                          content_y + content_h - 52)
             clear_h = 40
             is_clear_focused = (sub_r == _close_row and sub_c == 0)
             _sched_keys_all = ["Morning", "Commercials", "Evening", "Intros", "Night",
@@ -4848,7 +5157,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _has_sched_content = any(len(ch_info.get("schedules", {}).get(k, [])) > 0 for k in _sched_keys_all)
             _clear_txt_col = (NEON_GREEN if is_clear_focused else TEXT_WHITE) if _has_sched_content else (105, 105, 115)
             _clear_bg_col  = (OFF_RED if is_clear_focused else (45, 20, 25)) if _has_sched_content else (32, 32, 40)
-            lbl_clr = f_ch_label.render("CLEAR ALL BROADCAST TIME-SLOT SCHEDULE FILES", True, _clear_txt_col)
+            lbl_clr = f_ch_label.render("CLEAR ALL SCHEDULED MEDIA", True, _clear_txt_col)
             clear_w = min(lbl_clr.get_width() + 40, row_w)
             clear_x = row_x
             pygame.draw.rect(menu_canvas, _clear_bg_col, (clear_x, clear_y, clear_w, clear_h), border_radius=6)
@@ -4857,7 +5166,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             menu_canvas.blit(lbl_clr, (clear_x + clear_w // 2 - lbl_clr.get_width() // 2, clear_y + clear_h // 2 - lbl_clr.get_height() // 2))
 
             _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-            is_close_focused = (sub_r == _close_row and sub_c == 1)
+            is_close_focused = (sub_r == _close_row and sub_c == 3)
             pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
             if is_close_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
@@ -4889,7 +5198,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _audio_ctx = app_state.get("audio_track_context", "channel")
         if _audio_ctx == "dvd":
             f_sub_title = f_ch_label
-            lbl_hdr = f_sub_title.render("DVD — Change Audio Selection", True, TEXT_WHITE)
+            lbl_hdr = f_sub_title.render("DVD ��� Change Audio Selection", True, TEXT_WHITE)
         else:
             target_ch_str = str(app_state.get("audio_track_source_channel", app_state.get("selected_channel_row", 5))).zfill(2)
             ch_info = db.channels_db.get(target_ch_str, {"name": f"STATION {target_ch_str}"})
@@ -4962,6 +5271,50 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
 
     # ========================================================================
+    # SECTION: Channels tab: commercials and bumper sub-menu
+    # ========================================================================
+
+    elif active_tab == "Channels" and layer == "COMMERCIALS_SUB_MENU":
+        target_ch_str = str(app_state.get("selected_channel_row", 5)).zfill(2)
+        ch_info = db.channels_db.get(target_ch_str, {})
+        sub_r = app_state.get("sub_menu_row_index", 0)
+        labels = ("Commercials", "Fade-in", "Fade-out")
+        keys = ("Commercials", "Fade-in", "Fade-out")
+        f_sub_title = _get_font("Courier New", 20, bold=True)
+        lbl_hdr = f_sub_title.render(f"Channel {target_ch_str} — Commercials", True, TEXT_WHITE)
+        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
+        row_x = cx + 35
+        row_w = content_w - 70
+        row_top = content_y + 72
+        row_h = 44
+        close_y = content_y + content_h - 52
+        row_gap = max(18, (close_y - row_top - row_h * len(labels)) // len(labels))
+        for idx, (label, key) in enumerate(zip(labels, keys)):
+            y = row_top + idx * (row_h + row_gap)
+            focused = sub_r == idx
+            count = len(ch_info.get("schedules", {}).get(key, []))
+            pygame.draw.rect(menu_canvas, (25, 45, 80), (row_x, y, row_w, row_h), border_radius=6)
+            if focused:
+                _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, y, row_w, row_h), SELECTION_BORDER_WIDTH, border_radius=6)
+            text = f_ch_label.render(f"{label.upper()}:  {count} file{'s' if count != 1 else ''} selected — ENTER TO PICK FILES", True, NEON_GREEN if focused else TEXT_WHITE)
+            menu_canvas.blit(text, (row_x + 20, y + row_h // 2 - text.get_height() // 2))
+        clear_x, clear_w = cx + 35, 240
+        focused = sub_r == menu_nav.COMMERCIALS_CLEAR_ROW
+        pygame.draw.rect(menu_canvas, OFF_RED, (clear_x, close_y, clear_w, 40), border_radius=4)
+        if focused:
+            _aa_rounded_rect(menu_canvas, NEON_GREEN, (clear_x, close_y, clear_w, 40), SELECTION_BORDER_WIDTH, border_radius=4)
+        text = f_ch_btn.render("Clear Media", True, TEXT_WHITE)
+        menu_canvas.blit(text, (clear_x + clear_w // 2 - text.get_width() // 2, close_y + 20 - text.get_height() // 2))
+
+        focused = sub_r == menu_nav.COMMERCIALS_CLOSE_ROW
+        close_x = cx + content_w - 135
+        pygame.draw.rect(menu_canvas, OFF_RED, (close_x, close_y, 110, 40), border_radius=4)
+        if focused:
+            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_x, close_y, 110, 40), SELECTION_BORDER_WIDTH, border_radius=4)
+        text = f_ch_btn.render("Close", True, TEXT_WHITE)
+        menu_canvas.blit(text, (close_x + 55 - text.get_width() // 2, close_y + 20 - text.get_height() // 2))
+
+    # ========================================================================
     # SECTION: Channels tab: holiday sub-menu
     # ========================================================================
 
@@ -4979,28 +5332,65 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
 
         sub_r  = app_state.get("sub_menu_row_index", 0)
-        HKEYS  = ["halloween", "christmas", "valentine", "thanksgiving", "new_year"]
-        HNAMES = ["Halloween", "Christmas", "Valentine's Day", "Thanksgiving", "New Year's Eve"]
+        sub_c  = app_state.get("sub_menu_col_index", 0)
+        HKEYS  = list(media.HOLIDAY_KEYS)
+        HNAMES = ["Halloween", "Christmas", "Thanksgiving"]
+        _force_states = media.holiday_force_row_states(db.config, target_ch_str) if db is not None else {}
 
-        cell_h_hol = 44
-        y_gap_hol  = 10
-        top_hol_y  = content_y + 70
+        # VALUES CHANGE HERE: Holiday rows are spread evenly between the title and the Close button
+        _hol_top = content_y + 60
+        _hol_bottom = content_y + content_h - 62
+        _hol_slot_h = max(1, (_hol_bottom - _hol_top) // 3)
+        cell_h_hol = max(34, min(56, _hol_slot_h - 8))
+        _tog_w     = 190
+        _tog_gap   = 12
+        _row_w     = content_w - 70
+        _pick_w    = _row_w - _tog_w - _tog_gap
 
         for h_idx, (h_key, h_name) in enumerate(zip(HKEYS, HNAMES)):
-            hy = top_hol_y + h_idx * (cell_h_hol + y_gap_hol)
-            is_focused = (sub_r == h_idx)
+            hy = _hol_top + h_idx * _hol_slot_h + (_hol_slot_h - cell_h_hol) // 2
+            is_focused = (sub_r == h_idx and sub_c == 0)
             entries    = ch_info.get("holiday_schedules", {}).get(h_key, [])
             fc = len(entries)
-            pygame.draw.rect(menu_canvas, (25, 45, 80), (cx + 35, hy, content_w - 70, cell_h_hol), border_radius=6)
+            pygame.draw.rect(menu_canvas, (25, 45, 80), (cx + 35, hy, _pick_w, cell_h_hol), border_radius=6)
             if is_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (cx + 35, hy, content_w - 70, cell_h_hol), SELECTION_BORDER_WIDTH, border_radius=6)
+                _aa_rounded_rect(menu_canvas, NEON_GREEN, (cx + 35, hy, _pick_w, cell_h_hol), SELECTION_BORDER_WIDTH, border_radius=6)
             lbl_h = f_ch_label.render(
                 f"{h_name.upper()}:  {fc} file{'s' if fc != 1 else ''} selected — ENTER to pick files",
                 True, NEON_GREEN if is_focused else TEXT_WHITE
             )
             menu_canvas.blit(lbl_h, (cx + 55, hy + cell_h_hol // 2 - lbl_h.get_height() // 2))
 
-        is_back_focused = (sub_r == 5)
+            _tog_on = (_force_states.get(h_key) == "on")
+            _tog_greyed = (_force_states.get(h_key, "greyed") == "greyed")
+            _tog_focused = (sub_r == h_idx and sub_c == 1)
+            _tog_x = cx + 35 + _pick_w + _tog_gap
+            _tog_bg = (22, 22, 30) if _tog_greyed else (25, 45, 80)
+            pygame.draw.rect(menu_canvas, _tog_bg, (_tog_x, hy, _tog_w, cell_h_hol), border_radius=6)
+            if _tog_focused:
+                _aa_rounded_rect(menu_canvas, (150, 150, 170) if _tog_greyed else NEON_GREEN, (_tog_x, hy, _tog_w, cell_h_hol), SELECTION_BORDER_WIDTH, border_radius=6)
+            elif _tog_greyed:
+                pygame.draw.rect(menu_canvas, (45, 45, 55), (_tog_x, hy, _tog_w, cell_h_hol), 2, border_radius=6)
+            _tog_txt = (NEON_GREEN if _tog_focused else TEXT_WHITE) if not _tog_greyed else (130, 130, 150)
+            lbl_force = f_ch_label.render("FORCE", True, _tog_txt)
+            menu_canvas.blit(lbl_force, (_tog_x + 14, hy + cell_h_hol // 2 - lbl_force.get_height() // 2))
+            _sw_w, _sw_h = 55, 24
+            _sw_x = _tog_x + _tog_w - _sw_w - 14
+            _sw_y = hy + cell_h_hol // 2 - _sw_h // 2
+            pygame.draw.rect(menu_canvas, (35, 35, 45) if _tog_greyed else (OFF_GREEN if _tog_on else (45, 65, 100)),
+                             (_sw_x, _sw_y, _sw_w, _sw_h), border_radius=12)
+            _knob_x = _sw_x + _sw_w - 12 if _tog_on else _sw_x + 12
+            pygame.draw.circle(menu_canvas, (80, 80, 90) if _tog_greyed else TEXT_WHITE, (_knob_x, _sw_y + _sw_h // 2), 9)
+
+        is_clear_focused = (sub_r == menu_nav.HOLIDAY_CLEAR_ROW)
+        _clear_x, _clear_y, _clear_w, _clear_h = cx + content_w - 270, content_y + content_h - 52, 120, 40
+        pygame.draw.rect(menu_canvas, OFF_RED, (_clear_x, _clear_y, _clear_w, _clear_h), border_radius=4)
+        if is_clear_focused:
+            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_clear_x, _clear_y, _clear_w, _clear_h), SELECTION_BORDER_WIDTH, border_radius=4)
+        lbl_clear = f_ch_btn.render("Clear Media", True, TEXT_WHITE)
+        menu_canvas.blit(lbl_clear, (_clear_x + _clear_w // 2 - lbl_clear.get_width() // 2, _clear_y + _clear_h // 2 - lbl_clear.get_height() // 2))
+
+        is_back_focused = (sub_r == menu_nav.HOLIDAY_CLOSE_ROW)
         _bk_x, _bk_y, _bk_w, _bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
         pygame.draw.rect(menu_canvas, OFF_RED, (_bk_x, _bk_y, _bk_w, _bk_h), border_radius=4)
         if is_back_focused:
@@ -5027,8 +5417,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _srv_sm = db.remote_screen_mode_for(app_state.get("current_channel", "")) if db is not None else None
             if _srv_sm:
                 _screen_mode_val = _srv_sm
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_build_settings_overlay_menu: _srv_sm = db.remote_screen_mode_for(app_state.get('current_c", _swallowed_error)
 
         _row_gap = 14
         _radio_row_y = top_buttons_y + 6
@@ -5630,7 +6020,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         if console_key != "MENU":
             is_toggle_focused = (not _is_last_console) and (sub_row == 0)
             _toggle_label_color = (90, 90, 90) if _is_last_console else (NEON_GREEN if is_toggle_focused else TEXT_WHITE)
-            lbl_toggle_txt = f_ch_label.render("Status:", True, _toggle_label_color)
+            lbl_toggle_txt = f_ch_label.render("On/Off:", True, _toggle_label_color)
             menu_canvas.blit(lbl_toggle_txt, (cx + 25, top_y + 4))
 
             if _is_last_console:
@@ -6282,6 +6672,35 @@ def render_quit_prompt(surface, theme, db=None):
         surface.blit(scaled, (dest_x, dest_y))
 
 
+def render_update_prompt(surface, theme, db=None):
+    import colorsys
+
+    canvas_w, canvas_h = 650, 220
+    real_w, real_h = surface.get_size()
+    canvas = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+    bg_hue = db.config.get("theme_bg_hue", 220) / 360.0 if db is not None else 220 / 360.0
+    ui_hue = db.config.get("theme_ui_hue", 140) / 360.0 if db is not None else 140 / 360.0
+    r, g, b = colorsys.hsv_to_rgb(ui_hue, 0.9, 1.0)
+    neon_green = (int(r * 255), int(g * 255), int(b * 255))
+    r, g, b = colorsys.hsv_to_rgb(bg_hue, 0.6, 0.15)
+    midnight_navy = (int(r * 255), int(g * 255), int(b * 255))
+    menu_opacity = db.config.get("menu_opacity", 50) if db is not None else 50
+    bg = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+    bg.fill(midnight_navy + (int((menu_opacity / 100.0) * 255),))
+    canvas.blit(bg, (0, 0))
+    pygame.draw.rect(canvas, neon_green, (0, 0, canvas_w, canvas_h), 2)
+    title_font = _get_font("Courier New", 22, bold=True)
+    body_font = _get_font("Courier New", 19, bold=True)
+    title = title_font.render("AN UPDATE WAS FOUND", True, (255, 220, 0))
+    body = body_font.render("WOULD YOU LIKE TO UPDATE?", True, (255, 255, 255))
+    restart = body_font.render("YES = UPDATE AND RESTART", True, (255, 60, 60))
+    no = body_font.render("NO = QUIT", True, (255, 255, 255))
+    for image, y in ((title, 25), (body, 70), (restart, 125), (no, 165)):
+        canvas.blit(image, (canvas_w // 2 - image.get_width() // 2, y))
+    dest_w, dest_h, dest_x, dest_y = fit_design_canvas(canvas_w, canvas_h, real_w, real_h)
+    surface.blit(canvas if (dest_w, dest_h) == (canvas_w, canvas_h) else pygame.transform.smoothscale(canvas, (dest_w, dest_h)), (dest_x, dest_y))
+
+
 def render_pick_layout_popup(surface, theme, db, game_deck, player_num):
     import colorsys
 
@@ -6436,8 +6855,15 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     }
     _burnin_key = (target, _burnin_turning_on)
     _is_burnin_family = _burnin_key in _BURNIN_TITLES
+    # NOTE: the update popup carries the same Don't show this again box as the burn-in warnings.
+    _has_checkbox = _is_burnin_family or target == "app_update"
+    _update_version = str(state.get("update_prompt_version", "") or "").strip()
+    _update_body = [
+        f"Version {_update_version} is available." if _update_version else "A new version is available.",
+        "The app restarts when it finishes.",
+    ]
 
-    if _is_burnin_family:
+    if _has_checkbox:
         box_h = 290
     box_x = (real_w - box_w) // 2
     box_y = (real_h - box_h) // 2
@@ -6469,6 +6895,7 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         "clear_cores": "CLEAR ALL CORES?",
         "poweroff": "TURN OFF COMPUTER?",
         "boot_on_start": "REPLACE WINDOWS SHELL?",
+        "app_update": "UPDATE AND RESTART?",
     }
     if target == "clear_console_roms":
         from game_deck import CONSOLE_LABELS
@@ -6492,27 +6919,28 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     title = f_title.render(title_text, True, (255, 220, 0))
     surface.blit(title, (real_w // 2 - title.get_width() // 2, box_y + 25))
 
-    if _is_burnin_family:
+    if _is_burnin_family or target == "app_update":
+        _body_lines = _BURNIN_BODY[_burnin_key] if _is_burnin_family else _update_body
         _body_max_w = box_w - 40
         _body_size = 15
         while _body_size > 10:
             f_body = _get_font("Courier New", _body_size, bold=False)
-            if max((f_body.render(_l, True, TEXT_WHITE).get_width() for _l in _BURNIN_BODY[_burnin_key]), default=0) <= _body_max_w:
+            if max((f_body.render(_l, True, TEXT_WHITE).get_width() for _l in _body_lines), default=0) <= _body_max_w:
                 break
             _body_size -= 1
         _body_y = box_y + 60
-        for _line in _BURNIN_BODY[_burnin_key]:
+        for _line in _body_lines:
             _lbl = f_body.render(_line, True, TEXT_WHITE)
             surface.blit(_lbl, (real_w // 2 - _lbl.get_width() // 2, _body_y))
             _body_y += 19
 
     btn_w, btn_h = 110, 36
-    btn_y = box_y + (145 if _is_burnin_family else 85)
+    btn_y = box_y + (145 if _has_checkbox else 85)
     yes_x = real_w // 2 - 100 - btn_w // 2
     no_x = real_w // 2 + 100 - btn_w // 2
     selection = state.get("clear_confirm_selection", "No")
     _cc_focus = state.get("clear_confirm_focus", "buttons")
-    _buttons_focused = (not _is_burnin_family) or _cc_focus == "buttons"
+    _buttons_focused = (not _has_checkbox) or _cc_focus == "buttons"
 
     pygame.draw.rect(surface, (220, 53, 69), (yes_x, btn_y, btn_w, btn_h), border_radius=4)
     if selection == "Yes" and _buttons_focused:
@@ -6534,7 +6962,7 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
          btn_y + btn_h // 2 - no_label.get_height() // 2),
     )
 
-    if _is_burnin_family:
+    if _has_checkbox:
         _dont_show = state.get("clear_confirm_dont_show_again", False)
         _checkbox_focused = (_cc_focus == "checkbox")
         _cb_size = 16
@@ -6611,6 +7039,7 @@ __all__ = [
     "invalidate_guide_cache",
     "preload_games_tab_assets",
     "render_clear_confirm_popup",
+    "render_update_prompt",
     "render_controller_pick_wait_popup",
     "render_controls_splash",
     "render_dvd_button_mapping_popup",

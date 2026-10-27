@@ -31,6 +31,8 @@ one-off old-version-versus-new-version comparisons used while the menu code was 
 import ast
 import builtins
 import collections
+import copy
+import json
 import contextlib
 import ctypes
 import datetime
@@ -107,6 +109,18 @@ _CHECKS = [0]
 _FAILED = []
 
 
+def _set_manual_db(owner, path, value):
+    """Test helper: writes the legacy manual-dB offset straight into the library row, the way an older version saved it; returns False when the library cannot key the file."""
+    probe = getattr(owner, "probe_library", owner)
+    content_key = probe.keys.resolve(path)
+    if content_key is None:
+        return False
+    probe.library.upsert_fields(content_key, manual_gain_db=value)
+    if hasattr(owner, "forget"):
+        owner.forget(path)
+    return True
+
+
 def check(ok, label):
     """Records one check. A section function calls this many times; the section's test fails if any failed."""
     _CHECKS[0] += 1
@@ -117,12 +131,39 @@ def check(ok, label):
 _check_result = check
 
 
+class _CacheHub:
+    """Test stand-in for the duration hub: answers lengths from a {path: {"duration": seconds}} dict the way the old probe cache did."""
+
+    def __init__(self, cache):
+        self.cache = cache
+
+    def read(self, path):
+        entry = self.cache.get(path) or self.cache.get(os.path.normpath(path))
+        seconds = entry.get("duration") if isinstance(entry, dict) else None
+        if seconds and seconds > 0:
+            return seconds, media.DURATION_MEASURED
+        return None, None
+
+
+def _install_cache_hub(cache, testcase=None):
+    """Makes media read file lengths from the given dict; the section runner and the test case put the previous hub back afterwards."""
+    previous = media.get_duration_hub()
+    media.set_duration_hub(_CacheHub(cache))
+    if testcase is not None:
+        testcase.addCleanup(media.set_duration_hub, previous)
+    return previous
+
+
 class _SectionCase(unittest.TestCase):
     """A test whose body is a section function full of check() calls; the test fails with the first labels that failed."""
 
     def run_section(self, fn, *args):
         before = len(_FAILED)
-        fn(*args)
+        _hub_before = media.get_duration_hub()
+        try:
+            fn(*args)
+        finally:
+            media.set_duration_hub(_hub_before)
         failed = _FAILED[before:]
         if failed:
             shown = "\n  ".join(str(label) for label in failed[:20])
@@ -346,33 +387,33 @@ def _mock_result(stderr_text):
 
 
 class TestAsrProbeParity(unittest.TestCase):
+    def _probe(self, path, facts, exists=True):
+        fake_lib = types.SimpleNamespace(header_facts=lambda p: facts)
+        with patch.object(ml, "shared_probe_library", return_value=fake_lib), \
+             patch.object(media, "_cached_path_exists", return_value=exists):
+            return media._asr_probe_media(path)
+
     def test_full_file_duration_and_audio(self):
-        with patch("subprocess.run", return_value=_mock_result(FAKE_STDERR_FULL)), \
-             patch.object(media, "_cached_path_exists", return_value=True):
-            result = media._asr_probe_media("fake.mkv")
+        result = self._probe("fake.mkv", {"ok": True, "duration": 24 * 60 + 13.42, "has_audio": True})
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result["duration"], 24 * 60 + 13.42, places=2)
         self.assertTrue(result["has_audio"])
 
     def test_audio_only_file(self):
-        with patch("subprocess.run", return_value=_mock_result(FAKE_STDERR_AUDIO_ONLY)), \
-             patch.object(media, "_cached_path_exists", return_value=True):
-            result = media._asr_probe_media("fake.mp3")
+        result = self._probe("fake.mp3", {"ok": True, "duration": 3 * 60 + 30.0, "has_audio": True})
         self.assertIsNotNone(result)
         self.assertAlmostEqual(result["duration"], 3 * 60 + 30.0, places=2)
-        self.assertTrue(result["has_audio"])
 
     def test_broken_file_returns_none(self):
-        with patch("subprocess.run", return_value=_mock_result(FAKE_STDERR_BROKEN)), \
-             patch.object(media, "_cached_path_exists", return_value=True):
-            result = media._asr_probe_media("fake.bad")
-        self.assertIsNone(result)
+        self.assertIsNone(self._probe("fake.bad", {"ok": False}))
 
-    def test_missing_path_returns_none_without_subprocess(self):
-        with patch.object(media, "_cached_path_exists", return_value=False), \
-             patch("subprocess.run") as mock_run:
-            result = media._asr_probe_media("nope.mkv")
-        self.assertIsNone(result)
+    def test_missing_path_returns_none(self):
+        self.assertIsNone(self._probe("nope.mkv", None, exists=False))
+
+    def test_scanned_file_is_not_probed_again(self):
+        with patch("subprocess.run") as mock_run:
+            result = self._probe("seen.mkv", {"ok": True, "duration": 1500.0, "has_audio": False})
+        self.assertEqual(result, {"duration": 1500.0, "has_audio": False})
         mock_run.assert_not_called()
 
 
@@ -416,7 +457,7 @@ class TestSubtitleProbeParity(unittest.TestCase):
 
 
 class TestSeriesDurationGuess(unittest.TestCase):
-    def test_unknown_episode_uses_median_after_two_scanned_episodes(self):
+    def test_unknown_episode_uses_average_after_two_scanned_episodes(self):
         items = [
             {"path": "/tv/Show/Show S01E01.mkv"},
             {"path": "/tv/Show/Show S01E02.mkv"},
@@ -426,9 +467,10 @@ class TestSeriesDurationGuess(unittest.TestCase):
             items[0]["path"]: {"duration": 1200},
             items[1]["path"]: {"duration": 1500},
         }
-        tracks = media.build_raw_tracks(items, cache, lambda _path: True)
+        _install_cache_hub(cache, self)
+        tracks = media.build_raw_tracks(items, lambda _path: True)
         self.assertEqual([t["path"] for t in tracks], [item["path"] for item in items])
-        self.assertEqual(tracks[-1]["duration"], 1500)
+        self.assertEqual(tracks[-1]["duration"], 1350)
         self.assertNotIn("_duration_estimated", tracks[-1])
 
     def test_movies_and_commercials_are_not_guessed(self):
@@ -441,8 +483,9 @@ class TestSeriesDurationGuess(unittest.TestCase):
             items[0]["path"]: {"duration": 5000},
             items[1]["path"]: {"duration": 5100},
         }
-        tracks = media.build_raw_tracks(items, cache, lambda _path: True)
-        self.assertEqual([t["path"] for t in tracks], items[0:2])
+        _install_cache_hub(cache, self)
+        tracks = media.build_raw_tracks(items, lambda _path: True)
+        self.assertEqual([t["path"] for t in tracks], [item["path"] for item in items[0:2]])
 
 
 class TestDimsAndDurationUntouched(unittest.TestCase):
@@ -832,77 +875,6 @@ class TestResetAllSettingsLeavesLibraryIntact(unittest.TestCase):
         self.assertTrue(os.path.isdir(second))
 
 
-class TestLegacyCacheMigration(unittest.TestCase):
-    """The legacy cache migration is throttled and resumable, never mutates the source dicts, and skips missing and growing files."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.db_path = os.path.join(self.tmp, "lib.sqlite3")
-        self.library = ml.MediaLibrary(self.db_path)
-        self.probe_library = ml.ProbeLibrary(self.library, ffmpeg_path="ffmpeg")
-
-        self.present_path = os.path.join(self.tmp, "present.mp4")
-        _write_file(self.present_path, os.urandom(50_000))
-        self.missing_path = os.path.join(self.tmp, "missing.mp4")
-
-    def tearDown(self):
-        self.library.close()
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _legacy_dicts(self):
-        media_probe_cache = {
-            self.present_path: {"duration": 1234, "dims": [1920, 1080], "gain": 1.1},
-            self.missing_path: {"duration": 555, "dims": [640, 480]},
-        }
-        dvd_gain_cache = {self.present_path: 0.95}
-        return media_probe_cache, dvd_gain_cache
-
-    def test_migrates_present_file_skips_missing_file(self):
-        media_probe_cache, dvd_gain_cache = self._legacy_dicts()
-        migrator = ml.LegacyCacheMigrator(self.probe_library, batch_size=25)
-        migrator.start(media_probe_cache, dvd_gain_cache)
-        progress = migrator.step()
-        self.assertTrue(progress.done)
-        self.assertEqual(progress.migrated, 2)
-        self.assertEqual(progress.skipped_missing, 1)
-
-        entry = self.probe_library.get_cached(self.present_path)
-        self.assertEqual(entry["duration"], 1234)
-        self.assertEqual(entry["width"], 1920)
-        self.assertEqual(entry["gain"], 0.95)
-
-    def test_source_dicts_are_never_mutated(self):
-        media_probe_cache, dvd_gain_cache = self._legacy_dicts()
-        before = (dict(media_probe_cache), dict(dvd_gain_cache))
-        migrator = ml.LegacyCacheMigrator(self.probe_library, batch_size=25)
-        migrator.start(media_probe_cache, dvd_gain_cache)
-        migrator.step()
-        self.assertEqual(media_probe_cache, before[0])
-        self.assertEqual(dvd_gain_cache, before[1])
-
-    def test_batching_processes_a_few_entries_per_step(self):
-        media_probe_cache, dvd_gain_cache = self._legacy_dicts()
-        migrator = ml.LegacyCacheMigrator(self.probe_library, batch_size=1)
-        migrator.start(media_probe_cache, dvd_gain_cache)
-        progress = migrator.step()
-        self.assertFalse(progress.done)
-        self.assertEqual(progress.scanned, 1)
-        steps = 1
-        while not progress.done and steps < 20:
-            progress = migrator.step()
-            steps += 1
-        self.assertTrue(progress.done)
-
-    def test_growing_file_is_skipped_not_migrated(self):
-        media_probe_cache = {self.present_path: {"duration": 10}}
-        migrator = ml.LegacyCacheMigrator(self.probe_library, batch_size=25)
-        with mock.patch.object(ml, "compute_identity_key", return_value=None):
-            migrator.start(media_probe_cache, {})
-            progress = migrator.step()
-        self.assertEqual(progress.skipped_growing, 1)
-        self.assertEqual(progress.migrated, 0)
-
-
 class TestStorageAPIs(unittest.TestCase):
     """The per-file field slots store and return values."""
 
@@ -1037,26 +1009,35 @@ class TestPictureBoxDetection(unittest.TestCase):
         box, _ = _detect([good, dark, good, good, dark, good])
         self.assertEqual(box["rect"], [0, 99, 720, 378])
 
-    def test_asymmetric_vertical_bars_leave_that_axis_full_frame(self):
+    def test_uneven_vertical_bars_are_cropped_to_the_picture_found(self):
         box, _ = _detect([_pb_stderr((1280, 720), [(1280, 632, 0, 88)])])
-        self.assertEqual(box["reason"], "asymmetric_vertical")
-        self.assertEqual(box["rect"], [0, 0, 1280, 720])
+        self.assertEqual(box["reason"], "letterbox")
+        self.assertEqual(box["rect"], [0, 88, 1280, 632])
 
-    def test_one_sided_bar_is_asymmetric(self):
+    def test_one_sided_bar_is_cropped_to_the_picture_found(self):
         box, _ = _detect([_pb_stderr((1280, 720), [(1280, 620, 0, 0)])])
-        self.assertEqual(box["reason"], "asymmetric_vertical")
+        self.assertEqual(box["reason"], "letterbox")
+        self.assertEqual(box["rect"], [0, 0, 1280, 620])
+
+    def test_uneven_pillars_are_cropped_to_the_picture_found(self):
+        box, _ = _detect([_pb_stderr((1280, 720), [(1000, 720, 160, 0)])])
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"], [160, 0, 1000, 720])
+
+    def test_every_decision_is_bars_or_none_never_asymmetric(self):
+        for rect in [(1280, 632, 0, 88), (1280, 620, 0, 0), (1000, 720, 160, 0), (1280, 720, 0, 0), (1276, 716, 2, 2)]:
+            box, _ = _detect([_pb_stderr((1280, 720), [rect])])
+            self.assertFalse(box["reason"].startswith("asymmetric"), rect)
 
     def test_insubstantial_bars_are_ignored(self):
         box, _ = _detect([_pb_stderr((1280, 720), [(1276, 716, 2, 2)])])
         self.assertEqual(box["reason"], "no_bars")
         self.assertEqual(box["rect"], [0, 0, 1280, 720])
 
-    def test_vertical_bars_kept_when_only_horizontal_axis_is_bad(self):
+    def test_one_sided_pillar_is_cropped_together_with_even_letterbox(self):
         box, _ = _detect([_pb_stderr((1280, 720), [(1250, 544, 30, 88)])])
-        self.assertEqual(box["reason"], "letterbox")
-        self.assertEqual(box["rect"][0], 0)
-        self.assertEqual(box["rect"][2], 1280)
-        self.assertEqual(box["rect"][1:4:2], [88, 544])
+        self.assertEqual(box["reason"], "windowbox")
+        self.assertEqual(box["rect"], [30, 88, 1250, 544])
 
     def test_declared_dar_feeds_picture_aspect_not_rect(self):
         box, _ = _detect([_pb_stderr((720, 480), [(720, 480, 0, 0)], dar=(16, 9))])
@@ -1266,6 +1247,298 @@ class TestPictureBoxRealFfmpeg(unittest.TestCase):
 
     def test_missing_file_is_no_answer(self):
         self.assertIsNone(self._go(os.path.join(self.tmp, "nope.mp4")))
+
+
+# ============================================================================
+# SECTION: Picture-box flat-bar detection (bars of any one colour)
+# ============================================================================
+
+def _flat_frame(pixel):
+    """Builds one gray frame at the flat-check size; pixel(x, y) gives the level."""
+    w, h = ml._PB_FLAT_W, ml._PB_FLAT_H
+    out = bytearray(w * h)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            out[row + x] = pixel(x, y) & 255
+    return bytes(out)
+
+
+def _picture(x, y):
+    return (x * 7 + y * 13 + ((x * y) % 29) * 5) % 200 + 20
+
+
+def _bars_frame(left=0, right=0, top=0, bottom=0, side=128, cap=128, noise=0):
+    w, h = ml._PB_FLAT_W, ml._PB_FLAT_H
+
+    def pixel(x, y):
+        jitter = ((x * 31 + y * 17) % (2 * noise + 1)) - noise if noise else 0
+        if y < top or y >= h - bottom:
+            return cap + jitter
+        if x < left or x >= w - right:
+            return side + jitter
+        return _picture(x, y)
+    return _flat_frame(pixel)
+
+
+def _flat_detect(frame_size, flat_frames, cropdetect_boxes):
+    """Runs the real detector with canned ffmpeg output: stderr text and the given gray frames."""
+    stderr = _pb_stderr(frame_size, cropdetect_boxes)
+    stdout = b"".join(flat_frames)
+    fake = lambda cmd, **kw: mock.Mock(stderr=stderr.encode("utf-8"), stdout=stdout, returncode=0)
+    with mock.patch.object(ml.subprocess, "run", fake):
+        return ml.detect_picture_box("movie.mp4", duration=3000.0, ffmpeg_path="ffmpeg")
+
+
+class TestPictureBoxFlatBars(unittest.TestCase):
+
+    def test_grey_side_bars_are_measured(self):
+        flat = ml._pb_flat_sample([_bars_frame(left=80, right=80)])
+        self.assertEqual((flat["left"][0], flat["right"][0], flat["top"][0], flat["bottom"][0]), (80, 80, 0, 0))
+        self.assertAlmostEqual(flat["left"][1], 128, delta=1)
+
+    def test_bar_colour_does_not_matter(self):
+        for level in (0, 20, 60, 128, 180, 235):
+            flat = ml._pb_flat_sample([_bars_frame(left=60, right=60, side=level)])
+            self.assertEqual((flat["left"][0], flat["right"][0]), (60, 60), "level %d" % level)
+
+    def test_noise_inside_the_tolerance_still_reads_as_a_bar(self):
+        flat = ml._pb_flat_sample([_bars_frame(left=50, right=50, noise=4)])
+        self.assertEqual((flat["left"][0], flat["right"][0]), (50, 50))
+
+    def test_noise_past_the_tolerance_is_picture(self):
+        flat = ml._pb_flat_sample([_bars_frame(left=50, right=50, noise=ml._PB_FLAT_TOLERANCE)])
+        self.assertEqual((flat["left"][0], flat["right"][0]), (0, 0))
+
+    def test_picture_to_the_edge_has_no_strip(self):
+        flat = ml._pb_flat_sample([_bars_frame()])
+        self.assertEqual([flat[k][0] for k in ("top", "bottom", "left", "right")], [0, 0, 0, 0])
+
+    def test_letterbox_rows_are_measured(self):
+        flat = ml._pb_flat_sample([_bars_frame(top=60, bottom=60, cap=128)])
+        self.assertEqual((flat["top"][0], flat["bottom"][0], flat["left"][0], flat["right"][0]), (60, 60, 0, 0))
+
+    def test_windowbox_pillars_are_measured_beside_the_picture_rows_only(self):
+        flat = ml._pb_flat_sample([_bars_frame(left=70, right=70, top=50, bottom=50, side=128, cap=16)])
+        self.assertEqual((flat["top"][0], flat["bottom"][0], flat["left"][0], flat["right"][0]), (50, 50, 70, 70))
+
+    def test_a_frame_flat_all_over_cannot_say(self):
+        self.assertIsNone(ml._pb_flat_sample([_flat_frame(lambda x, y: 128)]))
+
+    def test_a_picture_thinner_than_the_limit_cannot_say(self):
+        thin = int(ml._PB_FLAT_H * (1 - ml._PB_FLAT_MIN_PICTURE_FRACTION / 2) / 2)
+        self.assertIsNone(ml._pb_flat_sample([_bars_frame(top=thin, bottom=thin)]))
+
+    def test_no_frames_cannot_say(self):
+        self.assertIsNone(ml._pb_flat_sample([]))
+        self.assertIsNone(ml._pb_flat_sample(None))
+        self.assertIsNone(ml._pb_flat_sample([b"short"]))
+
+    def test_every_frame_of_the_sample_must_agree(self):
+        flat = ml._pb_flat_sample([_bars_frame(left=80, right=80), _bars_frame(left=20, right=80)])
+        self.assertEqual((flat["left"][0], flat["right"][0]), (20, 80))
+
+    def test_bars_scale_to_the_frame_and_stay_inside_the_picture(self):
+        flat = ml._pb_flat_sample([_bars_frame(left=80, right=80)])
+        boxes = ml._pb_flat_boxes([flat] * 6, 1280, 720)
+        x, y, w, h = boxes[0]
+        self.assertEqual((x, y, w, h), (160, 0, 960, 720))
+        self.assertEqual(x % 2, 0)
+
+    def test_a_bar_whose_colour_changes_between_samples_is_not_a_bar(self):
+        a = ml._pb_flat_sample([_bars_frame(left=80, right=80, side=100)])
+        b = ml._pb_flat_sample([_bars_frame(left=80, right=80, side=100 + ml._PB_FLAT_TOLERANCE + 8)])
+        boxes = ml._pb_flat_boxes([a, b, a], 1280, 720)
+        for box in boxes:
+            self.assertEqual(box, (0, 0, 1280, 720))
+
+    def test_a_sample_that_cannot_say_stays_none(self):
+        a = ml._pb_flat_sample([_bars_frame(left=80, right=80)])
+        boxes = ml._pb_flat_boxes([a, None, a], 1280, 720)
+        self.assertIsNone(boxes[1])
+        self.assertEqual(boxes[0], (160, 0, 960, 720))
+
+    def test_detector_finds_grey_bars_that_cropdetect_misses(self):
+        frames = [_bars_frame(left=80, right=80), _bars_frame(left=80, right=80)]
+        box = _flat_detect((1280, 720), frames, [(1280, 720, 0, 0)])
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"], [160, 0, 960, 720])
+        self.assertEqual(box["flat_samples"], 6)
+        self.assertAlmostEqual(box["picture_aspect"], 4 / 3, places=3)
+
+    def test_without_frames_the_detector_answers_as_cropdetect_alone(self):
+        box = _flat_detect((1280, 720), [], [(1280, 720, 0, 0)])
+        self.assertEqual(box["reason"], "no_bars")
+        self.assertEqual(box["flat_samples"], 0)
+
+    def test_black_bars_cropdetect_finds_stay_cropped(self):
+        frames = [_bars_frame(left=80, right=80, side=0)]
+        box = _flat_detect((1280, 720), frames, [(960, 720, 160, 0)])
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"], [160, 0, 960, 720])
+
+    def test_a_flat_strip_on_one_side_only_is_cropped(self):
+        frames = [_bars_frame(left=80, right=0)]
+        box = _flat_detect((1280, 720), frames, [(1280, 720, 0, 0)])
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"][0] + box["rect"][2], 1280)
+        self.assertGreater(box["rect"][0], 0)
+
+    def test_one_sample_with_picture_to_the_edge_cancels_the_bars(self):
+        with_bars = [_bars_frame(left=80, right=80)]
+        without = [_bars_frame()]
+        answers = [with_bars, with_bars, without, with_bars, with_bars, with_bars]
+        calls = []
+
+        def fake(cmd, **kw):
+            frames = answers[len(calls)]
+            calls.append(cmd)
+            return mock.Mock(stderr=_pb_stderr((1280, 720), [(1280, 720, 0, 0)]).encode("utf-8"),
+                             stdout=b"".join(frames), returncode=0)
+        with mock.patch.object(ml.subprocess, "run", fake):
+            box = ml.detect_picture_box("movie.mp4", duration=3000.0, ffmpeg_path="ffmpeg")
+        self.assertEqual(box["reason"], "no_bars")
+
+    def test_a_failing_flat_check_is_logged_and_the_scan_goes_on(self):
+        with mock.patch.object(ml, "_pb_flat_sample", side_effect=RuntimeError("boom")), \
+             mock.patch.object(ml, "_log_swallowed") as logged:
+            box = _flat_detect((1280, 720), [_bars_frame(left=80, right=80)], [(1280, 720, 0, 0)])
+        self.assertEqual(box["reason"], "no_bars")
+        self.assertTrue(any("detect_picture_box: _pb_flat_sample" in c.args[0] for c in logged.call_args_list))
+
+    def test_one_process_per_sample_reads_both_the_text_and_the_frames(self):
+        fake = _FakeSamples([_pb_stderr((1280, 720), [(1280, 720, 0, 0)])])
+        with mock.patch.object(ml.subprocess, "run", fake):
+            ml.detect_picture_box("movie.mp4", duration=3000.0, ffmpeg_path="ffmpeg")
+        self.assertEqual(len(fake.calls), 6)
+        self.assertIn("cropdetect=limit=%d" % ml._PB_LIMIT, " ".join(fake.calls[0]))
+        self.assertIn("rawvideo", fake.calls[0])
+
+    def test_the_governor_table_holds_the_numbers(self):
+        self.assertEqual(ml._PB_FLAT_W, gov.PICTURE_BOX_FLAT_WIDTH)
+        self.assertEqual(ml._PB_FLAT_H, gov.PICTURE_BOX_FLAT_HEIGHT)
+        self.assertEqual(ml._PB_FLAT_TOLERANCE, gov.PICTURE_BOX_FLAT_TOLERANCE)
+        self.assertEqual(ml._PB_FLAT_FRAMES, gov.PICTURE_BOX_FLAT_FRAMES)
+        self.assertEqual(ml._PB_FLAT_MIN_PICTURE_FRACTION, gov.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION)
+        src = inspect.getsource(ml)
+        fallback = src[src.index("    _PB_FLAT_W = 640"):src.index("def _pb_axis")]
+        for name, value in (("_PB_FLAT_W", gov.PICTURE_BOX_FLAT_WIDTH), ("_PB_FLAT_H", gov.PICTURE_BOX_FLAT_HEIGHT),
+                            ("_PB_FLAT_TOLERANCE", gov.PICTURE_BOX_FLAT_TOLERANCE), ("_PB_FLAT_FRAMES", gov.PICTURE_BOX_FLAT_FRAMES),
+                            ("_PB_FLAT_MIN_PICTURE_FRACTION", gov.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION)):
+            self.assertIn("%s = %r" % (name, value), fallback)
+
+    def test_a_box_saved_by_the_old_detector_is_measured_again(self):
+        self.assertGreaterEqual(ml.PICTURE_BOX_DETECTOR_VERSION, 2)
+        tmp = tempfile.mkdtemp()
+        try:
+            library = ml.MediaLibrary(os.path.join(tmp, "lib.sqlite3"))
+            probe_library = ml.ProbeLibrary(library, ffmpeg_path="ffmpeg", use_vlc_fallback=False)
+            path = os.path.join(tmp, "rugrats.avi")
+            _write_file(path, os.urandom(50_000))
+            old_box = {"rect": [0, 0, 1280, 720], "frame": [1280, 720], "norm": [0, 0, 1, 1], "has_bars": False,
+                       "reason": "no_bars", "pixel_aspect": 1.0, "picture_aspect": 1.7778, "samples": 6,
+                       "sample_boxes": [], "detector_version": 1}
+            new_box = dict(old_box, rect=[160, 0, 960, 720], has_bars=True, reason="pillarbox",
+                           detector_version=ml.PICTURE_BOX_DETECTOR_VERSION)
+            key = probe_library.keys.resolve(path)
+            library.upsert_fields(key, picture_box=old_box, picture_box_detector_version=1, header_probed_at=1.0)
+            with mock.patch.object(ml, "detect_picture_box", return_value=new_box) as detect:
+                got = probe_library.detect_picture_box_if_needed(path)
+            self.assertEqual(detect.call_count, 1)
+            self.assertEqual(got["reason"], "pillarbox")
+            self.assertEqual(probe_library.get_cached(path)["picture_box_detector_version"], ml.PICTURE_BOX_DETECTOR_VERSION)
+            with mock.patch.object(ml, "detect_picture_box", return_value=None) as detect:
+                again = probe_library.detect_picture_box_if_needed(path)
+            self.assertEqual(detect.call_count, 0)
+            self.assertEqual(again["reason"], "pillarbox")
+            library.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPictureBoxFlatBarsRealFfmpeg(unittest.TestCase):
+    """Runs the real detector on synthetic clips with grey, light, one-sided and colour-changing bars."""
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        cls.tmp = tempfile.mkdtemp()
+        cls.ffmpeg = shutil.which("ffmpeg")
+
+        def make(name, size, vf, duration=8):
+            out = os.path.join(cls.tmp, name)
+            subprocess.run([cls.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                            "-i", f"testsrc2=size={size}:rate=25:duration={duration}", "-vf", vf,
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", out], check=True)
+            return out
+
+        cls.grey = make("grey.mp4", "960x720", "pad=1280:720:160:0:0x808080")
+        cls.light = make("light.mp4", "960x720", "pad=1280:720:160:0:0xB0B0B0")
+        cls.grey_letter = make("grey_letter.mp4", "720x378", "pad=720:576:0:99:0x808080")
+        cls.grey_window = make("grey_window.mp4", "640x480", "pad=1280:720:320:120:0x808080")
+        cls.one_side = make("one_side.mp4", "1120x720", "pad=1280:720:160:0:0x808080")
+        cls.black = make("black.mp4", "1200x720", "pad=1280:720:40:0:black")
+        cls.full = make("full.mp4", "1280x720", "null")
+        first = make("first.mp4", "960x720", "pad=1280:720:160:0:0x808080", 4)
+        second = make("second.mp4", "960x720", "pad=1280:720:160:0:0xB0B0B0", 4)
+        listing = os.path.join(cls.tmp, "list.txt")
+        with open(listing, "w") as handle:
+            handle.write("file 'first.mp4'\nfile 'second.mp4'\n")
+        cls.changing = os.path.join(cls.tmp, "changing.mp4")
+        subprocess.run([cls.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                        "-i", listing, "-c", "copy", cls.changing], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _go(self, path):
+        return ml.detect_picture_box(path, duration=8.0, ffmpeg_path=self.ffmpeg)
+
+    def test_tv_grey_baked_in_pillars_are_found(self):
+        box = self._go(self.grey)
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"], [160, 0, 960, 720])
+        self.assertAlmostEqual(box["picture_aspect"], 4 / 3, delta=0.01)
+
+    def test_light_grey_pillars_are_found(self):
+        box = self._go(self.light)
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"], [160, 0, 960, 720])
+
+    def test_grey_letterbox_is_found_and_never_cuts_picture(self):
+        box = self._go(self.grey_letter)
+        self.assertEqual(box["reason"], "letterbox")
+        x, y, w, h = box["rect"]
+        self.assertLessEqual(y, 99 + 4)
+        self.assertGreaterEqual(y, 99 - 8)
+        self.assertGreaterEqual(y + h, 99 + 378 - 4)
+        self.assertLessEqual(y + h, 99 + 378 + 8)
+
+    def test_grey_windowbox_is_found_on_both_axes(self):
+        box = self._go(self.grey_window)
+        self.assertEqual(box["reason"], "windowbox")
+        self.assertEqual(box["rect"], [320, 120, 640, 480])
+
+    def test_a_flat_strip_on_one_side_is_cropped(self):
+        box = self._go(self.one_side)
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertGreater(box["rect"][0], 0)
+        self.assertEqual(box["rect"][0] + box["rect"][2], 1280)
+
+    def test_bars_that_change_colour_during_the_file_are_left_alone(self):
+        box = self._go(self.changing)
+        self.assertEqual(box["reason"], "no_bars")
+
+    def test_black_bars_are_exactly_as_before(self):
+        box = self._go(self.black)
+        self.assertEqual(box["reason"], "pillarbox")
+        self.assertEqual(box["rect"], [40, 0, 1200, 720])
+
+    def test_full_frame_stays_full(self):
+        box = self._go(self.full)
+        self.assertEqual(box["reason"], "no_bars")
+        self.assertEqual(box["rect"], [0, 0, 1280, 720])
 
 
 # ============================================================================
@@ -2249,7 +2522,7 @@ def case_channels():
     check(mn.channels_page_of(43, 1) == 1 and mn.channels_page_of(99, 7) == mn.CHANNELS_NUM_PAGES - 1, "channels: page of a button uses the stored page, kept in range")
 
 
-ROWS_WITH_STYLE = ["bezel_toggle", "bezel_style_select", "warp_screen", "scan_lines", "watermark", "watermark_select",
+ROWS_WITH_STYLE = ["bezel_toggle", "bezel_style_select", "warp_screen", "scan_lines",
                    "boot_anim", "static_noise", "reception_lines"]
 ROWS_NO_STYLE = [r for r in ROWS_WITH_STYLE if r != "bezel_style_select"]
 
@@ -2260,23 +2533,22 @@ def case_channel_settings():
         t = mn.channel_settings_table(rows)
         structure(t, label, "bezel_toggle")
         check(mn.channel_settings_table(rows) is t, label + ": table is cached")
-        check(go(t, "bezel_toggle", mn.UP) is None and go(t, "watermark", mn.UP) is None, label + ": first rows do not leave upward")
+        check(go(t, "bezel_toggle", mn.UP) is None and go(t, "boot_anim", mn.UP) is None, label + ": first rows do not leave upward")
         check(go(t, "bezel_toggle", mn.DOWN) == "warp_screen" and go(t, "warp_screen", mn.DOWN) == "scan_lines", label + ": left column goes down")
         check(go(t, "scan_lines", mn.DOWN) == "reception_lines" and go(t, "static_noise", mn.DOWN) == "reception_lines", label + ": both columns end at Reception Lines")
         check(go(t, "reception_lines", mn.DOWN) == mn.CLOSE and go(t, mn.CLOSE, mn.UP) == "reception_lines", label + ": Reception Lines and Close")
         check(go(t, "reception_lines", mn.LEFT) is None and go(t, "reception_lines", mn.RIGHT) is None, label + ": Reception Lines has no sideways move")
         check(go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None and go(t, mn.CLOSE, mn.DOWN) is None, label + ": Close only goes up")
-        check(go(t, "watermark", mn.RIGHT) == "watermark_select" and go(t, "watermark_select", mn.LEFT) == "watermark", label + ": Add hangs off Water Mark")
-        check(go(t, "watermark_select", mn.RIGHT) is None, label + ": nothing right of Add")
-        check(go(t, "watermark_select", mn.UP) is None and go(t, "watermark_select", mn.DOWN) == "boot_anim", label + ": Add moves vertically like its row")
-        check(go(t, "watermark", mn.LEFT) == "bezel_toggle" and go(t, "boot_anim", mn.LEFT) == "warp_screen" and go(t, "static_noise", mn.LEFT) == "scan_lines", label + ": right column goes left row by row")
-        check(go(t, "scan_lines", mn.RIGHT) == "static_noise" and go(t, "warp_screen", mn.RIGHT) == "boot_anim", label + ": left column goes right row by row")
+        check(go(t, "boot_anim", mn.RIGHT) is None and go(t, "static_noise", mn.RIGHT) is None, label + ": nothing right of the right column")
+        check(go(t, "boot_anim", mn.DOWN) == "static_noise" and go(t, "static_noise", mn.UP) == "boot_anim", label + ": right column goes down and up")
+        check(go(t, "boot_anim", mn.LEFT) == "bezel_toggle" and go(t, "static_noise", mn.LEFT) == "warp_screen", label + ": right column goes left row by row")
+        check(go(t, "scan_lines", mn.RIGHT) == "static_noise" and go(t, "warp_screen", mn.RIGHT) == "static_noise", label + ": left column goes right row by row")
         if "bezel_style_select" in rows:
             check(go(t, "bezel_toggle", mn.RIGHT) == "bezel_style_select" and go(t, "bezel_style_select", mn.LEFT) == "bezel_toggle", label + ": the style box hangs off Bezel")
-            check(go(t, "bezel_style_select", mn.RIGHT) == "watermark", label + ": right of the style box is the right column")
+            check(go(t, "bezel_style_select", mn.RIGHT) == "boot_anim", label + ": right of the style box is the right column")
             check(go(t, "bezel_style_select", mn.DOWN) == "warp_screen" and go(t, "bezel_style_select", mn.UP) is None, label + ": the style box moves vertically like its row")
         else:
-            check(go(t, "bezel_toggle", mn.RIGHT) == "watermark", label + ": Bezel goes straight to the right column")
+            check(go(t, "bezel_toggle", mn.RIGHT) == "boot_anim", label + ": Bezel goes straight to the right column")
         for end in ("scan_lines", "static_noise"):
             memory = {}
             go(t, end, mn.DOWN, memory)
@@ -4080,7 +4352,10 @@ def make_env():
         "get_advanced_settings_menu_rows": ui.get_advanced_settings_menu_rows,
         "dvd_engine": None, "vlc_engine": None, "static_audio": None,
         "_disconnect_remote_server": boom, "_save_audio_track_pref": boom, "_fe_open": boom,
+        "_save_audio_gain_db": lambda filepath, value: None,
+        "_get_audio_gain_db": lambda filepath, ch_key=None: 0,
         "get_games_sub_menu_rows": boom, "_server_breadcrumb": boom, "server_sync": None, "logging": None,
+        "media": media, "_toggle_holiday_force": boom,
     }
 
 
@@ -4146,8 +4421,12 @@ def audio_cases():
 
 
 def holiday_cases():
-    for sel in range(0, 6):
-        yield n6_FakeDb(), {"menu_layer": "HOLIDAY_SUB_MENU", "sub_menu_row_index": sel, "selected_channel_row": 7}
+    for forced, forced_channels in (("", []), ("christmas", ["07"]), ("christmas", ["09"])):
+        for row in range(0, mn.HOLIDAY_CLOSE_ROW + 1):
+            for col in (0, 1):
+                db = n6_FakeDb(holiday_force_key=forced, holiday_force_channels=forced_channels)
+                db.channels_db = {"07": {"active": True, "holiday_schedules": {k: [{"path": "p"}] for k in media.HOLIDAY_KEYS}}}
+                yield db, {"menu_layer": "HOLIDAY_SUB_MENU", "sub_menu_row_index": row, "sub_menu_col_index": col, "selected_channel_row": 7}
 
 
 def channel_sub_infos():
@@ -4399,13 +4678,41 @@ def check_block(name, db, state, key, after):
         layout = mn.channel_sub_layout(db.channels_db["07"], sum(1 for v in db.channels_db.values() if v.get("active")))
         close = mn.channel_sub_close_row(layout)
         new_row, new_col = after["sub_menu_row_index"], after["sub_menu_col_index"]
+        if db.channels_db["07"].get("is_visualizer") and row == 2 and direction in (mn.LEFT, mn.RIGHT):
+            step = -1 if direction == mn.LEFT else 1
+            check((new_row, new_col) == (row, col), label + " Loudness Gain keeps the cursor where it is")
+            check(after.get("visualizer_gain_db") == step, label + " Loudness Gain moves one dB the way the key points")
+            check(abs(after.get("active_music_gain", 0) - 10 ** (step / 20.0)) < 1e-9, label + " the live music gain follows the dB")
+            check({k: v for k, v in after.items() if k not in ("visualizer_gain_db", "active_music_gain")} == state, label + " Loudness Gain changes only the gain values")
+            return
         check(0 <= new_row <= close and 0 <= new_col <= mn.CHANNEL_SUB_MAX_COL, label + " stays inside the grid")
         check(abs(new_row - row) <= 1 or (row == close and new_row == close - 1), label + " moves at most one row")
         if direction in (mn.LEFT, mn.RIGHT):
             check(new_row == row, label + " sideways keeps the row")
         check({k: v for k, v in after.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")} == {k: v for k, v in state.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")}, label + " changes only the cursor")
         return
-    sel_key = "sub_menu_row_index" if name in ("AUDIO_TRACK_PICKER", "HOLIDAY_SUB_MENU") else "menu_selection_index"
+    if name == "HOLIDAY_SUB_MENU":
+        row, col = state["sub_menu_row_index"], state["sub_menu_col_index"]
+        new_row, new_col = after["sub_menu_row_index"], after["sub_menu_col_index"]
+        check(0 <= new_row <= mn.HOLIDAY_CLOSE_ROW and new_col in (0, 1), label + " stays inside the grid")
+        check(new_row != mn.HOLIDAY_CLOSE_ROW or new_col == 0, label + " Close has no second column")
+        if direction in (mn.LEFT, mn.RIGHT) and row < mn.HOLIDAY_CLEAR_ROW:
+            check(new_row == row, label + " sideways keeps the row")
+        if direction == mn.RIGHT and col == 0 and row < mn.HOLIDAY_CLEAR_ROW:
+            check((new_row, new_col) == (row, 1), label + " right goes to the toggle of its row, greyed or not")
+        if direction == mn.LEFT and col == 1 and row < mn.HOLIDAY_CLEAR_ROW:
+            check((new_row, new_col) == (row, 0), label + " left goes back to the file picker")
+        if row == mn.HOLIDAY_CLEAR_ROW and direction == mn.RIGHT:
+            check((new_row, new_col) == (mn.HOLIDAY_CLOSE_ROW, 0), label + " right from Clear Media goes to Close on the same line")
+        if row == mn.HOLIDAY_CLOSE_ROW and direction == mn.LEFT:
+            check((new_row, new_col) == (mn.HOLIDAY_CLEAR_ROW, 0), label + " left from Close goes to Clear Media on the same line")
+        if row == mn.HOLIDAY_CLOSE_ROW and direction == mn.UP:
+            check((new_row, new_col) == (mn.HOLIDAY_ROWS - 1, 1), label + " up from Close goes to the last Force toggle")
+        else:
+            check(abs(new_row - row) <= 1, label + " moves at most one row")
+        check({k: v for k, v in after.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")} == {k: v for k, v in state.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")}, label + " changes only the cursor")
+        return
+    sel_key = "sub_menu_row_index" if name in ("AUDIO_TRACK_PICKER",) else "menu_selection_index"
     sel = state[sel_key]
     if name == "SERVER_MENU":
         extra = db.config["server_role"] in ("server", "user")
@@ -4418,9 +4725,9 @@ def check_block(name, db, state, key, after):
         if want[sel_key] != sel:
             want["server_slot_pending_delete"] = False
     elif name == "AUDIO_TRACK_PICKER":
-        want[sel_key] = old_move_column(sel, len(state["audio_track_list"]) + 1, direction)
-    elif name == "HOLIDAY_SUB_MENU":
-        want[sel_key] = old_move_column(sel, 6, direction)
+        want[sel_key] = old_move_column(sel, len(state["audio_track_list"]) + 2, direction)
+        if state["audio_track_context"] == "channel" and sel == len(state["audio_track_list"]) and direction in (mn.LEFT, mn.RIGHT):
+            want["audio_track_gain_db"] = -1 if direction == mn.LEFT else 1
     elif name == "REMOTE_REMAP_LIST":
         want[sel_key] = (sel + (-1 if direction in (mn.UP, mn.LEFT) else 1)) % 3
     elif name == "SERVER_SLOTS_MENU":
@@ -4613,7 +4920,7 @@ def case_hold_functions():
     check(mn.HOLD_RULES["vertical"] == mn.HoldRule(None, 100, False), "vertical rule is the old 100 ms")
     check(mn.HOLD_RULES["horizontal"] == mn.HoldRule(None, 110, False), "horizontal rule is the old 110 ms")
     check(mn.HOLD_RULES["rom_list"] == mn.HoldRule(380, 70, True), "ROM list rule is the old 380 ms then 70 ms")
-    check(mn.HOLD_RULES["volume"] == mn.HoldRule(200, 180, False), "volume rule is 200 ms then 180 ms")
+    check(mn.HOLD_RULES["volume"] == mn.HoldRule(100, 160, False), "volume rule is 100 ms then 160 ms (V169 started it twice as soon; repeats are now 0.2 s faster than the V169 360 ms)")
     check(mn.HOLD_STUCK_MS == {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}, "stuck limits are menu 1500, guide 3000, ROM list 1500, volume 1500")
     arrows = [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN]
     for key in list(range(0, 1200)) + arrows:
@@ -6147,9 +6454,11 @@ def suite_picture_box_before_show():
         return True
 
     ns.update({"log": log_stub, "_cached_path_exists": lambda p: True, "_get_probe_library": lambda: FakeLib(),
-               "_picture_box_failures": {}, "_PICTURE_BOX_RETRY_BACKOFF_S": (600, 1800, 7200),
+               
                "_is_drive_degraded": lambda p: False, "_picture_box_scan_one": fake_scan,
                "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 0.5, "_PICTURE_BOX_PRE_SHOW_PARALLEL": 6})
+    ns["_governor_priority_scope"] = gov.priority_scope
+    exec(main_function_code("_picture_box_scan_one_priority"), ns)
     exec(main_function_code("_decide_picture_box_before_show"), ns)
     decide = ns["_decide_picture_box_before_show"]
     path = os.path.normpath(os.path.abspath("show.mkv"))
@@ -6164,10 +6473,11 @@ def suite_picture_box_before_show():
     check(decide("show.mkv") is None, "a scan that misses the budget must give no box")
     check(time.monotonic() - started < 1.2, "the pre-show wait must stop at the budget")
     time.sleep(1.5)
-    ns["_picture_box_failures"][path] = (3, 0.0)
     store.clear()
     scans.clear()
-    check(decide("show.mkv") is None and scans == [], "a file out of retries must be played without a scan")
+    ns["_is_drive_degraded"] = lambda p: True
+    check(decide("show.mkv") is None and scans == [], "a file on a struggling drive must be played without a scan")
+    ns["_is_drive_degraded"] = lambda p: False
     check(decide("song.mp3") is None, "a non-video file must be skipped")
 
     play_src = MAIN_SRC
@@ -7024,13 +7334,6 @@ def aspect_keys_gone_case():
     check('engine_label == "dvd"' in MAIN_SRC[block_start - 120:block_start], "the DVD engine's target aspect is the fixed 16:9")
 
 
-class TestAspectKeysGone(_SectionCase):
-    """The unused DVD and Games Aspect Ratio keys and the dead Bezel aspect helpers are removed"""
-
-    def test_aspect_keys_gone(self):
-        self.run_section(aspect_keys_gone_case)
-
-
 # ============================================================================
 # SECTION: Game deck backgrounds and splash images fit the canvas
 # ============================================================================
@@ -7610,7 +7913,8 @@ def _block_scan_ns(block_mode, now_hour, schedules, scanned=()):
           "_scan_stages_pending": lambda p, g, d, lk: os.path.normpath(p) not in {os.path.normpath(x) for x in scanned},
           "_scan_file_is_done": lambda p, g, d, mo, lk: os.path.normpath(p) in {os.path.normpath(x) for x in scanned},
           "_scan_snapshot_channel": lambda ch: ns["_build_scan_snapshot"]()["channels"].get(ch),
-          "_front_load_watched_channel": lambda items: items}
+          "_front_load_watched_channel": lambda items: items,
+          "_gather_holiday_scan_items": lambda: ([], [], [])}
     for name in ("_airing_block_name", "_block_names_after_airing", "_get_block_ordered_content_peek", "_build_scan_snapshot",
                  "_compute_channel_scan_progress", "_gather_deep_backlog_queue", "_gather_probe_priority_queue"):
         exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
@@ -7724,7 +8028,7 @@ def suite_block_scan():
         probed = []
         n.update({"_priming_inflight": set(), "_priming_inflight_lock": __import__("threading").Lock(),
                   "_PRIME_DURATIONS_NEAR_TERM_N": 8, "threading": types.SimpleNamespace(Thread=lambda **kw: types.SimpleNamespace(start=lambda: probed.append(kw["args"][1]))),
-                  "_prime_channel_block_durations_worker": lambda *a: None, "_get_cached_media_probe": lambda p: {}, "_get_probe_now_state": lambda ch: {"file": ""},
+                  "_prime_channel_block_durations_worker": lambda *a: None, "_read_file_probe_facts": lambda p: {}, "_get_probe_now_state": lambda ch: {"file": ""},
                   "_next_n_from_ordered": lambda ordered, cur, n=4: ordered[:n]})
         exec(compile(get_function_source("_prime_channel_block_durations"), "<extracted:_prime_channel_block_durations>", "exec"), n)
         return n, probed
@@ -7779,145 +8083,9 @@ class TestBlockPeekIsolated(_SectionCase):
 # SECTION: Broken episode swap, sequential order
 # ============================================================================
 
-def suite_broken_swap_sequential():
-    import copy as _cp
-    PATH_MISSING, PATH_UNKNOWN = "missing", "unknown"
-    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
-          "log": MagicMock(), "media": media, "random": __import__("random"),
-          "PATH_MISSING": PATH_MISSING, "PATH_UNKNOWN": PATH_UNKNOWN,
-          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
-          "_mark_file_broken": lambda *a, **k: None,
-          "resolve_track_duration": media.resolve_track_duration,
-          "split_movies_and_series": media.split_movies_and_series,
-          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
-          "_cached_path_exists": lambda p: True,
-          "note_random_episode_played": media.note_random_episode_played}
-    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
-        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
-
-    def eps(name, n, dur):
-        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": dur} for i in range(n)]
-
-    def expand(lineup):
-        out = []
-        for t in lineup:
-            out += [t.get("pair_ep1_path", t["path"]), t.get("pair_ep2_path", "")] if t.get("is_pair") else [t["path"]]
-        return [p for p in out if p]
-
-    def alpha(paths):
-        return [p for p in paths if "/Alpha/" in p]
-
-    for pair_minutes, dur, count, broken_first in ((0, 1500, 12, False), (15, 600, 24, False), (0, 1500, 12, True)):
-        raw = eps("Alpha", count, dur) + eps("Beta", count, dur)
-        info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": pair_minutes, "episode_order_mode": "sequential",
-                "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
-        lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
-        info["playback_log"]["show_pos"] = show_pos
-        info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
-        label = "pairing %d min" % pair_minutes + (", another file of the show already broken" if broken_first else "")
-        if broken_first:
-            first = alpha(info["playback_log"]["sched_cached_tracks"])[0]
-            info["broken_files"] = [first]
-            info["playback_log"]["sched_cached_tracks"] = [p for p in info["playback_log"]["sched_cached_tracks"] if p != first]
-        planned = alpha(info["playback_log"]["sched_cached_tracks"])
-        failed = planned[1] if not broken_first else planned[0]
-        sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
-        check(sub is not None and sub["file"] != failed, label + ": a substitute is chosen")
-        swapped = alpha(info["playback_log"]["sched_cached_tracks"])
-        check(failed not in swapped and sub["file"] in swapped, label + ": the saved lineup holds the substitute, not the failed file")
-        pos = info["playback_log"]["show_pos"]
-        check("Alpha" not in pos and isinstance(pos.get("05:alpha"), dict) and "next" in pos.get("05:alpha"), label + ": the position is kept under the channel-scoped key only, as the file that airs next")
-        nxt, _, _ = media.build_block_rotation(raw, info, _cp.deepcopy(pos), 2026101, 28800, "05", None, "1:200")
-        again = set(alpha(expand(nxt))) & set(swapped)
-        check(not again, label + ": the next block does not start on an episode that already aired (%s)" % sorted(again))
-
-    raw = eps("Paired", 4, 600)
-    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential",
-            "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
-    lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
-    info["playback_log"]["show_pos"] = show_pos
-    info["playback_log"]["sched_cached_tracks"] = expand(lineup)
-    failed = raw[0]["path"]
-    replacement = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
-    paired_paths = [raw[2]["path"], raw[3]["path"]]
-    check(replacement is not None and replacement["file"] == paired_paths[0], "paired sequential swap: replaces the failed pair with the next rotation entry")
-    check(info["playback_log"]["sched_cached_tracks"] == paired_paths, "paired sequential swap: saved lineup contains the replacement pair once")
-    check(info["playback_log"]["show_pos"]["05:paired"]["next"] is None, "paired sequential swap: saved position advances by rotation entry")
-
-
-class TestBrokenSwapSequential(_SectionCase):
-    """A broken episode in sequential order moves the show's real position, so the substitute never airs twice"""
-
-    def test_broken_swap_sequential(self):
-        self.run_section(suite_broken_swap_sequential)
-
-
 # ============================================================================
 # SECTION: Broken episode swap, sequential order, show fills its block
 # ============================================================================
-
-def suite_broken_swap_sequential_full():
-    import copy as _cp
-    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
-          "log": MagicMock(), "media": media, "random": __import__("random"),
-          "PATH_MISSING": "missing", "PATH_UNKNOWN": "unknown",
-          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
-          "_mark_file_broken": lambda *a, **k: None,
-          "resolve_track_duration": media.resolve_track_duration,
-          "split_movies_and_series": media.split_movies_and_series,
-          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
-          "_cached_path_exists": lambda p: True,
-          "note_random_episode_played": media.note_random_episode_played}
-    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
-        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
-
-    def expand(lineup):
-        out = []
-        for t in lineup:
-            out += [t.get("pair_ep1_path", t["path"]), t.get("pair_ep2_path", "")] if t.get("is_pair") else [t["path"]]
-        return [p for p in out if p]
-
-    refused = swapped_count = 0
-    for mode in ("random_slots", "two_slots"):
-        for count in (2, 3, 4, 5, 6):
-            raw = [{"path": "/m/tv/Solo/Solo S01E%02d.mkv" % (i + 1), "duration": 1500} for i in range(count)]
-            base = {"scheduling_mode": mode, "pair_threshold_minutes": 0, "episode_order_mode": "sequential",
-                    "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
-            lineup, show_pos, _ = media.build_block_rotation(raw, base, {}, 2026100, 28800, "05", None, "1:200")
-            base["playback_log"]["show_pos"] = show_pos
-            base["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
-            planned = list(base["playback_log"]["sched_cached_tracks"])
-            for failed in planned:
-                label = "%s, %d episodes, %s fails" % (mode, count, failed[-7:-4])
-                info = _cp.deepcopy(base)
-                before_lineup = list(info["playback_log"]["sched_cached_tracks"])
-                before_pos = _cp.deepcopy(info["playback_log"]["show_pos"])
-                sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
-                after = info["playback_log"]["sched_cached_tracks"]
-                check(len(after) == len(set(after)), label + ": no episode is in the saved lineup twice (%s)" % [p[-7:-4] for p in after])
-                if sub is None:
-                    refused += 1
-                    check(after == before_lineup and info["playback_log"]["show_pos"] == before_pos,
-                          label + ": a refused swap leaves the saved lineup and positions unchanged")
-                else:
-                    swapped_count += 1
-                    check(sub["file"] in after and sub["file"] != failed, label + ": the saved lineup holds the substitute")
-    check(refused > 0 and swapped_count > 0, "both refused and made swaps were exercised (%d refused, %d made)" % (refused, swapped_count))
-
-    raw = eps("Paired", 4, 600)
-    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential",
-            "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
-    lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
-    info["playback_log"]["show_pos"] = show_pos
-    info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
-    failed = info["playback_log"]["sched_cached_tracks"][0]
-    sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
-    check(sub is not None, "paired sequential swap chooses a substitute")
-    state = info["playback_log"]["show_pos"]["05:paired"]
-    entries = media.pair_short_episodes(raw, 900)
-    expected = media.sequential_state_from_entry_index(raw, entries, 1)
-    check(state == expected, "paired sequential swap advances the saved position by rotation entry")
-
 
 # ============================================================================
 # SECTION: Saved lineup keeps every file of a leftover bundle
@@ -7945,7 +8113,12 @@ def suite_lineup_paths_bundle():
     bundle = media.pair_short_episodes(eps("B", [600, 1500, 600, 1500, 600]), threshold_seconds=900)
     got = media.lineup_paths(bundle)
     check(all(p in got for p in aired(bundle)) and len(got) == len(aired(bundle)),
-          "a leftover bundle gives every one of its files, not only the first (%s)" % [p[-7:-4] for p in got])
+          "the leftover pairs give every one of their files, not only the first (%s)" % [p[-7:-4] for p in got])
+    check(not any(t.get("is_bundle") for t in bundle) and all(len(media.lineup_paths([t])) in (1, 2) for t in bundle)
+          and all(len(media.lineup_paths([t])) == 2 for t in bundle if t.get("is_pair")),
+          "short episodes without a neighbour make pairs of exactly 2, never a bundle")
+    old_bundle = media._build_bundle_track([{"path": "/m/o1.mkv", "duration": 600}, {"path": "/m/o2.mkv", "duration": 600}, {"path": "/m/o3.mkv", "duration": 600}])
+    check(media.lineup_paths([old_bundle]) == ["/m/o1.mkv", "/m/o2.mkv", "/m/o3.mkv"], "a bundle saved by an older version still gives every one of its files")
     check(media.lineup_paths([]) == [] and media.lineup_paths(None) == [], "no tracks give no paths")
     check(media.lineup_paths([{"path": ""}]) == [], "an empty path is left out")
 
@@ -7957,10 +8130,11 @@ def suite_lineup_paths_bundle():
         lineup, sp, _ = media.build_block_rotation(raw, info, info["playback_log"].get("show_pos", {}), 2026100 + b, 28800, "05", None, "1:200")
         info["playback_log"]["show_pos"] = sp
         saved = list(dict.fromkeys(media.lineup_paths(lineup)))
-        seen_bundle = seen_bundle or any(t.get("is_bundle") for t in lineup)
+        seen_bundle = seen_bundle or any(t.get("leftover_pair") for t in lineup)
+        check(not any(t.get("is_bundle") for t in lineup), "block %d: no leftover bundle is built" % b)
         missing = [p[-7:-4] for p in aired(lineup) if p not in saved]
         check(not missing, "block %d: every file the first pass airs is in the saved list (missing %s)" % (b, missing))
-    check(seen_bundle, "the test blocks included a leftover bundle")
+    check(seen_bundle, "the test blocks included a pair of leftover short episodes")
 
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
     check(src.count("lineup_paths(") >= 5, "the scheduler saves its lineups through media.lineup_paths")
@@ -8036,7 +8210,7 @@ def suite_lineup_groups():
 
     base = _lineup_signature(lineup)
     check(read(record) == base, "matching groups give the saved lineup")
-    check(read(record, thresh=1800) != base or read(record, thresh=1800) == _lineup_signature(media.pair_short_episodes(raw_q, threshold_seconds=1800)),
+    check(read(record, thresh=1800) == _lineup_signature(media.saved_block_lineup(paths, {}, raw_q, folder_q, [], 1800)),
           "a changed threshold ignores the groups and pairs the list again")
 
     paired = eps("Swap", [600, 600, 1500, 600, 600])
@@ -8062,11 +8236,12 @@ def suite_lineup_groups():
     lineup_r = media.pair_short_episodes(raw_r, threshold_seconds=900)
     paths_r = list(dict.fromkeys(media.lineup_paths(lineup_r)))
     record_r = media.lineup_groups(lineup_r, 900)
-    bundle_group = next(g for g in record_r["groups"] if g["kind"] == "bundle")
-    check(len(bundle_group["paths"]) == 3, "the test show leaves a bundle of three files")
-    live_r = [x for x in raw_r if x["path"] != bundle_group["paths"][0]]
-    left = _lineup_signature(media.saved_block_lineup(paths_r, {}, live_r, live_r, [bundle_group["paths"][0]], 900, cached_groups=record_r))
-    check(any(k == "bundle" and tuple(p) == tuple(bundle_group["paths"][1:]) for k, p in left), "a bundle that loses a file keeps the rest as one bundle")
+    check(not any(g["kind"] == "bundle" for g in record_r["groups"]), "the test show leaves no bundle")
+    leftover_group = next(g for g in record_r["groups"] if g["kind"] == "pair")
+    check(len(leftover_group["paths"]) == 2, "the test show leaves pairs of two files")
+    live_r = [x for x in raw_r if x["path"] != leftover_group["paths"][0]]
+    left = _lineup_signature(media.saved_block_lineup(paths_r, {}, live_r, live_r, [leftover_group["paths"][0]], 900, cached_groups=record_r))
+    check(("single", (leftover_group["paths"][1],)) in left, "a leftover pair that loses a file airs the other file alone, in its place")
 
     channels = {"05": _mixed_short_channel(content)}
     times = [datetime.datetime(2026, 10, 13, 12, 0, 5) + datetime.timedelta(minutes=37 * i) for i in range(13)]
@@ -8101,7 +8276,7 @@ def suite_lineup_groups():
     now = times[-1]
     probe = {os.path.normpath(x["path"]): {"duration": x["duration"]} for x in content}
     with patch.object(media, "_cached_path_exists", lambda p: True):
-        read_back, _ = media.read_block_lineup("05", channels["05"], "Evening", now, probe, lambda p: True, lambda ci, off: 1)
+        read_back, _ = media.read_block_lineup("05", channels["05"], "Evening", now, lambda p: True, lambda ci, off: 1)
     last_used = used[-1]
     check(_lineup_signature(read_back) == last_used, "the read-only read of the block on air gives the lineup the station airs")
 
@@ -8127,91 +8302,14 @@ def suite_lineup_groups():
           "every episode up to the one airing is frozen at its whole length")
 
 
-def suite_lineup_groups_swap():
-    import copy as _cp
-    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
-          "log": MagicMock(), "media": media, "random": __import__("random"),
-          "PATH_MISSING": "missing", "PATH_UNKNOWN": "unknown",
-          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
-          "_mark_file_broken": lambda *a, **k: None,
-          "resolve_track_duration": media.resolve_track_duration,
-          "split_movies_and_series": media.split_movies_and_series,
-          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
-          "_cached_path_exists": lambda p: True,
-          "note_random_episode_played": media.note_random_episode_played}
-    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
-        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
-
-    def eps(name, durs):
-        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": d} for i, d in enumerate(durs)]
-
-    checked = 0
-    survived = 0
-    for order_mode in ("sequential", "random"):
-        for block in range(8):
-            raw = eps("Alpha", [600] * 8 + [1500, 600, 600, 1500, 600] ) + eps("Beta", [600] * 7)
-            info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": order_mode,
-                    "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
-            lineup, show_pos, _ = media.build_block_rotation(raw, info, {}, 2026100 + block, 28800, "05", None, "1:200")
-            plog = info["playback_log"]
-            plog["show_pos"] = show_pos
-            plog["sched_cached_tracks"] = list(dict.fromkeys(media.lineup_paths(lineup)))
-            plog["sched_cached_groups"] = media.lineup_groups(lineup, 900)
-            before_sig = _lineup_signature(lineup)
-            alpha_paths = [p for p in plog["sched_cached_tracks"] if "/Alpha/" in p]
-            if not alpha_paths:
-                continue
-            failed = alpha_paths[len(alpha_paths) // 2]
-            result = ns["_resolve_broken_episode"](info, failed, "Evening", "05")
-            info["broken_files"] = [failed]
-            if result is None:
-                check("sched_cached_groups" not in plog or media._matching_lineup_groups(plog["sched_cached_groups"], plog["sched_cached_tracks"], 900) is not None,
-                      "%s block %d: a refused swap leaves matching groups" % (order_mode, block))
-                continue
-            checked += 1
-            new_paths = plog["sched_cached_tracks"]
-            record = plog.get("sched_cached_groups")
-            check(record is not None and media._matching_lineup_groups(record, new_paths, 900) is not None,
-                  "%s block %d: after a swap the saved groups describe exactly the saved path list" % (order_mode, block))
-            if record is None:
-                continue
-            live = [x for x in raw if x["path"] not in info["broken_files"]]
-            after = media.saved_block_lineup(new_paths, {}, live, live, info["broken_files"], 900, cached_groups=record)
-            after_sig = _lineup_signature(after)
-            flat = list(dict.fromkeys(p for _, ps in after_sig for p in ps))
-            check(flat == list(dict.fromkeys(new_paths)), "%s block %d: the swapped lineup airs every saved file once, in the saved order" % (order_mode, block))
-            check(failed not in flat, "%s block %d: the broken file is gone from the lineup" % (order_mode, block))
-            beta_before = [e for e in before_sig if "/Beta/" in e[1][0]]
-            beta_after = [e for e in after_sig if "/Beta/" in e[1][0]]
-            check(beta_before == beta_after, "%s block %d: another show's entries are untouched by the swap" % (order_mode, block))
-            idx = next(i for i, (k, ps) in enumerate(before_sig) if failed in ps)
-            check(after_sig[:idx] == before_sig[:idx], "%s block %d: nothing before the failed entry moves" % (order_mode, block))
-            survived += 1
-    check(checked > 0 and survived > 0, "the swap blocks ran (%d swapped)" % checked)
-
-    raw_b = eps("Gamma", [600, 1500, 600, 1500, 600])
-    lineup_b = media.pair_short_episodes(raw_b, threshold_seconds=900)
-    cached_b = list(dict.fromkeys(media.lineup_paths(lineup_b)))
-    record_b = media.lineup_groups(lineup_b, 900)
-    first = next(g for g in record_b["groups"] if g["kind"] == "bundle")["paths"]
-    swapped = media.swap_lineup_groups(record_b, cached_b, [p for p in cached_b if p != first[1]] if False else cached_b,
-                                       {}, 900, lambda p: 600)
-    check(swapped is not None and swapped["groups"] == record_b["groups"], "a swap with no replacement keeps every group")
-    check(media.swap_lineup_groups(None, cached_b, cached_b, {}, 900, lambda p: 600) is None, "no record gives no groups")
-    wrong = media.swap_lineup_groups(record_b, cached_b, cached_b[:-1], {}, 900, lambda p: 600)
-    check(wrong is None, "a result that does not describe the new path list is dropped")
-
-    src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("_keep_swap_groups(") >= 3, "both swap branches rewrite the saved groups")
-
-
 def suite_bundle_freeze():
     ns = _sched_record_ns({"05": _sched_record_channel("full_day", "interrupt_half_hour", "random_slots", True)}, [datetime.datetime(2026, 10, 13, 0, 0, 5)], [0])
     items = [{"path": "/m/s/a.mkv", "duration": 600}, {"path": "/m/s/x.mkv", "duration": 1500}, {"path": "/m/s/b.mkv", "duration": 540},
              {"path": "/m/s/y.mkv", "duration": 1500}, {"path": "/m/s/c.mkv", "duration": 660}]
-    bundle = media.pair_short_episodes(items, threshold_seconds=900)
-    bundle = [b for b in bundle if b.get("is_bundle")]
-    check(len(bundle) == 1, "three separated short episodes make one leftover bundle")
+    made = media.pair_short_episodes(items, threshold_seconds=900)
+    check(not any(b.get("is_bundle") for b in made), "three separated short episodes no longer make a leftover bundle")
+    bundle = [media._build_bundle_track([items[0], items[2], items[4]])]
+    check(len(bundle) == 1, "a bundle saved by an older version is still built the same way")
     timeline, total, _ = media.build_channel_timeline(bundle, [], {"commercial_placement": "end_of_show", "block_mode": "full_day"}, 1)
     entry = next(e for e in timeline if not e.get("is_commercial"))
     check(entry.get("is_bundle") and entry.get("bundle_item_paths") == ["/m/s/a.mkv", "/m/s/b.mkv", "/m/s/c.mkv"]
@@ -8221,16 +8319,6 @@ def suite_bundle_freeze():
     check(durs == {"/m/s/a.mkv": 600, "/m/s/b.mkv": 540, "/m/s/c.mkv": 660}, "the freeze stores each bundle file's own length, not the sum under the first file (%s)" % durs)
 
 
-class TestLineupGroupsSwap(_SectionCase):
-    """A swap keeps the saved groups in step with the saved path list, and a bundle freezes each of its files"""
-
-    def test_lineup_groups_swap(self):
-        self.run_section(suite_lineup_groups_swap)
-
-    def test_bundle_freeze(self):
-        self.run_section(suite_bundle_freeze)
-
-
 class TestLineupGroups(_SectionCase):
     """A block's saved groups make every pass air the lineup the rotation built, and the freeze keeps whole episode lengths"""
 
@@ -8238,90 +8326,1355 @@ class TestLineupGroups(_SectionCase):
         self.run_section(suite_lineup_groups)
 
 
-class TestBrokenSwapSequentialFull(_SectionCase):
-    """A sequential swap on a show that fills its block never puts an episode in the block twice; it refuses instead"""
+# ============================================================================
+# SECTION: Leftover bundle never airs twice back to back after a file is removed
+# ============================================================================
 
-    def test_broken_swap_sequential_full(self):
-        self.run_section(suite_broken_swap_sequential_full)
+def suite_bundle_not_repaired_after_removal():
+    def ep(number, duration):
+        return {"path": "/m/tv/Alpha/Alpha S01E%02d.mkv" % number, "duration": duration}
+
+    def names(entries):
+        return [[p[-7:-4] for p in media.lineup_paths([e])] for e in entries]
+
+    episodes = [ep(1, 600), ep(3, 600), ep(4, 2400), ep(5, 2400)]
+    owed = [episodes[0]["path"], episodes[1]["path"]]
+    for count in (1, 2, 3):
+        entries, state = media.take_sequential_entries(episodes, {"next": None, "owed": list(owed)}, count, 900)
+        flat = [p for names_ in names(entries) for p in names_]
+        check(len(flat) == len(set(flat)), "leftover bundle, %d entries: no file is in the lineup twice (%s)" % (count, flat))
+        check(names(entries)[0] == ["E01", "E03"] and entries[0].get("is_pair") and entries[0].get("leftover_pair") and not entries[0].get("is_bundle"),
+              "leftover bundle, %d entries: the leftovers air first as a pair of exactly 2, not as a bundle" % count)
+        check(sorted(state["owed"]) == sorted(owed), "leftover bundle, %d entries: the files that just aired wait for the end of the new pass" % count)
+    entries, state = media.take_sequential_entries(episodes, {"next": None, "owed": list(owed)}, 4, 900)
+    check(names(entries) == [["E01", "E03"], ["E04"], ["E05"]],
+          "leftover bundle, whole pass: the call ends before the leftovers repeat (%s)" % names(entries))
+    entries, state = media.take_sequential_entries(episodes, state, 1, 900)
+    check(names(entries) == [["E01", "E03"]],
+          "leftover bundle, whole pass: the leftovers air again at the end of the next pass, first in the next call (%s)" % names(entries))
+
+
+class TestBundleNotRepairedAfterRemoval(_SectionCase):
+    """After a file is removed, the leftover bundle that just aired is not paired again at the top of the next pass"""
+
+    def test_bundle_not_repaired_after_removal(self):
+        self.run_section(suite_bundle_not_repaired_after_removal)
+
+
+# ============================================================================
+# SECTION: Random order never replays a file when a file is removed
+# ============================================================================
+
+def suite_random_no_replay_after_removal():
+    import random as _rnd
+
+    def ep(number, duration):
+        return {"path": "/m/tv/Beta/Beta S01E%02d.mkv" % number, "duration": duration}
+
+    replays = 0
+    for seed in range(120):
+        rng = _rnd.Random(seed)
+        pool = [ep(i + 1, rng.choice([600, 600, 1500, 2400])) for i in range(rng.randint(5, 14))]
+        present = {e["path"] for e in pool}
+        aired = set()
+        state = None
+        for block in range(30):
+            if rng.random() < 0.3 and len(pool) > 3:
+                gone = rng.choice(pool)
+                pool.remove(gone)
+                present.discard(gone["path"])
+                aired.discard(gone["path"])
+                if aired >= present:
+                    aired = set()
+            entries = media.pair_short_episodes(pool, threshold_seconds=900)
+            picked, state = media.draw_from_shuffle_bag_by_file(state, entries, rng.randint(1, 3), "%d:%d:Beta" % (seed, block))
+            for path in media.lineup_paths(picked):
+                if path in aired:
+                    replays += 1
+                aired.add(path)
+                if aired >= present:
+                    aired = set()
+    check(replays == 0, "random order with pairing: no file airs again before every file has aired once, with files removed between blocks (%d replays)" % replays)
+
+    pool = [ep(i + 1, 600) for i in range(6)]
+    entries = media.pair_short_episodes(pool, threshold_seconds=900)
+    picked, state = media.draw_from_shuffle_bag_by_file(None, entries, 1, "swap:Beta")
+    first_files = media.lineup_paths(picked)
+    pool = [e for e in pool if e["path"] != pool[2]["path"]]
+    entries = media.pair_short_episodes(pool, threshold_seconds=900)
+    candidates = media.random_bag_entry_indices({"05:beta": state}, "Beta", entries, channel_id="05")
+    offered = [p for i in candidates for p in media.lineup_paths([entries[i]])]
+    check(not any(p in first_files for p in offered), "the broken-file swap is never offered an entry holding a file that already aired this pass")
+
+
+class TestRandomNoReplayAfterRemoval(_SectionCase):
+    """Random order with short-episode pairing never airs a file twice in one pass when a file is removed"""
+
+    def test_random_no_replay_after_removal(self):
+        self.run_section(suite_random_no_replay_after_removal)
+
+
+# ============================================================================
+# SECTION: Sequential order never hands one file out twice in one block
+# ============================================================================
+
+def suite_sequential_no_file_twice_in_block():
+    import random as _rnd
+
+    def ep(show, number, duration):
+        return {"path": "/m/tv/%s/%s S01E%02d.mkv" % (show, show, number), "duration": duration}
+
+    def names(entries):
+        return [[p[-7:-4] for p in media.lineup_paths([e])] for e in entries]
+
+    pool = [ep("Alpha", 2, 2400), ep("Alpha", 3, 600)]
+    owed = [pool[1]["path"]]
+    for count in (1, 2, 3):
+        entries, state = media.take_sequential_entries(pool, {"next": None, "owed": list(owed)}, count, 900)
+        flat = [p for names_ in names(entries) for p in names_]
+        check(len(flat) == len(set(flat)), "whole-pass call, %d entries: no file is taken twice (%s)" % (count, flat))
+    entries, state = media.take_sequential_entries(pool, {"next": None, "owed": list(owed)}, 3, 900)
+    check(names(entries) == [["E03", "E02"]] and state == {"next": None, "owed": [pool[1]["path"]]},
+          "a call that would wrap the whole pass ends before the file repeats and saves the position after its last entry (%s, %s)" % (names(entries), state))
+    entries, state = media.take_sequential_entries(pool, state, 1, 900)
+    check(names(entries) == [["E03", "E02"]], "the next call airs the pair the ended call stopped before (%s)" % names(entries))
+
+    twice = 0
+    replays = 0
+    for mode in ("one_slot", "two_slots", "random_slots"):
+        channel = {"scheduling_mode": mode, "pair_threshold_minutes": 15, "episode_order_mode": "sequential"}
+        for seed in range(40):
+            rng = _rnd.Random(seed)
+            alpha = [ep("Alpha", i + 1, rng.choice([600, 1500, 2400])) for i in range(rng.randint(5, 16))]
+            beta = [ep("Beta", i + 1, 1500) for i in range(8)]
+            positions = {}
+            aired = set()
+            for block in range(40):
+                if rng.random() < 0.3 and len(alpha) > 3:
+                    gone = rng.choice(alpha)
+                    alpha.remove(gone)
+                    aired.discard(gone["path"])
+                present = {e["path"] for e in alpha}
+                if aired >= present:
+                    aired = set()
+                lineup, positions, _ = media.build_block_rotation(alpha + beta, channel, positions, 1000 + block, 28800, "05", None, 7)
+                files = [p for t in lineup for p in media.lineup_paths([t]) if "/Alpha/" in p]
+                if len(files) != len(set(files)):
+                    twice += 1
+                pulled = {t.get("leftover_partner_path") for t in lineup if t.get("leftover_partner_path")}
+                all_short = all(e["duration"] < 900 for e in alpha)
+                for path in dict.fromkeys(files):
+                    if path in aired and path not in pulled and not all_short:
+                        replays += 1
+                    aired.add(path)
+                    if aired >= present:
+                        aired = set()
+    check(twice == 0, "sequential order with pairing: no block holds a file twice, with files removed between blocks (%d blocks)" % twice)
+    check(replays == 0, "sequential order with pairing: no file airs again before every file has aired once (%d replays)" % replays)
+
+
+class TestSequentialNoFileTwiceInBlock(_SectionCase):
+    """A block of a sequential show never holds one file twice, so the saved lineup and the saved position agree"""
+
+    def test_sequential_no_file_twice_in_block(self):
+        self.run_section(suite_sequential_no_file_twice_in_block)
+
+
+# ============================================================================
+# SECTION: Positions after a cut cycle count only the entries that aired
+# ============================================================================
+
+def suite_cut_cycle_positions():
+    import copy as _copy
+    import random as _rnd
+
+    def ep(show, number, duration):
+        return {"path": "/m/tv/%s/%s S01E%02d.mkv" % (show, show, number), "duration": duration}
+
+    movies = [{"path": "/m/movies/Movie %d.mkv" % i, "duration": 7000} for i in range(1, 6)]
+    bad_full = 0
+    bad_continue = 0
+    bad_fair = 0
+    runs = 0
+    for order_mode in ("sequential", "random"):
+        for mode in ("one_slot", "two_slots", "random_slots"):
+            for with_movies in (False, True):
+                for seed in range(10):
+                    rng = _rnd.Random(seed)
+                    alpha = [ep("Alpha", i + 1, rng.choice([600, 1500, 2400])) for i in range(rng.randint(5, 12))]
+                    beta = [ep("Beta", i + 1, rng.choice([1500, 2400])) for i in range(rng.randint(4, 9))]
+                    raw = alpha + beta + (movies if with_movies else [])
+                    channel = {"scheduling_mode": mode, "pair_threshold_minutes": 15, "episode_order_mode": order_mode}
+                    positions = {}
+                    for block in range(4):
+                        day = 1000 + block
+                        start = _copy.deepcopy(positions)
+                        lineup, full, _order = media.build_block_rotation(raw, channel, positions, day, 28800, "05", None, 7)
+                        positions = full
+                        total = len(lineup)
+                        totals = media.aired_entry_limits(raw, lineup, total, channel_id="05")
+                        movie_pool, _names, show_eps = media.split_movies_and_series(raw, channel_id="05")
+                        for k in sorted({0, total // 3, total // 2, max(0, total - 1), total}):
+                            runs += 1
+                            cut = media.positions_after_aired_entries(raw, channel, start, day, 28800, "05", None, 7, lineup, k)
+                            if k == total:
+                                if cut != full:
+                                    bad_full += 1
+                                continue
+                            aired = media.aired_entry_limits(raw, lineup, k, channel_id="05")
+                            for key in totals:
+                                rest = totals[key] - aired[key]
+                                if rest <= 0:
+                                    continue
+                                if key == media.MOVIE_ROTATION_KEY:
+                                    state = cut.get(media.stable_series_id(key, "05"))
+                                    pool = sorted(movie_pool, key=lambda t: t.get("path", ""))
+                                    picked, _s = media.draw_from_shuffle_bag_by_file(state, pool, rest, "7:%s" % key)
+                                    expected = [e for e in lineup if media.lineup_paths([e])[0] in {m["path"] for m in movie_pool}]
+                                elif order_mode == "random":
+                                    state = cut.get(media.stable_series_id(key, "05"))
+                                    entries = media.pair_short_episodes(show_eps[key], threshold_seconds=900)
+                                    picked, _s = media.draw_from_shuffle_bag_by_file(state, entries, rest, "%d:%s" % (day, key))
+                                    expected = [e for e in lineup if "/%s/" % key in media.lineup_paths([e])[0]]
+                                else:
+                                    state = cut.get(media.stable_series_id(key, "05"), cut.get(key, 0))
+                                    picked, _s = media.take_sequential_entries(show_eps[key], state, rest, 900)
+                                    expected = [e for e in lineup if "/%s/" % key in media.lineup_paths([e])[0]]
+                                expected = expected[aired[key]:]
+                                if media.lineup_paths(picked) != media.lineup_paths(expected):
+                                    bad_continue += 1
+                            used_start = ((start.get("__FAIRNESS__") or {}).get("used") or {})
+                            used_cut = ((cut.get("__FAIRNESS__") or {}).get("used") or {})
+                            for key in show_eps:
+                                if int(used_cut.get(key, 0)) - int(used_start.get(key, 0)) != aired[key]:
+                                    bad_fair += 1
+    check(runs > 0, "cut cycle check ran (%d cuts)" % runs)
+    check(bad_full == 0, "a cut that covers the whole cycle saves exactly the positions the whole build saved (%d differ)" % bad_full)
+    check(bad_continue == 0, "after a cut, every show and the movie list continue with exactly the entries that did not air (%d differ)" % bad_continue)
+    check(bad_fair == 0, "after a cut, the fairness counters hold only the entries that aired (%d differ)" % bad_fair)
+
+
+class TestCutCyclePositions(_SectionCase):
+    """Positions saved after a cut cycle count only the entries that aired"""
+
+    def test_cut_cycle_positions(self):
+        self.run_section(suite_cut_cycle_positions)
+
+
+# ============================================================================
+# SECTION: A block change never skips an episode of the cycle it cuts
+# ============================================================================
+
+def suite_block_change_no_skipped_episode():
+    import re
+
+    def episode_number(path):
+        found = re.search(r"S01E(\d+)", path)
+        return int(found.group(1)) if found else None
+
+    wanted = ("eight_hour_no_ads_one_slot", "eight_hour_two_slots", "full_day_random")
+    skipped = {}
+    transitions = 0
+    for scenario in SCHED_RECORD_SCENARIOS:
+        if scenario[0] not in wanted:
+            continue
+        name, block_mode, placement, sched, commercials = scenario
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        start = datetime.datetime(2026, 10, 13, 4, 0, 5)
+        clock, ticks = [start], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        runs = []
+        last = None
+        for i in range(40 * 12):
+            clock[0] = start + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                result = ns["calculate_slotted_playback_state"]("05")
+            plog = channels["05"]["playback_log"]
+            path = result.get("file", "")
+            if result.get("mode") != "Video" or path not in set(plog.get("sched_cached_tracks") or []):
+                continue
+            if last is not None and last[0] == path:
+                last[1] += 1
+            else:
+                last = [path, 1, result.get("block")]
+                runs.append(last)
+        files = [(r[0], r[2]) for r in runs if r[1] >= 4]
+        listed = {}
+        for block_name, items in channels["05"]["schedules"].items():
+            if isinstance(items, list):
+                for item in items:
+                    show = re.match(r"/m/(Show [A-Z])/", item["path"])
+                    if show:
+                        listed.setdefault((block_name, show.group(1)), set()).add(episode_number(item["path"]))
+        previous = {}
+        bad = 0
+        for path, block_name in files:
+            show = re.match(r"/m/(Show [A-Z])/", path)
+            if not show:
+                continue
+            show = show.group(1)
+            number = episode_number(path)
+            if show in previous and previous[show] != number:
+                transitions += 1
+                own_list = listed[(block_name, show)]
+                ahead = [n for n in sorted(own_list) if n > previous[show]]
+                if number != (ahead[0] if ahead else min(own_list)):
+                    bad += 1
+            previous[show] = number
+        skipped[name] = bad
+    check(transitions > 0, "the block-change check followed show-to-show changes (%d)" % transitions)
+    check(all(v == 0 for v in skipped.values()), "no episode is skipped or aired out of order across block changes and cycle changes (%s)" % skipped)
+
+
+class TestBlockChangeNoSkippedEpisode(_SectionCase):
+    """A block change continues each show with the episode after the last one that started before the block end"""
+
+    def test_block_change_no_skipped_episode(self):
+        self.run_section(suite_block_change_no_skipped_episode)
+
+
+# ============================================================================
+# SECTION: Catch-up equals a station that kept running
+# ============================================================================
+
+def suite_catch_up_matches_continuous():
+    t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+    wanted = ("eight_hour_interrupt_random", "eight_hour_no_ads_one_slot", "eight_hour_two_slots", "full_day_random", "six_block_random")
+    compared = 0
+    differing = {}
+    for name, block_mode, placement, sched, commercials in SCHED_RECORD_SCENARIOS:
+        if name not in wanted:
+            continue
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        clock, ticks = [t0], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        changes = []
+        last_key = None
+        for i in range(40 * 12):
+            clock[0] = t0 + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                ns["calculate_slotted_playback_state"]("05")
+            plog = channels["05"]["playback_log"]
+            if plog.get("sched_block_key") != last_key:
+                last_key = plog.get("sched_block_key")
+                rounded = _sched_record_round(plog)
+                changes.append((clock[0], {key: rounded.get(key) for key in NIGHT_STATE_KEYS},
+                                (rounded.get("sched_cycle_start_pos") or {}).get("positions")))
+        for moment, state, start_positions in changes[2::2]:
+            fresh = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+            cold, _ = _night_date_run(fresh, [changes[0][0], moment])
+            compared += 1
+            for key in ("sched_block_key", "show_pos", "show_order", "sched_cached_tracks"):
+                if cold[key] != state[key]:
+                    differing.setdefault(name, set()).add(key)
+            if cold["cycle_start_positions"] != start_positions:
+                differing.setdefault(name, set()).add("cycle_start_positions")
+    check(compared >= 8, "the catch-up was compared with a station that kept running at %d block changes" % compared)
+    check(not differing, "a start after a gap holds the same block, show positions, show order and lineup as a station that kept running (%s)" % {k: sorted(v) for k, v in differing.items()})
+
+
+class TestCatchUpMatchesContinuous(_SectionCase):
+    """A start after a gap lands where a station that never stopped would be"""
+
+    def test_catch_up_matches_continuous(self):
+        self.run_section(suite_catch_up_matches_continuous)
+
+
+# ============================================================================
+# SECTION: Timeline cut at the block end
+# ============================================================================
+
+def suite_timeline_through_block_end():
+    def item(path, start, duration, commercial=False, seek=0):
+        return {"path": path, "start_time": start, "duration": duration, "is_commercial": commercial, "seek_offset": seek}
+
+    timeline = [item("/m/a.mkv", 0, 600), item("/c/x.mp4", 600, 60, True), item("/m/a.mkv", 660, 600, seek=600),
+                item("/c/y.mp4", 1260, 60, True), item("/m/b.mkv", 1320, 900), item("/m/c.mkv", 2220, 900)]
+    whole, whole_total = media.timeline_through_block_end(timeline, 3120, 3120)
+    check(whole is timeline and whole_total == 3120, "a cycle that ends by the block end is returned as it is")
+    check(media.timeline_through_block_end(timeline, 3120, None) == (timeline, 3120), "with no block end nothing is cut")
+    kept, total = media.timeline_through_block_end(timeline, 3120, 700)
+    check([i["path"] for i in kept] == ["/m/a.mkv", "/c/x.mp4", "/m/a.mkv"] and total == 1260,
+          "an entry that starts before the block end keeps all its parts and nothing after it airs")
+    kept, total = media.timeline_through_block_end(timeline, 3120, 1300)
+    check([i["path"] for i in kept] == ["/m/a.mkv", "/c/x.mp4", "/m/a.mkv", "/c/y.mp4"] and total == 1320,
+          "a commercial that starts before the block end is kept")
+    kept, total = media.timeline_through_block_end(timeline, 3120, 1400)
+    check([i["path"] for i in kept][-1] == "/m/b.mkv" and total == 2220 and len(kept) == 5,
+          "an entry that starts a little before the block end airs whole and the next one is dropped")
+    check(media.timeline_through_block_end(timeline, 3120, 2500)[1] == 3120,
+          "when only the last entry runs past the block end the timeline keeps it")
+    kept, total = media.timeline_through_block_end(timeline, 3120, 300)
+    check([i["path"] for i in kept] == ["/m/a.mkv", "/c/x.mp4", "/m/a.mkv"] and total == 1260,
+          "a commercial between the parts of an entry that runs past the block end is kept, so the entry airs without a gap")
+    check(timeline[-1]["path"] == "/m/c.mkv" and len(timeline) == 6, "the cut never changes the timeline it is given")
+
+
+class TestTimelineThroughBlockEnd(_SectionCase):
+    """A cycle cut by the block end is recorded as only what airs"""
+
+    def test_timeline_through_block_end(self):
+        self.run_section(suite_timeline_through_block_end)
+
+
+# ============================================================================
+# SECTION: Show running past the block end, ledger lost
+# ============================================================================
+
+def suite_overrun_static_when_ledger_lacks_entry():
+    t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+    checked, bad = 0, []
+    for name, block_mode, placement, sched, commercials in SCHED_RECORD_SCENARIOS:
+        if sched == "marathon" or block_mode == "full_day" or checked:
+            continue
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        clock, ticks = [t0], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        window = None
+        for i in range(40 * 12):
+            clock[0] = t0 + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                ns["calculate_slotted_playback_state"]("05")
+            log = channels["05"]["playback_log"]
+            layout = {n: h for n, h, _e in media._block_layout(block_mode)}
+            for key, anchor in log.get("block_anchors", {}).items():
+                parsed = media._parse_block_key(key)
+                if not parsed or parsed[1] not in layout or window is not None:
+                    continue
+                nominal = parsed[0] * 86400 + layout[parsed[1]] * 3600
+                late_until = parsed[0] * 86400 + anchor
+                if late_until >= nominal + 300 and clock[0].toordinal() * 86400 + 30 + clock[0].hour * 3600 + clock[0].minute * 60 + clock[0].second < late_until - 60:
+                    window = (key, nominal, late_until)
+            if window is not None:
+                now_abs = clock[0].toordinal() * 86400 + clock[0].hour * 3600 + clock[0].minute * 60 + clock[0].second
+                if window[1] + 30 <= now_abs < window[2] - 60:
+                    with_ledger = None
+                    with patch.object(media, "_cached_path_exists", lambda p: True):
+                        with_ledger = ns["calculate_slotted_playback_state"]("05")
+                    channels["05"]["playback_log"].pop("guide_aired_ledger", None)
+                    with patch.object(media, "_cached_path_exists", lambda p: True):
+                        lost = ns["calculate_slotted_playback_state"]("05")
+                    checked += 1
+                    if with_ledger.get("mode") not in ("Video", "Commercial"):
+                        bad.append("%s: the running show did not air with the ledger kept" % name)
+                    if lost.get("mode") != "Static" or lost.get("reason") != "probe_failed":
+                        bad.append("%s: with no ledger entry the station did not go to Static (%s)" % (name, lost.get("mode")))
+                    break
+    check(checked >= 1, "a station inside a block-change overrun was checked with its ledger lost (%d)" % checked)
+    check(not bad, "the running show airs from the ledger, and with the ledger lost the station is on Static and not on a guessed file (%s)" % bad)
+
+
+def _long_show_run(epic_seconds, hours=60, step=120, snapshot_at=None):
+    channel = _sched_record_channel("eight_hour", "interrupt_half_hour", "one_slot", False)
+    for name, items in channel["schedules"].items():
+        if name != "Commercials":
+            items.append({"path": "/m/Movies/Epic (2001).mkv", "duration": epic_seconds})
+    channels = {"05": channel}
+    t0 = datetime.datetime(2026, 10, 13, 0, 0, 5)
+    clock, ticks = [t0], [0]
+    ns = _sched_record_ns(channels, clock, ticks)
+    states, snapshot = [], None
+    for i in range(int(hours * 3600 / step)):
+        if i == snapshot_at:
+            snapshot = copy.deepcopy(channels["05"])
+        clock[0] = t0 + datetime.timedelta(seconds=i * step)
+        ticks[0] += 10000
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            states.append(ns["calculate_slotted_playback_state"]("05"))
+    return t0, step, states, channels, snapshot
+
+
+def suite_overrun_longer_than_a_block():
+    epic = "/m/Movies/Epic (2001).mkv"
+    for hours_long in (10, 20):
+        seconds = hours_long * 3600
+        t0, step, states, channels, _snap = _long_show_run(seconds)
+        modes = collections.Counter((st.get("mode"), st.get("reason")) for st in states)
+        check(set(m for m, _r in modes) == {"Video"}, "%d hour show: a scanned station never goes to Static or an empty state (%s)" % (hours_long, dict(modes)))
+        idx = [i for i, st in enumerate(states) if st.get("file") == epic]
+        first = idx[0]
+        run = []
+        for i in idx:
+            if i == first + len(run):
+                run.append(i)
+            else:
+                break
+        check(abs(len(run) * step - seconds) <= 2 * step, "%d hour show: it airs for its whole length once, not cut at a block change (%d s)" % (hours_long, len(run) * step))
+        off = [abs(states[i]["seek"] - (states[first]["seek"] + (i - first) * step)) for i in run]
+        check(max(off) <= 2.0, "%d hour show: its seek follows the clock across every block change, never restarting (%.1f s off)" % (hours_long, max(off)))
+        check(all(0 <= st["seek"] <= st["duration"] + 1 for st in states if st.get("mode") == "Video" and st.get("duration")), "%d hour show: every seek is inside its file" % hours_long)
+        after = states[run[-1] + 1]
+        check(after.get("mode") == "Video" and after.get("file") != epic, "%d hour show: the next show airs right after it ends" % hours_long)
+    layout = {n: e for n, _h, e in media._block_layout("eight_hour")}
+    late = [key for key, anchor in channels["05"]["playback_log"].get("block_anchors", {}).items()
+            if media._parse_block_key(key) and anchor > layout[media._parse_block_key(key)[1]] * 3600]
+    check(late, "a block with a saved start later than its own block end was reached and aired without Static")
+
+    t0, step, reference, _channels, snapshot = _long_show_run(20 * 3600, snapshot_at=60)
+    first = next(i for i, st in enumerate(reference) if st.get("file") == epic)
+    last = max(i for i, st in enumerate(reference[:first + 20 * 3600 // step + 5]) if st.get("file") == epic)
+    for label, gap_to in (("inside the show, two block changes later", 15 * 3600 // step),
+                          ("just after the show ends", last + 3),
+                          ("two hours after the show ends", last + 7200 // step)):
+        clock, ticks = [t0 + datetime.timedelta(seconds=gap_to * step)], [10 ** 7]
+        gap_channels = {"05": copy.deepcopy(snapshot)}
+        ns = _sched_record_ns(gap_channels, clock, ticks)
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            got = ns["calculate_slotted_playback_state"]("05")
+        want = reference[gap_to]
+        check(got.get("mode") == want.get("mode") and got.get("file") == want.get("file") and abs(got.get("seek", 0) - want.get("seek", 0)) <= 2.0,
+              "a start after a gap %s airs what a station that kept running airs (%s %s vs %s %s)" % (
+                  label, os.path.basename(got.get("file", "")), round(got.get("seek", 0)), os.path.basename(want.get("file", "")), round(want.get("seek", 0))))
+
+
+class TestOverrunLongerThanABlock(_SectionCase):
+    """A show longer than one block airs whole, the blocks inside it air nothing of their own, and a start after a gap lands in the right place"""
+
+    def test_overrun_longer_than_a_block(self):
+        self.run_section(suite_overrun_longer_than_a_block)
+
+
+class TestOverrunStaticWhenLedgerLacksEntry(_SectionCase):
+    """A station inside a block-change overrun with no ledger entry goes to Static"""
+
+    def test_overrun_static_when_ledger_lacks_entry(self):
+        self.run_section(suite_overrun_static_when_ledger_lacks_entry)
+
+
+# ============================================================================
+# SECTION: A gap with files not scanned yet
+# ============================================================================
+
+def _gap_boundaries(after, block_mode, count):
+    layout = media._block_layout(block_mode)
+    found = []
+    for day_offset in range(0, 8):
+        day = after.date() + datetime.timedelta(days=day_offset)
+        for _name, start_hour, _end_hour in layout:
+            if start_hour < 24:
+                boundary = datetime.datetime.combine(day, datetime.time(0)) + datetime.timedelta(hours=start_hour)
+                if boundary > after:
+                    found.append(boundary)
+    return found[:count]
+
+
+def suite_gap_with_unscanned_files():
+    scenarios = (("eight_hour", "one_slot"), ("six_block", "random_slots"), ("full_day", "random_slots"))
+    marker_sets = (("Show C", "Big Movie"), ("Show",))
+    t0 = datetime.datetime(2026, 10, 13, 0, 0, 5)
+    crossings, mismatched, statics, resumed = 0, [], [], 0
+
+    def unscan(channel, markers):
+        for items in channel["schedules"].values():
+            for item in items:
+                if any(m in item["path"] for m in markers):
+                    item.pop("duration", None)
+
+    for block_mode, sched in scenarios:
+        reference = _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)
+        full = {item["path"]: item["duration"] for items in reference["schedules"].values() for item in items}
+        seed_ns = _sched_record_ns({"05": reference}, [t0], [0])
+        for markers in marker_sets:
+            channels = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)}
+            clock, ticks = [t0], [0]
+            ns = _sched_record_ns(channels, clock, ticks)
+            ns["_priority_probe_pending_schedule"] = lambda *a, **k: None
+            for path in [p for p in ns["db"].config["media_probe_cache"] if any(m in p for m in markers)]:
+                del ns["db"].config["media_probe_cache"][path]
+            unscan(channels["05"], markers)
+            snapshots = []
+            for minute in range(0, 24 * 60 + 1):
+                clock[0] = t0 + datetime.timedelta(minutes=minute)
+                ticks[0] += 10000
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    ns["calculate_slotted_playback_state"]("05")
+                if minute % (8 * 60) == 0:
+                    snapshots.append((clock[0], copy.deepcopy(channels["05"])))
+            layout = media._block_layout(block_mode)
+            for taken, snap in snapshots:
+                plog = snap["playback_log"]
+                prev_key = plog.get("sched_block_key")
+                for boundary in _gap_boundaries(taken + datetime.timedelta(hours=1), block_mode, 3):
+                    name = [n for n, start_hour, _e in layout if start_hour == boundary.hour][0]
+                    cur_key = media.block_key_for(boundary, name)
+                    if not prev_key or cur_key == prev_key:
+                        continue
+                    probe = {os.path.normpath(p): {"duration": d} for p, d in full.items() if not any(m in p for m in markers)}
+                    seed = lambda offset: seed_ns["_start_order_seed"](reference, offset)
+                    show_pos = copy.deepcopy(plog.get("show_pos") or {})
+                    catch_up_end = media.catch_up_overrun_end("05", snap, copy.deepcopy(show_pos), prev_key, cur_key, lambda p: True, [], seed, None)
+                    rebuilt = {}
+                    for rec_name, rec_key, rec_start, rec_timeline, rec_total in media.replay_missed_blocks(
+                            "05", snap, copy.deepcopy(show_pos), prev_key, cur_key, boundary + datetime.timedelta(minutes=1), lambda p: True, [], seed, None):
+                        media.aired_ledger_upsert(rebuilt, rec_name, rec_key, rec_start, rec_timeline, rec_total, boundary + datetime.timedelta(minutes=1))
+                    for rec_id, rec in (plog.get(media.GUIDE_AIRED_LEDGER_KEY) or {}).items():
+                        rebuilt.setdefault(media.GUIDE_AIRED_LEDGER_KEY, {}).setdefault(rec_id, rec)
+                    ledger_end = media.block_overrun_end(rebuilt, boundary.toordinal(), boundary.hour * 3600)
+                    ledger_end = None if ledger_end is None else boundary.toordinal() * 86400 + ledger_end
+                    crossings += catch_up_end is not None
+                    if catch_up_end != ledger_end:
+                        mismatched.append("%s %s %s: catch-up %s, ledger %s" % (block_mode, markers, boundary.isoformat(), catch_up_end, ledger_end))
+                    for minutes_after in (1, 110):
+                        resume = boundary + datetime.timedelta(minutes=minutes_after)
+                        gap_channels = {"05": copy.deepcopy(snap)}
+                        for items in gap_channels["05"]["schedules"].values():
+                            for item in items:
+                                item.setdefault("duration", full[item["path"]])
+                        gap_clock, gap_ticks = [resume], [10 ** 7]
+                        gap_ns = _sched_record_ns(gap_channels, gap_clock, gap_ticks)
+                        gap_ns["_priority_probe_pending_schedule"] = lambda *a, **k: None
+                        for path in [p for p in gap_ns["db"].config["media_probe_cache"] if any(m in p for m in markers)]:
+                            del gap_ns["db"].config["media_probe_cache"][path]
+                        unscan(gap_channels["05"], markers)
+                        with patch.object(media, "_cached_path_exists", lambda p: True):
+                            got = gap_ns["calculate_slotted_playback_state"]("05")
+                        resumed += 1
+                        if got.get("mode") not in ("Video", "Commercial"):
+                            statics.append("%s %s %s: %s %s" % (block_mode, markers, resume.isoformat(), got.get("mode"), got.get("reason")))
+    check(crossings >= 20, "stations with unscanned files advanced across block changes with a show running across them (%d)" % crossings)
+    check(resumed >= 40, "stations with unscanned files were started after gaps at several moments (%d)" % resumed)
+    check(not mismatched, "the catch-up and guide history use the same known or saved-estimate tracks across block changes (%d differ: %s)" % (len(mismatched), mismatched[:3]))
+    check(not statics, "a station started after a gap with unscanned files airs the running show and never Static (%d: %s)" % (len(statics), statics[:3]))
+    catch_up_src = inspect.getsource(media._catch_up_replay)
+    guide_src = inspect.getsource(media.replay_missed_blocks)
+    check("build_raw_tracks(" in catch_up_src and "build_guess_filled_tracks(" not in catch_up_src
+          and "build_raw_tracks(" in guide_src and "build_guess_filled_tracks(" not in guide_src,
+          "schedule catch-up and guide history use the same track builder as live playback, with no replay-only duration guesses")
+    check("build_raw_tracks(" in get_function_source("calculate_slotted_playback_state"), "the live scheduler uses the shared duration-aware track builder")
+
+
+class TestGapWithUnscannedFiles(_SectionCase):
+    """After a gap, schedule advancement and guide history do not invent lengths for files without an estimate"""
+
+    def test_gap_with_unscanned_files(self):
+        self.run_section(suite_gap_with_unscanned_files)
+
+
+def suite_gap_probe_discovers_duration():
+    scenarios = (("full_day", "random_slots"), ("eight_hour", "one_slot"))
+    markers = ("Show C", "Big Movie")
+    t0 = datetime.datetime(2026, 10, 13, 0, 0, 5)
+    compared, probed_total, early_probes, differ, statics = 0, 0, 0, [], []
+
+    def unscanned_copy(snapshot, resume, full, prefilled):
+        channels = {"05": copy.deepcopy(snapshot)}
+        ns = _sched_record_ns(channels, [resume], [10 ** 7])
+        ns["db"].config["media_probe_cache"].clear()
+        for items in channels["05"]["schedules"].values():
+            for item in items:
+                if not prefilled and any(m in item["path"] for m in markers):
+                    item.pop("duration", None)
+        calls = []
+
+        def real_probe(path, *a, **k):
+            calls.append(os.path.normpath(path))
+            return full[os.path.normpath(path)], (640, 480)
+
+        ns["_probe_duration_and_dims_combined"] = real_probe
+        ns["_patch_probed_gain"] = (
+            lambda kind, ch_key, blk, p, gain=None, duration=None, dims=None, _ns=ns:
+            _ns["_save_file_probe_facts"](p, duration=duration, gain=gain, dims=dims))
+        return ns, calls
+
+    for block_mode, sched in scenarios:
+        channels = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)}
+        full = {os.path.normpath(item["path"]): item["duration"]
+                for items in channels["05"]["schedules"].values() for item in items}
+        clock, ticks = [t0], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        for minute in range(0, 8 * 60 + 1):
+            clock[0] = t0 + datetime.timedelta(minutes=minute)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                ns["calculate_slotted_playback_state"]("05")
+        snapshot = copy.deepcopy(channels["05"])
+        for minutes_after in (65, 190, 600):
+            resume = clock[0] + datetime.timedelta(minutes=minutes_after)
+            early_ns, early_calls = unscanned_copy(snapshot, resume, full, True)
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                early = early_ns["calculate_slotted_playback_state"]("05")
+            probe_ns, probe_calls = unscanned_copy(snapshot, resume, full, False)
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                got = probe_ns["calculate_slotted_playback_state"]("05")
+            again_ns, _again_calls = unscanned_copy(snapshot, resume, full, False)
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                again = again_ns["calculate_slotted_playback_state"]("05")
+            compared += 1
+            probed_total += len(probe_calls)
+            early_probes += len(early_calls)
+            if got.get("mode") not in ("Video", "Commercial"):
+                statics.append("%s %s: %s %s" % (block_mode, resume.isoformat(), got.get("mode"), got.get("reason")))
+            elif (got.get("mode"), got.get("file"), got.get("seek")) != (again.get("mode"), again.get("file"), again.get("seek")):
+                differ.append("%s %s: first probed run %s %s @%s, second probed run %s %s @%s" % (
+                    block_mode, resume.isoformat(), got.get("mode"), os.path.basename(got.get("file") or ""), got.get("seek"),
+                    again.get("mode"), os.path.basename(again.get("file") or ""), again.get("seek")))
+    check(compared == 6, "every gap run was compared (%d)" % compared)
+    check(probed_total > 0, "the real pending-probe path found lengths for unscanned files during the gap runs (%d probes)" % probed_total)
+    check(early_probes == 0, "a file whose length was scanned before the gap is never probed again (%d)" % early_probes)
+    check(not statics, "a probe that finds a length partway through a gap never leaves Static (%d: %s)" % (len(statics), statics[:3]))
+    check(not differ, "the same unscanned files probed during the same gap give the same airing every time (%d differ: %s)" % (len(differ), differ[:3]))
+
+
+class TestGapProbeDiscoversDuration(_SectionCase):
+    """C13 (e): a real probe that finds an unscanned file's length during a gap gives the same answer as a scanned station"""
+
+    def test_gap_probe_discovers_duration(self):
+        self.run_section(suite_gap_probe_discovers_duration)
+
+
+# ============================================================================
+# SECTION: Guide future cells, show running past the block end
+# ============================================================================
+
+def suite_guide_cycle_through_block_end():
+    def item(path, start, duration, commercial=False, seek=0):
+        return {"path": path, "start_time": start, "duration": duration, "is_commercial": commercial, "seek_offset": seek}
+
+    timeline = [item("/m/a.mkv", 0, 600), item("/c/x.mp4", 600, 60, True), item("/m/a.mkv", 660, 600, seek=600),
+                item("/c/y.mp4", 1260, 60, True), item("/m/b.mkv", 1320, 900), item("/m/c.mkv", 2220, 900)]
+    kept, total, end = media.guide_cycle_through_block_end(timeline, 3120, 10000, 13120)
+    check(kept is timeline and total == 3120 and end is None, "a cycle that ends by the block end is returned as it is and has no overrun end")
+    kept, total, end = media.guide_cycle_through_block_end(timeline, 3120, 10000, 10300)
+    check([i["path"] for i in kept] == ["/m/a.mkv", "/c/x.mp4", "/m/a.mkv"] and total == 1260 and end == 11260,
+          "a show whose first part starts before the block end keeps its later part after the commercial and the overrun ends where the last part ends, not where the first part ends")
+    check(end != 10000 + 600, "the overrun end is not the end of the first part")
+    kept, total, end = media.guide_cycle_through_block_end(timeline, 3120, 10000, 11300)
+    check(end == 11320 and [i["path"] for i in kept][-1] == "/c/y.mp4", "a commercial that starts before the block end and ends after it is the end of the overrun")
+    kept, total, end = media.guide_cycle_through_block_end(timeline, 3120, 10000, 11400)
+    check(end == 12220 and len(kept) == 5, "an entry that starts a little before the block end airs whole and the next entry is dropped")
+    kept, total, end = media.guide_cycle_through_block_end(timeline, 3120, 10000, 12500)
+    check(end == 13120 and len(kept) == 6, "a last entry that starts before the block end airs whole")
+    scheduler_kept, scheduler_total = media.timeline_through_block_end(timeline, 3120, 300)
+    guide_kept, guide_total, guide_end = media.guide_cycle_through_block_end(timeline, 3120, 0, 300)
+    check(guide_kept == scheduler_kept and guide_end == scheduler_total, "the guide and the scheduler cut the same cycle at the same place")
+    check(len(timeline) == 6, "the cycle given is never changed")
+    with open(os.path.join(os.path.dirname(os.path.abspath(media.__file__)), "ui.py"), encoding="utf-8") as ui_file:
+        ui_src = ui_file.read()
+    check(ui_src.count("media.guide_cycle_through_block_end(") == 2, "both guide walks (the overflow walk and the block render loop) use the shared cut")
+    check("if e_start >= block_abs_end:" not in ui_src, "the guide no longer stops at the first part of a show that crosses the block end")
+    check("+ _seg_d\n" not in "".join(l for l in ui_src.splitlines(True) if "block_abs_end =" in l) and "_bend + _bd" not in ui_src,
+          "the guide ends a block at its clock end, as the scheduler does, and not shifted by the block's saved start and airing cycle")
+    check("block_abs_end = 5 * 3600" not in ui_src and "block_abs_end = 24 * 3600 + 4 * 3600" in ui_src and ("Night", 20, 28) in media._GUIDE_EIGHT_HOUR_BLOCKS,
+          "the guide ends the Night block at 04:00 whether it is drawn before or after midnight, as the scheduler's block layout does")
+    check("_fd_anchor_secs + 24 * 3600" not in ui_src and "_base_day_start + _DAY_SPAN" not in ui_src,
+          "the guide ends a Full Day at the next midnight, as the scheduler does, and the later days start where the running show ends")
+    check(sum(1 for l in ui_src.splitlines() if "block_abs_start =" in l and "_seg_d" in l) >= 3, "the guide still starts a block at its saved start plus the airing cycle start")
+
+
+class TestGuideCycleThroughBlockEnd(_SectionCase):
+    """The guide's future cells end a block at the end of the whole show running past it"""
+
+    def test_guide_cycle_through_block_end(self):
+        self.run_section(suite_guide_cycle_through_block_end)
+
+
+# ============================================================================
+# SECTION: Guide past, no skipped episode
+# ============================================================================
+
+def suite_guide_past_no_skipped_episode():
+    import re
+
+    def number(path):
+        found = re.search(r"S01E(\d+)", path)
+        return int(found.group(1)) if found else None
+
+    wanted = ("eight_hour_no_ads_one_slot", "eight_hour_two_slots", "full_day_random", "six_block_random")
+    bad = {}
+    seen = 0
+    for name, block_mode, placement, sched, commercials in SCHED_RECORD_SCENARIOS:
+        if name not in wanted:
+            continue
+        info = _sched_record_channel(block_mode, placement, sched, commercials)
+        probe = {os.path.normpath(item["path"]): {"duration": item["duration"]}
+                 for items in info["schedules"].values() for item in items}
+        first_block = {"eight_hour": "Morning", "six_block": media.SIX_HOUR_BLOCK_NAMES[0], "full_day": "Full Day"}[block_mode]
+        now = datetime.datetime(2026, 10, 16, 4, 0, 5)
+        records = media.replay_missed_blocks(
+            "05", info, {}, "2026_286_%s" % first_block, media.block_key_for(now, first_block), now, 
+            lambda p: True, [], lambda offset: "7:%d" % offset, max_blocks=60)
+        listed = {}
+        for block, items in info["schedules"].items():
+            for item in items if isinstance(items, list) else []:
+                show = re.match(r"/m/(Show [A-Z])/", item["path"])
+                if show:
+                    listed.setdefault(block, {}).setdefault(show.group(1), set()).add(number(item["path"]))
+        previous = {}
+        count = 0
+        for block, _key, _start, timeline, _total in records:
+            for item in timeline:
+                if item.get("is_commercial") or item.get("seek_offset", 0):
+                    continue
+                show = re.match(r"/m/(Show [A-Z])/", item["path"])
+                if not show:
+                    continue
+                show, episode = show.group(1), number(item["path"])
+                numbers = listed.get(block, {}).get(show, set())
+                if show in previous and previous[show] != episode:
+                    count += 1
+                    ahead = [n for n in sorted(numbers) if n > previous[show]]
+                    if episode != (ahead[0] if ahead else min(numbers)):
+                        bad[name] = bad.get(name, 0) + 1
+                previous[show] = episode
+        seen += count
+    check(seen > 0, "the guide's past followed show-to-show changes (%d)" % seen)
+    check(not bad, "the guide's past skips no episode and airs none out of order across block ends (%s)" % bad)
+
+
+class TestGuidePastNoSkippedEpisode(_SectionCase):
+    """The guide's rebuilt past continues each show with the episode after the last one that started before the block end"""
+
+    def test_guide_past_no_skipped_episode(self):
+        self.run_section(suite_guide_past_no_skipped_episode)
+
+
+# ============================================================================
+# SECTION: Guide past after a gap equals a station that kept running
+# ============================================================================
+
+def suite_guide_past_matches_continuous():
+    t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+    gaps = ((datetime.datetime(2026, 10, 13, 7, 0, 5), datetime.datetime(2026, 10, 14, 5, 0, 5)),
+            (datetime.datetime(2026, 10, 13, 13, 10, 5), datetime.datetime(2026, 10, 15, 10, 0, 5)))
+    scenarios = (("eight_hour", "one_slot"), ("eight_hour", "two_slots"), ("eight_hour", "random_slots"),
+                 ("six_block", "random_slots"), ("full_day", "random_slots"))
+
+    def paths(timeline):
+        return [item["path"] for item in timeline]
+
+    compared = 0
+    tail_seen = 0
+    differing = {}
+    for block_mode, sched in scenarios:
+        label = "%s_%s" % (block_mode, sched)
+        channels = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)}
+        clock, ticks = [t0], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        truth = {}
+        for i in range(60 * 60):
+            clock[0] = t0 + datetime.timedelta(seconds=i * 60)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                ns["calculate_slotted_playback_state"]("05")
+            for rec in (channels["05"]["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values():
+                truth[rec["start"]] = (rec["total"], paths(rec["timeline"]))
+        for stop, resume in gaps:
+            fresh = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)}
+            clock2, ticks2 = [t0], [0]
+            ns2 = _sched_record_ns(fresh, clock2, ticks2)
+            for moment in [t0 + datetime.timedelta(seconds=i * 60) for i in range(int((stop - t0).total_seconds() // 60) + 1)] + [resume]:
+                clock2[0] = moment
+                ticks2[0] += 10000
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    ns2["calculate_slotted_playback_state"]("05")
+            plog = fresh["05"]["playback_log"]
+            rebuilt = {rec["start"]: (rec["total"], paths(rec["timeline"]))
+                       for rec in (plog.get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values()}
+            resume_block_start = (resume.toordinal() * 86400 + (plog.get("block_anchors") or {}).get(plog.get("sched_block_key"), 0))
+            floor_abs = (resume.toordinal() - 1) * 86400
+            after_stop = stop.toordinal() * 86400 + stop.hour * 3600 + stop.minute * 60 + stop.second
+            for start, (total, files) in truth.items():
+                if start <= after_stop or start >= resume_block_start or start + total < floor_abs:
+                    continue
+                compared += 1
+                if start not in rebuilt:
+                    differing.setdefault(label, set()).add("missing cycle at %d" % start)
+                elif rebuilt[start][1] != files:
+                    differing.setdefault(label, set()).add("different files at %d" % start)
+                elif start - after_stop < 8 * 3600:
+                    tail_seen += 1
+    check(compared >= 10, "the guide's past was compared with a station that kept running over %d cycles" % compared)
+    check(tail_seen > 0, "the cycles still unplayed in the last built block were compared (%d)" % tail_seen)
+    check(not differing, "after a gap the guide's past holds the same cycles and files as a station that kept running (%s)" % {k: sorted(v)[:3] for k, v in differing.items()})
+
+
+class TestGuidePastMatchesContinuous(_SectionCase):
+    """After a gap the guide's past shows what a station that never stopped aired"""
+
+    def test_guide_past_matches_continuous(self):
+        self.run_section(suite_guide_past_matches_continuous)
+
+
+# ============================================================================
+# SECTION: The show airing at a block change keeps airing
+# ============================================================================
+
+def suite_block_change_overrun_continues():
+    t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+    checked = 0
+    bad = {}
+    late_checked = 0
+    late_bad = {}
+    for name, block_mode, placement, sched, commercials in SCHED_RECORD_SCENARIOS:
+        if sched == "marathon":
+            continue
+        hours = (0,) if block_mode == "full_day" else (0, 6, 12, 18) if block_mode == "six_block" else (4, 12, 20)
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        clock, ticks = [t0], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        results = {}
+        built = {}
+        for i in range(40 * 12):
+            clock[0] = t0 + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                results[clock[0]] = ns["calculate_slotted_playback_state"]("05")
+            built[clock[0]] = channels["05"]["playback_log"].get("sched_block_key")
+        for moment in sorted(results):
+            if moment.hour not in hours or moment.minute != 0 or moment.second != 5 or moment == t0:
+                continue
+            before = results.get(moment - datetime.timedelta(seconds=30))
+            after = results[moment]
+            if not before or before.get("mode") not in ("Video", "Commercial") or after.get("mode") not in ("Video", "Commercial"):
+                continue
+            remaining = float(before.get("duration", 0)) - float(before.get("seek", 0))
+            if remaining <= 90 or before.get("mode") != "Video":
+                continue
+            checked += 1
+            if after.get("file") != before.get("file") or abs(float(after.get("seek", 0)) - float(before.get("seek", 0)) - 30) > 2:
+                bad.setdefault(name, []).append((str(moment), os.path.basename(str(before.get("file"))), os.path.basename(str(after.get("file")))))
+        layout = {n: h for n, h, _e in media._block_layout(block_mode)}
+        for key, anchor in sorted(channels["05"]["playback_log"].get("block_anchors", {}).items()):
+            parsed = media._parse_block_key(key)
+            if not parsed or parsed[1] not in layout:
+                continue
+            nominal = parsed[0] * 86400 + layout[parsed[1]] * 3600
+            late_until = parsed[0] * 86400 + anchor
+            if late_until < nominal + 120:
+                continue
+            ticks_in = [m for m in sorted(results) if nominal + 30 <= m.toordinal() * 86400 + m.hour * 3600 + m.minute * 60 + m.second < late_until - 30]
+            earlier = [m for m in sorted(results) if m.toordinal() * 86400 + m.hour * 3600 + m.minute * 60 + m.second < nominal]
+            if not ticks_in or not earlier:
+                continue
+            late_checked += 1
+            airing = results[earlier[-1]].get("file")
+            if any(results[m].get("mode") not in ("Video", "Commercial") or built[m] == key for m in ticks_in):
+                late_bad.setdefault(name, []).append(key + " block built or off air before the show ended")
+            if not (results[ticks_in[0]].get("file") == airing or "Commercial" in (results[earlier[-1]].get("mode"), results[ticks_in[0]].get("mode"))):
+                late_bad.setdefault(name, []).append(key + " show changed at the block start")
+            after = [m for m in sorted(results) if m.toordinal() * 86400 + m.hour * 3600 + m.minute * 60 + m.second >= late_until + 30]
+            if after and built[after[0]] != key:
+                late_bad.setdefault(name, []).append(key + " block not built when the show ended")
+    check(late_checked >= 3, "block changes with a show running past the block end were checked for a late start (%d)" % late_checked)
+    check(not late_bad, "the new block starts when the show running past the block end finishes, and not before (%s)" % late_bad)
+    check(checked >= 6, "block changes with an entry still airing were checked (%d)" % checked)
+    check(not bad, "the entry airing at a block change keeps airing, from the same place in the same file (%s)" % bad)
+
+
+class TestBlockChangeOverrunContinues(_SectionCase):
+    """The show that runs past a block end is the one that aired, not one rebuilt from the old ordering"""
+
+    def test_block_change_overrun_continues(self):
+        self.run_section(suite_block_change_overrun_continues)
+
+
+def suite_full_day_overrun_starts_when_show_ends():
+    scenario = next(x for x in SCHED_RECORD_SCENARIOS if x[1] == "full_day" and x[3] != "marathon")
+    name, block_mode, placement, sched, commercials = scenario
+    late_checked, bad, cold_checked = 0, [], 0
+    for start in (datetime.datetime(2026, 10, 13, 7, 24, 5), datetime.datetime(2026, 10, 13, 3, 5, 5), datetime.datetime(2026, 10, 13, 9, 15, 5)):
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        clock, ticks = [start], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        results, built = {}, {}
+        for i in range(34 * 120):
+            clock[0] = start + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                results[clock[0]] = ns["calculate_slotted_playback_state"]("05")
+            built[clock[0]] = channels["05"]["playback_log"].get("sched_block_key")
+        second = start.date() + datetime.timedelta(days=1)
+        key = "%d_%d_Full Day" % (second.year, second.timetuple().tm_yday)
+        anchor = channels["05"]["playback_log"].get("block_anchors", {}).get(key)
+        midnight = datetime.datetime.combine(second, datetime.time(0, 0, 0))
+        if anchor is None or anchor < 120:
+            continue
+        late_until = midnight + datetime.timedelta(seconds=anchor)
+        window = [m for m in sorted(results) if midnight + datetime.timedelta(seconds=30) <= m < late_until - datetime.timedelta(seconds=30)]
+        after = [m for m in sorted(results) if m >= late_until + datetime.timedelta(seconds=30)]
+        if not window or not after:
+            continue
+        late_checked += 1
+        if any(results[m].get("mode") not in ("Video", "Commercial") or built[m] == key for m in window):
+            bad.append("%s: the new day was built or the station went off air before the show ended" % start.time())
+        if built[after[0]] != key:
+            bad.append("%s: the new day was not built when the show ended" % start.time())
+        for moment in (window[len(window) // 2], after[0]):
+            fresh = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+            cclock, cticks = [start], [0]
+            cns = _sched_record_ns(fresh, cclock, cticks)
+            cold = None
+            for when in (start, moment):
+                cclock[0] = when
+                cticks[0] += 10000
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    cold = cns["calculate_slotted_playback_state"]("05")
+            cold_checked += 1
+            warm = results[moment]
+            if cold.get("file") != warm.get("file") or abs(float(cold.get("seek", 0)) - float(warm.get("seek", 0))) > 2:
+                bad.append("%s: a start after a gap at %s airs %s, a station that kept running airs %s" % (start.time(), moment.time(), os.path.basename(str(cold.get("file"))), os.path.basename(str(warm.get("file")))))
+    check(late_checked >= 2, "Full Day midnights with a show running past them were checked (%d)" % late_checked)
+    check(cold_checked >= 4, "starts after a gap in the middle of and just after the overrun were compared (%d)" % cold_checked)
+    check(not bad, "a Full Day starts when the show running past midnight finishes, and a start after a gap agrees (%s)" % bad)
+
+
+class TestFullDayOverrunStartsWhenShowEnds(_SectionCase):
+    """A Full Day channel lets the show running past midnight finish before the new day starts"""
+
+    def test_full_day_overrun_starts_when_show_ends(self):
+        self.run_section(suite_full_day_overrun_starts_when_show_ends)
+
+
+# ============================================================================
+# SECTION: Re-flavored block, no skipped episode
+# ============================================================================
+
+def suite_reflavor_no_skipped_episode():
+    import re
+
+    def episode_number(path):
+        found = re.search(r"S01E(\d+)", path)
+        return int(found.group(1)) if found else None
+
+    wanted = ("eight_hour_no_ads_one_slot", "eight_hour_two_slots", "full_day_random")
+    skipped = {}
+    transitions = 0
+    reflavors = 0
+    for scenario in SCHED_RECORD_SCENARIOS:
+        if scenario[0] not in wanted:
+            continue
+        name, block_mode, placement, sched, commercials = scenario
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        start = datetime.datetime(2026, 10, 13, 4, 0, 5)
+        clock, ticks = [start], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        runs = []
+        last = None
+        for i in range(40 * 12):
+            clock[0] = start + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            plog = channels["05"]["playback_log"]
+            requested = False
+            if i % 150 in (40, 41):
+                plog["_sched_rebuild_requested"] = True
+                requested = True
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                result = ns["calculate_slotted_playback_state"]("05")
+            if requested and i % 150 == 41 and not plog.get("_sched_rebuild_requested"):
+                reflavors += 1
+            path = result.get("file", "")
+            if result.get("mode") != "Video" or path not in set(plog.get("sched_cached_tracks") or []):
+                continue
+            if last is not None and last[0] == path:
+                last[1] += 1
+            else:
+                last = [path, 1, result.get("block")]
+                runs.append(last)
+        files = [(r[0], r[2]) for r in runs if r[1] >= 4]
+        listed = {}
+        for block_name, items in channels["05"]["schedules"].items():
+            if isinstance(items, list):
+                for item in items:
+                    show = re.match(r"/m/(Show [A-Z])/", item["path"])
+                    if show:
+                        listed.setdefault(block_name, {}).setdefault(show.group(1), set()).add(episode_number(item["path"]))
+        previous = {}
+        bad = 0
+        for path, block_name in files:
+            show = re.match(r"/m/(Show [A-Z])/", path)
+            if not show:
+                continue
+            show = show.group(1)
+            number = episode_number(path)
+            if show in previous and previous[show] != number:
+                transitions += 1
+                in_block = listed.get(block_name, {}).get(show) or {number}
+                ahead = [n for n in sorted(in_block) if n > previous[show]]
+                if number != (ahead[0] if ahead else min(in_block)):
+                    bad += 1
+            previous[show] = number
+        skipped[name] = bad
+    check(reflavors > 0, "the check re-flavored lineups in the middle of cycles (%d)" % reflavors)
+    check(transitions > 0, "the re-flavor check followed show-to-show changes (%d)" % transitions)
+    check(all(v == 0 for v in skipped.values()), "no episode is skipped or aired out of order after a lineup is re-flavored in the middle of a cycle (%s)" % skipped)
+
+
+class TestReflavorNoSkippedEpisode(_SectionCase):
+    """A lineup rebuilt in the middle of a cycle continues each show with the episode after the last kept one"""
+
+    def test_reflavor_no_skipped_episode(self):
+        self.run_section(suite_reflavor_no_skipped_episode)
+
+
+# ============================================================================
+# SECTION: Seek inside a part of a show cut by commercials
+# ============================================================================
+
+def suite_resolve_part_seek():
+    part = {"path": "/m/Show/S01E01.mkv", "duration": 880.0, "seek_offset": 1760.0}
+    check(media.resolve_lineup_playback(part, 1760.0 + 300.0) == ("/m/Show/S01E01.mkv", 2060.0, 880.0),
+          "a part that starts at 1760 s of its file seeks to 1760 plus the time into the part")
+    check(media.resolve_lineup_playback(part, 1760.0 + 900.0)[1] == 2660.0, "the seek keeps following the clock past the part's own length")
+    first = {"path": "/m/Show/S01E01.mkv", "duration": 880.0, "seek_offset": 0, "interior_cut": True}
+    check(media.resolve_lineup_playback(first, 300.0) == ("/m/Show/S01E01.mkv", 300.0, 880.0), "the first part seeks to the time into the part")
+    whole = {"path": "/m/Show/S01E02.mkv", "duration": 1500.0, "seek_offset": 0}
+    check(media.resolve_lineup_playback(whole, 1200.0) == ("/m/Show/S01E02.mkv", 1200.0, 1500.0), "a whole episode seeks to the time into it")
+    check(media.resolve_lineup_playback(whole, 1600.0) == ("/m/Show/S01E02.mkv", 1500.0, 1500.0), "an offset past the end of a whole episode stays at its end")
+    pair = {"path": "/m/Show/S01E03.mkv", "duration": 600.0, "seek_offset": 0, "is_pair": True,
+            "pair_ep1_path": "/m/Show/S01E03.mkv", "pair_ep1_duration": 600.0,
+            "pair_ep2_path": "/m/Show/S01E04.mkv", "pair_ep2_duration": 700.0}
+    check(media.resolve_lineup_playback(pair, 650.0) == ("/m/Show/S01E04.mkv", 50.0, 700.0), "a pair resolves an offset into its second file")
+
+    channel = {"scheduling_mode": "one_slot", "commercials_enabled": True, "commercial_placement": "interrupt_half_hour",
+               "pair_threshold_minutes": 15}
+    show = [{"path": "/m/tv/Alpha/Alpha S01E01.mkv", "duration": 2640}]
+    ads = [{"path": "/m/Ads/ad%d.mkv" % i, "duration": 30} for i in range(4)]
+    timeline, total, _ = media.build_channel_timeline(show, ads, channel, 7)
+    parts = [e for e in timeline if not e.get("is_commercial")]
+    check(len(parts) >= 3, "the commercial setup cuts a 2640 s episode into at least three parts (%d)" % len(parts))
+    wrong = 0
+    for entry in parts:
+        for into in (0.0, entry["duration"] / 2.0, entry["duration"] - 1.0):
+            _path, seek, _dur = media.resolve_lineup_playback(entry, entry.get("seek_offset", 0) + into)
+            wrong += abs(seek - (entry.get("seek_offset", 0) + into)) > 0.001
+    check(wrong == 0, "every part of a cut episode seeks to its place in the file (%d wrong)" % wrong)
+
+
+# ============================================================================
+# SECTION: First start of a station, pending file probe
+# ============================================================================
+
+def suite_pending_probe_does_not_wait_on_own_flag():
+    check(gov.PENDING_SCHEDULE_PROBE_PARALLEL == 6, "the governor must hold the pending-probe parallel count")
+    check(media._perf_governor is gov, "media must use the same governor module")
+    check(not gov.in_priority_scope(), "a plain thread is not in a priority scope")
+    with gov.priority_scope():
+        check(gov.in_priority_scope(), "a thread inside priority_scope reports it")
+    saved_wait = media._LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S
+    media._LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = 0.4
+    media.set_live_playback_priority(True)
+    try:
+        started = time.monotonic()
+        media._yield_to_live_playback("plain")
+        check(time.monotonic() - started >= 0.35, "background work still waits for the live open")
+        started = time.monotonic()
+        with gov.priority_scope():
+            media._yield_to_live_playback("scoped")
+        check(time.monotonic() - started < 0.1, "first-scan work in a priority scope never waits on the live flag")
+
+        ns = {"os": os, "time": time, "threading": threading, "db": mock.MagicMock(), "log": mock.MagicMock(),
+              "_channel_is_server_streamed": lambda ch: False, "initialize_vlc_on_demand": lambda: None,
+              "_governor_priority_scope": gov.priority_scope,
+              "set_live_playback_priority": media.set_live_playback_priority,
+              "_PENDING_SCHEDULE_PROBE_PARALLEL": 6}
+        patched = []
+        threads = set()
+        cached_path = os.path.normpath("/m/cached.mkv")
+
+        def fake_cached(path):
+            return {"duration": 5.0, "dims": (1, 1)} if path == cached_path else {}
+
+        def fake_probe(path):
+            threads.add(threading.current_thread().name)
+            with gov.priority_scope():
+                media._yield_to_live_playback("probe")
+                time.sleep(0.2)
+            return (None, None) if path.endswith("bad.mkv") else (100.0, (640, 480))
+
+        def fake_patch(kind, ch_key, sub_key, path, duration=None, dims=None):
+            patched.append((path, duration, threading.current_thread().name))
+
+        ns.update({"_read_file_probe_facts": fake_cached, "_probe_duration_and_dims_combined": fake_probe,
+                   "_patch_probed_gain": fake_patch})
+        exec(main_function_code("_probe_pending_schedule_one"), ns)
+        exec(main_function_code("_priority_probe_pending_schedule"), ns)
+        tracks = [{"path": "/m/f%d.mkv" % i} for i in range(8)]
+        tracks += [{"path": "/m/f0.mkv"}, {"path": "/m/cached.mkv"}, {"path": "/m/bad.mkv"}, {"path": ""}]
+        started = time.monotonic()
+        ns["_priority_probe_pending_schedule"]("05", "schedules", "Morning", tracks)
+        elapsed = time.monotonic() - started
+        check(elapsed < 1.5, "eight pending files must probe in parallel without waiting on the live flag (%.2fs)" % elapsed)
+        check(len(patched) == 8 and all(p[1] == 100.0 for p in patched), "every probed file is stored once (%d)" % len(patched))
+        check(len({p[0] for p in patched}) == 8, "a repeated path is probed and stored once")
+        check(all(p[2] == threading.current_thread().name for p in patched), "results are stored on the calling thread")
+        check(len(threads) > 1, "the probes must run on more than one thread (%d)" % len(threads))
+    finally:
+        media._LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = saved_wait
+        media.set_live_playback_priority(False)
+    check(not media._LIVE_PLAYBACK_PRIORITY.is_set(), "the pending probe must leave the live flag cleared")
+
+
+def suite_first_start_scan_plan():
+    P = gov.MachineProfile
+    weak = P(physical_cores=2, logical_cores=4, effective_physical=2, tier="WEAK")
+    four_core = P(physical_cores=4, logical_cores=8, effective_physical=4, tier="REFERENCE")
+    six_core = P(physical_cores=6, logical_cores=12, effective_physical=6, tier="REFERENCE")
+    strong = P(physical_cores=8, logical_cores=16, effective_physical=8, tier="STRONG")
+    check(gov.FIRST_START_CONCURRENT_MIN_CORES == 3.0 and gov.FIRST_START_CONCURRENT_MIN_THREADS == 4
+          and gov.FIRST_START_CONCURRENT_MAX_LEVEL == 2 and gov.FIRST_START_PRIORITY_DISK_SLOTS == 3,
+          "the governor must hold the first-start together-scan limits")
+    with mock.patch.object(gov, "enforcing", return_value=False):
+        check(gov.first_start_scan_plan(weak, "standard")[0] is False, "a weak PC runs the first-start scans in sequence")
+        check(gov.first_start_scan_plan(strong, "lite")[0] is False, "lite mode runs the first-start scans in sequence")
+        check(gov.first_start_scan_plan(four_core, "standard")[0] is False, "a 4-core PC without 3 spare scan cores runs them in sequence")
+        check(gov.first_start_scan_plan(six_core, "standard")[0] is True, "a 6-core PC runs them together")
+        check(gov.first_start_scan_plan(strong, "performance")[0] is True, "a strong PC in performance mode runs them together")
+        check(isinstance(gov.first_start_scan_plan(four_core, "standard")[1], str) and gov.first_start_scan_plan(four_core, "standard")[1],
+              "the plan names its reason")
+    with mock.patch.object(gov, "enforcing", return_value=True), mock.patch.object(gov, "current_level", return_value=3):
+        check(gov.first_start_scan_plan(strong, "standard")[0] is False, "a loaded PC falls back to the sequence")
+    with mock.patch.object(gov, "enforcing", return_value=True), mock.patch.object(gov, "current_level", return_value=2):
+        check(gov.first_start_scan_plan(strong, "standard")[0] is True, "a PC at the limit level still runs them together")
+
+    shared, own = media._FAST_DISK_IO_SEMAPHORE, media._FAST_DISK_IO_PRIORITY_SEMAPHORE
+    for together in (True, False):
+        with mock.patch.object(gov, "first_start_scans_concurrent", return_value=together):
+            before = (shared._value, own._value)
+            with gov.priority_scope():
+                with media._fast_disk_io_slot("probe"):
+                    inside = (shared._value, own._value)
+            with media._fast_disk_io_slot("probe"):
+                plain = (shared._value, own._value)
+        check(inside == ((before[0], before[1] - 1) if together else (before[0] - 1, before[1])),
+              "first-scan work takes the priority disk slot only when the scans run together (%s)" % together)
+        check(plain == (before[0] - 1, before[1]), "background work always takes the shared disk slot")
+
+    ns = {"os": os, "threading": threading, "time": time, "log": mock.MagicMock(), "media": media,
+          "_cached_path_exists": lambda p: True, "_read_file_probe_facts": lambda p: {},
+          "_loudness_probe_in_cooldown": lambda p: False, "_is_drive_degraded": lambda p: False,
+          "_governor_priority_scope": gov.priority_scope, "NoAudioStreamError": type("NoAudioStreamError", (Exception,), {}),
+          "_patch_probed_gain": lambda *a, **k: None}
+    events = []
+
+    def fake_picture_box(path):
+        events.append(("pb_start", time.monotonic()))
+        time.sleep(0.3)
+        events.append(("pb_end", time.monotonic()))
+
+    def fake_loudness(path, **kwargs):
+        events.append(("loud_start", time.monotonic()))
+        time.sleep(0.3)
+        events.append(("loud_end", time.monotonic()))
+        return 1.5
+
+    ns.update({"_picture_box_before_loudness": fake_picture_box, "_probe_loudness_guarded": fake_loudness})
+    exec(main_function_code("_probe_and_apply_loudness_blocking"), ns)
+    run = ns["_probe_and_apply_loudness_blocking"]
+    for together in (True, False):
+        events.clear()
+        ns["performance_governor"] = type("G", (), {"first_start_scan_plan": staticmethod(lambda: (together, "test"))})
+        started = time.monotonic()
+        gain = run("channel", "05", "Morning", os.path.normpath("/m/a.mkv"), "tune-in priority scan", priority=True)
+        elapsed = time.monotonic() - started
+        stamp = dict(events)
+        check(gain == 1.5, "the scan still returns its gain")
+        check(set(stamp) == {"pb_start", "pb_end", "loud_start", "loud_end"}, "both scans ran (%s)" % sorted(stamp))
+        if together:
+            check(abs(stamp["loud_start"] - stamp["pb_start"]) < 0.15 and elapsed < 0.5, "together: the loudness scan starts with the picture box (%.2fs)" % elapsed)
+            check(stamp["pb_end"] <= started + elapsed, "together: the call returns only after the picture box scan finished")
+        else:
+            check(stamp["loud_start"] >= stamp["pb_end"] - 0.01 and elapsed >= 0.55, "in sequence: the loudness scan waits for the picture box (%.2fs)" % elapsed)
+    events.clear()
+    ns["performance_governor"] = type("G", (), {"first_start_scan_plan": staticmethod(lambda: (True, "test"))})
+    run("channel", "05", "Morning", os.path.normpath("/m/a.mkv"), "background scan", priority=False)
+    stamp = dict(events)
+    check(stamp["loud_start"] >= stamp["pb_end"] - 0.01, "a scan that is not the playing file's first scan always waits for the picture box")
+
+
+def suite_first_start_remaining_scans():
+    scopes = []
+    ns = {"os": os, "time": time, "threading": threading, "media": media, "log": mock.MagicMock(),
+          "_cached_path_exists": lambda p: True,
+          "_is_drive_degraded": lambda p: False,
+          "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 2.0, "_PICTURE_BOX_PRE_SHOW_PARALLEL": 6,
+          "_governor_priority_scope": gov.priority_scope}
+    store = {}
+
+    class FakeLib:
+        def get_cached(self, path):
+            box = store.get(path)
+            return {"picture_box": box, "picture_box_detector_version": 99999} if box else None
+
+    def fake_scan(lib, mlmod, path, parallel=1):
+        scopes.append(gov.in_priority_scope())
+        store[path] = {"reason": "letterbox"}
+        return True
+
+    ns.update({"_get_probe_library": lambda: FakeLib(), "_picture_box_scan_one": fake_scan})
+    exec(main_function_code("_picture_box_scan_one_priority"), ns)
+    exec(main_function_code("_decide_picture_box_before_show"), ns)
+    with mock.patch.object(ml, "PICTURE_BOX_DETECTOR_VERSION", 1):
+        ns["_decide_picture_box_before_show"]("show.mkv")
+    check(scopes == [True], "the picture box scan before the show runs in a priority scope: %s" % scopes)
+
+    stored = []
+    in_scope = []
+    probe_threads = set()
+
+    def fake_probe(path):
+        in_scope.append(gov.in_priority_scope())
+        probe_threads.add(threading.current_thread().name)
+        time.sleep(0.2)
+        return 100.0
+
+    pns = {"os": os, "time": time, "log": mock.MagicMock(), "_read_file_probe_facts": lambda p: {},
+           "_cached_path_exists": lambda p: True, "_probe_duration_guarded": fake_probe,
+           "_save_file_probe_facts": lambda p, duration=None, **k: stored.append(p),
+           "_governor_priority_scope": gov.priority_scope}
+    exec(main_function_code("_prime_one_missing_duration"), pns)
+    exec(main_function_code("_prime_missing_durations"), pns)
+    prime = pns["_prime_missing_durations"]
+    items = [("/m/f%d.mkv" % i, os.path.normpath("/m/f%d.mkv" % i)) for i in range(8)]
+    for together in (True, False):
+        stored.clear()
+        in_scope.clear()
+        probe_threads.clear()
+        pns["performance_governor"] = type("G", (), {
+            "first_start_scans_concurrent": staticmethod(lambda: together),
+            "duration_workers": staticmethod(lambda playing=False: 4)})
+        probed, elapsed = prime("05", items, pace=False)
+        check(probed == 8 and len(stored) == 8, "the boot start stores every duration (%d)" % probed)
+        check(all(in_scope), "the boot start probes in a priority scope")
+        if together:
+            check(elapsed < 0.9 and len(probe_threads) > 1, "together: the boot durations probe on several threads (%.2fs)" % elapsed)
+        else:
+            check(elapsed >= 1.5 and len(probe_threads) == 1, "in sequence: the boot durations probe one at a time (%.2fs)" % elapsed)
+    stored.clear()
+    in_scope.clear()
+    probed, elapsed = prime("05", items[:2], pace=True)
+    check(probed == 2 and elapsed >= 0.5 and not any(in_scope), "the paced background priming stays one at a time and outside a priority scope")
+
+
+class TestFirstStartScanPlan(_SectionCase):
+    """The first-start scans of the playing file run together on a PC that can spare the threads and in sequence on one that cannot"""
+
+    def test_first_start_scan_plan(self):
+        self.run_section(suite_first_start_scan_plan)
+
+    def test_first_start_remaining_scans(self):
+        self.run_section(suite_first_start_remaining_scans)
+
+
+class TestPendingProbeFirstStart(_SectionCase):
+    """The first start of a station probes its pending files in parallel and never waits on its own live flag"""
+
+    def test_pending_probe_first_start(self):
+        self.run_section(suite_pending_probe_does_not_wait_on_own_flag)
+
+
+class TestResolvePartSeek(_SectionCase):
+    """A part of a show cut by commercials seeks to its place in the file, never to its own length"""
+
+    def test_resolve_part_seek(self):
+        self.run_section(suite_resolve_part_seek)
 
 
 # ============================================================================
 # SECTION: Broken episode swap, random order
 # ============================================================================
-
-def suite_broken_swap_random():
-    import copy as _cp
-    import random as _rnd
-    ns = {"db": types.SimpleNamespace(config={"media_probe_cache": {}}, save_settings=lambda **k: None),
-          "log": MagicMock(), "media": media, "random": _rnd, "PATH_MISSING": "missing", "PATH_UNKNOWN": "unknown",
-          "_path_status": lambda p: "ok", "_log_info_throttled": lambda *a, **k: None,
-          "_mark_file_broken": lambda *a, **k: None,
-          "resolve_track_duration": media.resolve_track_duration, "split_movies_and_series": media.split_movies_and_series,
-          "pair_short_episodes": media.pair_short_episodes, "build_raw_tracks": media.build_raw_tracks, "build_pending_tracks": media.build_pending_tracks,
-          "_cached_path_exists": lambda p: True, "note_random_episode_played": media.note_random_episode_played}
-    for fn in ("_get_show_episode_context", "_show_rotation_entries", "_show_raw_episodes", "_keep_swap_groups", "_resolve_broken_episode"):
-        exec(compile(get_function_source(fn), "<extracted:%s>" % fn, "exec"), ns)
-
-    def eps(name, n, dur):
-        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": dur} for i in range(n)]
-
-    def expand(lineup):
-        out = []
-        for t in lineup:
-            out += [t.get("pair_ep1_path", t["path"]), t.get("pair_ep2_path", "")] if t.get("is_pair") else [t["path"]]
-        return [p for p in out if p]
-
-    for pair_minutes, dur, count in ((0, 1500, 12), (15, 600, 24)):
-        raw = eps("Alpha", count, dur) + eps("Beta", count, dur)
-        info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": pair_minutes, "episode_order_mode": "random",
-                "schedules": {"Evening": raw}, "playback_log": {}, "broken_files": []}
-        _, pos1, _ = media.build_block_rotation(raw, info, {}, 2026100, 28800, "05", None, "1:200")
-        lineup2, pos2, _ = media.build_block_rotation(raw, info, pos1, 2026101, 28800, "05", None, "1:200")
-        info["playback_log"]["show_pos"] = pos2
-        info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup2)))
-        label = "pairing %d min" % pair_minutes
-        entries = ns["_show_rotation_entries"](info, "Evening", "Alpha")
-        in_bag = {p for i, e in enumerate(entries) if i in set(media.random_bag_entry_indices(pos2, "Alpha", entries, channel_id="05"))
-                  for p in ([e.get("pair_ep1_path"), e.get("pair_ep2_path")] if e.get("is_pair") else [e["path"]])}
-        before = list(info["playback_log"]["sched_cached_tracks"])
-        planned = [p for p in before if "/Alpha/" in p]
-        for trial in range(25):
-            trial_info = _cp.deepcopy(info)
-            _rnd.seed(trial)
-            failed = planned[trial % len(planned)]
-            sub = ns["_resolve_broken_episode"](trial_info, failed, "Evening", channel_id="05")
-            after = trial_info["playback_log"]["sched_cached_tracks"]
-            ok = (sub is not None and sub["file"] in in_bag and sub["file"] not in before and sub["file"] != failed)
-            check(ok, label + ", trial %d: the substitute is an episode still in the shuffle bag and not in this block" % trial)
-            if not ok:
-                break
-            at = before.index(failed)
-            new_paths = after[at:at + (len(after) - len(before) + 1)]
-            check(after[:at] == before[:at] and after[at + len(new_paths):] == before[at + 1:] and new_paths[0] == sub["file"],
-                  label + ", trial %d: only the failed file is replaced, nothing aired is removed" % trial)
-            bag_after = trial_info["playback_log"]["show_pos"]["05:alpha"]["bag"]
-            check(len(bag_after) == len(pos2["05:alpha"]["bag"]) - 1,
-                  label + ", trial %d: the substitute leaves the bag, so it cannot be drawn again this cycle" % trial)
-
-    tiny = eps("Tiny", 3, 1500)
-    info = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 0, "episode_order_mode": "random",
-            "schedules": {"Evening": tiny}, "playback_log": {}, "broken_files": []}
-    lineup, pos, _ = media.build_block_rotation(tiny, info, {}, 2026100, 28800, "05", None, "1:200")
-    info["playback_log"]["show_pos"] = pos
-    info["playback_log"]["sched_cached_tracks"] = list(dict.fromkeys(expand(lineup)))
-    saved = list(info["playback_log"]["sched_cached_tracks"])
-    failed = next(p for p in saved if "/Tiny/" in p)
-    sub = ns["_resolve_broken_episode"](info, failed, "Evening", channel_id="05")
-    check(sub is None and info["playback_log"]["sched_cached_tracks"] == saved,
-          "a show whose other episodes are all in this block or already aired gets no substitute and its saved lineup is left as it was")
-
-
-class TestBrokenSwapRandom(_SectionCase):
-    """A broken episode in random order is replaced only by an episode still in the shuffle bag"""
-
-    def test_broken_swap_random(self):
-        self.run_section(suite_broken_swap_random)
-
 
 # ============================================================================
 # SECTION: Two slot mode with small shows
@@ -8367,7 +9720,8 @@ class TestTwoSlotsSmallShows(_SectionCase):
 # ============================================================================
 
 def suite_commercial_tracks():
-    cache = {os.path.normpath("/c/probed.mp4"): {"duration": 45.7}}
+    cache = {"/c/probed.mp4": {"duration": 45.7}}
+    _install_cache_hub(cache)
     items = [
         {"path": "/c/probed.mp4", "duration": 10},
         {"path": "/c/stored.mp4", "duration": 62},
@@ -8380,21 +9734,21 @@ def suite_commercial_tracks():
         {"path": "", "duration": 15},
     ]
     exists = lambda p: "missing" not in p
-    out = media.build_commercial_tracks(items, cache, exists)
+    out = media.build_commercial_tracks(items, exists)
     got = {t["path"]: t["duration"] for t in out}
     check(got.get("/c/probed.mp4") == 45, "a probed duration wins over the stored one and is a whole number")
     check(got.get("/c/stored.mp4") == 62, "the stored duration is used when nothing was probed")
-    check(got.get("/c/nostore.mp4") == 30 and got.get("/c/zero.mp4") == 30, "no duration or zero becomes the 30 second default")
+    check("/c/nostore.mp4" not in got and "/c/zero.mp4" not in got, "a commercial with no known length, or a zero length, is left out and never given a guessed length")
     check("/c/long.mp4" not in got, "a commercial over the longest allowed length is left out")
     check("/c/missing.mp4" not in got, "a path that does not exist is left out")
-    check(got.get("/c/plain.mp4") == 30 and got.get("/c/viafile.mp4") == 15, "a plain string and a file key are both read")
-    check(len(out) == 6 and [t["path"] for t in out] == [p for p in ["/c/probed.mp4", "/c/stored.mp4", "/c/nostore.mp4", "/c/zero.mp4", "/c/plain.mp4", "/c/viafile.mp4"]], "order is kept and nothing else is added")
+    check("/c/plain.mp4" not in got and got.get("/c/viafile.mp4") == 15, "a plain string has no known length so it is left out, and a file key is read")
+    check(len(out) == 3 and [t["path"] for t in out] == ["/c/probed.mp4", "/c/stored.mp4", "/c/viafile.mp4"], "order is kept and nothing else is added")
     check(all(set(t) == {"path", "duration"} and isinstance(t["duration"], int) for t in out), "each track holds only a path and an int duration")
-    uncapped = media.build_commercial_tracks(items, cache, exists, max_seconds=None)
+    uncapped = media.build_commercial_tracks(items, exists, max_seconds=None)
     check(any(t["path"] == "/c/long.mp4" and t["duration"] == 301 for t in uncapped), "with no cap the long commercial is kept")
-    check(media.COMMERCIAL_DEFAULT_SECONDS == 30 and media.COMMERCIAL_MAX_SECONDS == 300, "default and longest length are 30 and 300 seconds")
+    check(media.COMMERCIAL_MAX_SECONDS == 300, "the maximum commercial length is 300 seconds")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_commercial_tracks(") == 2, "the main script builds commercial tracks only through the shared function")
+    check(src.count("build_commercial_tracks(") == 4, "the main script builds commercial tracks only through the shared function (holiday, main schedule, the block-start overrun check, and the hub's future rows)")
     check("COMMERCIAL_DEFAULT_DUR" not in src and "_H_COMMERCIAL_MAX_SECONDS" not in src, "the old local copies are gone from the main script")
 
 
@@ -8422,7 +9776,7 @@ def suite_block_seeds():
     check(media.block_day_seed(d, 5, 100) == media.block_day_seed(d, "05", 100), "channel 5 and 05 give the same seed")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
     check("_block_seed_offsets" not in src and "_peek_offsets" not in src, "the main script keeps no offset table of its own")
-    check(src.count("block_day_seed(") == 3, "the scheduler, the overlap and the catch-up use the shared seed; the read-only lineup in media.py uses it too")
+    check(src.count("block_day_seed(") == 3, "the scheduler, the catch-up and the add-media block prebuild use the shared seed; the read-only lineup in media.py uses it too")
     check("tm_yday + int(target_clean_key) + block_offset" not in src, "the scheduler no longer works out its seed by hand")
 
 
@@ -8442,7 +9796,7 @@ def suite_block_rotation():
                                         fixed_show_order=None, block_duration_seconds=8 * 3600, channel_id="05", order_seed="1:200")
     check(media.build_block_rotation(eps, info2, {}, 123, 8 * 3600, "05", None, "1:200") == direct2, "pairing threshold and episode order come from the channel")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_block_rotation(") == 3, "the scheduler (three places) builds a rotation through the wrapper; the read-only lineup in media.py does too")
+    check(src.count("build_block_rotation(") == 4, "the scheduler (three places) and the add-media block prebuild build a rotation through the wrapper; the read-only lineup in media.py does too")
     check("_seed_now = (now - datetime.timedelta" not in src, "the next-up builder takes the block's start date from the shared function")
 
 
@@ -8484,14 +9838,16 @@ def suite_sequential_position_by_file():
         eps = _seq_show([rng.choice([600, 700, 800, 1500, 1800, 2700]) for _ in range(rng.randint(1, 12))])
         thr = rng.choice([0, 900])
         paired = media.pair_short_episodes(eps, thr) if thr > 0 else list(eps)
+        if any(isinstance(e, dict) and (e.get("leftover_partner_path") or (thr > 0 and not e.get("is_pair") and e.get("duration", 0) < thr)) for e in paired):
+            continue
         old = new = rng.randrange(len(paired))
         for _ in range(8):
-            count = rng.randint(1, 3)
+            count = rng.randint(1, min(3, len(paired)))
             expected = [_seq_paths(paired[(old + i) % len(paired)]) for i in range(count)]
             old = (old + count) % len(paired)
             got, new = media.take_sequential_entries(eps, new, count, thr)
             mismatches += expected != [_seq_paths(e) for e in got]
-    check(mismatches == 0, "with no file joining or leaving, 2400 blocks give the lineups the list-number position gave (%d differ)" % mismatches)
+    check(mismatches == 0, "with no file joining or leaving and an even number of leftover short files, the blocks give the lineups the list-number position gave (%d differ)" % mismatches)
 
     long_eps = _seq_show([1800] * 6)
     entries, state = media.take_sequential_entries(long_eps, 0, 2, 900)
@@ -8540,7 +9896,8 @@ def suite_sequential_position_by_file():
     entries, state = media.take_sequential_entries(joined, {"next": shorts[2]["path"], "owed": []}, 1, 900)
     check(_seq_paths(entries[0]) == [shorts[2]["path"], shorts[3]["path"]], "an episode that already aired is never pulled into a pair when a short file joins before it")
     entries, state = media.take_sequential_entries(shorts, {"next": shorts[2]["path"], "owed": []}, 3, 900)
-    check([p for e in entries for p in _seq_paths(e)] == [shorts[2]["path"], shorts[3]["path"], shorts[4]["path"], shorts[5]["path"]], "pairing runs forward from the file that airs next, and the leftover short file airs in the bundle after the long one")
+    check([p for e in entries for p in _seq_paths(e)] == [shorts[2]["path"], shorts[3]["path"], shorts[4]["path"], shorts[5]["path"], shorts[0]["path"]]
+          and all(len(_seq_paths(e)) in (1, 2) for e in entries), "pairing runs forward from the file that airs next, and the leftover short file pairs with the first episode of the next pass after the long one")
     flat = [p for e in entries for p in _seq_paths(e)]
     check(len(flat) == len(set(flat)), "no file is in the lineup twice in one take")
 
@@ -8550,7 +9907,7 @@ def suite_sequential_position_by_file():
     for _ in range(4):
         got, state = media.take_sequential_entries(odd, state, 1, 900)
         seen.append([os.path.basename(p)[-10:-4] for p in _seq_paths(got[0])])
-    check(seen == [["S01E01", "S01E02"], ["S01E03"], ["S01E01", "S01E02"], ["S01E03"]], "a short episode with no partner airs once per pass in the leftover bundle (%s)" % seen)
+    check(seen == [["S01E01", "S01E02"], ["S01E03", "S01E01"], ["S01E02", "S01E03"], ["S01E01", "S01E02"]], "a short episode with no partner never airs alone: it pairs with the first episode of the next pass and every episode airs once per round (%s)" % seen)
 
     swapped = media.sequential_state_after_path(long_eps, long_eps[2]["path"], 0, 900)
     check(swapped == {"next": long_eps[3]["path"], "owed": []}, "after a swap the position is the file after the last one aired")
@@ -8571,8 +9928,8 @@ def suite_sequential_position_by_file():
     check(order == ["S01E01", "S01E02", "S01E03", "S01E04", "S01E05", "S01E06", "S01E01", "S01E02", "S01E03", "S01E04"], "two blocks with different file lists share one position that follows the file (%s)" % order)
 
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check("def _show_raw_episodes(" in src and "sequential_state_after_path(" in src, "the broken-episode swap sets the position by file")
-    check("% _rot_n" not in src, "the swap writes no list number as a position any more")
+    check("def _resolve_broken_episode(" not in src and "sequential_state_from_entry_index(" not in src, "the broken-episode swap that set positions is gone, so nothing in the script sets a position from a list number")
+    check("% _rot_n" not in src, "the script writes no list number as a position")
 
 
 class TestSequentialPositionByFile(_SectionCase):
@@ -8730,8 +10087,8 @@ def suite_random_position_by_file():
           "a block build saves every random show and the movie list by file")
 
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check("random_bag_entry_indices(" in src and "len(_rot_eps), _idx" not in src,
-          "the broken-episode swap reads and writes the bag through the shared functions")
+    check("def _resolve_broken_episode(" not in src and "len(_rot_eps), _idx" not in src,
+          "the broken-episode swap that read and wrote the bag is gone, so the script keeps no bag as list numbers")
 
 
 class TestRandomPositionByFile(_SectionCase):
@@ -8757,15 +10114,18 @@ def suite_unscanned_not_placed():
     items = [{"path": "/m/A/Season 1/A S01E01.mkv", "duration": 1800},
              {"path": "/m/A/Season 1/A S01E02.mkv", "duration": 0},
              {"path": "/m/Movies/Big (1999).mkv", "duration": 0}]
-    raw = media.build_raw_tracks(items, {}, exists)
-    check([t["path"] for t in raw] == [items[0]["path"]], "a file with no known duration is left out of the raw tracks")
+    raw = media.build_raw_tracks(items, exists)
+    check([t["path"] for t in raw] == [items[0]["path"], items[2]["path"]] and raw[1]["duration"] == media.HUB_MOVIE_ESTIMATE_SECONDS,
+          "an episode with no known duration and fewer than two scanned in its series is left out of the raw tracks; an unscanned movie is placed at the movie estimate")
     check(all(not t.get("_duration_estimated") for t in raw), "no placed track carries the estimated mark")
-    check([t["path"] for t in media.build_pending_tracks(items, {}, exists)] == [items[1]["path"], items[2]["path"]], "the files not scanned yet are listed, in schedule order")
-    check(len(media.build_raw_tracks(items, {}, exists, include_unknown=True)) == 3, "include_unknown puts every file back, marked estimated")
+    check([t["path"] for t in media.build_pending_tracks(items, exists)] == [items[1]["path"], items[2]["path"]], "the files not scanned yet are listed, in schedule order")
+    check(len(media.build_raw_tracks(items, exists, include_unknown=True)) == 3, "include_unknown puts every file back, marked estimated")
     probe = {os.path.normpath(items[1]["path"]): {"duration": 1500}}
-    check(len(media.build_raw_tracks(items, probe, exists)) == 2 and len(media.build_pending_tracks(items, probe, exists)) == 1, "a duration from the probe cache makes the file known")
-    check(media.build_raw_tracks(items, {}, lambda p: "E01" in p) == media.build_raw_tracks(items[:1], {}, exists), "a path that does not exist is neither placed nor pending")
-    check(media.build_pending_tracks(items, {}, lambda p: "E01" in p) == [], "a missing file is not listed as pending")
+    _hub_prev = _install_cache_hub(probe)
+    check(len(media.build_raw_tracks(items, exists)) == 3 and len(media.build_pending_tracks(items, exists)) == 1, "a duration from the hub makes the file known")
+    media.set_duration_hub(_hub_prev)
+    check(media.build_raw_tracks(items, lambda p: "E01" in p) == media.build_raw_tracks(items[:1], exists), "a path that does not exist is neither placed nor pending")
+    check(media.build_pending_tracks(items, lambda p: "E01" in p) == [], "a missing file is not listed as pending")
 
     def run_sequential(known_numbers, pending_numbers, passes, mode="one_slot", thr=900, durations=None, show="Show X"):
         durations = durations or {}
@@ -8862,11 +10222,12 @@ def suite_unscanned_not_placed():
     check(fix[0] == {}, "a pending file that is the same episode as a scanned one does not block the show")
 
     main_src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(main_src.count('"reason": "not_scanned"') >= 5, "the scheduler returns Static with the reason not_scanned in every case it has nothing scanned to air")
+    check(main_src.count('"reason": "not_scanned"') >= 3 and main_src.count('"reason": "probe_failed"') >= 1, "the scheduler returns Static with the reason not_scanned at its new-block, timeline and next-cycle checks, and probe_failed when the immediate probe finds nothing")
+    check(main_src.count("build_block_rotation(") <= main_src.count("pending_tracks="), "every scheduler rotation call is given the files not scanned")
     check("build_pending_tracks(folder_items" in main_src and "pending_tracks=_pending_tracks" in main_src, "the scheduler passes the files not scanned to every rotation call")
     ui_src = open(os.path.join(os.path.dirname(MAIN_SCRIPT), "ui.py"), encoding="utf-8").read() if os.path.exists(os.path.join(os.path.dirname(MAIN_SCRIPT), "ui.py")) else ""
     if ui_src:
-        check("media.build_raw_tracks(" in ui_src and "_duration_estimated" not in ui_src, "the guide builds its tracks through the shared function and holds no copy of the estimated mark")
+        check("media.read_block_lineup(" in ui_src and "media.read_holiday_lineup(" in ui_src and "_duration_estimated" not in ui_src, "the guide reads its lineups through the shared functions and holds no copy of the estimated mark")
 
     rec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduler_scan_record.json")
     if os.path.exists(rec_path):
@@ -8959,21 +10320,38 @@ SCHED_RECORD_PATH = os.path.join(HERE, "scheduler_record.json")
 
 SCHED_RECORD_FUNCS = [
     "_apply_repeat_guard", "_cached_lineup_durations_stale", "_channel_intro_seed",
-    "_channel_schedule_path_set", "_checkpoint_probe_cache", "_file_in_channel_schedule", "_freeze_aired_prefix_durations",
-    "_get_cached_media_probe", "_get_or_set_block_anchor", "_get_probe_library", "_governor_priority_scope",
+    "_channel_schedule_path_set", "_file_in_channel_schedule", "_freeze_aired_prefix_durations",
+    "_read_file_probe_facts", "_get_or_set_block_anchor", "_get_probe_library", "_governor_priority_scope",
     "_log_info_throttled", "_log_probe_failure", "_log_warn_throttled", "_marathon_start_seed",
     "_maybe_correct_estimated_target_duration", "_missed_block_day_seeds", "_mixer_seekable_formats",
-    "_prime_block_durations_on_cold_start", "_probe_and_persist_duration", "_probe_checkpoint_save_now",
-    "_snapshot_track_durations", "_start_order_seed", "_store_cached_media_probe", "_timeline_whole_episode_durations",
+    "_prime_block_durations_on_cold_start", "_probe_and_persist_duration",
+    "_snapshot_track_durations", "_start_order_seed", "_save_file_probe_facts", "_hub_note_measured_duration", "_timeline_whole_episode_durations",
     "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "calculate_slotted_playback_state",
+    "_block_overrun_anchor", "_channel_is_server_streamed", "_note_aired_cycle", "_note_missed_blocks", "_priority_probe_pending_schedule", "_probe_pending_schedule_one", "_set_saved_lineup",
 ]
 
+SCHED_RECORD_ENGINE_STUBS = {
+    "initialize_vlc_on_demand": lambda *a, **k: None,
+    "set_live_playback_priority": lambda *a, **k: None,
+    "_probe_duration_and_dims_combined": lambda path, *a, **k: (0, None),
+    "_patch_probed_gain": lambda *a, **k: None,
+    "_get_library_gain": lambda path: None,
+    "_get_library_dims": lambda path: None,
+    "_get_gain_hub": lambda: None,
+    "_store_loudness_gain": lambda path, gain: False,
+    "performance_governor": None,
+    "_sync_hub_rows_for_block": lambda *args, **kwargs: None,
+    "_write_missed_blocks_to_hub": lambda *args, **kwargs: None,
+    "_hub_airing_entry": lambda *args, **kwargs: None,
+    "copy": __import__("copy"),
+}
+
 SCHED_RECORD_GLOBALS = [
-    "_EMPTY_FOLDER_DIAG_LOGGED", "_ONDEMAND_DURATION_PROBE_COOLDOWN_S", "_PROBE_CHECKPOINT_MIN_INTERVAL_S",
+    "_EMPTY_FOLDER_DIAG_LOGGED", "_ONDEMAND_DURATION_PROBE_COOLDOWN_S", 
     "_SCHED_MEMBERSHIP_CACHE_SECONDS", "_THROTTLED_LOG_INTERVAL_S", "_cold_primed_channels", "_cold_primed_channels_lock",
     "_duration_precache_inflight", "_intro_seed_lock", "_ondemand_duration_probe_next", "_probe_block_timeline_cache",
-    "_probe_checkpoint_last", "_probe_checkpoint_lock", "_probe_checkpoint_timer", "_probe_library_lock",
-    "_probe_library_singleton", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
+    "_probe_library_lock",
+    "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
 ]
 
 SCHED_RECORD_SCENARIOS = [
@@ -9056,6 +10434,7 @@ def _sched_record_ns(channels, clock, ticks):
           "_cached_path_exists": lambda p: True, "_is_drive_responsive": lambda p: True,
           "_path_exists_cache": {}, "_path_exists_cache_lock": threading.Lock(), "_unresponsive_drive_roots": set(),
           "PATH_MISSING": 0, "PATH_UNKNOWN": 2}
+    ns.update(SCHED_RECORD_ENGINE_STUBS)
     assigns = {}
     for node in MAIN_TREE.body:
         if isinstance(node, ast.Assign):
@@ -9121,7 +10500,9 @@ def suite_scheduler_record():
         if current in needed or current not in tops:
             continue
         needed.add(current)
-        pending.extend(x.id for x in ast.walk(tops[current]) if isinstance(x, ast.Name))
+        decorators = {d.id for d in tops[current].decorator_list if isinstance(d, ast.Name)}
+        pending.extend(x.id for x in ast.walk(tops[current])
+                       if isinstance(x, ast.Name) and x.id not in SCHED_RECORD_ENGINE_STUBS and x.id not in decorators)
     missing = sorted(needed - set(SCHED_RECORD_FUNCS))
     check(not missing, "the record harness holds every function the scheduler reaches (missing: %s)" % missing)
     extra = sorted(set(SCHED_RECORD_FUNCS) - needed)
@@ -9139,6 +10520,7 @@ def suite_scheduler_record():
             check(res.get("mode") in ("Video", "Commercial", "Static", "Visualizer"), "%s %s: a known mode (%s)" % (key, row["at"], res.get("mode")))
             if res.get("mode") in ("Video", "Commercial"):
                 check(res.get("file") and res.get("seek", 0) >= 0, "%s %s: a file and a seek of zero or more" % (key, row["at"]))
+            check(res.get("mode") != "Static", "%s %s: every file is scanned, so the channel is never on Static" % (key, row["at"]))
 
     if os.environ.get("SCHED_RECORD_WRITE"):
         with open(SCHED_RECORD_PATH, "w", encoding="utf-8") as handle:
@@ -9255,6 +10637,8 @@ def _sched_scan_all():
 
 def suite_scheduler_scan_record():
     import json
+    check("_probe_pending_schedule_one" in SCHED_RECORD_FUNCS and "_PENDING_SCHEDULE_PROBE_PARALLEL" in SCHED_RECORD_GLOBALS,
+          "the record harness runs the real pending-file probe, with the library probe itself finding nothing")
     first = _sched_scan_all()
     second = _sched_scan_all()
     check(first == second, "the scan record is the same on two fresh runs")
@@ -9306,20 +10690,31 @@ def _night_date_run(channels, moments):
     clock, ticks = [moments[0]], [0]
     ns = _sched_record_ns(channels, clock, ticks)
     caught = []
-    real_fast_forward = ns["fast_forward_show_pos"]
+    replaying = [False]
+    real_rotation, real_catch_up = media.build_block_rotation, media.catch_up_state
 
-    def spy(raw, mode, show_pos, seeds, *args, **kwargs):
-        caught.append(list(seeds))
-        return real_fast_forward(raw, mode, show_pos, seeds, *args, **kwargs)
+    def rotation_spy(raw, ch_info, show_pos, day_seed, *args, **kwargs):
+        if replaying[0]:
+            caught.append(day_seed)
+        return real_rotation(raw, ch_info, show_pos, day_seed, *args, **kwargs)
 
-    ns["fast_forward_show_pos"] = spy
-    for moment in moments:
-        clock[0] = moment
-        ticks[0] += 10000
-        with patch.object(media, "_cached_path_exists", lambda p: True):
-            ns["calculate_slotted_playback_state"]("05")
+    def catch_up_spy(*args, **kwargs):
+        replaying[0] = True
+        try:
+            return real_catch_up(*args, **kwargs)
+        finally:
+            replaying[0] = False
+
+    with patch.object(media, "build_block_rotation", rotation_spy), patch.object(media, "catch_up_state", catch_up_spy):
+        for moment in moments:
+            clock[0] = moment
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                ns["calculate_slotted_playback_state"]("05")
     plog = _sched_record_round(channels["05"]["playback_log"])
-    return {key: plog.get(key) for key in NIGHT_STATE_KEYS}, caught
+    state = {key: plog.get(key) for key in NIGHT_STATE_KEYS}
+    state["cycle_start_positions"] = (plog.get("sched_cycle_start_pos") or {}).get("positions")
+    return state, list(dict.fromkeys(caught))
 
 
 def suite_night_block_date():
@@ -9336,8 +10731,8 @@ def _night_block_date_checks():
     source = main_function_source("calculate_slotted_playback_state")
     check("_seed_date = block_start_date(now, current_block)" in source, "the scheduler takes its seed date from block_start_date")
     check("block_day_seed(_seed_date, target_clean_key, block_offset)" in source, "the scheduler seeds the block from that date")
-    check(re.search(r"_missed_block_day_seeds\(\s*_prev_sched_block_key, current_block, target_clean_key, block_offset, _seed_date\)", source) is not None,
-          "the catch-up is given the same date as the seed")
+    check("media.catch_up_state(" in source and "_prev_sched_block_key, block_key" in source and "block_key = block_key_for(now, current_block)" in source,
+          "the catch-up is given the saved block key and the current block key, and the Night block's key carries the date it started")
     check("block_day_seed(now," not in source, "no seed in the scheduler is made from the clock's date")
 
     evening = datetime.datetime(2026, 10, 13, 22, 30, 0)
@@ -9349,17 +10744,27 @@ def _night_block_date_checks():
         at_twenty, _ = _night_date_run(fresh(), [evening])
         at_one, _ = _night_date_run(fresh(), [after_midnight])
         for key in NIGHT_STATE_KEYS:
+            if key == "show_pos":
+                continue
             check(at_twenty[key] == at_one[key], "%s: a Night block built at 01:00 has the same %s as one built at 22:30" % (name, key))
+        check(at_twenty["cycle_start_positions"] is not None and at_twenty["cycle_start_positions"] == at_one["cycle_start_positions"],
+              "%s: a Night block built at 01:00 starts its first cycle from the same show positions as one built at 22:30" % name)
 
         first = fresh()
         _night_date_run(first, [datetime.datetime(2026, 10, 10, 21, 0, 0)])
         before_state, before_seeds = _night_date_run(copy.deepcopy(first), [datetime.datetime(2026, 10, 13, 23, 0, 0)])
         after_state, after_seeds = _night_date_run(copy.deepcopy(first), [datetime.datetime(2026, 10, 14, 1, 0, 0)])
-        expected = [[media.block_day_seed(datetime.date(2026, 10, day), "05", media.block_seed_offset("Night", 0)) for day in (11, 12)]]
-        check(before_seeds == expected, "%s: starting at 23:00 catches up over the two missed Night blocks" % name)
-        check(after_seeds == expected, "%s: starting at 01:00 catches up over the same two Night blocks, not three" % name)
-        for key in NIGHT_STATE_KEYS:
-            check(before_state[key] == after_state[key], "%s: after the same time off, 23:00 and 01:00 leave the same %s" % (name, key))
+        night_offset = media.block_seed_offset("Night", 0)
+        night_seed = {day: media.block_day_seed(datetime.date(2026, 10, day), "05", night_offset) for day in (10, 11, 12, 13, 14)}
+        expected = [night_seed[11], night_seed[12]]
+        before_night = [x for x in before_seeds if x in night_seed.values() and x != night_seed[10]]
+        after_night = [x for x in after_seeds if x in night_seed.values() and x != night_seed[10]]
+        check(before_night == expected, "%s: starting at 23:00 catches up over the two missed Night blocks and not the one on air" % name)
+        check(after_night == expected, "%s: starting at 01:00 catches up over the same two Night blocks, not three" % name)
+        check(before_seeds == after_seeds, "%s: starting at 23:00 and at 01:00 replay exactly the same blocks" % name)
+        continuous_state, _ = _night_date_run(copy.deepcopy(first), [datetime.datetime(2026, 10, 13, 23, 0, 0), datetime.datetime(2026, 10, 14, 1, 0, 0)])
+        for key in tuple(NIGHT_STATE_KEYS) + ("cycle_start_positions",):
+            check(continuous_state[key] == after_state[key], "%s: a start at 01:00 after the time off leaves the same %s as a station that kept running from 23:00" % (name, key))
 
 
 class TestNightBlockDate(_SectionCase):
@@ -9443,8 +10848,8 @@ def suite_block_key_length():
     check(media.block_length_seconds("Nothing") == 28800 and media.block_length_seconds("Nothing", 100) == 100, "an unknown name gets the default")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
     calls = lambda fn: sum(1 for n in ast.walk(MAIN_TREE) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == fn)
-    check(calls("block_key_for") == 5, "the scheduler (five places) takes a block's key from the shared function; the read-only lineup in media.py does too")
-    check(calls("block_length_seconds") == 7, "the scheduler (five places, two for the previous block) takes a block's length from the shared table; the read-only lineup in media.py does too")
+    check(calls("block_key_for") == 6, "the scheduler (five places) and the add-media block prebuild take a block's key from the shared function; the read-only lineup in media.py does too")
+    check(calls("block_length_seconds") == 6, "the scheduler (five places) and the add-media block prebuild take a block's length from the shared table; the read-only lineup in media.py does too")
     check("_block_len_lut" not in src and "_prev_block_secs = 14400" not in src and "_prev_block_secs = 28800" not in src, "the main script keeps no length table of its own")
     check("tm_yday}_Night" not in src and "tm_yday}_Full Day" not in src and "tm_yday}_Marathon" not in src and "tm_yday}_{current_block}" not in src, "no block key is built by hand")
     check("block_duration_seconds = 8 * 3600" not in src and "block_duration_seconds = 86400" not in src and "(block_end_hour - block_start_hour) * 3600" not in src,
@@ -9481,7 +10886,12 @@ def suite_block_lineup():
 
     def read(block, now, ch_info=None, peek=False, probe=None):
         seeds.clear()
-        return media.read_block_lineup("5", ch_info or info, block, now, probe or {}, exists, start_seed, peek_only=peek)
+        _hub_prev = _install_cache_hub(probe) if probe else None
+        try:
+            return media.read_block_lineup("5", ch_info or info, block, now, exists, start_seed, peek_only=peek)
+        finally:
+            if probe:
+                media.set_duration_hub(_hub_prev)
 
     evening = datetime.datetime(2026, 10, 13, 14, 0)
     before = _copy.deepcopy(info)
@@ -9489,7 +10899,7 @@ def suite_block_lineup():
     check(lineup == [] and name is None, "a block with no existing file gives an empty lineup and no name")
     check(seeds == [] and info == before, "an empty block never asks for the start number and writes nothing")
 
-    raw = media.build_raw_tracks(info["schedules"]["Evening"], {}, exists, keep_gain=True)
+    raw = media.build_raw_tracks(info["schedules"]["Evening"], exists, keep_gain=True)
     expected = media.build_block_rotation(raw, info, _copy.deepcopy(info["playback_log"]["show_pos"]),
                                           media.block_day_seed(evening, "05", 200), 28800, "5", ["C", "A", "B", "E", "D"], "1:200")[0]
     lineup, name = read("Evening", evening, peek=True)
@@ -9498,7 +10908,7 @@ def suite_block_lineup():
     check(any("gain" in t for t in lineup) and not all("gain" in t for t in lineup), "each track keeps its schedule entry's gain and tracks with none get none")
 
     lineup, _ = read("Odd", evening, peek=True)
-    odd_raw = media.build_raw_tracks(info["schedules"]["Odd"], {}, exists, keep_gain=True)
+    odd_raw = media.build_raw_tracks(info["schedules"]["Odd"], exists, keep_gain=True)
     odd_expected = media.build_block_rotation(odd_raw, info, _copy.deepcopy(info["playback_log"]["show_pos"]),
                                               media.block_day_seed(evening, "05", 400), 28800, "5", None, "1:400")[0]
     check(lineup == odd_expected and seeds == [400], "an unknown block name gets the offset 400 and the 8 hour length")
@@ -9575,8 +10985,8 @@ def suite_block_lineup():
 
     calls_seen = []
 
-    def fake_lineup(ch_key, ch_info, block_name, now, media_probe_cache, path_exists, start_order_seed, peek_only=False):
-        calls_seen.append((ch_key, block_name, media_probe_cache, path_exists, start_order_seed, peek_only))
+    def fake_lineup(ch_key, ch_info, block_name, now, path_exists, start_order_seed, peek_only=False):
+        calls_seen.append((ch_key, block_name, path_exists, start_order_seed, peek_only))
         return (([], None) if block_name == "Empty" else ([{"path": "/m/a.mkv", "duration": 1}], block_name))
 
     sentinel_exists, sentinel_seed = (lambda p: True), (lambda i, o: "x")
@@ -9590,8 +11000,8 @@ def suite_block_lineup():
     first = wrapper("05", one, "Evening", evening, peek_only=True)
     second = wrapper("05", one, "Evening", evening, peek_only=True)
     check(first == second == ([{"path": "/m/a.mkv", "duration": 1}], "Evening") and len(calls_seen) == 1, "the result is kept for a few seconds, so the second read does not build again")
-    check(calls_seen[0][2] is probe_cache and calls_seen[0][3] is sentinel_exists and calls_seen[0][4] is sentinel_seed and calls_seen[0][5] is True,
-          "the probe cache, the path check, the start number function and peek_only are handed through")
+    check(calls_seen[0][2] is sentinel_exists and calls_seen[0][3] is sentinel_seed and calls_seen[0][4] is True,
+          "the path check, the start number function and peek_only are handed through, with no old cache")
     empty_a = wrapper("05", one, "Empty", evening)
     empty_b = wrapper("05", one, "Empty", evening)
     check(empty_a == empty_b == ([], None) and len(calls_seen) == 2, "an empty block is kept for a few seconds too")
@@ -9630,22 +11040,23 @@ def suite_channel_timeline():
         for minutes in (0, 15, 25, 45):
             info = {"commercial_placement": placement, "pair_threshold_minutes": minutes}
             floor = (minutes if minutes > 0 else 15) * 60
-            direct = media.build_block_timeline(shows, ads, placement, 4242, interrupt_floor_seconds=floor, media_probe_cache=cache, commercial_state=None)
-            wrapped = media.build_channel_timeline(shows, ads, info, 4242, media_probe_cache=cache)
+            direct = media.build_block_timeline(shows, ads, placement, 4242, interrupt_floor_seconds=floor, commercial_state=None)
+            wrapped = media.build_channel_timeline(shows, ads, info, 4242)
             check(wrapped == direct, "%s, threshold %s: the wrapper gives what build_block_timeline gives with the channel's placement and floor" % (placement, minutes))
             state = direct[2]
             again = media.build_block_timeline(shows, ads, placement, 4243, interrupt_floor_seconds=floor, commercial_state=state)
             check(media.build_channel_timeline(shows, ads, info, 4243, commercial_state=state) == again,
-                  "%s, threshold %s: the saved commercial state and a missing probe cache pass straight through" % (placement, minutes))
+                  "%s, threshold %s: the saved commercial state passes straight through" % (placement, minutes))
     default = media.build_block_timeline(shows, ads, "interrupt_half_hour", 7, interrupt_floor_seconds=900)
     check(media.build_channel_timeline(shows, ads, {}, 7) == default, "a channel with no settings uses interrupt placement and the 15 minute floor")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_channel_timeline(") == 5, "the scheduler builds all five timelines (two holiday, three main) through the wrapper")
+    check(src.count("build_channel_timeline(") == 3, "the scheduler builds its three main timelines through the wrapper; the holiday cycles are built by media.build_holiday_cycle")
+    check(inspect.getsource(media.build_holiday_cycle).count("build_channel_timeline(") == 1, "a holiday cycle's timeline is built through the wrapper")
     check("build_block_timeline(" not in src, "the main script no longer calls build_block_timeline itself")
     check("INTERRUPT_FLOOR_SECONDS" not in src and "h_commercial_placement" not in src, "the scheduler keeps no floor or placement of its own")
     calls = [n for n in ast.walk(MAIN_TREE) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "build_channel_timeline"]
-    check(len(calls) == 5 and all("media_probe_cache" in [k.arg for k in n.keywords] for n in calls),
-          "all five scheduler timelines are built with the probe cache")
+    check(len(calls) == 3 and all("media_probe_cache" not in [k.arg for k in n.keywords] for n in calls),
+          "no scheduler timeline is handed the old probe cache")
 
 
 class TestChannelTimeline(_SectionCase):
@@ -10065,24 +11476,31 @@ def tearDownModule():
 # SECTION: Visualizer guide row follows the station's admission rules
 # ============================================================================
 
-def suite_visualizer_guide_admission():
+_VIS_BAD_PATHS = set()
+
+
+def _suite_visualizer_guide_admission_body():
     import inspect
     A, B, C, D, E = ("/m/a.mp3", "/m/b.mp3", "/m/c.mp3", "/m/d.flac", "/m/e.mp3")
     stack = [{"path": p} for p in (A, B, C, D, E)]
     probe = {os.path.normpath(A): {"duration": 200}, os.path.normpath(B): {"duration": 0},
-             os.path.normpath(C): {"duration": 180, "confirmed_unplayable": True},
-             os.path.normpath(D): {"duration": 150}, os.path.normpath(E): {"duration": 120, "confirmed_no_audio": True}}
-    got = [p for p, _a in media.admit_visualizer_assets(stack, probe, {}, set())]
+             os.path.normpath(C): {"duration": 180},
+             os.path.normpath(D): {"duration": 150}, os.path.normpath(E): {"duration": 120}}
+    bad = _VIS_BAD_PATHS
+    bad.clear()
+    bad.update({os.path.normpath(C), os.path.normpath(E)})
+    _install_cache_hub(probe)
+    got = [p for p, _a in media.admit_visualizer_assets(stack, {}, set())]
     check(got == [A, D], "only measured, playable songs with audio are admitted")
-    got = [p for p, _a in media.admit_visualizer_assets(stack, probe, {os.path.normpath(A): True}, set())]
+    got = [p for p, _a in media.admit_visualizer_assets(stack, {os.path.normpath(A): True}, set())]
     check(got == [D], "a song the mixer cannot seek is not admitted")
-    got = [p for p, _a in media.admit_visualizer_assets(stack, probe, {}, {".flac"})]
+    got = [p for p, _a in media.admit_visualizer_assets(stack, {}, {".flac"})]
     check(got == [A], "a song in an unseekable format is not admitted")
-    got = [p for p, _a in media.admit_visualizer_assets([{"path": B, "duration": 90}], {}, {}, set())]
+    got = [p for p, _a in media.admit_visualizer_assets([{"path": B, "duration": 90}], {}, set())]
     check(got == [B], "a stored duration admits a song the probe cache has not measured")
-    got = [p for p, _a in media.admit_visualizer_assets([A, D], probe, {}, set())]
+    got = [p for p, _a in media.admit_visualizer_assets([A, D], {}, set())]
     check(got == [A, D], "plain path strings are read the same as asset dictionaries")
-    check(media.admit_visualizer_assets([], probe, {}, set()) == [] and media.admit_visualizer_assets(None, probe, {}, set()) == [],
+    check(media.admit_visualizer_assets([], {}, set()) == [] and media.admit_visualizer_assets(None, {}, set()) == [],
           "an empty channel admits nothing")
 
     for label, cache, unseek, exts in (
@@ -10090,8 +11508,10 @@ def suite_visualizer_guide_admission():
         ("one unseekable", probe, {os.path.normpath(A): True}, set()),
         ("an unseekable format", probe, {}, {".flac"}),
         ("nothing measured", {}, {}, set()),
-        ("everything unplayable", {os.path.normpath(p): {"duration": 100, "confirmed_unplayable": True} for p in (A, B, C, D, E)}, {}, set()),
+        ("everything unplayable", {os.path.normpath(p): {"duration": 100} for p in (A, B, C, D, E)}, {}, set()),
     ):
+        bad.clear()
+        bad.update({os.path.normpath(C), os.path.normpath(E)} if label != "everything unplayable" else {os.path.normpath(p) for p in (A, B, C, D, E)})
         channels = {"08": {"name": "Music", "is_visualizer": True, "schedules": {"Music Tracks": [{"path": p, "duration": 0} for p in (A, B, C, D, E)]},
                            "playback_log": {}}}
         clock, ticks = [datetime.datetime(2026, 10, 15, 12, 0, 0)], [0]
@@ -10101,10 +11521,12 @@ def suite_visualizer_guide_admission():
         ns["_mixer_seekable_formats"] = lambda e=exts: {x: False for x in e}
         track_list, total, _origin = ns["_visualizer_frozen_lineup"]("08", channels["08"], clock[0])
         station = sorted(t["path"] for t in track_list)
-        guide = sorted(p for p, _a in media.admit_visualizer_assets(channels["08"]["schedules"]["Music Tracks"], cache, unseek, exts))
+        guide = sorted(p for p, _a in media.admit_visualizer_assets(channels["08"]["schedules"]["Music Tracks"], unseek, exts))
         check(station == guide, "%s: the guide admits exactly the songs the station airs" % label)
         check(bool(guide) == bool(track_list) and (total > 0) == bool(track_list), "%s: the guide shows music exactly when the station airs music" % label)
 
+    bad.clear()
+    bad.update({os.path.normpath(C), os.path.normpath(E)})
     ch_info = {"is_visualizer": True, "schedules": {"Music Tracks": [{"path": A}, {"path": D}]}}
     fake_db = types.SimpleNamespace(config={"media_probe_cache": probe})
     state = {"visualizer_admission_inputs": lambda: ({os.path.normpath(A): True}, {".flac"})}
@@ -10112,6 +11534,7 @@ def suite_visualizer_guide_admission():
     state = {"visualizer_admission_inputs": lambda: ({}, set())}
     check(len(ui._guide_visualizer_admitted(ch_info, state, fake_db)) == 2, "the guide row has music when the station admits the songs")
     check(len(ui._guide_visualizer_admitted(ch_info, {}, fake_db)) == 2, "a missing station publication applies no unseekable filter")
+    media.set_duration_hub(None)
     check(ui._guide_visualizer_admitted(ch_info, state, types.SimpleNamespace(config={})) == [],
           "songs with no measured length leave the guide row empty")
 
@@ -10121,6 +11544,11 @@ def suite_visualizer_guide_admission():
           "the unreachable lineup builder is gone from the guide")
     app_src = MAIN_SRC
     check('app_state["visualizer_admission_inputs"] = _visualizer_admission_inputs' in app_src, "the station publishes the admission inputs to the guide")
+
+
+def suite_visualizer_guide_admission():
+    with patch.object(media, "file_is_confirmed_bad", lambda path: os.path.normpath(str(path)) in _VIS_BAD_PATHS):
+        _suite_visualizer_guide_admission_body()
 
 
 class TestVisualizerGuideAdmission(_SectionCase):
@@ -10133,6 +11561,12 @@ class TestVisualizerGuideAdmission(_SectionCase):
 # ============================================================================
 # SECTION: Duration scan runs ahead of the scan chain
 # ============================================================================
+
+def _exec_emulator_functions(ns, *names):
+    """Cuts the named top-level functions out of retro_tv_emulator.py and runs them into ns."""
+    for name in names:
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+
 
 def suite_duration_scan_ahead():
     class _Stop:
@@ -10172,7 +11606,7 @@ def suite_duration_scan_ahead():
         "_order_scan_pipeline": lambda tiers, deep: items,
         "_gather_probe_priority_queue": lambda: [[], [], [], []],
         "_gather_deep_backlog_queue": lambda: [],
-        "_get_cached_media_probe": lambda p: cache.get(p, {}),
+        "_read_file_probe_facts": lambda p: cache.get(p, {}),
         "_cached_path_exists": lambda p: True,
         "_is_drive_degraded": lambda p: False,
         "_scan_hold_drive": lambda p, w: None,
@@ -10189,6 +11623,7 @@ def suite_duration_scan_ahead():
         "DURATION_PRECACHE_PAUSE_RECHECK_SECONDS": 5.0,
         "DURATION_PRECACHE_IDLE_SLEEP_SECONDS": 20.0,
     }
+    _exec_emulator_functions(ns, "_scan_duration_reported")
     exec(compile(get_function_source("_duration_scan_worker"), "<extracted:_duration_scan_worker>", "exec"), ns)
     ns["_duration_scan_worker"]()
     check(probed == ["/m/now.mkv", "/m/next.mkv", "/m/bad.mkv", "/m/deep.mkv"],
@@ -10209,6 +11644,386 @@ class TestDurationScanAhead(_SectionCase):
 
     def test_duration_scan_ahead(self):
         self.run_section(suite_duration_scan_ahead)
+
+
+def suite_picture_box_lane():
+    class _Stop:
+        def __init__(self):
+            self.waits = []
+            self.flag = False
+
+        def is_set(self):
+            return self.flag
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            return seconds == 20.0
+
+    scanned, order_log = [], []
+    done, has_box = {"/m/done.mkv"}, set()
+    items = [
+        (0, 0, "channel", "05", "Full Day", "/m/done.mkv"),
+        (0, 0, "channel", "05", "Full Day", "/m/now.mkv"),
+        (0, 0, "channel", "05", "Full Day", "/m/song.mp3"),
+        (2, 1, "channel", "05", "Full Day", "/m/held.mkv"),
+        (2, 1, "channel", "05", "Full Day", "/m/next.mkv"),
+        (3, 4, "channel", "06", "Full Day", "/m/gone.mkv"),
+        (3, 4, "channel", "06", "Full Day", "/m/deep.mkv"),
+    ]
+    stop = _Stop()
+
+    def stage(path):
+        scanned.append(path)
+        if path == "/m/next.mkv":
+            return False
+        done.add(path)
+        return True
+
+    ns = {
+        "db": types.SimpleNamespace(save_settings_async=lambda **k: order_log.append("saved")),
+        "log": MagicMock(), "time": time, "os": os, "media": media,
+        "_app_shutting_down": stop,
+        "_background_scan_should_pause": lambda: False,
+        "_order_scan_pipeline": lambda tiers, deep: items,
+        "_gather_probe_priority_queue": lambda: [[], [], [], []],
+        "_gather_deep_backlog_queue": lambda: [],
+        "_cached_path_exists": lambda p: p != "/m/gone.mkv",
+        "_is_drive_degraded": lambda p: False,
+        "_scan_hold_drive": lambda p, w: None,
+        "_drive_latency_summary": lambda p: "",
+        "_scan_drive_on_hold": lambda p: p == "/m/held.mkv",
+        "_governor_priority_scope": contextlib.nullcontext,
+        "_governor_nullscope": contextlib.nullcontext,
+        "_pipeline_stage_picture_box": stage,
+        "_picture_box_done": done, "_scan_pb_has_box": has_box,
+        "_background_scan_pace_seconds": lambda base: base,
+        "SCAN_CLASS_NOW": 0,
+        "PICTURE_BOX_BETWEEN_FILES_SECONDS": 1.0,
+        "PICTURE_BOX_IDLE_SLEEP_SECONDS": 20.0,
+        "PICTURE_BOX_PAUSE_RECHECK_SECONDS": 5.0,
+        "SCAN_PIPELINE_PREEMPT_CHECK_SECONDS": 5.0,
+    }
+    ns.update({
+               "_LOUDNESS_PRIORITY_PENDING": threading.Event(), "performance_governor": gov,
+               "_log_swallowed": lambda where, error: None})
+    _exec_emulator_functions(ns, "_scan_picture_box_known", "_scan_picture_box_reported",
+                             "_picture_box_lane_hold_reason", "_picture_box_lane_wait")
+    exec(compile(get_function_source("_picture_box_scan_worker"), "<extracted:_picture_box_scan_worker>", "exec"), ns)
+    ns["_picture_box_scan_worker"]()
+    check(scanned == ["/m/now.mkv", "/m/next.mkv", "/m/deep.mkv"],
+          "picture boxes are scanned in the chain's order; a file already done, a song, a held drive and a missing file are skipped (got %s)" % scanned)
+    check(order_log == ["saved"], "the settings are saved once the pass ends")
+    check(0.0 not in stop.waits and stop.waits[-1] == 20.0, "the airing file is not paced (no wait), later files are, and the pass ends idle")
+
+    worker_src = get_function_source("_picture_box_scan_worker")
+    check("_probe_one_loudness" not in worker_src and "_pipeline_stage_duration" not in worker_src and "_scan_store_duration" not in worker_src,
+          "the picture-box scan never waits for a duration or loudness scan")
+    chain_src = get_function_source("_probe_upcoming_media")
+    chain_file = chain_src.split("def _pipeline_scan_file")[1].split("_preempted = False")[0]
+    check("_pipeline_stage_picture_box" not in chain_file and "_picture_box_scan_one" not in chain_file,
+          "the loudness chain no longer runs or waits for a picture-box scan")
+    check('threading.Thread(target=_picture_box_scan_worker, daemon=True, name="PictureBoxScan")' in MAIN_SRC,
+          "the picture-box scan thread is started with the other scans")
+
+    clock = {"t": 0.0}
+    gathers, scanned2 = [], []
+    first = [(0, 0, "channel", "05", "B", "/m/a.mkv"), (3, 4, "channel", "05", "B", "/m/b.mkv"), (3, 4, "channel", "05", "B", "/m/c.mkv")]
+    second = [(0, 0, "channel", "05", "B", "/m/c.mkv"), (3, 4, "channel", "05", "B", "/m/b.mkv")]
+    stop2 = _Stop()
+
+    def stage2(path):
+        scanned2.append(path)
+        clock["t"] += 6.0
+        done.add(path)
+        return True
+
+    def gather(tiers, deep):
+        gathers.append(1)
+        if len(gathers) >= 3:
+            stop2.flag = True
+        return first if len(gathers) == 1 else second
+
+    ns2 = dict(ns, _order_scan_pipeline=gather, _app_shutting_down=stop2, _pipeline_stage_picture_box=stage2,
+               time=types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    done.clear()
+    exec(compile(get_function_source("_picture_box_scan_worker"), "<extracted:_picture_box_scan_worker>", "exec"), ns2)
+    ns2["_picture_box_scan_worker"]()
+    check(scanned2[:2] == ["/m/a.mkv", "/m/c.mkv"], "after the re-check time the list is gathered again and the file that now airs goes first (got %s)" % scanned2)
+
+
+class TestPictureBoxLane(_SectionCase):
+    """The picture-box scan runs on its own thread in the chain's order, and neither it nor the loudness chain waits for the other"""
+
+    def test_picture_box_lane(self):
+        self.run_section(suite_picture_box_lane)
+
+
+class _LaneStop:
+    """A shutdown flag whose wait() records every wait and ends the thread only when told to."""
+
+    def __init__(self, ends_on=None, on_wait=None):
+        self.waits, self.flag, self.ends_on, self.on_wait = [], False, ends_on, on_wait
+
+    def is_set(self):
+        return self.flag
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        if self.on_wait is not None:
+            self.on_wait(len(self.waits))
+        return self.ends_on is True or seconds == self.ends_on
+
+
+def _picture_box_lock_source():
+    node = next(n for n in MAIN_TREE.body if isinstance(n, ast.ClassDef) and n.name == "_picture_box_path_lock")
+    return "".join(MAIN_SRC.splitlines(keepends=True)[node.lineno - 1:node.end_lineno])
+
+
+def suite_scan_lanes_finish():
+    bad, facts = set(), {}
+    done_set, box_set, library_entries = set(), set(), {}
+
+    class _Lib:
+        def get_cached(self, path):
+            return library_entries.get(path)
+
+    ns = {"os": os, "media": types.SimpleNamespace(VIDEO_DISPLAY_EXTS=media.VIDEO_DISPLAY_EXTS, file_is_confirmed_bad=lambda p: p in bad),
+          "_read_file_probe_facts": lambda p: facts.get(p, {}), "_picture_box_done": done_set, "_scan_pb_has_box": box_set,
+          
+          "_log_swallowed": lambda where, error: None, "_get_probe_library": lambda: _Lib()}
+    _exec_emulator_functions(ns, "_scan_duration_reported", "_scan_loudness_reported", "_scan_picture_box_known",
+                             "_scan_picture_box_reported", "_scan_file_is_done")
+    is_done = ns["_scan_file_is_done"]
+    video, song = "/m/a.mkv", "/m/s.mp3"
+
+    check(not ns["_scan_duration_reported"]({}, False) and ns["_scan_duration_reported"]({"duration": 5}, False)
+          and ns["_scan_duration_reported"]({}, True), "the duration scan has reported a file when a length is stored or the schedule entry holds one")
+    check(not ns["_scan_loudness_reported"]({}, False) and ns["_scan_loudness_reported"]({"gain": 1.0}, False)
+          and ns["_scan_loudness_reported"]({}, True), "the loudness scan has reported a file when a gain is stored or the schedule entry holds one")
+    check(ns["_scan_picture_box_reported"](song, [0]) and not ns["_scan_picture_box_reported"](video, [0]),
+          "a song has no picture box to report; a video has until its picture box is stored")
+
+    facts[video] = {"duration": 1200, "gain": 1.0}
+    done_set.add(video)
+    check(is_done(video, False, False, False, [0]), "a video is finished when duration, loudness and picture box have all reported")
+    for lane, setup in (("duration", lambda: facts.__setitem__(video, {"gain": 1.0})),
+                        ("loudness", lambda: facts.__setitem__(video, {"duration": 1200})),
+                        ("picture box", lambda: done_set.discard(video))):
+        facts[video] = {"duration": 1200, "gain": 1.0}
+        done_set.add(video)
+        setup()
+        check(not is_done(video, False, False, False, [0]), "a video is not finished while only the %s lane has not reported" % lane)
+    facts[video] = {}
+    done_set.discard(video)
+    check(not is_done(video, False, False, False, [0]), "a video no lane has reported is not finished")
+    bad.add(video)
+    check(is_done(video, False, False, False, [0]), "a file confirmed bad counts as finished with nothing stored")
+    bad.discard(video)
+
+    check(is_done(video, True, True, False, [0]) is False, "schedule entry values count for loudness and duration, but the picture box must still have reported")
+    done_set.add(video)
+    check(is_done(video, True, True, False, [0]), "with the picture box reported, schedule entry gain and duration finish a video")
+
+    facts[song] = {"gain": 1.0, "duration": 200}
+    check(is_done(song, False, False, False, [0]), "a song is finished with loudness and duration, no picture box needed")
+    facts[song] = {"gain": 1.0}
+    check(not is_done(song, False, False, False, [0]) and not is_done(song, False, True, True, [0]),
+          "a song without a stored length is not finished, and in a music-only lineup a schedule entry length does not stand in for it")
+    facts[song] = {"gain": 1.0, "duration": 200}
+    check(is_done(song, False, False, True, [0]), "a music-only file needs only loudness and a stored length")
+    facts["/m/b.mkv"] = {"gain": 1.0, "duration": 100}
+    check(is_done("/m/b.mkv", False, False, True, [0]), "a music-only lineup never waits for a picture box")
+
+    box_path = "/m/c.mkv"
+    facts[box_path] = {"gain": 1.0, "duration": 100}
+    check(not is_done(box_path, False, False, False, [0]), "with no library look-ups left an unknown picture box is not reported")
+    library_entries[box_path] = {"picture_box": {"reason": "bars"}, "picture_box_detector_version": ml.PICTURE_BOX_DETECTOR_VERSION - 1}
+    check(not is_done(box_path, False, False, False, [1]), "a picture box from an older detector has not been reported")
+    library_entries[box_path]["picture_box_detector_version"] = ml.PICTURE_BOX_DETECTOR_VERSION
+    left = [1]
+    check(is_done(box_path, False, False, False, left) and left == [0] and box_path in box_set,
+          "a stored current picture box is found with one library look-up and remembered")
+
+    check("_scan_duration_reported" in get_function_source("_duration_scan_worker")
+          and "_scan_picture_box_reported" in get_function_source("_picture_box_scan_worker"),
+          "the duration and picture-box scan threads skip a file by the same tests the finish rule uses")
+
+    def lane_ns(stop, items, cache=None, stage_fn=None, store_fn=None, clock=None, gathers=None):
+        cache = cache if cache is not None else {}
+        base = {
+            "db": types.SimpleNamespace(save_settings_async=lambda **k: None), "log": MagicMock(), "time": clock or time, "os": os,
+            "media": media, "_app_shutting_down": stop, "_background_scan_should_pause": lambda: False,
+            "_order_scan_pipeline": (lambda tiers, deep: gathers(items)) if gathers else (lambda tiers, deep: items),
+            "_gather_probe_priority_queue": lambda: [[], [], [], []], "_gather_deep_backlog_queue": lambda: [],
+            "_read_file_probe_facts": lambda p: cache.get(p, {}), "_cached_path_exists": lambda p: True,
+            "_is_drive_degraded": lambda p: False, "_scan_hold_drive": lambda p, w: None, "_drive_latency_summary": lambda p: "",
+            "_scan_drive_on_hold": lambda p: False, "_governor_priority_scope": contextlib.nullcontext,
+            "_governor_nullscope": contextlib.nullcontext, "_background_scan_pace_seconds": lambda b: b,
+            "_scan_store_duration": store_fn, "_scan_duration_failed": lambda p: False,
+            "_pipeline_stage_picture_box": stage_fn, "_picture_box_done": set(), "_scan_pb_has_box": set(),
+            
+            "_LOUDNESS_PRIORITY_PENDING": threading.Event(), "performance_governor": gov, "_log_swallowed": lambda w, e: None,
+            "SCAN_CLASS_NOW": 0, "BETWEEN_LOUDNESS_PROBES_SECONDS": 0.5, "PICTURE_BOX_BETWEEN_FILES_SECONDS": 1.0,
+            "PICTURE_BOX_IDLE_SLEEP_SECONDS": 20.0, "PICTURE_BOX_PAUSE_RECHECK_SECONDS": 5.0,
+            "SCAN_PIPELINE_PREEMPT_CHECK_SECONDS": 5.0, "DURATION_PRECACHE_PAUSE_RECHECK_SECONDS": 5.0,
+            "DURATION_PRECACHE_IDLE_SLEEP_SECONDS": 20.0,
+        }
+        _exec_emulator_functions(base, "_scan_duration_reported", "_scan_picture_box_known", "_scan_picture_box_reported",
+                                 "_picture_box_lane_hold_reason", "_picture_box_lane_wait", "_duration_scan_worker",
+                                 "_picture_box_scan_worker")
+        return base
+
+    entered, release = threading.Event(), threading.Event()
+    pb_scanned, probed, cache = [], [], {}
+
+    def blocking_stage(path):
+        pb_scanned.append(path)
+        if not entered.is_set():
+            entered.set()
+            release.wait(10)
+        return True
+
+    def store(kind, ch, block, path):
+        probed.append(path)
+        cache[path] = {"duration": 900}
+        return 900
+
+    video_items = [(0, 0, "channel", "05", "Full Day", "/m/x%d.mkv" % n) for n in range(3)]
+    pb_ns = lane_ns(_LaneStop(ends_on=True), [(0, 0, "channel", "05", "Full Day", "/m/p1.mkv"), (2, 1, "channel", "05", "Full Day", "/m/p2.mkv")],
+                    stage_fn=blocking_stage)
+    pb_thread = threading.Thread(target=pb_ns["_picture_box_scan_worker"], daemon=True)
+    pb_thread.start()
+    check(entered.wait(5), "the picture-box scan thread is inside a slow picture-box scan")
+    dur_ns = lane_ns(_LaneStop(ends_on=20.0), video_items, cache=cache, store_fn=store)
+    dur_ns["_duration_scan_worker"]()
+    check(pb_thread.is_alive() and probed == ["/m/x0.mkv", "/m/x1.mkv", "/m/x2.mkv"],
+          "the duration scan stores every length while a picture-box scan is still stuck (got %s)" % probed)
+    release.set()
+    pb_thread.join(5)
+    check(not pb_thread.is_alive() and pb_scanned == ["/m/p1.mkv", "/m/p2.mkv"],
+          "the picture-box scan carries on in its own order once its slow file ends (got %s)" % pb_scanned)
+
+    clock = {"t": 0.0}
+    gather_count, dur_probed, dur_cache = [0], [], {}
+    first = [(0, 0, "channel", "05", "B", "/m/a.mkv"), (3, 4, "channel", "05", "B", "/m/b.mkv"), (3, 4, "channel", "05", "B", "/m/c.mkv")]
+    second = [(0, 0, "channel", "05", "B", "/m/c.mkv"), (3, 4, "channel", "05", "B", "/m/b.mkv")]
+    reorder_stop = _LaneStop(ends_on=None)
+
+    def gathers(_items):
+        gather_count[0] += 1
+        if gather_count[0] >= 3:
+            reorder_stop.flag = True
+        return first if gather_count[0] == 1 else second
+
+    def slow_store(kind, ch, block, path):
+        dur_probed.append(path)
+        dur_cache[path] = {"duration": 900}
+        clock["t"] += 6.0
+        return 900
+
+    reorder_ns = lane_ns(reorder_stop, first, cache=dur_cache, store_fn=slow_store, clock=types.SimpleNamespace(monotonic=lambda: clock["t"]), gathers=gathers)
+    reorder_ns["_duration_scan_worker"]()
+    check(dur_probed[:2] == ["/m/a.mkv", "/m/c.mkv"],
+          "after a channel change the duration scan gathers the list again and the file that now airs goes first, keeping what was stored (got %s)" % dur_probed)
+
+    pending, paused = threading.Event(), {"v": False}
+    swallowed, hold_log = [], MagicMock()
+
+    class _Gov:
+        def __init__(self, result):
+            self.result = result
+
+        def first_start_scan_plan(self):
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    def hold_ns(plan, stop=None, governor="fake"):
+        h = {"time": time, "log": hold_log, "_app_shutting_down": stop or _LaneStop(ends_on=None),
+             "_background_scan_should_pause": lambda: paused["v"], "_LOUDNESS_PRIORITY_PENDING": pending,
+             "performance_governor": _Gov(plan) if governor == "fake" else None,
+             "_log_swallowed": lambda where, error: swallowed.append(where), "PICTURE_BOX_PAUSE_RECHECK_SECONDS": 5.0}
+        _exec_emulator_functions(h, "_picture_box_lane_hold_reason", "_picture_box_lane_wait")
+        return h
+
+    sequence, together = (False, "weak PC"), (True, "scan cores 4.0, threads 8, load level 0")
+    check(hold_ns(sequence)["_picture_box_lane_hold_reason"]() == (None, ""), "with no first-start scan running the picture-box scan is never held")
+    pending.set()
+    check(hold_ns(sequence)["_picture_box_lane_hold_reason"]() == ("first_start", "weak PC"),
+          "while the playing file's first-start scan runs and the PC's plan says in sequence, the picture-box scan waits")
+    check(hold_ns(together)["_picture_box_lane_hold_reason"]() == (None, ""),
+          "when the plan says the first-start scans may run together, the picture-box scan carries on")
+    check(hold_ns(None, governor=None)["_picture_box_lane_hold_reason"]()[0] == "first_start", "with no governor the first-start scan runs in sequence")
+    check(hold_ns(RuntimeError("boom"))["_picture_box_lane_hold_reason"]()[0] == "first_start" and swallowed,
+          "an unreadable plan means in sequence and the failure is written to the log")
+    paused["v"] = True
+    check(hold_ns(together)["_picture_box_lane_hold_reason"]()[0] == "pause", "a game or governor pause still holds the picture-box scan")
+    paused["v"] = False
+
+    waiter_stop = _LaneStop(ends_on=None, on_wait=lambda n: pending.clear() if n >= 2 else None)
+    waiter = hold_ns(sequence, stop=waiter_stop)
+    hold_log.reset_mock()
+    check(waiter["_picture_box_lane_wait"]() is False and waiter_stop.waits == [5.0, 5.0],
+          "the picture-box scan waits in 5-second steps until the first-start scan is done, then goes on (waits %s)" % waiter_stop.waits)
+    texts = [c.args[0] for c in hold_log.info.call_args_list]
+    check(sum("lane waiting" in t for t in texts) == 1 and sum("lane resumed" in t for t in texts) == 1,
+          "the hold and the resume are each written to the log once")
+    pending.set()
+    check(hold_ns(sequence, stop=_LaneStop(ends_on=True))["_picture_box_lane_wait"]() is True, "the app closing ends the wait")
+    pending.clear()
+
+    events, lane_scanned = [], []
+    pending.set()
+    held_stop = _LaneStop(ends_on=20.0, on_wait=lambda n: (events.append("wait"), pending.clear()) if n == 1 else None)
+
+    def recording_stage(path):
+        events.append("scan")
+        lane_scanned.append(path)
+        return True
+
+    held = lane_ns(held_stop, [(0, 0, "channel", "05", "Full Day", "/m/h1.mkv")], stage_fn=recording_stage)
+    held["_LOUDNESS_PRIORITY_PENDING"] = pending
+    held["performance_governor"] = _Gov(sequence)
+    held["_picture_box_scan_worker"]()
+    check(events[:2] == ["wait", "scan"], "the picture-box thread starts no file until the first-start scan is done (order %s)" % events)
+
+    check(gov.first_start_scan_plan(profile=types.SimpleNamespace(tier="WEAK"))[0] is False,
+          "the governor's own plan keeps first-start scans in sequence on a weak PC")
+    first_start_src = get_function_source("_probe_and_apply_loudness_blocking")
+    check("first_start_scan_plan" in first_start_src and "_picture_box_before_loudness" in first_start_src,
+          "the first-start scan of the playing file still follows the together-or-in-sequence plan")
+
+    lock_ns = {"threading": threading, "_picture_box_path_locks": {}, "_picture_box_path_locks_guard": threading.Lock()}
+    exec(compile(_picture_box_lock_source(), "<extracted:_picture_box_path_lock>", "exec"), lock_ns)
+    live = {"now": 0, "max": 0, "calls": 0}
+    live_guard = threading.Lock()
+
+    def locked_scan(lib, ml_mod, path, parallel=1):
+        with live_guard:
+            live["now"] += 1
+            live["calls"] += 1
+            live["max"] = max(live["max"], live["now"])
+        time.sleep(0.15)
+        with live_guard:
+            live["now"] -= 1
+        return True
+
+    lock_ns["_picture_box_scan_one_locked"] = locked_scan
+    _exec_emulator_functions(lock_ns, "_picture_box_scan_one")
+    threads = [threading.Thread(target=lock_ns["_picture_box_scan_one"], args=(None, None, "/m/play.mkv")) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    check(live["calls"] == 2 and live["max"] == 1,
+          "the picture-box thread and the tune-in scan never scan the same file at the same time (most at once: %d)" % live["max"])
+
+
+class TestScanLanesFinish(_SectionCase):
+    """A file is finished only after the duration, loudness and picture-box scans have all reported it; the lanes do not wait on each other and the first-start plan holds"""
+
+    def test_scan_lanes_finish(self):
+        self.run_section(suite_scan_lanes_finish)
 
 
 # ============================================================================
@@ -10273,7 +12088,7 @@ def suite_guide_history_ledger():
     check(ui.clamp_guide_time_idx(10000, cols) == 336 - 48 - cols, "the last visible column ends 6 days after today's midnight")
     check(ui.GUIDE_TOTAL_HALF_HOURS * 1800 == 7 * 86400, "7 days are always visible")
     ui_src = inspect.getsource(ui)
-    check("aired_ledger_entries" in ui_src, "the guide draws past cells from the ledger")
+    check("_guide_hub_aired_cells" in ui_src, "the guide draws past cells from the hub")
     check(MAIN_SRC.count("_note_aired_cycle(playback_log, current_block, block_key") == 2,
           "the scheduler records a cycle when it ends and every call for the live cycle")
 
@@ -10283,6 +12098,1539 @@ class TestGuideHistoryLedger(_SectionCase):
 
     def test_guide_history_ledger(self):
         self.run_section(suite_guide_history_ledger)
+
+
+# ============================================================================
+# SECTION: Schedule hub duration reader (H1a)
+# ============================================================================
+
+def suite_duration_hub():
+    tmp = tempfile.mkdtemp()
+    hubs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def make_file(name, size):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as handle:
+                handle.write(os.urandom(size))
+            return path
+
+        def open_hub():
+            lib = ml.MediaLibrary(db_path)
+            hub = ml.DurationHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+            hubs.append(lib)
+            return hub
+
+        check(media.DURATION_MEASURED == ml.DURATION_KIND_MEASURED and media.DURATION_ESTIMATED == ml.DURATION_KIND_ESTIMATED,
+              "media.py and the hub use the same two words for measured and estimated")
+        check(media.HUB_SERIES_ESTIMATE_MIN_SCANNED == gov.HUB_SERIES_ESTIMATE_MIN_SCANNED == 2
+              and media.HUB_MOVIE_ESTIMATE_SECONDS == gov.HUB_MOVIE_ESTIMATE_SECONDS == 5400
+              and media._MOVIE_DURATION_FALLBACK_SECONDS == 5400,
+              "the two-scan rule and the 5,400-second movie estimate come from the governor table")
+
+        shows = [make_file("Show S01E%02d.mkv" % n, 2000 + n) for n in (1, 2, 3, 4)]
+        movie_dir = os.path.join(tmp, "Movies")
+        os.makedirs(movie_dir)
+        movie = os.path.join(movie_dir, "Big (1999).mkv")
+        with open(movie, "wb") as handle:
+            handle.write(os.urandom(3000))
+        items = [{"path": p} for p in shows] + [{"path": movie}]
+
+        hub = open_hub()
+        media.set_duration_hub(hub)
+        try:
+            exists = lambda p: True
+            hub.note_measured(shows[0], 1200.6)
+            raw = media.build_raw_tracks(items, exists)
+            check(shows[1] not in [t["path"] for t in raw], "with one scanned episode the others stay unplaced")
+            check([t["duration"] for t in raw if t["path"] == movie] == [5400], "an unscanned movie is placed at the movie estimate")
+            hub.note_measured(shows[1], 1500)
+            raw = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
+            check(raw.get(shows[2]) == 1350 and raw.get(shows[3]) == 1350 and raw[shows[0]] == 1200,
+                  "with two scanned episodes the unscanned ones take their average (1200 and 1500 give 1350) and a measured one keeps its own length")
+
+            hub.note_measured(shows[2], 1000)
+            again = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
+            check(again[shows[3]] == 1350, "a saved estimate is not recalculated when another episode is scanned later")
+
+            hub2 = open_hub()
+            media.set_duration_hub(hub2)
+            restarted = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
+            check(restarted[shows[3]] == 1350 and restarted[movie] == 5400 and restarted[shows[0]] == 1200,
+                  "after a restart the saved estimates and measured lengths read back the same")
+
+            hub2.note_measured(shows[3], 1420)
+            after = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
+            check(after[shows[3]] == 1420 and after[movie] == 5400 and after[shows[2]] == 1000,
+                  "a real length replaces only its own estimate")
+            row = hub2.probe_library.get_cached(shows[3])
+            check(row["estimated_duration"] == 1350 and row["duration"] == 1420 and row["estimate_basis"] == "series_average" and row["estimated_at"],
+                  "the estimate, its date and its basis stay in the library after the real length arrives")
+
+            cache = {}
+            guide = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
+            live = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
+            check(guide == live, "guide history and live playback use the same measured or saved-estimate track list")
+            check(media.track_duration_is_estimated(movie, 0) and not media.track_duration_is_estimated(shows[0], 0),
+                  "a movie with only a saved estimate still counts as unscanned, so it keeps being probed")
+        finally:
+            media.set_duration_hub(None)
+
+        check(not hasattr(ml.DurationHub, "reload") and not hasattr(ml.MediaLibrary, "path_duration_rows"),
+              "the hub reads nothing in advance: no bulk load of the library exists")
+        lazy_lib = ml.MediaLibrary(db_path)
+        hubs.append(lazy_lib)
+        asked = []
+        real_row = lazy_lib.path_duration_row
+        lazy_lib.path_duration_row = lambda key: (asked.append(key), real_row(key))[1]
+        lazy = ml.DurationHub(ml.ProbeLibrary(lazy_lib, use_vlc_fallback=False))
+        check(asked == [], "a new hub has asked the library about no file")
+        lazy.read(shows[0])
+        lazy.read(shows[0])
+        check(len(asked) == 1, "the hub asks the library about only the file it is asked for, once, then remembers (asked %d)" % len(asked))
+
+        old_path = os.path.join(tmp, "old.sqlite3")
+        import sqlite3 as _sq
+        conn = _sq.connect(old_path)
+        conn.executescript("CREATE TABLE library (content_key TEXT PRIMARY KEY, size INTEGER, duration REAL, duration_source TEXT, created_at REAL, updated_at REAL);"
+                           "INSERT INTO library (content_key, duration) VALUES ('k1', 99.0);")
+        conn.commit()
+        conn.close()
+        upgraded = ml.MediaLibrary(old_path)
+        hubs.append(upgraded)
+        cols = {r[1] for r in upgraded._conn.execute("PRAGMA table_info(library)").fetchall()}
+        check({"estimated_duration", "estimated_at", "estimate_basis"} <= cols
+              and upgraded._conn.execute("SELECT duration FROM library WHERE content_key='k1'").fetchone()[0] == 99.0,
+              "an older library file gets the estimate columns on open and keeps its rows")
+
+        probe_lib = ml.ProbeLibrary(ml.MediaLibrary(os.path.join(tmp, "p.sqlite3")), use_vlc_fallback=False)
+        hubs.append(probe_lib.library)
+        lonely = make_file("Lonely.mkv", 2500)
+        ml.DurationHub(probe_lib).store_estimate(lonely, 1800, "series_average")
+        with patch.object(ml, "combined_header_probe", lambda *a, **k: ml.HeaderProbeResult(ok=True, duration=1234.0)):
+            entry = probe_lib.get_or_probe_sync(lonely)
+        check(entry and entry["duration"] == 1234.0, "a library row holding only an estimate is still probed, not returned as a finished probe")
+    finally:
+        media.set_duration_hub(None)
+        for lib in hubs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestDurationHub(_SectionCase):
+    """One reader gives the scheduler, guide and catch-up the same length; estimates are saved once and never recalculated"""
+
+    def test_duration_hub(self):
+        self.run_section(suite_duration_hub)
+
+
+# ============================================================================
+# SECTION: Gain hub (scanned gain, its settings and the owner's manual dB in the library)
+# ============================================================================
+
+_GAIN_EMULATOR_FUNCTIONS = (
+    "_library_gain_is_current", "_get_library_gain", "_store_loudness_gain", "_library_gain_first",
+    "_read_file_probe_facts", "_save_file_probe_facts", "_audio_track_pref_key",
+    "_get_manual_audio_gain_db", "_save_audio_gain_db",
+    "_lookup_file_gain", "_safe_gain", "_hub_forget_path", "_get_audio_gain_db", "_get_library_dims",
+    "_set_gain_double_checked", "_take_gain_double_checked", "_set_gain_windows", "_take_gain_windows",
+)
+
+
+def _gain_namespace(fake_db, hub, server_channels=()):
+    ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
+          "log": mock.MagicMock(), "_log_swallowed": lambda where, error: None,
+          "_MUSIC_FILE_EXTS": (".mp3", ".flac", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".opus"),
+          "_get_gain_hub": lambda: hub, "_hub_note_measured_duration": lambda path, duration: None,
+          "_channel_is_server_streamed": lambda ch: str(ch).zfill(2) in server_channels,
+          "_checkpoints": [], "app_state": {},
+          "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock()}
+    ns["_checkpoint_probe_cache"] = lambda: ns["_checkpoints"].append(1)
+    for name in _GAIN_EMULATOR_FUNCTIONS:
+        exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+    return ns
+
+
+def suite_gain_hub():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def make_file(name, size):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as handle:
+                handle.write(os.urandom(size))
+            return path
+
+        def open_hub():
+            lib = ml.MediaLibrary(db_path)
+            libs.append(lib)
+            return ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+
+        a = make_file("a.mkv", 3000)
+        b = make_file("b.mkv", 3100)
+        gone = os.path.join(tmp, "gone.mkv")
+
+        hub = open_hub()
+        check(hub.read(a) == {"gain": None, "target_lufs": None, "scan_version": None,
+                              "convergence_db": None, "manual_gain_db": None},
+              "a file the library has never heard of reads as nothing on record in every gain field")
+        check(hub.note_gain(a, 0.8, -20.5, 1, 1.5) and hub.read(a)["gain"] == 0.8
+              and hub.read(a)["target_lufs"] == -20.5 and hub.read(a)["scan_version"] == 1
+              and hub.read(a)["convergence_db"] == 1.5,
+              "a scanned gain is saved with the target, scan version and convergence it was measured under")
+        check(_set_manual_db(hub, a, 3) and hub.read(a)["manual_gain_db"] == 3 and hub.read(a)["gain"] == 0.8,
+              "the owner's manual dB is saved in its own field and leaves the scanned gain alone")
+        check(hub.note_gain(a, 0.9, -20.5, 1, 1.5) and hub.read(a)["manual_gain_db"] == 3,
+              "a new scan replaces the scanned gain and leaves the owner's manual dB alone")
+        check(_set_manual_db(hub, b, 0) and hub.read(b)["manual_gain_db"] == 0 and hub.read(b)["gain"] is None,
+              "a manual dB of zero is kept as its own answer, different from nothing on record")
+        check(not hub.note_gain(gone, 0.7) and not _set_manual_db(hub, gone, 2) and not hub.note_gain(a, 0),
+              "a file the library cannot key, or a gain that is not positive, is refused so the caller keeps it elsewhere")
+
+        hub2 = open_hub()
+        row = hub2.read(a)
+        check(row["gain"] == 0.9 and row["manual_gain_db"] == 3 and row["target_lufs"] == -20.5
+              and hub2.read(b)["manual_gain_db"] == 0,
+              "after a restart the scanned gain, its settings and both manual dB values read back the same")
+
+        old_key = hub2.probe_library.keys.resolve(a)
+        with open(a, "ab") as handle:
+            handle.write(os.urandom(500))
+        check(hub2.read(a)["gain"] == 0.9, "a changed file keeps answering from memory until the hub is told the file changed")
+        hub2.forget(a)
+        check(hub2.read(a)["gain"] is None and hub2.read(a)["manual_gain_db"] is None,
+              "after a file changes on disk and the hub forgets it, the new content has no gain on record")
+        kept = hub2.probe_library.library.get_entry(old_key)
+        check(kept and kept["gain"] == 0.9 and kept["manual_gain_db"] == 3,
+              "the old content's row stays in the library untouched")
+
+        check(not hasattr(ml.GainHub, "reload") and not hasattr(ml.MediaLibrary, "path_gain_rows"),
+              "the gain hub reads nothing in advance: no bulk load of the library exists")
+        miss_hub = open_hub()
+        c = make_file("c.mkv", 3200)
+        check(miss_hub.read(c)["gain"] is None, "an unscanned file reads as no gain")
+        other = open_hub()
+        other.note_gain(c, 0.6, -20.5, 1, 1.5)
+        check(miss_hub.read(c)["gain"] is None, "a file with no gain on record is not asked about again until the recheck time")
+        with mock.patch.object(ml, "_GAIN_MISS_RECHECK_SECONDS", 0.0):
+            check(miss_hub.read(c)["gain"] == 0.6, "after the recheck time the hub finds a gain another writer saved")
+
+        old_path = os.path.join(tmp, "old.sqlite3")
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(old_path)
+        conn.executescript(
+            "CREATE TABLE path_keys (norm_path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL, "
+            "content_key TEXT NOT NULL, updated_at REAL NOT NULL);"
+            "CREATE TABLE library (content_key TEXT PRIMARY KEY, size INTEGER, duration REAL, duration_source TEXT, "
+            "width INTEGER, height INTEGER, dar_num INTEGER, dar_den INTEGER, audio_streams TEXT, subtitle_streams TEXT, "
+            "header_probed_at REAL, picture_box TEXT, picture_box_detector_version INTEGER, gain REAL, "
+            "gain_target_lufs REAL, gain_scan_version INTEGER, captions_blob BLOB, captions_source TEXT, "
+            "captions_reason TEXT, pan_scan_memory TEXT, created_at REAL, updated_at REAL);"
+            "INSERT INTO library (content_key, duration, gain, gain_target_lufs) VALUES ('k1', 1500, 0.77, -20.5);")
+        conn.commit()
+        conn.close()
+        upgraded = ml.MediaLibrary(old_path)
+        libs.append(upgraded)
+        entry = upgraded.get_entry("k1")
+        check(entry["gain"] == 0.77 and entry["duration"] == 1500 and "manual_gain_db" in entry and "gain_convergence_db" in entry,
+              "an older library file gains the manual dB and convergence columns when opened and keeps every row")
+
+        fake_db = types.SimpleNamespace(config={"media_probe_cache": {}, "audio_gain_db_by_file": {}},
+                                        channels_db={}, save_settings=lambda: fake_db.saves.append(1), saves=[])
+        d = make_file("d.mkv", 3300)
+        e = make_file("e.mp3", 3400)
+        emu_hub = open_hub()
+        ns = _gain_namespace(fake_db, emu_hub)
+        ns["_save_file_probe_facts"](d, gain=0.8)
+        row = emu_hub.read(d)
+        check(row["gain"] == 0.8 and row["target_lufs"] == media.TARGET_LUFS
+              and row["scan_version"] == media.LOUDNESS_GAIN_SCAN_VERSION
+              and row["convergence_db"] == media.LOUDNESS_CONVERGENCE_DB,
+              "a new loudness scan is saved in the library with the video target, the scan version and the convergence")
+        check("gain" not in fake_db.config["media_probe_cache"].get(d, {}) and not ns["_checkpoints"],
+              "a new loudness scan is not also written into the old cache and no settings save is forced")
+        check(ns["_read_file_probe_facts"](d)["gain"] == 0.8,
+              "every reader of the old cache's gain sees the library's gain")
+        ns["_save_file_probe_facts"](e, gain=0.7)
+        check(emu_hub.read(e)["target_lufs"] == media.MUSIC_TARGET_LUFS,
+              "a music file's scan is stamped with the music target")
+        ns["_save_file_probe_facts"](gone, gain=0.5)
+        check(gone not in fake_db.config["media_probe_cache"] and emu_hub.read(gone)["gain"] is None,
+              "a gain for a file the library cannot key saves nothing and the old cache is not written")
+
+        with mock.patch.object(media, "TARGET_LUFS", -23.0):
+            check(ns["_get_library_gain"](d) is None and "gain" not in ns["_read_file_probe_facts"](d),
+                  "a gain measured under another target is ignored so the file is measured again")
+        with mock.patch.object(media, "LOUDNESS_GAIN_SCAN_VERSION", media.LOUDNESS_GAIN_SCAN_VERSION + 1):
+            check(ns["_get_library_gain"](d) is None, "a gain from an older scan version is ignored")
+        with mock.patch.object(media, "LOUDNESS_CONVERGENCE_DB", media.LOUDNESS_CONVERGENCE_DB + 1.0):
+            check(ns["_get_library_gain"](d) is None, "a gain measured under another convergence is ignored")
+        check(emu_hub.read(d)["gain"] == 0.8, "an ignored gain stays in the library until a new scan replaces it")
+        check(ns["_library_gain_is_current"]({"gain": 1.0, "target_lufs": None, "scan_version": None, "convergence_db": None}),
+              "a migrated gain with no stamp counts as current")
+
+        ns["_save_audio_gain_db"](d, 3)
+        owned = emu_hub.read(d)
+        check(abs(owned["gain"] - 10 ** (3 / 20.0)) < 1e-9 and owned["manual_gain_db"] == 0
+              and owned["target_lufs"] is None and owned["scan_version"] == media.OWNER_GAIN_SCAN_VERSION and owned["convergence_db"] is None
+              and not fake_db.config["audio_gain_db_by_file"] and not fake_db.saves,
+              "the owner's chosen gain replaces the scanned number in the library, is marked as the owner's, and nothing goes into settings")
+        check(ns["_get_audio_gain_db"](d) == 3 and ns["_get_manual_audio_gain_db"](d) == 0,
+              "the menu reads the owner's gain back as the file's one gain with no extra offset")
+        check(ns["_store_loudness_gain"](d, 0.5) and abs(emu_hub.read(d)["gain"] - 10 ** (3 / 20.0)) < 1e-9,
+              "a later scan never replaces the owner's gain")
+        with mock.patch.object(media, "LOUDNESS_CONVERGENCE_DB", media.LOUDNESS_CONVERGENCE_DB + 1.0):
+            check(abs(ns["_get_library_gain"](d) - 10 ** (3 / 20.0)) < 1e-9,
+                  "the owner's gain still counts as current when the scan settings change")
+        emu_hub.forget(d)
+        check(abs(emu_hub.read(d)["gain"] - 10 ** (3 / 20.0)) < 1e-9 and emu_hub.read(d)["manual_gain_db"] == 0,
+              "the owner's gain is read back from the library file after a restart of the reader")
+        f = make_file("f.mkv", 3500)
+        fake_db.config["audio_gain_db_by_file"][ns["_audio_track_pref_key"](f)] = -4
+        ns["_save_audio_gain_db"](f, 0)
+        check(ns["_get_manual_audio_gain_db"](f) == 0 and abs(emu_hub.read(f)["gain"] - 1.0) < 1e-9,
+              "setting a file's gain back to zero is saved as the owner's gain and beats the old settings value")
+        ns["_save_audio_gain_db"](gone, 5)
+        check(ns["_audio_track_pref_key"](gone) not in fake_db.config["audio_gain_db_by_file"],
+              "a gain for a file the library cannot key saves nothing and the old settings are not written")
+        ns["_save_audio_gain_db"](d, 99)
+        check(abs(emu_hub.read(d)["gain"] - 10 ** (12 / 20.0)) < 1e-9, "the owner's gain is held to the plus or minus 12 dB range")
+        ns["_save_audio_gain_db"](d, 3)
+
+        check(ns["_get_audio_gain_db"](d, "05") == 3 and ns["_get_audio_gain_db"](d) == 3,
+              "the menu shows the gain the file plays with")
+        h = make_file("h.mkv", 3700)
+        emu_hub.note_gain(h, 10 ** (-4 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+        check(ns["_get_audio_gain_db"](h, "05") == -4,
+              "a file the scan set to minus 4 dB shows as minus 4 in the menu, not 0")
+        ns["_save_audio_gain_db"](h, -3)
+        check(ns["_get_audio_gain_db"](h, "05") == -3 and abs(ns["_lookup_file_gain"]("05", h) - 10 ** (-3 / 20.0)) < 1e-9,
+              "one step up from the shown minus 4 plays at minus 3, not at plus 1")
+        legacy = make_file("legacy.mkv", 3800)
+        fake_db.channels_db = {"05": {"schedules": {"Morning": [{"path": legacy, "gain": 10 ** (-4 / 20.0)}]}}}
+        check(ns["_get_audio_gain_db"](legacy, "05") == -4,
+              "a gain that only a schedule entry holds is shown as it plays, not as 0")
+        ns["_save_audio_gain_db"](legacy, -3)
+        check(ns["_get_audio_gain_db"](legacy, "05") == -3,
+              "changing that file's gain saves the new total and plays at it")
+        scan_db = ns["_get_audio_gain_db"](d)
+        check(scan_db == 3, "the gain shown in the menu is the library gain in dB")
+        pool_entry = {"path": d, "gain": 2.0}
+        fake_db.channels_db = {"05": {"schedules": {"Morning": [pool_entry]}}, "06": {"schedules": {"Morning": [pool_entry]}}}
+        applied = ns["_lookup_file_gain"]("05", d)
+        check(abs(applied - 10 ** (3 / 20.0)) < 1e-9,
+              "the gain a channel plays with is the library's gain, ahead of a leftover schedule value")
+        ns_server = _gain_namespace(fake_db, emu_hub, server_channels=("06",))
+        check(abs(ns_server["_lookup_file_gain"]("06", d) - 2.0) < 1e-9,
+              "a channel streamed from a Server keeps the gain its own schedule entry carries")
+        pool_entry.pop("gain")
+        g = make_file("g.mkv", 3600)
+        check(abs(ns["_lookup_file_gain"]("05", g, default=1.0) - 1.0) < 1e-9, "a file with nothing on record plays at the default gain")
+
+        with open(d, "ab") as handle:
+            handle.write(os.urandom(200))
+        ns["_hub_forget_path"](d)
+        check(emu_hub.read(d)["gain"] is None, "the changed-file hook makes the gain reader forget the file as well as its length")
+
+        with mock.patch.object(ml, "shared_gain_hub", side_effect=RuntimeError("no sqlite3")):
+            src = get_function_source("_get_gain_hub")
+            hub_ns = {"threading": threading, "log": mock.MagicMock(), "_gain_hub_singleton": None,
+                      "_gain_hub_failed": False, "_gain_hub_lock": threading.Lock()}
+            exec(compile(src, "<extracted:_get_gain_hub>", "exec"), hub_ns)
+            check(hub_ns["_get_gain_hub"]() is None and hub_ns["_get_gain_hub"]() is None and hub_ns["log"].warning.call_count == 1,
+                  "when the library cannot open the gain reader is off, one line is logged, and the old cache keeps working")
+
+        patch_ns = {"db": types.SimpleNamespace(config={}, channels_db={}), "os": os, "log": mock.MagicMock(),
+                    "dvd_engine": None, "game_deck": None, "vlc_engine": None, "app_state": {}, "pygame": mock.MagicMock(),
+                    "media": media, "_log_swallowed": lambda where, error: None, "_stored": [],
+                    "_request_schedule_rebuild": lambda ch, blk: None, "_drop_media_from_pool": lambda *a, **k: None}
+        patch_ns["_save_file_probe_facts"] = lambda path, duration=None, gain=None, dims=None: patch_ns["_stored"].append((path, gain))
+        exec(compile(get_function_source("_patch_probed_gain"), "<extracted:_patch_probed_gain>", "exec"), patch_ns)
+        patch_ns["_patch_probed_gain"]("dvd", None, None, d, gain=0.7)
+        check(patch_ns["_stored"] == [(d, 0.7)] and "dvd_gain_cache" not in patch_ns["db"].config,
+              "a DVD scan result goes to the library and no longer into the old dvd gain cache")
+        single = {"path": d}
+        pair = {"is_pair": True, "pair_ep1_path": d, "pair_ep2_path": e, "path": os.path.join(tmp, "pair.mkv")}
+        patch_ns["db"].channels_db = {"05": {"schedules": {"Morning": [single]}}}
+        patch_ns["_patch_probed_gain"]("channel", "05", "Morning", d, gain=0.6)
+        patch_ns["db"].channels_db = {"05": {"schedules": {"Morning": [pair]}}}
+        patch_ns["_patch_probed_gain"]("channel", "05", "Morning", d, gain=0.6)
+        check("gain" not in single and not any(k in pair for k in ("gain", "pair_ep1_gain", "pair_ep2_gain")),
+              "a channel scan result is no longer copied into the schedule entry, single or pair")
+
+        check('setdefault("dvd_gain_cache"' not in MAIN_SRC and 'entry["pair_ep1_gain"] = gain' not in MAIN_SRC
+              and 'entry["gain"] = gain\n                    entry["pair' not in MAIN_SRC,
+              "no scan writer still copies a new gain into the old dvd cache or a pair schedule entry")
+        check(media.OWNER_GAIN_SCAN_VERSION == ml._OWNER_GAIN_SCAN_VERSION == 0, "the owner-gain mark is the same in media.py and the library")
+        check(media.LOUDNESS_GAIN_SCAN_VERSION == 9 and gov.HUB_GAIN_MISS_RECHECK_SECONDS == ml._GAIN_MISS_RECHECK_SECONDS,
+              "the scan version lives in media.py and the recheck time comes from the governor table")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestGainHub(_SectionCase):
+    """Scanned gain, the settings it was measured under and the owner's manual dB live in the library, with the manual dB in its own field"""
+
+    def test_gain_hub(self):
+        self.run_section(suite_gain_hub)
+
+
+
+# ============================================================================
+# SECTION: Gain double-check (extra scans and season comparison)
+# ============================================================================
+
+_GAIN_CHECK_FUNCTIONS = (
+    "_set_gain_double_checked", "_take_gain_double_checked", "_set_gain_windows", "_take_gain_windows",
+    "_gain_bundle_members", "_gain_check_db",
+    "_middle_value", "_gain_neighbor_check", "_store_loudness_gain", "_library_gain_is_current",
+    "_get_library_gain", "_library_gain_first",
+    "_loudness_learning_data", "_learning_set", "_learned_series_offset", "_learned_offset_applied",
+    "_apply_offset_once_confirmed", "_take_learned_offset_applied",
+)
+
+
+def suite_gain_double_check():
+    windows_of = media._lufs_sample_windows
+    check(windows_of(180.0) is None and windows_of(100.0) is None and windows_of(None) is None and len(windows_of(181.0)) == 5,
+          "a file of 180 seconds or less is scanned whole, with no sample windows, and a file just over it gets 5 windows")
+    forty = windows_of(2400.0)
+    check(len(forty) == 5 and all(length == 60.0 for _start, length in forty)
+          and [round(start) for start, _length in forty] == [210, 690, 1170, 1650, 2130],
+          "a 40 minute show gets 5 windows of 60 seconds, evenly spaced across the file")
+    check(len(windows_of(3600.0)) == 5 and len(windows_of(3601.0)) == 7 and len(windows_of(7200.0)) == 7,
+          "a show of an hour or less gets 5 windows and a show over an hour gets 7")
+    long_show = windows_of(7200.0)
+    gaps = [long_show[i + 1][0] - long_show[i][0] for i in range(6)]
+    check(len(long_show) == 7 and all(abs(gap - 7200.0 / 7) < 1.0 for gap in gaps)
+          and all(length == 60.0 for _start, length in long_show),
+          "the 7 windows of a long show are 60 seconds each and evenly spaced")
+    check(media._standard_window_centers(2400.0) == (0.1, 0.3, 0.5, 0.7, 0.9)
+          and media._standard_window_centers(7200.0) == (0.0714, 0.2143, 0.3571, 0.5, 0.6429, 0.7857, 0.9286),
+          "the first scan's places are the middle of each equal share of the file")
+    check(all(getattr(media, name) == getattr(gov, name) for name in (
+              "LOUDNESS_SCAN_WINDOW_SECONDS", "LOUDNESS_SCAN_WINDOWS_STANDARD", "LOUDNESS_SCAN_WINDOWS_LONG",
+              "LOUDNESS_SCAN_LONG_SHOW_SECONDS", "LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS", "GAIN_CHECK_DRASTIC_DB",
+              "GAIN_CHECK_DRASTIC_EXTRA_BATCHES", "GAIN_CHECK_NEIGHBOR_DB", "GAIN_CHECK_BUNDLE_MIN_SCANNED",
+              "GAIN_CHECK_RECHECK_EXTRA_BATCHES", "GAIN_CHECK_EXTRA_BATCH_WINDOWS", "GAIN_CHECK_MAX_OVERLAP")),
+          "the scan and double-check numbers in media.py follow the governor table")
+    check(gov.LOUDNESS_SCAN_WINDOW_SECONDS == 60.0 and gov.LOUDNESS_SCAN_WINDOWS_STANDARD == 5
+          and gov.LOUDNESS_SCAN_WINDOWS_LONG == 7 and gov.LOUDNESS_SCAN_LONG_SHOW_SECONDS == 3600.0
+          and gov.LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS == 180.0,
+          "the table holds 60 second windows, 5 for a show up to an hour, 7 above it, and a whole-file limit of 180 seconds")
+
+    for duration in (1500.0, 2400.0, 7200.0):
+        first_places = list(media._standard_window_centers(duration))
+        taken = list(first_places)
+        ok = True
+        for _batch in range(2):
+            more = media._extra_window_centers(duration, taken, 3)
+            ok = ok and more == sorted(more) and len(more) == len(set(more))
+            for place in more:
+                ok = ok and all(abs(place - other) * duration >= 30.0 - duration * 0.0002 for other in taken)
+                ok = ok and first_places[0] <= place <= first_places[-1]
+            taken += more
+        check(ok and len(taken) > len(first_places),
+              "extra windows for a %d second show sit away from every earlier window, inside the span of the first scan" % duration)
+    check(len(media._extra_window_centers(2400.0, media._standard_window_centers(2400.0), 3)) == 3
+          and media._extra_window_centers(200.0, media._standard_window_centers(200.0), 3) == []
+          and len(media._extra_window_centers(300.0, media._standard_window_centers(300.0)
+                                              + (0.2, 0.4, 0.6), 3)) == 1
+          and media._extra_window_centers(300.0, [0.1, 0.3, 0.5, 0.7, 0.9, 0.2, 0.4, 0.6, 0.8], 3) == [],
+          "a short show has room for fewer new windows, and none once the room is used")
+
+    check(abs(media._reconcile_lufs_readings([-29.4, -28.1, -34.3]) - media._combine_lufs_readings([-29.4, -28.1])) < 1e-9
+          and media._reconcile_lufs_readings([-20.0, -26.0, -30.0]) == -30.0
+          and media._reconcile_lufs_readings([-20.0]) == -20.0 and media._reconcile_lufs_readings([]) is None,
+          "readings that agree are averaged, the quietest is used when none agree, and one reading stands alone")
+    mixed = [-27.0, -27.5, -27.2, -40.0, -26.8, -27.4]
+    check(abs(media._reconcile_lufs_readings(mixed) - media._combine_lufs_readings([-27.0, -27.5, -27.2, -26.8, -27.4])) < 1e-9
+          and abs(media._reconcile_lufs_readings([-35.0, -35.2, -34.8, -27.0, -27.5, -27.2, -27.3, -27.1, -27.4])
+                  - media._combine_lufs_readings([-27.0, -27.5, -27.2, -27.3, -27.1, -27.4])) < 1e-9,
+          "with every window compared together, the biggest group that agrees decides and a stray window is outvoted")
+
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "ep.mkv")
+        with open(path, "wb") as handle:
+            handle.write(os.urandom(2000))
+        calls = []
+        script = {}
+
+        def fake_readings(file_path, target_lufs, semaphore=None, chunk_timeout=180, semaphore_timeout=None,
+                          parallel_windows=False, duration_out=None, centers=None, known_duration=None, window_out=None,
+                          dialogue=None, method_out=None):
+            calls.append(centers)
+            if duration_out is not None:
+                duration_out["duration_sec"] = script["duration"]
+            if centers is None:
+                values = script["first"]
+                places = media._standard_window_centers(script["duration"])
+            else:
+                index = len([c for c in calls[:-1] if c is not None])
+                values = script["extras"][min(index, len(script["extras"]) - 1)]
+                places = centers
+            got = [(place, value) for place, value in zip(places, values) if value is not None]
+            if window_out is not None and media._lufs_sample_windows(script["duration"]) is not None:
+                window_out.extend(got)
+            return ([media._reconcile_lufs_readings([v for _p, v in got])] if got else []), [], [], "", False
+
+        def run(first, extras, duration=2400.0, **kwargs):
+            calls.clear()
+            script.update({"first": first, "extras": extras, "duration": duration})
+            shortfall = {}
+            with mock.patch.object(media, "_sample_lufs_readings", fake_readings), \
+                 mock.patch.object(media, "_resolve_dialogue_basis", lambda *a, **k: (None, False)), \
+                 mock.patch.object(media, "_get_header_facts", lambda p: None), \
+                 mock.patch.object(media, "_probe_duration_seconds_fast", lambda p: duration), \
+                 mock.patch.object(media, "_duration_looks_implausible", lambda p, d: False), \
+                 mock.patch.object(media, "_cached_path_exists", lambda p: True):
+                gain = media._get_media_loudness_gain_impl(path, shortfall_out=shortfall, **kwargs)
+            return gain, shortfall
+
+        target = media.TARGET_LUFS
+        first = [-35.0, -35.2, -34.8]
+        gain, info = run(first, [[-27.0, -27.5, -27.2], [-27.3, -27.1, -27.4]])
+        db_out = 20 * math.log10(gain)
+        std = list(media._standard_window_centers(2400.0))
+        check(len(calls) == 3 and calls[0] is None and all(calls[i] and len(calls[i]) == 3 for i in (1, 2)) and info.get("double_checked") is True,
+              "a gain more than 4 dB from 0 gets two more batches of windows, right then, and is marked double-checked")
+        check(len(info["windows"]) == 3 + 3 + 3 and all(abs(a[0] - b[0]) * 2400.0 >= 149.0 for a in info["windows"][3:] for b in info["windows"][:3]),
+              "the new windows sit at places the first windows never looked, and every window is kept with the result")
+        check(abs(db_out - (target + 27.25 + media.LOUDNESS_GAIN_OFFSET_DB)) < media.LOUDNESS_CONVERGENCE_DB + 0.3,
+              "the gain is worked out from the first windows and the new ones together, so the wrong first windows are outvoted")
+        gain, info = run([-24.5, -24.6, -24.4], [[-27.0, -27.5, -27.2]])
+        check(len(calls) == 1 and info.get("double_checked") is False and len(info["windows"]) == 3,
+              "a gain within 4 dB of 0 gets no extra windows and is not marked double-checked")
+        gain, info = run([-35.0], [[-27.0, -27.5]], duration=100.0)
+        check(len(calls) == 1 and info.get("double_checked") is False and not info["windows"],
+              "a file of 180 seconds or less was scanned whole, so a big gain adds no extra windows")
+        gain, info = run(first, [[-27.0, -27.5, -27.2], [-27.0, None, -27.1]])
+        check(len(calls) == 3 and info.get("double_checked") is False,
+              "when a new window returns nothing the file is not marked double-checked so it can be gone back to")
+        gain, info = run([-35.0, -35.2, -34.8, -35.1, -34.9], [[-27.0, -27.5, -27.2], [-27.3, -27.1, -27.4]], duration=7200.0)
+        check(len(calls) == 3 and len(info["windows"]) == 5 + 3 + 3 and info.get("double_checked") is True
+              and abs(20 * math.log10(gain) - (target + 27.25 + media.LOUDNESS_GAIN_OFFSET_DB)) < media.LOUDNESS_CONVERGENCE_DB + 0.3,
+              "a show over an hour starts with 5 windows, adds batches of 3, and still compares every window")
+        gain, info = run([-35.0, -35.2, -34.8], [[-27.0, -27.5]], duration=200.0)
+        check(len(calls) == 2 and info.get("double_checked") is True,
+              "a file with room for only one more batch is marked double-checked once that batch is done")
+
+        prior = [(0.1667, -33.0), (0.5, -33.4), (0.8333, -32.8)]
+        gain, info = run(first, [[-27.0, -27.5, -27.2], [-27.3, -27.1, -27.4]], prior_windows=prior, treat_fallback_as_unknown=True)
+        new_calls = [c for c in calls if c is not None]
+        check(len(calls) == 2 and None not in calls and len(info["windows"]) == 9 and info.get("double_checked") is True
+              and info["windows"][:3] == [list(w) for w in prior],
+              "a recheck keeps the earlier windows, adds only new ones, and does not scan the first places again")
+        check(all(abs(place - other) * 2400.0 >= 149.0 for batch in new_calls for place in batch for other in [w[0] for w in prior]),
+              "the recheck's new windows are in different places than the earlier windows")
+        check(abs(20 * math.log10(gain) - (target + 27.2 + media.LOUDNESS_GAIN_OFFSET_DB)) < media.LOUDNESS_CONVERGENCE_DB + 0.4,
+              "the recheck compares the earlier windows with the new ones and the bigger agreeing group decides")
+        gain, info = run(first, [[-27.0, -27.5, -27.2], [-27.3, -27.1, -27.4]], prior_windows=[], treat_fallback_as_unknown=True)
+        check(calls[0] is None and len(calls) == 3 and len(info["windows"]) == 3 + 3 + 3 and info.get("double_checked") is True,
+              "a file with no windows on record gets a fresh first scan, then the recheck batches, all compared together")
+        gain, info = run(first, [[None, None, None], [None, None, None]], prior_windows=prior, treat_fallback_as_unknown=True)
+        check(gain is None, "a recheck whose new windows return nothing gives no result, so the saved gain is left as it was")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    ceiling = media.TRUE_PEAK_CEILING_DBTP
+    needed = 10 ** (4.6 / 20.0)
+    got, capped = media._true_peak_limited_gain(needed, needed, -6.1)
+    check(capped and abs(20 * math.log10(got) + -6.1 - ceiling) < 1e-9 and got < needed,
+          "a boost the true-peak limit holds back lands exactly on the ceiling, never above it and never above what the target needs")
+    got, capped = media._true_peak_limited_gain(needed, needed, -20.0)
+    check(not capped and got == needed, "a boost with room under the ceiling is left alone")
+    got, capped = media._true_peak_limited_gain(needed, needed, -0.5)
+    check(capped and got == 1.0, "a boost is never turned into a cut by the true-peak limit")
+    cut = 10 ** (-1.8 / 20.0)
+    got, capped = media._true_peak_limited_gain(cut, cut, 1.3)
+    check(capped and abs(20 * math.log10(got) + 1.3 - ceiling) < 1e-9,
+          "a cut for a file whose peak is over the ceiling brings the peak to the ceiling")
+    check(media.LOUDNESS_CONVERGENCE_DB == 0.0 and not hasattr(media, "_converge_clamped_gain"),
+          "nothing is added back on top of the true-peak limit any more")
+
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "ep.mkv")
+        with open(path, "wb") as handle:
+            handle.write(os.urandom(2000))
+        state = {}
+        whole_calls = []
+
+        def fake_sample(file_path, target_lufs, semaphore=None, chunk_timeout=180, semaphore_timeout=None,
+                        parallel_windows=False, duration_out=None, centers=None, known_duration=None, window_out=None,
+                        dialogue=None, method_out=None):
+            if duration_out is not None:
+                duration_out["duration_sec"] = state["duration"]
+            return [state["lufs"]], [state["tp"]], [8.0], "", False
+
+        def fake_whole(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
+                       semaphore=None, semaphore_timeout=None):
+            whole_calls.append((start_sec, length_sec, timeout))
+            return state["whole"]
+
+        def run_peak(duration, lufs, tp, whole):
+            state.update({"duration": duration, "lufs": lufs, "tp": tp, "whole": whole})
+            whole_calls.clear()
+            with mock.patch.object(media, "_sample_lufs_readings", fake_sample), \
+                 mock.patch.object(media, "_resolve_dialogue_basis", lambda *a, **k: (None, False)), \
+                 mock.patch.object(media, "_lufs_window_ffmpeg", fake_whole), \
+                 mock.patch.object(media, "_get_header_facts", lambda p: None), \
+                 mock.patch.object(media, "_probe_duration_seconds_fast", lambda p: duration), \
+                 mock.patch.object(media, "_duration_looks_implausible", lambda p, d: False), \
+                 mock.patch.object(media, "_cached_path_exists", lambda p: True):
+                return media._get_media_loudness_gain_impl(path)
+
+        got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -6.1, (0.0, -3.0, 5.0, "", False))
+        check(len(whole_calls) == 1 and whole_calls[0][:2] == (None, None)
+              and abs(20 * math.log10(got) + -3.0 - ceiling) < 1e-6,
+              "a sampled file whose boosted peak would land near the ceiling gets a whole-file peak pass and is held to the louder peak it finds")
+        got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -6.1, (None, None, None, "", True))
+        check(len(whole_calls) == 1 and 20 * math.log10(got) + -6.1 + media.TRUE_PEAK_CONFIRM_MARGIN_DB <= ceiling + 1e-6,
+              "when the whole-file peak pass cannot finish the gain is held back by the margin so the ceiling still holds")
+        got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -20.0, (0.0, -3.0, 5.0, "", False))
+        check(not whole_calls and abs(20 * math.log10(got) - (4.6 + media.LOUDNESS_GAIN_OFFSET_DB)) < 1e-6,
+              "a sampled file with plenty of room under the ceiling needs no whole-file pass and keeps its full boost")
+        got = run_peak(100.0, media.TARGET_LUFS - 4.6, -3.0, (0.0, -3.0, 5.0, "", False))
+        check(not whole_calls and abs(20 * math.log10(got) + -3.0 - ceiling) < 1e-6,
+              "a file scanned whole already has its true peak, so no second pass runs and the ceiling holds")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        libs.append(lib)
+        hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+
+        def make(name, size):
+            full = os.path.join(tmp, name)
+            with open(full, "wb") as handle:
+                handle.write(os.urandom(size))
+            return os.path.normpath(full)
+
+        a = make("a.mkv", 3000)
+        check(not hub.is_checked(a) and hub.note_gain(a, 1.2, -20.5, 1, 1.5) and not hub.is_checked(a),
+              "a scanned gain starts out not double-checked")
+        check(hub.mark_checked(a) and hub.is_checked(a) and ml.GainHub(hub.probe_library).is_checked(a),
+              "the double-checked mark is saved in the library and survives a restart")
+        check(hub.note_gain(a, 1.3, -20.5, 1, 1.5) and not hub.is_checked(a),
+              "a new scan result that was not double-checked clears the mark")
+        check(hub.note_gain(a, 1.3, -20.5, 1, 1.5, checked=True) and hub.is_checked(a),
+              "a scan result saved as double-checked carries the mark")
+        check(hub.note_owner_gain(a, 3) and hub.is_checked(a),
+              "a file the owner set by hand counts as checked and is never scanned again")
+        check(not hub.mark_checked(os.path.join(tmp, "gone.mkv")), "a file the library cannot key cannot be marked")
+
+        w = [(0.1667, -33.0), (0.5, -33.4), (0.8333, -32.8)]
+        wf = make("w.mkv", 3050)
+        check(hub.read_windows(wf) == [] and hub.note_gain(wf, 1.2, -20.5, 1, 1.5, windows=w) and hub.read_windows(wf) == w
+              and ml.GainHub(hub.probe_library).read_windows(wf) == w,
+              "the sample windows behind a scanned gain are saved in the library, read back, and survive a restart")
+        check(hub.note_gain(wf, 1.3, -20.5, 1, 1.5) and hub.read_windows(wf) == [],
+              "a new scan result saved without windows leaves none on record, so old windows never sit behind a new gain")
+        check(hub.read_windows(os.path.join(tmp, "gone.mkv")) == [], "a file the library cannot key has no windows")
+        ns_take = {"_gain_windows_pending": {}, "_gain_check_lock": threading.Lock()}
+        for name in ("_set_gain_windows", "_take_gain_windows"):
+            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns_take)
+        ns_take["_set_gain_windows"]("x", [(0.5, -20.0)])
+        check(ns_take["_take_gain_windows"]("x") == [(0.5, -20.0)] and ns_take["_take_gain_windows"]("x") == [],
+              "the windows remembered for a scan are handed to the save once")
+
+        files = {}
+        for i in range(5):
+            files[i] = make("e%d.mkv" % i, 3100 + i)
+        durations = {p: 1500.0 for p in files.values()}
+        rescans = []
+        probe_ns = {}
+
+        def make_ns(season_key="show"):
+            fake_db = types.SimpleNamespace(config={"loudness_scan_enabled": True})
+            ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
+                  "log": mock.MagicMock(), "_log_swallowed": lambda where, error: None,
+                  "_MUSIC_FILE_EXTS": (".mp3",), "_get_gain_hub": lambda: hub,
+                  "_get_show_smoothing_key": lambda p: season_key, "_is_drive_degraded": lambda p: False,
+                  "_get_part_group_key": lambda p: None,
+                  "_read_file_probe_facts": lambda p: {"duration": durations.get(p, 0)},
+                  "_app_shutting_down": threading.Event(), "_LOUDNESS_PRIORITY_PENDING": threading.Event(),
+                  "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
+                  "_gain_check_tried": set(), "_gain_check_folder_seen": {}, "_GAIN_CHECK_FOLDER_REVISIT_S": 600,
+                  "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {}}
+
+            def fake_probe(norm_p, **kwargs):
+                rescans.append((norm_p, kwargs.get("prior_windows")))
+                ns["_set_gain_double_checked"](norm_p, True)
+                ns["_set_gain_windows"](norm_p, [(0.5, -27.0), (0.3, -27.4)])
+                return 10 ** (probe_ns["answer_db"] / 20.0)
+            ns["_probe_loudness_guarded"] = fake_probe
+            for name in _GAIN_CHECK_FUNCTIONS:
+                exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+            return ns
+
+        def set_gains(values):
+            for i, value in values.items():
+                hub.note_gain(files[i], 10 ** (value / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+
+        set_gains({0: 2.0, 1: 2.0, 2: 6.0, 3: 2.0, 4: 2.0})
+        probe_ns["answer_db"] = 2.2
+        ns = make_ns()
+        done = ns["_gain_neighbor_check"](files[0], force=True)
+        check(done == 1 and rescans == [(files[2], [])],
+              "once enough of a season is scanned, the one episode far from the rest is scanned again and no other file is; a gain with no windows on record gets a fresh scan")
+        check(hub.read_windows(files[2]) == [(0.5, -27.0), (0.3, -27.4)],
+              "the windows behind the new gain are saved in the library with it")
+        check(abs(20 * math.log10(hub.read(files[2])["gain"]) - 2.2) < 1e-6 and hub.is_checked(files[2])
+              and not hub.is_checked(files[0]) and abs(20 * math.log10(hub.read(files[0])["gain"]) - 2.0) < 1e-6,
+              "the new gain replaces the old one, the episode is marked double-checked, and the others keep their gain")
+        rescans.clear()
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
+              "an episode that was already double-checked is never scanned a second time")
+
+        hub2_files = {}
+        set_gains({0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0, 4: 4.9})
+        hub.note_gain(files[2], 10 ** (2.0 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+        rescans.clear()
+        ns = make_ns()
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
+              "an episode 2.9 dB from the season's middle gain is left alone")
+        hub.note_gain(files[4], 10 ** (5.0 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+        ns = make_ns()
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 1 and rescans and rescans[0][0] == files[4],
+              "an episode 3 dB from the season's middle gain is scanned again")
+
+        rescans.clear()
+        set_gains({0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0, 4: 6.0})
+        hub.note_owner_gain(files[4], 6)
+        ns = make_ns()
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
+              "an episode whose gain the owner set is never scanned again")
+        set_gains({0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0})
+        durations[files[3]] = 100.0
+        hub.note_gain(files[3], 10 ** (7.0 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+        ns = make_ns()
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
+              "a short file that was scanned whole is not scanned again")
+        durations[files[3]] = 1500.0
+        hub.note_gain(files[3], 10 ** (2.0 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+
+        few_tmp = tempfile.mkdtemp()
+        try:
+            small = []
+            for i in range(3):
+                full = os.path.normpath(os.path.join(few_tmp, "s%d.mkv" % i))
+                with open(full, "wb") as handle:
+                    handle.write(os.urandom(4000 + i))
+                durations[full] = 1500.0
+                small.append(full)
+                hub.note_gain(full, 10 ** ((9.0 if i == 0 else 2.0) / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+            rescans.clear()
+            ns = make_ns()
+            check(ns["_gain_neighbor_check"](small[0], force=True) == 0 and not rescans,
+                  "a season with fewer scanned files than the table asks for is not compared yet")
+        finally:
+            shutil.rmtree(few_tmp, ignore_errors=True)
+
+        ns = make_ns(season_key=None)
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
+              "a file that is not in a season folder is never compared with its folder")
+        ns = make_ns()
+        ns["db"].config["loudness_scan_enabled"] = False
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0, "with loudness scanning off the check does nothing")
+        ns = make_ns()
+        ns["_LOUDNESS_PRIORITY_PENDING"].set()
+        set_gains({0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0, 4: 8.0})
+        hub.note_gain(files[4], 10 ** (8.0 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+        check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
+              "a file that just started airing and needs its own scan comes first: the check waits")
+        ns = make_ns()
+        ns["_gain_neighbor_check"](files[0])
+        rescans.clear()
+        check(ns["_gain_neighbor_check"](files[0]) == 0 and not rescans,
+              "a season already looked at a moment ago is not listed and compared again until the revisit time")
+    finally:
+        for opened in libs:
+            opened.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    src = MAIN_SRC
+    check("_gain_neighbor_check(norm_p, force=True)" in src and "_gain_neighbor_check(norm_p)" in src,
+          "the loudness scan worker runs the season check after saving a gain and when it meets an already-scanned file")
+
+
+class TestGainDoubleCheck(_SectionCase):
+    """Extra scans for a drastic gain right away, and a rescan of the episode that sits far from the rest of its season"""
+
+    def test_gain_double_check(self):
+        self.run_section(suite_gain_double_check)
+
+
+# ============================================================================
+# SECTION: Learned series loudness offset (F3)
+# ============================================================================
+
+
+_LEARNED_OFFSET_FUNCTIONS = (
+    "_set_gain_double_checked", "_take_gain_double_checked", "_set_gain_windows", "_take_gain_windows",
+    "_gain_bundle_members", "_gain_check_db", "_middle_value", "_store_loudness_gain", "_library_gain_is_current",
+    "_get_library_gain", "_loudness_learning_data", "_learning_set", "_learned_series_offset",
+    "_learned_offset_applied", "_series_scan_is_outlier", "_apply_learned_series_offset",
+    "_apply_offset_once_confirmed", "_take_learned_offset_applied", "_owner_gain_baseline_db",
+    "_learn_from_owner_gain",
+)
+
+
+def suite_learned_series_offset():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        libs.append(lib)
+        hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+        files = []
+        for i in range(10):
+            full = os.path.join(tmp, "e%d.mkv" % i)
+            with open(full, "wb") as handle:
+                handle.write(os.urandom(3000 + i))
+            files.append(os.path.normpath(full))
+        saves = []
+        fake_db = types.SimpleNamespace(config={}, save_settings_async=lambda **k: saves.append(1))
+        ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
+              "log": mock.MagicMock(), "_log_swallowed": lambda where, error: None,
+              "_MUSIC_FILE_EXTS": (".mp3",), "_get_gain_hub": lambda: hub,
+              "_get_show_smoothing_key": lambda p: "show", "_is_drive_degraded": lambda p: False,
+              "_get_part_group_key": lambda p: None,
+              "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
+              "LOUDNESS_LEARN_MIN_FILES": 3, "LOUDNESS_LEARN_MAX_OFFSET_DB": 12,
+              "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {}}
+        for name in _LEARNED_OFFSET_FUNCTIONS:
+            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+
+        def scan(i, value_db):
+            hub.note_gain(files[i], 10 ** (value_db / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION,
+                          media.LOUDNESS_CONVERGENCE_DB)
+
+        def owner(i, total_db):
+            baseline = ns["_owner_gain_baseline_db"](files[i], hub)
+            hub.note_owner_gain(files[i], total_db)
+            ns["_learn_from_owner_gain"](files[i], baseline, total_db)
+
+        def raw_db(i):
+            return ns["_gain_check_db"](hub, files[i])
+
+        for i in range(6):
+            scan(i, 2.0)
+        owner(0, 4)
+        owner(0, 5)
+        check(ns["_learned_series_offset"](files[0]) == 0 and saves,
+              "one episode changed by hand, even in two steps, teaches the series nothing yet and is saved")
+        owner(1, 5)
+        check(ns["_learned_series_offset"](files[0]) == 0, "two episodes changed by the same amount are not yet enough")
+        owner(2, 5)
+        check(ns["_learned_series_offset"](files[0]) == 3,
+              "three episodes of a series changed by the same 3 dB give the series a learned +3 dB offset")
+        check(ns["_learned_offset_applied"](files[0]) == 0 and all(raw_db(i) is None for i in (0, 1, 2)),
+              "the three changed episodes are the owner's and are never rescanned or offset again")
+        owner(0, 6)
+        check(ns["_learned_series_offset"](files[0]) == 0,
+              "when the owner's latest three changes are not the same amount the learned offset is cleared")
+        owner(0, 5)
+        check(ns["_learned_series_offset"](files[0]) == 3, "changing it back to the same amount learns it again")
+
+        base_db = 2.0
+        gain = ns["_apply_learned_series_offset"](files[6], 10 ** (base_db / 20.0))
+        check(abs(20 * math.log10(gain) - 5.0) < 1e-9, "an unscanned episode of the series is scanned and given the learned +3 dB")
+        check(ns["_store_loudness_gain"](files[6], gain) and ns["_learned_offset_applied"](files[6]) == 3
+              and abs(raw_db(6) - base_db) < 1e-6,
+              "the offset that was added is remembered, and the season comparison still sees the episode's own scanned dB")
+        check(abs(ns["_owner_gain_baseline_db"](files[6], hub) - base_db) < 1e-6,
+              "an owner change to an offset episode is measured from its own scanned dB, not from the offset one")
+
+        gain = ns["_apply_learned_series_offset"](files[7], 10 ** (8.0 / 20.0))
+        check(abs(20 * math.log10(gain) - 8.0) < 1e-9,
+              "an episode whose own scan is 3 dB or more from the rest of its season is left behind without the offset")
+        check(ns["_store_loudness_gain"](files[7], gain) and ns["_learned_offset_applied"](files[7]) == 0,
+              "the left-behind episode is saved with no offset recorded")
+        gain = ns["_apply_offset_once_confirmed"](files[7], 10 ** (2.2 / 20.0), 2.0)
+        check(abs(20 * math.log10(gain) - 5.2) < 1e-9,
+              "after the scan at new places agrees with the season, the learned offset is added to that episode")
+        check(ns["_store_loudness_gain"](files[7], gain) and ns["_learned_offset_applied"](files[7]) == 3,
+              "the offset added after the recheck is remembered")
+        gain = ns["_apply_offset_once_confirmed"](files[7], 10 ** (8.0 / 20.0), 2.0)
+        check(abs(20 * math.log10(gain) - 8.0) < 1e-9,
+              "if the scan at new places still differs from the season, the episode keeps its own scanned gain")
+
+        ns["_get_show_smoothing_key"] = lambda p: None
+        check(ns["_learned_series_offset"](files[8]) == 0 and ns["_apply_learned_series_offset"](files[8], 1.5) == 1.5,
+              "a file outside a season folder is never offset")
+        scan(9, 2.0)
+        before = len(saves)
+        owner(9, 7)
+        check(len(saves) == before and ns["_learned_series_offset"](files[9]) == 0,
+              "a change to a file outside a season folder is not learned from")
+    finally:
+        for opened in libs:
+            opened.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    src = MAIN_SRC
+    check("apply_learned_offset=False" in src and "_apply_offset_once_confirmed(member, new_gain, middle)" in src
+          and "_learn_from_owner_gain(norm_path, baseline_db, value)" in src,
+          "the season check scans a far episode again without the offset, and the owner's gain changes are learned from")
+
+
+class TestLearnedSeriesOffset(_SectionCase):
+    """A series the owner changes by the same amount three times has the rest of it offset by that amount"""
+
+    def test_learned_series_offset(self):
+        self.run_section(suite_learned_series_offset)
+
+
+
+# ============================================================================
+# SECTION: Pan & Scan shots and picture sizes in the library
+# ============================================================================
+
+
+def suite_pan_scan_dims_hub():
+    import numpy as np
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def make_file(name, size):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as handle:
+                handle.write(os.urandom(size))
+            return path
+
+        def open_probe():
+            lib = ml.MediaLibrary(db_path)
+            libs.append(lib)
+            return ml.ProbeLibrary(lib, use_vlc_fallback=False)
+
+        a = make_file("a.mkv", 3000)
+        probe = open_probe()
+        shots = [{"sig": [0.1 * i for i in range(10)], "offset": 0.5}, {"sig": [1.0] * 10, "offset": -0.25}]
+        check(probe.get_pan_scan_axis(a, "x") == [], "a file with no saved Pan & Scan shots reads as an empty list")
+        check(probe.store_pan_scan_axis(a, "x", shots) and probe.get_pan_scan_axis(a, "x") == shots,
+              "a Pan & Scan shot list is saved in the library and reads back")
+        check(probe.store_pan_scan_axis(a, "y", shots[:1]) and probe.get_pan_scan_axis(a, "x") == shots
+              and probe.get_pan_scan_axis(a, "y") == shots[:1],
+              "saving one axis leaves the other axis's shots alone")
+        again = open_probe()
+        check(again.get_pan_scan_axis(a, "x") == shots, "saved shots survive a restart")
+        gone = os.path.join(tmp, "gone.mkv")
+        check(not probe.store_pan_scan_axis(gone, "x", shots), "a file the library cannot key is refused so the caller keeps it elsewhere")
+        many = [make_file("v%d.mkv" % i, 3100 + i) for i in range(70)]
+        for path in many:
+            probe.store_pan_scan_axis(path, "x", shots[:1])
+        check(all(probe.get_pan_scan_axis(path, "x") for path in many) and probe.get_pan_scan_axis(a, "x") == shots,
+              "no file's shots are dropped however many files are saved")
+
+        facts = ml.FileFactsHub(probe)
+        c = make_file("c.mkv", 3300)
+        check(facts.pan_scan_shots(c, "x") == [], "the file-facts hub reads a file with no saved shots as an empty list")
+        check(facts.note(c, caption_kind="srt") and facts.note_pan_scan_shots(c, "x", shots), "the hub saves a caption fact and Pan & Scan shots for one file")
+        check(facts.pan_scan_shots(c, "x") == shots and facts.read(c)["caption_kind"] == "srt",
+              "the shots and the file's other facts come back from the same library row")
+        check(probe.get_pan_scan_axis(c, "x") == shots and probe.get_cached(c).get("caption_kind") == "srt",
+              "the hub wrote them where the library keeps every other per-file fact")
+        check(facts.note_pan_scan_shots(c, "y", shots[:1]) and facts.pan_scan_shots(c, "x") == shots and facts.pan_scan_shots(c, "y") == shots[:1],
+              "saving one axis through the hub keeps the other")
+        check(not any("sig" in str(value) for value in facts._memo.values()), "the long shot lists are not held in the hub's memo")
+        check(not facts.note_pan_scan_shots(gone, "x", shots), "a file the library cannot key is refused through the hub so the caller can say so")
+        broken = ml.FileFactsHub(types.SimpleNamespace(get_pan_scan_axis=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")),
+                                                      store_pan_scan_axis=lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))))
+        check(broken.pan_scan_shots(c, "x") == [] and broken.note_pan_scan_shots(c, "x", shots) is False,
+              "a library failure gives an empty list or a refusal and never raises")
+
+        class _FakeDb(types.SimpleNamespace):
+            def save_settings_async(self, **k):
+                self.async_saves += 1
+
+        fake_db = _FakeDb(config={"media_probe_cache": {}}, channels_db={}, async_saves=0)
+        hub = ml.GainHub(probe)
+        lib_probe = probe
+        facts_hub = ml.FileFactsHub(lib_probe)
+        ns = {"db": fake_db, "np": np, "os": os, "time": time, "threading": threading, "log": mock.MagicMock(),
+              "media": types.SimpleNamespace(**{**vars(media), "get_file_facts_hub": lambda: facts_hub}),
+              "_log_swallowed": lambda where, error: None, "_log_probe_failure": lambda *args, **kw: None,
+              "_get_probe_library": lambda: lib_probe, "_get_gain_hub": lambda: hub,
+              "_PAN_SCAN_SHOT_SIG_LEN": 10,
+              "_get_library_gain": lambda path: None, "_library_gain_is_current": lambda record: True}
+        for name in ("_pan_scan_shots_from_rows", "_pan_scan_library_load", "_pan_scan_library_save",
+                     "_get_library_dims", "_read_file_probe_facts", "_save_file_probe_facts"):
+            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+        ns["_store_loudness_gain"] = lambda path, gain: False
+        ns["_hub_note_measured_duration"] = lambda path, duration: None
+        ns["_checkpoint_probe_cache"] = lambda: None
+
+        b = make_file("b.mkv", 4000)
+        memory = [{"sig": np.asarray([0.2] * 10, dtype=np.float32), "offset": 0.3}]
+        ns["_pan_scan_library_save"]("key-b", "x", memory, b)
+        deadline = time.time() + 5
+        while time.time() < deadline and not probe.get_pan_scan_axis(b, "x"):
+            time.sleep(0.02)
+        loaded = ns["_pan_scan_library_load"]("key-b", "x", b)
+        check(len(loaded) == 1 and abs(loaded[0]["offset"] - 0.3) < 1e-9 and loaded[0]["sig"].shape == (10,),
+              "Pan & Scan shots saved by the player are loaded back from the library")
+        check("pan_scan_library" not in fake_db.config and fake_db.async_saves == 0,
+              "a file the library can key is not also written into the old settings copy")
+        ns["_pan_scan_library_save"]("key-gone", "x", memory, gone)
+        time.sleep(0.5)
+        check("pan_scan_library" not in fake_db.config,
+              "shots for a file the library cannot key save nothing and the old settings copy is not written")
+        fake_db.config["pan_scan_library"] = {"key-old-%d" % index: {"_v": 1, "axes": {}} for index in range(70)}
+        ns["_pan_scan_library_save"]("key-b", "y", memory, b)
+        time.sleep(0.5)
+        check(len(fake_db.config["pan_scan_library"]) == 70, "the old settings copy is never trimmed")
+        check(ns["_pan_scan_library_load"](None, "x", None) == [] and ns["_pan_scan_library_load"]("k", None, b) == [],
+              "no file or no axis loads nothing")
+
+        d = make_file("d.mkv", 5000)
+        check(hub.read_dims(d) is None, "a file with no saved picture size reads as none")
+        ns["_save_file_probe_facts"](d, dims=(1920, 1080))
+        check(hub.read_dims(d) == (1920, 1080) and "dims" not in fake_db.config["media_probe_cache"].get(d, {}),
+              "a measured picture size is saved in the library and not in the old cache")
+        check(ns["_read_file_probe_facts"](d).get("dims") == [1920, 1080],
+              "every reader of the old cache's picture size sees the library's size")
+        check(ml.GainHub(open_probe()).read_dims(d) == (1920, 1080), "a saved picture size survives a restart")
+        ns["_save_file_probe_facts"](gone, dims=(640, 480))
+        check(gone not in fake_db.config["media_probe_cache"],
+              "a picture size for a file the library cannot key saves nothing and the old cache is not written")
+        check(probe.library.get_entry(probe.keys.resolve(d)).get("header_probed_at") is None,
+              "saving a picture size does not mark the full header read as done")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPanScanDimsHub(_SectionCase):
+    """Pan & Scan shots and picture sizes live in the library with nothing trimmed"""
+
+    def test_pan_scan_dims_hub(self):
+        self.run_section(suite_pan_scan_dims_hub)
+
+
+# ============================================================================
+# SECTION: File facts hub (caption source, playability verdicts, loudness retry timers)
+# ============================================================================
+
+
+def suite_file_facts_hub():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def make_file(name, size):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as handle:
+                handle.write(os.urandom(size))
+            return path
+
+        def open_hub():
+            lib = ml.MediaLibrary(db_path)
+            libs.append(lib)
+            return ml.FileFactsHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+
+        a = make_file("a.mkv", 3000)
+        hub = open_hub()
+        blank = hub.read(a)
+        check(all(blank[name] in (None, False) for name in ml.FILE_FACT_COLUMNS), "a file with nothing on record reads as nothing on record")
+        check(hub.note(a, caption_kind="sidecar", caption_srt_path="x.srt") and hub.read(a)["caption_kind"] == "sidecar",
+              "a caption source is saved and reads back")
+        check(open_hub().read(a)["caption_srt_path"] == "x.srt", "a caption source survives a restart")
+        check(not hub.note(os.path.join(tmp, "gone.mkv"), caption_kind="sidecar"), "a file the library cannot key is refused so the caller can say so")
+        counts = [hub.add_unplayable_strike(a, "r%d" % i, 3) for i in range(3)]
+        facts = hub.read(a)
+        check(counts == [1, 2, 3] and facts["confirmed_unplayable"] and facts["unplayable_reason"] == "r2",
+              "strikes count up one at a time and the third confirms the file unplayable")
+        check(open_hub().read(a)["unplayable_strikes"] == 3 and open_hub().read(a)["confirmed_unplayable"], "strikes and the confirmed verdict survive a restart")
+        workers = [threading.Thread(target=hub.add_unplayable_strike, args=(a, "race", 99)) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        check(hub.read(a)["unplayable_strikes"] == 11, "strikes added from many threads at once are all counted")
+        check(hub.note(a, confirmed_no_audio=True, no_audio_reason="silent") and hub.read(a)["confirmed_no_audio"] is True,
+              "a confirmed no-audio verdict is saved")
+        check(hub.note(a, loudness_timeout_streak=2, loudness_next_retry_ts=123.5)
+              and hub.read(a)["loudness_next_retry_ts"] == 123.5, "loudness retry timers are saved")
+        hub.clear(a, "loudness_timeout_streak", "loudness_next_retry_ts")
+        check(open_hub().read(a)["loudness_timeout_streak"] is None, "clearing the retry timers is kept across a restart")
+
+        with open(a, "wb") as handle:
+            handle.write(os.urandom(3500))
+        hub.forget(a)
+        changed = hub.read(a)
+        check(changed["caption_kind"] is None and not changed["confirmed_unplayable"],
+              "a file that changed on disk has no record, so its old verdicts never apply to it")
+
+        movie = make_file("movie.mkv", 3200)
+        sidecar = os.path.join(tmp, "movie.srt")
+        with open(sidecar, "w") as handle:
+            handle.write("1\n00:00:01,000 --> 00:00:02,000\nhi\n")
+        library_hub = open_hub()
+        broken = make_file("broken.mkv", 3250)
+        library_hub.note(broken, confirmed_unplayable=True)
+        with patch.object(media, "get_file_facts_hub", return_value=library_hub), \
+             patch.object(media, "_cached_path_exists", os.path.exists), \
+             patch.object(media, "_probe_embedded_subtitle_streams", return_value=[]), \
+             patch.object(media, "_burned_in_verdict", return_value=False):
+            first = media.resolve_caption_source(movie)
+            check(first["kind"] == "sidecar" and library_hub.read(movie)["caption_kind"] == "sidecar",
+                  "finding a caption file next to a video saves it in the library")
+            second = media.resolve_caption_source(movie)
+            check(second["kind"] == "cache" and second["srt_path"] == sidecar, "the second lookup answers from the library")
+            os.remove(sidecar)
+            check(media.resolve_caption_source(movie)["kind"] is None, "a saved caption file that is gone is not used")
+            extracted = make_file("tv_1.srt", 40)
+            check(media.note_caption_source(movie, "embedded", extracted) and media.resolve_caption_source(movie)["kind"] == "cache",
+                  "an extracted embedded caption file is found again from the library")
+            newer = os.path.join(tmp, "movie.en.srt")
+            with open(newer, "w") as handle:
+                handle.write("x")
+            check(media.resolve_caption_source(movie)["kind"] == "sidecar", "a caption file added later beats a saved embedded extraction")
+            check(media.file_is_confirmed_bad(broken) and not media.file_is_confirmed_bad(movie),
+                  "the scheduler's broken-file check reads the library")
+            check(not media.note_caption_source(os.path.join(tmp, "gone.mkv"), "sidecar", "x.srt"), "a caption source for an unkeyable file is reported as not saved")
+
+        fake_cache = {os.path.normpath(movie): {"duration": 1500}}
+        fake_db = types.SimpleNamespace(config={"media_probe_cache": fake_cache}, save_settings_async=lambda **k: None)
+        ns = {"db": fake_db, "os": os, "time": time, "media": media, "log": mock.MagicMock(), "print": lambda *a, **k: None,
+              "_log_warn_throttled": lambda *a, **k: None, "UNPLAYABLE_STRIKE_THRESHOLD": 3,
+              "_LOUDNESS_TIMEOUT_BACKOFF_S": (60, 120, 240)}
+        for name in ("_loudness_backoff_seconds", "_loudness_probe_in_cooldown", "_record_loudness_timeout",
+                     "_clear_loudness_timeout_streak", "_register_unplayable_strike", "_mark_confirmed_no_audio"):
+            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+        hub3 = open_hub()
+        target = make_file("target.mkv", 3400)
+        with patch.object(media, "get_file_facts_hub", return_value=hub3):
+            check(not ns["_loudness_probe_in_cooldown"](target), "a file with no timeout is not in cooldown")
+            ns["_record_loudness_timeout"](target)
+            ns["_record_loudness_timeout"](target)
+            check(hub3.read(target)["loudness_timeout_streak"] == 2 and ns["_loudness_probe_in_cooldown"](target),
+                  "loudness timeouts build a streak in the library and start a cooldown")
+            ns["_clear_loudness_timeout_streak"](target)
+            check(not ns["_loudness_probe_in_cooldown"](target) and hub3.read(target)["loudness_timeout_streak"] is None, "a good scan ends the cooldown")
+            counts = [ns["_register_unplayable_strike"](target, "bad") for _ in range(3)]
+            check(counts == [1, 2, 3] and hub3.read(target)["confirmed_unplayable"], "playback strikes are saved in the library and the third confirms the file")
+            ns["_mark_confirmed_no_audio"](target, "silent")
+            check(hub3.read(target)["confirmed_no_audio"], "a no-audio verdict is saved in the library")
+        check(fake_cache == {os.path.normpath(movie): {"duration": 1500}} and set(fake_db.config) == {"media_probe_cache"},
+              "nothing about strikes, verdicts or retry timers is written to the old settings")
+
+        for old_name in ('config.get("caption_cache"', 'setdefault("caption_cache"', "_purge_stale_asr_caption_cache"):
+            check(old_name not in MAIN_SRC, "the emulator no longer uses %s" % old_name)
+        check('entry["unplayable_strikes"]' not in MAIN_SRC and '["confirmed_unplayable"] = True' not in MAIN_SRC,
+              "the emulator no longer keeps strikes or verdicts in the old cache")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestFileFactsHub(_SectionCase):
+    """Caption sources, playability verdicts and loudness retry timers live in the library"""
+
+    def test_file_facts_hub(self):
+        self.run_section(suite_file_facts_hub)
+
+
+# ============================================================================
+# SECTION: Multi-part title gains in the library
+# ============================================================================
+
+_PART_GROUP_EMULATOR_FUNCTIONS = (
+    "_library_gain_is_current", "_read_part_group_gain", "_set_part_group_anchor_gain",
+    "_invalidate_gains_for_target_lufs_change", "_probe_loudness_guarded",
+)
+
+
+def suite_part_group_gain_hub():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def open_hub():
+            lib = ml.MediaLibrary(db_path)
+            libs.append(lib)
+            return ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+
+        hub = open_hub()
+        key_a, key_b = "d:\\movies\\saga::saga", "d:\\movies\\epic::epic"
+        check(hub.read_group(key_a) is None, "a multi-part title with nothing on record reads as nothing on record")
+        check(hub.note_group(key_a, "d:\\movies\\saga\\saga cd1.mkv", 0.8, -20.5, 1, 1.5), "a multi-part title gain is saved")
+        row = hub.read_group(key_a)
+        check(row == {"anchor_path": "d:\\movies\\saga\\saga cd1.mkv", "gain": 0.8, "target_lufs": -20.5, "scan_version": 1, "convergence_db": 1.5},
+              "the saved gain reads back with the part it came from and the settings it was measured under")
+        check(open_hub().read_group(key_a)["gain"] == 0.8, "a multi-part title gain survives a restart")
+        check(hub.read_group(key_b) is None, "another title is not affected")
+        hub.note_group(key_a, "d:\\movies\\saga\\saga cd2.mkv", 0.6, -20.5, 1, 1.5)
+        check(hub.read_group(key_a)["gain"] == 0.6 and hub.read_group(key_a)["anchor_path"].endswith("cd2.mkv"),
+              "a new scan of the title replaces the gain and the part on record")
+        check(not hub.note_group("", "x.mkv", 0.5) and not hub.note_group(key_b, "", 0.5) and not hub.note_group(key_b, "x.mkv", 0)
+              and not hub.note_group(key_b, "x.mkv", -1) and hub.read_group(key_b) is None,
+              "an empty title, an empty part or a gain of zero or less is refused and nothing is saved")
+
+        hub.probe_library.library._conn.execute("DROP TABLE hub_part_group_gain")
+        hub.probe_library.library._conn.commit()
+        upgraded = open_hub()
+        check(upgraded.note_group(key_b, "x.mkv", 0.7) and upgraded.read_group(key_b)["gain"] == 0.7,
+              "an older library file gains the multi-part gain table when it is opened")
+
+        emu_hub = open_hub()
+        fake_db = types.SimpleNamespace(config={}, channels_db={}, saves=[])
+        fake_db.save_settings_async = lambda: fake_db.saves.append(1)
+        logged = mock.MagicMock()
+        ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
+              "log": logged, "_log_swallowed": lambda where, error: None,
+              "_MUSIC_FILE_EXTS": (".mp3", ".flac", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".opus"),
+              "_get_gain_hub": lambda: emu_hub, "_get_probe_library": lambda: emu_hub.probe_library,
+              "TARGET_LUFS": media.TARGET_LUFS, "LOUDNESS_CONVERGENCE_DB": media.LOUDNESS_CONVERGENCE_DB}
+        for name in _PART_GROUP_EMULATOR_FUNCTIONS:
+            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+
+        gk = "d:\\movies\\emu::emu"
+        check(ns["_read_part_group_gain"](gk) is None and ns["_read_part_group_gain"](None) is None, "no saved title gain reads as none")
+        ns["_set_part_group_anchor_gain"](gk, "d:\\movies\\emu\\emu cd1.mkv", 0.75)
+        got = ns["_read_part_group_gain"](gk)
+        check(got["gain"] == 0.75 and got["anchor_path"].endswith("emu cd1.mkv") and got["target_lufs"] == media.TARGET_LUFS
+              and got["scan_version"] == media.LOUDNESS_GAIN_SCAN_VERSION and got["convergence_db"] == media.LOUDNESS_CONVERGENCE_DB,
+              "the first scanned part's gain is saved in the library with the video target, the scan version and the convergence")
+        ns["_set_part_group_anchor_gain"]("d:\\music\\album::album", "d:\\music\\album\\a.mp3", 0.5)
+        check(ns["_read_part_group_gain"]("d:\\music\\album::album")["target_lufs"] == media.MUSIC_TARGET_LUFS,
+              "a music part is stamped with the music target")
+        check("_part_group_gain_cache" not in fake_db.config and not fake_db.saves, "saving a title gain writes nothing into settings and forces no settings save")
+        with mock.patch.object(media, "TARGET_LUFS", -23.0):
+            check(ns["_read_part_group_gain"](gk) is None, "a title gain measured under another target is ignored so the title is measured again")
+        with mock.patch.object(media, "LOUDNESS_GAIN_SCAN_VERSION", media.LOUDNESS_GAIN_SCAN_VERSION + 1):
+            check(ns["_read_part_group_gain"](gk) is None, "a title gain from an older scan version is ignored")
+        with mock.patch.object(media, "LOUDNESS_CONVERGENCE_DB", media.LOUDNESS_CONVERGENCE_DB + 1.0):
+            check(ns["_read_part_group_gain"](gk) is None, "a title gain measured under another convergence is ignored")
+        check(emu_hub.read_group(gk)["gain"] == 0.75, "an ignored title gain stays in the library until a new scan replaces it")
+        check(ns["_library_gain_is_current"]({"gain": 1.1, "target_lufs": None, "scan_version": None, "convergence_db": None}),
+              "a title gain with no stamp counts as current")
+
+        ns["_get_gain_hub"] = lambda: None
+        logged.reset_mock()
+        ns["_set_part_group_anchor_gain"](gk, "p.mkv", 0.4)
+        check(ns["_read_part_group_gain"](gk) is None and logged.warning.call_count == 1 and "multi-part title gain" in logged.warning.call_args[0][0],
+              "with no library the title gain is not read, and not being able to save it writes one line to the log")
+        ns["_get_gain_hub"] = lambda: emu_hub
+        ns["_set_part_group_anchor_gain"](None, "p.mkv", 0.4)
+        ns["_set_part_group_anchor_gain"](gk, "p.mkv", None)
+        check(emu_hub.read_group(gk)["gain"] == 0.75, "saving without a title or without a gain does nothing")
+
+        fake_db.config["_gain_cache_target_lufs"] = [-23.0, media.LOUDNESS_CONVERGENCE_DB]
+        fake_db.channels_db = {"05": {"schedules": {"Morning": [{"path": "p.mkv", "gain": 0.9, "pair_ep1_gain": 0.8}]}}}
+        ns["TARGET_LUFS"] = media.TARGET_LUFS
+        before = emu_hub.read_group(gk)
+        cleared = ns["_invalidate_gains_for_target_lufs_change"]()
+        check(cleared == 2 and "gain" not in fake_db.channels_db["05"]["schedules"]["Morning"][0], "a loudness target change still clears the gains held inside schedule entries")
+        check(emu_hub.read_group(gk) == before and not hasattr(fake_db, "_part_group_gain_cache"),
+              "a loudness target change no longer clears multi-part title gains; the library keeps them and the stamps decide if they count")
+
+        def run_guarded(path, group, scan_gain=None, shortfall=None):
+            guarded = {"_get_part_group_key": lambda p: group, "_read_part_group_gain": ns["_read_part_group_gain"],
+                       "_set_part_group_anchor_gain": ns["_set_part_group_anchor_gain"], "_claim_probe": lambda p, f: True,
+                       "_release_probe": lambda p, f: None, "get_media_loudness_gain": mock.MagicMock(return_value=scan_gain),
+                       "_set_gain_double_checked": lambda p, c: None, "_set_gain_windows": lambda p, w: None,
+                       "_apply_show_loudness_smoothing": lambda p, g, i: g, "print": lambda *a, **k: None, "db": fake_db}
+            scope = dict(ns)
+            scope.update(guarded)
+            exec(compile(get_function_source("_probe_loudness_guarded"), filename="<extracted:_probe_loudness_guarded>", mode="exec"), scope)
+            out = {} if shortfall is None else shortfall
+            return scope["_probe_loudness_guarded"](path, out_shortfall=out), out, scope["get_media_loudness_gain"]
+
+        gain, out, scanner = run_guarded("d:\\movies\\emu\\emu cd2.mkv", gk)
+        check(gain == 0.75 and out.get("measured_lufs") is None and not scanner.called,
+              "another part of a scanned title reuses the saved gain from the library and is not scanned")
+        gain, out, scanner = run_guarded("d:\\movies\\emu\\emu cd1.mkv", gk, scan_gain=0.7)
+        check(gain == 0.7 and scanner.called and emu_hub.read_group(gk)["gain"] == 0.7,
+              "the part the title's gain came from is scanned on its own and its new gain replaces the saved one")
+        fresh = "d:\\movies\\fresh::fresh"
+        gain, out, scanner = run_guarded("d:\\movies\\fresh\\fresh cd1.mkv", fresh, scan_gain=0.65)
+        check(gain == 0.65 and scanner.called and emu_hub.read_group(fresh)["gain"] == 0.65 and emu_hub.read_group(fresh)["anchor_path"].endswith("fresh cd1.mkv"),
+              "the first part of a new multi-part title that is scanned becomes the title's saved gain")
+        with mock.patch.object(media, "TARGET_LUFS", -23.0):
+            gain, out, scanner = run_guarded("d:\\movies\\fresh\\fresh cd2.mkv", fresh, scan_gain=0.55)
+            check(gain == 0.55 and scanner.called and emu_hub.read_group(fresh)["anchor_path"].endswith("fresh cd2.mkv"),
+                  "when the saved title gain was measured under another target the next part is scanned and becomes the new saved gain")
+        gain, out, scanner = run_guarded("d:\\movies\\solo.mkv", None, scan_gain=0.9)
+        check(gain == 0.9 and scanner.called, "a file that is not part of a multi-part title is scanned as before")
+        gain, out, scanner = run_guarded("d:\\movies\\none\\none cd1.mkv", "d:\\movies\\none::none", scan_gain=None)
+        check(gain is None and emu_hub.read_group("d:\\movies\\none::none") is None, "a scan that returns nothing saves no title gain")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPartGroupGainHub(_SectionCase):
+    """Multi-part title gains live in the library with the settings they were measured under"""
+
+    def test_part_group_gain_hub(self):
+        self.run_section(suite_part_group_gain_hub)
+
+
+# ============================================================================
+# SECTION: Reset and Clear keep what was learned about each file
+# ============================================================================
+
+
+def suite_clear_keeps_file_data():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        kept_names = ("_gain_cache_target_lufs", "_lufs23_migration_done", "_music_target_v2_migration_done")
+        check(set(media.FACTORY_RESET_KEEPS_FILE_DATA) == set(kept_names),
+              "the list of settings keys that survive Reset All Settings holds the loudness-target stamp and the one-time gain flags")
+        learned = {"_gain_cache_target_lufs": [-20.5, 1.5],
+                   "_lufs23_migration_done": True, "_music_target_v2_migration_done": True}
+        rdb = object.__new__(media.RetroDatabase)
+        rdb.config = dict(copy.deepcopy(learned))
+        rdb.config.update({"global_volume": 10, "current_theme": "X"})
+        rdb.ready_flag = False
+        rdb.channels_db = {"05": {"schedules": {"Morning": [{"path": "c:\\tv\\a.mkv", "duration": 1500}]}}}
+        saved = []
+        rdb.save_settings = lambda: saved.append(1)
+        rdb._build_channels_db = lambda raw: {"05": {"schedules": {"Morning": []}}}
+        rdb.factory_reset()
+        check(all(rdb.config.get(k) == v for k, v in learned.items()),
+              "Reset All Settings keeps the loudness-target stamp and the one-time gain flags")
+        check(rdb.config["global_volume"] == 70 and rdb.channels_db["05"]["schedules"]["Morning"] == [],
+              "Reset All Settings still returns settings to their defaults and clears all media from every channel")
+
+        db_path = os.path.join(tmp, "library.sqlite3")
+        lib = ml.MediaLibrary(db_path)
+        libs.append(lib)
+        hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+        movie = os.path.join(tmp, "movie.mkv")
+        with open(movie, "wb") as handle:
+            handle.write(os.urandom(4000))
+        hub.note_gain(movie, 0.8, -20.5, 1, 1.5)
+        _set_manual_db(hub, movie, 4)
+        again = ml.GainHub(ml.ProbeLibrary(ml.MediaLibrary(db_path), use_vlc_fallback=False))
+        libs.append(again.probe_library.library)
+        row = again.read(movie)
+        check(row["gain"] == 0.8 and row["manual_gain_db"] == 4,
+              "the library rows are not part of the settings, so a cleared and re-added file reads its gain and manual dB without a rescan")
+
+        reset_src = get_function_source("_execute_system_reset_all_settings")
+        check(reset_src.index("_save_schedule_lengths_into_library()") < reset_src.index("db.factory_reset()"),
+              "lengths and gains held only in schedule entries are copied into the kept cache before Reset All Settings clears the channels")
+
+        fake_db = types.SimpleNamespace(
+            config={k: copy.deepcopy(v) for k, v in learned.items()}, saves=[],
+            channels_db={"05": {"schedules": {"Morning": [{"path": "a"}], "Commercials": [{"path": "b"}]},
+                                 "playback_log": {"x": 1}, "sched_cached_tracks": {"y": 1}},
+                         "06": {"schedules": {"Morning": [{"path": "c"}]}, "playback_log": {"z": 1}},
+                         "07": {"is_visualizer": True, "schedules": {"Music Tracks": [{"path": "m.mp3"}]}}})
+        fake_db.save_settings = lambda: fake_db.saves.append(1)
+        clear_ns = {"db": fake_db, "app_state": {"current_channel": "06"}, "SIX_HOUR_BLOCK_NAMES": ("A", "B"),
+                    "vlc_engine": None, "pygame": mock.MagicMock(), "log": mock.MagicMock(),
+                    "_clear_last_video_frame": lambda: None, "invalidate_guide_cache": lambda: None,
+                    "_log_swallowed": lambda where, error: None}
+        exec(compile(get_function_source("_execute_channel_media_clear"), "<extracted:clear>", "exec"), clear_ns)
+        clear_ns["_execute_channel_media_clear"]("05", fake_db.channels_db["05"])
+        check(fake_db.channels_db["05"]["schedules"]["Morning"] == [] and fake_db.channels_db["05"]["schedules"]["Commercials"] == []
+              and "playback_log" not in fake_db.channels_db["05"],
+              "a channel's Clear button empties that station's media and its playing state")
+        check(fake_db.channels_db["06"]["schedules"]["Morning"] == [{"path": "c"}] and "playback_log" in fake_db.channels_db["06"],
+              "a channel's Clear button leaves every other station alone")
+        clear_ns["_execute_channel_media_clear"]("07", fake_db.channels_db["07"])
+        check(fake_db.channels_db["07"]["schedules"]["Music Tracks"] == [],
+              "a visualizer's Clear button empties only its own music tracks")
+        check(all(fake_db.config[k] == v for k, v in learned.items()),
+              "a channel's Clear button leaves every stored length, gain, manual dB and caption result untouched")
+    finally:
+        for item in libs:
+            try:
+                item.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestClearKeepsFileData(_SectionCase):
+    """Reset All Settings and each channel's Clear button clear media but keep what was learned about each file"""
+
+    def test_clear_keeps_file_data(self):
+        self.run_section(suite_clear_keeps_file_data)
+
+
+
+# ============================================================================
+# SECTION: Channel 03 menu music in the hub (random order, no repeats, one scan gain)
+# ============================================================================
+
+
+def suite_ch03_menu_music_hub():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def open_lib():
+            lib = ml.MediaLibrary(db_path)
+            libs.append(lib)
+            return lib
+
+        def make(name):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as handle:
+                handle.write(os.urandom(2500))
+            return path
+
+        tracks = [make("t%d.mp3" % i) for i in range(6)]
+        lib = open_lib()
+        hub = ml.PlayOrderHub(lib, rng=random.Random(7))
+        check(hub.next_track("L") is None and hub.order("L") == [], "a list with no tracks plays nothing")
+        hub.sync("L", tracks)
+        dealt = [p for p, _a in hub.order("L")]
+        check(sorted(dealt) == sorted(tracks) and len(dealt) == 6, "every track in the list is dealt into the order once")
+        check(dealt != tracks or len(set(dealt)) == 6, "the order is dealt at random, not left in list order")
+
+        reopened = ml.PlayOrderHub(open_lib(), rng=random.Random(99))
+        check([p for p, _a in reopened.order("L")] == dealt, "the dealt order is kept across a restart and is not dealt again")
+        reopened.sync("L", tracks)
+        check([p for p, _a in reopened.order("L")] == dealt, "syncing an unchanged list leaves the order alone")
+
+        first_pass = [hub.next_track("L") for _ in range(6)]
+        check(first_pass == dealt, "the tracks air in the dealt order")
+        check(len(set(first_pass)) == 6, "no track airs twice in one pass")
+        check(hub.state("L") == {"pass_no": 1, "aired": 6, "total": 6}, "after every track has aired the pass shows all aired")
+        last_of_pass = first_pass[-1]
+        second_pass = [hub.next_track("L") for _ in range(6)]
+        check(sorted(second_pass) == sorted(tracks) and len(set(second_pass)) == 6,
+              "the next pass airs every track once again")
+        check(second_pass[0] != last_of_pass and hub.state("L")["pass_no"] == 2,
+              "a new pass never opens with the track that just aired and counts as pass 2")
+        seen_runs_ok = True
+        previous_last = second_pass[-1]
+        for _ in range(40):
+            run = [hub.next_track("L") for _ in range(6)]
+            if len(set(run)) != 6 or run[0] == previous_last:
+                seen_runs_ok = False
+            previous_last = run[-1]
+        check(seen_runs_ok, "over forty more passes no track repeats inside a pass or back to back across passes")
+
+        mid = ml.PlayOrderHub(lib, rng=random.Random(3))
+        got = [mid.next_track("L") for _ in range(2)]
+        new_track = make("new.mp3")
+        mid.sync("L", tracks + [new_track])
+        order_now = mid.order("L")
+        check([p for p, a in order_now if a] == got and any(p == new_track and not a for p, a in order_now),
+              "a track added mid pass joins the part that has not aired and the aired marks stay")
+        mid.sync("L", [t for t in tracks if t != tracks[0]] + [new_track])
+        check(all(p != tracks[0] for p, _a in mid.order("L")), "a removed track leaves the active order")
+        rows = lib._conn.execute("SELECT COUNT(*) FROM hub_play_order WHERE list_id = 'L'").fetchone()[0]
+        check(rows == 7, "a removed track's row stays in the library, nothing is deleted")
+        mid.sync("L", tracks + [new_track])
+        check(any(p == tracks[0] for p, _a in mid.order("L")), "a track added back returns with its history")
+
+        gone = os.path.join(tmp, "gone.mp3")
+        lone = ml.PlayOrderHub(open_lib(), rng=random.Random(1))
+        lone.sync("M", [gone, tracks[0]])
+        picked = lone.next_track("M", usable=os.path.isfile)
+        check(picked == tracks[0], "a track whose file is missing is skipped")
+        check(lone.next_track("M", usable=os.path.isfile) is None and lone.state("M")["pass_no"] == 1
+              and lone.state("M")["aired"] == 1,
+              "when only missing files remain nothing plays and the pass does not advance")
+        solo = ml.PlayOrderHub(open_lib(), rng=random.Random(1))
+        solo.sync("S", [tracks[1]])
+        check([solo.next_track("S") for _ in range(3)] == [tracks[1]] * 3, "a list of one track plays it every pass")
+
+        hub_ns = {"app_state": {"ch03_menu_music_idx": 0}, "os": os, "_log_swallowed": lambda w, e: None,
+                  "_CH03_MENU_MUSIC_LIST_ID": "ch03_menu_music"}
+        ch03_hub = ml.PlayOrderHub(open_lib(), rng=random.Random(5))
+        hub_ns["_get_play_order_hub"] = lambda: ch03_hub
+        for name in ("_ch03_entry_path", "_ch03_next_playlist_entry"):
+            exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), hub_ns)
+        playlist = [{"path": t, "gain": 1.5} for t in tracks[:4]]
+        airs = [hub_ns["_ch03_next_playlist_entry"](playlist) for _ in range(4)]
+        check(sorted(a[1] for a in airs) == sorted(tracks[:4]) and all(playlist[a[0]]["path"] == a[1] for a in airs),
+              "menu music airs every playlist track once, returning the playlist index and entry of each")
+        check(hub_ns["app_state"]["ch03_menu_music_idx"] == airs[-1][0], "the playlist index follows the track that aired")
+        hub_ns["_get_play_order_hub"] = lambda: None
+        hub_ns["app_state"]["ch03_menu_music_idx"] = 0
+        seq = [hub_ns["_ch03_next_playlist_entry"](playlist)[0] for _ in range(5)]
+        check(seq == [0, 1, 2, 3, 0], "when the hub is off the menu music still moves on to the next track in list order")
+
+        db_fake = types.SimpleNamespace(config={"media_probe_cache": {}, "audio_gain_db_by_file": {}}, channels_db={})
+        gain_hub = ml.GainHub(ml.ProbeLibrary(open_lib(), use_vlc_fallback=False))
+        gns = _gain_namespace(db_fake, gain_hub)
+        exec(compile(get_function_source("_ch03_track_gain"), "<extracted:_ch03_track_gain>", "exec"), gns)
+        track = tracks[2]
+        check(gns["_ch03_track_gain"](track, {"path": track}) == 1.0, "a track with no scan and no saved gain plays at 1.0")
+        check(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) == 1.4,
+              "a gain saved in the playlist by an older version is used only until the scan lands")
+        gain_hub.note_gain(track, 0.8, media.MUSIC_TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
+        check(abs(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) - 0.8) < 1e-9,
+              "the scanned gain replaces the saved playlist gain and is applied once")
+        _set_manual_db(gain_hub, track, 3)
+        check(abs(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) - 0.8 * 10 ** (3 / 20.0)) < 1e-9,
+              "the owner's manual dB sits on top of the scanned gain")
+
+        patch_db = types.SimpleNamespace(config={"ch03_menu_music": [{"path": track}]}, channels_db={})
+        stored = []
+        patch_ns = {"db": patch_db, "os": os, "log": mock.MagicMock(), "app_state": {"ch03_menu_music_track": ""},
+                    "_ch03_music_is_playing": lambda: False, "_set_ch03_menu_music_volume": lambda *a, **k: None,
+                    "_get_manual_audio_gain_db": lambda p: 0, "dvd_engine": None, "game_deck": None,
+                    "_save_file_probe_facts": lambda path, duration=None, gain=None, dims=None: stored.append((path, gain, duration))}
+        exec(compile(get_function_source("_patch_probed_gain"), "<extracted:_patch_probed_gain>", "exec"), patch_ns)
+        patch_ns["_patch_probed_gain"]("ch03_menu_music", None, 0, os.path.normpath(track), gain=0.7)
+        check(stored == [(os.path.normpath(track), 0.7, None)] and "gain" not in patch_db.config["ch03_menu_music"][0],
+              "a menu-music scan result goes to the library and is no longer copied into the playlist entry")
+
+        start_src = get_function_source("_start_ch03_menu_music")
+        check("_get_audio_gain_db" not in start_src and "_ch03_next_playlist_entry" in start_src and "_ch03_track_gain" in start_src,
+              "starting menu music picks through the hub and no longer stacks the scan gain on the playlist gain")
+        queue_src = get_function_source("_gather_music_probe_queue").split("for i in range(5, 45)")[0]
+        check('"gain" in entry' not in queue_src and "_have.get(\"duration\")" in queue_src,
+              "the music scan queue asks the library for both the length and the gain of each menu-music track")
+        check('_cur_idx  = app_state.get("ch03_menu_music_idx", 0)' not in MAIN_SRC,
+              "the end-of-track loop no longer moves the list index itself; the hub picks the next track")
+    finally:
+        for item in libs:
+            try:
+                item.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestCh03MenuMusicHub(_SectionCase):
+    """Channel 03 menu music is dealt a random order with no repeats by the hub and keeps one scanned gain"""
+
+    def test_ch03_menu_music_hub(self):
+        self.run_section(suite_ch03_menu_music_hub)
+
 
 
 # ============================================================================
@@ -10304,23 +13652,35 @@ def suite_guide_past_replay():
         if "Beta" in p and not p.endswith("E05.mkv"):
             cache[p] = {"duration": 2700}
     exists = lambda p: True
+    _install_cache_hub(cache)
 
-    guesses = media.estimated_track_durations(items + [{"path": "/m/Gamma/S01E01.mkv"}, {"path": "/m/Movies/Heat.mkv"}], cache, exists)
-    check(guesses["/m/Alpha/S01E05.mkv"] == 1320 and guesses["/m/Beta/S01E05.mkv"] == 2700,
-          "an unscanned episode is guessed from its own series' scanned episodes")
-    check(guesses["/m/Gamma/S01E01.mkv"] in (1320, 2700),
-          "an unscanned episode of a series with nothing scanned takes the channel's middle episode length")
-    check(guesses["/m/Movies/Heat.mkv"] == media._MOVIE_DURATION_FALLBACK_SECONDS,
-          "an unscanned movie takes the movie default")
-    check(media.estimated_track_durations([{"path": "/m/Solo/S01E01.mkv"}], {}, exists)["/m/Solo/S01E01.mkv"] == media.GUIDE_REPLAY_EPISODE_GUESS_SECONDS,
-          "with nothing scanned anywhere an episode takes the default episode length")
-    filled = {t["path"]: t for t in media.build_guess_filled_tracks(items, cache, exists)}
-    check(len(filled) == len(items) and filled["/m/Alpha/S01E05.mkv"]["duration"] == 1320 and "_duration_estimated" not in filled["/m/Alpha/S01E05.mkv"],
-          "the guess-filled tracks keep every file, unscanned ones at their guessed length")
-    check("/m/Gamma/S01E01.mkv" not in {t["path"] for t in media.build_raw_tracks(items + [{"path": "/m/Gamma/S01E01.mkv"}], cache, exists)},
-          "the scheduler's own builder still leaves out an unscanned file it cannot guess")
-    check("/m/Gamma/S01E01.mkv" in {t["path"] for t in media.build_guess_filled_tracks(items + [{"path": "/m/Gamma/S01E01.mkv"}], cache, exists)},
-          "the guess-filled builder keeps it")
+    estimates = media.estimated_track_durations(items + [{"path": "/m/Gamma/S01E01.mkv"}, {"path": "/m/Movies/Heat.mkv"}], exists)
+    check(estimates["/m/Alpha/S01E05.mkv"] == 1320 and estimates["/m/Beta/S01E05.mkv"] == 2700,
+          "an unscanned episode with two scanned episodes uses its own series' saved average")
+    check("/m/Gamma/S01E01.mkv" not in estimates,
+          "an unscanned episode with no scanned series average has no duration and receives no channel-wide fallback")
+    check(estimates["/m/Movies/Heat.mkv"] == media.HUB_MOVIE_ESTIMATE_SECONDS,
+          "an unscanned movie uses the hub's saved movie estimate")
+    check("/m/Solo/S01E01.mkv" not in media.estimated_track_durations([{"path": "/m/Solo/S01E01.mkv"}], exists),
+          "an unscanned episode with no series duration remains unplaced")
+    unestimated = [
+        {"path": "/m/Gamma/S01E01.mkv"},
+        {"path": "/m/LooseFilm.mkv"},
+        {"path": "/m/Commercials/Unscanned.mp4"},
+    ]
+    check(not media.estimated_track_durations(unestimated, exists),
+          "an unscanned episode, unidentified movie, or commercial gets no replay-only duration fallback")
+    tracks = {t["path"]: t for t in media.build_raw_tracks(items, exists)}
+    check(len(tracks) == len(items) and tracks["/m/Alpha/S01E05.mkv"]["duration"] == 1320,
+          "the shared track builder places the permitted series estimate without a replay-only fallback")
+    expanded = {t["path"] for t in media.build_raw_tracks(items + [{"path": "/m/Gamma/S01E01.mkv"}], exists)}
+    check("/m/Gamma/S01E01.mkv" not in expanded,
+          "guide history and live scheduling both leave an unestimated episode out")
+    check(not hasattr(media, "build_guess_filled_tracks")
+          and not hasattr(media, "GUIDE_REPLAY_EPISODE_GUESS_SECONDS")
+          and not hasattr(gov, "GUIDE_REPLAY_EPISODE_GUESS_SECONDS")
+          and not hasattr(media, "COMMERCIAL_DEFAULT_SECONDS"),
+          "the replay-only episode, movie-middle and commercial fallbacks are removed")
 
     ch = {"scheduling_mode": "one_slot", "block_mode": "full_day", "schedules": {"Full Day": items},
           "playback_log": {"show_pos": {}}, "pair_threshold_minutes": 15}
@@ -10329,52 +13689,55 @@ def suite_guide_past_replay():
     d = datetime.date
     before = _copy.deepcopy(ch)
     recs = media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
-                                      now, cache, exists, [], lambda off: "7:%d" % off)
+                                      now, exists, [], lambda off: "7:%d" % off)
     check(ch == before, "the rebuild changes nothing in the channel")
     check(recs and all(r[2] + r[4] > (now.toordinal() - 1) * 86400 for r in recs),
           "only cycles that reach back no further than the previous midnight are returned")
-    check(all(a[2] + a[4] <= b[2] + 0.5 for a, b in zip(recs, recs[1:])), "rebuilt cycles follow each other without overlap")
+    check(all(a[1] != b[1] or a[2] + a[4] <= b[2] + 0.5 for a, b in zip(recs, recs[1:])), "rebuilt cycles of one block follow each other without overlap")
+    block_start = lambda rec: (d(2026, 1, 1) + datetime.timedelta(days=int(rec[1].split("_")[1]) - 1)).toordinal() * 86400
+    check(all(b[2] == max(block_start(b), math.ceil(a[2] + a[4] - 1e-6)) for a, b in zip(recs, recs[1:]) if a[1] != b[1]),
+          "the first cycle of each rebuilt block starts at the block's own clock start, or when the last entry of the block before it ends if that runs past it")
     check(recs[-1][2] // 86400 == d(2026, 10, 14).toordinal() and recs[-1][2] + recs[-1][4] <= d(2026, 10, 15).toordinal() * 86400 + 7200,
           "the last rebuilt cycle is on the day before the current block")
     placed = {e["path"]: e["duration"] for r in recs for e in r[3]}
-    check(placed.get("/m/Alpha/S01E05.mkv") == 1320, "an unscanned file is placed in the past at its guessed length")
+    check(placed.get("/m/Alpha/S01E05.mkv") == 1320, "the past guide uses the same saved series estimate as live scheduling")
     again = media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
-                                       now, cache, exists, [], lambda off: "7:%d" % off)
+                                       now, exists, [], lambda off: "7:%d" % off)
     check([(r[1], r[2], r[3]) for r in again] == [(r[1], r[2], r[3]) for r in recs], "the same gap always rebuilds the same past")
 
     check(media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 14), "Full Day"), key(d(2026, 10, 15), "Full Day"),
-                                     now, cache, exists, [], lambda off: "x") == [], "no gap, nothing to rebuild")
+                                     now, exists, [], lambda off: "x") == [], "no gap, nothing to rebuild")
     check(media.replay_missed_blocks("05", ch, {}, "", key(d(2026, 10, 15), "Full Day"),
-                                     now, cache, exists, [], lambda off: "x") == [], "a channel with no earlier block has no past to rebuild")
+                                     now, exists, [], lambda off: "x") == [], "a channel with no earlier block has no past to rebuild")
     marathon = dict(ch, scheduling_mode="marathon")
     check(media.replay_missed_blocks("05", marathon, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
-                                     now, cache, exists, [], lambda off: "x") == [], "marathon channels are left alone")
+                                     now, exists, [], lambda off: "x") == [], "marathon channels are left alone")
     holiday = media.replay_missed_blocks("05", ch, {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
-                                         now, cache, exists, [], lambda off: "7:%d" % off, is_holiday_date=lambda dd: dd == d(2026, 10, 14))
+                                         now, exists, [], lambda off: "7:%d" % off, is_holiday_date=lambda dd: dd == d(2026, 10, 14))
     check(all(r[2] // 86400 != d(2026, 10, 14).toordinal() or r[2] % 86400 < 7200 for r in holiday),
           "a holiday day is not rebuilt from the normal schedule")
 
     eight = dict(ch, block_mode="eight_hour", schedules={n: items for n in ("Morning", "Evening", "Night")})
     night = media.replay_missed_blocks("05", eight, {}, key(d(2026, 10, 14), "Evening"), key(d(2026, 10, 15), "Morning"),
-                                       now, cache, exists, [], lambda off: "7:%d" % off)
+                                       now, exists, [], lambda off: "7:%d" % off)
     check(night and all(r[0] == "Night" for r in night) and night[0][2] == d(2026, 10, 14).toordinal() * 86400 + 20 * 3600,
           "after an evening and a morning start, the missed Night block is rebuilt from 20:00")
     six = dict(ch, block_mode="six_block", schedules={n: items for n in media.SIX_HOUR_BLOCK_NAMES})
     missed = media.replay_missed_blocks("05", six, {}, key(d(2026, 10, 15), "12-4am"), key(d(2026, 10, 15), "8-12pm"),
-                                        now, cache, exists, [], lambda off: "7:%d" % off)
+                                        now, exists, [], lambda off: "7:%d" % off)
     check({r[0] for r in missed} == {"4-8am"}, "six-block channels rebuild exactly the blocks that were missed")
 
     ns = {"media": media, "time": time, "log": MagicMock(), "_cached_path_exists": exists,
-          "_start_order_seed": lambda c, o: "7:%d" % o}
+          "_start_order_seed": lambda c, o: "7:%d" % o, "_write_missed_blocks_to_hub": lambda *a, **k: None}
     exec(compile(get_function_source("_note_missed_blocks"), "<extracted:_note_missed_blocks>", "exec"), ns)
     plog_ch = _copy.deepcopy(ch)
     ns["_note_missed_blocks"](plog_ch, "05", {}, key(d(2026, 10, 10), "Full Day"), key(d(2026, 10, 15), "Full Day"),
-                              now, cache, [], lambda dd: False)
+                              now, [], lambda dd: False)
     check(plog_ch["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY), "the rebuilt cycles are written to the channel's guide ledger")
     check(plog_ch["playback_log"]["show_pos"] == {}, "writing the ledger leaves the saved show positions alone")
     ns["media"] = types.SimpleNamespace(replay_missed_blocks=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     exec(compile(get_function_source("_note_missed_blocks"), "<extracted:_note_missed_blocks>", "exec"), ns)
-    ns["_note_missed_blocks"](_copy.deepcopy(ch), "05", {}, "a", "b", now, cache, [], None)
+    ns["_note_missed_blocks"](_copy.deepcopy(ch), "05", {}, "a", "b", now, [], None)
     check(True, "a rebuild failure never reaches the scheduler")
 
     sched_src = get_function_source("calculate_slotted_playback_state")
@@ -10400,22 +13763,22 @@ def suite_scheduler_catch_up():
 
     eight = channel("eight_hour")
     before = _copy.deepcopy(eight)
-    state = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_283_Morning", cache, exists, [], order_seed)
+    state = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_283_Morning", exists, [], order_seed)
     check(state is not None and state[3] == 8,
-          "an 8 hour channel off for two and a half days replays all 8 missed blocks, not one per missed day")
+          "an 8 hour channel off for two and a half days advances across all 8 missed blocks, not one per missed day")
     check(eight == before, "the catch-up changes nothing in the channel")
-    again = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_283_Morning", cache, exists, [], order_seed)
-    check(again[0] == state[0], "the same gap always replays to the same positions")
-    one_block = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_280_Evening", cache, exists, [], order_seed)
+    again = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_283_Morning", exists, [], order_seed)
+    check(again[0] == state[0], "the same gap always advances to the same schedule positions")
+    one_block = media.catch_up_state("07", eight, {}, "2026_280_Morning", "2026_280_Evening", exists, [], order_seed)
     check(one_block is None, "blocks that follow each other have nothing missed between them")
-    full = media.catch_up_state("07", channel("full_day"), {}, "2026_280_Full Day", "2026_283_Full Day", cache, exists, [], order_seed)
-    check(full is not None and full[3] == 2, "a Full Day channel replays each missed day")
-    six = media.catch_up_state("07", channel("six_block"), {}, "2026_280_%s" % media.SIX_HOUR_BLOCK_NAMES[0], "2026_282_%s" % media.SIX_HOUR_BLOCK_NAMES[0], cache, exists, [], order_seed)
-    check(six is not None and six[3] == len(media.SIX_HOUR_BLOCK_NAMES) * 2 - 1, "a six block channel replays every missed block of its day")
+    full = media.catch_up_state("07", channel("full_day"), {}, "2026_280_Full Day", "2026_283_Full Day", exists, [], order_seed)
+    check(full is not None and full[3] == 2, "a Full Day channel advances across each missed day")
+    six = media.catch_up_state("07", channel("six_block"), {}, "2026_280_%s" % media.SIX_HOUR_BLOCK_NAMES[0], "2026_282_%s" % media.SIX_HOUR_BLOCK_NAMES[0], exists, [], order_seed)
+    check(six is not None and six[3] == len(media.SIX_HOUR_BLOCK_NAMES) * 2 - 1, "a six block channel advances across every missed block")
     marathon = channel("full_day")
     marathon["scheduling_mode"] = "marathon"
-    check(media.catch_up_state("07", marathon, {}, "2026_280_Full Day", "2026_283_Full Day", cache, exists, [], order_seed) is None,
-          "marathon channels are not replayed")
+    check(media.catch_up_state("07", marathon, {}, "2026_280_Full Day", "2026_283_Full Day", exists, [], order_seed) is None,
+          "marathon channels do not use block-gap position advancement")
     mixed = [{"path": "/m/%s/%s S01E%02d.mkv" % (s, s, i), "duration": d} for s, d in (("Alpha", 1320), ("Beta", 2700), ("Gamma", 1500)) for i in range(1, 26)]
     mixed_cache = {os.path.normpath(it["path"]): {"duration": it["duration"]} for it in mixed}
 
@@ -10424,11 +13787,13 @@ def suite_scheduler_catch_up():
         offset = media.block_seed_offset(name, 0)
         seed = media.block_day_seed(date, "07", offset)
         secs = media.block_length_seconds(name)
-        raw = media.build_raw_tracks(ch_info["schedules"][name], mixed_cache, exists)
+        raw = media.build_raw_tracks(ch_info["schedules"][name], exists)
         pos, commercial, cursor, first = {}, None, 0, None
         while cursor < secs:
+            start = _copy.deepcopy(pos)
             lineup, pos, _o = media.build_block_rotation(raw, ch_info, pos, seed, secs, "07", None, order_seed(offset), pending_tracks=[])
-            timeline, total, commercial = media.build_channel_timeline(lineup, [], ch_info, seed, media_probe_cache=mixed_cache, commercial_state=commercial)
+            timeline, total, commercial = media.build_channel_timeline(lineup, [], ch_info, seed, commercial_state=commercial)
+            pos, _how = media.cycle_positions_at_block_end(raw, ch_info, start, seed, secs, "07", None, order_seed(offset), lineup, timeline, total, secs - cursor, pos, pending_tracks=[])
             first = first or (_copy.deepcopy(pos), total, commercial)
             cursor += total
         return pos, first
@@ -10441,18 +13806,18 @@ def suite_scheduler_catch_up():
         ordinal = (datetime.date(2026, 1, 1) + datetime.timedelta(days=int(prev_key.split("_")[1]) - 1)).toordinal()
         whole, first = run_continuous(ch_info, name, ordinal)
         ch_info["playback_log"].update({"sched_cycle_boundary": 0, "sched_cycle_total": first[1], "commercial_pos": first[2]})
-        resumed = media.catch_up_state("07", ch_info, first[0], prev_key, next_key, mixed_cache, exists, [], order_seed)
+        resumed = media.catch_up_state("07", ch_info, first[0], prev_key, next_key, exists, [], order_seed)
         check(resumed is not None and resumed[0] == whole,
               "%s: stopping after a block's first cycle and catching up lands on the same positions as running it all the way through" % name)
         ch_info["playback_log"]["sched_cycle_boundary"] = media.block_length_seconds(name)
-        check(media.catch_up_state("07", ch_info, whole, prev_key, next_key, mixed_cache, exists, [], order_seed) is None,
+        check(media.catch_up_state("07", ch_info, whole, prev_key, next_key, exists, [], order_seed) is None,
               "%s: a block that already ran to its end has nothing left to catch up" % name)
     check("media.catch_up_state(" in sched_src and "CATCH_UP_MAX_BLOCKS" in inspect.getsource(__import__("performance_governor")),
-          "the scheduler uses the replay and its numbers live in the governor table")
+          "the scheduler advances positions across missed blocks using limits from the governor table")
 
 
 class TestSchedulerCatchUp(_SectionCase):
-    """When a block starts, every block missed since the last one built is replayed, so series positions follow the schedule"""
+    """When a block starts, saved positions advance across missed blocks without playing missed media"""
 
     def test_scheduler_catch_up(self):
         self.run_section(suite_scheduler_catch_up)
@@ -10560,8 +13925,15 @@ def suite_block_anchor_real_start():
     check(anchor_for(holiday, "2026_289_holiday", noon_ish) == 12 * 3600,
           "a caller that gives no clock start gets the old behaviour")
     sched = get_function_source("calculate_slotted_playback_state")
-    check(sched.count("real_start_seconds=0)") == 1 and sched.count("real_start_seconds=block_start_hour * 3600)") == 3,
+    check(sched.count("real_start_seconds=0,") == 1 and sched.count("real_start_seconds=block_start_hour * 3600,") == 3,
           "every scheduler block passes its real clock start")
+    late = {"playback_log": {"sched_block_key": "2026_288_Evening"}}
+    check(anchor_for(late, "2026_288_Night", 20 * 3600 + 60, real_start_seconds=20 * 3600, overrun_end_seconds=20 * 3600 + 4740) == 20 * 3600 + 4740,
+          "a block that starts while an entry of the last block is still airing is measured from the second that entry ends")
+    check(anchor_for({"playback_log": {"sched_block_key": "2026_288_Evening"}}, "2026_288_Night", 20 * 3600 + 60, real_start_seconds=20 * 3600, overrun_end_seconds=20 * 3600 - 30) == 20 * 3600,
+          "an end before the block's clock start never moves the start earlier")
+    check(anchor_for({}, "2026_288_Night", 20 * 3600 + 60, real_start_seconds=20 * 3600, overrun_end_seconds=20 * 3600 + 4740) == 20 * 3600,
+          "a channel that never aired before ignores the overrun and starts at the half hour it went on air")
 
 
 class TestBlockAnchorRealStart(_SectionCase):
@@ -10571,11 +13943,5708 @@ class TestBlockAnchorRealStart(_SectionCase):
         self.run_section(suite_block_anchor_real_start)
 
 
+def suite_explorer_delete_label():
+    state = {"file_explorer_cwd": ""}
+    ns = {"app_state": state, "os": os}
+    for name in ("_fe_managed_delete_dir", "_fe_in_managed_delete_dir", "_fe_remove_button_label"):
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    label = ns["_fe_remove_button_label"]
+    cores, bios, roms = os.path.join("x", "cores", "PSX"), os.path.join("x", "cores", "PSX", "system"), os.path.join("x", "roms")
+
+    state["file_explorer_cwd"] = cores
+    check(label({"mode": "libretro_core", "emu_folder": cores}) == "DELETE SELECTED",
+          "the cores browser says DELETE SELECTED inside the console's cores folder")
+    state["file_explorer_cwd"] = bios
+    check(label({"mode": "add_bios", "bios_dir": bios}) == "DELETE SELECTED",
+          "the BIOS browser says DELETE SELECTED inside the console's system folder")
+    state["file_explorer_cwd"] = roms
+    check(label({"mode": "libretro_core", "emu_folder": cores}) == "REMOVE SELECTED"
+          and label({"mode": "add_bios", "bios_dir": bios}) == "REMOVE SELECTED",
+          "the same browsers say REMOVE SELECTED outside the managed folder, where the button only deselects")
+    state["file_explorer_cwd"] = cores
+    for mode in ("schedule", "commercial", "holiday", "add_roms", "ch03_menu_music", "scan_for_roms", "scan_for_cores", "rom_folder_relocate", ""):
+        check(label({"mode": mode, "emu_folder": cores, "bios_dir": cores}) == "REMOVE SELECTED",
+              "the %s browser keeps REMOVE SELECTED, since it never deletes from disk" % (mode or "default"))
+    check('"remove_sel": _fe_remove_button_label(_fe_ctx)' in MAIN_SRC,
+          "the explorer footer draws the button text from that helper")
+
+
+def suite_explorer_bios_flow():
+    import shutil as _sh
+    import tempfile as _tf
+    root = _tf.mkdtemp(prefix="bios_flow_")
+    try:
+        bios = os.path.join(root, "cores", "PSX", "system")
+        other = os.path.join(root, "downloads")
+        os.makedirs(bios)
+        os.makedirs(other)
+        for name in ("scph1001.bin", "scph5501.bin", "scph7502.bin"):
+            with open(os.path.join(other, name), "wb") as fh:
+                fh.write(name.encode())
+        with open(os.path.join(bios, "scph1001.bin"), "wb") as fh:
+            fh.write(b"old")
+
+        class _Db:
+            config = {}
+            saves = 0
+
+            def save_settings_async(self):
+                _Db.saves += 1
+
+        class _Deck:
+            refreshed = 0
+
+            def refresh_from_config(self, cfg):
+                _Deck.refreshed += 1
+
+        state = {"file_explorer_cwd": other, "file_explorer_items": [], "file_explorer_selection": set(),
+                 "file_explorer_checked": [], "file_explorer_context": {}}
+        ns = {"app_state": state, "os": os, "re": re, "db": _Db(), "game_deck": _Deck(),
+              "_log_warn_throttled": lambda *a, **k: None}
+        for name in ("_fe_managed_delete_dir", "_fe_in_managed_delete_dir", "_fe_in_bios_dir", "_fe_add_button_label",
+                     "_fe_remove_button_label", "_is_usa_bios_filename", "_bios_region_rank", "_bios_priority_key",
+                     "_fe_resolve_active_bios_name", "_fe_pick_bios_in_folder", "_fe_apply_bios_selection"):
+            exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+        ns["_BIOS_KNOWN_PRIORITY"] = ["scph5501", "scph7001", "scph1001", "scph5502", "scph7002", "scph1002",
+                                      "scph5500", "scph7000", "scph1000"]
+        ctx = {"mode": "add_bios", "console_key": "PSX", "bios_dir": bios}
+
+        state["file_explorer_cwd"] = other
+        check(ns["_fe_add_button_label"](ctx) == "ADD TO BIOS" and ns["_fe_remove_button_label"](ctx) == "REMOVE SELECTED",
+              "outside the BIOS folder the BIOS browser says ADD TO BIOS and REMOVE SELECTED")
+        state["file_explorer_cwd"] = bios
+        check(ns["_fe_add_button_label"](ctx) == "ADD SELECTED" and ns["_fe_remove_button_label"](ctx) == "DELETE SELECTED",
+              "inside the BIOS folder it says ADD SELECTED and DELETE SELECTED")
+        for mode in ("libretro_core", "schedule", "commercial", "holiday", "add_roms", "ch03_menu_music", ""):
+            check(ns["_fe_add_button_label"]({"mode": mode, "bios_dir": bios, "emu_folder": bios}) == "ADD SELECTED",
+                  "the %s browser keeps ADD SELECTED" % (mode or "default"))
+
+        items = [{"type": "file", "path": os.path.join(bios, n)} for n in ("scph1001.bin",)]
+        state["file_explorer_cwd"] = bios
+        state["file_explorer_checked"] = [os.path.join(other, "scph7502.bin")]
+        ns["_fe_pick_bios_in_folder"](items, {0}, ctx)
+        check(state["file_explorer_checked"] == [os.path.join(other, "scph7502.bin"), os.path.join(bios, "scph1001.bin")],
+              "picking inside the BIOS folder keeps files queued from elsewhere and adds the pick")
+        items2 = items + [{"type": "file", "path": os.path.join(bios, "extra.bin")}]
+        ns["_fe_pick_bios_in_folder"](items2, {1}, ctx)
+        in_folder = [f for f in state["file_explorer_checked"] if os.path.dirname(f) == bios]
+        check(in_folder == [os.path.join(bios, "extra.bin")],
+              "a second pick inside the BIOS folder replaces the first, so only one is ever chosen")
+        ns["_fe_pick_bios_in_folder"]([{"type": "dir", "path": os.path.join(bios, "sub")}], {0}, ctx)
+        check(in_folder == [f for f in state["file_explorer_checked"] if os.path.dirname(f) == bios],
+              "selecting only a folder inside the BIOS folder changes nothing")
+
+        _Db.config = {}
+        ns["_fe_apply_bios_selection"]("PSX", bios, [os.path.join(other, "scph5501.bin"), os.path.join(other, "scph7502.bin")])
+        check(os.path.isfile(os.path.join(bios, "scph5501.bin")) and os.path.isfile(os.path.join(bios, "scph7502.bin")),
+              "files added from outside are copied into the console's BIOS folder")
+        check(os.path.isfile(os.path.join(other, "scph5501.bin")), "the originals stay where they were")
+        with open(os.path.join(bios, "scph1001.bin"), "rb") as fh:
+            check(fh.read() == b"old", "a BIOS file already in the folder is not touched by an add of other files")
+        check(_Db.config["active_bios"]["PSX"] == "scph5501.bin",
+              "with nothing saved, adding from outside makes the best BIOS in the folder active so the core uses it")
+
+        _Db.config = {"active_bios": {"PSX": "scph7502.bin"}}
+        ns["_fe_apply_bios_selection"]("PSX", bios, [os.path.join(other, "scph1001.bin")])
+        check(_Db.config["active_bios"]["PSX"] == "scph7502.bin",
+              "adding from outside never changes a BIOS the owner already chose")
+
+        ns["_fe_apply_bios_selection"]("PSX", bios, [os.path.join(bios, "scph1001.bin")])
+        check(_Db.config["active_bios"]["PSX"] == "scph1001.bin",
+              "DONE with a file picked inside the BIOS folder makes that file the active BIOS without copying")
+
+        _Db.config = {"active_bios": {"PSX": "gone.bin"}}
+        ns["_fe_apply_bios_selection"]("PSX", bios, [os.path.join(other, "scph1001.bin")])
+        check(_Db.config["active_bios"]["PSX"] == "scph5501.bin",
+              "a saved BIOS that is no longer in the folder is replaced by the best one there")
+
+        before = _Db.saves
+        ns["_fe_apply_bios_selection"]("PSX", bios, [])
+        check(_Db.saves == before, "DONE with nothing queued changes nothing")
+        check(_Deck.refreshed >= 1, "the game deck is refreshed after the active BIOS changes")
+
+        src = MAIN_SRC
+        check('"add_sel": _fe_add_button_label(_fe_ctx)' in src, "the explorer footer draws the add button text from the helper")
+        check("_fe_pick_bios_in_folder(items, sel, context)" in get_function_source("_fe_add_selected_to_queue"),
+              "the add button picks one BIOS when pressed inside the BIOS folder")
+        check("_fe_apply_bios_selection(" in src and 'elif _fe_ctx_mode == "add_bios":' in src,
+              "DONE applies the BIOS selection and the footer has its own BIOS text")
+    finally:
+        _sh.rmtree(root, ignore_errors=True)
+
+
+class TestExplorerBiosFlow(_SectionCase):
+    """The BIOS browser copies files in from outside, picks one to use inside its own folder, and labels each case"""
+
+    def test_explorer_bios_flow(self):
+        self.run_section(suite_explorer_bios_flow)
+
+
+class TestExplorerDeleteLabel(_SectionCase):
+    """The explorer's footer button reads DELETE where it deletes files and REMOVE where it only deselects"""
+
+    def test_explorer_delete_label(self):
+        self.run_section(suite_explorer_delete_label)
+
+
 class TestGuidePastReplay(_SectionCase):
     """The guide's past is rebuilt from the schedule for time the app was off, with guessed lengths for unscanned files"""
 
     def test_guide_past_replay(self):
         self.run_section(suite_guide_past_replay)
+
+
+# ============================================================================
+# SECTION: Module state and undefined names (retro_tv_emulator.py)
+# ============================================================================
+
+
+def _main_module_bound_names():
+    """Names the main script binds at module level, anywhere in its top-level control flow."""
+    bound = set()
+
+    def bind(target):
+        if isinstance(target, ast.Name):
+            bound.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                bind(element)
+        elif isinstance(target, ast.Starred):
+            bind(target.value)
+
+    def walk(body):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(node.name)
+                continue
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    bind(target)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                bind(node.target)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bound.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                bind(node.target)
+            elif isinstance(node, ast.With):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        bind(item.optional_vars)
+            elif isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    if handler.name:
+                        bound.add(handler.name)
+                    walk(handler.body)
+            for field in ("body", "orelse", "finalbody"):
+                inner = getattr(node, field, None)
+                if isinstance(inner, list):
+                    walk(inner)
+
+    walk(MAIN_TREE.body)
+    return bound
+
+
+def suite_module_state_initialised():
+    bound = _main_module_bound_names()
+    dynamic = set(re.findall(r'globals\(\)\[\s*["\'](\w+)["\']\s*\]\s*=', MAIN_SRC))
+    declared = {}
+    for node in ast.walk(MAIN_TREE):
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                declared.setdefault(name, node.lineno)
+    for name, line in sorted(declared.items(), key=lambda item: item[1]):
+        check(name in bound or name in dynamic,
+              "global %s (declared in a function at line %d) has a starting value at module level" % (name, line))
+    for name in ("_loudness_rebuild_inflight", "_wedged_engine_replacement_inflight", "_dvd_engine_rebuild_deferred"):
+        check(name in bound, "%s has a starting value, so the main loop's first pass cannot raise NameError" % name)
+
+
+def suite_called_names_are_defined():
+    known = set(_main_module_bound_names())
+    for node in ast.walk(MAIN_TREE):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            known.add(node.name)
+        elif isinstance(node, ast.arg):
+            known.add(node.arg)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            known.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                known.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            known.add(node.name)
+        elif isinstance(node, ast.Global):
+            known.update(node.names)
+    for node in ast.walk(MAIN_TREE):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            name = node.func.id
+            check(name in known or hasattr(builtins, name),
+                  "%s() called at line %d is defined somewhere in the script" % (name, node.lineno))
+
+
+def suite_replace_wedged_engine():
+    calls = []
+    ticks = [10000]
+    state = {}
+    ns = {
+        "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0])),
+        "app_state": state,
+        "log": types.SimpleNamespace(critical=lambda *a, **k: None),
+        "_WEDGED_ENGINE_REPLACE_RETRY_MS": 5000,
+        "_loudness_rebuild_inflight": False,
+        "_wedged_engine_replacement_inflight": False,
+        "_rebuild_vlc_engines_for_loudness_toggle": lambda **kw: calls.append(kw),
+    }
+    replace = load_function("_replace_wedged_vlc_engine", ns)
+    gl = replace.__globals__
+    replace()
+    check(calls == [{"rebuild_main": True, "rebuild_dvd": False}],
+          "a wedged main engine is replaced alone; the DVD engine is not touched")
+    replace()
+    check(len(calls) == 1, "a second call inside the retry wait does nothing")
+    ticks[0] += 5000
+    replace()
+    check(len(calls) == 2, "after the retry wait a failed replacement is tried again")
+    gl["_wedged_engine_replacement_inflight"] = True
+    ticks[0] += 5000
+    replace()
+    check(len(calls) == 2, "nothing starts while a replacement is already building")
+    gl["_wedged_engine_replacement_inflight"] = False
+    gl["_loudness_rebuild_inflight"] = True
+    replace()
+    check(len(calls) == 2, "nothing starts while a loudness rebuild is running")
+    deferred = load_function("_run_deferred_dvd_engine_rebuild", {
+        "_dvd_engine_rebuild_deferred": False, "_loudness_rebuild_inflight": False,
+        "_wedged_engine_replacement_inflight": False, "game_deck": None,
+        "_rebuild_vlc_engines_for_loudness_toggle": lambda **kw: calls.append(kw)})
+    deferred()
+    check(len(calls) == 2, "the deferred DVD rebuild does nothing when no rebuild was deferred")
+
+
+def suite_read_names_are_defined():
+    exempt = {"_virtual_screen_surf"}
+    for name in ("retro_tv_emulator.py", "media.py", "media_library.py", "ui.py", "performance_governor.py"):
+        path = MAIN_SCRIPT if name == "retro_tv_emulator.py" else (os.path.join(ROOT, name) if os.path.exists(os.path.join(ROOT, name)) else os.path.join(ASSETS_DIR, name))
+        with open(path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        known = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                known.add(node.name)
+            elif isinstance(node, ast.arg):
+                known.add(node.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                known.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    known.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                known.add(node.name)
+            elif isinstance(node, ast.Global):
+                known.update(node.names)
+        missing = sorted({(node.id, node.lineno) for node in ast.walk(tree)
+                          if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in known and node.id not in exempt})
+        check(not missing, "%s reads no name that is never defined anywhere in it; missing: %s" % (name, missing[:10]))
+    for name in ("DURATION_PRECACHE_PAUSE_RECHECK_SECONDS", "DURATION_PRECACHE_IDLE_SLEEP_SECONDS"):
+        check(re.search(r"^%s\s*=" % name, MAIN_SRC, re.M) is not None, "the duration scan's %s is defined at the top level of the main script" % name)
+    for name in ("_duration_precache_done", "_duration_precache_failures"):
+        check(name not in MAIN_SRC, "the write-only duration bookkeeping name %s is gone from the main script" % name)
+
+
+def suite_old_carry_in_retired():
+    main_names = ("_install_legacy_carrier", "_legacy_cache_migration_worker", "_empty_old_stores_after_carry",
+                  "_carry_playability_facts_into_library", "_carry_caption_sources_into_library",
+                  "_carry_part_group_gains_into_library", "_snapshot_legacy_cache", "_legacy_migrator",
+                  "LEGACY_MIGRATION_BATCH_SIZE", "LEGACY_MIGRATION_BETWEEN_BATCHES_SECONDS", "_OLD_FILE_FACT_KEYS",
+                  "_FIRST_PASS_SWEEP_DONE", "_PAN_SCAN_LIBRARY_SCHEMA_VERSION")
+    check(not [name for name in main_names if name in MAIN_SRC], "the boot carry-in, its worker threads and their pacing numbers are gone from the main script")
+    check(not [name for name in ("LegacyCacheMigrator", "MigrationProgress", "set_legacy_carrier", "_carry_legacy_values", "_LEGACY_STORE_NAMES", "_is_legacy_fallback_gain")
+               if hasattr(ml, name)], "the library no longer holds the old-settings carrier or migrator")
+    check(not [name for name in ("LegacyCacheMigrator", "set_legacy_carrier") if name in ml.__all__], "the library's export list no longer names the migrator or the carrier")
+    check(set(media.FACTORY_RESET_KEEPS_FILE_DATA) == {"_gain_cache_target_lufs", "_lufs23_migration_done", "_music_target_v2_migration_done"},
+          "Reset All Settings keeps only the loudness-target stamp and the one-time flags; the five old file-fact stores are no longer listed")
+    with open(os.path.join(ROOT, "ui.py"), "r", encoding="utf-8") as handle:
+        ui_src = handle.read()
+    check(not any(name in ui_src for name in ("media_probe_cache", "dvd_gain_cache", "audio_gain_db_by_file", "pan_scan_library", "_part_group_gain_cache")),
+          "the menu's ignore list no longer names the old file-fact stores")
+    check(ui._MENU_IRRELEVANT_CONFIG_KEYS == frozenset() and ui._menu_relevant_config_hash({"a": 1}) is not None, "the menu change check still hashes the whole config")
+    check('threading.Thread(target=_legacy' not in MAIN_SRC and "LibraryMigration" not in MAIN_SRC and "CaptionSourceMigration" not in MAIN_SRC,
+          "boot starts no migration threads")
+
+    import numpy as np
+    shot = {"sig": [0.5] * 10, "offset": 4.0}
+    old_settings = {"pan_scan_library": {"d:\\\\v.mkv|1|1": {"_v": 1, "axes": {"x": [shot]}}}}
+    held = {"rows": []}
+    stub = types.SimpleNamespace(pan_scan_shots=lambda path, axis: held["rows"])
+    ns = {"db": types.SimpleNamespace(config=old_settings), "np": np, "os": os, "_PAN_SCAN_SHOT_SIG_LEN": 10,
+          "media": types.SimpleNamespace(get_file_facts_hub=lambda: stub), "_log_probe_failure": lambda *a, **k: None}
+    for name in ("_pan_scan_shots_from_rows", "_pan_scan_library_load"):
+        exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+    check(ns["_pan_scan_library_load"]("d:\\\\v.mkv|1|1", "x", "d:\\\\v.mkv") == [],
+          "Pan & Scan shots left in the old setting are not read once the library has none for the file")
+    held["rows"] = [shot]
+    got = ns["_pan_scan_library_load"]("d:\\\\v.mkv|1|1", "x", "d:\\\\v.mkv")
+    check(len(got) == 1 and got[0]["offset"] == 4.0, "Pan & Scan shots saved in the library are still read")
+    check(ns["_pan_scan_library_load"](None, "x", None) == [] and ns["_pan_scan_library_load"]("k", None, "p") == [], "no file or no axis loads nothing")
+    check("get_file_facts_hub" in get_function_source("_pan_scan_library_load") and "get_pan_scan_axis" not in get_function_source("_pan_scan_library_load")
+          and "get_file_facts_hub" in get_function_source("_pan_scan_library_save") and "store_pan_scan_axis" not in get_function_source("_pan_scan_library_save"),
+          "the player loads and saves Pan & Scan shots through the file-facts hub, not straight from the library")
+
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        libs.append(lib)
+        probe = ml.ProbeLibrary(lib, use_vlc_fallback=False)
+        movie = os.path.join(tmp, "movie.mkv")
+        with open(movie, "wb") as handle:
+            handle.write(b"x" * 4096)
+        duration_hub = ml.DurationHub(probe)
+        gain_hub = ml.GainHub(probe)
+        check(duration_hub.read(movie) is not None and gain_hub.read(movie)["gain"] is None,
+              "the hubs answer for a file with nothing on record without any carrier installed")
+        gain_hub.note_group("d:\\\\m\\\\t::t", "d:\\\\m\\\\t cd1.mkv", 0.8, -20.5, 1, 1.5)
+        check(gain_hub.read_group("d:\\\\m\\\\t::t")["gain"] == 0.8, "a multi-part title gain is still saved and read in the library")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestOldCarryInRetired(_SectionCase):
+    """The boot carry-in of old settings values into the library, its threads and the old Pan & Scan read are gone, and the library paths still work"""
+
+    def test_old_carry_in_retired(self):
+        self.run_section(suite_old_carry_in_retired)
+
+
+def suite_loading_screen_has_no_drive_banner():
+    start = MAIN_SRC.index("render_loading_screen(screen, app_state[\"load_progress\"], green_loading_theme)")
+    end = MAIN_SRC.index("if real_subsystems_loaded and _held_long_enough:", start)
+    block = MAIN_SRC[start:end]
+    check("_unresponsive_drive_roots" not in block and "_draw_status_banner_bar" not in block and "_drive_banner_label" not in block,
+          "the loading screen never draws the drive banner, so a slow first read of a waking drive cannot show it while the media loads")
+    check("_draw_status_banner_bar(screen, _status_banner_label(_status_banner_current))" in MAIN_SRC,
+          "the ordinary status banner, which needs the failing drive to be the one playing, is still drawn after boot")
+
+
+class TestLoadingScreenHasNoDriveBanner(_SectionCase):
+    """The drive banner is not drawn on the loading screen"""
+
+    def test_loading_screen_has_no_drive_banner(self):
+        self.run_section(suite_loading_screen_has_no_drive_banner)
+
+
+def suite_drive_banner_waits_for_failure():
+    ns = {"_station_confirmed_dead_drive": {}, "_visualizer_confirmed_dead_drive": {}, "app_state": {"current_channel": "05"},
+          "game_deck": None, "_unresponsive_drive_roots": lambda: {"D-ROOT"}}
+    exec(main_function_code("_drive_banner_roots"), ns)
+    roots = ns["_drive_banner_roots"]
+
+    check(roots() == set(), "a TV station playing from a drive flagged slow shows no banner while nothing has failed")
+    ns["_station_confirmed_dead_drive"]["05"] = "D-ROOT"
+    check(roots() == {"D-ROOT"}, "a TV station that went to Static for a drive shows the banner for that drive")
+    ns["app_state"]["current_channel"] = "06"
+    check(roots() == set(), "another channel does not show a banner for a drive that failed on channel 05")
+    ns["_visualizer_confirmed_dead_drive"]["06"] = "E-ROOT"
+    check(roots() == {"E-ROOT"}, "a visualizer that went to Static for a drive shows the banner for that drive")
+    ns["app_state"]["current_channel"] = "04"
+    ns["_visualizer_confirmed_dead_drive"]["04"] = "E-ROOT"
+    check(roots() == set(), "channel 04 never shows the drive banner")
+
+    module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_banner")
+    deck = object.__new__(module.ExternalGameDeck)
+    deck._drive_launch_failed = {}
+    deck._romlist_error_msg = ""
+    deck._romlist_error_until = 0
+    ns["game_deck"] = deck
+    ns["app_state"]["current_channel"] = "03"
+    check(roots() == set(), "the games and DVD list shows no banner while nothing has failed, even with a flagged drive")
+
+    deck.note_drive_launch_failure("/mnt/d/a.sfc")
+    failed = roots()
+    check(len(failed) == 1 and set(deck.drive_launch_failures()) == failed,
+          "a game launch that failed on a drive shows the banner for that drive on channel 03")
+    ns["_station_confirmed_dead_drive"].clear()
+    ns["app_state"]["current_channel"] = "05"
+    check(roots() == set(), "channel 03 launch failures do not leak onto a TV station")
+    ns["app_state"]["current_channel"] = "03"
+    for root in list(deck.drive_launch_failures()):
+        deck.clear_drive_launch_failure(root)
+    check(roots() == set(), "a recovered drive clears the banner")
+
+    module._gd_is_drive_responsive = lambda path: False
+    blocked = deck._dvd_launch_blocked_by_drive("/mnt/d/movie.mkv")
+    check(blocked is True and deck.drive_launch_failures() and "Drive not responding" in deck._romlist_error_msg,
+          "a DVD or media player launch from a drive that is not responding stops, stays on the list and notes the failure")
+    deck._drive_launch_failed.clear()
+    module._gd_is_drive_responsive = lambda path: True
+    check(deck._dvd_launch_blocked_by_drive("/mnt/d/movie.mkv") is False and not deck.drive_launch_failures(),
+          "a DVD or media player launch from a responsive drive goes ahead")
+
+    src = MAIN_SRC
+    start = src.index("def _advance_status_banner_streaks")
+    block = src[start:src.index("def _status_banner_is_active", start)]
+    check("_active_playback_drive_roots" not in src and "_return_active_game_to_romlist_if_drive_failed" not in src
+          and "return_active_rom_to_list_for_drive_failure" not in open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read(),
+          "a game past its load screen is never sent back to the list just because its drive is flagged slow")
+    check("_drive_banner_roots()" in block and "_active_playback_drive_roots" not in block and "_unresponsive_drive_roots" not in block,
+          "the banner takes its drives only from real failures, not from the slow-drive flag")
+    sweep = src[src.index("def _sweep_all_recovered_dead_drives"):src.index("CHANNEL_FAILURE_MESSAGE_MS = ")]
+    check("clear_drive_launch_failure" in sweep, "the background sweep clears a game or DVD launch failure once the drive is back")
+
+
+class TestDriveBannerWaitsForFailure(_SectionCase):
+    """The drive banner shows only after a real failure: Static on a TV station or visualizer, or a game, DVD or media player launch that failed and returned to its list"""
+
+    def test_drive_banner_waits_for_failure(self):
+        self.run_section(suite_drive_banner_waits_for_failure)
+
+
+def suite_failed_file_banner():
+    drawn = []
+    ns = {"pygame": pygame, "log": types.SimpleNamespace(warning=lambda *a, **k: drawn.append(("warn", a)), info=lambda *a, **k: None),
+          "CHANNEL_FAILURE_MESSAGE_MS": 30000, "_channel_playback_failures": {}, "_station_confirmed_dead_drive": {},
+          "_visualizer_confirmed_dead_drive": {}, "media": types.SimpleNamespace(_drive_root_of=lambda p: "D-ROOT"),
+          "_draw_reason_banner_bar": lambda screen, rect, label, scale=1.0: drawn.append(label)}
+    exec(main_function_code("_channel_failure_is_drive_wide"), ns)
+    exec(main_function_code("_draw_channel_failure_message"), ns)
+    draw = ns["_draw_channel_failure_message"]
+    now = pygame.time.get_ticks()
+
+    ns["_channel_playback_failures"]["05"] = {"file_path": "/m/Show S01E02.mkv", "file": "Show S01E02.mkv", "reason": "VLC failed to load: bad header", "shown_at": now}
+    draw(None, None, "05")
+    check(len(drawn) == 1 and "Show S01E02.mkv" in drawn[0] and drawn[0].startswith("PLAYBACK FAILED"),
+          "a file that would not load, on a drive that answered, shows a banner naming the file")
+    drawn.clear()
+    draw(None, None, "06")
+    check(drawn == [], "a channel with no failure shows no file banner")
+    ns["_channel_playback_failures"]["05"]["shown_at"] = now - 31000
+    draw(None, None, "05")
+    check(drawn == [], "the file banner goes away after 30 seconds")
+    ns["_channel_playback_failures"]["05"]["shown_at"] = now
+    ns["_channel_playback_failures"]["05"]["reason"] = "drive not responding"
+    draw(None, None, "05")
+    check(drawn == [], "a drive failure shows the drive banner, not the file banner")
+
+
+class TestFailedFileBannerShowsFileName(_SectionCase):
+    """A file that would not load on a drive that answered goes to Static and shows a banner with the file's name"""
+
+    def test_failed_file_banner(self):
+        self.run_section(suite_failed_file_banner)
+
+
+def suite_list_leaves_failed_drive():
+    module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_list_drive")
+    module._gd_drive_root_of = lambda path: (str(path)[:2] + "\\\\") if path and ":" in str(path) else None
+    calls = []
+
+    def make(mode="ROMLIST", console="DVD", browse="D:\\\\Movies", roms=None):
+        deck = object.__new__(module.ExternalGameDeck)
+        deck.mode = mode
+        deck.active_console = console
+        deck.current_browse_dir = browse
+        deck.roms = list(roms or [])
+        deck._drive_launch_failed = {}
+        deck._romlist_error_msg = ""
+        deck._romlist_error_until = 0
+        deck._get_console_rom_dir = lambda c: "C:\\\\roms\\\\" + c
+        deck._scan_roms = lambda c: calls.append(("scan", c))
+        deck._snap_rom_cursor_if_scan_landed = lambda: None
+        return deck
+
+    D, C = "D:\\\\", "C:\\\\"
+    deck = make()
+    check(deck.leave_list_of_failed_drive(set()) is False and deck.current_browse_dir == "D:\\\\Movies", "no failed drive, the list stays where it is")
+    check(deck.leave_list_of_failed_drive({C}) is False and deck.current_browse_dir == "D:\\\\Movies", "a failed drive that is not the one being browsed leaves the list alone")
+    check(deck.leave_list_of_failed_drive({D}) is True and deck.current_browse_dir == "" and set(deck.drive_launch_failures()) == {D},
+          "browsing a folder on a drive that failed leaves that folder, notes the drive for the banner and rescans")
+    check(("scan", "DVD") in calls and "Drive not responding" in deck._romlist_error_msg, "the list is rescanned and says why")
+    calls.clear()
+    check(deck.leave_list_of_failed_drive({D}) is False and calls == [], "a drive already handled is not handled again every frame")
+
+    for mode in ("GAME", "DVD_PLAYER", "LOADING"):
+        running = make(mode=mode)
+        check(running.leave_list_of_failed_drive({D}) is False and running.current_browse_dir == "D:\\\\Movies" and not running.drive_launch_failures(),
+              "a running game or DVD is never touched by a drive that fails (%s)" % mode)
+
+    top = make(browse="", roms=[("[DRIVE] C:\\\\", C), ("[DRIVE] D:\\\\", D)])
+    check(top.leave_list_of_failed_drive({D}) is True and set(top.drive_launch_failures()) == {D},
+          "a drive that fails while the list of drives is on screen is noted and the list is rebuilt")
+
+    console = make(console="SNES", browse="D:\\\\roms\\\\SNES")
+    check(console.leave_list_of_failed_drive({D}) is True and console.current_browse_dir == "C:\\\\roms\\\\SNES" and set(console.drive_launch_failures()) == {D},
+          "a game list on a failed drive goes back to the console's own folder and notes the drive")
+
+    mixed = make(roms=[("[.. BACK TO THIS PC]", ""), ("[DRIVE] C:\\\\", C), ("[DRIVE] D:\\\\", D), ("[.. BACK TO PREVIOUS FOLDER]", "D:\\\\")])
+    mixed.note_drive_launch_failure(D)
+    shown = [n for n, _p in mixed._without_failed_drives(mixed.roms)]
+    check(shown == ["[.. BACK TO THIS PC]", "[DRIVE] C:\\\\", "[.. BACK TO PREVIOUS FOLDER]"], "the failed drive is hidden from view and the back entries stay")
+    mixed.clear_drive_launch_failure(D)
+    check(len(mixed._without_failed_drives(mixed.roms)) == 4, "once the drive is cleared it is listed again")
+
+    src = MAIN_SRC
+    check("game_deck.leave_list_of_failed_drive(set(_failed_drive_roots()))" in src, "the main loop hands the drives that stayed unresponsive long enough to the list every frame")
+
+
+class TestListLeavesFailedDrive(_SectionCase):
+    """A drive that fails while its list is on screen takes the screen off that list, hides the drive, shows the banner, and lists it again when it returns"""
+
+    def test_list_leaves_failed_drive(self):
+        self.run_section(suite_list_leaves_failed_drive)
+
+
+def suite_schedule_hub_rows():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        db_path = os.path.join(tmp, "library.sqlite3")
+
+        def open_lib():
+            lib = ml.MediaLibrary(db_path)
+            libs.append(lib)
+            return lib
+
+        def rows(n, start=1000.0):
+            return [{"position": i, "path": os.path.join(tmp, "e%d.mkv" % i), "kind": "episode", "pass_no": 1,
+                     "planned_start": start + i * 1800.0, "used_length": 1500.0, "length_source": "measured"} for i in range(n)]
+
+        hub = ml.ScheduleHub(open_lib())
+        check(hub.rows("05") == [], "a channel with no rows has an empty list")
+        check(hub.put_rows("05", "Morning", rows(4)) == (4, 0), "four planned rows are written")
+        listed = hub.rows("05", "Morning")
+        check([r["position"] for r in listed] == [0, 1, 2, 3] and all(r["state"] == "planned" for r in listed), "rows come back in order, all planned")
+        check(listed[0]["kind"] == "episode" and listed[0]["used_length"] == 1500.0 and listed[0]["length_source"] == "measured", "each row keeps its kind, length and where the length came from")
+
+        reopened = ml.ScheduleHub(open_lib())
+        check(len(reopened.rows("05")) == 4, "rows are kept across a restart")
+
+        check(hub.mark("05", "Morning", 0, "airing") is True and hub.mark("05", "Morning", 0, "aired", used_length=1490.0) is True,
+              "a row moves forward from planned to airing to aired")
+        check(hub.mark("05", "Morning", 0, "planned") is False and hub.mark("05", "Morning", 0, "airing") is False,
+              "a row never moves back")
+        check(hub.mark("05", "Morning", 9, "aired") is False and hub.mark("05", "Morning", 1, "bogus") is False, "an unknown row or state changes nothing")
+        check(hub.rows("05", "Morning")[0]["used_length"] == 1490.0, "the length that really aired is saved on the row")
+
+        check(hub.mark("05", "Morning", 1, "static") is True, "a slot that passed on Static is marked static, not replayed")
+        check(hub.set_length("05", "Morning", 2, 1700.0, "measured") is True and hub.rows("05", "Morning")[2]["used_length"] == 1700.0,
+              "a new length changes a row still ahead")
+        check(hub.set_length("05", "Morning", 0, 99.0, "measured") is False and hub.rows("05", "Morning")[0]["used_length"] == 1490.0,
+              "a new length never changes a row that aired")
+        check(hub.set_length("05", "Morning", 1, 99.0, "measured") is False, "a new length never changes a row that went to Static")
+
+        written, skipped = hub.put_rows("05", "Morning", rows(5, start=5000.0))
+        after = hub.rows("05", "Morning")
+        check(written == 3 and skipped == 2, "a rebuild writes only the positions not held by history (%s, %s)" % (written, skipped))
+        check(after[0]["state"] == "aired" and after[0]["planned_start"] == 1000.0 and after[1]["state"] == "static",
+              "a rebuild leaves the aired and static rows exactly as they were")
+        check(len(after) == 5 and all(r["state"] == "planned" for r in after[2:]), "the rows after the history are the new plan")
+
+        hub.put_rows("06", "Morning", rows(2))
+        check(len(hub.rows("06")) == 2 and len(hub.rows("05")) == 5, "channels keep separate rows")
+        check(hub.counts("05") == {"planned": 3, "airing": 0, "aired": 1, "static": 1}, "the counts by state add up")
+
+        late = [dict(r, position=i + 10, planned_start=None) for i, r in enumerate(rows(1))]
+        hub.put_rows("07", "Evening", rows(1, start=9000.0) + late)
+        check([r["position"] for r in hub.rows("07")] == [0, 10], "a row with no planned start sorts after the timed rows")
+
+        old = os.path.join(tmp, "old.sqlite3")
+        import sqlite3
+        first = ml.MediaLibrary(old)
+        first.close()
+        conn = sqlite3.connect(old)
+        conn.execute("DROP TABLE hub_schedule_row")
+        conn.commit()
+        conn.close()
+        upgraded = ml.ScheduleHub(ml.MediaLibrary(old))
+        libs.append(upgraded.library)
+        check(upgraded.put_rows("05", "Morning", rows(1)) == (1, 0), "an older library gains the rows table when it opens")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestScheduleHubRows(_SectionCase):
+    """The hub keeps each channel's ordered rows; history rows are never changed or removed and a row never moves back"""
+
+    def test_schedule_hub_rows(self):
+        self.run_section(suite_schedule_hub_rows)
+
+
+def suite_timeline_mirrors_to_hub():
+    timeline = [
+        {"path": "/m/a.mkv", "duration": 1320.0, "start_time": 0.0, "is_commercial": False, "seek_offset": 0},
+        {"path": "/m/ad1.mp4", "duration": 30.0, "start_time": 1320.0, "is_commercial": True, "seek_offset": 0},
+        {"path": "/m/ad2.mp4", "duration": 15.0, "start_time": 1350.0, "is_commercial": True, "seek_offset": 0},
+        {"path": "/m/b.mkv", "duration": 1800.0, "start_time": 1365.0, "is_commercial": False, "seek_offset": 0, "duration_estimated": True},
+        {"path": "", "duration": 5.0, "start_time": 3165.0, "is_commercial": False, "seek_offset": 0},
+    ]
+    rows = media.schedule_rows_from_timeline(timeline, 100000.0)
+    check(len(rows) == 4 and [r["position"] for r in rows] == [0, 1, 2, 3], "every timeline entry with a file becomes a row, in order")
+    check([r["kind"] for r in rows] == ["episode", "commercial", "commercial", "episode"], "commercials and episodes are told apart")
+    check([r["planned_start"] for r in rows] == [100000.0, 101320.0, 101350.0, 101365.0], "each row's start is the block start plus its place in the block")
+    check(rows[0]["used_length"] == 1320.0 and rows[0]["length_source"] == "measured" and rows[3]["length_source"] == "estimate",
+          "each row keeps its length and whether it was measured or estimated")
+    check(media.schedule_rows_from_timeline([], 5.0) == [] and media.schedule_rows_from_timeline(None, 5.0) == [], "an empty timeline gives no rows")
+
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        libs.append(lib)
+        hub = ml.ScheduleHub(lib)
+        check(hub.put_rows("05", "2026_292_Morning", rows) == (4, 0) and len(hub.rows("05", "2026_292_Morning")) == 4,
+              "the built rows go into the hub under the channel and block")
+        hub.mark("05", "2026_292_Morning", 0, "aired")
+        later = media.schedule_rows_from_timeline(timeline[1:], 101320.0)
+        written, skipped = hub.put_rows("05", "2026_292_Morning", later)
+        check(hub.rows("05", "2026_292_Morning")[0]["state"] == "aired", "a rebuilt block leaves an aired row as it was")
+    finally:
+        for lib in libs:
+            lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    src = MAIN_SRC
+    live = src[src.index("def calculate_slotted_playback_state"):]
+    check("_sync_hub_rows_for_block(target_clean_key, block_key, timeline, target_show, position_in_playlist, raw_tracks, _clock_shift_seconds)" in live
+          and "_mirror_block_timeline_to_hub" not in src, "the live scheduler keeps the hub's rows in step once the airing entry is known")
+    check("_mark_hub_row_static(ch_key, file_path)" in src[src.index("def _register_channel_playback_failure"):], "a file that goes to Static marks its hub row static")
+
+
+def _hub_mode_ns(ns, modes=None, mono=None):
+    """Adds to a namespace what the hub sync needs for slot modes: a settle clock, the mode table, the busy lock and the real mode lookup."""
+    ns["time"] = types.SimpleNamespace(monotonic=lambda: (mono or {"t": 1000.0})["t"], time=time.time)
+    ns["_hub_mode_since"] = {}
+    ns["_hub_sync_lock"] = threading.Lock()
+    ns["_HUB_MODE_SWITCH_SETTLE_SECONDS"] = 0.5
+    ns["db"] = types.SimpleNamespace(channels_db=modes if modes is not None else {})
+    exec(main_function_code("_hub_channel_mode"), ns)
+    return ns
+
+
+def suite_hub_rows_follow_the_clock():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        warnings = []
+        clock = {"t": 500000.0}
+        ns = {"os": os, "media": media, "ml_unused": None,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(clock["t"])),
+              "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_hub_rows_seen": {}, "_HUB_CLOCK_COMPARE_GRACE_SECONDS": 1.0, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        ns["_compare_hub_clock_answer"] = lambda *args, **kwargs: None
+        _hub_mode_ns(ns)
+        exec(main_function_code("_hub_channel_key"), ns)
+        exec(main_function_code("_hub_bundles_for"), ns)
+        exec(main_function_code("_sync_hub_rows_for_block"), ns)
+        exec(main_function_code("_mark_hub_row_static"), ns)
+        raw_sync, static = ns["_sync_hub_rows_for_block"], ns["_mark_hub_row_static"]
+
+        def sync(channel, block, tl, show, position, start=499990.0):
+            clock["t"] = start + position
+            raw_sync(channel, block, tl, show, position)
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        timeline = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1800)]
+        states = lambda: [r["state"] for r in hub.rows("05", "blk")]
+        sync(5, "blk", timeline, timeline[0], 10.0)
+        check(len(hub.rows("05", "blk")) == 3 and states() == ["airing", "planned", "planned"], "the first call writes the rows and marks the airing one (channel 5 and 05 are the same)")
+        check(hub.rows("05", "blk")[0]["planned_start"] == 500000.0 - 10.0, "the planned start is the clock time the block's content began")
+        sync(5, "blk", timeline, timeline[0], 11.0)
+        check(states() == ["airing", "planned", "planned"], "a call with nothing changed leaves the rows alone")
+        sync(5, "blk", timeline, timeline[1], 1325.0)
+        check(states() == ["aired", "airing", "planned"], "when the clock passes into the next entry the one before is aired and the new one is airing")
+        sync(5, "blk", timeline, timeline[2], 1360.0)
+        check(states() == ["aired", "aired", "airing"], "every entry that has passed is aired")
+
+        longer = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1900)]
+        sync(5, "blk", longer, longer[2], 1400.0)
+        rows = hub.rows("05", "blk")
+        check(states() == ["aired", "aired", "airing"] and rows[2]["state"] == "airing", "a rebuilt block leaves aired and airing rows as they were")
+
+        plan = [entry("/m/a.mkv", 0, 1320), entry("/m/c.mkv", 1320, 600), entry("/m/d.mkv", 1920, 600)]
+        sync(6, "blk2", plan, plan[0], 5.0, 499995.0)
+        replanned = [entry("/m/a.mkv", 0, 1320), entry("/m/c.mkv", 1320, 900), entry("/m/d.mkv", 2220, 600)]
+        sync(6, "blk2", replanned, replanned[0], 6.0, 499995.0)
+        after = hub.rows("06", "blk2")
+        check([r["used_length"] for r in after] == [1320.0, 900.0, 600.0] and [r["state"] for r in after] == ["airing", "planned", "planned"],
+              "a new length rewrites the planned rows ahead and keeps the airing one")
+
+        sync(7, "blk3", plan, plan[0], 5.0, 499995.0)
+        static(7, "/m/a.mkv")
+        check([r["state"] for r in hub.rows("07", "blk3")] == ["static", "planned", "planned"], "a file that would not play marks its airing row static")
+        sync(7, "blk3", plan, plan[1], 1325.0, 499995.0)
+        check([r["state"] for r in hub.rows("07", "blk3")] == ["static", "airing", "planned"], "a Static slot stays static after the clock moves on")
+        static(7, "/m/zzz.mkv")
+        check(warnings == [], "none of this raised a failure")
+
+        ns["_hub_rows_seen"].clear()
+        sync(5, "blk", None, None, 0)
+        sync(5, "blk", timeline, None, 0)
+        check(warnings == [] and states() == ["aired", "aired", "airing"], "an empty timeline or no airing entry changes nothing")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_hub_clock_lookup():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        infos, warnings = [], []
+        clock = {"t": 500000.0}
+        ns = {"os": os, "media": media,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(clock["t"])),
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a) if "[HUB CLOCK]" in a[0] else None, warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_hub_rows_seen": {}, "_HUB_CLOCK_COMPARE_GRACE_SECONDS": 1.0, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        _hub_mode_ns(ns)
+        exec(main_function_code("_hub_channel_key"), ns)
+        exec(main_function_code("_hub_bundles_for"), ns)
+        exec(main_function_code("_compare_hub_clock_answer"), ns)
+        exec(main_function_code("_sync_hub_rows_for_block"), ns)
+        sync, compare = ns["_sync_hub_rows_for_block"], ns["_compare_hub_clock_answer"]
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        timeline = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1800)]
+        sync(5, "blk", timeline, timeline[0], 10.0)
+        start = 500000.0 - 10.0
+        at = lambda t: hub.at("05", t)
+        check(at(start)["path"] == "/m/a.mkv" and at(start + 1319.9)["path"] == "/m/a.mkv", "the hub answers the show that covers the moment")
+        check(at(start + 1320)["path"] == "/m/ad1.mp4" and at(start + 1320)["kind"] == "commercial", "at a slot edge the hub answers the next slot, the commercial")
+        check(at(start + 1350)["path"] == "/m/b.mkv" and at(start + 3149.9)["path"] == "/m/b.mkv", "the last slot covers up to its end")
+        check(at(start - 1) is None and at(start + 3150) is None, "before the first row and after the last row there is no answer")
+        check(hub.at("06", start + 5) is None, "another channel's rows are not used")
+        check(len(infos) == 1 and "agree" in infos[0][0] and warnings == [], "the first scheduler pick matches the hub and is logged as agreement")
+
+        clock["t"] = start + 1325.0
+        sync(5, "blk", timeline, timeline[1], 1325.0)
+        check(len(infos) == 2 and warnings == [], "the next slot also agrees")
+
+        clock["t"] = start + 1360.0
+        sync(5, "blk", timeline, timeline[2], 1360.0)
+        check(len(infos) == 3 and warnings == [], "a third slot agrees and nothing is reported")
+
+        before = len(infos)
+        compare(hub, "05", "blk", start + 100.0, entry("/m/zzz.mkv", 0, 600))
+        check(len(warnings) == 1 and "zzz.mkv" in str(warnings[0][2]) and "a.mkv" in str(warnings[0][2]), "when the scheduler has a different file the log names both files")
+        compare(hub, "05", "blk", start + 100.0, entry("/m/a.mkv", 0, 600, True))
+        check(len(warnings) == 2, "the same file as a commercial instead of a show is a disagreement")
+        compare(hub, "05", "blk", start + 5000.0, entry("/m/a.mkv", 0, 600))
+        check(len(warnings) == 3 and "no row" in warnings[2][1], "a moment the hub has no row for is reported")
+        compare(hub, "05", "blk", start + 1319.5, entry("/m/ad1.mp4", 1320, 30, True))
+        check(len(warnings) == 3 and len(infos) == before + 1, "a pick within the grace of a slot edge counts as agreement")
+
+        check(hub.at("05", start + 10)["state"] == "aired", "a row that has aired is still answered")
+        hub.put_rows("05", "other", [{"position": 0, "path": "/m/p.mkv", "kind": "episode", "planned_start": start, "used_length": 1320.0, "length_source": "measured"}])
+        check(hub.at("05", start + 10)["path"] == "/m/a.mkv", "a planned row never outranks a row that has aired or is on air at the same moment")
+
+        bad = types.SimpleNamespace(at=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        compare(bad, "05", "blk", start, entry("/m/a.mkv", 0, 600))
+        check(len(warnings) == 4 and "could not ask" in str(warnings[3]), "a failed lookup is logged and does not raise")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubClockLookup(_SectionCase):
+    """The hub answers what is on a channel at a clock moment and every scheduler pick is compared with that answer"""
+
+    def test_hub_clock_lookup(self):
+        self.run_section(suite_hub_clock_lookup)
+
+
+def suite_hub_airing_entry():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        real_hub = ml.ScheduleHub(lib)
+        asked = []
+
+        class CountingHub:
+            def __getattr__(self, name):
+                return getattr(real_hub, name)
+
+            def at(self, channel, epoch):
+                asked.append((channel, epoch))
+                return real_hub.at(channel, epoch)
+
+        ml.shared_schedule_hub = lambda: CountingHub()
+        infos, warnings = [], []
+        clock = {"t": 500000.0}
+        mono = {"t": 1000.0}
+        ns = {"os": os, "media": media,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(clock["t"])),
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_hub_rows_seen": {}, "_hub_airing_memo": {}, "_HUB_AIRING_LOOKUP_RETRY_SECONDS": 1.0,
+              "_HUB_CLOCK_COMPARE_GRACE_SECONDS": 1.0, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        _hub_mode_ns(ns, mono=mono)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_compare_hub_clock_answer", "_sync_hub_rows_for_block", "_hub_airing_entry"):
+            exec(main_function_code(name), ns)
+        sync, ask = ns["_sync_hub_rows_for_block"], ns["_hub_airing_entry"]
+        agreements = lambda: [i for i in infos if "[HUB CLOCK]" in i[0] and "agree" in i[0]]
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        S = 500000.0
+        timeline = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1800)]
+
+        clock["t"] = S + 10.0
+        check(ask(5, "blk", timeline, timeline[0], 10.0) is None, "on the first pass of a block the hub has no row yet, so the timeline's pick stays")
+        check(len(asked) == 1, "the hub was asked once")
+        check(ask(5, "blk", timeline, timeline[0], 10.0) is None and len(asked) == 1, "a miss is not asked again within the retry seconds, so the library lock is not taken on every pass")
+        sync(5, "blk", timeline, timeline[0], 10.0)
+        asked_after_sync = len(asked)
+        mono["t"] += 0.5
+        check(ask(5, "blk", timeline, timeline[0], 10.0) is None and len(asked) == asked_after_sync, "still inside the retry window the earlier miss stands and the hub is not asked again")
+        asked_before = len(asked)
+        mono["t"] += 2.0
+        answer = ask(5, "blk", timeline, timeline[0], 10.0)
+        check(answer is timeline[0] and len(asked) == asked_before + 1, "once the rows are written and the retry seconds have passed the hub names the airing entry and that entry is returned")
+        check(ask(5, "blk", timeline, timeline[0], 11.0) is timeline[0] and len(asked) == asked_before + 1, "a confirmed entry is not looked up again while the airing entry and the timeline are unchanged")
+
+        clock["t"] = S + 1325.0
+        sync(5, "blk", timeline, timeline[1], 1325.0)
+        asked_after_move = len(asked)
+        check(ask(5, "blk", timeline, timeline[1], 1325.0) is timeline[1] and len(asked) == asked_after_move + 1, "when the airing entry moves on the hub is asked again and names the commercial")
+
+        check(ask(5, "blk", timeline, timeline[2], 1325.0) is None, "a row that names a different entry than the clock position falls in is refused and the timeline's pick stays")
+        check(ask(5, "other", timeline, timeline[1], 1325.0) is None, "a row of another block is never used")
+
+        clock["t"] = S + 1349.9
+        mono["t"] += 5.0
+        check(ask(5, "blk", timeline, timeline[2], 1351.0, 0.0) is None, "without the guard shift the moment is still the commercial's last second, so the hub's row does not match")
+        mono["t"] += 5.0
+        check(ask(5, "blk", timeline, timeline[2], 1351.0, 1.1) is timeline[2], "with the repeat-guard shift of 1.1 seconds the moment is the next show's and the hub names it")
+
+        clock["t"] = S + 1349.9
+        del infos[:], warnings[:]
+        ns["_hub_rows_seen"].clear()
+        sync(5, "blk2", timeline, timeline[2], 1351.0, None, 1.1)
+        rows = real_hub.rows("05", "blk2")
+        check(abs(rows[0]["planned_start"] - S) < 1e-6, "rows written on a guard-shifted pass start where the block really began, not one second early")
+        check(len(agreements()) == 1 and warnings == [], "the compare uses the shifted moment, so the false disagreement from the owner's log no longer appears")
+
+        class Broken:
+            def at(self, *a):
+                raise RuntimeError("boom")
+
+        ml.shared_schedule_hub = lambda: Broken()
+        ns["_hub_airing_memo"].clear()
+        del warnings[:]
+        check(ask(5, "blk", timeline, timeline[0], 10.0) is None and len(warnings) == 1 and "could not ask" in warnings[0][1], "a failed hub lookup is logged, returns nothing and never raises")
+        check(ask(5, "blk", [], None, 0.0) is None and ask(5, "blk", timeline, None, 0.0) is None, "an empty timeline or no pick asks nothing")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    src = MAIN_SRC
+    live = src[src.index("def calculate_slotted_playback_state"):]
+    check(live.index("_hub_pick = _hub_airing_entry(") < live.index("_sync_hub_rows_for_block(target_clean_key")
+          and "_position_before_guard = position_in_playlist" in live and "target_show = _hub_pick" in live,
+          "the live scheduler asks the hub for the airing entry after the repeat guard and before the hub's rows are brought up to date")
+    check("_clock_shift_seconds = position_in_playlist - _position_before_guard" in live, "the guard's shift of the clock position is measured and passed on")
+    check(gov.HUB_AIRING_LOOKUP_RETRY_SECONDS == 1.0 and "performance_governor.HUB_AIRING_LOOKUP_RETRY_SECONDS" in MAIN_SRC
+          and "else 1.0\n" in MAIN_SRC[MAIN_SRC.index("_HUB_AIRING_LOOKUP_RETRY_SECONDS = "):][:200],
+          "the retry seconds live in the governor table with a matching fallback copy")
+
+
+class TestHubAiringEntry(_SectionCase):
+    """The scheduler asks the hub for the airing entry first, keeps its own pick whenever the hub has no matching row, and measures the repeat guard's shift"""
+
+    def test_hub_airing_entry(self):
+        self.run_section(suite_hub_airing_entry)
+
+
+class TestHubRowsFollowTheClock(_SectionCase):
+    """The hub's rows are marked airing, aired or static as the clock passes, and rewritten ahead when lengths change"""
+
+    def test_hub_rows_follow_the_clock(self):
+        self.run_section(suite_hub_rows_follow_the_clock)
+
+
+# ============================================================================
+# SECTION: Hub rows left behind by a block change or a gap (H3 stage 4)
+# ============================================================================
+
+def suite_hub_closes_rows_left_behind():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+
+        def row(position, path, start, length, kind="episode"):
+            return {"position": position, "path": path, "kind": kind, "planned_start": start, "used_length": length, "length_source": "measured"}
+
+        states = lambda channel, slot: [r["state"] for r in hub.rows(channel, slot)]
+        base = 1_000_000.0
+        hub.place_rows("05", "blkA", [row(0, "/m/a1.mkv", base, 1000.0), row(1, "/m/a2.mkv", base + 1000, 1000.0),
+                                       row(2, "/m/a3.mkv", base + 2000, 1000.0), row(3, "/m/a4.mkv", base + 3000, 1000.0)], mode="random_slots")
+        hub.mark("05", "blkA", 0, "aired")
+        hub.mark("05", "blkA", 1, "airing")
+        hub.place_rows("05", "blkB", [row(0, "/m/b1.mkv", base + 5000, 1000.0), row(1, "/m/b2.mkv", base + 6000, 1000.0)], mode="random_slots")
+        hub.place_rows("05", "blkNoStart", [{"position": 0, "path": "/m/n1.mkv", "kind": "episode"}], mode="random_slots")
+        hub.place_rows("06", "blkOther", [row(0, "/m/o1.mkv", base, 1000.0)], mode="random_slots")
+        hub.mark("06", "blkOther", 0, "airing")
+        with lib._lock, lib._conn:
+            lib._conn.execute("INSERT INTO hub_schedule_set (channel, slot_key, mode, state, created_at, updated_at) VALUES ('05', 'blkAside', 'random_slots', 'set_aside', 0, 0)")
+        hub.put_rows("05", "blkAside", [row(0, "/m/s1.mkv", base, 1000.0), row(1, "/m/s2.mkv", base + 1000, 1000.0)])
+
+        now = base + 5100.0
+        hub.mark("05", "blkB", 0, "airing")
+        closed = hub.close_passed_rows("05", now, "blkB", 0)
+        check(closed == (1, 2), "one row left airing and the two planned rows that ended before now are closed (%s)" % (closed,))
+        check(states("05", "blkA") == ["aired", "aired", "aired", "aired"], "the earlier block's rows are all aired (%s)" % states("05", "blkA"))
+        check(hub.rows("05", "blkA")[1]["used_length"] == 1000.0, "a row that was airing keeps its planned length when it ended before now")
+        check(states("05", "blkB") == ["airing", "planned"], "the block on air is left to its own marking")
+        check(states("05", "blkNoStart") == ["planned"], "a planned row with no start time stays planned")
+        check(states("05", "blkAside") == ["planned", "planned"], "a set that was put aside keeps its unaired rows")
+        check(states("06", "blkOther") == ["airing"], "another channel is not touched")
+        check(hub.close_passed_rows("05", now, "blkB", 0) == (0, 0), "closing again changes nothing")
+        check(len(hub.rows("05")) == 4 + 2 + 1 + 2, "no row was deleted (R26)")
+
+        hub.place_rows("05", "blkC", [row(0, "/m/c1.mkv", base + 7000, 1000.0), row(1, "/m/c2.mkv", base + 8000, 1000.0)], mode="random_slots")
+        hub.mark("05", "blkB", 1, "airing")
+        hub.mark("05", "blkC", 0, "airing")
+        check(hub.close_passed_rows("05", base + 7200.0, "blkC", 0) == (2, 0), "the rows left airing by the block before are closed")
+        late = hub.rows("05", "blkB")[1]
+        check(late["state"] == "aired" and late["used_length"] == 1000.0, "a row keeps its planned length when it ended before now")
+        hub.place_rows("05", "blkD", [row(0, "/m/d1.mkv", base + 9000, 1000.0)], mode="random_slots")
+        hub.mark("05", "blkC", 0, "aired")
+        hub.mark("05", "blkC", 1, "airing")
+        check(hub.close_passed_rows("05", base + 8500.0, "blkD", 0) == (1, 0), "a row still airing when the next block starts is closed")
+        cut = hub.rows("05", "blkC")[1]
+        check(cut["state"] == "aired" and cut["used_length"] == 500.0, "its length is cut to the moment it was left (%s)" % cut["used_length"])
+        check(states("05", "blkD") == ["planned"], "a block that has not started keeps its planned row")
+
+        hub.mark("05", "blkD", 0, "static")
+        hub.close_passed_rows("05", base + 20000.0, "blkZ", 0)
+        check(states("05", "blkD") == ["static"], "a Static row never changes back")
+
+        hub.place_rows("07", "one", [row(0, "/m/same.mkv", base, 1000.0)], mode="random_slots")
+        hub.place_rows("07", "two", [row(0, "/m/same.mkv", base + 5000, 1000.0)], mode="random_slots")
+        hub.mark("07", "one", 0, "airing")
+        hub.mark("07", "two", 0, "airing")
+        check(hub.mark_airing_static("07", "/m/same.mkv") == 1, "one row is marked Static, not every airing row of the file")
+        check(states("07", "one") == ["airing"] and states("07", "two") == ["static"], "the newest airing row of the file is the one that goes Static")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_hub_block_change_and_restart_close_rows():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        warnings, infos = [], []
+        clock = {"t": 500000.0}
+        ns = {"os": os, "media": media,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(clock["t"])),
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_hub_rows_seen": {}, "_HUB_CLOCK_COMPARE_GRACE_SECONDS": 1.0, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        ns["_compare_hub_clock_answer"] = lambda *args, **kwargs: None
+        _hub_mode_ns(ns)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_sync_hub_rows_for_block", "_mark_hub_row_static"):
+            exec(main_function_code(name), ns)
+        raw_sync = ns["_sync_hub_rows_for_block"]
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        def sync(channel, block, tl, index, position, start):
+            clock["t"] = start + position
+            raw_sync(channel, block, tl, tl[index], position)
+
+        first = [entry("/m/a.mkv", 0, 1000), entry("/m/b.mkv", 1000, 1000), entry("/m/c.mkv", 2000, 1000)]
+        second = [entry("/m/d.mkv", 0, 1000), entry("/m/e.mkv", 1000, 1000)]
+        states = lambda channel, slot: [r["state"] for r in hub.rows(channel, slot)]
+
+        sync(5, "blkA", first, 2, 2500.0, 500000.0)
+        check(states("05", "blkA") == ["aired", "aired", "airing"], "the block's last entry is airing when its block ends")
+        sync(5, "blkB", second, 0, 10.0, 503000.0)
+        check(states("05", "blkA") == ["aired", "aired", "aired"], "the next block's first pass closes the row the old block left airing (%s)" % states("05", "blkA"))
+        check(states("05", "blkB") == ["airing", "planned"], "the new block's own rows are marked as before")
+        check(any("left 1 row(s) airing" in str(a[0]) % a[1:] if len(a) > 1 else False for a in infos) or any("earlier blocks behind" in str(a[0]) for a in infos),
+              "the closing is written to the log")
+
+        ns["_hub_rows_seen"].clear()
+        sync(5, "blkC", second, 0, 10.0, 600000.0)
+        check(states("05", "blkB") == ["aired", "aired"], "after the app was off, the old block's passed planned row is closed too (%s)" % states("05", "blkB"))
+        check(states("05", "blkC") == ["airing", "planned"], "the block the station started in is marked as before")
+
+        sync(6, "blkA", first, 1, 1500.0, 500000.0)
+        hub.mark_airing_static("06", "/m/zzz.mkv")
+        check(warnings == [], "none of this raised a failure")
+        live = MAIN_SRC[MAIN_SRC.index("def _sync_hub_rows_for_block"):MAIN_SRC.index("def _compare_hub_clock_answer")]
+        check("close_passed_rows(" in live and live.index('_hub.mark(_key[0], _slot, _airing, "airing")') < live.index("close_passed_rows("),
+              "the sync closes the rows left behind after it has marked the airing entry")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubClosesRowsLeftBehind(_SectionCase):
+    """A row left airing by an earlier block, or planned and passed while the app was off, is closed as aired and never deleted"""
+
+    def test_hub_closes_rows_left_behind(self):
+        self.run_section(suite_hub_closes_rows_left_behind)
+
+    def test_hub_block_change_and_restart_close_rows(self):
+        self.run_section(suite_hub_block_change_and_restart_close_rows)
+
+
+# ============================================================================
+# SECTION: Gap longer than the guide's block limit matches continuous running (H3 stage 4, B15 b)
+# ============================================================================
+
+def suite_guide_past_after_long_gap():
+    t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+    stop = datetime.datetime(2026, 10, 13, 7, 0, 5)
+    resume = datetime.datetime(2026, 11, 7, 10, 0, 5)
+    scenarios = (("eight_hour", "random_slots"), ("six_block", "random_slots"), ("full_day", "random_slots"))
+    unscanned_sets = ((), ("Show C", "Big Movie"))
+    step = 600
+    compared = 0
+    long_gaps = 0
+    differing, statics, positions = [], [], []
+
+    def paths(timeline):
+        return [item["path"] for item in timeline]
+
+    def unscan(ns, channel, markers):
+        if not markers:
+            return
+        ns["_priority_probe_pending_schedule"] = lambda *a, **k: None
+        for path in [p for p in ns["db"].config["media_probe_cache"] if any(m in p for m in markers)]:
+            del ns["db"].config["media_probe_cache"][path]
+        for items in channel["schedules"].values():
+            for item in items:
+                if any(m in item["path"] for m in markers):
+                    item.pop("duration", None)
+
+    for block_mode, sched in scenarios:
+        for markers in unscanned_sets:
+            label = "%s %s" % (block_mode, "with unscanned files" if markers else "all scanned")
+            channels = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)}
+            clock, ticks = [t0], [0]
+            ns = _sched_record_ns(channels, clock, ticks)
+            unscan(ns, channels["05"], markers)
+            truth = {}
+            for i in range(int((resume - t0).total_seconds() // step) + 1):
+                clock[0] = t0 + datetime.timedelta(seconds=i * step)
+                ticks[0] += 10000
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    ns["calculate_slotted_playback_state"]("05")
+                for rec in (channels["05"]["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values():
+                    truth[rec["start"]] = (rec["total"], paths(rec["timeline"]))
+            continuous_pos = _sched_record_round(channels["05"]["playback_log"].get("show_pos"))
+
+            fresh = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", sched, False)}
+            clock2, ticks2 = [t0], [0]
+            ns2 = _sched_record_ns(fresh, clock2, ticks2)
+            unscan(ns2, fresh["05"], markers)
+            result = None
+            for moment in [t0 + datetime.timedelta(seconds=i * 60) for i in range(int((stop - t0).total_seconds() // 60) + 1)] + [resume]:
+                clock2[0] = moment
+                ticks2[0] += 10000
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    result = ns2["calculate_slotted_playback_state"]("05")
+            plog = fresh["05"]["playback_log"]
+            if result.get("mode") not in ("Video", "Commercial"):
+                statics.append("%s: %s %s" % (label, result.get("mode"), result.get("reason")))
+            if (plog.get("last_gap_catchup") or {}).get("missed_blocks", 0) > media.GUIDE_REPLAY_MAX_BLOCKS:
+                long_gaps += 1
+            rebuilt = {rec["start"]: (rec["total"], paths(rec["timeline"])) for rec in (plog.get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values()}
+            if markers:
+                check(len(rebuilt) >= 3, "%s: the guide's past after the long gap holds the cycles the clock scheduled from the known files (%d)" % (label, len(rebuilt)))
+                continue
+            positions.append(_sched_record_round(plog.get("show_pos")) == continuous_pos)
+            resume_block_start = resume.toordinal() * 86400 + (plog.get("block_anchors") or {}).get(plog.get("sched_block_key"), 0)
+            floor_abs = (resume.toordinal() - 1) * 86400
+            after_stop = stop.toordinal() * 86400 + stop.hour * 3600 + stop.minute * 60 + stop.second
+            for start, (total, files) in truth.items():
+                if start <= after_stop or start >= resume_block_start or start + total < floor_abs:
+                    continue
+                compared += 1
+                if start not in rebuilt:
+                    differing.append("%s: missing cycle at %d" % (label, start))
+                elif rebuilt[start][1] != files:
+                    differing.append("%s: different files at %d" % (label, start))
+    check(compared >= 15, "the guide's past after a gap of about 25 days was compared with a station that kept running over %d cycles" % compared)
+    check(long_gaps >= 4, "%d of the runs missed more blocks than the guide's rebuild limit of %d" % (long_gaps, media.GUIDE_REPLAY_MAX_BLOCKS))
+    check(all(positions), "the show positions after the gap are the ones a station that kept running holds (%d of %d)" % (sum(positions), len(positions)))
+    check(not differing, "after a gap longer than the rebuild limit the guide's past holds the same cycles and files as a station that kept running (%d differ: %s)" % (len(differing), differing[:3]))
+    check(not statics, "a station started after the long gap, with or without unscanned files, airs a show or commercial and never Static (%s)" % statics[:3])
+
+
+class TestGuidePastAfterLongGap(_SectionCase):
+    """After a gap longer than the guide's block limit the guide's past and the show positions still match a station that never stopped"""
+
+    def test_guide_past_after_long_gap(self):
+        self.run_section(suite_guide_past_after_long_gap)
+
+
+# ============================================================================
+# SECTION: Missed cycles in the hub, holiday boot image (V163)
+# ============================================================================
+
+def suite_missed_cycles_recorded_in_hub():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        warnings = []
+        infos = []
+        ns = {"os": os, "media": media, "datetime": datetime, "build_raw_tracks": media.build_raw_tracks, "_cached_path_exists": lambda p: True,
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a))}
+        _hub_mode_ns(ns)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_write_missed_blocks_to_hub"):
+            exec(main_function_code(name), ns)
+        write = ns["_write_missed_blocks_to_hub"]
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        ch = {"schedules": {"Morning": [{"path": "/m/a.mkv", "duration": 1000}, {"path": "/m/b.mkv", "duration": 1000}]}}
+        day = datetime.date(2026, 10, 20).toordinal()
+        start_a, start_b = day * 86400 + 4 * 3600, day * 86400 + 4 * 3600 + 2030
+        tl_a = [entry("/m/a.mkv", 0, 1000), entry("/m/ad.mp4", 1000, 30, True), entry("/m/b.mkv", 1030, 1000)]
+        tl_b = [entry("/m/b.mkv", 0, 1000), entry("/m/a.mkv", 1000, 1000)]
+        records = [("Morning", "2026_293_Morning", start_a, tl_a, 2030), ("Morning", "2026_293_Morning", start_b, tl_b, 2000)]
+        write(ch, 5, records)
+        rows = hub.rows("05")
+        check(len(rows) == 5 and {r["state"] for r in rows} == {"aired"}, "every row of the missed cycles is saved as aired (%d)" % len(rows))
+        check(len({r["slot_key"] for r in rows}) == 2, "each missed cycle has a set of its own, so two cycles of one block never share positions")
+        first_epoch = datetime.datetime.fromordinal(day).timestamp() + 4 * 3600
+        check(hub.at("05", first_epoch + 10)["path"] == "/m/a.mkv" and hub.at("05", first_epoch + 1010)["kind"] == "commercial",
+              "the hub answers what the clock scheduled at a moment inside the gap")
+        write(ch, 5, records)
+        check(len(hub.rows("05")) == 5, "recording the same cycles again adds nothing")
+        hub.place_rows("05", "live", [{"position": 0, "path": "/m/x.mkv", "kind": "episode", "planned_start": first_epoch + 5000, "used_length": 900.0}], mode="random_slots")
+        write(ch, 5, [("Morning", "2026_293_Morning", day * 86400 + 4 * 3600 + 5000, tl_a, 2030)])
+        check(len(hub.rows("05")) == 6, "a cycle the hub already has a row for is left alone")
+        check(warnings == [], "none of this raised a failure")
+        broken = types.SimpleNamespace(at=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        ml.shared_schedule_hub = lambda: broken
+        write(ch, 5, records)
+        check(len(warnings) == 1 and "could not record the missed cycles" in warnings[0][1], "a failing hub is logged and never raises")
+        note_src = get_function_source("_note_missed_blocks")
+        check(note_src.index("aired_ledger_upsert(") < note_src.index("_write_missed_blocks_to_hub("), "the hub is written after the guide's ledger")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ============================================================================
+# SECTION: The hub's future rows (V170, H5 stage 3)
+# ============================================================================
+
+def _future_row(slot, position, path, start, length, kind="episode", facts=True):
+    return {"slot_key": slot, "position": position, "path": path, "kind": kind, "planned_start": start, "used_length": length,
+            "guide_entry": {"path": path, "duration": length} if facts else None}
+
+
+def suite_hub_future_table():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    try:
+        hub = ml.ScheduleHub(lib)
+        base = 1_800_000_000.0
+        check(hub.future_signature("05") == (0, 0.0), "a channel with no future rows has the empty signature")
+        rows = [_future_row("a@1", 0, "/m/a.mkv", base, 1000.0), _future_row("a@1", 1, "/m/ad.mp4", base + 1000, 30.0, "commercial"),
+                _future_row("b@2", 0, "/m/b.mkv", base + 2000, 1500.0), _future_row("b@2", 1, "/m/x.mkv", base + 3500, 0.0),
+                _future_row("b@2", 2, "", base + 3500, 100.0)]
+        check(hub.replace_future_rows("05", rows) == 3, "rows with no length or no file are not saved")
+        found = hub.future_rows_between("05", base, base + 4000)
+        check([r["path"] for r in found] == ["/m/a.mkv", "/m/ad.mp4", "/m/b.mkv"], "the future rows come back in start order")
+        check(found[0]["guide_entry"] == {"path": "/m/a.mkv", "duration": 1000.0}, "each row keeps the facts the guide draws its cell from")
+        check([r["path"] for r in hub.future_rows_between("05", base + 1010, base + 1020)] == ["/m/ad.mp4"], "only rows that overlap the span are returned")
+        check(hub.future_rows_between("06", base, base + 4000) == [], "another channel has none")
+        first_sig = hub.future_signature("05")
+        time.sleep(0.01)
+        hub.replace_future_rows("05", [_future_row("c@3", 0, "/m/c.mkv", base + 9000, 900.0)])
+        check([r["path"] for r in hub.future_rows_between("05", base, base + 20000)] == ["/m/c.mkv"], "saving again replaces the channel's earlier future rows")
+        check(hub.future_signature("05") != first_sig, "the signature moves when the rows are replaced")
+        check(hub.rows("05") == [], "the schedule's own rows are untouched by future rows")
+        check(hub.at("05", base + 9100) is None, "nothing that asks what is on air can pick a future row up")
+        hub.place_rows("05", "live", [{"position": 0, "path": "/m/live.mkv", "kind": "episode", "planned_start": base, "used_length": 500.0}], mode="random_slots")
+        hub.replace_future_rows("05", [_future_row("d@4", 0, "/m/d.mkv", base + 700, 900.0)])
+        check([r["state"] for r in hub.rows("05")] == ["planned"] and hub.rows("05")[0]["path"] == "/m/live.mkv", "replacing future rows leaves the schedule's rows as they were (R26)")
+        lib._conn.execute("DROP TABLE hub_future_row")
+        lib._conn.commit()
+        lib._conn.executescript(ml._SCHEMA)
+        check(hub.future_rows_between("05", base, base + 20000) == [], "a database file without the table gains it")
+        lib._conn.execute("INSERT INTO hub_future_row VALUES ('05','e@5',0,'/m/e.mkv','episode',?,100.0,'{bad json',1.0)", (base,))
+        check(hub.future_rows_between("05", base, base + 50)[0]["guide_entry"] is None, "unreadable facts read as none")
+    finally:
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_future_block_keys():
+    day = datetime.datetime(2026, 10, 25, 10, 30, 0)
+    check(media.block_key_containing("full_day", day) == "2026_298_Full Day", "a Full Day channel is always inside its one block")
+    eight = media.block_key_containing("eight_hour", day)
+    check(eight is not None and eight.startswith("2026_298_"), "an eight hour channel is inside one of the day's blocks: %s" % eight)
+    after_midnight = datetime.datetime(2026, 10, 26, 1, 0, 0)
+    night = media.block_key_containing("eight_hour", after_midnight)
+    check(night is not None, "a moment after midnight is inside the block that began the evening before: %s" % night)
+    for mode in ("eight_hour", "six_block", "full_day"):
+        key = media.future_block_key_after(mode, day, 48.0)
+        parsed = media._parse_block_key(key)
+        check(parsed is not None, "%s: the key after 48 hours reads back (%s)" % (mode, key))
+        start = {n: s for n, s, e in media._block_layout(mode)}[parsed[1]]
+        check(parsed[0] * 86400 + start * 3600 >= day.toordinal() * 86400 + 10.5 * 3600 + 48 * 3600 - 0.5, "%s: the block starts at or after the horizon" % mode)
+        earlier = media.future_block_key_after(mode, day, 47.0)
+        check(media._parse_block_key(earlier)[0] <= parsed[0], "%s: a nearer horizon never gives a later key" % mode)
+
+
+def suite_future_rows_match_continuous_run(hours_ahead=24.0, run_hours=48, step=600):
+    t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+    stop = datetime.datetime(2026, 10, 13, 13, 20, 5)
+    end = stop + datetime.timedelta(hours=run_hours)
+    compared = same = 0
+    problems = []
+    saved_before_after = []
+    for block_mode in ("eight_hour", "six_block", "full_day"):
+        for commercials in (False, True):
+            label = "%s%s" % (block_mode, " with commercials" if commercials else "")
+            channels = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", "random_slots", commercials)}
+            clock, ticks = [t0], [0]
+            ns = _sched_record_ns(channels, clock, ticks)
+            truth, stopped_log = {}, None
+            for i in range(int((end - t0).total_seconds() // step) + 1):
+                clock[0] = t0 + datetime.timedelta(seconds=i * step)
+                ticks[0] += 10000
+                with patch.object(media, "_cached_path_exists", lambda p: True):
+                    ns["calculate_slotted_playback_state"]("05")
+                for rec in (channels["05"]["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values():
+                    truth[rec["start"]] = (rec["total"], [e["path"] for e in rec["timeline"]])
+                if stopped_log is None and clock[0] >= stop:
+                    stopped_log = copy.deepcopy(channels["05"])
+                    stopped_at = clock[0]
+            ch = stopped_log
+            before = json.dumps(ch["playback_log"], sort_keys=True, default=str)
+            items = ch["schedules"].get("Commercials", [])
+            ads = media.build_commercial_tracks(items, lambda p: True) if ch.get("commercials_enabled") and items else []
+            records = media.project_future_blocks("05", ch, stopped_at, lambda p: True, ads, lambda off: ns["_start_order_seed"](ch, off), None, hours_ahead)
+            saved_before_after.append(before == json.dumps(ch["playback_log"], sort_keys=True, default=str))
+            if len(records) < 3:
+                problems.append("%s: only %d cycles projected" % (label, len(records)))
+            for name, key, abs_start, timeline, total in records:
+                compared += 1
+                got = truth.get(abs_start)
+                if got is None:
+                    problems.append("%s: projected cycle at %d is not in the run that kept going" % (label, abs_start))
+                elif got[1] != [e["path"] for e in timeline]:
+                    problems.append("%s: different files at %d" % (label, abs_start))
+                else:
+                    same += 1
+    check(compared >= 12, "the projected future was compared with a station that kept running over %d cycles" % compared)
+    check(not problems, "every projected cycle starts where, and holds the files that, the running station aired (%d of %d same; %s)" % (same, compared, problems[:3]))
+    check(all(saved_before_after), "projecting the future leaves the channel's saved positions and state exactly as they were")
+
+
+def suite_future_week_matches_continuous_run():
+    hours = gov.HUB_FUTURE_HOURS_AHEAD
+    check(hours >= ui.GUIDE_TOTAL_HALF_HOURS / 2.0 + 24.0, "the hub's future covers the guide's whole span plus one extra day (%s hours)" % hours)
+    fallback = re.search(r"^_HUB_FUTURE_HOURS_AHEAD = .* else ([0-9.]+)$", MAIN_SRC, re.M)
+    check(fallback is not None and float(fallback.group(1)) == hours, "the script's fallback copy of the number is the governor's")
+    suite_future_rows_match_continuous_run(hours_ahead=hours, run_hours=int(hours) + 12, step=1200)
+
+
+def suite_hub_future_worker():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        t0 = datetime.datetime(2026, 10, 13, 4, 0, 5)
+        stop = datetime.datetime(2026, 10, 13, 13, 20, 5)
+        channels = {"05": _sched_record_channel("eight_hour", "interrupt_half_hour", "random_slots", True)}
+        clock, ticks = [t0], [0]
+        sns = _sched_record_ns(channels, clock, ticks)
+        for i in range(int((stop - t0).total_seconds() // 600) + 1):
+            clock[0] = t0 + datetime.timedelta(seconds=i * 600)
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                sns["calculate_slotted_playback_state"]("05")
+        warnings, infos = [], []
+        mono = {"t": 1000.0}
+        ns = {"os": os, "media": media, "datetime": datetime, "copy": copy, "db": sns["db"], "_cached_path_exists": lambda p: True,
+              "build_commercial_tracks": media.build_commercial_tracks, "_start_order_seed": sns["_start_order_seed"],
+              "time": types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter),
+              "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]),
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_HUB_FUTURE_HOURS_AHEAD": 24.0, "_HUB_FUTURE_REFRESH_SECONDS": 900.0}
+        _hub_mode_ns(ns)
+        ns["db"] = sns["db"]
+        ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
+        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_hub_future_for_channel"):
+            exec(main_function_code(name), ns)
+        ns["_missed_block_day_seeds"] = sns["_missed_block_day_seeds"]
+        ns["_hub_future_state"] = {}
+        ns["_hub_future_logged"] = {}
+        run = ns["_hub_future_for_channel"]
+        snap_a, snap_b = ns["_hub_future_snapshot"](channels["05"]), ns["_hub_future_snapshot"](channels["05"])
+        check(snap_a["playback_log"].get("intro_seed") == channels["05"]["playback_log"]["intro_seed"] == snap_b["playback_log"].get("intro_seed"), "the channel's saved start number goes into the projection, so unbuilt blocks are ordered as the scheduler will order them")
+        plog_before = json.dumps(channels["05"]["playback_log"], sort_keys=True, default=str)
+        saved = run("05")
+        check(isinstance(saved, int) and saved >= 6, "the channel's future is worked out and saved (%s rows)" % saved)
+        check(json.dumps(channels["05"]["playback_log"], sort_keys=True, default=str) == plog_before, "the worker changes nothing in the channel's saved state")
+        rows = hub.future_rows_between("05", 0, 4e12)
+        check(all(r["planned_start"] > 0 and r["used_length"] > 0 and r["guide_entry"] for r in rows), "every saved row has a start, a length and the guide's facts")
+        check(any(r["kind"] == "commercial" for r in rows), "commercial rows are kept too")
+        check(hub.rows("05") == [] and hub.at("05", rows[0]["planned_start"] + 1) is None, "the schedule's rows are untouched and cannot see them")
+        check(run("05") == 0, "nothing changed and the rows are fresh, so nothing is worked out again")
+        mono["t"] += 901.0
+        check(run("05") == saved, "after the refresh seconds the future is worked out again, so a new file length reaches rows still ahead")
+        check(run("05", force=True) == saved, "a forced pass works it out again")
+        channels["05"]["broken_files"] = [channels["05"]["schedules"]["Morning"][0]["path"]]
+        changed = run("05")
+        check(isinstance(changed, int) and changed > 0, "a changed file list makes the channel's future work out again at once")
+        channels["05"]["broken_files"] = []
+        channels["05"]["playback_log"]["sched_block_key"] = "2026_200_Morning"
+        check(run("05", force=True) == 0, "a channel whose block on air is not the last block built is left to the scheduler")
+        channels["05"]["playback_log"]["sched_block_key"] = media.block_key_containing("eight_hour", clock[0])
+        channels["05"]["is_visualizer"] = True
+        check(run("05", force=True) == 0, "a visualizer channel has no future rows")
+        channels["05"]["is_visualizer"] = False
+        broken = types.SimpleNamespace(replace_future_rows=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        ml.shared_schedule_hub = lambda: broken
+        before = len(warnings)
+        check(run("05", force=True) is None and len(warnings) == before + 1 and "could not work out or save the future rows" in warnings[-1][1], "a failing hub is logged and never raises")
+        src = MAIN_SRC
+        worker = get_function_source("_hub_future_worker")
+        check("_HUB_FUTURE_START_DELAY_SECONDS" in worker and worker.index("_HUB_FUTURE_START_DELAY_SECONDS") < worker.index("_hub_future_for_channel("), "the worker waits after boot before it works out anything")
+        check("_background_scan_should_pause()" in worker and "_background_scan_pace_seconds(" in worker, "the worker stops while the governor holds background work and paces itself between channels")
+        check('target=_hub_future_worker' in src and src.index("target=_hub_future_worker") > src.index('_mark_boot_step("vlc_engine")'), "the worker thread starts after the boot steps, never inside the boot path")
+        check(get_function_source("_hub_future_for_channel").count("_cached_path_exists") >= 2, "the projection uses the same file check as the scheduler")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_hub_future_holiday_rows():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        for label, make in (("simple", _holiday_simple_channel), ("pairs, movies and commercials", _holiday_rich_channel)):
+            channel = make()
+            start = datetime.datetime(2026, 10, 29, 0, 0, 5)
+            steps = int((datetime.datetime(2026, 11, 1, 3, 0, 0) - start).total_seconds() // 120)
+            snap_index = int((datetime.datetime(2026, 10, 29, 10, 0, 5) - start).total_seconds() // 120)
+            _sns, truth, (snap, now) = _holiday_truth_run(channel, start, steps, 120, snap_index)
+            clock, ticks = [now], [0]
+            sns = _sched_record_ns({"05": snap}, clock, ticks)
+            warnings = []
+            mono = {"t": 1000.0}
+            ns = {"os": os, "media": media, "datetime": datetime, "copy": copy, "_cached_path_exists": lambda p: True,
+                  "build_commercial_tracks": media.build_commercial_tracks, "_start_order_seed": sns["_start_order_seed"],
+                  "_missed_block_day_seeds": sns["_missed_block_day_seeds"],
+                  "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]),
+                  "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: warnings.append(a)),
+                  "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+                  "_HUB_FUTURE_HOURS_AHEAD": 70.0, "_HUB_FUTURE_REFRESH_SECONDS": 900.0}
+            _hub_mode_ns(ns)
+            ns["db"] = sns["db"]
+            ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
+            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_hub_future_for_channel"):
+                exec(main_function_code(name), ns)
+            ns["_hub_future_state"], ns["_hub_future_logged"] = {}, {}
+            run = ns["_hub_future_for_channel"]
+            state_before = json.dumps([snap.get("holiday_playback_log"), snap["playback_log"]], sort_keys=True, default=str)
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                saved = run("05")
+            check(isinstance(saved, int) and saved > 20 and not warnings, "%s: a holiday day on air has its rest and the next holiday days saved (%s rows, %s)" % (label, saved, warnings[:1]))
+            check(json.dumps([snap.get("holiday_playback_log"), snap["playback_log"]], sort_keys=True, default=str) == state_before, "%s: the worker changes nothing in the channel's saved holiday state" % label)
+            rows = hub.future_rows_between("05", 0, 4e12)
+            slots = {}
+            for row in rows:
+                slots.setdefault(row["slot_key"], []).append(row["path"])
+            holiday_days = sorted({k.split("@")[0] for k in slots})
+            check(len(holiday_days) == 3, "%s: the rows cover today's rest and both later holiday days (%s)" % (label, holiday_days))
+            wrong = []
+            for slot, paths in slots.items():
+                known = truth.get(int(slot.split("@")[1]))
+                if known is None or known[0] != slot.split("@")[0] or known[1][:len(paths)] != paths:
+                    wrong.append(slot)
+            check(not wrong, "%s: every saved holiday cycle holds the files the running station aired at that second (%s)" % (label, wrong[:2]))
+            check(all(r["guide_entry"] for r in rows), "%s: every holiday row keeps the guide's facts" % label)
+            hub.replace_future_rows("05", [])
+            ns["_hub_future_state"].clear()
+            unbuilt = copy.deepcopy(snap)
+            unbuilt["holiday_playback_log"] = {}
+            sns["db"].channels_db["05"] = unbuilt
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                check(run("05", force=True) == 0, "%s: a holiday day the scheduler has not built leaves the saved rows as they were" % label)
+        src = MAIN_SRC
+        code = get_function_source("_hub_future_for_channel")
+        check("project_holiday_days(" in code and "holiday_day_tracks(" in code, "the worker plans the holiday days through the media functions")
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8") as handle:
+            guide = handle.read()
+        call = guide.index("_guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end),")
+        line = guide.rfind("if _tl_hit is None", 0, call)
+        check("_is_holiday_guide" not in guide[line:call], "the guide lays the hub's future over its own cells on a holiday day too")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_guide_future_from_hub():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    try:
+        hub = ml.ScheduleHub(lib)
+        now = datetime.datetime(2026, 10, 25, 10, 0, 0)
+        midnight = datetime.datetime(2026, 10, 25).timestamp()
+        pair = {"path": "/m/a.mkv", "duration": 1500.0, "is_pair": True, "pair_ep1_path": "/m/a.mkv", "pair_ep1_duration": 700.0,
+                "pair_ep2_path": "/m/b.mkv", "pair_ep2_duration": 800.0}
+        hub.replace_future_rows("05", [
+            {"slot_key": "k@1", "position": 0, "path": "/m/a.mkv", "kind": "episode", "planned_start": midnight + 12 * 3600, "used_length": 1500.0, "guide_entry": pair},
+            {"slot_key": "k@1", "position": 1, "path": "/m/ad.mp4", "kind": "commercial", "planned_start": midnight + 12 * 3600 + 1500, "used_length": 30.0, "guide_entry": {"path": "/m/ad.mp4", "duration": 30.0}},
+            {"slot_key": "k@1", "position": 2, "path": "/m/n.mkv", "kind": "episode", "planned_start": midnight + 12 * 3600 + 1530, "used_length": 900.0, "guide_entry": None}])
+        hub.replace_future_rows("07", [{"slot_key": "k@9", "position": 0, "path": "/m/far.mkv", "kind": "episode", "planned_start": midnight + 6 * 86400 + 9 * 3600, "used_length": 1800.0, "guide_entry": {"path": "/m/far.mkv", "duration": 1800.0}}])
+        far = ui._guide_hub_future_cells("07", now, 6 * 86400 + 8 * 3600, 6 * 86400 + 12 * 3600, hub=hub)
+        check(len(far) == 1 and far[0][1] == 6 * 86400 + 9 * 3600, "a row on the seventh day ahead is read back at its planned time, so the week comes from the hub")
+        cells = ui._guide_hub_future_cells("05", now, 10 * 3600, 16 * 3600, hub=hub)
+        check(len(cells) == 2, "a row with no readable facts is left to the guide's own future (%d cells)" % len(cells))
+        check(cells[0][0].get("is_pair") and cells[0][0]["pair_ep2_path"] == "/m/b.mkv" and cells[0][1] == 12 * 3600 and cells[0][2] == 12 * 3600 + 1500,
+              "a projected pair is drawn as the pair with both parts, at its planned time")
+        check(cells[1][0]["is_commercial"] is True, "a projected break is a break cell")
+        day_two = [(({"path": "/m/old.mkv", "duration": 7200.0}), 11 * 3600, 13 * 3600, "Morning")]
+        spliced = ui._guide_splice_aired(day_two, ui._guide_aired_rows_in_view(cells, 10 * 3600, 16 * 3600))
+        check(any(c[0].get("path") == "/m/a.mkv" for c in spliced) and any(c[0].get("path") == "/m/old.mkv" for c in spliced),
+              "the hub's future lies over the guide's own copy and the copy keeps the part the hub does not cover")
+        sig = ui._guide_hub_future_signature("05", now, hub=hub)
+        check(sig and sig[0] == 3, "the guide's saved timeline key holds the future rows' signature: %s" % (sig,))
+        broken = types.SimpleNamespace(future_rows_between=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")),
+                                       future_signature=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        check(ui._guide_hub_future_cells("05", now, 10 * 3600, 16 * 3600, hub=broken) == [], "a failing hub gives no future cells, so the guide draws its own")
+        check(ui._guide_hub_future_signature("05", now, hub=broken) is None, "a failing hub gives no signature and the guide still draws")
+        src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read() if "ROOT" in globals() else None
+        if src is None:
+            import inspect
+            src = inspect.getsource(ui)
+        key_at = src.index("_guide_hub_future_signature(ch_str, now_dt))")
+        check(key_at < src.index("_tl_hit = _guide_timeline_cache.get(_tl_key)"), "the future rows' signature is part of the guide's timeline cache key")
+        future_at = src.index("_guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start")
+        check(future_at < src.index("_guide_hub_aired_cells(ch_str, now_dt, viewport_adjusted_start"), "the hub's past is laid over the future, never the other way round")
+    finally:
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubFutureRows(_SectionCase):
+    """H5 stage 3: the hub keeps what each channel will air, worked out in the background from the prebuilt order, and the guide reads it"""
+
+    def test_hub_future_table(self):
+        self.run_section(suite_hub_future_table)
+
+    def test_future_block_keys(self):
+        self.run_section(suite_future_block_keys)
+
+    def test_future_rows_match_continuous_run(self):
+        self.run_section(suite_future_rows_match_continuous_run)
+
+    def test_hub_future_worker(self):
+        self.run_section(suite_hub_future_worker)
+
+    def test_future_week_matches_continuous_run(self):
+        self.run_section(suite_future_week_matches_continuous_run)
+
+    def test_guide_future_from_hub(self):
+        self.run_section(suite_guide_future_from_hub)
+
+    def test_hub_future_holiday_rows(self):
+        self.run_section(suite_hub_future_holiday_rows)
+
+
+def suite_holiday_boot_loading_image():
+    tmp = tempfile.mkdtemp()
+    try:
+        for name in ("retro_tv_loading.png", "retro_tv_loadingChristmas.png", "Retro_TV_LoadingHalloween.PNG", "retro_tv_loadingThanksgiving.txt"):
+            with open(os.path.join(tmp, name), "wb") as handle:
+                handle.write(b"x")
+        find = media.holiday_loading_image_path
+        check(os.path.basename(find(tmp, "christmas")) == "retro_tv_loadingChristmas.png", "retro_tv_loading plus the holiday name is the holiday's boot image")
+        check(os.path.basename(find(tmp, "halloween")) == "Retro_TV_LoadingHalloween.PNG", "the name and the ending are matched without regard to case")
+        check(find(tmp, "thanksgiving") is None, "a holiday with no picture has none (a text file is not a picture)")
+        check(find(tmp, "easter") is None and find(os.path.join(tmp, "none"), "christmas") is None, "an unknown holiday or a missing folder gives none")
+
+        warnings = []
+        cfg_dir = tempfile.mkdtemp()
+        script = os.path.join(cfg_dir, "retro_tv_emulator.py")
+        today = {"d": datetime.date(2026, 12, 24)}
+        ns = {"os": os, "sys": types.SimpleNamespace(argv=[script]), "media": media,
+              "broadcast_clock": types.SimpleNamespace(date=lambda: today["d"]),
+              "log": types.SimpleNamespace(warning=lambda *a, **k: warnings.append(a))}
+        exec(main_function_code("_boot_loading_image_path"), ns)
+        pick = lambda: os.path.basename(ns["_boot_loading_image_path"](tmp))
+        check(pick() == "retro_tv_loadingChristmas.png", "inside a holiday's days the boot shows the holiday image")
+        today["d"] = datetime.date(2026, 11, 1)
+        check(pick() == "retro_tv_loading.png", "outside every holiday the boot shows the normal image")
+        today["d"] = datetime.date(2026, 11, 1)
+        import json as _json
+        with open(os.path.join(cfg_dir, "retro_config.json"), "w") as handle:
+            _json.dump({"config": {"holiday_force_key": "halloween", "holiday_force_channels": ["05"]}}, handle)
+        check(pick() == "Retro_TV_LoadingHalloween.PNG", "a forced holiday shows its boot image on any day")
+        with open(os.path.join(cfg_dir, "retro_config.json"), "w") as handle:
+            handle.write("{not json")
+        check(pick() == "retro_tv_loading.png" and len(warnings) == 1, "an unreadable config falls back to the normal image with one warning")
+        today["d"] = datetime.date(2026, 12, 24)
+        os.remove(os.path.join(tmp, "retro_tv_loadingChristmas.png"))
+        check(pick() == "retro_tv_loading.png", "a holiday with no picture falls back to the normal image")
+        shutil.rmtree(cfg_dir, ignore_errors=True)
+        check('img_path = _boot_loading_image_path(os.path.join(base_dir, "main", "images", "loading"))' in MAIN_SRC,
+              "the boot code asks for the image through the holiday-aware function")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestMissedCyclesInHubAndHolidayBoot(_SectionCase):
+    """Cycles missed while the station was off are saved in the hub as aired rows; the boot loading image follows the holidays"""
+
+    def test_missed_cycles_recorded_in_hub(self):
+        self.run_section(suite_missed_cycles_recorded_in_hub)
+
+    def test_holiday_boot_loading_image(self):
+        self.run_section(suite_holiday_boot_loading_image)
+
+
+class TestTimelineMirrorsToHub(_SectionCase):
+    """A newly built block's timeline is recorded as hub rows, planned, without changing what airs"""
+
+    def test_timeline_mirrors_to_hub(self):
+        self.run_section(suite_timeline_mirrors_to_hub)
+
+
+def suite_hub_row_generations():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        infos, warnings = [], []
+        clock = {"t": 500000.0}
+        ns = {"os": os, "media": media,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(clock["t"])),
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_hub_rows_seen": {}, "_HUB_CLOCK_COMPARE_GRACE_SECONDS": 1.0, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        _hub_mode_ns(ns)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_compare_hub_clock_answer", "_sync_hub_rows_for_block", "_mark_hub_row_static"):
+            exec(main_function_code(name), ns)
+        raw_sync, static = ns["_sync_hub_rows_for_block"], ns["_mark_hub_row_static"]
+        agreements = lambda: [i for i in infos if "[HUB CLOCK]" in i[0] and "agree" in i[0]]
+
+        def sync(channel, block, tl, show, position, start):
+            clock["t"] = start + position
+            raw_sync(channel, block, tl, show, position)
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        S = 500000.0
+        old = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1800)]
+        new = [entry("/m/x.mkv", 0, 1500), entry("/m/ad2.mp4", 1500, 30, True), entry("/m/y.mkv", 1530, 1200)]
+        sync(5, "blk", old, old[0], 600.0, S)
+        check(hub.current_slot_key("05", "blk") == "blk" and hub.generation_key("blk", 1) == "blk" and hub.generation_key("blk", 3) == "blk#g3",
+              "the first set of rows for a block uses the block key itself")
+
+        before_history = [r for r in hub.rows("05") if r["state"] != "planned"]
+        sync(5, "blk", new, new[0], 700.0, S)
+        check(hub.current_slot_key("05", "blk") == "blk#g2", "a block rebuilt with other files gets its own set of rows")
+        first = hub.rows("05", "blk")
+        check([(r["path"], r["state"]) for r in first] == [("/m/a.mkv", "aired"), ("/m/ad1.mp4", "planned"), ("/m/b.mkv", "planned")] and first[0]["used_length"] == 700.0,
+              "the old set keeps the show that really aired, closed at the moment of the change, and its unaired plan stays, set aside")
+        second = hub.rows("05", "blk#g2")
+        check([(r["path"], r["state"]) for r in second] == [("/m/x.mkv", "airing"), ("/m/ad2.mp4", "planned"), ("/m/y.mkv", "planned")],
+              "the new set holds the new plan with the airing entry marked")
+        check(second[0]["planned_start"] == S + 700.0 and second[0]["used_length"] == 800.0,
+              "the new set's first row starts at the moment of the change and runs to the end of the slot, a show joined in progress")
+        check(hub.at("05", S + 700.0)["path"] == "/m/x.mkv" and hub.at("05", S + 699.0)["path"] == "/m/a.mkv" and hub.at("05", S + 100.0)["path"] == "/m/a.mkv",
+              "the hub answers the new file from the change on and the old file for the time before it")
+        check(len(agreements()) == 2 and warnings == [], "the scheduler and the hub agree after the rebuild and nothing is reported")
+        after_history = [r for r in hub.rows("05") if r["state"] != "planned"]
+        check(all(any(h["path"] == b["path"] and h["position"] == b["position"] for h in after_history) for b in before_history),
+              "no row that had aired or was airing is removed")
+
+        sync(5, "blk", new, new[1], 1505.0, S)
+        check([r["state"] for r in hub.rows("05", "blk#g2")] == ["aired", "airing", "planned"] and [r["state"] for r in hub.rows("05", "blk")] == ["aired", "planned", "planned"],
+              "later marks follow the clock in the new set and leave the old set alone")
+        static(5, "/m/ad2.mp4")
+        check(hub.rows("05", "blk#g2")[1]["state"] == "static", "a file that goes to Static is marked in the new set")
+
+        ns["_hub_rows_seen"].clear()
+        sync(5, "blk", new, new[1], 1510.0, S)
+        check(hub.current_slot_key("05", "blk") == "blk#g2" and hub.rows("05", "blk#g3") == [], "after a restart the same plan goes back into the same set")
+
+        third = [entry("/m/p.mkv", 0, 900), entry("/m/q.mkv", 900, 900)]
+        sync(5, "blk", third, third[1], 1600.0, S)
+        check(hub.current_slot_key("05", "blk") == "blk#g3" and [r["position"] for r in hub.rows("05", "blk#g3")] == [1],
+              "a second rebuild opens a third set, and only from the airing entry on, since the earlier slots never aired under that plan")
+        check([r["state"] for r in hub.rows("05", "blk#g2")] == ["aired", "static", "planned"] and hub.set_info("05", "blk#g2")["state"] == "set_aside",
+              "the second set is put aside with its history and its unaired plan kept")
+
+        base = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1800)]
+        sync(6, "len", base, base[0], 10.0, S)
+        longer = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1900)]
+        sync(6, "len", longer, longer[0], 20.0, S)
+        check(hub.current_slot_key("06", "len") == "len" and [r["used_length"] for r in hub.rows("06", "len")] == [1320.0, 30.0, 1900.0],
+              "a new length for a later entry rewrites the plan in the same set and opens no new one")
+
+        sync(7, "cyc", base, base[2], 1400.0, S)
+        sync(7, "cyc", base, base[0], 5.0, S + 3150.0)
+        check(hub.current_slot_key("07", "cyc") == "cyc#g2", "the same plan run again later, as the next cycle of a Full Day block, gets its own set")
+        cycle_one = hub.rows("07", "cyc")
+        check([r["state"] for r in cycle_one] == ["aired", "aired", "aired"] and cycle_one[2]["used_length"] == 1800.0,
+              "the first cycle's rows stay as aired history with the length that aired")
+        check(hub.at("07", S + 3155.0)["path"] == "/m/a.mkv" and hub.rows("07", "cyc#g2")[0]["state"] == "airing" and hub.at("07", S + 100.0)["state"] == "aired",
+              "the hub answers the second cycle's moment from its own rows and the first cycle's moment from the old ones")
+
+        sync(8, "mid", old, old[0], 10.0, S)
+        sync(8, "mid", new, new[2], 1600.0, S)
+        check([r["position"] for r in hub.rows("08", "mid#g2")] == [2], "a rebuild that lands on a later entry writes rows from that entry on")
+        check(hub.at("08", S + 1600.0)["path"] == "/m/y.mkv", "and the hub answers that entry")
+
+        gap = {"position": 0, "path": "/m/a.mkv", "kind": "episode", "planned_start": S, "used_length": 1320.0, "length_source": "measured"}
+        hub.put_rows("09", "t", [dict(gap)])
+        hub.mark("09", "t", 0, "airing")
+        slot, w, k, opened = hub.place_rows("09", "t", [dict(gap, planned_start=S + 59.0)], airing_position=0, now_epoch=S + 100.0, start_tolerance=60.0)
+        check((slot, opened) == ("t", False), "a start that moved less than the tolerance is the same plan")
+        slot, w, k, opened = hub.place_rows("09", "t", [dict(gap, planned_start=S + 61.0)], airing_position=0, now_epoch=S + 100.0, start_tolerance=60.0)
+        check((slot, opened, w) == ("t#g2", True, 1), "a start that moved more than the tolerance opens a new set")
+
+        hub.put_rows("10", "pre", [dict(gap, planned_start=None), dict(gap, position=1, path="/m/c.mkv", planned_start=None)])
+        slot, w, k, opened = hub.place_rows("10", "pre", [dict(gap, path="/m/z.mkv", planned_start=None)], now_epoch=S)
+        check((slot, opened, w) == ("pre", False, 1) and [r["path"] for r in hub.rows("10", "pre")] == ["/m/z.mkv"],
+              "a block with no aired rows is simply replanned, as before; only history can force a new set")
+
+        hub.put_rows("11", "2026_292_Full Day", [dict(gap)])
+        hub.mark("11", "2026_292_Full Day", 0, "airing")
+        hub.place_rows("11", "2026_292_Full Day", [dict(gap, path="/m/n.mkv")], airing_position=0, now_epoch=S + 50.0)
+        hub.put_rows("11", "2026X292XFull Day", [dict(gap)])
+        check(hub.current_slot_key("11", "2026X292XFull Day") == "2026X292XFull Day" and hub.current_slot_key("11", "2026_292_Full Day") == "2026_292_Full Day#g2",
+              "block names that differ only where a wildcard would match are kept apart")
+
+        slot, w, k, opened = hub.place_rows("12", "fresh", [dict(gap)], airing_position=0, now_epoch=S)
+        check((slot, opened, w) == ("fresh", False, 1), "a block with no rows at all starts in its first set")
+
+        live = MAIN_SRC[MAIN_SRC.index("def _sync_hub_rows_for_block"):MAIN_SRC.index("def _compare_hub_clock_answer")]
+        check("place_rows(" in live and ".put_rows(" not in live, "the scheduler's sync writes through the generation-aware call")
+        pre = MAIN_SRC[MAIN_SRC.index("def _write_prebuilt_block_to_hub"):MAIN_SRC.index("def _mark_hub_row_static")]
+        check("place_rows(" in pre and ".put_rows(" not in pre, "the Add Media prebuild writes through it too")
+        check(gov.HUB_ROW_GENERATION_START_TOLERANCE_SECONDS == ml._ROW_GENERATION_START_TOLERANCE_SECONDS, "the library and the governor agree on the start tolerance")
+        check(warnings == [], "none of this raised a failure")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubRowGenerations(_SectionCase):
+    """A block rebuilt with other files, or run again as the next cycle, gets its own set of hub rows while the earlier rows stay as history"""
+
+    def test_hub_row_generations(self):
+        self.run_section(suite_hub_row_generations)
+
+
+def suite_hub_mode_sets():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        S = 500000.0
+        gap = {"position": 0, "path": "/m/a.mkv", "kind": "episode", "planned_start": S, "used_length": 1320.0, "length_source": "measured"}
+
+        def rows3(paths):
+            return [dict(gap, position=i, path=p, planned_start=S + 1320.0 * i) for i, p in enumerate(paths)]
+
+        slot, w, k, opened = hub.place_rows("05", "blk", rows3(["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"]), airing_position=0, now_epoch=S, mode="two_slots")
+        info = hub.set_info("05", "blk")
+        check(slot == "blk" and not opened and info["mode"] == "two_slots" and info["state"] == "active", "the first set of a block is labelled with its slot mode and is active")
+        hub.mark("05", "blk", 0, "airing")
+        slot, w, k, opened = hub.place_rows("05", "blk", rows3(["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"]), airing_position=0, now_epoch=S + 10, mode="two_slots")
+        check(slot == "blk" and not opened and len(hub.sets("05", "blk")) == 1, "the same plan in the same mode stays in the same set")
+
+        slot, w, k, opened = hub.place_rows("05", "blk", rows3(["/m/a.mkv", "/m/x.mkv", "/m/y.mkv"]), airing_position=0, now_epoch=S + 600, mode="one_slot")
+        sets = hub.sets("05", "blk")
+        check(opened and slot == "blk#g2" and [(x["mode"], x["state"]) for x in sets] == [("two_slots", "set_aside"), ("one_slot", "active")],
+              "a slot mode change opens a new set even when the playing show is the same, and the old set is put aside")
+        check(sets[0]["stop_position"] == 0 and sets[0]["stop_epoch"] == S + 600, "the old set records where it was put aside: the airing entry and the clock moment")
+        check([(r["path"], r["state"]) for r in hub.rows("05", "blk")] == [("/m/a.mkv", "aired"), ("/m/b.mkv", "planned"), ("/m/c.mkv", "planned")],
+              "the old set keeps its unaired rows")
+        check(hub.at("05", S + 700.0)["path"] == "/m/a.mkv" and hub.at("05", S + 700.0)["slot_key"] == "blk#g2",
+              "the hub answers from the new set at the moment of the change")
+        check(hub.at("05", S + 1400.0)["path"] == "/m/x.mkv" and hub.at("05", S + 2700.0)["path"] == "/m/y.mkv", "and from the new plan after it")
+        check(hub.at("05", S + 4500.0) is None, "a moment only the set-aside plan covers is not answered from it")
+
+        slot, w, k, opened = hub.place_rows("05", "blk", rows3(["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"]), airing_position=0, now_epoch=S + 1000, mode="two_slots")
+        check(opened and slot == "blk#g3" and [x["state"] for x in hub.sets("05", "blk")] == ["set_aside", "set_aside", "active"],
+              "switching back opens another set and leaves both earlier ones set aside")
+
+        hub.put_rows("06", "u", [dict(gap)])
+        hub.mark("06", "u", 0, "airing")
+        slot, w, k, opened = hub.place_rows("06", "u", [dict(gap)], airing_position=0, now_epoch=S + 5, mode="one_slot")
+        check(not opened and hub.set_info("06", "u")["mode"] == "one_slot", "rows from before the labels existed take the current mode without a new set")
+
+        hub.put_rows("07", "z", [dict(gap)])
+        hub.mark("07", "z", 0, "airing")
+        hub.place_rows("07", "z", [dict(gap, path="/m/q.mkv")], airing_position=0, now_epoch=S + 30)
+        check(hub.set_info("07", "z")["mode"] == "unknown" and hub.set_info("07", "z")["state"] == "set_aside" and hub.set_info("07", "z#g2")["mode"] == "unknown",
+              "an unlabelled set that is put aside is labelled unknown, never left without a label")
+
+        hub.put_rows("08", "atom", [dict(gap)])
+        hub.mark("08", "atom", 0, "airing")
+        hub.place_rows("08", "atom", [dict(gap)], airing_position=0, now_epoch=S, mode="two_slots")
+        bad = [dict(gap, path="/m/other.mkv"), dict(gap, position=5, path="/m/e.mkv", planned_start=object())]
+        failed = False
+        try:
+            hub.place_rows("08", "atom", bad, airing_position=0, now_epoch=S + 50, mode="one_slot")
+        except Exception:
+            failed = True
+        check(failed and [r["state"] for r in hub.rows("08", "atom")] == ["airing"] and len(hub.sets("08", "atom")) == 1
+              and hub.set_info("08", "atom")["state"] == "active" and hub.set_info("08", "atom#g2") is None,
+              "a switch that fails part way leaves the old set exactly as it was, nothing half done")
+
+        import sqlite3
+        old = os.path.join(tmp, "old.sqlite3")
+        first = ml.MediaLibrary(old)
+        first.close()
+        conn = sqlite3.connect(old)
+        conn.execute("DROP TABLE hub_schedule_set")
+        conn.commit()
+        conn.close()
+        upgraded = ml.ScheduleHub(ml.MediaLibrary(old))
+        try:
+            check(upgraded.place_rows("05", "m", [dict(gap)], airing_position=0, now_epoch=S, mode="two_slots")[3] is False and upgraded.set_info("05", "m") is not None,
+                  "an older library gains the set labels table when it opens")
+        finally:
+            upgraded.library.close()
+
+        infos, warnings = [], []
+        clock = {"t": S}
+        mono = {"t": 1000.0}
+        modes = {"05": {"scheduling_mode": "two_slots"}}
+        ns = {"os": os, "media": media,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(clock["t"])),
+              "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
+              "_hub_rows_seen": {}, "_HUB_CLOCK_COMPARE_GRACE_SECONDS": 1.0, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        _hub_mode_ns(ns, modes, mono)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_compare_hub_clock_answer", "_sync_hub_rows_for_block"):
+            exec(main_function_code(name), ns)
+        raw = ns["_sync_hub_rows_for_block"]
+
+        def entry(path, start, dur, ad=False):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": 0}
+
+        def sync(tl, show, position):
+            clock["t"] = S + position
+            raw(5, "mblk", tl, show, position)
+
+        two = [entry("/m/a.mkv", 0, 1320), entry("/m/b.mkv", 1320, 1320), entry("/m/c.mkv", 2640, 1320)]
+        one = [entry("/m/a.mkv", 0, 1320), entry("/m/x.mkv", 1320, 1320), entry("/m/y.mkv", 2640, 1320)]
+        sync(two, two[0], 100.0)
+        check(hub.set_info("05", "mblk")["mode"] == "two_slots", "the sync labels the block's rows with the channel's slot mode")
+
+        modes["05"]["scheduling_mode"] = "one_slot"
+        sync(two, two[0], 101.0)
+        check(len(hub.sets("05", "mblk")) == 1, "a slot mode that has not held for half a second changes nothing in the hub")
+        modes["05"]["scheduling_mode"] = "two_slots"
+        mono["t"] += 0.1
+        sync(two, two[0], 102.0)
+        modes["05"]["scheduling_mode"] = "one_slot"
+        mono["t"] += 0.1
+        sync(one, one[0], 103.0)
+        modes["05"]["scheduling_mode"] = "two_slots"
+        mono["t"] += 0.1
+        sync(two, two[0], 104.0)
+        check(len(hub.sets("05", "mblk")) == 1 and warnings == [], "cycling through modes quickly and ending where it started opens no set")
+
+        modes["05"]["scheduling_mode"] = "one_slot"
+        mono["t"] += 0.1
+        sync(one, one[0], 110.0)
+        mono["t"] += 0.3
+        sync(one, one[0], 111.0)
+        check(len(hub.sets("05", "mblk")) == 1, "still under half a second after the mode last changed, nothing happens")
+        mono["t"] += 0.3
+        sync(one, one[0], 112.0)
+        mset = hub.sets("05", "mblk")
+        check([(x["mode"], x["state"]) for x in mset] == [("two_slots", "set_aside"), ("one_slot", "active")], "once the mode has held half a second the new set opens and the old one is put aside")
+        check(any("slot mode changed from two_slots to one_slot" in str(i[0]) % tuple(i[1:]) for i in infos if "slot mode changed" in str(i[0])), "the log names the old and the new mode")
+        check(hub.at("05", S + 112.0)["path"] == "/m/a.mkv" and hub.at("05", S + 1400.0)["path"] == "/m/x.mkv",
+              "the hub then answers from the one-slot plan")
+
+        hub.put_rows("05", "idle", [])
+        hub_calls = []
+        real_place = hub.place_rows
+        hub.place_rows = lambda *a, **k: hub_calls.append(1) or real_place(*a, **k)
+        ns["_hub_sync_lock"].acquire()
+        sync(one, one[1], 1500.0)
+        ns["_hub_sync_lock"].release()
+        check(hub_calls == [], "a second caller while the hub is being written leaves at once instead of waiting")
+        hub.place_rows = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("library closed"))
+        modes["05"]["scheduling_mode"] = "two_slots"
+        sync(two, two[1], 1500.0)
+        mono["t"] += 0.6
+        sync(two, two[1], 1501.0)
+        check(ns["_hub_sync_lock"].acquire(blocking=False), "the guard is released even when the write fails")
+        ns["_hub_sync_lock"].release()
+        check(len(warnings) == 1 and "could not update" in warnings[0][1], "a failed write is logged once and does not raise")
+        hub.place_rows = real_place
+
+        check(gov.HUB_MODE_SWITCH_SETTLE_SECONDS == 0.5 and "performance_governor.HUB_MODE_SWITCH_SETTLE_SECONDS" in MAIN_SRC,
+              "the half second settle lives in the governor table and the main script reads it from there")
+        src = MAIN_SRC[MAIN_SRC.index("def _sync_hub_rows_for_block"):MAIN_SRC.index("def _compare_hub_clock_answer")]
+        check("blocking=False" in src and "finally:" in src and "mode=_mode" in src, "the sync keeps its busy guard, releases it in a finally, and passes the mode")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubModeSets(_SectionCase):
+    """A slot mode change opens a labelled set of hub rows only after the mode has held, puts the old set aside with its unaired rows and its stopping point, and never half-saves"""
+
+    def test_hub_mode_sets(self):
+        self.run_section(suite_hub_mode_sets)
+
+
+def suite_stall_static_threshold():
+    check(gov.STALL_FORCES_STATIC_MS == 7000, "the fall back to Static waits 7 seconds without a new picture")
+    check("STALL_FORCES_STATIC_MS = performance_governor.STALL_FORCES_STATIC_MS if performance_governor is not None else 7000" in MAIN_SRC,
+          "the main script reads the number from the governor table and its fallback matches")
+    recovery = int(re.search(r"^PLAYBACK_STALL_TIMEOUT_MS = (\d+)", MAIN_SRC, re.M).group(1))
+    initial = int(re.search(r"^PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = (\d+)", MAIN_SRC, re.M).group(1))
+    check(gov.STALL_FORCES_STATIC_MS < recovery <= initial, "Static still comes before the stall recovery, which is unchanged")
+    check("_stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS" in MAIN_SRC, "the main loop still decides Static from the time without a new picture")
+
+
+class TestStallStaticThreshold(_SectionCase):
+    """The screen falls back to Static only after 7 seconds without a new picture, and still before the stall recovery"""
+
+    def test_stall_static_threshold(self):
+        self.run_section(suite_stall_static_threshold)
+
+
+def suite_guide_entry_warm_static_burst():
+    start = MAIN_SRC.index("[GUIDE ENTRY WARM] highlight already matches live playback")
+    block = MAIN_SRC[start:MAIN_SRC.index("_mute_guard_log(\"ARM (guide-entry warm transition shield)\"", start)]
+    static_part, black_part = block.split("            else:\n                _warm_burst_ms = GUIDE_PREVIEW_SETTLE_MS", 1)
+    check("_warm_transition_style == \"static\"" in static_part, "the guide-entry warm path still splits on the Static style")
+    check("app_state[\"channel_switch_black_until\"] = 0" in static_part, "in Static style the guide-entry warm path leaves no black shield armed")
+    check("channel_switch_black_until\"] = pygame.time.get_ticks()" not in static_part, "in Static style the guide-entry warm path does not arm the black shield")
+    check("app_state[\"guide_preview_static_until\"] = pygame.time.get_ticks() + _warm_burst_ms" in static_part, "in Static style the guide preview still shows the full Static burst")
+    check("app_state[\"channel_switch_black_until\"] = pygame.time.get_ticks() + _warm_burst_ms" in black_part, "in Black style the guide-entry warm path still arms the black shield for the burst")
+    check("app_state[\"guide_preview_black_until\"] = pygame.time.get_ticks() + _warm_burst_ms" in black_part, "in Black style the guide preview still holds black for the burst")
+    check("_arm_warm_transition_shield(vlc_engine, _warm_burst_ms)" in block, "the mute shield is still armed for the full burst in both styles")
+    exit_start = MAIN_SRC.index("_guide_exit_warm_skip_stop = False")
+    exit_block = MAIN_SRC[exit_start:MAIN_SRC.index("_guide_exit_warm_skip_music_stop = False", exit_start)]
+    check("app_state[\"channel_switch_black_until\"] = 0" in exit_block, "the guide-exit warm path does the same in Static style, so entry and exit now agree")
+
+
+class TestGuideEntryWarmStaticBurst(_SectionCase):
+    """Entering the guide on the channel that is already playing shows only the Static burst in Static style, with no black shield armed behind it"""
+
+    def test_guide_entry_warm_static_burst(self):
+        self.run_section(suite_guide_entry_warm_static_burst)
+
+
+def suite_static_effects_wait_for_burst():
+    state = {"now": 1000, "black": 0, "static": 0, "style": "static", "surf": ""}
+
+    class _Time:
+        @staticmethod
+        def get_ticks():
+            return state["now"]
+
+    class _State(dict):
+        pass
+
+    app = _State({"channel_switch_black_until": 0, "channel_switch_static_until": 0, "surf_origin": ""})
+    env = {"pygame": types.SimpleNamespace(time=_Time), "app_state": app,
+           "_configured_transition_style": lambda: state["style"]}
+    env["_surf_origin_active"] = lambda: bool(app.get("surf_origin", ""))
+    env["_static_transition_running"] = load_function("_static_transition_running", env)
+    over = load_function("_channel_transition_over", env)
+
+    check(over() is True, "with no burst and no shield the transition is over")
+    app["channel_switch_static_until"] = 2500
+    check(over() is False, "a running Static burst is not over, even with the black timer at 0")
+    state["now"] = 2500
+    check(over() is True, "the transition is over the moment the Static burst ends")
+    app["channel_switch_black_until"] = 3000
+    state["style"] = "black"
+    check(over() is False, "in Black style the black shield still holds the effects back")
+    state["now"] = 3000
+    check(over() is True, "in Black style the effects return when the shield ends")
+    state["style"] = "static"
+    app["channel_switch_static_until"] = 0
+    app["surf_origin"] = "05"
+    check(over() is False, "a channel flip that is waiting holds the effects back in Static style")
+    app["surf_origin"] = ""
+    state["style"] = "black"
+    app["channel_switch_static_until"] = 99999
+    check(over() is True, "a leftover Static timer does nothing in Black style")
+
+    for name, var in (("fake static noise", "_static_transition_over"), ("reception lines", "_lines_transition_over")):
+        check("%s = _channel_transition_over()" % var in MAIN_SRC, "%s waits for the shared transition-over check" % name)
+        check("%s = pygame.time.get_ticks() >= app_state.get(\"channel_switch_black_until\", 0)" % var not in MAIN_SRC, "%s no longer reads the black timer alone" % name)
+    wm = MAIN_SRC.index("_wm_bounds = _watermark_bounds_rect(content_rect)")
+    check("and _channel_transition_over()):" in MAIN_SRC[wm - 400:wm], "the watermark waits for the shared transition-over check")
+    check("_channel_transition_active = not _channel_transition_over()" in MAIN_SRC, "the bezel channel number stays up through a Static-style burst, not only the black shield")
+    layer = MAIN_SRC.index("_overlay_active = (", MAIN_SRC.index("_now_layer = pygame.time.get_ticks()"))
+    check("or not _channel_transition_over()" in MAIN_SRC[layer:layer + 600], "the game overlay layer counts a running Static-style burst as an overlay")
+    check("_now_layer < app_state.get(\"channel_switch_black_until\", 0)" not in MAIN_SRC, "the overlay layer no longer reads the black timer alone")
+
+
+class TestStaticEffectsWaitForBurst(_SectionCase):
+    """The fake static noise, reception lines and watermark stay off while a Static-style channel burst or flip is running"""
+
+    def test_static_effects_wait_for_burst(self):
+        self.run_section(suite_static_effects_wait_for_burst)
+
+
+def suite_hub_row_pass_numbers():
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    try:
+        hub = ml.ScheduleHub(lib)
+
+        def entry(path, start, dur, ad=False, seek=0):
+            return {"path": path, "duration": dur, "start_time": start, "is_commercial": ad, "seek_offset": seek}
+
+        def plan(timeline, start=1000.0):
+            return media.schedule_rows_from_timeline(timeline, start)
+
+        passes = lambda slot: [r["pass_no"] for r in hub.rows("05", slot)]
+        first = [entry("/m/a.mkv", 0, 600), entry("/m/ad.mp4", 600, 30, True), entry("/m/a.mkv", 630, 600, seek=600), entry("/m/b.mkv", 1230, 600)]
+        hub.put_rows("05", "d1", plan(first))
+        check(passes("d1") == [1, 1, 1, 1], "files that have never aired are on their first pass, and the second half of a split show keeps its first half's pass")
+        check([r["continuation"] for r in plan(first)] == [False, False, True, False], "only the second part of a split show is a continuation")
+
+        for position in range(4):
+            hub.mark("05", "d1", position, "aired")
+        hub.put_rows("05", "d2", plan([entry("/m/a.mkv", 0, 600), entry("/m/ad.mp4", 600, 30, True), entry("/m/c.mkv", 630, 600)]))
+        check(passes("d2") == [2, 2, 1], "a file that already aired is on its next pass and a new file is on its first")
+
+        hub.put_rows("05", "d3", plan([entry("/m/b.mkv", 0, 600), entry("/m/b.mkv", 600, 600)]))
+        check(passes("d3") == [2, 3], "the same file twice in one block counts a pass each time")
+
+        hub.mark("05", "d2", 0, "airing")
+        hub.put_rows("05", "d2", plan([entry("/m/a.mkv", 0, 600), entry("/m/ad.mp4", 600, 40, True), entry("/m/a.mkv", 640, 600, seek=600)]))
+        check(passes("d2") == [2, 2, 2], "a rebuild while a show airs keeps its pass and its continuation")
+
+        hub.mark("05", "d2", 0, "static")
+        again = hub.rows("05", "d2")[0]["pass_no"]
+        hub.put_rows("05", "d4", plan([entry("/m/a.mkv", 0, 600)]))
+        check(again == 2 and passes("d4") == [3], "a slot that went to Static still counts as a pass")
+
+        hub.put_rows("06", "d1", plan([entry("/m/a.mkv", 0, 600)]))
+        check(passes("d1") == [1, 1, 1, 1] and [r["pass_no"] for r in hub.rows("06", "d1")] == [1], "each channel counts its own passes")
+        hub.put_rows("06", "d2", [{"position": 0, "path": "/m/a.mkv", "kind": "episode", "pass_no": 7, "planned_start": 1.0}])
+        check([r["pass_no"] for r in hub.rows("06", "d2")] == [7], "a pass number given by the caller is kept")
+    finally:
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubRowPassNumbers(_SectionCase):
+    """Each hub row carries how many times its file has aired on the channel; the count is never cleared"""
+
+    def test_hub_row_pass_numbers(self):
+        self.run_section(suite_hub_row_pass_numbers)
+
+
+def suite_add_media_prebuild_rows():
+    lineup = [
+        {"path": "/m/a.mkv", "duration": 1320.0},
+        {"path": "/m/b.mkv", "duration": 1500.0, "_duration_estimated": True},
+        {"path": "", "duration": 60.0},
+        {"path": "/m/c.mkv", "duration": 0},
+    ]
+    rows = media.schedule_rows_from_lineup(lineup)
+    check([r["path"] for r in rows] == ["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"] and [r["position"] for r in rows] == [0, 1, 3],
+          "every show in the prebuilt lineup that has a file becomes a row, in the dealt order")
+    check(all(r["planned_start"] is None and r["kind"] == "episode" for r in rows), "the prebuild knows the order but not the times, so rows have no start yet")
+    check([r["length_source"] for r in rows] == ["measured", "estimate", "measured"] and rows[0]["used_length"] == 1320.0,
+          "each row keeps its length and whether it is an estimate")
+    check(media.schedule_rows_from_lineup(None) == [] and media.schedule_rows_from_lineup([]) == [], "an empty lineup gives no rows")
+
+    tmp = tempfile.mkdtemp()
+    lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+    original = ml.shared_schedule_hub
+    try:
+        hub = ml.ScheduleHub(lib)
+        ml.shared_schedule_hub = lambda: hub
+        warnings = []
+        ns = {"os": os, "media": media, "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime.fromtimestamp(500000.0)),
+              "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: warnings.append(a)),
+              "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)), "_hub_rows_seen": {},
+              "_compare_hub_clock_answer": lambda *args, **kwargs: None, "_HUB_ROW_GENERATION_START_TOLERANCE_SECONDS": 60.0}
+        _hub_mode_ns(ns)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_write_prebuilt_block_to_hub", "_sync_hub_rows_for_block"):
+            exec(main_function_code(name), ns)
+
+        ns["_write_prebuilt_block_to_hub"](5, "2026_300_Evening", lineup)
+        planned = hub.rows("05", "2026_300_Evening")
+        check(len(planned) == 3 and all(r["state"] == "planned" for r in planned), "the prebuild for a block not yet on air is recorded as planned rows (channel 5 and 05 are the same)")
+        ns["_write_prebuilt_block_to_hub"](5, "2026_300_Evening", lineup[:2])
+        check(len(hub.rows("05", "2026_300_Evening")) == 2, "adding media again replaces the earlier prebuild instead of stacking it")
+
+        timeline = [{"path": "/m/a.mkv", "duration": 1320.0, "start_time": 0.0, "is_commercial": False, "seek_offset": 0},
+                    {"path": "/m/ad.mp4", "duration": 30.0, "start_time": 1320.0, "is_commercial": True, "seek_offset": 0},
+                    {"path": "/m/b.mkv", "duration": 1500.0, "start_time": 1350.0, "is_commercial": False, "seek_offset": 0}]
+        ns["_sync_hub_rows_for_block"](5, "2026_300_Evening", timeline, timeline[0], 5.0)
+        live = hub.rows("05", "2026_300_Evening")
+        check([r["path"] for r in live] == ["/m/a.mkv", "/m/ad.mp4", "/m/b.mkv"] and live[0]["planned_start"] is not None and live[0]["state"] == "airing",
+              "when the block goes live the full timeline with commercials and start times replaces the prebuilt rows")
+        check(warnings == [], "none of this raised a failure")
+
+        class Broken:
+            def place_rows(self, *a, **k):
+                raise RuntimeError("library closed")
+        ml.shared_schedule_hub = lambda: Broken()
+        ns["_write_prebuilt_block_to_hub"](5, "2026_300_Evening", lineup)
+        check(len(warnings) == 1 and "prebuild" in warnings[0][0], "a failure to record is logged and does not stop Add Media")
+    finally:
+        ml.shared_schedule_hub = original
+        lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    src = MAIN_SRC
+    handler = src[src.index("_vt_add, _, _ = build_block_rotation("):]
+    handler = handler[:handler.index("_deferred_metadata_probing_worker")]
+    check("_write_prebuilt_block_to_hub(target_ch, _bkey_add, _vt_add, _raw_add)" in handler and handler.index("_brc_add[_bkey_add] = {") < handler.index("_write_prebuilt_block_to_hub("),
+          "the Add Media prebuild records its lineup right after it stores it in the block cache")
+
+
+class TestAddMediaPrebuildRows(_SectionCase):
+    """The Add Media prebuild records the show order it dealt for a block that is not on air, and the live timeline replaces it when the block starts"""
+
+    def test_add_media_prebuild_rows(self):
+        self.run_section(suite_add_media_prebuild_rows)
+
+
+def suite_vlc_log_callback_failures_do_not_repeat():
+    import ctypes
+    import queue as _queue
+
+    def build(vlc_module):
+        swallowed = []
+        lines = _queue.Queue()
+
+        def fake_vsnprintf(buf, size, fmt, args):
+            ctypes.memmove(buf, fmt, len(fmt))
+            return len(fmt)
+
+        ns = {"ctypes": ctypes, "queue": _queue, "log": MagicMock(), "_vlc_log_cb_refs": [], "_vlc_log_queue": lines,
+              "_VLC_LOG_LEVEL_NAMES": {0: "debug", 1: "notice", 2: "warning", 3: "error"},
+              "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime(2026, 10, 19, 16, 41, 44)),
+              "_log_swallowed": lambda where, error: swallowed.append((where, str(error))),
+              "_get_vsnprintf_cached": lambda: fake_vsnprintf}
+        exec(main_function_code("_make_vlc_log_callback"), ns)
+        callback = ns["_make_vlc_log_callback"](vlc_module)
+        return callback, swallowed, lines
+
+    def fire(callback, count=5):
+        for _ in range(count):
+            callback(None, 0, None, b"hello", None)
+
+    def wrapper_with_three_arguments(ctx, module, file):
+        return None
+
+    def good_dll_function(ctx, module_ref, file_ref, line_ref):
+        module_ref._obj.value = b"core"
+
+    good = types.SimpleNamespace(libvlc_log_get_context=wrapper_with_three_arguments,
+                                 dll=types.SimpleNamespace(libvlc_log_get_context=good_dll_function))
+    callback, swallowed, lines = build(good)
+    fire(callback)
+    texts = [lines.get_nowait() for _ in range(lines.qsize())]
+    check(swallowed == [] and len(texts) == 5 and all(" core debug: hello" in t for t in texts),
+          "with python-vlc's short wrapper, the VLC library's own function gives the module name and nothing fails")
+
+    def failing_dll_function(ctx, module_ref, file_ref, line_ref):
+        raise OSError("access violation")
+
+    broken = types.SimpleNamespace(dll=types.SimpleNamespace(libvlc_log_get_context=failing_dll_function))
+    callback, swallowed, lines = build(broken)
+    fire(callback, 50)
+    texts = [lines.get_nowait() for _ in range(lines.qsize())]
+    check(len(swallowed) == 1 and len(texts) == 50 and all(" main debug: hello" in t for t in texts),
+          "a module-name function that fails is logged once, then switched off, and every log line is still written")
+
+    callback, swallowed, lines = build(types.SimpleNamespace())
+    fire(callback)
+    check(swallowed == [] and lines.qsize() == 5, "a VLC library with no module-name function logs nothing and writes every line")
+
+    resolver_swallowed = []
+    ns = {"ctypes": ctypes, "_log_swallowed": lambda where, error: resolver_swallowed.append(str(error))}
+    exec(main_function_code("_resolve_vsnprintf"), ns)
+    found = ns["_resolve_vsnprintf"]()
+    check(found is not None and resolver_swallowed == [], "a vsnprintf found after a missing candidate logs no failure")
+
+
+class TestVlcLogCallbackFailuresDoNotRepeat(_SectionCase):
+    """The VLC log callback logs a module-name failure once, not on every VLC log line, and a vsnprintf candidate that is merely missing is not logged as a failure"""
+
+    def test_vlc_log_callback_failures_do_not_repeat(self):
+        self.run_section(suite_vlc_log_callback_failures_do_not_repeat)
+
+
+class TestReplaceWedgedEngine(_SectionCase):
+    """A wedged main engine is replaced once, alone, with a wait before any retry"""
+
+    def test_replace_wedged_engine(self):
+        self.run_section(suite_replace_wedged_engine)
+
+
+# ============================================================================
+# SECTION: Visualizer menu, Clear All Scheduled Music button
+# ============================================================================
+
+
+def suite_visualizer_clear_music():
+    HEADERS["CHANNEL_SUB_MENU"] = 'elif app_state["menu_layer"] == "CHANNEL_SUB_MENU":'
+    try:
+        code = extract_branch(MAIN_SCRIPT, "CHANNEL_SUB_MENU")
+    finally:
+        del HEADERS["CHANNEL_SUB_MENU"]
+
+    def press(row, col, tracks, visualizer=True):
+        db = n6_FakeDb()
+        db.channels_db = {str(n).zfill(2): {"active": False} for n in range(5, 45)}
+        db.channels_db["05"]["active"] = True
+        db.channels_db["07"] = {"active": True, "is_visualizer": visualizer, "name": "X", "schedules": {"Music Tracks": list(tracks)}}
+        state = {"menu_layer": "CHANNEL_SUB_MENU", "sub_menu_row_index": row, "sub_menu_col_index": col, "selected_channel_row": 7, "show_menu": True}
+        env = make_env()
+        env.update({"app_state": state, "db": db, "event": types.SimpleNamespace(key=pygame.K_RETURN), "now_ticks": 123,
+                    "SIX_HOUR_BLOCK_NAMES": [], "_count_active_content_channels": lambda _db: 2,
+                    "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)})
+        exec(code, env)
+        return state
+
+    state = press(4, 0, ["a.mp3"])
+    check(state.get("show_clear_confirm") is True and state.get("clear_confirm_target") == "channel_music",
+          "Enter on Clear All Scheduled Music asks to confirm clearing the music")
+    check(state.get("clear_confirm_channel") == "07" and state.get("clear_confirm_selection") == "No",
+          "the confirm names the channel and starts on No")
+    state = press(4, 0, [])
+    check(not state.get("show_clear_confirm"), "with no music added the button does nothing")
+    state = press(4, 1, ["a.mp3"])
+    check(not state.get("show_clear_confirm") and state.get("menu_layer") == "CHANNEL_LIST",
+          "Enter on Close in the same row closes the menu and does not ask to clear")
+    state = press(4, 2, ["a.mp3"])
+    check(not state.get("show_clear_confirm") and state.get("menu_layer") == "CHANNEL_SUB_MENU",
+          "a column left over from another layout does not clear anything")
+
+
+class TestVisualizerClearMusic(_SectionCase):
+    """Enter on Clear All Scheduled Music asks to clear the channel's music; Close in the same row only closes"""
+
+    def test_visualizer_clear_music(self):
+        self.run_section(suite_visualizer_clear_music)
+
+
+# ============================================================================
+# SECTION: Crash log and exit notice (native crash stack, running marker, quit lines)
+# ============================================================================
+
+
+def suite_crash_log_and_exit_notice():
+    import datetime as _dt
+    import subprocess as _sp
+    import textwrap as _tw
+
+    with tempfile.TemporaryDirectory() as folder:
+        warnings = []
+        ns = {
+            "os": os, "sys": sys,
+            "_log_output_dir": lambda: folder,
+            "broadcast_clock": types.SimpleNamespace(now=lambda: _dt.datetime(2026, 10, 16, 18, 0, 0)),
+            "log": types.SimpleNamespace(warning=lambda msg, *a: warnings.append(msg % a if a else msg),
+                                         info=lambda *a, **k: None),
+        }
+        for name in ("_run_marker_path", "_check_previous_run_exit", "_clear_run_marker"):
+            exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+        marker = os.path.join(folder, "running.marker")
+
+        ns["_check_previous_run_exit"]()
+        check(not warnings and os.path.exists(marker), "a first start logs nothing and writes the running marker")
+        ns["_check_previous_run_exit"]()
+        check(len(warnings) == 1 and "did not exit cleanly" in warnings[0] and "2026-10-16T18:00:00" in warnings[0],
+              "a start that finds the marker left behind logs one unclean-exit warning with the old start time")
+        check("crash_log_previous.txt" in warnings[0], "the warning names where a crash moved to")
+        warnings.clear()
+        ns["_clear_run_marker"]()
+        check(not os.path.exists(marker), "a clean quit removes the marker")
+        ns["_check_previous_run_exit"]()
+        check(not warnings, "the start after a clean quit logs no warning")
+        ns["_clear_run_marker"]()
+        ns["_clear_run_marker"]()
+
+        exits = []
+        removed = []
+        exit_ns = {"os": types.SimpleNamespace(name="posix", _exit=lambda code: exits.append(code)),
+                   "ctypes": None, "_clear_run_marker": lambda: removed.append(True)}
+        exec(compile(get_function_source("_hard_exit_process"), "<extracted:_hard_exit_process>", "exec"), exit_ns)
+        exit_ns["_hard_exit_process"](0)
+        check(exits == [0] and removed == [True], "exit code 0 removes the running marker, then exits")
+        exit_ns["_hard_exit_process"](1)
+        check(exits == [0, 1] and removed == [True], "any other exit code leaves the marker for the next start to report")
+
+        script = os.path.join(folder, "native_crash.py")
+        crash_dir = os.path.join(folder, "temp")
+        os.makedirs(crash_dir)
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write("import os, sys, ctypes\n" + get_function_source("_enable_native_crash_stack")
+                         + "\n_native_crash_stream = None\n_log_output_dir = lambda: sys.argv[1]\n"
+                         + "_enable_native_crash_stack()\nctypes.string_at(0)\n")
+        proc = _sp.run([sys.executable, script, crash_dir], capture_output=True, text=True, timeout=60)
+        crash_file = os.path.join(crash_dir, "crash_log.txt")
+        written = ""
+        if os.path.exists(crash_file):
+            with open(crash_file, encoding="utf-8") as crash_handle:
+                written = crash_handle.read()
+        check(proc.returncode != 0 and "Fatal Python error" in written and "native_crash.py" in written,
+              "a process that dies inside native code leaves its stack in crash_log.txt")
+
+    check('log.info("[QUIT] window close requested; shutting down")' in MAIN_SRC,
+          "closing the window logs a [QUIT] line")
+    check('log.info("[EXIT] Exit program chosen in Settings; shutting down")' in MAIN_SRC,
+          "the Exit program row logs an [EXIT] line")
+    check('log.info("[SHUTDOWN] power off chosen; shutting down")' in MAIN_SRC,
+          "the power-off action logs a [SHUTDOWN] line")
+
+
+class TestCrashLogAndExitNotice(_SectionCase):
+    """A native crash leaves a stack, an unclean exit is reported at the next start, and each quit path says it was used"""
+
+    def test_crash_log_and_exit_notice(self):
+        self.run_section(suite_crash_log_and_exit_notice)
+
+
+# ============================================================================
+# SECTION: Channel menu buttons that count files say ADD while empty
+# ============================================================================
+
+
+def suite_empty_file_buttons_say_add():
+    with open(os.path.join(os.path.dirname(MAIN_SCRIPT), "ui.py"), encoding="utf-8") as handle:
+        ui_src = handle.read()
+    check("f\"COMMERCIALS ({'ADD' if _com_file_ct == 0 else _com_file_ct})\"" in ui_src,
+          "the Commercials button says ADD while no commercial files are added, then the count")
+    check("f\"{name.upper()} ({'ADD' if file_count == 0 else file_count})\"" in ui_src,
+          "the Morning, Evening, Night and 4-hour buttons say ADD while empty, then the count")
+    check("24-HOUR BLOCK  ({'ADD' if file_count == 0 else" in ui_src and "24-HOUR MARATHON  ({'ADD' if file_count == 0 else" in ui_src,
+          "the 24-hour block and marathon buttons say ADD while empty, then the file count")
+    check("COMMERCIALS ({_com_file_ct})" not in ui_src, "no button puts a bare 0 in brackets for an empty list")
+
+
+# ============================================================================
+# SECTION: Failure-point error text and tester report (retro_tv_emulator.py)
+# ============================================================================
+
+
+_SILENT_ALLOWED_FUNCTIONS = {
+    "_early_crash_path", "_early_crash_hook", "_clear_stale_logs_on_fresh_boot", "_enable_native_crash_stack", "_write_crash_log",
+    "_write_crash_log_main_thread", "_logged_print", "_hard_exit_process", "_attempt_self_relaunch",
+    "_force_recover_from_dead_main_loop",
+}
+
+
+def _enclosing_names(tree):
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    def top_function(node):
+        found = ""
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                found = node.name
+        return found
+    return parents, top_function
+
+
+def check_shared_failure_helper():
+    """Runs the one shared helper in performance_governor.py through first write, repeats, a different place and a broken log."""
+    lines = []
+    saved_log = gov.log
+    gov._swallowed_failure_counts.clear()
+    gov.log = types.SimpleNamespace(warning=lambda msg, *a: lines.append(msg % a))
+    try:
+        def failing():
+            raise ValueError("bad value 7")
+
+        def raised():
+            try:
+                failing()
+            except Exception as error:
+                return error
+        err = raised()
+        gov.log_swallowed("playing: audio_set_mute(True)", err)
+        check(len(lines) == 1 and "[FAILURE] playing: audio_set_mute(True): ValueError: bad value 7" in lines[0],
+              "the first failure writes one line with where, the error type and the error text")
+        check("test_suite.py:" in lines[0], "the line names the source file and line the error was raised on")
+        for _ in range(8):
+            gov.log_swallowed("playing: audio_set_mute(True)", err)
+        check(len(lines) == 1, "repeats 2 to 9 of the same failure write nothing")
+        gov.log_swallowed("playing: audio_set_mute(True)", err)
+        check(len(lines) == 2 and "(seen 10 times)" in lines[1], "the 10th repeat writes a line saying how many times it was seen")
+        for _ in range(89):
+            gov.log_swallowed("playing: audio_set_mute(True)", err)
+        check(len(lines) == 2, "repeats 11 to 99 write nothing")
+        gov.log_swallowed("playing: audio_set_mute(True)", err)
+        check(len(lines) == 3 and "(seen 100 times)" in lines[2], "the 100th repeat writes a line")
+        gov.log_swallowed("other place", err)
+        gov.log_swallowed("playing: audio_set_mute(True)", KeyError("k"))
+        check(len(lines) == 5, "a different place or a different error type is counted and written on its own")
+        gov.log_swallowed("no traceback", ValueError("never raised"))
+        check(len(lines) == 6 and "never raised" in lines[5] and "test_suite" not in lines[5], "an error that was never raised still writes its line, without a source position")
+        gov.log = types.SimpleNamespace(warning=lambda *a: (_ for _ in ()).throw(RuntimeError("log is down")))
+        gov._swallowed_failure_counts.clear()
+        try:
+            gov.log_swallowed("x", err)
+            survived = True
+        except Exception:
+            survived = False
+        check(survived, "the shared helper never raises, even when the log itself fails")
+    finally:
+        gov.log = saved_log
+        gov._swallowed_failure_counts.clear()
+    check(gov._log_swallowed is gov.log_swallowed, "the governor's own handlers call the same helper under the shared name")
+
+
+def shared_helper_import_checks():
+    """Every script takes the helper from performance_governor.py and keeps no copy or count of its own."""
+    for name in ("retro_tv_emulator.py", "game_deck.py", "media.py", "ui.py", "libretro_core.py", "media_library.py"):
+        with open(os.path.join(ROOT, name), encoding="utf-8") as handle:
+            text = handle.read()
+        check("from performance_governor import log_swallowed as _log_swallowed" in text, "%s imports the shared failure helper from performance_governor.py" % name)
+        check("_swallowed_failure_counts" not in text and "_swallowed_failure_lock" not in text, "%s keeps no failure counts or lock of its own" % name)
+        tree = ast.parse(text)
+        top_defs = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_log_swallowed"]
+        check(not top_defs, "%s defines no helper of its own at the top level (only the import fallback)" % name)
+
+
+def converted_handler_checks(name, expected):
+    """Every broad except in the script that only passed now makes exactly one helper call naming its place and its own error."""
+    with open(os.path.join(ROOT, name), encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    parents, top_function = _enclosing_names(tree)
+    silent = []
+    converted = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and (node.type is None or (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException"))):
+            if all(isinstance(stmt, ast.Pass) for stmt in node.body):
+                silent.append(node)
+            elif node.name == "_swallowed_error":
+                converted.append(node)
+    stray = [n.lineno for n in silent if top_function(n) != "log_swallowed"]
+    check(not stray, "%s has no broad except that only passes; stray lines: %s" % (name, stray[:10]))
+    quiet = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and n.name is None
+             and (n.type is None or (isinstance(n.type, ast.Name) and n.type.id in ("Exception", "BaseException")))
+             and all(isinstance(stmt, (ast.Return, ast.Continue, ast.Break)) and not (isinstance(stmt, ast.Return) and stmt.value is not None and not isinstance(stmt.value, (ast.Constant, ast.UnaryOp))) for stmt in n.body)]
+    check(not quiet, "%s has no broad except that only returns or continues; stray lines: %s" % (name, quiet[:10]))
+    check(len(converted) == expected, "%s: %d silent handlers now call the helper (%d found)" % (name, expected, len(converted)))
+    for node in converted:
+        call = node.body[0].value if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Call) else None
+        ok = (call is not None and getattr(call.func, "id", "") == "_log_swallowed" and len(call.args) == 2
+              and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str) and call.args[0].value.strip() != ""
+              and isinstance(call.args[1], ast.Name) and call.args[1].id == "_swallowed_error")
+        check(ok, "%s line %d passes a non-empty where text and its own caught error to the helper" % (name, node.lineno))
+
+
+def check_tester_report_button_removed():
+    """Checks that the Make Tester Report button is gone from the Advanced Settings menu and that the automatic start and exit reports are still there."""
+    rows = ui.get_advanced_settings_menu_rows(None, {})
+    check("tester_report" not in rows and "tester_report" not in ui.SYSTEM_ROW_META, "the Advanced Settings menu has no Make Tester Report row")
+    check(rows == ["update_check", "remote_remap", "performance_mode", "gpu_render_mode", "boot_on_start", "server_option", "server_menu_open"],
+          "the other Advanced Settings rows keep their order")
+    check("_start_tester_report_on_demand" not in MAIN_SRC and "_tester_report_button_label" not in open(ui.__file__, encoding="utf-8").read(),
+          "no code starts or labels a menu report")
+    check(not hasattr(gov, "TESTER_REPORT_BUTTON_SETTLE_SECONDS") and not hasattr(gov, "TESTER_REPORT_BUTTON_STATUS_SECONDS"),
+          "the button's two governor numbers are gone")
+    check(hasattr(gov, "TESTER_REPORT_MAX_LOG_LINES") and hasattr(gov, "TESTER_REPORT_MAX_CRASH_LINES"), "the numbers the automatic report uses stay")
+
+
+def suite_failure_point_text():
+    parents, top_function = _enclosing_names(MAIN_TREE)
+    silent = []
+    converted = []
+    for node in ast.walk(MAIN_TREE):
+        if isinstance(node, ast.ExceptHandler) and (node.type is None or (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException"))):
+            if all(isinstance(stmt, ast.Pass) for stmt in node.body):
+                silent.append(node)
+            elif node.name == "_swallowed_error":
+                converted.append(node)
+    module_level = [n.lineno for n in silent if top_function(n) == ""]
+    stray = [n.lineno for n in silent if top_function(n) != "" and top_function(n) not in _SILENT_ALLOWED_FUNCTIONS]
+    check(not stray, "every broad except that only passes is a crash writer, the log itself or the exit path; stray lines: %s" % stray[:10])
+    check(len(module_level) == 1, "only the log-file setup failure handler stays silent at module level (%d found)" % len(module_level))
+    check(len(converted) >= 125, "the silent and quiet handlers now call _log_swallowed (%d found)" % len(converted))
+    quiet = []
+    for node in ast.walk(MAIN_TREE):
+        if isinstance(node, ast.ExceptHandler) and (node.type is None or (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException"))) and node.name is None:
+            if all(isinstance(stmt, (ast.Return, ast.Continue, ast.Break)) and not (isinstance(stmt, ast.Return) and stmt.value is not None and not isinstance(stmt.value, (ast.Constant, ast.UnaryOp))) for stmt in node.body):
+                quiet.append(node)
+    quiet_stray = [n.lineno for n in quiet if top_function(n) not in _SILENT_ALLOWED_FUNCTIONS]
+    check(not quiet_stray, "no broad except that only returns or continues is left outside the boot crash path; stray lines: %s" % quiet_stray[:10])
+    for node in converted:
+        call = node.body[0].value if isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Call) else None
+        rest_ok = all(isinstance(stmt, (ast.Return, ast.Continue, ast.Break)) for stmt in node.body[1:])
+        if call is None or getattr(call.func, "id", "") != "_log_swallowed" or not rest_ok:
+            check(False, "line %d: a converted handler is one _log_swallowed call, then at most the return or continue it had before" % node.lineno)
+            continue
+        where_ok = bool(call.args) and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str) and call.args[0].value.strip() != ""
+        error_ok = len(call.args) == 2 and isinstance(call.args[1], ast.Name) and call.args[1].id == node.name
+        check(where_ok and error_ok, "line %d passes a non-empty where text and its own caught error to _log_swallowed" % node.lineno)
+
+    check_shared_failure_helper()
+    shared_helper_import_checks()
+
+    with tempfile.TemporaryDirectory() as folder:
+        reported = []
+        report_ns = {
+            "os": os, "sys": sys, "datetime": __import__("datetime"),
+            "_log_output_dir": lambda: folder,
+            "broadcast_clock": types.SimpleNamespace(now=lambda: __import__("datetime").datetime(2026, 10, 16, 19, 0, 0)),
+            "_boot_environment_text": "OS=TestOS | CPU cores=8 | RAM=16.0GB total | Process=64-bit",
+            "_previous_run_unclean": True,
+            "_TESTER_REPORT_LOG_TAIL_BYTES": 4096, "_TESTER_REPORT_MAX_LOG_LINES": 3, "_TESTER_REPORT_MAX_CRASH_LINES": 2,
+            "_log_swallowed": lambda where, error: reported.append((where, error)),
+        }
+        for name in ("_tester_report_tail_lines", "_write_tester_report"):
+            exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), report_ns)
+        with open(os.path.join(folder, "app_log.txt"), "w", encoding="utf-8") as handle:
+            for number in range(10):
+                handle.write("2026-10-16 18:00:%02d,000 [INFO] retro: info line %d\n" % (number, number))
+                handle.write("2026-10-16 18:00:%02d,500 [WARNING] retro: [FAILURE] warn line %d\n" % (number, number))
+            handle.write("2026-10-16 18:01:00,000 [ERROR] retro: error line\n")
+        with open(os.path.join(folder, "crash_log.txt"), "w", encoding="utf-8") as handle:
+            handle.write("crash one\ncrash two\ncrash three\n")
+        report_ns["_write_tester_report"]("start")
+        report_path = os.path.join(folder, "tester_report.txt")
+        check(os.path.exists(report_path) and not os.path.exists(report_path + ".tmp"), "the report is written whole, with no temporary file left")
+        text = open(report_path, encoding="utf-8").read() if os.path.exists(report_path) else ""
+        check("RETRO TV TESTER REPORT" in text and "2026-10-16T19:00:00 (start)" in text, "the report starts with its title and when and why it was written")
+        check("OS=TestOS | CPU cores=8" in text and "previous run ended uncleanly: yes" in text, "the report carries the PC facts and the unclean-exit finding")
+        check("python: " in text and "script: " in text and "last modified " in text, "the report names the Python version and when the script was last modified")
+        check("crash three" in text and "crash one" not in text, "only the last crash file lines are kept, up to the line limit")
+        check("=== crash_log_previous.txt" in text and "(none)" in text, "a missing crash file says (none)")
+        check("an empty or missing crash file means the app did not crash" in text, "the report says plainly that an empty or missing crash file means no crash")
+        check("info line" not in text, "plain info lines are left out")
+        check("warn line 9" in text and "warn line 8" in text and "error line" in text and "warn line 7" not in text,
+              "only the latest warning and error lines are kept, up to the line limit")
+        check(not reported, "a good report logs no failure of its own")
+        report_ns["_log_output_dir"] = lambda: os.path.join(folder, "missing", "deeper")
+        report_ns["_write_tester_report"]("again")
+        check(len(reported) == 1 and "tester_report" in reported[0][0], "a report that cannot be written logs one failure line instead of raising")
+    check(report_ns["_write_tester_report"]("again") is False, "a report that cannot be written returns False")
+    with tempfile.TemporaryDirectory() as folder2:
+        report_ns["_log_output_dir"] = lambda: folder2
+        check(report_ns["_write_tester_report"]("ok") is True, "a report that was written returns True")
+    check_tester_report_button_removed()
+    start_calls = MAIN_SRC.count('_write_tester_report("start")')
+    check(start_calls == 1 and "_check_previous_run_exit()\n    _write_tester_report(\"start\")" in MAIN_SRC, "the report is written at every start, right after the unclean-exit check")
+    exit_src = get_function_source("_hard_exit_process")
+    check("_flush_app_log()" in exit_src and '_write_tester_report("exit code %s" % code)' in exit_src
+          and exit_src.index("_flush_app_log()") < exit_src.index("_write_tester_report("),
+          "the report is written on every exit, after the log queue is flushed")
+
+
+class TestFailurePointText(_SectionCase):
+    """Every caught failure writes its own error text, and the tester report gathers them with the crash files and PC facts"""
+
+    def test_failure_point_text(self):
+        self.run_section(suite_failure_point_text)
+
+
+# ============================================================================
+# SECTION: Failure-point error text (game_deck.py)
+# ============================================================================
+
+
+def suite_failure_point_text_game_deck():
+    converted_handler_checks("game_deck.py", 35)
+    path = os.path.join(ROOT, "game_deck.py")
+    module = load_deck_module(path, "game_deck_failure_text")
+    check(module._log_swallowed is gov.log_swallowed, "game_deck uses the one shared helper from performance_governor.py")
+    check(module.log.propagate and not module.log.handlers, "game_deck lines go through the root logger, so they reach app_log.txt with every other line")
+    lines = []
+    saved_log = gov.log
+    gov._swallowed_failure_counts.clear()
+    gov.log = types.SimpleNamespace(warning=lambda msg, *a: lines.append(msg % a))
+    try:
+        def raised():
+            try:
+                raise ValueError("pad read failed")
+            except Exception as error:
+                return error
+        module._log_swallowed("reading pads: _try_xinput_read_all()", raised())
+        check(len(lines) == 1 and "[FAILURE] reading pads: _try_xinput_read_all(): ValueError: pad read failed" in lines[0] and "test_suite.py:" in lines[0],
+              "a game_deck failure writes one line with where, the error type, the error text and the source line")
+    finally:
+        gov.log = saved_log
+        gov._swallowed_failure_counts.clear()
+
+
+class TestFailurePointTextGameDeck(_SectionCase):
+    """Every caught failure in game_deck.py writes its own error text into app_log.txt"""
+
+    def test_failure_point_text_game_deck(self):
+        self.run_section(suite_failure_point_text_game_deck)
+
+
+# ============================================================================
+# SECTION: Failure-point error text (media.py, performance_governor.py, ui.py, libretro_core.py)
+# ============================================================================
+
+
+def suite_failure_point_text_other_scripts():
+    for name, expected in (("media.py", 28), ("performance_governor.py", 8), ("ui.py", 5), ("libretro_core.py", 3), ("media_library.py", 23)):
+        converted_handler_checks(name, expected)
+    check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
+
+
+class TestFailurePointTextOtherScripts(_SectionCase):
+    """The remaining scripts write their own error text through the shared helper"""
+
+    def test_failure_point_text_other_scripts(self):
+        self.run_section(suite_failure_point_text_other_scripts)
+
+
+def suite_schedule_mode_commit_hold():
+    class _Clock:
+        def __init__(self):
+            self.t = 1000
+
+        def get_ticks(self):
+            return self.t
+
+    class _Pg:
+        pass
+
+    clock = _Clock()
+    pg = _Pg()
+    pg.time = clock
+    state = {"selected_channel_row": "05", "menu_layer": "CHANNEL_SUB_MENU", "sub_menu_row_index": 3, "sub_menu_col_index": 1}
+    applied = []
+    saved = []
+
+    class _Log:
+        def exception(self, *a, **k):
+            applied.append(("logged", a))
+
+    channels = {"05": {"scheduling_mode": "random_slots"}, "06": {"scheduling_mode": "one_slot"}}
+
+    class _Db:
+        channels_db = channels
+
+        def save_settings(self):
+            saved.append(1)
+
+    def fake_apply(ch_info, new_mode, ch):
+        applied.append((ch, new_mode))
+        ch_info["scheduling_mode"] = new_mode
+
+    ns = {"pygame": pg, "app_state": state, "menu_nav": mn, "db": _Db(), "log": _Log(),
+          "_SCHEDULE_MODE_COMMIT_HOLD_MS": gov.SCHEDULE_MODE_COMMIT_HOLD_MS,
+          "_apply_scheduling_mode_change": fake_apply}
+    request = load_function("_request_scheduling_mode", ns)
+    commit = load_function("_commit_requested_scheduling_modes", ns)
+    ch = channels["05"]
+
+    check(gov.SCHEDULE_MODE_COMMIT_HOLD_MS == 5000, "the one wait before a picked mode is committed and the next block rebuilt is 5000 milliseconds in the governor table")
+    check("_SCHEDULE_MODE_COMMIT_HOLD_MS = performance_governor.SCHEDULE_MODE_COMMIT_HOLD_MS if performance_governor is not None else 5000" in MAIN_SRC,
+          "the main script reads the hold from the governor table and its fallback matches")
+
+    request(ch, "one_slot", "05")
+    check(ch["scheduling_mode"] == "random_slots" and not applied and not saved, "a press records only a pick: the real mode is unchanged and nothing is saved or switched")
+    check(mn.shown_scheduling_mode(ch) == "one_slot", "the menu shows the pick at once")
+    commit()
+    check(not applied and ch["scheduling_mode"] == "random_slots", "a pick younger than the hold is not committed")
+
+    clock.t += 3000
+    request(ch, "two_slots", "05")
+    clock.t += 3000
+    commit()
+    check(not applied, "a second press restarts the wait, so 6 seconds after the first press still commits nothing")
+    clock.t += 2500
+    commit()
+    check(applied == [("05", "two_slots")], "the last pick is committed once, after it held; the pick in between is never committed")
+    check("_sched_mode_request" not in ch and mn.shown_scheduling_mode(ch) == "two_slots", "the pick is cleared once committed and the menu then shows the real mode")
+    commit()
+    check(applied == [("05", "two_slots")], "a second poll commits nothing more")
+
+    applied.clear()
+    ch["scheduling_mode"] = "random_slots"
+    request(ch, "one_slot", "05")
+    clock.t += 100
+    request(ch, "two_slots", "05")
+    clock.t += 100
+    request(ch, "marathon", "05")
+    clock.t += 100
+    request(ch, "random_slots", "05")
+    check("_sched_mode_request" not in ch, "ending back on the starting mode removes the pick")
+    clock.t += 6000
+    commit()
+    check(not applied, "ending back on the starting mode commits nothing")
+
+    state["sub_menu_row_index"] = 3
+    state["sub_menu_col_index"] = 1
+    request(ch, "two_slots", "05")
+    check((state["sub_menu_row_index"], state["sub_menu_col_index"]) == (3, 1), "a pick that does not cross marathon leaves the menu cursor alone")
+    request(ch, "marathon", "05")
+    check((state["sub_menu_row_index"], state["sub_menu_col_index"]) == (1, 0), "a pick into marathon puts the menu cursor on the Schedule row, as the switch did before")
+    state["sub_menu_row_index"] = 3
+    state["sub_menu_col_index"] = 1
+    state["selected_channel_row"] = "06"
+    request(ch, "random_slots", "05")
+    check((state["sub_menu_row_index"], state["sub_menu_col_index"]) == (3, 1), "the cursor is only moved on the channel whose menu is open")
+    state["selected_channel_row"] = "05"
+
+    channels["06"]["_sched_mode_request"] = {"to": "marathon", "since": clock.t - 10}
+    channels["05"]["_sched_mode_request"] = {"to": "one_slot", "since": clock.t - 10}
+    clock.t += 6000
+    applied.clear()
+    commit()
+    check(sorted(applied) == [("05", "one_slot"), ("06", "marathon")], "every channel commits its own pick")
+
+    layout_random = mn.channel_sub_layout({"scheduling_mode": "random_slots"}, 2)
+    layout_pick = mn.channel_sub_layout({"scheduling_mode": "random_slots", "_sched_mode_request": {"to": "marathon", "since": 0}}, 2)
+    check(layout_random[2] is False and layout_pick[2] is True, "the menu's row layout follows the pick, so the cursor rows match what is drawn")
+
+    runtime = {"05": {"scheduling_mode": "one_slot", "_sched_mode_request": {"to": "marathon", "since": 5}}, "06": {"a": 1}}
+    copied = media.without_runtime_channel_keys(__import__("copy").deepcopy(runtime))
+    check("_sched_mode_request" not in copied["05"] and "_sched_mode_request" in runtime["05"], "a saved copy never carries the pick and the live channel keeps it")
+    with open(media.__file__.replace(".pyc", ".py"), encoding="utf-8") as media_file:
+        media_text = media_file.read()
+    check("return without_runtime_channel_keys(copy.deepcopy(source))" in media_text, "the channels snapshot that is written to disk is stripped")
+
+    press = MAIN_SRC[MAIN_SRC.index('_SM = ["random_slots", "one_slot", "two_slots", "marathon"]'):][:700]
+    check("_request_scheduling_mode(ch_info" in press and "_apply_scheduling_mode_change(" not in press, "the Schedule row press only records a pick")
+    check(MAIN_SRC.count("_apply_scheduling_mode_change(ch_info") == 2 and "def _apply_scheduling_mode_change(ch_info" in MAIN_SRC and "_apply_scheduling_mode_change(ch_info, pending" in MAIN_SRC,
+          "the only caller that switches the mode is the commit step")
+    check("_sweep_all_recovered_dead_drives()\n    _commit_requested_scheduling_modes()" in MAIN_SRC, "the main loop checks for picks that have held, every frame")
+    apply_src = get_function_source("_apply_scheduling_mode_change")
+    check('ch_info["_sched_debounce_pending_since"] = pygame.time.get_ticks() - _SCHEDULE_MODE_COMMIT_HOLD_MS' in apply_src,
+          "the commit marks the wait as already served, so the rebuild is not made to wait a second time")
+    check(MAIN_SRC.count("- _pending >= _SCHEDULE_MODE_COMMIT_HOLD_MS") == 1 and MAIN_SRC.count("- _pending_since >= _SCHEDULE_MODE_COMMIT_HOLD_MS") == 1,
+          "both rebuild checks read the same wait from the governor table")
+    check("sub_menu_row_index" not in apply_src and "db.save_settings()" in apply_src, "the commit no longer moves the menu cursor and still saves")
+
+
+class TestScheduleModeCommitHold(_SectionCase):
+    """A Schedule row press only changes the picked mode; the channel switches and the next block rebuilds after the pick has held for 5 seconds"""
+
+    def test_schedule_mode_commit_hold(self):
+        self.run_section(suite_schedule_mode_commit_hold)
+
+
+def suite_schedule_rebuild_in_flight():
+    import broadcast_clock as _bc
+    import copy as _copy
+    import functools as _functools
+    import threading as _threading
+
+    start = MAIN_SRC.index("# SECTION: Schedule rebuild in-flight guard")
+    start = MAIN_SRC.rfind("# ====", 0, start)
+    end = MAIN_SRC.index("def _apply_scheduling_mode_change(ch_info, new_mode, target_ch_str):")
+    guard_ns = {"threading": _threading, "functools": _functools}
+    exec(compile(MAIN_SRC[start:end], "<extracted:in-flight guard>", "exec"), guard_ns)
+    guard = guard_ns["_sched_rebuild_guard"]
+    running = guard_ns["_sched_rebuild_is_running"]
+    gate = guard_ns["_sched_rebuild_gate"]
+    counts = guard_ns["_sched_rebuild_running"]
+    generations = guard_ns["_sched_mode_generation"]
+
+    check(gov.SCHEDULE_MODE_STOP_POINTS_KEPT == 3, "the number of stopping points kept per channel is 3 in the governor table")
+    check("_SCHEDULE_MODE_STOP_POINTS_KEPT = performance_governor.SCHEDULE_MODE_STOP_POINTS_KEPT if performance_governor is not None else 3" in MAIN_SRC,
+          "the main script reads the number from the governor table and its fallback matches")
+    check("@_sched_rebuild_guard\ndef calculate_slotted_playback_state(" in MAIN_SRC, "the scheduler entry point runs inside the in-flight guard")
+    check(MAIN_SRC.count("@_sched_rebuild_guard") == 1, "only the scheduler entry point is guarded")
+
+    seen = []
+
+    @guard
+    def fake_scheduler(channel_id, snap=False):
+        seen.append(running(str(channel_id).zfill(2)))
+        return "state-" + str(channel_id)
+
+    check(fake_scheduler(5) == "state-5" and fake_scheduler("05", snap=True) == "state-05", "the guard passes the arguments and the answer through")
+    check(seen == [True, True] and not running("05") and not counts, "a channel counts as running inside its scheduler call and not after it, for a number or a padded name")
+    check(fake_scheduler.__name__ == "fake_scheduler", "the guard keeps the function's name")
+
+    @guard
+    def failing_scheduler(channel_id):
+        raise ValueError("boom")
+
+    try:
+        failing_scheduler("06")
+        failed = False
+    except ValueError:
+        failed = True
+    check(failed and not running("06") and not counts, "a scheduler call that fails still releases the channel")
+
+    @guard
+    def nested_scheduler(channel_id):
+        inner = []
+        inner.append(running("07"))
+        fake_scheduler("07")
+        inner.append(running("07"))
+        return inner
+
+    check(nested_scheduler("07") == [True, True] and not running("07"), "a call inside a call of the same channel keeps the channel running until the outer call ends")
+
+    inside_other = []
+
+    @guard
+    def other_channel(channel_id):
+        inside_other.append((running("08"), running("09")))
+
+    other_channel("08")
+    check(inside_other == [(True, False)], "a running call marks only its own channel")
+
+    log_lines = []
+
+    class _Log:
+        def info(self, *a, **k):
+            log_lines.append(a)
+
+        def exception(self, *a, **k):
+            log_lines.append(("exception",) + a)
+
+    saved = []
+
+    class _Db:
+        def save_settings(self):
+            saved.append(1)
+
+    class _Clock2:
+        t = 1000
+
+        def get_ticks(self):
+            return self.t
+
+    class _Pg:
+        time = _Clock2()
+
+    changes = []
+    app_state = {"current_channel": "09", "is_playing_video": False}
+
+    def reset_marathon(ch_info):
+        changes.append(("reset_marathon",))
+
+    def change_channel(ch, **kw):
+        changes.append(("change_channel", ch))
+
+    ns = {
+        "pygame": _Pg(), "app_state": app_state, "db": _Db(), "log": _Log(), "copy": _copy, "os": os,
+        "broadcast_clock": _bc, "vlc_engine": None,
+        "_SCHEDULE_MODE_COMMIT_HOLD_MS": gov.SCHEDULE_MODE_COMMIT_HOLD_MS,
+        "_SCHEDULE_MODE_STOP_POINTS_KEPT": gov.SCHEDULE_MODE_STOP_POINTS_KEPT,
+        "_reset_marathon_anchor": reset_marathon, "change_channel": change_channel,
+        "calculate_slotted_playback_state": lambda ch: {"mode": "Static"},
+        "_sched_rebuild_gate": gate, "_sched_rebuild_running": counts, "_sched_mode_generation": generations,
+        "_sched_rebuild_is_running": running,
+    }
+    apply = load_function("_apply_scheduling_mode_change", ns)
+
+    ch = {"scheduling_mode": "random_slots", "playback_log": {"show_pos": {"Show A": 3, "Show B": 7}}}
+    release = _threading.Event()
+    entered = _threading.Event()
+
+    @guard
+    def slow_rebuild(channel_id):
+        entered.set()
+        release.wait(5)
+
+    worker = _threading.Thread(target=slow_rebuild, args=("05",))
+    worker.start()
+    check(entered.wait(5) and running("05"), "a rebuild running on another thread marks the channel as running")
+    result = apply(ch, "one_slot", "05")
+    check(result is False, "the switch reports that it has to wait while a rebuild of the channel is running")
+    check(ch["scheduling_mode"] == "random_slots" and "mode_stop_points" not in ch["playback_log"] and not saved and not generations,
+          "a switch that waits changes nothing: the mode, the stopping points, the saved settings and the generation are untouched")
+    other_ch = {"scheduling_mode": "random_slots", "playback_log": {}}
+    check(apply(other_ch, "two_slots", "06") is True and other_ch["scheduling_mode"] == "two_slots",
+          "a rebuild on one channel does not hold up the switch of another channel")
+    release.set()
+    worker.join(5)
+    check(not running("05"), "the channel is free again once the rebuild ends")
+
+    app_state["current_channel"] = "05"
+    app_state["is_playing_video"] = True
+    ch["playback_anchor"] = {"file": "C:\\videos\\CH 05\\Show A\\S01E04.mkv", "seek_offset": 120.0, "duration": 1320, "mode": "Video", "block": "Morning"}
+    saved.clear()
+    log_lines.clear()
+    result = apply(ch, "one_slot", "05")
+    check(result is True and ch["scheduling_mode"] == "one_slot", "once no rebuild is running the switch is made and reports done")
+    check(generations.get("05") == 1, "the channel's mode generation goes up by one at the commit")
+    points = ch["playback_log"].get("mode_stop_points")
+    check(isinstance(points, list) and len(points) == 1, "one stopping point is written at the commit")
+    point = points[0]
+    check(point["from_mode"] == "random_slots" and point["to_mode"] == "one_slot" and point["generation"] == 1, "the stopping point names the old mode, the new mode and the generation")
+    check(point["file"].endswith("S01E04.mkv"), "the stopping point holds the file that was playing")
+    check(isinstance(point["clock"], str) and "T" in point["clock"], "the stopping point holds the clock moment")
+    check(point["show_pos"] == {"Show A": 3, "Show B": 7}, "the stopping point holds the show positions")
+    ch["playback_log"]["show_pos"]["Show A"] = 99
+    check(point["show_pos"]["Show A"] == 3, "the stopping point holds a copy of the show positions, not the live ones")
+    check(saved == [1], "the switch is saved once")
+    check(any("[MODE SWITCH]" in str(a[0]) and "committed" in str(a[0]) for a in log_lines), "the commit writes a [MODE SWITCH] line")
+    check(ch.get("_sched_debounce_pending_since") == _Pg.time.get_ticks() - gov.SCHEDULE_MODE_COMMIT_HOLD_MS, "the rebuild of the tail is still marked as already waited for")
+    check(not [c for c in changes if c[0] == "change_channel"], "a switch that does not cross marathon does not re-tune")
+
+    for new_mode in ("two_slots", "random_slots", "one_slot", "two_slots"):
+        apply(ch, new_mode, "05")
+    points = ch["playback_log"]["mode_stop_points"]
+    check(len(points) == gov.SCHEDULE_MODE_STOP_POINTS_KEPT == 3, "only the newest 3 stopping points are kept per channel")
+    check([p["generation"] for p in points] == [3, 4, 5] and points[-1]["to_mode"] == "two_slots", "the kept stopping points are the newest ones, oldest first")
+    check(generations.get("06") == 1 and generations.get("05") == 5, "each channel counts its own generations")
+
+    changes.clear()
+    apply(ch, "marathon", "05")
+    check(("reset_marathon",) in changes and ("change_channel", "05") in changes, "crossing into marathon still resets the marathon and re-tunes a playing channel")
+    check(ch["playback_anchor"] == {} and ch.get("_sched_debounce_pending_since") is None, "crossing the marathon boundary still clears the anchor and the rebuild wait")
+
+    apply_src = get_function_source("_apply_scheduling_mode_change")
+    check(MAIN_SRC.count('ch_info["scheduling_mode"] = new_mode') == 1, "the committed mode is written in one place only")
+    check(apply_src.index("with _sched_rebuild_gate:") < apply_src.index('ch_info["scheduling_mode"] = new_mode'),
+          "the mode is written inside the gate that the rebuild counter uses, so a rebuild cannot start between the check and the write")
+    check(apply_src.index("_sched_rebuild_is_running(target_ch_str)") < apply_src.index("_live_now = None"),
+          "a switch that has to wait does no work before it waits")
+
+    clock = _Clock2()
+    pg = _Pg()
+    pg.time = clock
+    state = {"selected_channel_row": "05", "menu_layer": "CHANNEL_SUB_MENU"}
+    channels = {"05": {"scheduling_mode": "random_slots"}}
+    answers = [False, False, True]
+    calls = []
+
+    def fake_apply(ch_info, new_mode, target):
+        calls.append((target, new_mode))
+        answer = answers.pop(0) if answers else None
+        if answer is True:
+            ch_info["scheduling_mode"] = new_mode
+        return answer
+
+    class _Db2:
+        channels_db = channels
+
+    commit_ns = {"pygame": pg, "app_state": state, "db": _Db2(), "log": _Log(),
+                 "_SCHEDULE_MODE_COMMIT_HOLD_MS": gov.SCHEDULE_MODE_COMMIT_HOLD_MS,
+                 "_apply_scheduling_mode_change": fake_apply}
+    request = load_function("_request_scheduling_mode", dict(commit_ns, menu_nav=mn))
+    commit = load_function("_commit_requested_scheduling_modes", commit_ns)
+    request(channels["05"], "one_slot", "05")
+    clock.t += 6000
+    log_lines.clear()
+    commit()
+    check(calls == [("05", "one_slot")] and channels["05"].get("_sched_mode_request", {}).get("to") == "one_slot" and channels["05"]["scheduling_mode"] == "random_slots",
+          "a switch that has to wait keeps the pick and does not change the mode")
+    commit()
+    check(len(calls) == 2 and "_sched_mode_request" in channels["05"], "the commit tries again on the next frame")
+    deferred_lines = [a for a in log_lines if "waits" in str(a[0])]
+    check(len(deferred_lines) == 1, "the wait is written to the log once, not every frame")
+    commit()
+    check(len(calls) == 3 and channels["05"]["scheduling_mode"] == "one_slot" and "_sched_mode_request" not in channels["05"],
+          "the switch is made as soon as the rebuild is over and the pick is cleared")
+    commit()
+    check(len(calls) == 3, "a finished pick is not committed again")
+
+    channels["05"]["scheduling_mode"] = "random_slots"
+    answers[:] = [False]
+    calls.clear()
+    request(channels["05"], "one_slot", "05")
+    clock.t += 6000
+    commit()
+    clock.t += 1000
+    request(channels["05"], "two_slots", "05")
+    answers[:] = [True]
+    commit()
+    check(len(calls) == 1, "a new press while a switch is waiting restarts the hold, so nothing is committed on the old pick")
+    clock.t += 6000
+    commit()
+    check(calls[-1] == ("05", "two_slots") and channels["05"]["scheduling_mode"] == "two_slots", "the newest pick is the one committed")
+
+    channels["05"]["scheduling_mode"] = "random_slots"
+    channels["05"]["_sched_mode_request"] = {"to": "one_slot", "since": clock.t - 6000}
+
+    def raising_apply(ch_info, new_mode, target):
+        raise RuntimeError("apply failed")
+
+    commit_ns["_apply_scheduling_mode_change"] = raising_apply
+    commit_fail = load_function("_commit_requested_scheduling_modes", commit_ns)
+    log_lines.clear()
+    commit_fail()
+    check("_sched_mode_request" not in channels["05"] and any(a and a[0] == "exception" for a in log_lines),
+          "a switch that fails is logged and its pick is dropped, as before")
+
+
+class TestScheduleRebuildInFlight(_SectionCase):
+    """A picked scheduling mode is only switched while no scheduler call of that channel is running, and each switch records its stopping point"""
+
+    def test_schedule_rebuild_in_flight(self):
+        self.run_section(suite_schedule_rebuild_in_flight)
+
+
+# ============================================================================
+# SECTION: Leftover short episodes air in pairs of exactly 2
+# ============================================================================
+
+def suite_leftover_pairs_of_two():
+    import random as _rnd
+
+    def show(n, shorts, name="Real Monsters"):
+        return [{"path": "/m/tv/%s/%s S01E%02d.mkv" % (name, name, i + 1), "duration": 660 if i in shorts else 1500} for i in range(n)]
+
+    def stream(eps, thr, chunk, total):
+        state, out = {"next": None, "owed": []}, []
+        while len(out) < total:
+            got, state = media.take_sequential_entries(eps, state, chunk(), thr)
+            if not got:
+                break
+            out.extend(got)
+        return out[:total]
+
+    check(media.SHORT_EPISODE_PAIRING_VERSION == 4, "the pairing rule version is 4, so lineups saved under the one-bundle rule are rebuilt")
+    old_record = media.lineup_groups(media.pair_short_episodes(show(4, {0, 1}), 900), 900)
+    old_record["pairing_rule_version"] = 3
+    check(media._matching_lineup_groups(old_record, list(dict.fromkeys(media.lineup_paths(media.pair_short_episodes(show(4, {0, 1}), 900)))), 900) is None,
+          "groups saved under pairing rule 3 are ignored")
+
+    bad_bundle = bad_big = bad_single = bad_chunk = bad_fair = bad_once = 0
+    for seed in range(600):
+        rng = _rnd.Random(seed)
+        n = rng.randint(1, 14)
+        shorts = {i for i in range(n) if rng.random() < rng.choice([0.1, 0.5, 0.9, 1.0])}
+        eps = show(n, shorts)
+        total = 8 * n + 5
+        a = stream(eps, 900, lambda: 1, total)
+        b = stream(eps, 900, lambda: rng.randint(1, 5), total)
+        bad_chunk += [media.lineup_paths([e]) for e in a] != [media.lineup_paths([e]) for e in b]
+        for e in a:
+            files = media.lineup_paths([e])
+            bad_bundle += bool(e.get("is_bundle"))
+            bad_big += len(files) > 2
+            bad_single += (len(files) == 1 and n >= 2 and e["duration"] < 900)
+        counts = collections.Counter(p for e in a for p in media.lineup_paths([e]))
+        bad_once += len(counts) != n
+        if counts:
+            bad_fair += (max(counts.values()) - min(counts.values())) > 2
+    check(bad_bundle == 0, "sequential order never builds a leftover bundle (%d)" % bad_bundle)
+    check(bad_big == 0, "every combined entry holds exactly 2 episodes, never 3 or more (%d)" % bad_big)
+    check(bad_single == 0, "with pairing on, a short episode never airs alone (%d)" % bad_single)
+    check(bad_chunk == 0, "taking the slots one at a time or several at once gives the same order (%d)" % bad_chunk)
+    check(bad_once == 0 and bad_fair == 0, "every episode of the show airs, about equally often (%d missing, %d unfair)" % (bad_once, bad_fair))
+
+    names = [[os.path.basename(p)[-7:-4] for p in media.lineup_paths([e])] for e in stream(show(6, {0, 2, 4, 5}), 900, lambda: 1, 4)]
+    check(["E05", "E06"] in names and ["E01", "E03"] in names, "neighbouring shorts pair, and the two shorts left without a neighbour are combined in one cell of 2 (%s)" % names)
+
+    odd_leftovers = show(7, {0, 2, 4})
+    first_pass = stream(odd_leftovers, 900, lambda: 1, 6)
+    check(all(len(media.lineup_paths([e])) == 2 for e in first_pass if e["duration"] < 1000), "three leftover short episodes make one pair and one that waits for the next pass's first episode")
+    held = [e for e in first_pass if e.get("leftover_partner_path")]
+    check(held and held[0]["pair_ep1"]["duration"] < 900, "the odd leftover is the first file of a pair with the next pass's first episode (%d)" % len(held))
+
+    lone = stream(show(5, {2}), 900, lambda: 1, 8)
+    check(not any(len(media.lineup_paths([e])) == 1 and e["duration"] < 900 for e in lone), "a lone short episode among long ones is paired with an extra episode, never aired alone")
+
+    check([media.lineup_paths([e]) for e in media.take_sequential_entries(show(3, {0, 1, 2}), {"next": None, "owed": []}, 3, 0)[0]]
+          == [[show(3, {0, 1, 2})[i]["path"]] for i in range(3)], "with pairing off (0 minutes) every episode airs as a single")
+    check(not any(e.get("is_pair") for e in media.pair_short_episodes(show(4, {0, 1}), 0)), "with pairing off nothing is paired")
+
+    stateless_bad = 0
+    for seed in range(300):
+        rng = _rnd.Random(seed)
+        n = rng.randint(1, 12)
+        eps = show(n, {i for i in range(n) if rng.random() < 0.6})
+        entries = media.pair_short_episodes(eps, 900)
+        flat = [p for e in entries for p in media.lineup_paths([e])]
+        stateless_bad += (any(e.get("is_bundle") for e in entries) or any(len(media.lineup_paths([e])) > 2 for e in entries)
+                          or sorted(flat) != sorted(e["path"] for e in eps))
+    check(stateless_bad == 0, "the entry list used by random order has no bundle, no entry above 2 episodes, and holds every file once (%d)" % stateless_bad)
+
+    pos = media.take_sequential_entries(show(5, {0, 1, 2, 3, 4}), {"next": None, "owed": []}, 2, 900)[1]
+    resumed = media.take_sequential_entries(show(5, {0, 1, 2, 3, 4}), dict(pos), 2, 900)[0]
+    check(len(resumed) == 2, "a saved position resumes where it stopped")
+    check(media.take_sequential_entries(show(3, {1}), {"next": None, "owed": [show(3, {1})[1]["path"]]}, 1, 900)[0] != [],
+          "an old saved position without the done count is still read")
+
+    entries = media.pair_short_episodes(show(8, {0, 2, 4, 6}), 900)
+    leftover_pairs = [e for e in entries if e.get("leftover_pair")]
+    check(len(leftover_pairs) == 2 and all(len(media.lineup_paths([e])) == 2 for e in leftover_pairs), "four leftover short episodes make two combined cells of exactly 2")
+    state = media.sequential_state_from_entry_index(show(8, {0, 2, 4, 6}), entries, entries.index(leftover_pairs[1]))
+    check(state["next"] is None and state.get("done") == 2 and len(state["owed"]) == 4, "the saved position of the second leftover pair says the first has aired")
+
+    e1 = {"path": "/m/tv/Ahh Real Monsters/Ahh Real Monsters S01E01 Fire Drill.mkv", "duration": 660}
+    e2 = {"path": "/m/tv/Ahh Real Monsters/Ahh Real Monsters S01E02 Monster Love.mkv", "duration": 660}
+    title = media.guide_pair_title(media._build_pair_track(e1, e2))
+    check(" + " in title and "Fire Drill" in title and "Monster Love" in title, "a combined guide cell names both episodes (%s)" % title)
+    e3 = {"path": "/m/tv/Real Monsters/Real Monsters S01E03.mkv", "duration": 660}
+    e4 = {"path": "/m/tv/Real Monsters/Real Monsters S01E04.mkv", "duration": 660}
+    same = media.guide_pair_title(media._build_pair_track(e3, e4))
+    check(" + " in same and "E03" in same and "E04" in same, "two episodes with the same name are told apart by episode number, not shown as one name (%s)" % same)
+    ui_src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+    check("media.guide_pair_title(show)" in ui_src, "the guide draws a combined cell through the shared title helper")
+
+    channel = {"scheduling_mode": "random_slots", "pair_threshold_minutes": 15, "episode_order_mode": "sequential"}
+    for order_mode in ("sequential", "random"):
+        channel["episode_order_mode"] = order_mode
+        raw = show(9, {0, 1, 3, 5, 6, 8})
+        positions = {}
+        wrong = 0
+        for block in range(30):
+            lineup, positions, _ = media.build_block_rotation(raw, channel, positions, 3000 + block, 28800, "05", None, 7)
+            wrong += sum(1 for t in lineup if t.get("is_bundle") or len(media.lineup_paths([t])) > 2)
+        check(wrong == 0, "%s blocks: no bundle and no cell above 2 episodes in 30 blocks (%d)" % (order_mode, wrong))
+
+
+class TestLeftoverPairsOfTwo(_SectionCase):
+    """Leftover short episodes air in combined cells of exactly 2 episodes; an odd one pairs with the next pass's first episode and a short episode never airs alone while pairing is on"""
+
+    def test_leftover_pairs_of_two(self):
+        self.run_section(suite_leftover_pairs_of_two)
+
+
+# ============================================================================
+# SECTION: Controller answers the DVD quit and back-to-menu confirms
+# ============================================================================
+
+def suite_dvd_confirm_controller():
+    main_src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+    deck_src = open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read()
+    sync = main_src[main_src.index("dvd_in_menu=bool(game_deck is not None"):][:420]
+    check('"dvd_exit_confirm"' in sync and '"dvd_return_menu_confirm"' in sync,
+          "the controller nav state counts an open DVD Yes / No confirm as a menu, so left and right are not rewind and fast-forward")
+    worker = deck_src[deck_src.index("def _xi_nav_worker"):deck_src.index("threading.Thread(target=_xi_nav_worker")]
+    check('and not _xi_nav_state.get("dvd_in_menu", False):\n            _xi_nav_state["dvd_left_held"]' in worker,
+          "a held left or right does not seek while a DVD confirm is open")
+    check('getattr(self, "dvd_exit_confirm", False)' in deck_src and 'getattr(self, "dvd_return_menu_confirm", False)' in deck_src,
+          "the held-skip poll does nothing while a DVD confirm is open")
+    check(menu_nav.deck_confirm_choice(menu_nav.LEFT) == "Yes" and menu_nav.deck_confirm_choice(menu_nav.RIGHT) == "No",
+          "left answers Yes and right answers No on the DVD confirm")
+
+
+class TestDvdConfirmController(_SectionCase):
+    """A controller's left, right and accept answer the DVD quit and back-to-menu confirms"""
+
+    def test_dvd_confirm_controller(self):
+        self.run_section(suite_dvd_confirm_controller)
+
+
+
+# ============================================================================
+# SECTION: A drive that is only waking up is not a failed drive (Q3)
+# ============================================================================
+class TestFailedDriveWaitsBeforeFailing(unittest.TestCase):
+    def setUp(self):
+        import media as _m
+        self.m = _m
+        self._saved = dict(_m._drive_health)
+        _m._drive_health.clear()
+
+    def tearDown(self):
+        self.m._drive_health.clear()
+        self.m._drive_health.update(self._saved)
+
+    def _put(self, root, responsive, since_ago_ms):
+        now = self.m._now_ms()
+        self.m._drive_health[root] = {"responsive": responsive, "checked_at": now, "checking_since": None,
+                                      "unresponsive_since": None if responsive else now - since_ago_ms}
+
+    def test_a_drive_just_marked_unresponsive_is_not_failed_yet(self):
+        self._put("X:\\", False, 500)
+        self.assertEqual(self.m._unresponsive_drive_roots(), ["X:\\"])
+        self.assertEqual(self.m._failed_drive_roots(), [])
+
+    def test_a_drive_unresponsive_long_enough_is_failed(self):
+        self._put("X:\\", False, self.m._DRIVE_FAILED_AFTER_MS + 100)
+        self.assertEqual(self.m._failed_drive_roots(), ["X:\\"])
+
+    def test_a_responsive_drive_is_never_failed(self):
+        self._put("X:\\", True, 0)
+        self.assertEqual(self.m._failed_drive_roots(), [])
+
+    def test_the_wait_is_in_the_governor_table(self):
+        import performance_governor as g
+        self.assertEqual(self.m._DRIVE_FAILED_AFTER_MS, g.DRIVE_FAILED_AFTER_MS)
+
+    def test_probe_worker_keeps_the_time_the_drive_first_went_unresponsive(self):
+        root = "Q:\\"
+        now = self.m._now_ms()
+        self.m._drive_health[root] = {"responsive": False, "checked_at": now, "checking_since": now, "unresponsive_since": now - 4000}
+        orig = self.m.os.path.exists
+        self.m.os.path.exists = lambda p: False
+        try:
+            self.m._drive_probe_worker(root)
+        finally:
+            self.m.os.path.exists = orig
+        self.assertLessEqual(self.m._drive_health[root]["unresponsive_since"], now - 4000)
+        self.m.os.path.exists = lambda p: True
+        try:
+            self.m._drive_probe_worker(root)
+        finally:
+            self.m.os.path.exists = orig
+        self.assertIsNone(self.m._drive_health[root]["unresponsive_since"])
+
+    def test_the_list_screen_leaves_only_drives_that_are_failed(self):
+        src = open(MAIN_SCRIPT, encoding="utf-8").read()
+        self.assertIn("leave_list_of_failed_drive(set(_failed_drive_roots()))", src)
+        self.assertNotIn("leave_list_of_failed_drive(set(_unresponsive_drive_roots()))", src)
+
+
+# ============================================================================
+# SECTION: Media added mid-schedule joins the rotation (Q2 requirement)
+# ============================================================================
+class TestAddedMediaJoinsRotation(unittest.TestCase):
+    def _ep(self, n, show="Zed Show"):
+        return {"path": "C:/v/CH 05/%s/Season 1/%s - S01E%02d.mp4" % (show, show, n), "duration": 1320.0,
+                "title": "%s - S01E%02d" % (show, n)}
+
+    def _run(self, order, mode, days=12, add=((4, 7), (6, 8))):
+        eps = [self._ep(i) for i in range(1, 7)]
+        pos, aired = {}, []
+        add = dict(add)
+        for day in range(1, days + 1):
+            if day in add:
+                eps.append(self._ep(add[day]))
+            tracks, pos, _ = media.build_show_rotation(
+                eps, mode, pos, "d%d" % day, pair_threshold_seconds=0, episode_order_mode=order,
+                block_duration_seconds=3600 if mode == "two_slots" else 1800, channel_id="05")
+            aired += [int(t["path"].split("E")[-1][:2]) for t in tracks if not t.get("is_commercial")]
+        return aired
+
+    def test_every_added_file_airs_in_every_mode_and_order(self):
+        for order in ("sequential", "random"):
+            for mode in ("random_slots", "one_slot", "two_slots"):
+                aired = self._run(order, mode)
+                self.assertIn(7, aired, (order, mode))
+                self.assertIn(8, aired, (order, mode))
+
+    def test_sequential_added_file_airs_in_its_place_in_the_order(self):
+        for mode in ("random_slots", "one_slot", "two_slots"):
+            aired = self._run("sequential", mode)
+            self.assertLess(aired.index(7), len(aired))
+            first7 = aired.index(7)
+            self.assertEqual(aired[first7 - 1], 6, mode)
+
+    def test_no_file_airs_twice_inside_one_short_window_in_one_slot(self):
+        for order in ("sequential", "random"):
+            aired = self._run(order, "one_slot", days=8)
+            self.assertEqual(sorted(aired), list(range(1, 9)), order)
+
+class TestHubRoundNumber(unittest.TestCase):
+    FILES = ["/tv/Zed Show/Zed Show S01E0%d.mkv" % n for n in (1, 2, 3)]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.lib = ml.MediaLibrary(os.path.join(self.tmp, "library.sqlite3"))
+        self.hub = ml.ScheduleHub(self.lib)
+
+    def tearDown(self):
+        try:
+            self.lib._conn.close()
+        except Exception as error:
+            log.warning("TestHubRoundNumber.tearDown: could not close the library: %s", error)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rows(self, order, active=None, first=0, start=1000.0):
+        active = list(active or self.FILES)
+        return [{"position": first + i, "path": p, "kind": "episode", "planned_start": start + (first + i) * 100.0, "used_length": 90.0,
+                 "length_source": "measured", "bundle": "zed show", "bundle_files": active, "row_files": [p]} for i, p in enumerate(order)]
+
+    def _passes(self, slot):
+        return [r["pass_no"] for r in self.hub.rows("05", slot)]
+
+    def _air(self, slot, count):
+        for position in range(count):
+            self.hub.mark("05", slot, position, "aired")
+
+    def test_round_is_one_trip_through_the_bundle(self):
+        a, b, c = self.FILES
+        self.hub.put_rows("05", "d1", self._rows([a, b, c, a, b, c, a]))
+        self.assertEqual(self._passes("d1"), [1, 1, 1, 2, 2, 2, 3])
+
+    def test_round_continues_across_slots_from_saved_history(self):
+        a, b, c = self.FILES
+        self.hub.put_rows("05", "d1", self._rows([a, b]))
+        self._air("d1", 2)
+        self.hub.put_rows("05", "d2", self._rows([c, a], start=5000.0))
+        self.assertEqual(self._passes("d2"), [1, 2])
+
+    def test_partner_that_airs_again_does_not_start_a_round(self):
+        a, b, c = self.FILES
+        self.hub.put_rows("05", "d1", self._rows([a, b, a, c, b]))
+        self.assertEqual(self._passes("d1"), [1, 1, 1, 1, 2])
+
+    def test_file_added_mid_round_must_air_before_the_round_ends(self):
+        a, b, c = self.FILES
+        d = "/tv/Zed Show/Zed Show S01E04.mkv"
+        self.hub.put_rows("05", "d1", self._rows([a, b, c]))
+        self._air("d1", 3)
+        self.hub.put_rows("05", "d2", self._rows([d, a], active=[a, b, c, d], start=5000.0))
+        self.assertEqual(self._passes("d2"), [1, 2])
+        self.assertEqual(self._passes("d1"), [1, 1, 1])
+
+    def test_removed_file_no_longer_holds_the_round_open(self):
+        a, b, c = self.FILES
+        self.hub.put_rows("05", "d1", self._rows([a, b]))
+        self._air("d1", 2)
+        self.hub.put_rows("05", "d2", self._rows([a], active=[a, b], start=5000.0))
+        self.assertEqual(self._passes("d2"), [2])
+
+    def test_rewriting_planned_rows_gives_the_same_rounds(self):
+        a, b, c = self.FILES
+        order = [a, b, c, a, b]
+        self.hub.put_rows("05", "d1", self._rows(order))
+        first = self._passes("d1")
+        self.hub.put_rows("05", "d1", self._rows(order))
+        self.assertEqual(self._passes("d1"), first)
+
+    def test_two_bundles_on_one_channel_count_their_own_rounds(self):
+        a, b, c = self.FILES
+        other = ["/tv/Other/Other S01E01.mkv", "/tv/Other/Other S01E02.mkv"]
+        rows = self._rows([a, b, c])
+        rows += [{"position": 3 + i, "path": p, "kind": "episode", "planned_start": 2000.0 + i, "used_length": 90.0, "length_source": "measured",
+                  "bundle": "other", "bundle_files": other, "row_files": [p]} for i, p in enumerate(other * 2)]
+        self.hub.put_rows("05", "d1", rows)
+        self.assertEqual(self._passes("d1"), [1, 1, 1, 1, 1, 2, 2])
+
+    def test_rows_without_a_bundle_keep_the_per_file_count(self):
+        rows = [{"position": 0, "path": "/m/x.mkv", "kind": "episode", "planned_start": 1.0}, {"position": 1, "path": "/m/x.mkv", "kind": "episode", "planned_start": 2.0}]
+        self.hub.put_rows("05", "d1", rows)
+        self.assertEqual(self._passes("d1"), [1, 2])
+
+    def test_a_database_without_the_new_columns_is_upgraded_and_keeps_its_rows(self):
+        old_path = os.path.join(self.tmp, "old.sqlite3")
+        import sqlite3 as _sq
+        conn = _sq.connect(old_path)
+        conn.execute("CREATE TABLE hub_schedule_row (channel TEXT NOT NULL, slot_key TEXT NOT NULL, position INTEGER NOT NULL, path_key TEXT NOT NULL, "
+                     "path TEXT NOT NULL, kind TEXT NOT NULL, pass_no INTEGER NOT NULL DEFAULT 1, planned_start REAL, used_length REAL, length_source TEXT, "
+                     "state TEXT NOT NULL DEFAULT 'planned', updated_at REAL NOT NULL, PRIMARY KEY (channel, slot_key, position))")
+        conn.execute("INSERT INTO hub_schedule_row VALUES ('05', 'd1', 0, 'k', '/m/k.mkv', 'episode', 4, 1.0, 90.0, 'measured', 'aired', 1.0)")
+        conn.commit()
+        conn.close()
+        lib = ml.MediaLibrary(old_path)
+        try:
+            hub = ml.ScheduleHub(lib)
+            rows = hub.rows("05", "d1")
+            self.assertEqual([(r["path"], r["pass_no"], r["state"]) for r in rows], [("/m/k.mkv", 4, "aired")])
+            hub.put_rows("05", "d2", [dict(self._rows([self.FILES[0]])[0], position=0)])
+            self.assertEqual([r["pass_no"] for r in hub.rows("05", "d2")], [1])
+        finally:
+            lib._conn.close()
+
+    def test_timeline_rows_carry_the_bundle_and_both_files_of_a_pair(self):
+        a, b, c = self.FILES
+        eps = [{"path": p, "duration": 600} for p in (a, b, c)]
+        pair = media._build_pair_track(eps[0], eps[1])
+        pair.update({"start_time": 0.0, "seek_offset": 0})
+        single = {"path": c, "duration": 600, "start_time": 1200.0, "seek_offset": 0}
+        ad = {"path": "/m/ad.mp4", "duration": 30, "start_time": 1800.0, "is_commercial": True, "seek_offset": 0}
+        bundles = media.bundles_of_tracks(eps)
+        rows = media.schedule_rows_from_timeline([pair, single, ad], 100.0, bundles)
+        self.assertEqual(rows[0]["row_files"], [a, b])
+        self.assertEqual(sorted(rows[0]["bundle_files"]), sorted([a, b, c]))
+        self.assertEqual(rows[0]["bundle"], rows[1]["bundle"])
+        self.assertNotIn("bundle", rows[2])
+        self.hub.put_rows("05", "d1", rows[:2])
+        self.assertEqual(self._passes("d1"), [1, 1])
+
+    def test_movies_share_one_bundle(self):
+        movies = [{"path": "/v/Movies/Big One (1999).mkv", "duration": 6000}, {"path": "/v/Movies/Big Two (2001).mkv", "duration": 6200}]
+        bundles = media.bundles_of_tracks(movies)
+        self.assertEqual(set(bundles["files"].values()), {media.MOVIE_BUNDLE_KEY})
+        self.assertEqual(sorted(bundles["members"][media.MOVIE_BUNDLE_KEY]), sorted(m["path"] for m in movies))
+
+
+class TestGuideFillsFromHub(unittest.TestCase):
+    def setUp(self):
+        ui._guide_hub_fill_cache.clear()
+        self.tmp = tempfile.mkdtemp()
+        self.lib = ml.MediaLibrary(os.path.join(self.tmp, "library.sqlite3"))
+        self.hub = ml.ScheduleHub(self.lib)
+        self.now = datetime.datetime(2026, 10, 20, 13, 51, 22)
+        self.epoch = self.now.timestamp()
+        self.midnight = self.epoch - (13 * 3600 + 51 * 60 + 22)
+        self.show = os.path.join(self.tmp, "Real Monsters S01E05.mkv")
+        self.past = os.path.join(self.tmp, "Real Monsters S01E04.mkv")
+        for path in (self.show, self.past):
+            open(path, "wb").close()
+
+    def tearDown(self):
+        try:
+            self.lib._conn.close()
+        except Exception as error:
+            log.warning("TestGuideFillsFromHub.tearDown: could not close the library: %s", error)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _row(self, position, path, start_offset, length, kind="episode"):
+        return {"position": position, "path": path, "kind": kind, "planned_start": self.epoch + start_offset, "used_length": length, "length_source": "measured"}
+
+    def _fill(self, entries, hub=None):
+        return ui._guide_fill_from_hub(list(entries), "05", self.now, 12 * 3600, 16 * 3600, None, hub or self.hub)
+
+    def test_show_on_air_at_boot_replaces_off_air(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "airing")
+        out = self._fill([])
+        self.assertEqual(len(out), 1)
+        entry, start, end, _block = out[0]
+        self.assertEqual(entry["path"], self.show)
+        self.assertTrue(start <= 13 * 3600 + 51 * 60 + 22 < end)
+
+    def test_planned_row_that_covers_now_is_used_when_not_marked_yet(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.show, -60, 1320)])
+        self.assertEqual([e[0]["path"] for e in self._fill([])], [self.show])
+
+    def test_earlier_aired_show_is_back_filled(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.past, -3000, 1320), self._row(1, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "aired")
+        self.hub.mark("05", "blk", 1, "airing")
+        self.assertEqual([e[0]["path"] for e in self._fill([])], [self.past, self.show])
+
+    def test_nothing_is_added_where_an_entry_already_covers(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "airing")
+        start = 13 * 3600 + 51 * 60 + 22 - 1260
+        existing = [({"path": self.show, "duration": 1320}, start, start + 1320, "Evening")]
+        self.assertEqual(self._fill(existing), existing)
+
+    def test_channel_never_scheduled_stays_off_air(self):
+        self.assertEqual(self._fill([]), [])
+
+    def test_future_planned_rows_are_not_drawn(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.past, -3000, 1320), self._row(1, self.show, 600, 1320)])
+        self.assertEqual(self._fill([]), [])
+
+    def test_a_static_slot_is_drawn_as_the_scheduled_show_not_off_air(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.past, -3000, 1320), self._row(1, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "aired")
+        self.hub.mark("05", "blk", 1, "airing")
+        self.assertEqual(self.hub.mark_airing_static("05", self.show), 1)
+        out = self._fill([])
+        self.assertEqual([e[0]["path"] for e in out], [self.past, self.show])
+        self.assertEqual((out[1][1], out[1][2]), (13 * 3600 + 51 * 60 + 22 - 1260, 13 * 3600 + 51 * 60 + 22 + 60))
+
+    def test_a_static_slot_in_the_past_keeps_its_own_file_and_never_another_episode(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.past, -3000, 1320), self._row(1, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "airing")
+        self.hub.mark_airing_static("05", self.past)
+        self.hub.mark("05", "blk", 1, "airing")
+        out = self._fill([])
+        self.assertEqual([e[0]["path"] for e in out], [self.past, self.show])
+        self.assertEqual(self.hub.rows("05", "blk")[0]["state"], "static")
+
+    def test_a_static_row_does_not_move_back_when_the_file_plays_again(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "airing")
+        self.hub.mark_airing_static("05", self.show)
+        self.assertFalse(self.hub.mark("05", "blk", 0, "airing"))
+        self.assertEqual([e[0]["path"] for e in self._fill([])], [self.show])
+
+    def test_a_static_slot_that_an_entry_already_covers_is_left_to_that_entry(self):
+        self.hub.put_rows("05", "blk", [self._row(0, self.show, -1260, 1320)])
+        self.hub.mark("05", "blk", 0, "airing")
+        self.hub.mark_airing_static("05", self.show)
+        start = 13 * 3600 + 51 * 60 + 22 - 1260
+        existing = [({"path": self.show, "duration": 1320}, start, start + 1320, "Evening")]
+        self.assertEqual(self._fill(existing), existing)
+
+    def test_the_hub_read_returns_static_rows_and_still_leaves_commercial_rows(self):
+        rows = [self._row(0, self.past, -3000, 1320), self._row(1, self.show, -1260, 1320),
+                self._row(2, self.show, -100, 30, kind="commercial")]
+        self.hub.put_rows("05", "blk", rows)
+        self.hub.mark("05", "blk", 0, "aired")
+        self.hub.mark("05", "blk", 1, "airing")
+        self.hub.mark_airing_static("05", self.show)
+        found = self.hub.rows_between("05", self.epoch - 4000, self.epoch + 100, self.epoch)
+        self.assertEqual([(r["path"], r["state"]) for r in found], [(self.past, "aired"), (self.show, "static")])
+
+    def test_the_fall_back_to_static_is_still_seven_seconds(self):
+        import performance_governor as _gov
+        self.assertEqual(_gov.STALL_FORCES_STATIC_MS, 7000)
+
+    def test_missing_file_is_not_drawn(self):
+        gone = os.path.join(self.tmp, "gone.mkv")
+        self.hub.put_rows("05", "blk", [self._row(0, gone, -100, 1320)])
+        self.assertEqual(self._fill([]), [])
+
+    def test_a_hub_failure_leaves_the_entries_and_is_logged(self):
+        class Broken:
+            def rows_between(self, *args):
+                raise RuntimeError("hub down")
+        entries = [({"path": self.show, "duration": 60}, 0, 60, "x")]
+        with self.assertLogs(ui.log, level="WARNING") as captured:
+            self.assertEqual(self._fill(entries, Broken()), entries)
+        self.assertIn("[GUIDE HUB FILL] ch05", captured.output[0])
+
+    def test_guide_row_build_calls_the_fill_before_the_cutoff(self):
+        src = open(ui.__file__, encoding="utf-8").read()
+        self.assertLess(src.index("timeline_entries = _guide_fill_from_hub("), src.index("_cutoff_g = None"))
+
+
+class TestGuidePastFromHub(unittest.TestCase):
+    def setUp(self):
+        ui._guide_hub_fill_cache.clear()
+        ui._guide_hub_past_cache.clear()
+        self.tmp = tempfile.mkdtemp()
+        self.lib = ml.MediaLibrary(os.path.join(self.tmp, "library.sqlite3"))
+        self.hub = ml.ScheduleHub(self.lib)
+        self.now = datetime.datetime(2026, 10, 20, 13, 51, 22)
+        self.epoch = self.now.timestamp()
+        self.midnight = self.epoch - (13 * 3600 + 51 * 60 + 22)
+        self.ep1 = os.path.join(self.tmp, "Show S01E01.mkv")
+        self.ep2 = os.path.join(self.tmp, "Show S01E02.mkv")
+        self.com = os.path.join(self.tmp, "com.mp4")
+        self.timeline = [
+            {"path": self.ep1, "duration": 1500, "start_time": 0, "is_commercial": False, "seek_offset": 0,
+             "is_pair": True, "pair_ep1_path": self.ep1, "pair_ep1_duration": 700, "pair_ep2_path": self.ep2, "pair_ep2_duration": 800},
+            {"path": self.com, "duration": 300, "start_time": 1500, "is_commercial": True, "seek_offset": 0},
+            {"path": self.ep2, "duration": 1200, "start_time": 1800, "is_commercial": False, "seek_offset": 600},
+        ]
+
+    def tearDown(self):
+        try:
+            self.lib._conn.close()
+        except Exception as error:
+            log.warning("TestGuidePastFromHub.tearDown: could not close the library: %s", error)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _put(self, offset=-3000, mark=("aired", "aired", "airing")):
+        rows = media.schedule_rows_from_timeline(self.timeline, self.epoch + offset)
+        self.hub.put_rows("05", "blk", rows)
+        for position, state in enumerate(mark):
+            if state:
+                self.hub.mark("05", "blk", position, state)
+        return rows
+
+    def _past(self, hub=None):
+        return ui._guide_hub_aired_cells("05", self.now, 12 * 3600, 16 * 3600, hub or self.hub)
+
+    def test_timeline_rows_carry_the_guide_facts(self):
+        rows = media.schedule_rows_from_timeline(self.timeline, self.epoch)
+        pair = rows[0]["guide_entry"]
+        self.assertTrue(pair["is_pair"])
+        self.assertEqual((pair["pair_ep1_path"], pair["pair_ep1_duration"], pair["pair_ep2_path"], pair["pair_ep2_duration"]),
+                         (self.ep1, 700, self.ep2, 800))
+        self.assertTrue(rows[1]["guide_entry"]["is_commercial"])
+        self.assertEqual(rows[2]["guide_entry"]["seek_offset"], 600)
+
+    def test_bundle_facts_are_kept(self):
+        bundle = {"path": self.ep1, "duration": 900, "start_time": 0, "is_commercial": False, "is_bundle": True,
+                  "bundle_item_paths": [self.ep1, self.ep2], "bundle_item_durations": [400, 500], "bundle_items": [{"path": self.ep1}]}
+        facts = media.guide_entry_facts(bundle)
+        self.assertEqual(facts["bundle_item_paths"], [self.ep1, self.ep2])
+        self.assertEqual(facts["bundle_item_durations"], [400, 500])
+        self.assertNotIn("bundle_items", facts)
+        self.assertIsNone(media.guide_entry_facts(None))
+
+    def test_hub_returns_facts_and_commercials_only_for_the_full_read(self):
+        self._put()
+        full = self.hub.rows_between("05", self.midnight, self.midnight + 86400, self.epoch, full=True)
+        self.assertEqual([r["kind"] for r in full], ["episode", "commercial", "episode"])
+        self.assertTrue(full[0]["guide_entry"]["is_pair"])
+        plain = self.hub.rows_between("05", self.midnight, self.midnight + 86400, self.epoch)
+        self.assertEqual([r["kind"] for r in plain], ["episode", "episode"])
+        self.assertNotIn("guide_entry", plain[0])
+
+    def test_full_read_leaves_out_planned_rows(self):
+        self._put(offset=-3000, mark=("aired", None, None))
+        full = self.hub.rows_between("05", self.midnight, self.midnight + 86400, self.epoch, full=True)
+        self.assertEqual(len(full), 1)
+
+    def test_row_saved_without_facts_reads_as_none_and_is_not_drawn(self):
+        rows = media.schedule_rows_from_timeline(self.timeline, self.epoch - 3000)
+        for row in rows:
+            row.pop("guide_entry")
+        self.hub.put_rows("05", "blk", rows)
+        for position in range(3):
+            self.hub.mark("05", "blk", position, "aired")
+        full = self.hub.rows_between("05", self.midnight, self.midnight + 86400, self.epoch, full=True)
+        self.assertTrue(all(r["guide_entry"] is None for r in full))
+        self.assertEqual(self._past(), [])
+
+    def test_unreadable_facts_read_as_none(self):
+        self._put()
+        with self.lib._lock:
+            self.lib._conn.execute("UPDATE hub_schedule_row SET guide_entry = '{not json' WHERE position = 0")
+            self.lib._conn.commit()
+        full = self.hub.rows_between("05", self.midnight, self.midnight + 86400, self.epoch, full=True)
+        self.assertIsNone(full[0]["guide_entry"])
+        self.assertIsNotNone(full[1]["guide_entry"])
+
+    def test_old_table_gets_the_column_and_keeps_its_rows(self):
+        path = os.path.join(self.tmp, "old.sqlite3")
+        lib = ml.MediaLibrary(path)
+        try:
+            hub = ml.ScheduleHub(lib)
+            hub.put_rows("05", "blk", [{"position": 0, "path": self.ep1, "kind": "episode", "planned_start": self.epoch, "used_length": 600, "length_source": "measured"}])
+            with lib._lock:
+                cols = [r[1] for r in lib._conn.execute("PRAGMA table_info(hub_schedule_row)").fetchall()]
+            self.assertIn("guide_entry", cols)
+            lib._conn.execute("ALTER TABLE hub_schedule_row DROP COLUMN guide_entry")
+            lib._conn.commit()
+            lib._ensure_schedule_row_columns()
+            cols = [r[1] for r in lib._conn.execute("PRAGMA table_info(hub_schedule_row)").fetchall()]
+            self.assertIn("guide_entry", cols)
+            self.assertEqual(len(hub.rows("05")), 1)
+        finally:
+            lib._conn.close()
+
+    def test_past_rows_rebuild_the_pair_and_break_cells(self):
+        self._put()
+        out = self._past()
+        self.assertEqual(len(out), 3)
+        parts = ui._guide_entry_parts(out[0][0])
+        self.assertEqual([p for p, _d in parts], [os.path.normcase(os.path.normpath(self.ep1)), os.path.normcase(os.path.normpath(self.ep2))])
+        self.assertEqual([d for _p, d in parts], [700, 800])
+        self.assertTrue(out[1][0]["is_commercial"])
+        self.assertEqual(out[2][0]["seek_offset"], 600)
+        self.assertAlmostEqual(out[0][1], 13 * 3600 + 51 * 60 + 22 - 3000)
+        self.assertAlmostEqual(out[0][2] - out[0][1], 1500)
+
+    def test_static_row_is_drawn_as_its_scheduled_show(self):
+        self._put(mark=("static", "aired", "airing"))
+        out = self._past()
+        self.assertEqual(out[0][0]["path"], self.ep1)
+        self.assertTrue(out[0][0]["is_pair"])
+
+    def test_overlapping_row_is_dropped(self):
+        self._put()
+        other = media.schedule_rows_from_timeline([{"path": self.ep2, "duration": 600, "start_time": 0, "is_commercial": False}], self.epoch - 2900)
+        self.hub.put_rows("05", "other", other)
+        self.hub.mark("05", "other", 0, "aired")
+        self.assertEqual(len(self._past()), 3)
+
+    def test_hub_rows_win_over_ledger_rows_and_ledger_fills_the_rest(self):
+        self._put(mark=("aired", "aired", None))
+        start = 13 * 3600 + 51 * 60 + 22 - 3000
+        ledger = [({"path": self.ep2, "duration": 1500, "is_commercial": False}, start, start + 1500, "Evening"),
+                  ({"path": self.com, "duration": 300, "is_commercial": True}, start + 3000, start + 3300, "Evening")]
+        spliced = ui._guide_splice_aired([], ledger)
+        spliced = ui._guide_splice_aired(spliced, ui._guide_aired_rows_in_view(self._past(), 12 * 3600, 16 * 3600))
+        first = [e for e in spliced if abs(e[1] - start) < 1][0]
+        self.assertTrue(first[0].get("is_pair"))
+        self.assertEqual(first[0]["path"], self.ep1)
+        self.assertTrue(any(abs(e[1] - (start + 3000)) < 1 for e in spliced))
+        self.assertEqual(sum(1 for e in spliced if e[1] < start + 1500 - 0.5 and e[2] > start + 0.5), 1)
+
+    def test_signature_changes_when_a_row_moves_forward(self):
+        self._put(mark=("aired", None, None))
+        before = self.hub.past_signature("05")
+        time.sleep(0.01)
+        self.hub.mark("05", "blk", 1, "aired")
+        self.assertNotEqual(before, self.hub.past_signature("05"))
+        self.assertEqual(before[0] + 1, self.hub.past_signature("05")[0])
+
+    def test_failing_hub_leaves_the_guide_as_it_was(self):
+        class Broken:
+            def rows_between(self, *args, **kwargs):
+                raise RuntimeError("hub down")
+
+            def past_signature(self, channel):
+                raise RuntimeError("hub down")
+        self.assertEqual(self._past(Broken()), [])
+        self.assertIsNone(ui._guide_hub_past_signature("05", self.now, Broken()))
+
+    def test_guide_splices_the_hub_past_after_the_future(self):
+        with open(ui.__file__, encoding="utf-8") as handle:
+            src = handle.read()
+        i = src.index("_guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start")
+        j = src.index("_guide_hub_aired_cells(ch_str, now_dt", i)
+        self.assertLess(i, j)
+        self.assertIn("_guide_hub_past_signature(ch_str, now_dt)", src)
+
+
+class TestFlyingVisualizerSpeed(unittest.TestCase):
+    def setUp(self):
+        import visualizers as _viz
+        self.viz = _viz
+        self.deck = _viz.VisualizerDeck()
+        self.surface = pygame.Surface((64, 48))
+        self.clock = [1000.0]
+        self._patch = unittest.mock.patch.object(_viz._time, "monotonic", lambda: self.clock[0])
+        self._patch.start()
+        self.ease, self.star_min, self.star_max, self.tunnel_min, self.tunnel_max, self.max_step = _viz._flight_tunables()
+
+    def tearDown(self):
+        self._patch.stop()
+
+    def _frame(self, style, amp, dt):
+        self.clock[0] += dt
+        self.deck.render_active_engine(self.surface, {}, amp, style)
+
+    def _run(self, style, amp_for_frame, seconds, fps):
+        dt = 1.0 / fps
+        for n in range(int(seconds * fps)):
+            self._frame(style, amp_for_frame(n), dt)
+
+    def test_starfield_never_stops_in_silence(self):
+        self._run("NeonStarfield", lambda n: 0, 30, 20)
+        self.assertGreaterEqual(self.deck.star_speed, self.star_min - 1e-9)
+        self.assertGreater(self.deck.star_speed, 0.3)
+
+    def test_tunnel_never_stops_in_silence(self):
+        self._run("WarpTunnel", lambda n: 0, 30, 20)
+        self.assertGreaterEqual(self.deck.tunnel_speed, self.tunnel_min - 1e-9)
+
+    def test_beats_do_not_make_the_starfield_lurch(self):
+        speeds = []
+        dt = 1.0 / 20.0
+        for n in range(200):
+            self._frame("NeonStarfield", 256 if n % 4 < 2 else 0, dt)
+            speeds.append(self.deck.star_speed)
+        biggest_step = max(abs(b - a) for a, b in zip(speeds, speeds[1:]))
+        self.assertLessEqual(biggest_step, (self.star_max - self.star_min) * dt / self.ease * 1.05)
+        self.assertGreaterEqual(min(speeds), self.star_min - 1e-9)
+
+    def test_speed_takes_about_the_ease_time_to_change(self):
+        self._run("NeonStarfield", lambda n: 0, 20, 20)
+        slow = self.deck.star_speed
+        self._run("NeonStarfield", lambda n: 256, 1, 20)
+        self.assertLess(self.deck.star_speed - slow, (self.star_max - self.star_min) * 0.45)
+        self._run("NeonStarfield", lambda n: 256, 12, 20)
+        self.assertGreater(self.deck.star_speed, self.star_max - (self.star_max - self.star_min) * 0.05)
+
+    def test_same_flight_at_10_and_20_frames_per_second(self):
+        results = []
+        for fps in (30, 20):
+            self.setUp()
+            self._run("NeonStarfield", lambda n: 128, 8, fps)
+            self._run("WarpTunnel", lambda n: 128, 8, fps)
+            results.append((self.deck.star_speed, self.deck.tunnel_speed, self.deck.tunnel_depth))
+            self.tearDown()
+        self.assertAlmostEqual(results[0][0], results[1][0], delta=0.01)
+        self.assertAlmostEqual(results[0][1], results[1][1], delta=0.01)
+        gap = abs(results[0][2] - results[1][2])
+        self.assertLess(min(gap, 1.0 - gap), 0.02)
+
+    def test_tunnel_speed_change_does_not_move_the_rings(self):
+        self._run("WarpTunnel", lambda n: 0, 5, 20)
+        before = self.deck.tunnel_depth
+        self._frame("WarpTunnel", 256, 1.0 / 20.0)
+        moved = (self.deck.tunnel_depth - before) % 1.0
+        self.assertLessEqual(moved, self.tunnel_max / 20.0 + 1e-9)
+        self.assertGreaterEqual(moved, self.tunnel_min / 20.0 * 0.99)
+
+    def test_every_dot_moves_toward_the_screen(self):
+        self._run("NeonStarfield", lambda n: 100, 1, 20)
+        before = [star["z"] for star in self.deck.stars]
+        self._frame("NeonStarfield", 100, 1.0 / 20.0)
+        for old, star in zip(before, self.deck.stars):
+            self.assertTrue(star["z"] < old or star["z"] == 1.0)
+
+    def test_a_long_pause_is_capped_to_one_step(self):
+        self._run("NeonStarfield", lambda n: 128, 1, 20)
+        before = self.deck.stars[0]["z"]
+        self.clock[0] += 30.0
+        self.deck.render_active_engine(self.surface, {}, 128, "NeonStarfield")
+        moved = before - self.deck.stars[0]["z"]
+        self.assertLessEqual(moved, self.star_max * self.max_step + 1e-9)
+
+    def test_fallback_numbers_match_the_governor_table(self):
+        import performance_governor as _gov
+        saved = self.viz._governor
+        self.viz._governor = None
+        try:
+            fallback = self.viz._flight_tunables()
+        finally:
+            self.viz._governor = saved
+        self.assertEqual(fallback, (_gov.FLIGHT_SPEED_EASE_SECONDS, _gov.FLIGHT_STARFIELD_MIN_SPEED, _gov.FLIGHT_STARFIELD_MAX_SPEED,
+                                    _gov.FLIGHT_TUNNEL_MIN_SPEED, _gov.FLIGHT_TUNNEL_MAX_SPEED, _gov.FLIGHT_MAX_STEP_SECONDS))
+
+
+class TestCommercialBundleLaps(unittest.TestCase):
+    LENGTHS = (10, 15, 20, 25, 30, 30, 30, 45, 60, 75, 90)
+
+    def _ads(self, count, prefix="ad"):
+        import random as _random
+        rng = _random.Random(1)
+        return [{"path": "%s%03d.mp4" % (prefix, i), "duration": rng.choice(self.LENGTHS)} for i in range(count)]
+
+    def _shows(self, count=8, duration=1500):
+        return [{"path": "show%d.mp4" % i, "duration": duration} for i in range(count)]
+
+    def _run(self, ads, blocks, placement="interrupt_half_hour", state=None, shows=None):
+        aired = []
+        for block in range(blocks):
+            timeline, _total, state = media.build_block_timeline(
+                shows or self._shows(), ads, placement, 1000 + block, commercial_state=state)
+            aired.extend(entry["path"] for entry in timeline if entry["is_commercial"])
+        return aired, state
+
+    def _lap_violations(self, ads, aired):
+        bundle_of = {a["path"]: media.commercial_bundle_ceiling(a["duration"]) for a in ads}
+        mates = {}
+        for path, bundle in bundle_of.items():
+            mates.setdefault(bundle, []).append(path)
+        counts = {a["path"]: 0 for a in ads}
+        bad = 0
+        for path in aired:
+            if counts[path] > min(counts[other] for other in mates[bundle_of[path]]):
+                bad += 1
+            counts[path] += 1
+        return bad, counts
+
+    def test_bundles_are_every_fifteen_seconds_up_to_five_minutes(self):
+        self.assertEqual(media.COMMERCIAL_BUNDLE_CEILINGS, tuple(range(15, 301, 15)))
+        self.assertEqual(len(media.COMMERCIAL_BUNDLE_CEILINGS), 20)
+        self.assertEqual(media.COMMERCIAL_BUNDLE_CEILINGS[-1], media.COMMERCIAL_MAX_SECONDS)
+
+    def test_a_commercial_rounds_up_to_its_bundle(self):
+        ceiling = media.commercial_bundle_ceiling
+        self.assertEqual([ceiling(d) for d in (1, 15, 16, 30, 31, 299, 300, 301)], [15, 15, 30, 30, 45, 300, 300, 300])
+
+    def test_bundle_step_fallback_matches_the_governor_table(self):
+        import performance_governor as _gov
+        src = open(media.__file__, encoding="utf-8").read()
+        self.assertEqual(_gov.COMMERCIAL_BUNDLE_STEP_SECONDS, 15)
+        self.assertIn("_COMMERCIAL_BUNDLE_STEP_SECONDS = %d" % _gov.COMMERCIAL_BUNDLE_STEP_SECONDS, src)
+        self.assertEqual(media._COMMERCIAL_BUNDLE_STEP_SECONDS, _gov.COMMERCIAL_BUNDLE_STEP_SECONDS)
+
+    def test_no_commercial_airs_again_before_its_bundle_has_aired(self):
+        for count in (20, 40, 80):
+            ads = self._ads(count)
+            aired, _state = self._run(ads, 30)
+            bad, counts = self._lap_violations(ads, aired)
+            self.assertEqual(bad, 0, "%d commercials: %d airings came before every other commercial of the bundle had aired" % (count, bad))
+            self.assertTrue(all(c > 0 for c in counts.values()), "every commercial airs")
+
+    def test_a_bundle_of_one_does_not_air_as_often_as_a_big_bundle(self):
+        ads = [{"path": "single45.mp4", "duration": 45}] + [{"path": "a%d.mp4" % i, "duration": 30} for i in range(20)]
+        aired, _state = self._run(ads, 20)
+        single = aired.count("single45.mp4")
+        others = [aired.count(a["path"]) for a in ads[1:]]
+        self.assertLessEqual(single, 1.5 * max(others))
+        self.assertGreaterEqual(single, 0.5 * min(others))
+
+    def test_the_state_holds_the_aired_commercials_and_a_rebuild_matches(self):
+        ads = self._ads(30)
+        _aired, state = self._run(ads, 3)
+        for saved in state["bundles"].values():
+            self.assertIsInstance(saved["drawn"], list)
+            self.assertEqual(len(saved["drawn"]), len(set(saved["drawn"])))
+        first = media.build_block_timeline(self._shows(), ads, "interrupt_half_hour", 4242, commercial_state=copy.deepcopy(state))
+        second = media.build_block_timeline(self._shows(), ads, "interrupt_half_hour", 4242, commercial_state=copy.deepcopy(state))
+        self.assertEqual(first, second)
+
+    def test_a_state_saved_before_the_lap_record_still_builds(self):
+        ads = self._ads(30)
+        _aired, state = self._run(ads, 2)
+        old_state = copy.deepcopy(state)
+        for saved in old_state["bundles"].values():
+            saved.pop("drawn")
+        timeline, total, new_state = media.build_block_timeline(self._shows(), ads, "interrupt_half_hour", 77, commercial_state=old_state)
+        self.assertTrue(any(e["is_commercial"] for e in timeline))
+        self.assertGreater(total, 0)
+        self.assertTrue(all("drawn" in saved for saved in new_state["bundles"].values()))
+
+    def test_a_commercial_added_mid_lap_airs_before_any_repeat(self):
+        ads = [{"path": "a%d.mp4" % i, "duration": 30} for i in range(10)]
+        _aired, state = self._run(ads, 1, shows=self._shows(1))
+        drawn_before = set(state["bundles"]["30"]["drawn"])
+        self.assertTrue(drawn_before)
+        grown = ads + [{"path": "new.mp4", "duration": 30}]
+        aired, _state = self._run(grown, 3, state=state)
+        self.assertIn("new.mp4", aired)
+        before_new = aired[:aired.index("new.mp4")]
+        counts_when_new_airs = {a["path"]: before_new.count(a["path"]) for a in grown}
+        self.assertLessEqual(max(counts_when_new_airs.values()), 1)
+
+    def test_a_removed_commercial_leaves_the_record(self):
+        ads = self._ads(30)
+        _aired, state = self._run(ads, 2)
+        kept = ads[1:]
+        _aired, state = self._run(kept, 1, state=state)
+        every_drawn = {p for saved in state["bundles"].values() for p in saved["drawn"]}
+        self.assertNotIn(ads[0]["path"], every_drawn)
+
+    def test_one_commercial_airs_in_every_break(self):
+        ads = [{"path": "only.mp4", "duration": 30}]
+        timeline, _total, _state = media.build_block_timeline(self._shows(4), ads, "interrupt_half_hour", 9)
+        breaks, current = [], []
+        for entry in timeline:
+            if entry["is_commercial"]:
+                current.append(entry["path"])
+            elif current:
+                breaks.append(current)
+                current = []
+        if current:
+            breaks.append(current)
+        self.assertGreaterEqual(len(breaks), 4)
+        self.assertTrue(all(b == ["only.mp4"] for b in breaks))
+
+    def test_a_break_that_one_pair_finishes_is_finished_exactly(self):
+        ads = [{"path": "a%d.mp4" % d, "duration": d} for d in (15, 30, 45, 60, 90)]
+        for seed in (5, 6, 7):
+            timeline, total, _state = media.build_block_timeline(self._shows(1, 1680), ads, "end_of_show", seed)
+            self.assertEqual(sum(e["duration"] for e in timeline if e["is_commercial"]), 120)
+            self.assertEqual(total, 1800)
+
+    def test_no_commercial_repeats_inside_one_break(self):
+        ads = self._ads(12)
+        timeline, _total, _state = media.build_block_timeline(self._shows(), ads, "interrupt_half_hour", 31)
+        current = []
+        for entry in timeline + [{"is_commercial": False}]:
+            if entry["is_commercial"]:
+                current.append(entry["path"])
+            else:
+                self.assertEqual(len(current), len(set(current)))
+                current = []
+
+
+class TestGuidePreviewBoxHold(unittest.TestCase):
+    def _ns(self, store):
+        class FakeLib:
+            def get_cached(self, path):
+                box = store.get(path)
+                return {"picture_box": box} if box else None
+
+        clock = {"t": 100.0}
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["t"])
+        ns = {"os": os, "time": fake_time, "media": media, "math": math, "pygame": MagicMock(), "log": MagicMock(),
+              "performance_governor": gov, "_get_probe_library": lambda: FakeLib(),
+              "_pan_scan_content_key": lambda p: p, "_log_probe_failure": lambda *a, **k: None,
+              "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
+              "PICTURE_BOX_FIT_RETRY_SECONDS": 2.0,
+              "_picture_box_fit_state": {"content_key": None, "norm_rect": None, "picture_aspect": None, "retry_at": 0.0},
+              "GUIDE_PREVIEW_BOX_HOLD_MS": gov.GUIDE_PREVIEW_BOX_HOLD_MS,
+              "GUIDE_PREVIEW_BOX_RECHECK_SECONDS": gov.GUIDE_PREVIEW_BOX_RECHECK_SECONDS,
+              "_guide_preview_box_hold_state": {"content_key": None, "started": 0.0, "gave_up": False}}
+        for name in ("_picture_box_set_content", "_guide_preview_box_hold"):
+            exec(main_function_code(name), ns)
+        return ns, clock
+
+    def test_governor_rows(self):
+        self.assertEqual(gov.GUIDE_PREVIEW_BOX_HOLD_MS, 1500)
+        self.assertEqual(gov.GUIDE_PREVIEW_BOX_RECHECK_SECONDS, 0.2)
+        self.assertEqual(MAIN_SRC.count("GUIDE_PREVIEW_BOX_HOLD_MS = performance_governor.GUIDE_PREVIEW_BOX_HOLD_MS"), 1)
+
+    def test_black_until_the_box_is_read_then_shows(self):
+        path = os.path.normpath(os.path.abspath("/m/show.mkv"))
+        store = {}
+        ns, clock = self._ns(store)
+        hold = ns["_guide_preview_box_hold"]
+        self.assertTrue(hold(path))
+        clock["t"] += 0.5
+        self.assertTrue(hold(path))
+        store[path] = {"reason": "pillarbox", "norm": [0.1, 0.0, 0.8, 1.0], "picture_aspect": 4 / 3}
+        clock["t"] += 0.25
+        self.assertFalse(hold(path))
+        self.assertIsNotNone(ns["_picture_box_fit_state"]["norm_rect"])
+
+    def test_hold_ends_at_the_limit_and_logs_once(self):
+        path = os.path.normpath(os.path.abspath("/m/show.mkv"))
+        ns, clock = self._ns({})
+        hold = ns["_guide_preview_box_hold"]
+        self.assertTrue(hold(path))
+        clock["t"] += gov.GUIDE_PREVIEW_BOX_HOLD_MS / 1000.0 + 0.1
+        self.assertFalse(hold(path))
+        self.assertFalse(hold(path))
+        self.assertEqual(ns["log"].info.call_count, 1)
+
+    def test_no_hold_for_decided_or_unscannable_files(self):
+        path = os.path.normpath(os.path.abspath("/m/show.mkv"))
+        ns, _ = self._ns({path: {"reason": "no_bars"}})
+        self.assertFalse(ns["_guide_preview_box_hold"](path))
+        song = os.path.normpath(os.path.abspath("/m/song.mp3"))
+        ns, _ = self._ns({})
+        self.assertFalse(ns["_guide_preview_box_hold"](song))
+
+    def test_each_file_gets_its_own_hold(self):
+        a = os.path.normpath(os.path.abspath("/m/a.mkv"))
+        b = os.path.normpath(os.path.abspath("/m/b.mkv"))
+        ns, clock = self._ns({})
+        hold = ns["_guide_preview_box_hold"]
+        hold(a)
+        clock["t"] += 5
+        self.assertFalse(hold(a))
+        self.assertTrue(hold(b))
+
+    def test_preview_draw_waits_for_the_hold(self):
+        at = MAIN_SRC.index("_guide_preview_box_hold(hl_state[\"file\"])")
+        self.assertLess(at, MAIN_SRC.index("video_surf = pygame.image.frombuffer(vlc_bytes, (vlc_engine.width, vlc_engine.height), \"BGRA\")", at - 200))
+
+
+class TestProbeMarkerRenameRetry(unittest.TestCase):
+    """The probe-in-progress marker rename retries from the governor table, stays atomic and logs once when every try fails"""
+
+    def _ns(self, replace, attempts=None, step=None):
+        sleeps = []
+        log = MagicMock()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake_os = types.SimpleNamespace(path=os.path, fsync=os.fsync, replace=replace)
+        fake_time = types.SimpleNamespace(time=time.time, sleep=lambda s: sleeps.append(s))
+        ns = {"os": fake_os, "time": fake_time, "log": log,
+              "_probe_marker_path": lambda: os.path.join(tmp, "_probe_inflight.json"),
+              "PROBE_MARKER_RENAME_ATTEMPTS": gov.PROBE_MARKER_RENAME_ATTEMPTS if attempts is None else attempts,
+              "PROBE_MARKER_RENAME_STEP_SECONDS": gov.PROBE_MARKER_RENAME_STEP_SECONDS if step is None else step}
+        exec(main_function_code("_write_probe_marker"), ns)
+        return ns, log, sleeps, tmp
+
+    def test_governor_rows(self):
+        self.assertEqual(gov.PROBE_MARKER_RENAME_ATTEMPTS, 6)
+        self.assertEqual(gov.PROBE_MARKER_RENAME_STEP_SECONDS, 0.02)
+        self.assertEqual(MAIN_SRC.count("PROBE_MARKER_RENAME_ATTEMPTS = performance_governor.PROBE_MARKER_RENAME_ATTEMPTS"), 1)
+        self.assertEqual(MAIN_SRC.count("PROBE_MARKER_RENAME_STEP_SECONDS = performance_governor.PROBE_MARKER_RENAME_STEP_SECONDS"), 1)
+        self.assertNotIn("range(6)", main_function_source("_write_probe_marker"))
+        self.assertNotIn("0.02", main_function_source("_write_probe_marker"))
+
+    def test_refused_twice_then_works_without_a_warning(self):
+        calls = {"n": 0}
+
+        def replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(5, "Access is denied")
+            os.replace(src, dst)
+        ns, log, sleeps, tmp = self._ns(replace)
+        ns["_write_probe_marker"]("/m/show.mkv", "duration")
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(sleeps, [0.02, 0.04])
+        log.warning.assert_not_called()
+        import json as _json
+        with open(os.path.join(tmp, "_probe_inflight.json")) as f:
+            self.assertEqual(_json.load(f)["path"], "/m/show.mkv")
+
+    def test_always_refused_tries_the_table_count_and_warns_once(self):
+        calls = {"n": 0}
+
+        def replace(src, dst):
+            calls["n"] += 1
+            raise PermissionError(5, "Access is denied")
+        ns, log, sleeps, tmp = self._ns(replace, attempts=4, step=0.5)
+        ns["_write_probe_marker"]("/m/show.mkv", "duration")
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(sleeps, [0.5, 1.0, 1.5, 2.0])
+        self.assertEqual(log.warning.call_count, 1)
+        self.assertIn("failed to write probe-in-progress marker", log.warning.call_args[0][0])
+
+
+
+class TestFailedLoadGoesStaticAndRetries(unittest.TestCase):
+    """A file that fails to load is never removed or swapped for another episode; only a confirmed missing file is removed"""
+
+    def _mark(self, status="present", unresponsive=()):
+        removed = []
+        ns = {"log": MagicMock(), "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: 1000)),
+              "media": types.SimpleNamespace(_drive_root_of=lambda p: "C:\\"),
+              "_MARK_BROKEN_CONFIRMED_REASONS": {"confirmed_missing", "file_corrupt"},
+              "_transient_failure_state": {}, "PATH_MISSING": "missing", "_path_status": lambda p: status,
+              "_unresponsive_drive_roots": lambda: set(unresponsive), "_is_drive_degraded": lambda p: False,
+              "_remove_confirmed_file_from_saved_lineups": lambda p: removed.append(p), "db": None}
+        exec(main_function_code("_mark_file_broken"), ns)
+        return ns, removed
+
+    def test_unconfirmed_failures_never_remove_the_file(self):
+        ns, removed = self._mark()
+        info = {}
+        for reason in ("opening_timeout", "vlc_state_error", "abnormal_end_duration_mismatch", "deferred_open_failed",
+                       "retry_search_play_failed", "opening_timeout", "opening_timeout", "opening_timeout"):
+            ns["_mark_file_broken"](info, "/m/show.mkv", reason=reason)
+        self.assertEqual(info.get("broken_files", []), [])
+        self.assertEqual(removed, [])
+        self.assertEqual(ns["_transient_failure_state"]["/m/show.mkv"]["count"], 8)
+
+    def test_a_confirmed_or_missing_file_is_still_removed(self):
+        ns, removed = self._mark()
+        info = {}
+        ns["_mark_file_broken"](info, "/m/a.mkv", reason="confirmed_missing")
+        self.assertEqual(info["broken_files"], ["/m/a.mkv"])
+        ns2, removed2 = self._mark(status="missing")
+        info2 = {}
+        ns2["_mark_file_broken"](info2, "/m/b.mkv", reason="opening_timeout")
+        self.assertEqual(info2["broken_files"], ["/m/b.mkv"])
+        self.assertEqual(removed2, ["/m/b.mkv"])
+
+    def test_a_dead_drive_is_not_counted_against_the_file(self):
+        ns, removed = self._mark(unresponsive=["C:\\"])
+        ns["_mark_file_broken"]({}, "/m/a.mkv", reason="opening_timeout")
+        self.assertEqual(ns["_transient_failure_state"], {})
+
+    def test_change_channel_no_longer_swaps_in_another_episode(self):
+        self.assertNotIn("_resolve_broken_episode", MAIN_SRC)
+        self.assertIn("file is tried again (no substitute episode, the schedule is unchanged)", MAIN_SRC)
+        self.assertIn("_play_fail_streak_by_root[_retry_fail_root]", MAIN_SRC)
+
+    def test_watchdog_bail_only_pauses_on_a_finish_and_keeps_retrying(self):
+        self.assertIn("elif is_video_finished and _watchdog_consecutive_errors.get(_wd_ch_key, 0) >= _WATCHDOG_ERROR_BAIL_AFTER:", MAIN_SRC)
+
+
+class TestBezelScreenHoleMeasured(unittest.TestCase):
+    """Each bezel's screen is measured from its own transparent pixels; the typed numbers are only a fallback"""
+
+    def _ns(self):
+        ns = {"os": os, "pygame": pygame, "log": MagicMock(), "_tv_border_cutout_cache": {},
+              "_TV_BORDER_DEFAULT_CUTOUT": (0.0, 0.0, 1.0, 1.0),
+              "_TV_BORDER_KNOWN_CUTOUTS": {"bezel1": (0.2053, 0.1344, 0.5060, 0.6595)},
+              "_BEZEL_HOLE_ALPHA_MAX": gov.BEZEL_HOLE_ALPHA_MAX, "_BEZEL_HOLE_MIN_AREA_FRAC": gov.BEZEL_HOLE_MIN_AREA_FRAC,
+              "_store_bezel_led_window": lambda *a: None, "re": re}
+        for name in ("_measure_bezel_screen_hole", "_bezel_style_stem", "_full_tv_border_cutout_frac"):
+            exec(main_function_code(name), ns)
+        return ns
+
+    def _frame(self, w, h, hole, corners=False, speck=None):
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill((60, 40, 20, 255))
+        surf.fill((0, 0, 0, 0), pygame.Rect(*hole))
+        if corners:
+            for rect in ((0, 0, 30, 30), (w - 30, 0, 30, 30), (0, h - 30, 30, 30), (w - 30, h - 30, 30, 30)):
+                surf.fill((0, 0, 0, 0), pygame.Rect(*rect))
+        if speck:
+            surf.fill((0, 0, 0, 0), pygame.Rect(*speck))
+        return surf
+
+    def test_hole_is_measured_exactly(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_screen_hole"](self._frame(400, 300, (80, 60, 200, 150)))
+        self.assertEqual(frac, (0.2, 0.2, 0.5, 0.5))
+
+    def test_a_different_hole_gives_different_numbers(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_screen_hole"](self._frame(400, 300, (40, 30, 320, 180)))
+        self.assertEqual(frac, (0.1, 0.1, 0.8, 0.6))
+
+    def test_transparent_corners_outside_the_frame_are_ignored(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_screen_hole"](self._frame(400, 300, (80, 60, 200, 150), corners=True))
+        self.assertEqual(frac, (0.2, 0.2, 0.5, 0.5))
+
+    def test_a_tiny_transparent_speck_does_not_move_the_edges(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_screen_hole"](self._frame(400, 300, (80, 60, 200, 150), speck=(10, 100, 3, 3)))
+        self.assertEqual(frac, (0.2, 0.2, 0.5, 0.5))
+
+    def test_no_hole_gives_none(self):
+        ns = self._ns()
+        solid = pygame.Surface((400, 300), pygame.SRCALPHA)
+        solid.fill((60, 40, 20, 255))
+        self.assertIsNone(ns["_measure_bezel_screen_hole"](solid))
+
+    def test_measurement_wins_over_the_typed_table_for_the_same_name(self):
+        ns = self._ns()
+        surf = self._frame(400, 300, (40, 30, 320, 180))
+        frac = ns["_full_tv_border_cutout_frac"](surf, ("k", 1), True, "/b/bezel1.png")
+        self.assertEqual(frac, (0.1, 0.1, 0.8, 0.6))
+        self.assertEqual(ns["_tv_border_cutout_cache"][("k", 1)], frac)
+
+    def test_typed_numbers_are_the_fallback_when_there_is_no_hole(self):
+        ns = self._ns()
+        solid = pygame.Surface((400, 300), pygame.SRCALPHA)
+        solid.fill((60, 40, 20, 255))
+        self.assertEqual(ns["_full_tv_border_cutout_frac"](solid, ("k", 2), True, "/b/bezel1.png"), (0.2053, 0.1344, 0.5060, 0.6595))
+        self.assertEqual(ns["_full_tv_border_cutout_frac"](solid, ("k", 3), True, "/b/bezel9.png"), (0.0, 0.0, 1.0, 1.0))
+
+    def test_the_frame_that_presents_a_bezel_never_measures(self):
+        ns = self._ns()
+        surf = self._frame(400, 300, (40, 30, 320, 180))
+        self.assertEqual(ns["_full_tv_border_cutout_frac"](surf, ("k", 4), False, "/b/bezel1.png"), (0.2053, 0.1344, 0.5060, 0.6595))
+        self.assertEqual(ns["_full_tv_border_cutout_frac"](surf, ("k", 5), False, "/b/bezel9.png"), (0.0, 0.0, 1.0, 1.0))
+        self.assertEqual(ns["_tv_border_cutout_cache"], {})
+
+    def test_governor_rows(self):
+        self.assertEqual(gov.BEZEL_HOLE_ALPHA_MAX, 23)
+        self.assertEqual(gov.BEZEL_HOLE_MIN_AREA_FRAC, 0.005)
+        self.assertEqual(MAIN_SRC.count("_BEZEL_HOLE_ALPHA_MAX = performance_governor.BEZEL_HOLE_ALPHA_MAX"), 1)
+
+
+class TestBezelNumberWindowMeasured(unittest.TestCase):
+    """The channel number is centred in the black square of the bezel image, measured from its dark pixels, with no black patch under it"""
+
+    HOLE = (0.1, 0.2, 0.5, 0.6)
+
+    def _ns(self):
+        ns = {"os": os, "pygame": pygame, "log": MagicMock(), "_tv_border_led_window_cache": {}, "_tv_border_led_tilt_cache": {}, "math": math,
+              "_BEZEL_CHANNEL_LED_FRAC": {"bezel": (0.7, 0.2, 0.07, 0.08), "bezel1": (0.78, 0.12, 0.12, 0.12)},
+              "_tv_border_current_path": {"path": None},
+              "_bezel_file_cache_key_throttled": lambda path: ("key", path)}
+        for const in ("DARK_MAX", "ALPHA_MIN", "MIN_AREA_FRAC", "MIN_FILL", "MIN_ASPECT", "MAX_ASPECT", "MAX_TILT_DEG", "MIN_TILT_DEG"):
+            ns["_BEZEL_LED_WINDOW_" + const] = getattr(gov, "BEZEL_LED_WINDOW_" + const)
+        for name in ("_bezel_led_box_tilt_deg", "_measure_bezel_led_shape", "_measure_bezel_led_window", "_store_bezel_led_window",
+                     "_bezel_measured_led_window", "_bezel_measured_led_tilt", "_blit_centered_led_text"):
+            exec(main_function_code(name), ns)
+        return ns
+
+    def _frame(self, window=(800, 100, 100, 60), wall=True, text=False):
+        surf = pygame.Surface((1000, 500), pygame.SRCALPHA)
+        surf.fill((90, 80, 70, 255))
+        surf.fill((0, 0, 0, 0), pygame.Rect(100, 100, 500, 300))
+        if wall:
+            surf.fill((10, 10, 10, 255), pygame.Rect(0, 0, 1000, 40))
+        surf.fill((0, 0, 0, 255), pygame.Rect(*window))
+        if text:
+            surf.fill((255, 40, 40, 255), pygame.Rect(window[0] + 20, window[1] + 15, 12, 30))
+            surf.fill((255, 40, 40, 255), pygame.Rect(window[0] + 50, window[1] + 15, 12, 30))
+        return surf
+
+    def test_window_is_measured_exactly(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_led_window"](self._frame(), self.HOLE)
+        self.assertEqual(frac, (0.8, 0.2, 0.1, 0.12))
+
+    def test_a_moved_window_gives_different_numbers(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_led_window"](self._frame(window=(700, 60, 120, 50)), self.HOLE)
+        self.assertEqual(frac, (0.7, 0.12, 0.12, 0.1))
+
+    def test_dark_wall_touching_the_top_edge_is_not_the_window(self):
+        ns = self._ns()
+        surf = self._frame(wall=True)
+        surf.fill((0, 0, 0, 255), pygame.Rect(700, 0, 30, 120))
+        frac = ns["_measure_bezel_led_window"](surf, self.HOLE)
+        self.assertEqual(frac, (0.8, 0.2, 0.1, 0.12))
+
+    def test_text_already_drawn_in_the_window_does_not_stop_the_measure(self):
+        ns = self._ns()
+        frac = ns["_measure_bezel_led_window"](self._frame(text=True), self.HOLE)
+        self.assertEqual(frac, (0.8, 0.2, 0.1, 0.12))
+
+    def test_a_thin_dark_strip_is_not_a_window(self):
+        ns = self._ns()
+        surf = self._frame(window=(800, 100, 6, 120))
+        self.assertIsNone(ns["_measure_bezel_led_window"](surf, self.HOLE))
+
+    def test_no_dark_square_gives_none(self):
+        ns = self._ns()
+        surf = pygame.Surface((1000, 500), pygame.SRCALPHA)
+        surf.fill((90, 80, 70, 255))
+        self.assertIsNone(ns["_measure_bezel_led_window"](surf, self.HOLE))
+
+    def test_only_bezels_with_a_number_readout_are_measured(self):
+        ns = self._ns()
+        ns["_store_bezel_led_window"](self._frame(), ("k", 1), "bezel2", self.HOLE)
+        self.assertNotIn(("k", 1), ns["_tv_border_led_window_cache"])
+        ns["_store_bezel_led_window"](self._frame(), ("k", 2), "bezel1", self.HOLE)
+        self.assertEqual(ns["_tv_border_led_window_cache"][("k", 2)], (0.8, 0.2, 0.1, 0.12))
+
+    def test_a_bezel_with_no_window_is_stored_as_none_and_warns_once(self):
+        ns = self._ns()
+        blank = pygame.Surface((1000, 500), pygame.SRCALPHA)
+        blank.fill((90, 80, 70, 255))
+        ns["_store_bezel_led_window"](blank, ("k", 3), "bezel", self.HOLE)
+        self.assertIsNone(ns["_tv_border_led_window_cache"][("k", 3)])
+        self.assertEqual(ns["log"].warning.call_count, 1)
+
+    def test_current_bezel_reads_its_own_measured_window(self):
+        ns = self._ns()
+        ns["_tv_border_current_path"]["path"] = "/b/bezel.png"
+        ns["_tv_border_led_window_cache"][("key", "/b/bezel.png")] = (0.8, 0.2, 0.1, 0.12)
+        self.assertEqual(ns["_bezel_measured_led_window"](), (0.8, 0.2, 0.1, 0.12))
+        ns["_tv_border_current_path"]["path"] = "/b/other.png"
+        self.assertIsNone(ns["_bezel_measured_led_window"]())
+
+    def test_text_is_centred_in_the_window(self):
+        ns = self._ns()
+        pygame.font.init()
+        screen = pygame.Surface((300, 200), pygame.SRCALPHA)
+        rect = pygame.Rect(100, 60, 80, 50)
+        font = pygame.font.Font(None, 30)
+        lbl_ch = font.render("CH", True, (0, 255, 0))
+        lbl_num = font.render("04", True, (0, 255, 0))
+        lbl_fit = font.render("88", True, (0, 255, 0))
+        ns["_blit_centered_led_text"](screen, rect, lbl_ch, lbl_num, lbl_fit, 6)
+        lit = screen.get_bounding_rect()
+        self.assertLessEqual(abs(lit.centery - rect.centery), 2)
+        self.assertLessEqual(abs(lit.centerx - rect.centerx), 4)
+
+    def test_the_draw_function_skips_the_black_patch_and_hand_tables_when_measured(self):
+        src = main_function_source("_draw_bezel_channel_led")
+        self.assertIn("measured=False", src)
+        self.assertIn("_led_stem = None if measured else stem", src)
+        self.assertLess(src.index("if measured:"), src.index("pygame.draw.rect(screen, (0, 0, 0), _hide_rect)"))
+
+    def test_governor_rows_exist(self):
+        for name in ("DARK_MAX", "ALPHA_MIN", "MIN_AREA_FRAC", "MIN_FILL", "MIN_ASPECT", "MAX_ASPECT"):
+            self.assertTrue(hasattr(gov, "BEZEL_LED_WINDOW_" + name))
+
+
+
+class TestBezelNumberWindowTilt(unittest.TestCase):
+    """The channel number leans with the black square of the bezel image, measured from its dark pixels"""
+
+    HOLE = (0.1, 0.2, 0.5, 0.6)
+
+    def _ns(self):
+        return TestBezelNumberWindowMeasured._ns(self)
+
+    def _frame(self, clockwise_deg, size=(100, 60), center=(850, 130)):
+        surf = pygame.Surface((1000, 500), pygame.SRCALPHA)
+        surf.fill((90, 80, 70, 255))
+        surf.fill((0, 0, 0, 0), pygame.Rect(100, 100, 500, 300))
+        box = pygame.Surface(size, pygame.SRCALPHA)
+        box.fill((0, 0, 0, 255))
+        if clockwise_deg:
+            box = pygame.transform.rotate(box, -clockwise_deg)
+        surf.blit(box, box.get_rect(center=center))
+        return surf
+
+    def test_a_square_leaning_right_measures_a_positive_tilt_and_its_level_size(self):
+        ns = self._ns()
+        frame, tilt = ns["_measure_bezel_led_shape"](self._frame(3.0), self.HOLE)
+        self.assertAlmostEqual(tilt, 3.0, delta=0.8)
+        self.assertAlmostEqual(frame[2] * 1000, 100, delta=3)
+        self.assertAlmostEqual(frame[3] * 500, 60, delta=3)
+        self.assertAlmostEqual((frame[0] + frame[2] / 2) * 1000, 850, delta=1.5)
+        self.assertAlmostEqual((frame[1] + frame[3] / 2) * 500, 130, delta=1.5)
+
+    def test_a_square_leaning_left_measures_a_negative_tilt(self):
+        ns = self._ns()
+        _frame, tilt = ns["_measure_bezel_led_shape"](self._frame(-4.0), self.HOLE)
+        self.assertAlmostEqual(tilt, -4.0, delta=0.8)
+
+    def test_a_level_square_has_no_tilt_and_the_exact_window(self):
+        ns = self._ns()
+        frame, tilt = ns["_measure_bezel_led_shape"](self._frame(0.0), self.HOLE)
+        self.assertEqual(tilt, 0.0)
+        self.assertEqual(frame, (0.8, 0.2, 0.1, 0.12))
+
+    def test_a_tilt_beyond_the_table_limit_is_treated_as_level(self):
+        ns = self._ns()
+        _frame, tilt = ns["_measure_bezel_led_shape"](self._frame(16.0), self.HOLE)
+        self.assertEqual(tilt, 0.0)
+
+    def test_the_tilt_is_stored_with_the_window_and_read_back(self):
+        ns = self._ns()
+        ns["_store_bezel_led_window"](self._frame(3.0), ("k", 9), "bezel", self.HOLE)
+        self.assertAlmostEqual(ns["_tv_border_led_tilt_cache"][("k", 9)], 3.0, delta=0.8)
+        ns["_tv_border_current_path"]["path"] = "/b/bezelHalloween.png"
+        ns["_tv_border_led_tilt_cache"][("key", "/b/bezelHalloween.png")] = 2.5
+        self.assertEqual(ns["_bezel_measured_led_tilt"](), 2.5)
+        ns["_tv_border_current_path"]["path"] = None
+        self.assertEqual(ns["_bezel_measured_led_tilt"](), 0.0)
+
+    def _lit(self, tilt):
+        ns = self._ns()
+        pygame.font.init()
+        screen = pygame.Surface((400, 240), pygame.SRCALPHA)
+        rect = pygame.Rect(120, 70, 160, 100)
+        font = pygame.font.Font(None, 30 * 4)
+        parts = [font.render(t, True, (0, 255, 0)) for t in ("CH", "04", "88")]
+        ns["_blit_centered_led_text"](screen, rect, parts[0], parts[1], parts[2], 6 * 4, tilt, 4)
+        return screen, rect
+
+    def test_text_leans_to_the_right_with_the_square(self):
+        screen, rect = self._lit(5.0)
+        left, right = [], []
+        for x in range(screen.get_width()):
+            for y in range(screen.get_height()):
+                if screen.get_at((x, y)).a > 128:
+                    (left if x < rect.centerx else right).append(y)
+        self.assertGreater(sum(right) / len(right), sum(left) / len(left) + 2)
+
+    def test_tilted_text_stays_centred_in_the_square(self):
+        screen, rect = self._lit(5.0)
+        lit = screen.get_bounding_rect()
+        self.assertLessEqual(abs(lit.centery - rect.centery), 3)
+        self.assertLessEqual(abs(lit.centerx - rect.centerx), 4)
+
+    def test_level_text_is_not_tilted(self):
+        screen, rect = self._lit(0.0)
+        left, right = [], []
+        for x in range(screen.get_width()):
+            for y in range(screen.get_height()):
+                if screen.get_at((x, y)).a > 128:
+                    (left if x < rect.centerx else right).append(y)
+        self.assertLess(abs(sum(right) / len(right) - sum(left) / len(left)), 2)
+
+    def test_both_callers_pass_the_measured_tilt(self):
+        self.assertEqual(MAIN_SRC.count("def _bezel_measured_led_tilt()"), 1)
+        self.assertEqual(MAIN_SRC.count("_bezel_measured_led_tilt()") - 1, 2)
+        src = main_function_source("_draw_bezel_channel_led")
+        self.assertIn("tilt_deg=0.0", src)
+        self.assertIn("_tilt_ss", src)
+
+    def test_governor_rows_exist(self):
+        self.assertTrue(hasattr(gov, "BEZEL_LED_WINDOW_MAX_TILT_DEG"))
+        self.assertTrue(hasattr(gov, "BEZEL_LED_WINDOW_MIN_TILT_DEG"))
+
+
+class TestHolidayWindow(unittest.TestCase):
+    """Only Halloween, Christmas and Thanksgiving are holidays, each lasting the 72 hours before midnight at the end of the day"""
+
+    def _key(self, y, m, d, forced=None, today=None):
+        return media.holiday_key_for_date(datetime.date(y, m, d), forced, today)
+
+    def test_halloween_window(self):
+        self.assertEqual([self._key(2026, 10, d) for d in (28, 29, 30, 31)], [None, "halloween", "halloween", "halloween"])
+        self.assertIsNone(self._key(2026, 11, 1))
+
+    def test_christmas_window(self):
+        self.assertEqual([self._key(2026, 12, d) for d in (22, 23, 24, 25, 26)], [None, "christmas", "christmas", "christmas", None])
+
+    def test_thanksgiving_is_the_fourth_thursday_and_its_window_is_three_days(self):
+        for year, day in ((2023, 23), (2024, 28), (2025, 27), (2026, 26)):
+            self.assertEqual(media.holiday_date("thanksgiving", year), datetime.date(year, 11, day))
+            self.assertEqual(self._key(year, 11, day), "thanksgiving")
+            self.assertEqual(self._key(year, 11, day - 2), "thanksgiving")
+            self.assertIsNone(self._key(year, 11, day - 3))
+            self.assertIsNone(self._key(year, 11, day + 1))
+
+    def test_valentine_and_new_year_are_no_longer_holidays(self):
+        for month, day in ((2, 14), (12, 31), (1, 1)):
+            self.assertIsNone(self._key(2026, month, day))
+        self.assertEqual(media.HOLIDAY_KEYS, ("halloween", "christmas", "thanksgiving"))
+
+    def test_a_forced_holiday_applies_from_today_on_and_never_to_a_past_day(self):
+        today = datetime.date(2026, 10, 24)
+        self.assertEqual(media.holiday_key_for_date(today, "christmas", today), "christmas")
+        self.assertEqual(media.holiday_key_for_date(datetime.date(2026, 10, 25), "christmas", today), "christmas")
+        self.assertEqual(media.holiday_key_for_date(datetime.date(2026, 12, 1), "christmas", today), "christmas")
+        self.assertIsNone(media.holiday_key_for_date(datetime.date(2026, 10, 23), "christmas", today))
+        self.assertIsNone(media.holiday_key_for_date(today, "", today))
+        self.assertIsNone(media.holiday_key_for_date(today, "valentine", today))
+        self.assertIsNone(media.holiday_key_for_date(today, "christmas", None))
+
+    def test_the_window_length_is_the_governor_value(self):
+        self.assertEqual(gov.HOLIDAY_WINDOW_DAYS, 3)
+        with patch.object(media, "_HOLIDAY_WINDOW_DAYS", 5):
+            self.assertEqual(self._key(2026, 10, 27), "halloween")
+            self.assertIsNone(self._key(2026, 10, 26))
+
+    def test_the_station_reads_holidays_through_the_one_function(self):
+        self.assertNotIn("m == 10 and 25 <= day <= 31", MAIN_SRC)
+        self.assertNotIn("m == 10 and 25 <= day <= 31", read(os.path.join(ROOT, "ui.py")))
+        self.assertEqual(MAIN_SRC.count("media.holiday_key_for_date("), 4, "the bezel, the scheduler, the boot loading image (read before the database is open) and the hub's future rows are the only readers")
+
+    def test_todays_holiday_key_reads_the_force_setting(self):
+        today = datetime.date(2026, 10, 24)
+        db = types.SimpleNamespace(config={})
+        ns = {"broadcast_clock": types.SimpleNamespace(date=lambda: today), "db": db, "media": media}
+        exec(main_function_code("_todays_holiday_key"), ns)
+        self.assertIsNone(ns["_todays_holiday_key"]())
+        db.config.update({"holiday_force_key": "thanksgiving", "holiday_force_channels": ["05"]})
+        self.assertEqual(ns["_todays_holiday_key"](), "thanksgiving", "the bezel reads the one forced holiday")
+        self.assertEqual(ns["_todays_holiday_key"](channel_key="05"), "thanksgiving")
+        self.assertEqual(ns["_todays_holiday_key"](channel_key="06"), "thanksgiving", "the force is on for every channel")
+        self.assertEqual(ns["_todays_holiday_key"](datetime.date(2026, 10, 30), "05"), "thanksgiving")
+        self.assertEqual(ns["_todays_holiday_key"](datetime.date(2026, 10, 30), "06"), "thanksgiving")
+        self.assertEqual(ns["_todays_holiday_key"](datetime.date(2026, 10, 23), "06"), None, "a past day never changes")
+
+    def test_a_forced_holiday_airs_its_files_today_and_off_airs_the_normal_ones(self):
+        def channel():
+            ch = _holiday_simple_channel()
+            ch["holiday_schedules"] = {"halloween": [{"path": "/m/Show H/Season 1/Show H S01E%02d.mkv" % (i + 1), "duration": 1500.0} for i in range(8)]}
+            return ch
+        start = datetime.datetime(2026, 10, 24, 10, 0, 5)
+        _c, forced = _holiday_run(channel(), start, 30, 120, force="halloween")
+        _c, plain = _holiday_run(channel(), start, 30, 120)
+        forced_files = [r["file"] for _w, r in forced if r.get("mode") == "Video"]
+        plain_files = [r["file"] for _w, r in plain if r.get("mode") == "Video"]
+        self.assertTrue(forced_files and all("Show H" in f for f in forced_files))
+        self.assertTrue(plain_files and not any("Show H" in f for f in plain_files))
+
+    def test_a_forced_holiday_follows_every_day_until_it_is_turned_off(self):
+        def channel():
+            ch = _holiday_simple_channel()
+            ch["holiday_schedules"] = {"halloween": [{"path": "/m/Show H/Season 1/Show H S01E%02d.mkv" % (i + 1), "duration": 1500.0} for i in range(8)]}
+            return ch
+        start = datetime.datetime(2026, 11, 3, 10, 0, 5)
+        _c, out = _holiday_run(channel(), start, 20, 120, force="halloween")
+        files = [r["file"] for _w, r in out if r.get("mode") == "Video"]
+        self.assertTrue(files and all("Show H" in f for f in files), "the forced holiday follows every day while it is on")
+        _c, normal = _holiday_run(channel(), start, 20, 120)
+        self.assertFalse(any("Show H" in r.get("file", "") for _w, r in normal))
+
+
+class TestHolidayForceToggle(unittest.TestCase):
+    """One force toggle per holiday row: switching it on from any channel forces that holiday on every channel and the bezel, and switching it off from any channel switches it off everywhere"""
+
+    FILES = {"halloween": [{"path": "a"}], "christmas": [{"path": "b"}], "thanksgiving": [{"path": "c"}]}
+
+    def _ns(self, config=None):
+        db = types.SimpleNamespace(config=dict(config or {}), channels_db={
+            "05": {"holiday_schedules": dict(self.FILES), "playback_anchor": {"file": "x"}},
+            "06": {"holiday_schedules": {"halloween": [{"path": "d"}]}, "playback_anchor": {"file": "y"}},
+            "07": {"holiday_schedules": {}, "playback_anchor": {"file": "z"}}},
+            save_settings_async=MagicMock())
+        ns = {"db": db, "media": media, "app_state": {"guide_refresh_token": 4},
+              "broadcast_clock": types.SimpleNamespace(date=lambda: datetime.date(2026, 10, 24))}
+        exec(main_function_code("_toggle_holiday_force"), ns)
+        return ns, db
+
+    def test_on_from_one_channel_is_on_for_every_channel_and_off_from_any_channel(self):
+        ns, db = self._ns()
+        self.assertTrue(ns["_toggle_holiday_force"]("halloween", "05"))
+        self.assertEqual(db.config["holiday_force_key"], "halloween")
+        self.assertEqual(db.config["holiday_force_channels"], ["05", "06", "07"])
+        for channel in ("05", "06", "07", "12"):
+            self.assertEqual(media.holiday_force_row_states(db.config, channel),
+                             {"halloween": "on", "christmas": "greyed", "thanksgiving": "greyed"}, "the toggle shows on in every channel's menu")
+            self.assertEqual(media.holiday_forced_key_for_channel(db.config, channel), "halloween", "every channel schedules the holiday, even one added later")
+        self.assertTrue(ns["_toggle_holiday_force"]("halloween", "07"), "any channel can turn it off")
+        self.assertEqual(db.config["holiday_force_key"], "")
+        self.assertEqual(db.config["holiday_force_channels"], [])
+        self.assertEqual(db.config["holiday_force_day"], "")
+        for channel in ("05", "06", "07"):
+            self.assertEqual(media.holiday_forced_key_for_channel(db.config, channel), "")
+            self.assertEqual(media.holiday_force_row_states(db.config, channel), {"halloween": "off", "christmas": "off", "thanksgiving": "off"})
+        self.assertEqual(db.save_settings_async.call_count, 2)
+
+    def test_the_day_it_was_switched_on_is_kept(self):
+        ns, db = self._ns()
+        ns["_toggle_holiday_force"]("halloween", "05")
+        self.assertEqual(db.config["holiday_force_day"], "2026-10-24")
+        self.assertTrue(media.holiday_force_started_today(db.config, datetime.date(2026, 10, 24)))
+        self.assertFalse(media.holiday_force_started_today(db.config, datetime.date(2026, 10, 25)))
+        self.assertFalse(media.holiday_force_started_today({}, datetime.date(2026, 10, 24)))
+
+    def test_the_force_stays_on_until_it_is_turned_off(self):
+        ns, db = self._ns()
+        ns["_toggle_holiday_force"]("christmas", "05")
+        for later in (datetime.date(2026, 10, 25), datetime.date(2027, 3, 3)):
+            self.assertEqual(media.holiday_key_for_date(later, media.holiday_forced_key_for_channel(db.config, "05"), datetime.date(2026, 10, 24)), "christmas")
+
+    def test_the_other_two_holidays_are_greyed_while_one_is_forced(self):
+        ns, db = self._ns({"holiday_force_key": "halloween", "holiday_force_channels": ["05"]})
+        self.assertFalse(ns["_toggle_holiday_force"]("christmas", "05"))
+        self.assertFalse(ns["_toggle_holiday_force"]("thanksgiving", "06"))
+        self.assertEqual(db.config["holiday_force_key"], "halloween")
+        self.assertEqual(media.holiday_force_row_states(db.config, "05"),
+                         {"halloween": "on", "christmas": "greyed", "thanksgiving": "greyed"})
+
+    def test_on_another_channel_only_the_forced_holidays_own_switch_is_open_and_it_turns_everything_off(self):
+        cfg = {"holiday_force_key": "halloween", "holiday_force_channels": ["05"]}
+        self.assertEqual(media.holiday_force_enabled_rows(cfg, "06"), (0,))
+        ns, db = self._ns(cfg)
+        self.assertTrue(ns["_toggle_holiday_force"]("halloween", "06"))
+        self.assertEqual(media.holiday_forced_key_global(db.config), "")
+        self.assertEqual(media.holiday_forced_key_for_channel(db.config, "05"), "")
+
+    def test_a_channel_without_that_holidays_files_can_still_turn_it_on(self):
+        ns, db = self._ns()
+        self.assertEqual(media.holiday_force_row_states(db.config, "07"), {"halloween": "off", "christmas": "off", "thanksgiving": "off"})
+        self.assertEqual(media.holiday_force_enabled_rows(db.config, "07"), (0, 1, 2))
+        self.assertTrue(ns["_toggle_holiday_force"]("halloween", "07"))
+        self.assertEqual(db.config["holiday_force_channels"], ["05", "06", "07"])
+        self.assertEqual(media.holiday_forced_key_global(db.config), "halloween", "the bezel follows even when no channel has files")
+        self.assertEqual(media.holiday_force_row_states(db.config, "07")["halloween"], "on")
+        self.assertEqual(media.holiday_force_row_states(db.config, "07")["christmas"], "greyed")
+        self.assertTrue(ns["_toggle_holiday_force"]("halloween", "07"))
+        self.assertEqual(media.holiday_forced_key_global(db.config), "")
+
+    def test_a_channel_without_files_keeps_its_live_anchor_when_toggled(self):
+        ns, db = self._ns()
+        ns["_toggle_holiday_force"]("halloween", "07")
+        self.assertEqual(db.channels_db["07"]["playback_anchor"], {"file": "z"}, "its schedule does not change, so its airing show is not touched")
+        self.assertEqual(ns["app_state"]["guide_refresh_token"], 5)
+        ns["_toggle_holiday_force"]("halloween", "07")
+        self.assertEqual(db.channels_db["07"]["playback_anchor"], {"file": "z"})
+
+    def test_a_channel_without_files_airs_its_normal_programming_while_forced(self):
+        def channel():
+            ch = _holiday_simple_channel()
+            ch["holiday_schedules"] = {"halloween": []}
+            return ch
+        start = datetime.datetime(2026, 10, 24, 10, 0, 5)
+        _c, forced = _holiday_run(channel(), start, 30, 120, force="halloween")
+        _c, plain = _holiday_run(channel(), start, 30, 120)
+        self.assertEqual([(w, r.get("mode"), r.get("file")) for w, r in forced], [(w, r.get("mode"), r.get("file")) for w, r in plain])
+
+    def test_scheduling_follows_the_one_forced_holiday_on_every_channel(self):
+        cfg = {"holiday_force_key": "christmas", "holiday_force_channels": ["05", "06"]}
+        for channel in ("05", 5, "06", "07", "40"):
+            self.assertEqual(media.holiday_forced_key_for_channel(cfg, channel), "christmas")
+        self.assertEqual(media.holiday_forced_key_for_channel({"holiday_force_key": "christmas", "holiday_force_channels": []}, "05"), "", "a key with no channels is off")
+        self.assertEqual(media.holiday_forced_key_global({"holiday_force_key": "christmas", "holiday_force_channels": []}), "")
+
+    def test_an_unknown_holiday_is_refused(self):
+        ns, db = self._ns()
+        self.assertFalse(ns["_toggle_holiday_force"]("valentine", "05"))
+        self.assertEqual(db.config.get("holiday_force_key", ""), "")
+
+    def test_no_channel_loses_its_live_anchor_so_the_airing_show_finishes_first(self):
+        ns, db = self._ns()
+        ns["_toggle_holiday_force"]("halloween", "05")
+        self.assertEqual(db.channels_db["05"]["playback_anchor"], {"file": "x"}, "the airing show holds until it ends")
+        self.assertEqual(db.channels_db["06"]["playback_anchor"], {"file": "y"})
+        self.assertEqual(ns["app_state"]["guide_refresh_token"], 5)
+        ns["_toggle_holiday_force"]("halloween", "05")
+        self.assertEqual(db.channels_db["05"]["playback_anchor"], {"file": "x"}, "switching it off waits too")
+
+    def _forced_takeover(self, force_day):
+        channel = _holiday_simple_channel()
+        channel["holiday_schedules"] = {"halloween": [{"path": "/m/Spooky/Spooky S01E%02d.mkv" % (i + 1), "duration": 1500.0} for i in range(6)]}
+        channels = {"05": channel}
+        airing = channel["schedules"]["Morning"][0]["path"]
+        start = datetime.datetime(2026, 10, 24, 10, 0, 0)
+        clock, ticks = [start], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        ns["db"].config["holiday_force_key"] = "halloween"
+        ns["db"].config["holiday_force_channels"] = ["05"]
+        ns["db"].config["holiday_force_day"] = force_day
+        lengths = {os.path.normpath(x["path"]): x["duration"] for x in channel["holiday_schedules"]["halloween"]}
+        ns["_read_file_probe_facts"] = lambda p: {"duration": lengths.get(os.path.normpath(p))}
+        state = {"value": "Playing"}
+        fake_vlc = types.SimpleNamespace(State=types.SimpleNamespace(Ended="Ended", Error="Error", Stopped="Stopped"))
+        media_obj = types.SimpleNamespace(get_mrl=lambda: "file:///" + airing)
+        player = types.SimpleNamespace(get_state=lambda: state["value"], get_media=lambda: media_obj)
+        ns["vlc"] = fake_vlc
+        ns["vlc_engine"] = types.SimpleNamespace(player=player)
+        ns["app_state"].update({"_live_playback_channel": "05", "is_playing_video": True})
+        channel["playback_anchor"] = {"file": airing, "wall_start": 10 * 3600.0, "seek_offset": 0, "duration": 1620.0,
+                                      "slot_start_seek": 0, "mode": "Video", "block": "Morning"}
+        real_read = media.read_track_duration
+
+        def read(path, default=0):
+            known = lengths.get(os.path.normpath(path))
+            return (known, media.DURATION_MEASURED) if known else real_read(path, default)
+
+        seen = []
+        with patch.object(media, "read_track_duration", read), patch.object(media, "_cached_path_exists", lambda p: True):
+            for seconds in (30, 600, 1610):
+                clock[0] = start + datetime.timedelta(seconds=seconds)
+                ticks[0] += 10000
+                seen.append(ns["calculate_slotted_playback_state"]("05"))
+            state["value"] = "Ended"
+            clock[0] = start + datetime.timedelta(seconds=1622)
+            ticks[0] += 10000
+            after = ns["calculate_slotted_playback_state"]("05")
+            clock[0] = start + datetime.timedelta(seconds=1922)
+            ticks[0] += 10000
+            later = ns["calculate_slotted_playback_state"]("05")
+        return airing, seen, after, later
+
+    def test_a_forced_holiday_waits_for_the_airing_show_to_end(self):
+        airing, seen, after, _later = self._forced_takeover("2026-10-24")
+        for result in seen:
+            self.assertEqual(os.path.normpath(result["file"]), os.path.normpath(airing), "the airing show keeps airing while it plays")
+        self.assertIn("Spooky", str(after.get("file")), "once the show has ended the holiday media airs")
+
+    def test_the_first_forced_day_starts_its_first_entry_when_the_show_ends(self):
+        _airing, _seen, after, later = self._forced_takeover("2026-10-24")
+        self.assertLessEqual(after["seek"], 2.0, "the holiday media starts at its beginning, not part way in")
+        self.assertEqual(after["file"], later["file"], "and it carries on from there on the clock")
+        self.assertAlmostEqual(later["seek"] - after["seek"], 300.0, delta=1.0)
+
+    def test_a_forced_holiday_from_an_earlier_day_keeps_the_half_hour_grid(self):
+        _airing, _seen, after, _later = self._forced_takeover("2026-10-23")
+        self.assertGreater(after["seek"], 100.0, "only the day it was switched on starts at the end of the show")
+
+    def test_navigation_reaches_every_toggle_greyed_or_not(self):
+        state = {}
+        up, down, left, right = mn.UP, mn.DOWN, mn.LEFT, mn.RIGHT
+        pos = (0, 0)
+        for d in (right, down, down):
+            pos = mn.holiday_move(state, pos[0], pos[1], d)
+        self.assertEqual(pos, (2, 1), "down the toggle column passes every row")
+        pos = mn.holiday_move(state, pos[0], pos[1], down)
+        self.assertEqual(pos, (3, 0), "down from the last toggle reaches Close")
+        pos = mn.holiday_move(state, pos[0], pos[1], up)
+        self.assertEqual(pos, (2, 0), "up from Close lands on the last file picker")
+        self.assertEqual(mn.holiday_move(state, 0, 0, right), (0, 1))
+        self.assertEqual(mn.holiday_move(state, 1, 0, right), (1, 1))
+        self.assertEqual(mn.holiday_move(state, 2, 0, right), (2, 1))
+        self.assertEqual(mn.holiday_move(state, 1, 1, left), (1, 0))
+        self.assertEqual(mn.holiday_move(state, 0, 1, up), (0, 1), "the top toggle stays put")
+        self.assertEqual(mn.holiday_move(state, 1, 1, up), (0, 1))
+        self.assertEqual(mn.holiday_move(state, 3, 0, right), (3, 0), "Close has no second column")
+
+    def test_navigation_no_longer_takes_a_list_of_open_toggles(self):
+        import inspect
+        self.assertEqual(list(inspect.signature(mn.holiday_table).parameters), [])
+        self.assertEqual(list(inspect.signature(mn.holiday_move).parameters), ["app_state", "row", "col", "direction"])
+
+    def _enter_on_toggle(self, config, row):
+        text = read(MAIN_SCRIPT)
+        runner = runner_for(text, "HOLIDAY_SUB_MENU", "HOLIDAY_SUB_MENU")
+        db = n6_FakeDb(**config)
+        db.channels_db = {"07": {"active": True, "holiday_schedules": {}}}
+        state = {"menu_layer": "HOLIDAY_SUB_MENU", "sub_menu_row_index": row, "sub_menu_col_index": 1, "selected_channel_row": 7}
+        calls = []
+        env = make_env()
+        env["_toggle_holiday_force"] = lambda key, ch: calls.append((key, ch)) or True
+        event = types.SimpleNamespace(key=pygame.K_RETURN)
+        work = dict(state)
+        with Quiet():
+            runner(event, work, db, env)
+        return calls, work
+
+    def test_enter_on_a_greyed_toggle_does_nothing(self):
+        cfg = {"holiday_force_key": "christmas", "holiday_force_channels": ["07"]}
+        calls, work = self._enter_on_toggle(cfg, 0)
+        self.assertEqual(calls, [], "Halloween's toggle is greyed while Christmas is forced")
+        self.assertEqual((work["sub_menu_row_index"], work["sub_menu_col_index"]), (0, 1), "the highlight stays on the greyed toggle")
+        calls, _work = self._enter_on_toggle(cfg, 2)
+        self.assertEqual(calls, [], "Thanksgiving's toggle is greyed too")
+
+    def test_enter_on_an_open_toggle_switches_it(self):
+        cfg = {"holiday_force_key": "christmas", "holiday_force_channels": ["07"]}
+        calls, _work = self._enter_on_toggle(cfg, 1)
+        self.assertEqual(calls, [("christmas", "07")], "the forced holiday's own toggle can switch it off")
+        calls, _work = self._enter_on_toggle({}, 0)
+        self.assertEqual(calls, [("halloween", "07")])
+
+    def test_the_menu_handler_has_three_rows_two_columns_and_the_toggle(self):
+        src = MAIN_SRC[MAIN_SRC.index('elif app_state["menu_layer"] == "HOLIDAY_SUB_MENU":'):]
+        src = src[:src.index('elif app_state["menu_layer"] == "GAMES_LIST":')]
+        self.assertIn("media.HOLIDAY_KEYS", src)
+        self.assertIn("_toggle_holiday_force(HKEYS[sub_row], target_ch_str)", src)
+        self.assertIn("media.holiday_force_enabled_rows(", src)
+        self.assertNotIn("valentine", src)
+
+    def test_the_menu_picture_has_three_holidays_and_a_greyed_state(self):
+        src = read(os.path.join(ROOT, "ui.py"))
+        part = src[src.index('layer == "HOLIDAY_SUB_MENU"'):src.index("# SECTION: Video tab")]
+        self.assertIn("media.HOLIDAY_KEYS", part)
+        self.assertIn("media.holiday_force_row_states(", part)
+        self.assertIn("_tog_greyed", part)
+        self.assertIn("_tog_focused = (sub_r == h_idx and sub_c == 1)", part, "a greyed toggle still shows the highlight")
+        self.assertIn("_hol_slot_h", part, "the three rows are spread over the panel")
+        self.assertNotIn("y_gap_hol", part)
+        self.assertNotIn("Valentine", part)
+        self.assertNotIn("New Year", part)
+
+    def test_the_guide_and_the_scheduler_read_the_channels_own_force(self):
+        self.assertIn("media.holiday_forced_key_for_channel(db.config, ch_str)", read(os.path.join(ROOT, "ui.py")))
+        self.assertIn("media.holiday_forced_key_for_channel(db.config, target_clean_key)", MAIN_SRC)
+
+
+class TestHolidayFilesAreScanned(unittest.TestCase):
+    """Holiday files that no normal lineup holds are fed to the duration, picture-box and loudness scans"""
+
+    TODAY = datetime.date(2026, 10, 24)
+
+    def _ns(self, channels, pending, config=None):
+        db = types.SimpleNamespace(config=dict(config or {}), channels_db=channels)
+        ns = {"db": db, "media": media, "os": os, "log": MagicMock(),
+              "broadcast_clock": types.SimpleNamespace(date=lambda: self.TODAY),
+              "SCAN_GATHER_LIBRARY_LOOKUPS": 400, "HOLIDAY_SCAN_LEAD_DAYS": 7,
+              "_cached_path_exists": lambda p: True,
+              "_scan_stages_pending": lambda p, g, d, lk: os.path.normpath(p) in {os.path.normpath(x) for x in pending}}
+        for name in ("_paths_from_entry", "_todays_holiday_key", "_gather_holiday_scan_items"):
+            exec(main_function_code(name), ns)
+        return ns
+
+    def _ch(self, **holidays):
+        return {"active": True, "schedules": {}, "holiday_schedules": holidays}
+
+    def test_a_holiday_only_file_is_found_and_labelled_with_its_holiday(self):
+        ns = self._ns({"05": self._ch(halloween=[{"path": "/m/h1.mkv"}])}, ["/m/h1.mkv"])
+        active, soon, later = ns["_gather_holiday_scan_items"]()
+        self.assertEqual((active, later), ([], []))
+        self.assertEqual(soon, [("channel", "05", "halloween", os.path.normpath("/m/h1.mkv"))])
+
+    def test_a_file_already_scanned_is_not_queued(self):
+        ns = self._ns({"05": self._ch(halloween=[{"path": "/m/h1.mkv"}, {"path": "/m/h2.mkv"}])}, ["/m/h2.mkv"])
+        self.assertEqual([it[3] for it in ns["_gather_holiday_scan_items"]()[1]], [os.path.normpath("/m/h2.mkv")])
+
+    def test_the_holiday_on_air_comes_first_then_the_nearest_then_the_far_ones(self):
+        today = datetime.date(2026, 11, 22)
+        ns = self._ns({"05": self._ch(halloween=[{"path": "/m/h.mkv"}], christmas=[{"path": "/m/c.mkv"}]),
+                       "06": self._ch(thanksgiving=[{"path": "/m/t.mkv"}])}, ["/m/h.mkv", "/m/c.mkv", "/m/t.mkv"],
+                      {"holiday_force_key": "halloween", "holiday_force_channels": ["05"]})
+        ns["broadcast_clock"] = types.SimpleNamespace(date=lambda: today)
+        active, soon, later = ns["_gather_holiday_scan_items"]()
+        self.assertEqual([it[2] for it in active], ["halloween"], "forced on, so on air")
+        self.assertEqual([it[2] for it in soon], ["thanksgiving"], "its window opens in 2 days, inside the 7-day lead")
+        self.assertEqual([it[2] for it in later], ["christmas"], "its window opens in 31 days")
+
+    def test_a_forced_holiday_counts_as_on_air_for_every_channel(self):
+        ns = self._ns({"05": self._ch(christmas=[{"path": "/m/c5.mkv"}]), "06": self._ch(christmas=[{"path": "/m/c6.mkv"}])},
+                      ["/m/c5.mkv", "/m/c6.mkv"], {"holiday_force_key": "christmas", "holiday_force_channels": ["05"]})
+        active, soon, later = ns["_gather_holiday_scan_items"]()
+        self.assertEqual(sorted(it[1] for it in active), ["05", "06"])
+        self.assertEqual(later, [])
+
+    def test_one_file_on_two_channels_is_queued_once(self):
+        ns = self._ns({"05": self._ch(halloween=[{"path": "/m/h.mkv"}]), "06": self._ch(halloween=[{"path": "/m/h.mkv"}])}, ["/m/h.mkv"])
+        self.assertEqual(len(ns["_gather_holiday_scan_items"]()[1]), 1)
+
+    def test_a_pair_entry_queues_both_episodes(self):
+        pair = {"is_pair": True, "pair_ep1_path": "/m/a.mkv", "pair_ep2_path": "/m/b.mkv"}
+        ns = self._ns({"05": self._ch(halloween=[pair])}, ["/m/a.mkv", "/m/b.mkv"])
+        self.assertEqual(len(ns["_gather_holiday_scan_items"]()[1]), 2)
+
+    def test_broken_missing_inactive_server_and_visualizer_channels_are_skipped(self):
+        broken = self._ch(halloween=[{"path": "/m/bad.mkv"}])
+        broken["broken_files"] = ["/m/bad.mkv"]
+        off = self._ch(halloween=[{"path": "/m/off.mkv"}]); off["active"] = False
+        server = self._ch(halloween=[{"path": "/m/srv.mkv"}]); server["server_locked"] = True
+        vis = self._ch(halloween=[{"path": "/m/vis.mp3"}]); vis["is_visualizer"] = True
+        ns = self._ns({"05": broken, "06": off, "07": server, "08": vis, "09": self._ch(halloween=[{"path": "/m/gone.mkv"}])},
+                      ["/m/bad.mkv", "/m/off.mkv", "/m/srv.mkv", "/m/vis.mp3", "/m/gone.mkv"])
+        ns["_cached_path_exists"] = lambda p: "gone" not in p
+        self.assertEqual(ns["_gather_holiday_scan_items"](), ([], [], []))
+
+    def test_a_failure_is_logged_and_the_rest_of_the_scan_goes_on(self):
+        ns = self._ns({"05": self._ch(halloween=[{"path": "/m/h.mkv"}])}, ["/m/h.mkv"])
+        ns["_scan_stages_pending"] = MagicMock(side_effect=RuntimeError("boom"))
+        self.assertEqual(ns["_gather_holiday_scan_items"](), ([], [], []))
+        self.assertIn("[HOLIDAY SCAN]", ns["log"].warning.call_args[0][0])
+
+    def test_the_deep_backlog_puts_holiday_files_ahead_of_the_deep_lineup_and_the_far_ones_last(self):
+        calls = {}
+        ns = {"db": types.SimpleNamespace(channels_db={}), "os": os, "_scan_snapshot_channel": lambda ch: None,
+              "SCAN_GATHER_LIBRARY_LOOKUPS": 400, "_front_load_watched_channel": lambda items: items,
+              "_gather_holiday_scan_items": lambda: ([("channel", "05", "halloween", "A")], [("channel", "05", "christmas", "B")], [("channel", "05", "thanksgiving", "C")])}
+        exec(main_function_code("_gather_deep_backlog_queue"), ns)
+        self.assertEqual([it[3] for it in ns["_gather_deep_backlog_queue"]()], ["A", "B", "C"])
+
+    def test_the_holiday_item_reaches_every_scan_lane_through_the_one_pipeline(self):
+        order = {}
+        ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3}
+        exec(main_function_code("_order_scan_pipeline"), ns)
+        out = ns["_order_scan_pipeline"]([[], [], [], []], [("channel", "05", "halloween", "/m/h.mkv")])
+        self.assertEqual(out, [(3, 4, "channel", "05", "halloween", "/m/h.mkv")])
+        self.assertIn("_order_scan_pipeline(_gather_probe_priority_queue(), _gather_deep_backlog_queue())", MAIN_SRC)
+        self.assertIn("_order_scan_pipeline(tiers, _gather_deep_backlog_queue())", MAIN_SRC)
+
+    def test_a_scan_result_for_a_holiday_file_is_written_into_the_holiday_list(self):
+        src = MAIN_SRC[MAIN_SRC.index("def _patch_probed_gain("):]
+        src = src[:src.index("\ndef ", 10)]
+        self.assertIn('for container_key in ("schedules", "holiday_schedules"):', src)
+
+    def test_days_until_a_holiday_window_opens(self):
+        d = datetime.date
+        self.assertEqual(media.holiday_days_until_open("halloween", d(2026, 10, 24)), 5)
+        self.assertEqual(media.holiday_days_until_open("halloween", d(2026, 10, 29)), 0)
+        self.assertEqual(media.holiday_days_until_open("halloween", d(2026, 10, 31)), 0)
+        self.assertEqual(media.holiday_days_until_open("halloween", d(2026, 11, 1)), 362, "next year's Halloween window opens 29 October 2027")
+        self.assertIsNone(media.holiday_days_until_open("valentine", d(2026, 10, 24)))
+
+    def test_the_lead_time_is_a_governor_row(self):
+        self.assertEqual(gov.HOLIDAY_SCAN_LEAD_DAYS, 7)
+        self.assertIn("performance_governor.HOLIDAY_SCAN_LEAD_DAYS", MAIN_SRC)
+
+
+class TestHolidayBezelFiles(unittest.TestCase):
+    """On a holiday, bezel option 1 shows bezel<Holiday>.png, option 2 bezel<Holiday>1.png and option 3 bezel<Holiday>2.png"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        for name in ("bezel.png", "bezel1.png", "bezel2.png", "bezelChristmas.png", "bezelChristmas1.png",
+                     "bezelHalloween.png", "bezelthanksgiving1.PNG", "bezelChristmas2.png", "bezelHalloween2.png", "bezelThanksgiving2.png"):
+            with open(os.path.join(self.dir, name), "wb") as handle:
+                handle.write(b"x")
+        media._bezel_dir_cache.update({"dir": self.dir, "checked_at": time.monotonic() + 3600})
+        media._bezel_style_files_cache.update({"key": None, "files": [], "checked_at": 0.0})
+        media._holiday_bezel_files_cache.update({"key": None, "files": {}, "checked_at": 0.0})
+
+    def tearDown(self):
+        media._bezel_dir_cache.update({"dir": None, "checked_at": 0.0})
+        media._bezel_style_files_cache.update({"key": None, "files": [], "checked_at": 0.0})
+        media._holiday_bezel_files_cache.update({"key": None, "files": {}, "checked_at": 0.0})
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _p(self, name):
+        return os.path.join(self.dir, name)
+
+    def test_holiday_images_are_not_bezel_styles(self):
+        names = [os.path.basename(p) for p in media.discover_bezel_style_files()]
+        self.assertEqual(names, ["bezel.png", "bezel1.png", "bezel2.png"])
+
+    def test_option_one_and_two_pick_their_own_holiday_image(self):
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel.png"), "christmas"), self._p("bezelChristmas.png"))
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel1.png"), "christmas"), self._p("bezelChristmas1.png"))
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel.png"), "halloween"), self._p("bezelHalloween.png"))
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel1.png"), "thanksgiving"), self._p("bezelthanksgiving1.PNG"))
+
+    def test_a_missing_holiday_image_means_the_normal_bezel(self):
+        self.assertIsNone(media.holiday_bezel_path_for(self._p("bezel1.png"), "halloween"))
+        self.assertIsNone(media.holiday_bezel_path_for(self._p("bezel.png"), "thanksgiving"))
+
+    def test_option_three_picks_its_own_holiday_image(self):
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel2.png"), "christmas"), self._p("bezelChristmas2.png"))
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel2.png"), "halloween"), self._p("bezelHalloween2.png"))
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel2.png"), "thanksgiving"), self._p("bezelThanksgiving2.png"))
+        self.assertEqual(media.holiday_bezel_path_for(self._p("bezel.png"), "thanksgiving"), None, "option 1 has no Thanksgiving file here, so the plain bezel stays")
+
+    def test_other_holidays_have_no_override(self):
+        self.assertIsNone(media.holiday_bezel_path_for(self._p("bezel.png"), "valentine"))
+        self.assertIsNone(media.holiday_bezel_path_for(self._p("bezel.png"), None))
+        self.assertIsNone(media.holiday_bezel_path_for(None, "christmas"))
+
+    def _resolver(self, style, holiday):
+        ns = {"os": os, "log": MagicMock(), "media": media, "NATIVE_WIDTH": 1920, "NATIVE_HEIGHT": 1080,
+              "db": types.SimpleNamespace(config={"bezel_style": style}),
+              "resolve_bezel_dir": media.resolve_bezel_dir, "discover_bezel_style_files": media.discover_bezel_style_files,
+              "_todays_holiday_key": lambda d=None: holiday}
+        for name in ("_real_screen_is_true_169", "_holiday_bezel_override", "_resolve_current_bezel_path"):
+            exec(main_function_code(name), ns)
+        return ns["_resolve_current_bezel_path"]
+
+    def test_the_station_shows_the_holiday_image_only_on_a_holiday(self):
+        self.assertEqual(self._resolver(1, None)(), self._p("bezel.png"))
+        self.assertEqual(self._resolver(1, "christmas")(), self._p("bezelChristmas.png"))
+        self.assertEqual(self._resolver(2, "christmas")(), self._p("bezelChristmas1.png"))
+        self.assertEqual(self._resolver(3, "christmas")(), self._p("bezelChristmas2.png"))
+        self.assertEqual(self._resolver(3, "halloween")(), self._p("bezelHalloween2.png"))
+        self.assertEqual(self._resolver(3, None)(), self._p("bezel2.png"))
+        self.assertEqual(self._resolver(2, "halloween")(), self._p("bezel1.png"))
+
+    def test_a_holiday_image_counts_as_the_style_it_replaces(self):
+        ns = {"re": re}
+        exec(main_function_code("_bezel_style_stem"), ns)
+        stem = ns["_bezel_style_stem"]
+        self.assertEqual(stem("bezelchristmas"), "bezel")
+        self.assertEqual(stem("bezelChristmas1"), "bezel1")
+        self.assertEqual(stem("borderhalloween1"), "border1")
+        self.assertEqual(stem("bezel2"), "bezel2")
+        self.assertEqual(stem("bezelchristmas2"), "bezel2")
+        self.assertEqual(stem("bezelThanksgiving2"), "bezel2")
+        self.assertIsNone(stem(None))
+
+    def test_the_boot_preloader_measures_holiday_images_too(self):
+        self.assertIn("discover_holiday_bezel_files", main_function_source("_preload_all_bezel_styles"))
+
+    def test_every_stem_reader_goes_through_the_style_stem(self):
+        for name in ("_bezel_channel_led_rect", "_bezel_led_stem", "_full_tv_border_cutout_frac", "_active_bezel_stem"):
+            self.assertIn("_bezel_style_stem(", main_function_source(name), name)
+
+
+class TestAddedSeasonsAndMoviesJoin(unittest.TestCase):
+    def _ep(self, season, n):
+        return {"path": "C:/v/CH 05/Zed Show/Season %d/Zed Show - S%02dE%02d.mp4" % (season, season, n), "duration": 1320.0,
+                "title": "Zed Show - S%02dE%02d" % (season, n)}
+
+    def _run(self, add_season, add_day=4, days=14):
+        eps = [self._ep(s, n) for s in (1, 3, 4) for n in (1, 2)]
+        pos, aired = {}, []
+        for day in range(1, days + 1):
+            if day == add_day:
+                eps += [self._ep(add_season, n) for n in (1, 2)]
+            tracks, pos, _ = media.build_show_rotation(eps, "one_slot", pos, "d%d" % day, pair_threshold_seconds=0,
+                                                       episode_order_mode="sequential", block_duration_seconds=1800, channel_id="05")
+            aired += [int(t["path"].rsplit(" - S", 1)[1][:2]) for t in tracks if not t.get("is_commercial")]
+        return aired
+
+    def test_added_season_behind_the_position_waits_for_the_round_to_come_round(self):
+        aired = self._run(2)
+        self.assertEqual(aired[:6], [1, 1, 3, 3, 4, 4])
+        self.assertEqual(aired[6:10], [1, 1, 2, 2])
+
+    def test_added_season_ahead_of_the_position_plays_next(self):
+        aired = self._run(5)
+        self.assertEqual(aired[4:8], [4, 4, 5, 5])
+
+    def test_added_movies_join_the_current_round_and_each_airs_once_per_round(self):
+        mv = lambda n: {"path": "C:/v/Movies/Movie %02d (1999).mkv" % n, "duration": 6000.0, "title": "Movie %02d" % n}
+        eps, pos, aired = [mv(i) for i in range(1, 6)], {}, []
+        for day in range(1, 14):
+            if day == 4:
+                eps += [mv(6), mv(7)]
+            tracks, pos, _ = media.build_show_rotation(eps, "one_slot", pos, "d%d" % day, pair_threshold_seconds=0,
+                                                       episode_order_mode="sequential", block_duration_seconds=7200, channel_id="06")
+            aired += [int(t["path"].split("Movie ")[1][:2]) for t in tracks if not t.get("is_commercial")]
+        self.assertEqual(sorted(aired[:7]), list(range(1, 8)))
+        self.assertIn(6, aired)
+        self.assertIn(7, aired)
+
+
+# ============================================================================
+# SECTION: Holiday day cycles
+# ============================================================================
+
+_HOLIDAY_START = datetime.datetime(2026, 10, 29, 1, 10, 5)
+_HOLIDAY_END = datetime.datetime(2026, 11, 1, 0, 0, 0)
+
+
+def _holiday_simple_channel(episodes=12):
+    channel = _sched_record_channel("eight_hour", "interrupt_half_hour", "random_slots", False)
+    items = []
+    for show in "ABC":
+        items += [{"path": "/m/Show %s/Season 1/Show %s S01E%02d.mkv" % (show, show, i + 1),
+                   "duration": 1800.0 if show == "B" else 1500.0} for i in range(episodes)]
+    channel["schedules"] = {"Morning": list(items), "Evening": list(items), "Night": list(items), "Commercials": []}
+    channel["holiday_schedules"] = {"halloween": list(items)}
+    channel["pair_threshold_minutes"] = 0
+    return channel
+
+
+def _holiday_rich_channel():
+    channel = _sched_record_channel("eight_hour", "interrupt_half_hour", "random_slots", True)
+    shows, movies, _ads = _sched_record_library()
+    shorts = [{"path": "/m/Show D/Season 1/Show D S01E%02d.mkv" % (i + 1), "duration": 660.0} for i in range(7)]
+    channel["holiday_schedules"] = {"halloween": [dict(x) for x in shows + movies + shorts]}
+    channel["pair_threshold_minutes"] = 15
+    return channel
+
+
+def _holiday_run(channel, start, steps, step_seconds, stale_path=None, stale_at=None, restart_at=None, seen=None, force=""):
+    channels = {"05": channel}
+    clock, ticks = [start], [0]
+    ns = _sched_record_ns(channels, clock, ticks)
+    ns["db"].config["holiday_force_key"] = force
+    ns["db"].config["holiday_force_channels"] = ["05"] if force else []
+    lengths = {os.path.normpath(x["path"]): x["duration"] for x in channel["holiday_schedules"]["halloween"]}
+    lengths.update({os.path.normpath(x["path"]): x["duration"] for x in channel["schedules"].get("Commercials", [])})
+
+    def wire(namespace):
+        namespace["_read_file_probe_facts"] = lambda p: {"duration": lengths.get(os.path.normpath(p))}
+
+    wire(ns)
+    real_read = media.read_track_duration
+
+    def read(path, default=0):
+        known = lengths.get(os.path.normpath(path))
+        return (known, media.DURATION_MEASURED) if known else real_read(path, default)
+
+    real_cut, real_reflavor = media.cycle_positions_at_block_end, media.reflavor_holiday_cycle
+
+    def counted_cut(*args, **kwargs):
+        result = real_cut(*args, **kwargs)
+        if seen is not None:
+            seen[result[1]] = seen.get(result[1], 0) + 1
+        return result
+
+    def counted_reflavor(*args, **kwargs):
+        result = real_reflavor(*args, **kwargs)
+        if seen is not None:
+            seen["reflavor_ok" if result is not None else "reflavor_none"] = seen.get("reflavor_ok" if result is not None else "reflavor_none", 0) + 1
+        return result
+
+    out = []
+    with patch.object(media, "read_track_duration", read), patch.object(media, "cycle_positions_at_block_end", counted_cut), \
+            patch.object(media, "reflavor_holiday_cycle", counted_reflavor):
+        for i in range(steps):
+            clock[0] = start + datetime.timedelta(seconds=i * step_seconds)
+            ticks[0] += 10000
+            if stale_at is not None and i == stale_at:
+                lengths[os.path.normpath(stale_path)] += 420.0
+            if restart_at is not None and i == restart_at:
+                ns = _sched_record_ns(channels, clock, ticks)
+                ns["db"].config["holiday_force_key"] = force
+                ns["db"].config["holiday_force_channels"] = ["05"] if force else []
+                wire(ns)
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                out.append((clock[0], ns["calculate_slotted_playback_state"]("05")))
+    return channel, out
+
+
+def _holiday_hops(out, step):
+    bad = []
+    previous = None
+    for when, result in out:
+        if previous is not None and previous[1].get("mode") == "Video" and result.get("mode") == "Video" and previous[0].date() == when.date():
+            last = previous[1]
+            continued = last["file"] == result["file"] and abs((result["seek"] - last["seek"]) - step) <= 1.0
+            ended = last["seek"] + step >= last["duration"] - 1.0
+            if not (continued or ended):
+                bad.append((when.strftime("%d %H:%M"), os.path.basename(str(result["file"]))))
+        previous = (when, result)
+    return bad
+
+
+def _holiday_repeats_before_all(out, episodes):
+    import re
+    aired = {}
+    bad = []
+    last = None
+    for when, result in out:
+        if result.get("mode") != "Video" or when >= _HOLIDAY_END:
+            continue
+        found = re.search(r"Show ([A-Z]) S01E(\d+)", result["file"])
+        if not found or last == result["file"]:
+            continue
+        last = result["file"]
+        show, number = found.group(1), int(found.group(2))
+        got = aired.setdefault(show, set())
+        if number in got:
+            if len(got) < episodes:
+                bad.append((when.strftime("%d %H:%M"), show, number, len(got)))
+            aired[show] = {number}
+        else:
+            got.add(number)
+    return bad
+
+
+def suite_holiday_cycles_hold_airing_item_and_skip_nothing():
+    cuts = {}
+    for start in (_HOLIDAY_START, datetime.datetime(2026, 10, 29, 2, 40, 5), datetime.datetime(2026, 10, 29, 5, 20, 5)):
+        steps = int((_HOLIDAY_END - start).total_seconds() // 120)
+        channel, out = _holiday_run(_holiday_simple_channel(), start, steps, 120, seen=cuts)
+        hops = _holiday_hops(out, 120)
+        check(not hops, "%s: the airing item changes only when its slot ends, also after the first cycle of a day (%s)" % (start.time(), hops[:3]))
+        repeats = _holiday_repeats_before_all(out, 12)
+        check(not repeats, "%s: no episode repeats before every episode of its show has aired, across the days and their midnights (%s)" % (start.time(), repeats[:3]))
+        record = channel["holiday_playback_log"]["halloween"]
+        check(isinstance(record.get("cycle_boundary"), (int, float)) and isinstance(record.get("cycle_start_pos"), dict)
+              and record["cycle_start_pos"].get("block_key") == record.get("block_key"),
+              "%s: the day's saved state holds where the airing cycle begins and the positions it started from" % start.time())
+    check(cuts.get("cut", 0) >= 3, "cycles that cross the end of a day were cut to the entries that started (%s)" % cuts)
+    check(cuts.get("whole", 0) >= 3, "cycles that end inside a day keep their whole positions (%s)" % cuts)
+
+
+def suite_holiday_stale_duration_keeps_aired_entries():
+    seen = {}
+    start = datetime.datetime(2026, 10, 29, 0, 0, 5)
+    steps = int((datetime.datetime(2026, 10, 31) - start).total_seconds() // 60)
+    for stale_at in (100, 413, 777, 1000):
+        channel, out = _holiday_run(_holiday_simple_channel(), start, steps, 60, stale_path="/m/Show A/Season 1/Show A S01E05.mkv",
+                                    stale_at=stale_at, seen=seen)
+        hops = _holiday_hops(out, 60)
+        check(not hops, "stale at %d: the item airing when a duration turns stale does not move, and nothing airs early (%s)" % (stale_at, hops[:3]))
+        repeats = _holiday_repeats_before_all(out, 12)
+        check(not repeats, "stale at %d: no episode is skipped or repeated early after the rebuild (%s)" % (stale_at, repeats[:3]))
+        record = channel["holiday_playback_log"]["halloween"]
+        check(record["cycle_start_pos"]["block_key"] == record["block_key"], "stale at %d: the saved record belongs to the day" % stale_at)
+        import re
+        later = [r for when, r in out[stale_at + 130:] if r.get("mode") == "Video" and r["file"].endswith("Show A S01E05.mkv")]
+        check(not later or all(abs(r["duration"] - 1920.0) < 1.0 for r in later),
+              "stale at %d: a later airing of the changed file uses the new length" % stale_at)
+    check(seen.get("reflavor_ok", 0) >= 1, "a file of the airing cycle turning stale rebuilt that cycle, keeping the entries that had started (%s)" % seen)
+    check(not seen.get("reflavor_none"), "no rebuild fell back to leaving the timeline as it was (%s)" % seen)
+
+    rich_start = datetime.datetime(2026, 10, 30, 1, 10, 5)
+    rich_steps = int((datetime.datetime(2026, 10, 31, 12) - rich_start).total_seconds() // 120)
+    for stale_at in (150, 500):
+        _channel, out = _holiday_run(_holiday_rich_channel(), rich_start, rich_steps, 120,
+                                     stale_path="/m/Show B/Season 1/Show B S01E03.mkv", stale_at=stale_at, seen=seen)
+        hops = _holiday_hops(out, 120)
+        check(not hops, "pairs, movies and commercials, stale at %d: the airing item does not move (%s)" % (stale_at, hops[:3]))
+
+
+def suite_holiday_restart_matches_continuous():
+    start = datetime.datetime(2026, 10, 29, 0, 0, 5)
+    steps = int((datetime.datetime(2026, 10, 30, 12) - start).total_seconds() // 60)
+    _channel, warm = _holiday_run(_holiday_simple_channel(), start, steps, 60)
+    for restart in (130, 241, 600, 1500):
+        _channel, cold = _holiday_run(_holiday_simple_channel(), start, steps, 60, restart_at=restart)
+        different = [when.strftime("%d %H:%M") for (when, a), (_w, b) in zip(warm, cold)
+                     if (a.get("file"), round(a.get("seek", 0))) != (b.get("file"), round(b.get("seek", 0)))]
+        check(not different, "a restart at step %d airs what a station that kept running airs (%s)" % (restart, different[:3]))
+    rich_start = datetime.datetime(2026, 10, 30, 1, 10, 5)
+    rich_steps = int((datetime.datetime(2026, 10, 31, 6) - rich_start).total_seconds() // 120)
+    _channel, rich_warm = _holiday_run(_holiday_rich_channel(), rich_start, rich_steps, 120)
+    _channel, rich_cold = _holiday_run(_holiday_rich_channel(), rich_start, rich_steps, 120, restart_at=400)
+    different = [when.strftime("%d %H:%M") for (when, a), (_w, b) in zip(rich_warm, rich_cold)
+                 if (a.get("file"), round(a.get("seek", 0))) != (b.get("file"), round(b.get("seek", 0)))]
+    check(not different, "pairs, movies and commercials: a restart airs what a station that kept running airs (%s)" % different[:3])
+    check(not _holiday_hops(rich_warm, 120), "pairs, movies and commercials: the airing item changes only when its slot ends")
+
+
+def suite_holiday_cycle_functions():
+    import json
+    channel = _holiday_simple_channel()
+    raw = [{"path": x["path"], "duration": x["duration"]} for x in channel["holiday_schedules"]["halloween"]]
+    start_pos = {}
+    full = media.build_holiday_cycle(raw, channel, [], start_pos, None, 5, "05", None, 99, None)
+    check(full["how"] == "whole" and full["kept"] == 0 and len(full["lineup"]) == 9, "a cycle with no cut keeps its whole positions (%s, %d entries)" % (full["how"], len(full["lineup"])))
+    check(start_pos == {}, "the positions handed in are not changed by a build")
+    cutoff = full["total"] / 2.0
+    cut = media.build_holiday_cycle(raw, channel, [], start_pos, None, 5, "05", None, 99, cutoff)
+    started = media.entries_started_before(cut["timeline"], cut["lineup"], cutoff)
+    expected = media.positions_after_aired_entries(raw, media.holiday_rotation_settings(channel), start_pos, 5, 86400, "05", None, 99,
+                                                   cut["lineup"], started)
+    check(cut["how"] == "cut" and cut["positions"] == expected and cut["positions"] != full["positions"],
+          "a cycle that crosses the day's end saves the positions after only the entries that started (%s)" % cut["how"])
+    check(cut["lineup"] == full["lineup"] and cut["timeline"] == full["timeline"], "the cut changes the saved positions, never the cycle that airs")
+
+    log_state = {}
+    media.store_holiday_cycle(log_state, full, "2026_298_Holiday_halloween", 0, 0)
+    check(media.holiday_cycle_record_ok(log_state, "2026_298_Holiday_halloween"), "a stored cycle is a usable record for its day")
+    check(not media.holiday_cycle_record_ok(log_state, "2026_299_Holiday_halloween"), "a record of another day is not used")
+    check(not media.holiday_cycle_record_ok({"timeline": full["timeline"], "show_pos": {}}, "2026_298_Holiday_halloween"), "a day saved before the record existed is not used")
+    check(len(json.dumps(log_state)) > 0, "the stored cycle can be saved as JSON")
+
+    position = full["timeline"][3]["start_time"] + 60.0
+    again = media.reflavor_holiday_cycle(raw, channel, [], log_state, position, 5, "05", 99, None)
+    check(again is not None and again["kept"] == 4 and again["lineup"][:4] == full["lineup"][:4],
+          "a rebuild keeps every entry that has started exactly as it was (%s)" % (None if again is None else again["kept"]))
+    check(again is not None and again["timeline"][:4] == full["timeline"][:4], "the kept entries keep their places in the timeline")
+    check(media.reflavor_holiday_cycle(raw, channel, [], {"timeline": full["timeline"]}, position, 5, "05", 99, None) is None,
+          "a rebuild without a saved record says so and changes nothing")
+    gone = [t for t in raw if "Show A" not in t["path"]]
+    last_second = full["timeline"][-1]["start_time"] + 1.0
+    check(media.reflavor_holiday_cycle(gone, channel, [], log_state, last_second, 5, "05", 99, None) is None,
+          "a rebuild whose aired entries include a file no longer in the list says so and changes nothing")
+
+
+def _holiday_truth_run(channel, start, steps, step_seconds, snapshot_at=None):
+    channels = {"05": channel}
+    clock, ticks = [start], [0]
+    ns = _sched_record_ns(channels, clock, ticks)
+    lengths = {os.path.normpath(x["path"]): x["duration"] for x in channel["holiday_schedules"]["halloween"]}
+    lengths.update({os.path.normpath(x["path"]): x["duration"] for x in channel["schedules"].get("Commercials", [])})
+    ns["_read_file_probe_facts"] = lambda p: {"duration": lengths.get(os.path.normpath(p))}
+    real_read = media.read_track_duration
+
+    def read(path, default=0):
+        known = lengths.get(os.path.normpath(path))
+        return (known, media.DURATION_MEASURED) if known else real_read(path, default)
+
+    truth, snapshot = {}, None
+    with patch.object(media, "read_track_duration", read), patch.object(media, "_cached_path_exists", lambda p: True):
+        for i in range(steps):
+            clock[0] = start + datetime.timedelta(seconds=i * step_seconds)
+            ticks[0] += 10000
+            ns["calculate_slotted_playback_state"]("05")
+            for h_log in (channel.get("holiday_playback_log") or {}).values():
+                block_key = h_log.get("block_key")
+                if block_key and h_log.get("timeline"):
+                    _y, yday, _rest = block_key.split("_", 2)
+                    day = datetime.date(int(_y), 1, 1) + datetime.timedelta(days=int(yday) - 1)
+                    anchor = channel["playback_log"]["block_anchors"].get(block_key, 0)
+                    truth[day.toordinal() * 86400 + anchor + int(round(h_log["cycle_boundary"]))] = (block_key, [e["path"] for e in h_log["timeline"]])
+            if snapshot_at is not None and i == snapshot_at:
+                snapshot = (copy.deepcopy(channel), clock[0])
+    return ns, truth, snapshot
+
+
+def _holiday_projection_problems(ns, truth, snapshot, hours, ads_on):
+    channel, now = snapshot
+    items = channel["schedules"].get("Commercials", [])
+    ads = media.build_commercial_tracks(items, lambda p: True) if ads_on and items else []
+    forced = ""
+    before = json.dumps([channel.get("holiday_playback_log"), channel["playback_log"]], sort_keys=True, default=str)
+    records = media.project_holiday_days(
+        "05", channel, now, lambda p: True, ads, lambda off: ns["_start_order_seed"](channel, off),
+        lambda d: media.holiday_key_for_date(d, forced, now.date()) if channel.get("holiday_schedules", {}).get(media.holiday_key_for_date(d, forced, now.date())) else None,
+        ns["_missed_block_day_seeds"], hours)
+    problems = []
+    if json.dumps([channel.get("holiday_playback_log"), channel["playback_log"]], sort_keys=True, default=str) != before:
+        problems.append("the channel's saved state changed")
+    for name, key, abs_start, timeline, total in records:
+        got = truth.get(abs_start)
+        paths = [e["path"] for e in timeline]
+        if got is None:
+            problems.append("cycle at %d is not in the run that kept going" % abs_start)
+        elif got[0] != key:
+            problems.append("different day key at %d: %s / %s" % (abs_start, got[0], key))
+        elif got[1][:len(paths)] != paths or not paths:
+            problems.append("different files at %d (%s)" % (abs_start, key))
+    return records, problems
+
+
+def suite_holiday_days_match_continuous_run():
+    for label, make, ads_on in (("simple", _holiday_simple_channel, False), ("pairs, movies and commercials", _holiday_rich_channel, True)):
+        channel = make()
+        start = datetime.datetime(2026, 10, 29, 0, 0, 5)
+        steps = int((datetime.datetime(2026, 11, 1, 3, 0, 0) - start).total_seconds() // 120)
+        snap_index = int((datetime.datetime(2026, 10, 29, 10, 0, 5) - start).total_seconds() // 120)
+        ns, truth, snapshot = _holiday_truth_run(channel, start, steps, 120, snap_index)
+        records, problems = _holiday_projection_problems(ns, truth, snapshot, 70.0, ads_on)
+        days = sorted({r[1] for r in records})
+        check(len(records) >= 8, "%s: the rest of today and the next days are projected (%d cycles)" % (label, len(records)))
+        check(len(days) == 3, "%s: all three days of the window are covered (%s)" % (label, days))
+        check(not problems, "%s: every projected cycle starts where, and holds the files that, the running station aired (%s)" % (label, problems[:3]))
+        check(max(r[2] for r in records) < datetime.date(2026, 11, 1).toordinal() * 86400, "%s: nothing is projected past the end of the window" % label)
+
+        channel = make()
+        prior = datetime.datetime(2025, 10, 30, 0, 0, 5)
+        _holiday_truth_run(channel, prior, int((datetime.datetime(2025, 10, 31, 20, 0, 0) - prior).total_seconds() // 120), 120)
+        start = datetime.datetime(2026, 10, 28, 12, 0, 5)
+        steps = int((datetime.datetime(2026, 11, 1, 3, 0, 0) - start).total_seconds() // 120)
+        snap_index = 3
+        ns, truth, snapshot = _holiday_truth_run(channel, start, steps, 120, snap_index)
+        check(snapshot[0]["holiday_playback_log"]["halloween"]["block_key"].startswith("2025_"), "%s: the saved holiday state is last year's" % label)
+        records, problems = _holiday_projection_problems(ns, truth, snapshot, 100.0, ads_on)
+        check(len(sorted({r[1] for r in records})) == 3, "%s: a window that has not opened yet is projected for all three days (%d cycles)" % (label, len(records)))
+        check(not problems, "%s: after a year without the holiday the projection matches the running station (%s)" % (label, problems[:3]))
+        fresh = copy.deepcopy(snapshot[0])
+        today_key = "2026_%d_Holiday_halloween" % datetime.date(2026, 10, 29).timetuple().tm_yday
+        midday = datetime.datetime(2026, 10, 29, 10, 0, 5)
+        none_of = lambda d: "halloween" if d >= midday.date() and d <= datetime.date(2026, 10, 31) else None
+        args = ("05", fresh, midday, lambda p: True, [], lambda off: 1, none_of, ns["_missed_block_day_seeds"], 70.0)
+        check(media.project_holiday_days(*args) == [], "%s: a holiday day the scheduler has not built yet is left to the scheduler" % label)
+        check(media.project_holiday_days("05", dict(fresh, scheduling_mode="marathon"), *args[2:]) == [], "%s: a marathon channel has no holiday projection" % label)
+        check(media.project_holiday_days("05", dict(fresh, holiday_schedules={}), *args[2:]) == [], "%s: a channel with no holiday files has none" % label)
+        check(media.holiday_day_tracks(dict(fresh, holiday_schedules={}), "halloween", lambda p: True) == ([], []), "%s: no holiday files gives no tracks" % label)
+
+
+class TestHolidayDayCycles(_SectionCase):
+    """A holiday day airs one cycle after another without moving the airing item, and a day's end cuts the saved positions"""
+
+    def test_holiday_cycles_hold_airing_item_and_skip_nothing(self):
+        self.run_section(suite_holiday_cycles_hold_airing_item_and_skip_nothing)
+
+    def test_holiday_stale_duration_keeps_aired_entries(self):
+        self.run_section(suite_holiday_stale_duration_keeps_aired_entries)
+
+    def test_holiday_restart_matches_continuous(self):
+        self.run_section(suite_holiday_restart_matches_continuous)
+
+    def test_holiday_days_match_continuous_run(self):
+        self.run_section(suite_holiday_days_match_continuous_run)
+
+    def test_holiday_cycle_functions(self):
+        self.run_section(suite_holiday_cycle_functions)
+
+
+# ============================================================================
+# SECTION: Guide cell of a paired show (ui.py)
+# ============================================================================
+
+
+def _load_ui_guide_helpers():
+    """The guide helpers of ui.py, taken out with the real AST (ui.py imports pygame, so it is not imported here)."""
+    with open(os.path.join(ROOT, "ui.py"), encoding="utf-8") as handle:
+        src = handle.read()
+    tree = ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    ns = {"media": media}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in ("_guide_entry_parts", "_guide_entry_airs_file", "_guide_aired_rows_in_view", "_guide_splice_aired", "_guide_merge_cells"):
+            exec(compile("".join(lines[node.lineno - 1:node.end_lineno]), "<ui:%s>" % node.name, "exec"), ns)
+    return ns, src
+
+
+def suite_guide_pair_keeps_one_cell():
+    ns, src = _load_ui_guide_helpers()
+    check("_guide_entry_parts" in ns and "_guide_entry_airs_file" in ns, "ui.py has the helpers that list the files a guide entry airs")
+    parts, airs = ns["_guide_entry_parts"], ns["_guide_entry_airs_file"]
+    pair = media._build_pair_track({"path": "/a/ep1.mp4", "duration": 711}, {"path": "/a/ep2.mp4", "duration": 719})
+    check([d for _p, d in parts(pair)] == [711, 719] and len(parts(pair)) == 2, "a pair lists both its episodes with their lengths (%s)" % parts(pair))
+    check(airs(pair, "/a/ep1.mp4") and airs(pair, "/a/ep2.mp4") and not airs(pair, "/a/other.mp4"), "the airing file of either half belongs to the pair's cell")
+    bundle = media._build_bundle_track([{"path": "/b/1.mp4", "duration": 300}, {"path": "/b/2.mp4", "duration": 400}])
+    check(airs(bundle, "/b/2.mp4") and len(parts(bundle)) == 2, "a leftovers bundle lists all of its files")
+    single = {"path": "/c/s.mp4", "duration": 1500}
+    check(len(parts(single)) == 1 and airs(single, "/c/s.mp4") and not airs(single, "/c/t.mp4"), "a single episode lists only itself")
+    check(src.count("_guide_entry_airs_file(") >= 3 and src.count("_guide_entry_parts(") >= 3,
+          "the anchor patch and the live-state patch both use the helpers instead of comparing one path")
+
+
+class TestGuidePairCell(_SectionCase):
+    """A paired show keeps its one guide cell when the playing file is its second half"""
+
+    def test_guide_pair_keeps_one_cell(self):
+        self.run_section(suite_guide_pair_keeps_one_cell)
+
+
+def _guide_test_cycle(slot_lengths, break_one):
+    timeline, pos = [], 0
+    for n, target in enumerate(slot_lengths):
+        slot0 = pos
+        base = {"is_pair": True, "path": "/p/s%da.mp4" % n, "pair_ep1_path": "/p/s%da.mp4" % n, "pair_ep1_duration": 711,
+                "pair_ep2_path": "/p/s%db.mp4" % n, "pair_ep2_duration": 719, "is_commercial": False}
+        timeline.append(dict(base, duration=711, start_time=pos, seek_offset=0, interior_cut=True))
+        pos += 711
+        for d in break_one:
+            timeline.append({"path": "/c/%d_%d.mp4" % (n, d), "duration": d, "start_time": pos, "is_commercial": True, "seek_offset": 0})
+            pos += d
+        timeline.append(dict(base, duration=719, start_time=pos, seek_offset=711))
+        pos += 719
+        left = target - (pos - slot0)
+        while left > 0:
+            d = 30 if left >= 30 else left
+            timeline.append({"path": "/c/e%d_%d.mp4" % (n, pos), "duration": d, "start_time": pos, "is_commercial": True, "seek_offset": 0})
+            pos += d
+            left -= d
+    return timeline, pos
+
+
+def suite_guide_aired_cycle_whole():
+    ns, src = _load_ui_guide_helpers()
+    for name in ("_guide_aired_rows_in_view", "_guide_splice_aired", "_guide_merge_cells"):
+        check(name in ns, "ui.py has %s" % name)
+    in_view, splice, merge = ns["_guide_aired_rows_in_view"], ns["_guide_splice_aired"], ns["_guide_merge_cells"]
+    import datetime as _dt
+    now_dt = _dt.datetime(2026, 10, 23, 4, 43, 45)
+    ordinal, base = now_dt.toordinal(), 12600
+    ledger_tl, total_a = _guide_test_cycle([1800, 1790, 1812, 1798], [30, 34, 30, 30, 30])
+    regen_tl, total_b = _guide_test_cycle([1800, 1800, 1800, 1800], [10, 30, 31, 29, 30])
+    check(total_a == total_b == 7200, "the scheduler's cycle and the guide's own rebuild have the same total (%s, %s)" % (total_a, total_b))
+    playback_log = {}
+    media.aired_ledger_upsert(playback_log, "Full Day", "2026_296_Full Day", ordinal * 86400 + base, ledger_tl, total_a, now_dt)
+    rows = media.aired_ledger_entries(playback_log, ordinal)
+    regen = [(e, base + e["start_time"], base + e["start_time"] + e["duration"], "Full Day") for e in regen_tl]
+    kind = lambda e: "C" if e.get("is_commercial") else "S"
+
+    cells = merge(splice(regen, in_view(rows, 3 * 3600, 9 * 3600)))
+    check(len(cells) == 4 and all(c[0].get("is_pair") for c in cells), "the cycle comes out as four pair cells (got %d)" % len(cells))
+    check(len({c[0]["path"] for c in cells}) == 4, "each pair is exactly one cell, never split in two")
+    check(all(b[1] - a[2] < 1 for a, b in zip(cells, cells[1:])), "no hole between cells, so nothing is drawn OFF-AIR inside the cycle")
+    check(not any(kind(c[0]) == "C" for c in cells), "no commercial break stands alone as its own cell")
+    own = merge(rows)
+    check([(c[1], c[2]) for c in cells] == [(c[1], c[2]) for c in own], "the cells are the scheduler's own layout")
+    ends = [base + sum(1 for _ in [0]) * 0]
+    slot_end = base
+    for target in (1800, 1790, 1812, 1798):
+        slot_end += target
+        check(any(abs(c[2] - slot_end) < 1 for c in cells), "a pair's end commercials stay inside its cell, which ends at %d where the next show starts" % slot_end)
+
+    clock = base + 711 + 40
+    cut = [r for r in rows if r[2] <= clock]
+    old = sorted([t for t in regen if not any(t[1] < p[2] - 0.5 and p[1] < t[2] - 0.5 for p in cut)] + cut, key=lambda t: t[1])
+    old_cells = merge(old)
+    check(len({c[0]["path"] for c in old_cells if c[0].get("is_pair")}) == 4 and len([c for c in old_cells if c[0].get("is_pair")]) > 4,
+          "the same data cut at the clock splits a pair, so this test would have caught the old behaviour")
+    check(any(b[1] - a[2] >= 1 for a, b in zip(old_cells, old_cells[1:])), "the same data cut at the clock leaves an OFF-AIR hole")
+
+    next_cycle = [(e, s + total_b - 40, en + total_b - 40, b) for e, s, en, b in regen]
+    seam_cells = merge(splice(regen + next_cycle, in_view(rows, 3 * 3600, 14 * 3600)))
+    check(all(b[1] - a[2] < 1 for a, b in zip(seam_cells, seam_cells[1:])), "a next cycle that starts 40 s early leaves no hole at the seam")
+    gap_cycle = [(e, s + total_b + 25, en + total_b + 25, b) for e, s, en, b in regen]
+    check(len(merge(splice(regen + gap_cycle, in_view(rows, 3 * 3600, 14 * 3600)))) >= 8, "a next cycle that starts late is still laid out")
+
+    e = {"path": "/x.mp4"}
+    r = {"path": "/r.mp4"}
+    spliced = splice([(e, 0, 100, "B")], [(r, 40, 60, "B")])
+    check([(t[1], t[2]) for t in spliced] == [(0, 40), (40, 60), (60, 100)], "an entry that straddles an aired row keeps both of its uncovered parts (%s)" % [(t[1], t[2]) for t in spliced])
+    check(len(splice([(e, 45, 55, "B")], [(r, 40, 60, "B")])) == 1, "an entry wholly covered by an aired row is replaced by it")
+    check(splice([(e, 0, 100, "B")], []) == [(e, 0, 100, "B")], "with no aired rows the timeline is untouched")
+    rows_v = [(r, 10, 20, "B"), (r, 3000, 3100, "B"), (r, 9000, 9100, "B")]
+    check(len(in_view(rows_v, 0, 100)) == 2, "the viewport keeps rows up to an hour past its end and has no cut at the clock")
+
+    sig_a = media.aired_ledger_signature(playback_log)
+    check(sig_a == media.aired_ledger_signature(playback_log), "the ledger signature is stable while the ledger is unchanged")
+    changed = [dict(x) for x in ledger_tl]
+    changed[1]["duration"] += 1
+    other_log = {}
+    media.aired_ledger_upsert(other_log, "Full Day", "2026_296_Full Day", ordinal * 86400 + base, changed, total_a, now_dt)
+    check(sig_a != media.aired_ledger_signature(other_log), "the ledger signature changes when a recorded break changes")
+    check(media.aired_ledger_signature({}) == (), "an empty ledger has an empty signature")
+    check("media.aired_ledger_signature(" in src and "_guide_splice_aired(" in src and "_guide_merge_cells(" in src,
+          "the guide's timeline cache key carries the ledger signature and the build uses the three helpers")
+    check("_r[2] <= _now_rel_secs" not in src and "_past_rows" not in src, "the guide no longer cuts the aired rows at the clock")
+
+
+class TestGuideAiredCycleWhole(_SectionCase):
+    """The guide lays the scheduler's whole recorded cycle over its own rebuild, so pairs stay whole and no break shows OFF-AIR"""
+
+    def test_guide_aired_cycle_whole(self):
+        self.run_section(suite_guide_aired_cycle_whole)
+
+
+class TestFolderListingCacheAndPushOut(unittest.TestCase):
+    """The shared folder listing cache, read-ahead, drive hold and the way out of a list that does not load"""
+
+    def setUp(self):
+        media.listing_cache_invalidate()
+        for root in media.held_drive_roots():
+            media.release_drive_hold(root)
+
+    def test_governor_rows_exist(self):
+        for name in ("LISTING_CACHE_MAX_FOLDERS", "LISTING_CACHE_FRESH_SECONDS", "LISTING_READ_AHEAD_FOLDERS",
+                     "LISTING_CONSOLE_READ_AHEAD_MAX", "LISTING_CONSOLE_READ_AHEAD_SECONDS", "LISTING_DVD_HAS_CONTENT_SECONDS",
+                     "LISTING_DRIVE_PUSH_OUT_SECONDS", "LISTING_DRIVE_RETEST_SECONDS", "LISTING_PUSH_OUT_BANNER_SECONDS"):
+            self.assertTrue(hasattr(gov, name), name)
+
+    def test_a_cached_listing_comes_back_and_is_copied(self):
+        items = [{"type": "dir", "path": "/a/b"}]
+        media.listing_cache_put("fe:all", "/a", items)
+        got, age = media.listing_cache_get("fe:all", "/a")
+        self.assertEqual(got, items)
+        got.append("changed")
+        self.assertEqual(media.listing_cache_get("fe:all", "/a")[0], items, "a caller cannot change the stored list")
+        self.assertIsNone(media.listing_cache_get("fe:video", "/a"), "a different filter is a different listing")
+
+    def test_oldest_listing_is_dropped_past_the_limit(self):
+        old = gov.LISTING_CACHE_MAX_FOLDERS
+        try:
+            gov.LISTING_CACHE_MAX_FOLDERS = 3
+            for i in range(5):
+                media.listing_cache_put("k", "/f%d" % i, [i])
+            self.assertIsNone(media.listing_cache_get("k", "/f0"))
+            self.assertIsNotNone(media.listing_cache_get("k", "/f4"))
+        finally:
+            gov.LISTING_CACHE_MAX_FOLDERS = old
+
+    def test_invalidate_one_folder_and_everything(self):
+        media.listing_cache_put("k", "/a", [1])
+        media.listing_cache_put("k", "/a/b", [2])
+        media.listing_cache_put("k", "/z", [3])
+        media.listing_cache_invalidate("/a/b")
+        self.assertIsNone(media.listing_cache_get("k", "/a/b"))
+        self.assertIsNone(media.listing_cache_get("k", "/a"), "the parent list shows the folder, so it is dropped too")
+        self.assertIsNotNone(media.listing_cache_get("k", "/z"))
+        media.listing_cache_invalidate()
+        self.assertIsNone(media.listing_cache_get("k", "/z"))
+
+    def test_has_content_answer_is_remembered(self):
+        self.assertIsNone(media.listing_dvd_has_content_get("/m"))
+        media.listing_dvd_has_content_put("/m", False)
+        self.assertIs(media.listing_dvd_has_content_get("/m"), False)
+
+    def test_read_ahead_lists_and_caches_and_skips_failures(self):
+        import time as _t
+        seen = []
+
+        def lister(path):
+            seen.append(path)
+            return ([{"type": "file", "path": path + "/x"}], "ok") if path != "/bad" else ([], "error")
+
+        self.assertTrue(media.listing_read_ahead("ra", ["/one", "/two", "/bad"], lister))
+        for _ in range(100):
+            if len(seen) == 3 and not media._listing_read_ahead_running:
+                break
+            _t.sleep(0.02)
+        self.assertEqual(sorted(seen), ["/bad", "/one", "/two"])
+        self.assertIsNotNone(media.listing_cache_get("ra", "/one"))
+        self.assertIsNone(media.listing_cache_get("ra", "/bad"), "a failed read is never cached")
+        self.assertFalse(media.listing_read_ahead("ra", ["/one"], lister), "a folder cached a moment ago is not read again")
+
+    def test_a_held_drive_is_hidden_then_shown_when_it_answers(self):
+        import time as _t
+        old = gov.LISTING_DRIVE_RETEST_SECONDS
+        gov.LISTING_DRIVE_RETEST_SECONDS = 0.05
+        real = media.os.path.isdir
+        answers = {"ok": False}
+        try:
+            media.os.path.isdir = lambda p: answers["ok"] if p == "/" else real(p)
+            media.hold_drive("/some/where")
+            self.assertTrue(media.is_drive_held("/some/where"))
+            self.assertEqual(media.held_drive_roots(), ["/"])
+            _t.sleep(0.2)
+            self.assertTrue(media.is_drive_held("/x"), "still hidden while the drive does not answer")
+            answers["ok"] = True
+            for _ in range(100):
+                if not media.held_drive_roots():
+                    break
+                _t.sleep(0.02)
+            self.assertEqual(media.held_drive_roots(), [], "shown again once the drive answers")
+        finally:
+            media.os.path.isdir = real
+            gov.LISTING_DRIVE_RETEST_SECONDS = old
+            media.release_drive_hold("/")
+
+    def _deck(self):
+        module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_listing")
+        deck = object.__new__(module.ExternalGameDeck)
+        deck.mode = "ROMLIST"
+        deck.active_console = "DVD"
+        deck.current_browse_dir = "D:\\Movies"
+        deck.roms = [("old", "p")]
+        deck.rom_index = 0
+        deck.rom_scroll = 0
+        deck.status_msg = ""
+        deck._romlist_error_msg = ""
+        deck._romlist_error_until = 0
+        deck._drive_launch_failed = {}
+        deck._scan_path = deck.current_browse_dir
+        deck._get_console_rom_dir = lambda c: "C:\\roms\\" + c
+        return module, deck
+
+    def test_the_worker_keeps_a_way_back_for_a_folder_that_does_not_answer(self):
+        module, deck = self._deck()
+        deck._scan_lock = threading.Lock()
+        deck._scan_request_id = 1
+        deck._scan_result = None
+        deck.console_roms_manual = {}
+        module._gd_is_drive_responsive = lambda p: False
+        deck._scan_roms_worker(1, "DVD", "D:\\Movies", [".mp4"])
+        roms, msg, status = deck._scan_result
+        self.assertEqual(status, "unresponsive")
+        self.assertEqual(msg, "Folder not responding")
+        self.assertTrue(any(n.startswith("[.. BACK") for n, _p in roms), "the list is never a dead end")
+
+    def test_a_missing_folder_steps_up_with_a_banner(self):
+        module, deck = self._deck()
+        calls = []
+        deck._scan_roms = lambda c: calls.append(("scan", c, deck.current_browse_dir))
+        deck._snap_rom_cursor_if_scan_landed = lambda: None
+        module._gd_is_drive_responsive = lambda p: True
+        real = module.os.path.isdir
+        module.os.path.isdir = lambda p: p in ("D:\\", "")
+        try:
+            deck._push_out_of_list("missing")
+        finally:
+            module.os.path.isdir = real
+        self.assertEqual(deck._romlist_error_msg, "Folder not found")
+        self.assertGreater(deck._romlist_error_until, 0)
+        self.assertEqual(calls[-1][0], "scan")
+
+    def test_an_unresponsive_drive_is_held_and_you_are_moved_out(self):
+        module, deck = self._deck()
+        calls = []
+        deck._scan_roms = lambda c: calls.append(deck.current_browse_dir)
+        deck._snap_rom_cursor_if_scan_landed = lambda: None
+        held = []
+        module._media_listing = types.SimpleNamespace(hold_drive=held.append, held_drive_roots=lambda: [], is_drive_held=lambda p: False)
+        deck._push_out_of_list("unresponsive")
+        self.assertEqual(held, ["D:\\Movies"])
+        self.assertEqual(calls, [""], "the DVD list goes back to This PC")
+        self.assertEqual(deck._romlist_error_msg, "Drive not responding")
+
+    def test_a_timed_out_list_no_longer_keeps_the_old_folders_entries(self):
+        module, deck = self._deck()
+        src = inspect.getsource(module.ExternalGameDeck._poll_scan_pending)
+        self.assertIn('self._push_out_of_list("unresponsive")', src)
+
+    def test_dvd_last_folder_is_remembered_only_after_it_loaded(self):
+        module, _deck = self._deck()
+        src = inspect.getsource(module.ExternalGameDeck._scan_roms)
+        self.assertNotIn("self.dvd_last_dir = target_folder", src)
+        self.assertIn("self.dvd_last_dir = self.current_browse_dir", inspect.getsource(module.ExternalGameDeck._poll_scan_pending))
+
+    def test_held_drives_are_not_listed(self):
+        module, deck = self._deck()
+        module._gd_drive_root_of = lambda p: str(p)[:3] if p else None
+        module._media_listing = types.SimpleNamespace(held_drive_roots=lambda: ["E:\\"])
+        out = deck._without_failed_drives([("[.. BACK]", ""), ("[DRIVE] E:\\", "E:\\"), ("[DRIVE] C:\\", "C:\\")])
+        self.assertEqual([p for _n, p in out], ["", "C:\\"])
+
+    def test_scan_for_roms_back_cancels_and_adds_nothing(self):
+        module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_cancel")
+        deck = object.__new__(module.ExternalGameDeck)
+        deck.console_roms_manual = {}
+        added = []
+        deck.add_manual_roms = lambda c, p: added.append((c, p)) or (len(p), 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            nes = os.path.join(tmp, "NES")
+            os.makedirs(nes)
+            for i in range(3):
+                open(os.path.join(nes, "g%d.nes" % i), "wb").close()
+            self.assertEqual(deck.bulk_scan_for_roms(tmp, cancel_cb=lambda: True), ({}, []))
+            self.assertEqual(deck.bulk_scan_for_roms(tmp, commit_cb=lambda: False), ({}, []))
+            self.assertEqual(added, [], "a cancelled scan adds no ROMs")
+            results, _bad = deck.bulk_scan_for_roms(tmp, cancel_cb=lambda: False, commit_cb=lambda: True)
+            self.assertEqual(sum(n for n, _s in results.values()), 3)
+
+    def test_a_dead_console_folder_with_no_usable_manual_roms_returns_to_the_console_list(self):
+        module, deck = self._deck()
+        deck.active_console = "SNES"
+        deck.current_browse_dir = "C:\\roms\\SNES"
+        deck._scan_path = deck.current_browse_dir
+        module._gd_is_drive_responsive = lambda p: False
+        module._media_listing = types.SimpleNamespace(hold_drive=lambda p: None, held_drive_roots=lambda: [], is_drive_held=lambda p: False)
+        deck._push_out_of_list("unresponsive", [("[OFFLINE] game", "X:\\\\g.sfc")])
+        self.assertEqual(deck.mode, "BROWSE")
+        self.assertEqual(deck._romlist_error_msg, "Drive not responding")
+
+    def test_a_dead_console_folder_keeps_usable_manual_roms(self):
+        module, deck = self._deck()
+        deck.active_console = "SNES"
+        deck.current_browse_dir = "C:\\roms\\SNES"
+        deck._scan_path = deck.current_browse_dir
+        module._gd_is_drive_responsive = lambda p: p.startswith("D:")
+        module._media_listing = types.SimpleNamespace(hold_drive=lambda p: None, held_drive_roots=lambda: [], is_drive_held=lambda p: False)
+        roms = [("game", "D:\\\\g.sfc")]
+        deck._push_out_of_list("unresponsive", roms)
+        self.assertEqual(deck.mode, "ROMLIST")
+        self.assertEqual(deck.roms, roms)
+
+    def test_an_old_cancelled_scan_cannot_finish_into_a_new_one(self):
+        src = MAIN_SRC[MAIN_SRC.index("def _fe_bulkscan_worker("):MAIN_SRC.index("def _fe_cancel_bulkscan")]
+        self.assertIn('app_state.get("file_explorer_bulkscan_id", 0) != scan_id', src)
+        self.assertIn('if app_state.get("file_explorer_bulkscan_id", 0) == scan_id:', src)
+        self.assertIn('"file_explorer_bulkscan_id"]        += 1', MAIN_SRC)
+
+    def test_the_explorer_wiring(self):
+        for name in ("_fe_list_dir", "_fe_push_out", "_fe_banner_text", "_fe_cancel_bulkscan", "_fe_left_refresh_worker"):
+            self.assertIn("def %s(" % name, MAIN_SRC, name)
+        self.assertIn("media.listing_cache_get(_fe_cache_kind(_valid_exts), path)", MAIN_SRC)
+        self.assertIn("media.hold_drive(path)", MAIN_SRC)
+        self.assertIn("media.listing_cache_invalidate()", MAIN_SRC)
+        handler = MAIN_SRC[MAIN_SRC.index("def _fe_handle_event(event):"):]
+        handler = handler[:handler.index("fe_rect = app_state.get")]
+        self.assertIn("_fe_cancel_bulkscan()", handler, "Back during Scan For Roms cancels it")
+
+    def test_the_explorer_lists_a_real_folder_and_reports_a_missing_one(self):
+        env = make_env()
+        text = MAIN_SRC
+        start = text.index("def _fe_cache_kind(valid_exts):")
+        end = text.index("def _fe_context_key(context):")
+        ns = dict(env)
+        ns.update({"os": os, "media": media, "log": __import__("logging").getLogger("t"), "_is_drive_responsive": lambda p: True})
+        exec(text[start:end], ns)
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "sub"))
+            open(os.path.join(tmp, "a.mp4"), "wb").close()
+            items, status = ns["_fe_list_dir"](tmp, {".mp4"})
+            self.assertEqual(status, "ok")
+            self.assertEqual([i["type"] for i in items], ["dir", "file"])
+            self.assertEqual(ns["_fe_list_dir"](os.path.join(tmp, "nope"), {".mp4"}), ([], "missing"))
+        ns["_is_drive_responsive"] = lambda p: False
+        self.assertEqual(ns["_fe_list_dir"]("X:\\", None), ([], "unresponsive"))
+
+
+class TestBootDriveWake(unittest.TestCase):
+    """The boot wake-up reads one real file per media drive before the boot warm-up probes anything."""
+
+    def _env(self, channels, ready=True):
+        log = __import__("logging").getLogger("t_wake")
+        db = types.SimpleNamespace(ready_flag=ready, config={"last_channel": "05"}, channels_db=channels)
+        ns = {"os": os, "time": time, "threading": threading, "log": log, "db": db, "media": media,
+              "_log_swallowed": lambda *a: None, "_app_shutting_down": threading.Event(),
+              "_boot_drive_wake_done": threading.Event(),
+              "_boot_bar_const": lambda name, fallback: 3.0 if name == "BOOT_DRIVE_WAKE_SECONDS" else fallback}
+        for name in ("_boot_wake_candidates_by_drive", "_wake_drive_with_read", "_wake_media_drives"):
+            exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+        return ns
+
+    def test_boot_channel_files_come_first_and_each_drive_is_listed_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = os.path.join(tmp, "a.mp4"), os.path.join(tmp, "b.mp4")
+            ns = self._env({"06": {"schedules": {"Full Day": [b]}}, "05": {"schedules": {"Full Day": [{"path": a}]}}})
+            found = ns["_boot_wake_candidates_by_drive"]()
+            self.assertEqual(len(found), 1)
+            self.assertEqual(list(found.values())[0], [a, b])
+
+    def test_a_missing_first_file_falls_back_and_a_real_read_wakes_the_drive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = os.path.join(tmp, "good.mp4")
+            with open(good, "wb") as handle:
+                handle.write(b"x" * 100000)
+            ns = self._env({"05": {"schedules": {"Full Day": [os.path.join(tmp, "gone.mp4"), good]}}})
+            paths = list(ns["_boot_wake_candidates_by_drive"]().values())[0]
+            self.assertTrue(ns["_wake_drive_with_read"]("/", paths, time.monotonic() + 5))
+            self.assertFalse(ns["_wake_drive_with_read"]("/", [os.path.join(tmp, "nope.mp4")], time.monotonic() + 5))
+            ns["_wake_media_drives"]()
+            self.assertTrue(ns["_boot_drive_wake_done"].is_set())
+
+    def test_boot_never_waits_when_there_is_nothing_to_wake(self):
+        ns = self._env({})
+        started = time.monotonic()
+        ns["_wake_media_drives"]()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(ns["_boot_drive_wake_done"].is_set())
+
+    def test_the_wake_is_started_after_the_database_and_awaited_before_probing(self):
+        worker = MAIN_SRC[MAIN_SRC.index("def _background_subsystem_worker("):]
+        self.assertLess(worker.index('_mark_boot_step("db")'), worker.index("target=_wake_media_drives"))
+        self.assertLess(worker.index("target=_wake_media_drives"), worker.index("target=_prewarm_boot_channel_paths"))
+        prewarm = get_function_source("_prewarm_boot_channel_paths")
+        self.assertLess(prewarm.index("_boot_drive_wake_done.wait("), prewarm.index("_gather_other_channels_now_playing_targets("))
+        self.assertTrue(hasattr(gov, "BOOT_DRIVE_WAKE_SECONDS"))
 
 
 if __name__ == "__main__":

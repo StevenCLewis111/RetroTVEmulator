@@ -49,6 +49,42 @@ def _eq_ease(current, target, dt, smooth_seconds):
     return current + (target - current) * (1.0 - math.exp(-dt / smooth_seconds))
 
 
+def _flight_tunables():
+    """Returns the flying-style numbers (ease seconds, starfield slowest and fastest speed, tunnel slowest and fastest speed, longest step seconds) from the governor table."""
+    # WARNING: the fallback numbers must match the FLIGHT_* values in performance_governor.py; they are used only when that module fails to import.
+    if _governor is None:
+        return 3.0, 0.35, 1.4, 0.40, 1.10, 0.1
+    return (_governor.FLIGHT_SPEED_EASE_SECONDS, _governor.FLIGHT_STARFIELD_MIN_SPEED, _governor.FLIGHT_STARFIELD_MAX_SPEED,
+            _governor.FLIGHT_TUNNEL_MIN_SPEED, _governor.FLIGHT_TUNNEL_MAX_SPEED, _governor.FLIGHT_MAX_STEP_SECONDS)
+
+
+def _flight_speed(current, level, dt, ease_seconds, slowest, fastest):
+    """Eases a flying speed toward the speed a music level (0 to 1) asks for, and never lets it fall below the slowest steady speed."""
+    target = slowest + (fastest - slowest) * max(0.0, min(1.0, level))
+    return max(slowest, _eq_ease(current, target, dt, ease_seconds))
+
+
+# VALUES CHANGE HERE (real-music visualizers: seconds a level takes to rise toward a louder reading, and to fall toward a quieter one; beat glow fade seconds)
+_REACT_ATTACK_SECONDS = 0.035
+_REACT_RELEASE_SECONDS = 0.16
+_REACT_BEAT_FADE_SECONDS = 0.18
+
+
+def _react_at(react, p):
+    """Returns the music level (0 to 1) at position p (0 = lowest pitch, 1 = highest): the 24-band spectrum in Performance, the 3 bands blended smoothly in Standard."""
+    p = max(0.0, min(1.0, p))
+    spectrum = react["spectrum"]
+    if spectrum is not None:
+        x = p * (len(spectrum) - 1)
+        i = int(x)
+        j = min(len(spectrum) - 1, i + 1)
+        return spectrum[i] + (spectrum[j] - spectrum[i]) * (x - i)
+    bands = react["bands"]
+    x = p * 2.0
+    i = min(1, int(x))
+    return bands[i] + (bands[i + 1] - bands[i]) * (x - i)
+
+
 def _eq_column(level, max_dots):
     """Splits a column level (in dots) into the whole dots to light and the fade, 0 to 1, of the next dot; always at least one dot, never past the top."""
     level = max(1.0, min(float(max_dots), level))
@@ -72,6 +108,7 @@ class VisualizerDeck:
         self.current_running_style = "PrismShards"
         self.time_delta = 0.0
         self.smooth_amp = 50.0
+        self._react_state = None
 
         self.render_styles = [
             "PrismShards", "LiquidChrome", "PulseRings",
@@ -92,6 +129,12 @@ class VisualizerDeck:
         self.eq_bar_phase = [random.uniform(0, math.pi * 2) for _ in range(24)]
         self.eq_bar_mult  = [random.uniform(0.75, 1.25) for _ in range(24)]
         self._eq_last_time = None
+
+        _flight = _flight_tunables()
+        self.star_speed = _flight[1]
+        self.tunnel_speed = _flight[3]
+        self.tunnel_depth = 0.0
+        self._flight_last_time = None
 
         self.trail_surface = None
         self._glow_braid_fade = None
@@ -207,27 +250,75 @@ class VisualizerDeck:
     # SECTION: Render entry points
     # ========================================================================
 
-    def render_active_engine(self, surface, theme, mock_amplitude=None, style_override=None):
+    def _prepare_reactive(self, reactive, dt):
+        """Smooths the real-music numbers (quick rise, slower fall) and returns the dict the styles read, or None to keep the Lite fake motion."""
+        if not reactive:
+            self._react_state = None
+            return None
+        state = self._react_state
+        if state is None:
+            state = {"level": 0.0, "bands": [0.0, 0.0, 0.0], "spectrum": None, "pulse": 0.0}
+            self._react_state = state
+
+        def follow(current, target):
+            return _eq_ease(current, target, dt,
+                            _REACT_ATTACK_SECONDS if target > current else _REACT_RELEASE_SECONDS)
+
+        state["level"] = follow(state["level"], reactive["level"])
+        state["bands"] = [follow(c, t) for c, t in zip(state["bands"], reactive["bands"])]
+        incoming = reactive.get("spectrum")
+        if incoming is None:
+            state["spectrum"] = None
+        else:
+            held = state["spectrum"]
+            if held is None or len(held) != len(incoming):
+                held = [0.0] * len(incoming)
+            state["spectrum"] = [follow(c, t) for c, t in zip(held, incoming)]
+        state["pulse"] = max(reactive["beat"], state["pulse"] * math.exp(-dt / _REACT_BEAT_FADE_SECONDS))
+
+        bands = state["bands"]
+        centroid = (bands[1] * 0.5 + bands[2]) / (sum(bands) + 1e-6)
+        spectrum = state["spectrum"]
+        peak_pos = (spectrum.index(max(spectrum)) / float(len(spectrum) - 1)) if spectrum else centroid
+        return {
+            "level": state["level"], "bands": bands, "spectrum": spectrum,
+            "beat": reactive["beat"], "pulse": state["pulse"],
+            "centroid": centroid, "peak_pos": peak_pos, "full": spectrum is not None,
+        }
+
+    def render_active_engine(self, surface, theme, mock_amplitude=None, style_override=None, reactive=None):
         try:
             return self._render_active_engine(
-                surface, theme, mock_amplitude, style_override
+                surface, theme, mock_amplitude, style_override, reactive
             )
         except Exception as error:
             _LOGGER.error("Visualizer render failed for style %r: %s", style_override, error)
             raise
 
-    def _render_active_engine(self, surface, theme, mock_amplitude=None, style_override=None):
+    def _render_active_engine(self, surface, theme, mock_amplitude=None, style_override=None, reactive=None):
         w, h = surface.get_size()
         self.time_delta += 0.04
+        _flight_ease, _star_min, _star_max, _tunnel_min, _tunnel_max, _flight_max_step = _flight_tunables()
+        _flight_now = _time.monotonic()
+        flight_dt = (1.0 / 60.0) if self._flight_last_time is None else min(_flight_max_step, max(0.0, _flight_now - self._flight_last_time))
+        self._flight_last_time = _flight_now
 
-        target_amp = mock_amplitude if mock_amplitude is not None else 50
-        self.smooth_amp += (target_amp - self.smooth_amp) * 0.15
+        react = self._prepare_reactive(reactive, flight_dt)
+        if react is None:
+            target_amp = mock_amplitude if mock_amplitude is not None else 50
+            self.smooth_amp += (target_amp - self.smooth_amp) * 0.15
+        else:
+            self.smooth_amp = 8.0 + react["level"] * 92.0
         amp = self.smooth_amp
 
         if style_override is not None:
             style = style_override
         else:
             style = self.current_running_style if self.active_mode == "Random" else self.active_mode
+
+        # Pulsate is the shared beat-driven expansion/glow layer. Keep normal
+        # level and spectrum reactivity for styles that do not use that effect.
+        react_pulse = 0.0 if style in {"GlowBraid", "Kaleidoscope", "Lightning"} else (react["pulse"] if react is not None else 0.0)
 
         # WARNING: (1, 1, 1), not pure black: (0, 0, 0) is the game-overlay transparency key.
         surface.fill((1, 1, 1))
@@ -250,15 +341,21 @@ class VisualizerDeck:
 
             for shard in self.prism_shards:
                 local_angle = shard["a_frac"] * half
-                radius = shard["r_frac"] * max_r * (1.0 + amp_norm * 0.12)
+                if react is None:
+                    radius = shard["r_frac"] * max_r * (1.0 + amp_norm * 0.12)
+                else:
+                    radius = shard["r_frac"] * max_r * (1.0 + _react_at(react, shard["r_frac"]) * 0.30 + react_pulse * 0.12)
                 cx0 = radius * math.cos(local_angle)
                 cy0 = radius * math.sin(local_angle)
                 breathe = 1.0 + 0.18 * math.sin(t * 1.4 + shard["phase"])
+                if react is not None:
+                    breathe += _react_at(react, shard["a_frac"]) * 0.25 + react_pulse * 0.10
                 spin = shard["spin"] * t
                 csp, ssp = math.cos(spin), math.sin(spin)
 
                 hue = (shard["hue"] + t * 0.05) % 1.0
-                cr, cg, cb = colorsys.hsv_to_rgb(hue, 0.85, 0.95)
+                shard_value = 0.95 if react is None else min(1.0, 0.45 + _react_at(react, shard["r_frac"]) * 0.55 + react_pulse * 0.2)
+                cr, cg, cb = colorsys.hsv_to_rgb(hue, 0.85, shard_value)
                 color = (int(cr * 255), int(cg * 255), int(cb * 255))
                 edge_color = (min(255, color[0] + 60), min(255, color[1] + 60), min(255, color[2] + 60))
 
@@ -295,7 +392,12 @@ class VisualizerDeck:
                 elif b["y"] > h:
                     b["y"] = h; b["vy"] *= -1
 
-            radii = [b["base_r"] * (0.8 + amp_norm * 0.9) for b in self.chrome_balls]
+            if react is None:
+                radii = [b["base_r"] * (0.8 + amp_norm * 0.9) for b in self.chrome_balls]
+            else:
+                ball_count = max(1, len(self.chrome_balls) - 1)
+                radii = [b["base_r"] * (0.75 + _react_at(react, i / float(ball_count)) * 0.9 + react_pulse * 0.25)
+                         for i, b in enumerate(self.chrome_balls)]
 
             small = self._chrome_small
             if small is None or small.get_size() != (cols, rows):
@@ -334,17 +436,29 @@ class VisualizerDeck:
 
         elif style == "PulseRings":
             self.pulse_spawn_timer += 1
-            spawn_interval = max(5, int(16 - amp_norm * 12))
-            onset = (amp - self.pulse_last_amp) > 8
+            if react is None:
+                spawn_interval = max(5, int(16 - amp_norm * 12))
+                onset = (amp - self.pulse_last_amp) > 8
+                spawn_now = self.pulse_spawn_timer >= spawn_interval or onset
+            else:
+                spawn_now = react["beat"] > 0.0 or self.pulse_spawn_timer >= 90
             self.pulse_last_amp = amp
 
-            if self.pulse_spawn_timer >= spawn_interval or onset:
+            if spawn_now:
                 self.pulse_spawn_timer = 0
-                self.pulse_active.append({
-                    "r": 0.0,
-                    "hue": (t * 0.1) % 1.0,
-                    "speed": 4.0 + amp_norm * 9.0,
-                })
+                if react is None:
+                    self.pulse_active.append({
+                        "r": 0.0,
+                        "hue": (t * 0.1) % 1.0,
+                        "speed": 4.0 + amp_norm * 9.0,
+                    })
+                else:
+                    self.pulse_active.append({
+                        "r": 0.0,
+                        "hue": (0.95 - 0.6 * react["centroid"]) % 1.0,
+                        "speed": 4.0 + react["level"] * 9.0 + react["beat"] * 6.0,
+                        "shape": ([_react_at(react, abs(k / 24.0 - 1.0)) for k in range(48)] if react["full"] else None),
+                    })
 
             edge_r = math.hypot(cx, cy) * 1.05
             still_alive = []
@@ -360,9 +474,16 @@ class VisualizerDeck:
                 thickness = max(2, int(10 * (1.0 - frac * 0.6)))
                 cr, cg, cb = colorsys.hsv_to_rgb(ring["hue"], 1.0, 0.45 + 0.55 * fade)
                 color = (int(cr * 255), int(cg * 255), int(cb * 255))
-                pygame.draw.circle(surface, color, (cx, cy), int(ring["r"]), thickness)
+                shape = ring.get("shape")
+                if shape is not None and ring["r"] >= 4:
+                    ring_pts = [(int(cx + math.cos(k * math.pi / 24.0) * ring["r"] * (1.0 + 0.18 * shape[k])),
+                                 int(cy + math.sin(k * math.pi / 24.0) * ring["r"] * (1.0 + 0.18 * shape[k])))
+                                for k in range(48)]
+                    pygame.draw.lines(surface, color, True, ring_pts, thickness)
+                else:
+                    pygame.draw.circle(surface, color, (cx, cy), int(ring["r"]), thickness)
 
-            core_r = 14 + amp_norm * 34
+            core_r = 14 + amp_norm * 34 if react is None else 14 + react["level"] * 40 + react_pulse * 20
             cr, cg, cb = colorsys.hsv_to_rgb((t * 0.15) % 1.0, 0.55, 1.0)
             pygame.draw.circle(surface, (int(cr * 255), int(cg * 255), int(cb * 255)), (cx, cy), int(core_r))
 
@@ -370,13 +491,16 @@ class VisualizerDeck:
         elif style == "WarpTunnel":
             sides = 6
             num_rings = 16
-            speed = 0.16 + amp_norm * 0.4
+            self.tunnel_speed = _flight_speed(self.tunnel_speed, amp_norm if react is None else react["level"], flight_dt, _flight_ease, _tunnel_min, _tunnel_max)
+            self.tunnel_depth = (self.tunnel_depth + self.tunnel_speed * flight_dt) % 1.0
 
             base_unit = min(w, h) * 0.045
             for i in range(num_rings):
-                depth = ((i / float(num_rings)) - t * speed) % 1.0
+                depth = ((i / float(num_rings)) - self.tunnel_depth) % 1.0
                 scale = 1.0 / (depth + 0.06)
                 radius = scale * base_unit
+                if react is not None:
+                    radius *= 1.0 + react_pulse * 0.08
                 if radius > max(w, h) * 1.3:
                     continue
 
@@ -385,7 +509,10 @@ class VisualizerDeck:
                 bright = max(0.15, 1.0 - depth)
                 cr, cg, cb = colorsys.hsv_to_rgb(hue, 0.9, bright)
                 color = (int(cr * 255), int(cg * 255), int(cb * 255))
-                thickness = max(1, int(3 * bright + amp_norm * 5))
+                if react is None:
+                    thickness = max(1, int(3 * bright + amp_norm * 5))
+                else:
+                    thickness = max(1, int(3 * bright + _react_at(react, i / float(num_rings - 1)) * 8 + react_pulse * 4))
 
                 pts = []
                 for s in range(sides):
@@ -394,7 +521,7 @@ class VisualizerDeck:
                 if len(pts) >= 3:
                     pygame.draw.polygon(surface, color, pts, thickness)
 
-            core_r = 8 + amp_norm * 16
+            core_r = 8 + amp_norm * 16 if react is None else 8 + react["level"] * 20 + react_pulse * 10
             cr, cg, cb = colorsys.hsv_to_rgb((t * 0.05) % 1.0, 0.5, 1.0)
             pygame.draw.circle(surface, (int(cr * 255), int(cg * 255), int(cb * 255)), (cx, cy), int(core_r))
 
@@ -409,17 +536,20 @@ class VisualizerDeck:
                 self._glow_braid_fade.fill((0, 0, 0, 16))
             self.trail_surface.blit(self._glow_braid_fade, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
 
-            self.lissa_phase += 0.015 + amp_norm * 0.05
+            self.lissa_phase += 0.015 + (amp_norm if react is None else react["level"] * 0.4) * 0.05
             cx2, cy2 = w / 2.0, h / 2.0
-            rx = w * 0.48 * (0.75 + amp_norm * 0.5)
-            ry = h * 0.48 * (0.75 + amp_norm * 0.5)
+            braid_amp = 0.75 + amp_norm * 0.5
 
-            freq_a = 3.0 + math.sin(t * 0.07) * 1.4 + amp_norm * 0.8
+            freq_a = 3.0 + math.sin(t * 0.07) * 1.4 + (amp_norm * 0.8 if react is None else react["centroid"] * 1.2)
             freq_b = 2.0 + math.cos(t * 0.05) * 1.1
 
-            strands = 3
+            strands = 6 if (react is not None and react["full"]) else 3
             samples = 220
             for s_i in range(strands):
+                if react is not None:
+                    braid_amp = 0.70 + _react_at(react, s_i / float(max(1, strands - 1))) * 0.55 + react_pulse * 0.10
+                rx = w * 0.48 * braid_amp
+                ry = h * 0.48 * braid_amp
                 strand_phase = self.lissa_phase + s_i * (math.pi * 2.0 / strands) * 0.22
                 hue = (t * 0.05 + s_i / float(strands)) % 1.0
                 cr, cg, cb = colorsys.hsv_to_rgb(hue, 0.85, 1.0)
@@ -453,6 +583,8 @@ class VisualizerDeck:
             max_dots = (h - _EQ_TOP_MARGIN) // cell_h
 
             _eq_smooth, _eq_peak_fall, _eq_max_step = _eq_tunables()
+            if react is not None:
+                _eq_smooth = min(_eq_smooth, 0.05)
             _eq_now = _time.monotonic()
             _eq_dt = (1.0 / 60.0) if self._eq_last_time is None else min(_eq_max_step, max(0.0, _eq_now - self._eq_last_time))
             self._eq_last_time = _eq_now
@@ -460,7 +592,13 @@ class VisualizerDeck:
             for i in range(num_bars):
                 center_boost = 1.0 - abs(i - num_bars/2.0) / (num_bars/2.0) * 0.35
                 wobble = 0.85 + 0.15 * math.sin(t * 1.6 + self.eq_bar_phase[i])
-                self.eq_targets[i] = min(1.0, (amp / 120.0) * center_boost * self.eq_bar_mult[i] * wobble)
+                if react is None:
+                    self.eq_targets[i] = min(1.0, (amp / 120.0) * center_boost * self.eq_bar_mult[i] * wobble)
+                else:
+                    bar_level = _react_at(react, i / float(num_bars - 1))
+                    if not react["full"]:
+                        bar_level *= 0.9 + 0.2 * (self.eq_bar_mult[i] - 0.75) / 0.5
+                    self.eq_targets[i] = min(1.0, bar_level * 1.05)
                 self.eq_bars[i] = _eq_ease(self.eq_bars[i], self.eq_targets[i], _eq_dt, _eq_smooth)
                 if self.eq_bars[i] >= self.eq_peaks[i]:
                     self.eq_peaks[i] = self.eq_bars[i]
@@ -508,28 +646,40 @@ class VisualizerDeck:
 
         elif style == "ParticleFlow":
             for p in self.particles:
-                p["y"] -= p["speed"] * (1.0 + amp * 0.01)
+                if react is None:
+                    p["y"] -= p["speed"] * (1.0 + amp * 0.01)
+                else:
+                    p["y"] -= p["speed"] * (1.0 + _react_at(react, p["color"]) * 1.2 + react_pulse * 1.0)
                 p["angle"] += p["angleSpeed"]
                 p["x"] += math.sin(p["angle"]) * 3
                 if p["y"] < 0:
                     p["y"] = h
                     p["x"] = random.uniform(0, w)
-                scale = (amp / 80.0) + 0.6
+                if react is None:
+                    scale = (amp / 80.0) + 0.6
+                else:
+                    scale = 0.6 + _react_at(react, p["color"]) * 1.6 + react_pulse * 0.5
                 r, g, b = colorsys.hsv_to_rgb(p["color"], 1.0, 1.0)
                 pygame.draw.circle(surface, (int(r*255), int(g*255), int(b*255)), (int(p["x"]), int(p["y"])), max(1, int(p["size"] * scale)))
 
         elif style == "NeonStarfield":
-            speed = (amp / 256.0) * 0.08 + 0.01
+            self.star_speed = _flight_speed(self.star_speed, amp_norm if react is None else react["level"], flight_dt, _flight_ease, _star_min, _star_max)
             for s in self.stars:
-                s["z"] -= speed
+                s["z"] -= self.star_speed * flight_dt
                 if s["z"] <= 0:
                     s["z"] = 1.0
                     s["x"] = random.uniform(-1, 1)
                     s["y"] = random.uniform(-1, 1)
                 sx = int((s["x"] / s["z"]) * (w / 2) + (w / 2))
                 sy = int((s["y"] / s["z"]) * (h / 2) + (h / 2))
-                r_sz = max(1, int((1.0 - s["z"]) * (4 + amp * 0.05)))
-                r, g, b = colorsys.hsv_to_rgb(s["color"], 1.0, 1.0)
+                if react is None:
+                    r_sz = max(1, int((1.0 - s["z"]) * (4 + amp * 0.05)))
+                    star_value = 1.0
+                else:
+                    star_level = _react_at(react, s["color"])
+                    r_sz = max(1, int((1.0 - s["z"]) * (3 + star_level * 5 + react_pulse * 4)))
+                    star_value = min(1.0, 0.45 + star_level * 0.55 + react_pulse * 0.2)
+                r, g, b = colorsys.hsv_to_rgb(s["color"], 1.0, star_value)
                 if 0 <= sx < w and 0 <= sy < h:
                     pygame.draw.circle(surface, (int(r*255), int(g*255), int(b*255)), (sx, sy), r_sz)
 
@@ -538,14 +688,20 @@ class VisualizerDeck:
             onset_delta = amp - self.lightning_last_amp
             self.lightning_last_amp = amp
 
-            beat = onset_delta > 7.2
+            if react is None:
+                beat = onset_delta > 7.2
+            else:
+                beat = react["beat"] > 0.0
 
             if beat:
 
-                hit = max(0.0, min(1.0, onset_delta / 7.5))
+                hit = max(0.0, min(1.0, onset_delta / 7.5)) if react is None else react["beat"]
                 num_bolts = 1 + int(hit * 2)
                 for _ in range(num_bolts):
-                    start_x = random.uniform(w * 0.15, w * 0.85)
+                    if react is not None and react["full"]:
+                        start_x = max(w * 0.1, min(w * 0.9, w * (0.1 + 0.8 * react["peak_pos"]) + random.uniform(-w * 0.05, w * 0.05)))
+                    else:
+                        start_x = random.uniform(w * 0.15, w * 0.85)
                     self.lightning_bolts.append(
                         self._build_lightning_bolt(w, h, start_x, hit))
 

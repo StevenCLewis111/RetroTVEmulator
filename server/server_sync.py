@@ -43,8 +43,16 @@ def _rewrite_remote(value, remote_id: str):
 
 
 def sanitize_channels(channels: Mapping, remote_id: str = "") -> dict:
-    """Return a deep-copied schedule payload with no config or file contents."""
-    safe = copy.deepcopy(dict(channels or {}))
+    """Return only channel schedule data; never send channel settings or games."""
+    safe = {}
+    for key, channel in dict(channels or {}).items():
+        if not isinstance(channel, Mapping):
+            continue
+        safe[str(key)] = {
+            field: copy.deepcopy(channel[field])
+            for field in ("schedules", "holiday_schedules")
+            if field in channel
+        }
     if remote_id:
         safe = _rewrite_remote(safe, remote_id)
     return safe
@@ -56,13 +64,8 @@ VALID_SCREEN_MODES = ("normal", "stretch", "crop", "panscan")
 
 
 def sanitize_playback(playback) -> dict:
-    """Whitelist the playback settings a Server may impose on streamed channels."""
-    out = {}
-    if isinstance(playback, Mapping):
-        mode = str(playback.get("screen_mode", "")).strip().lower()
-        if mode in VALID_SCREEN_MODES:
-            out["screen_mode"] = mode
-    return out
+    """Do not transmit video/playback settings through the schedule server."""
+    return {}
 
 
 def build_schedule_message(slot_id: str, channels: Mapping, revision: int,

@@ -435,9 +435,9 @@ def _build_channels_table(page):
 # SECTION: Channel settings
 # ============================================================================
 
-# WARNING: these groups must match the grid in the Channel settings drawing in ui.py: the left column gets (n+1)//2 of the toggles, the bezel style box hangs off Bezel and Add hangs off Water Mark, and Reception Lines sits alone under both columns.
-CHANNEL_SETTINGS_SECONDARY = {"bezel_style_select": "bezel_toggle", "watermark_select": "watermark"}
-CHANNEL_SETTINGS_BOTTOM = "reception_lines"
+# WARNING: these groups must match the grid in the Channel settings drawing in ui.py: left column is Bezel (with its style button), Warp Screen, Boot Anim; right column is Static Noise, Reception Lines, Scan Lines.
+CHANNEL_SETTINGS_SECONDARY = {"bezel_style_select": "bezel_toggle"}
+CHANNEL_SETTINGS_BOTTOM = None
 
 _channel_settings_tables = {}
 
@@ -470,9 +470,10 @@ def _build_channel_settings_table(rows):
     secondary_of = {s: p for s, p in CHANNEL_SETTINGS_SECONDARY.items() if s in rows and p in rows}
     attached = {p: s for s, p in secondary_of.items()}
     bottom = CHANNEL_SETTINGS_BOTTOM if CHANNEL_SETTINGS_BOTTOM in rows else None
-    grid = [r for r in rows if r not in secondary_of and r != bottom]
-    left_count = (len(grid) + 1) // 2
-    columns = [grid[:left_count], grid[left_count:]]
+    columns = [
+        [r for r in ("bezel_toggle", "warp_screen", "boot_anim") if r in rows],
+        [r for r in ("static_noise", "reception_lines", "scan_lines") if r in rows],
+    ]
     t = NavTable()
     t.known(CLOSE, *rows)
 
@@ -592,6 +593,19 @@ def slider_adjust(config, cell, direction):
     key, default, low, high = spec
     moved = config.get(key, default) + (SLIDER_STEP if direction == RIGHT else -SLIDER_STEP)
     config[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
+    return True
+
+
+# VALUES CHANGE HERE (milliseconds): the fastest a value control (slider, volume) may step, however fast the key is pressed or held. Keep it below the held-key repeat intervals in HOLD_RULES so a hold is never dropped.
+VALUE_STEP_MIN_MS = 100
+
+
+def step_ready(gate, name, now, min_ms=VALUE_STEP_MIN_MS):
+    """Returns True and records the time when the control `name` may step now (at least min_ms since its last step); False when the press came too soon and is dropped. Presses are never queued, so nothing can pile up or stick."""
+    last = gate.get(name)
+    if last is not None and 0 <= now - last < min_ms:
+        return False
+    gate[name] = now
     return True
 
 _theme_table = None
@@ -1295,6 +1309,118 @@ def ring_move(app_state, layer, selection, count, direction):
     return selection if target is None else int(target[3:])
 
 
+# ============================================================================
+# SECTION: Commercials and bumper file sub-menu
+# ============================================================================
+
+COMMERCIALS_ROWS = 3
+COMMERCIALS_CLEAR_ROW = COMMERCIALS_ROWS
+COMMERCIALS_CLOSE_ROW = COMMERCIALS_ROWS + 1
+_commercials_table = None
+
+
+def commercials_move(app_state, row, direction):
+    """Move through the Commercials, Fade-in, Fade-out and Close rows."""
+    global _commercials_table
+    if _commercials_table is None:
+        table = NavTable()
+        for idx in range(COMMERCIALS_ROWS):
+            cell = f"pick{idx}"
+            table.known(cell)
+            table.link(cell, UP, f"pick{idx - 1}" if idx else cell)
+            table.link(cell, DOWN, f"pick{idx + 1}" if idx < COMMERCIALS_ROWS - 1 else "clear")
+        table.known("clear")
+        table.link("clear", UP, "pick2")
+        table.link("clear", DOWN, CLOSE)
+        table.link("clear", RIGHT, CLOSE)
+        table.link("clear", LEFT, "clear")
+        table.known(CLOSE)
+        table.link(CLOSE, UP, "clear")
+        table.link(CLOSE, DOWN, CLOSE)
+        table.link(CLOSE, RIGHT, CLOSE)
+        table.link(CLOSE, LEFT, "clear")
+        _commercials_table = table
+    row = max(0, min(COMMERCIALS_CLOSE_ROW, row))
+    if row == COMMERCIALS_CLOSE_ROW:
+        cell = CLOSE
+    elif row == COMMERCIALS_CLEAR_ROW:
+        cell = "clear"
+    else:
+        cell = f"pick{row}"
+    target = navigate(app_state, "COMMERCIALS_SUB_MENU", _commercials_table, cell, direction)
+    if target is None:
+        return row
+    if target == CLOSE:
+        return COMMERCIALS_CLOSE_ROW
+    if target == "clear":
+        return COMMERCIALS_CLEAR_ROW
+    return int(target[4:])
+
+
+# ============================================================================
+# SECTION: Holiday sub-menu (pick files and force toggle per holiday)
+# ============================================================================
+
+HOLIDAY_ROWS = 3
+HOLIDAY_CLEAR_ROW = HOLIDAY_ROWS
+HOLIDAY_CLOSE_ROW = HOLIDAY_ROWS + 1
+HOLIDAY_PICK_COLUMN = 0
+HOLIDAY_FORCE_COLUMN = 1
+_holiday_table = None
+
+
+def holiday_cell(row, col):
+    """Returns the cell name for a Holiday sub-menu row and column: pick0 to pick2 (the file picker), force0 to force2 (the force toggle) or CLOSE."""
+    if row == HOLIDAY_CLEAR_ROW:
+        return "clear"
+    if row >= HOLIDAY_CLOSE_ROW:
+        return CLOSE
+    return ("force%d" if col == HOLIDAY_FORCE_COLUMN else "pick%d") % max(0, row)
+
+
+def holiday_position(cell):
+    """Returns the (row, column) of a Holiday sub-menu cell name."""
+    if cell == CLOSE:
+        return HOLIDAY_CLOSE_ROW, HOLIDAY_PICK_COLUMN
+    if cell == "clear":
+        return HOLIDAY_CLEAR_ROW, HOLIDAY_PICK_COLUMN
+    return int(cell[-1]), (HOLIDAY_FORCE_COLUMN if cell.startswith("force") else HOLIDAY_PICK_COLUMN)
+
+
+def holiday_table():
+    """Returns the cached NavTable of the Holiday sub-menu: every file picker and every force toggle can be reached with the keys, greyed or not."""
+    global _holiday_table
+    if _holiday_table is None:
+        table = NavTable()
+        for row in range(HOLIDAY_ROWS):
+            table.known(holiday_cell(row, 0))
+            table.link(holiday_cell(row, 0), UP, holiday_cell(row - 1, 0) if row > 0 else None)
+            table.link(holiday_cell(row, 0), DOWN, holiday_cell(row + 1, 0))
+            table.link(holiday_cell(row, 0), RIGHT, holiday_cell(row, 1))
+            table.link(holiday_cell(row, 1), LEFT, holiday_cell(row, 0))
+            table.link(holiday_cell(row, 1), UP, holiday_cell(row - 1, 1) if row > 0 else None)
+            table.link(holiday_cell(row, 1), DOWN, holiday_cell(row + 1, 1) if row < HOLIDAY_ROWS - 1 else "clear")
+        table.known("clear")
+        table.link("clear", UP, holiday_cell(HOLIDAY_ROWS - 1, 0))
+        table.link("clear", RIGHT, CLOSE)
+        table.link(CLOSE, LEFT, "clear")
+        table.known(CLOSE)
+        table.link(CLOSE, UP, holiday_cell(HOLIDAY_ROWS - 1, 1))
+        _holiday_table = table
+    return _holiday_table
+
+
+def holiday_move(app_state, row, col, direction):
+    """Returns the new (row, column) after one key in the Holiday sub-menu."""
+    row = max(0, min(HOLIDAY_CLOSE_ROW, row))
+    table = holiday_table()
+    cell = holiday_cell(row, col)
+    if cell not in table.cells:
+        return holiday_position(holiday_cell(row, 0))
+    target = navigate(app_state, "HOLIDAY_SUB_MENU", table, cell, direction)
+    return (row, HOLIDAY_FORCE_COLUMN if cell.startswith("force") else HOLIDAY_PICK_COLUMN) if target is None else holiday_position(target)
+
+
 def server_slots_cell(selection):
     """Returns the cell name for a Server Slots selection number: slot0 to slot5, create, manage or CLOSE."""
     return SERVER_SLOT_CELLS[selection] if isinstance(selection, int) and 0 <= selection < len(SERVER_SLOT_CELLS) else CLOSE
@@ -1329,17 +1455,25 @@ def server_slots_table():
 # SECTION: Channels per-channel sub-menu
 # ============================================================================
 
-# WARNING: the row numbers and column counts here must match the Channel sub-menu drawing in ui.py and the Enter code in the main script: row 0 is Active, Mode and Name, then Close is row 1 for an off channel, row 4 for a music channel and row 6 (marathon) or 7 otherwise, with Clear and Close sharing the last row for a content channel that is on.
+# WARNING: the row numbers and column counts here must match the Channel sub-menu drawing in ui.py and the Enter code in the main script: row 0 is Active, Mode and Name; row 4 is the schedule-length control plus Watermark and Add for content channels; Close is row 1 for an off channel, row 7 for a music channel and row 6 (marathon) or 7 otherwise.
 CHANNEL_SUB_MAX_COL = 5
 
 _channel_sub_tables = {}
+
+
+def shown_scheduling_mode(ch_info):
+    """Returns the scheduling mode the channel menu shows: the pick waiting to be committed, otherwise the mode the channel really has."""
+    pending = ch_info.get("_sched_mode_request")
+    if isinstance(pending, dict) and pending.get("to"):
+        return pending["to"]
+    return ch_info.get("scheduling_mode", "random_slots")
 
 
 def channel_sub_layout(ch_info, active_count):
     """Returns the hashable layout of one channel's sub-menu: (on, music, marathon, full day, six block, commercials, only active channel); active_count is how many channels are on."""
     on = bool(ch_info.get("active", True))
     music = bool(ch_info.get("is_visualizer", False))
-    marathon = (not music) and ch_info.get("scheduling_mode", "random_slots") == "marathon"
+    marathon = (not music) and shown_scheduling_mode(ch_info) == "marathon"
     full_day = (not marathon) and ch_info.get("block_mode", "full_day") == "full_day"
     six_block = (not marathon) and ch_info.get("block_mode", "full_day") == "six_block"
     return (on, music, marathon, full_day, six_block, bool(ch_info.get("commercials_enabled", False)), on and active_count <= 1)
@@ -1351,7 +1485,7 @@ def channel_sub_close_row(layout):
     if not on:
         return 1
     if music:
-        return 4
+        return 7
     return 6 if marathon else 7
 
 
@@ -1408,13 +1542,17 @@ def _channel_sub_target(layout, close, row, col, direction):
         return row + 1, 0
     if direction == RIGHT:
         if row == close:
-            limit = 1 if on else None
+            if not on:
+                return None
+            return (row, 3) if col == 0 else None
         elif row == 0:
             limit = 2 if on else None
         elif not music and row == 1:
             limit = None if marathon else 1
         elif not music and row == 3:
             limit = 2 if commercials else None
+        elif not music and row == 4:
+            limit = 2
         elif not music and row == folder_row:
             limit = (5 if six_block else 2) if (not marathon and not full_day) else None
         elif has_audio_row and row == holiday_row and not marathon:
@@ -1423,7 +1561,9 @@ def _channel_sub_target(layout, close, row, col, direction):
             limit = None
         return None if limit is None else (row, min(limit, col + 1))
     if row == close:
-        floor = 0 if on else None
+        if not on:
+            return None
+        return (row, 0) if col == 3 else None
     elif row == 0:
         floor = only_off_at_row0 if on else None
     elif not music and row == 3:
@@ -1609,7 +1749,7 @@ HOLD_RULES = {
     "horizontal": HoldRule(None, 110),
     "rom_list": HoldRule(380, 70, True),
     "gamepad": HoldRule(400, 180, True),
-    "volume": HoldRule(200, 180),
+    "volume": HoldRule(100, 160),
 }
 # VALUES CHANGE HERE
 HOLD_STUCK_MS = {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}
@@ -1948,6 +2088,27 @@ def joystick_action(event):
 
 
 # ============================================================================
+# SECTION: Controller bridge keys
+# ============================================================================
+
+_BRIDGE_VK_KEYS = {}
+
+
+def bridge_vk_to_key(vk):
+    """Returns the pygame key a Windows virtual-key code sent by the controller bridge arrives as, or None when it has no pygame key here."""
+    import pygame
+    if not _BRIDGE_VK_KEYS:
+        _BRIDGE_VK_KEYS.update({
+            0x08: pygame.K_BACKSPACE, 0x09: pygame.K_TAB, 0x0D: pygame.K_RETURN, 0x1B: pygame.K_ESCAPE,
+            0x20: pygame.K_SPACE, 0x25: pygame.K_LEFT, 0x26: pygame.K_UP, 0x27: pygame.K_RIGHT, 0x28: pygame.K_DOWN,
+        })
+        _BRIDGE_VK_KEYS.update({0x30 + i: pygame.K_0 + i for i in range(10)})
+        _BRIDGE_VK_KEYS.update({0x41 + i: pygame.K_a + i for i in range(26)})
+        _BRIDGE_VK_KEYS.update({0x70 + i: pygame.K_F1 + i for i in range(12)})
+    return _BRIDGE_VK_KEYS.get(vk)
+
+
+# ============================================================================
 # SECTION: Channel number entry
 # ============================================================================
 
@@ -2148,7 +2309,7 @@ def dvd_hold_due(held_ms, now, cooldown):
 __all__ = [
     "UP", "DOWN", "LEFT", "RIGHT", "DIRECTIONS", "TAB_BAR", "PANEL", "CLOSE",
     "ACCEPT", "BACK", "Remember", "NavTable", "key_to_direction", "key_to_action", "action_keys", "action_key", "pressed_actions", "is_accept", "is_back", "navigate",
-    "SLIDER_STEP", "SLIDER_SPECS", "slider_adjust",
+    "SLIDER_STEP", "SLIDER_SPECS", "slider_adjust", "VALUE_STEP_MIN_MS", "step_ready",
     "system_cell", "system_index", "system_table",
     "advanced_cell", "advanced_index", "advanced_table",
     "GAMES_SUB_MENU_LEFT", "GAMES_SUB_MENU_RIGHT", "GAMES_SUB_RIGHT_COLUMN", "games_sub_cell", "games_sub_index", "games_sub_table",
@@ -2176,7 +2337,7 @@ __all__ = [
     "EXPLORER_THUMB_MIN_H", "EXPLORER_SB_WIDTH", "EXPLORER_SB_PAD", "explorer_hit", "explorer_in_band", "explorer_visible_rows", "explorer_row", "explorer_row_at", "explorer_list_pick",
     "explorer_in_remove_zone", "explorer_wheel", "explorer_wheel_button", "explorer_thumb", "explorer_scroll_from_thumb", "explorer_scrollbar_track", "explorer_scrollbar_press",
     "explorer_scrollbar_drag", "explorer_modifiers", "explorer_select", "explorer_double_click", "explorer_drag_moved", "explorer_drag_step", "explorer_button_at",
-    "JOY_AXIS_THRESHOLD", "JOY_VERTICAL_AXIS", "JOY_HORIZONTAL_AXIS", "JOY_ACCEPT_BUTTONS", "JOY_BACK_BUTTONS", "joystick_action",
+    "bridge_vk_to_key", "JOY_AXIS_THRESHOLD", "JOY_VERTICAL_AXIS", "JOY_HORIZONTAL_AXIS", "JOY_ACCEPT_BUTTONS", "JOY_BACK_BUTTONS", "joystick_action",
     "DIGIT_ENTRY_MAX", "DIGIT_ENTRY_SINGLE_MS", "DIGIT_ENTRY_CONFIRM_MS", "key_to_digit", "digit_entry_step", "digit_entry_due", "digit_entry_channel",
     "NAME_SAVE", "NAME_CANCEL", "NAME_EDIT", "NAME_ENTRY_CHANNEL_MAX_DEFAULT", "NAME_ENTRY_SLOT_MAX", "name_entry_step",
     "DVD_PLAY_PAUSE", "DVD_REWIND", "DVD_FAST_FORWARD", "DVD_RETURN_MENU", "DVD_ACTIONS", "DVD_RETURN_IGNORE", "DVD_RETURN_REISSUE", "DVD_RETURN_CONFIRM",

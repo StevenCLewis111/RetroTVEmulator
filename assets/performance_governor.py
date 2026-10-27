@@ -32,6 +32,37 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================================
+# SECTION: Swallowed-failure lines (shared by every script)
+# ============================================================================
+_swallowed_failure_counts = {}
+_swallowed_failure_lock = threading.Lock()
+
+
+def log_swallowed(where, error):
+    """Writes one [FAILURE] line naming where a caught failure happened, its error text and its source line, and again at the 10th, 100th, 1000th ... repeat."""
+    # WARNING: this is the one shared copy; every script imports it from here, so the repeat counts are shared and a new script must import it, not copy it.
+    # WARNING: this runs inside handlers on render, VLC callback and worker threads; it must never raise and must never wait on anything but its own short lock.
+    try:
+        key = (where, type(error).__name__)
+        with _swallowed_failure_lock:
+            count = _swallowed_failure_counts.get(key, 0) + 1
+            _swallowed_failure_counts[key] = count
+        if count != 10 ** (len(str(count)) - 1):
+            return
+        trace = error.__traceback__
+        while trace is not None and trace.tb_next is not None:
+            trace = trace.tb_next
+        source = "" if trace is None else " [%s:%d]" % (os.path.basename(trace.tb_frame.f_code.co_filename), trace.tb_lineno)
+        log.warning("[FAILURE] %s: %s: %s%s%s", where, type(error).__name__, error, source,
+                    "" if count == 1 else " (seen %d times)" % count)
+    except Exception:
+        pass
+
+
+_log_swallowed = log_swallowed
+
+
+# ============================================================================
 # SECTION: TUNABLES - every number the governor uses lives in this section
 # ============================================================================
 
@@ -135,6 +166,14 @@ EQ_GRID_SMOOTH_SECONDS = 0.12
 EQ_GRID_PEAK_FALL_PER_SECOND = 0.42
 EQ_GRID_MAX_STEP_SECONDS = 0.1
 
+# VALUES CHANGE HERE (Visualizer flying styles, Neon Starfield and Warp Tunnel: seconds the flying speed takes to ease toward the speed the music asks for, the slowest steady speed it may ever have so it never stops, the fastest speed (the starfield in depth per second, the tunnel in rings per second), longest frame time one step may use in seconds)
+FLIGHT_SPEED_EASE_SECONDS = 3.0
+FLIGHT_STARFIELD_MIN_SPEED = 0.35
+FLIGHT_STARFIELD_MAX_SPEED = 1.4
+FLIGHT_TUNNEL_MIN_SPEED = 0.40
+FLIGHT_TUNNEL_MAX_SPEED = 1.10
+FLIGHT_MAX_STEP_SECONDS = 0.1
+
 # VALUES CHANGE HERE (throttle level -> allowance factor; level 4 pauses everything non-priority)
 LEVEL_FACTOR = (1.0, 0.75, 0.5, 0.25, 0.0)
 MAX_LEVEL = 4
@@ -179,6 +218,12 @@ MENU_NAV_REPEAT_DELAY_MS = 400
 # VALUES CHANGE HERE (channel Up/Down: milliseconds you must stay on a channel number before that channel is tuned; presses faster than this only change the number shown on the grey screen)
 CHANNEL_SURF_HESITATE_MS = 400
 
+# VALUES CHANGE HERE (channel menu Schedule row: milliseconds a picked scheduling mode must be left alone, with no other press, before the channel really switches to it and the next block is rebuilt; this is the one 5-second wait, the screen shows the pick at once)
+SCHEDULE_MODE_COMMIT_HOLD_MS = 5000
+
+# VALUES CHANGE HERE (channel menu Schedule row: how many stopping points are kept per channel; one is written each time a picked scheduling mode is committed and holds the playing file, the clock moment and the show positions at that moment, and only the newest ones are kept)
+SCHEDULE_MODE_STOP_POINTS_KEPT = 3
+
 # VALUES CHANGE HERE (typed channel number: milliseconds between the second digit and the tune; the show on air is hidden, muted and shut down the moment the second digit is typed)
 CHANNEL_DIGIT_TUNE_DELAY_MS = 350
 
@@ -198,6 +243,14 @@ BOOT_BAR_MAX_BEFORE_DONE = 99.0
 BOOT_BAR_CATCHUP_RATE_PER_SECOND = 12.0
 BOOT_BAR_FINISH_RATE_PER_SECOND = 60.0
 BOOT_BAR_CONFIG_KEY = "_boot_bar_costs"
+# VALUES CHANGE HERE (playback stall watchdog: a main-loop pass longer than this many ms is a blocked loop, and the blocked time is never counted as a playback stall)
+LOOP_BLOCKED_GAP_MS = 1000
+# VALUES CHANGE HERE (milliseconds between retries when a wedged playback engine is replaced)
+WEDGED_ENGINE_REPLACE_RETRY_MS = 5000
+# VALUES CHANGE HERE (tester report: bytes read from the end of app_log.txt and of each crash file; the most warning, error and failure lines of app_log.txt kept; the most lines kept from each crash file)
+TESTER_REPORT_LOG_TAIL_BYTES = 524288
+TESTER_REPORT_MAX_LOG_LINES = 300
+TESTER_REPORT_MAX_CRASH_LINES = 200
 # VALUES CHANGE HERE (boot stall watchdog: seconds into boot before one [BOOT STALL] report names what is unfinished, 0 = off; seconds before the optional boot warm-up stops holding the loading screen, 0 = never)
 BOOT_STALL_REPORT_SECONDS = 8.0
 BOOT_PREWARM_MAX_SECONDS = 20.0
@@ -208,6 +261,8 @@ BOOT_UNIT_HOLD_MIN_SECONDS = 5.0
 BOOT_PREWARM_OTHER_WORKERS = 4
 BOOT_FILE_SIZE_WORKERS = 8
 BOOT_FILE_SIZE_TIMEOUT_SECONDS = 1.5
+# VALUES CHANGE HERE (boot drive wake-up: the most seconds boot waits for a sleeping media hard drive to spin up before it carries on without it, 0 = do not wake drives at boot)
+BOOT_DRIVE_WAKE_SECONDS = 15.0
 
 # VALUES CHANGE HERE (Advanced Settings menu: width of every bar in pixels; text padding inside a bar; gap between a bar and its side pill or button; preferred gap between rows, the smallest gap rows may shrink to when the list is tall, gap under the title, space kept free above the Close button; how fast a too-long label scrolls in pixels per second, the pause in seconds at each end of the scroll, and how many times per second the menu is redrawn while one scrolls)
 ADVANCED_MENU_BAR_WIDTH = 360
@@ -276,9 +331,71 @@ GPU_FRAME_LOG_INTERVAL_FRAMES = 600
 MENU_NAV_BURST_WARN_EVENTS = 3
 LOOP_PROFILE_LOG_INTERVAL_FRAMES = 600
 
-# VALUES CHANGE HERE (guide past rebuild: most recent missed block occurrences replayed per channel at a block change; length in seconds guessed for an unscanned episode with no scanned episode of its series or channel to average)
+# VALUES CHANGE HERE (guide history rebuild: most recent missed block occurrences recorded per channel at a block change)
 GUIDE_REPLAY_MAX_BLOCKS = 60
-GUIDE_REPLAY_EPISODE_GUESS_SECONDS = 1800
+
+# VALUES CHANGE HERE (schedule hub saved estimates: scanned episodes of one series needed before its unscanned episodes get the average as their saved estimate; length in seconds saved as the estimate of a movie that is not scanned yet)
+HUB_SERIES_ESTIMATE_MIN_SCANNED = 2
+HUB_MOVIE_ESTIMATE_SECONDS = 5400
+
+# VALUES CHANGE HERE (schedule hub: seconds before the hub asks the library again about a file that has no measured length yet)
+HUB_UNMEASURED_RECHECK_SECONDS = 30.0
+
+# VALUES CHANGE HERE (schedule hub loudness: seconds before the hub asks the library again about a file that has no scanned gain on record)
+HUB_GAIN_MISS_RECHECK_SECONDS = 900.0
+
+# VALUES CHANGE HERE (seconds before a loudness scan skipped because its drive is slow may be retried; this keeps playback ahead of background rescans)
+LOUDNESS_DEGRADED_RETRY_SECONDS = 1800.0
+
+# VALUES CHANGE HERE (schedule hub clock check: seconds either side of a slot edge in which the hub's answer for "what is on air now" may differ from the scheduler's without being reported)
+HUB_CLOCK_COMPARE_GRACE_SECONDS = 1.0
+
+# VALUES CHANGE HERE (schedule hub airing lookup: seconds the scheduler waits before asking the hub again for the airing entry after the hub had no matching row; the scheduler's own pick airs in the meantime)
+HUB_AIRING_LOOKUP_RETRY_SECONDS = 1.0
+
+# VALUES CHANGE HERE (schedule hub rows: a rebuilt block whose rows at already-aired positions start this many seconds away from the rows on record, or hold other files, gets its own set of rows and the old rows stay as history)
+HUB_ROW_GENERATION_START_TOLERANCE_SECONDS = 60.0
+
+# VALUES CHANGE HERE (schedule hub future rows: how many hours ahead of the clock the background step works out what each channel will air and saves it in the hub for the guide to read; 192 is the guide's seven day span plus one extra day)
+HUB_FUTURE_HOURS_AHEAD = 192.0
+
+# VALUES CHANGE HERE (schedule hub future rows: seconds the background step waits after working out one channel, before the next channel, so playback is never crowded)
+HUB_FUTURE_BETWEEN_CHANNELS_SECONDS = 4.0
+
+# VALUES CHANGE HERE (schedule hub future rows: seconds after boot before the background step starts, so the future is never worked out during boot)
+HUB_FUTURE_START_DELAY_SECONDS = 45.0
+
+# VALUES CHANGE HERE (schedule hub future rows: a channel whose inputs have not changed is still worked out again after this many seconds, so a newly found file length reaches rows that are still ahead)
+HUB_FUTURE_REFRESH_SECONDS = 900.0
+
+# VALUES CHANGE HERE (schedule hub future rows: seconds the background step sleeps when every channel is up to date)
+HUB_FUTURE_IDLE_SECONDS = 30.0
+
+# VALUES CHANGE HERE (schedule hub slot-mode switch: seconds a channel's slot mode must stay unchanged before the hub puts its current set of rows aside and opens a new one, so cycling through modes quickly changes nothing in the hub)
+HUB_MODE_SWITCH_SETTLE_SECONDS = 0.5
+
+# VALUES CHANGE HERE (fall back to Static: milliseconds a playing channel may go without a new picture before the screen shows Static; it must stay below the stall recovery time in retro_tv_emulator.py, PLAYBACK_STALL_TIMEOUT_MS)
+STALL_FORCES_STATIC_MS = 7000
+
+# VALUES CHANGE HERE (loudness scan sampling: each sample window is this many seconds of audio; a show up to the long-show length gets the first number of windows and a longer show gets the second, evenly spaced across the file; a file up to the whole-file length is scanned whole)
+LOUDNESS_SCAN_WINDOW_SECONDS = 60.0
+LOUDNESS_SCAN_WINDOWS_STANDARD = 5
+LOUDNESS_SCAN_WINDOWS_LONG = 7
+LOUDNESS_SCAN_LONG_SHOW_SECONDS = 3600.0
+LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = 180.0
+
+# VALUES CHANGE HERE (gain double-check, right away: a scan whose gain lands more than this many dB from 0 dB scans this many more batches of windows, each batch the size given below; the gain is then worked out from every window together)
+GAIN_CHECK_DRASTIC_DB = 4.0
+GAIN_CHECK_DRASTIC_EXTRA_BATCHES = 2
+
+# VALUES CHANGE HERE (gain double-check, after the fact: a file whose gain is this many dB or more from the middle gain of its season folder is scanned again once with this many more batches of windows, and its gain is worked out from every window together; the season folder needs at least the second number of scanned files, the file itself included, before any file in it is compared)
+GAIN_CHECK_NEIGHBOR_DB = 3.0
+GAIN_CHECK_BUNDLE_MIN_SCANNED = 4
+GAIN_CHECK_RECHECK_EXTRA_BATCHES = 2
+
+# VALUES CHANGE HERE (gain double-check, where the new windows go: windows per extra batch; the share of one window a new window may overlap an earlier window, 0 meaning never)
+GAIN_CHECK_EXTRA_BATCH_WINDOWS = 3
+GAIN_CHECK_MAX_OVERLAP = 0.5
 
 # VALUES CHANGE HERE (scheduler catch-up: most recent missed blocks replayed per channel at a block change; most cycles replayed inside one missed block)
 CATCH_UP_MAX_BLOCKS = 3000
@@ -461,15 +578,15 @@ def _read_ram_gb():
             status.dwLength = ctypes.sizeof(_MemStatus)
             if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
                 return status.ullTotalPhys / 1024 ** 3, status.ullAvailPhys / 1024 ** 3
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_read_ram_gb: class _MemStatus(ctypes.Structure): _fields_ = [('dwLength',", _swallowed_error)
     else:
         try:
             page = os.sysconf("SC_PAGE_SIZE")
             return (os.sysconf("SC_PHYS_PAGES") * page / 1024 ** 3,
                     os.sysconf("SC_AVPHYS_PAGES") * page / 1024 ** 3)
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_read_ram_gb: page = os.sysconf('SC_PAGE_SIZE')", _swallowed_error)
     return 0.0, 0.0
 
 
@@ -603,7 +720,8 @@ def apply_cv2_threads(mode=None):
         count = int(cv2_threads(None, mode))
         cv2.setNumThreads(count)
         return count
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("apply_cv2_threads: import cv2", _swallowed_error)
         return None
 
 
@@ -721,6 +839,8 @@ STICK_MENU_AXIS_THRESHOLD = 0.6
 # ============================================================================
 # VALUES CHANGE HERE (trigger travel, 0 to 255, that counts as a button press in the Controller Map and the DVD button map; trigger travel for the in-game hotkey; milliseconds before that hotkey can fire again; how far, in raw DirectInput units, an axis must move to show a pad is alive)
 TRIGGER_PRESS_THRESHOLD = 30
+# VALUES CHANGE HERE (controller keystroke guard: ms after a controller-sent key is released during which the TV still ignores that key)
+BRIDGE_KEY_GRACE_MS = 250
 GAME_HOTKEY_TRIGGER_THRESHOLD = 128
 GAME_HOTKEY_COOLDOWN_MS = 2000
 DINPUT_AXIS_LIVENESS_THRESHOLD = 1500
@@ -732,6 +852,107 @@ JS_DEAD_TIMEOUT_SECONDS = 5.0
 XI_NAV_POLL_HZ = 30
 XI_NAV_NO_PAD_INTERVAL_SECONDS = 0.25
 XI_NAV_MISSES_BEFORE_SLOW = 30
+
+
+# ============================================================================
+# SECTION: Failed-drive values
+# ============================================================================
+# VALUES CHANGE HERE (milliseconds a drive must stay unresponsive, counted from when it was first marked unresponsive, before the list screen and the failed-drive banner treat it as failed)
+DRIVE_FAILED_AFTER_MS = 7000
+
+
+# ============================================================================
+# SECTION: Probe marker rename retry values
+# ============================================================================
+# VALUES CHANGE HERE (how many times the probe-in-progress marker rename is tried before it gives up)
+PROBE_MARKER_RENAME_ATTEMPTS = 6
+# VALUES CHANGE HERE (seconds added to the wait after each refused rename: the wait after try n is this times n)
+PROBE_MARKER_RENAME_STEP_SECONDS = 0.02
+
+
+# ============================================================================
+# SECTION: Bezel screen hole values
+# ============================================================================
+# VALUES CHANGE HERE (a bezel pixel counts as part of the transparent screen hole when its alpha is at or below this, 0 to 255)
+BEZEL_HOLE_ALPHA_MAX = 23
+# VALUES CHANGE HERE (the smallest screen hole accepted, as a share of the whole bezel image; anything smaller is treated as no hole)
+BEZEL_HOLE_MIN_AREA_FRAC = 0.005
+
+
+# ============================================================================
+# SECTION: Bezel channel number window values
+# ============================================================================
+# VALUES CHANGE HERE (a bezel pixel counts as part of the black number window when red, green and blue are each at or below this, 0 to 255)
+BEZEL_LED_WINDOW_DARK_MAX = 32
+# VALUES CHANGE HERE (a bezel pixel must have at least this alpha to count as part of the black number window, 0 to 255)
+BEZEL_LED_WINDOW_ALPHA_MIN = 200
+# VALUES CHANGE HERE (the smallest black number window accepted, as a share of the whole bezel image)
+BEZEL_LED_WINDOW_MIN_AREA_FRAC = 0.0005
+# VALUES CHANGE HERE (how much of the window's box the black pixels must fill, 0 to 1; keeps out dark shadows and thin strips)
+BEZEL_LED_WINDOW_MIN_FILL = 0.6
+# VALUES CHANGE HERE (the narrowest and widest the window may be, as width divided by height)
+BEZEL_LED_WINDOW_MIN_ASPECT = 1.2
+BEZEL_LED_WINDOW_MAX_ASPECT = 6.0
+# VALUES CHANGE HERE (the most the black number window may be tilted in the art, in degrees; a larger measured tilt is treated as level)
+BEZEL_LED_WINDOW_MAX_TILT_DEG = 15.0
+# VALUES CHANGE HERE (a measured tilt smaller than this, in degrees, is treated as level)
+BEZEL_LED_WINDOW_MIN_TILT_DEG = 0.3
+
+
+# ============================================================================
+# SECTION: Holiday window values
+# ============================================================================
+# VALUES CHANGE HERE (how many calendar days a holiday lasts, counted back from midnight at the end of the holiday itself; 3 days is 72 hours)
+HOLIDAY_WINDOW_DAYS = 3
+# VALUES CHANGE HERE (a holiday whose window opens within this many days has its unscanned files scanned ahead of the deep backlog; a later holiday waits behind it)
+HOLIDAY_SCAN_LEAD_DAYS = 7
+
+
+# ============================================================================
+# SECTION: Folder listing cache values (ROM/DVD lists and the file explorer)
+# ============================================================================
+
+# VALUES CHANGE HERE (most folder listings kept in memory; the oldest is dropped first)
+LISTING_CACHE_MAX_FOLDERS = 400
+# VALUES CHANGE HERE (seconds a cached listing is shown without a fresh read being forced; after this it is still shown, and re-read in the background)
+LISTING_CACHE_FRESH_SECONDS = 30.0
+# VALUES CHANGE HERE (how many sub-folders of a just-listed folder are read ahead)
+LISTING_READ_AHEAD_FOLDERS = 12
+# VALUES CHANGE HERE (most console ROM folders read ahead while the Channel 03 console list shows)
+LISTING_CONSOLE_READ_AHEAD_MAX = 24
+# VALUES CHANGE HERE (seconds between console ROM folder read-aheads while the console list shows)
+LISTING_CONSOLE_READ_AHEAD_SECONDS = 30.0
+# VALUES CHANGE HERE (seconds a "this folder has something in it" answer is remembered for the DVD list)
+LISTING_DVD_HAS_CONTENT_SECONDS = 30.0
+# VALUES CHANGE HERE (seconds a list can stay on the rocking wait bar before you are pushed out of the drive)
+LISTING_DRIVE_PUSH_OUT_SECONDS = 6.0
+# VALUES CHANGE HERE (seconds between retests of a drive that pushed you out; it is shown again once it answers)
+LISTING_DRIVE_RETEST_SECONDS = 5.0
+# VALUES CHANGE HERE (seconds the "why you were pushed out" banner stays up)
+LISTING_PUSH_OUT_BANNER_SECONDS = 4.0
+
+
+# ============================================================================
+# SECTION: Guide hub fill values
+# ============================================================================
+# VALUES CHANGE HERE (seconds the guide keeps the hub rows it asked for, so a row drawn every frame asks the hub once)
+GUIDE_HUB_FILL_CACHE_SECONDS = 2.0
+
+
+# ============================================================================
+# SECTION: Guide preview picture box hold values
+# ============================================================================
+# VALUES CHANGE HERE (milliseconds the guide preview stays black while the highlighted file's picture box has not been read yet, before it shows the full frame anyway)
+GUIDE_PREVIEW_BOX_HOLD_MS = 1500
+# VALUES CHANGE HERE (seconds between looks for the picture box while the guide preview is held black)
+GUIDE_PREVIEW_BOX_RECHECK_SECONDS = 0.2
+
+
+# ============================================================================
+# SECTION: Commercial bundle values
+# ============================================================================
+# VALUES CHANGE HERE (seconds between commercial length bundles: 15 gives bundles of 15, 30, 45 and so on up to the 5 minute commercial limit, twenty bundles)
+COMMERCIAL_BUNDLE_STEP_SECONDS = 15
 
 
 # ============================================================================
@@ -771,6 +992,30 @@ GAME_DISPLAY_ASPECTS = {"NES": 4.0 / 3.0, "SNES": 4.0 / 3.0}
 # VALUES CHANGE HERE
 PICTURE_BOX_PRE_SHOW_BUDGET_S = 8.0
 PICTURE_BOX_PRE_SHOW_PARALLEL = 6
+
+
+# ============================================================================
+# SECTION: Picture box, flat-bar detection
+# ============================================================================
+# VALUES CHANGE HERE (a bar is an edge strip of one flat colour in every sample; the frame is read at this size, flat means the pixel levels in the strip differ by no more than the tolerance, a sample whose picture is thinner than the fraction of the frame height is not used)
+PICTURE_BOX_FLAT_WIDTH = 640
+PICTURE_BOX_FLAT_HEIGHT = 480
+PICTURE_BOX_FLAT_TOLERANCE = 12
+PICTURE_BOX_FLAT_FRAMES = 2
+PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION = 0.125
+
+
+# ============================================================================
+# SECTION: First-start probe of pending scheduled files
+# ============================================================================
+# VALUES CHANGE HERE
+PENDING_SCHEDULE_PROBE_PARALLEL = 6
+
+# VALUES CHANGE HERE (the first-start scans of the playing file, picture box and loudness, start together only when the PC can spare this many scan cores and threads and its load level is no higher than the limit; otherwise the picture box runs first and loudness follows; the priority disk slots are what those together-scans may hold at once)
+FIRST_START_CONCURRENT_MIN_CORES = 3.0
+FIRST_START_CONCURRENT_MIN_THREADS = 4
+FIRST_START_CONCURRENT_MAX_LEVEL = 2
+FIRST_START_PRIORITY_DISK_SLOTS = 3
 
 
 # ============================================================================
@@ -1034,7 +1279,8 @@ class SystemCpuSampler:
     def percent(self):
         try:
             times = self._reader()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("percent: times = self._reader()", _swallowed_error)
             return None
         if times is None:
             return None
@@ -1148,6 +1394,36 @@ def priority_scope():
         _gate_tls.depth -= 1
 
 
+def first_start_scan_plan(profile=None, mode=None):
+    """(True, reason) when the playing file's first-start scans may run at the same time, (False, reason) when they must run in sequence on this PC right now."""
+    profile = profile or get_profile()
+    mode = _limit_mode("scan", _resolve_mode(mode))
+    if profile.tier == "WEAK":
+        return False, "weak PC"
+    if mode == "lite":
+        return False, "lite mode"
+    cores = core_budget(profile, mode)
+    if cores < FIRST_START_CONCURRENT_MIN_CORES:
+        return False, "scan cores %.1f below %.1f" % (cores, FIRST_START_CONCURRENT_MIN_CORES)
+    threads = affordable_threads(profile, mode)
+    if threads < FIRST_START_CONCURRENT_MIN_THREADS:
+        return False, "threads %d below %d" % (threads, FIRST_START_CONCURRENT_MIN_THREADS)
+    level = current_level() if enforcing() else 0
+    if level > FIRST_START_CONCURRENT_MAX_LEVEL:
+        return False, "load level %d above %d" % (level, FIRST_START_CONCURRENT_MAX_LEVEL)
+    return True, "scan cores %.1f, threads %d, load level %d" % (cores, threads, level)
+
+
+def first_start_scans_concurrent(profile=None, mode=None):
+    """True when the playing file's first-start scans may run at the same time on this PC right now."""
+    return first_start_scan_plan(profile, mode)[0]
+
+
+def in_priority_scope():
+    """True when the calling thread is inside priority_scope (first-scan work of a file about to play)."""
+    return getattr(_gate_tls, "depth", 0) > 0
+
+
 def _is_priority_context():
     # WARNING: the UI thread must never wait on a gate; it must count as priority.
     return getattr(_gate_tls, "depth", 0) > 0 or threading.current_thread() is threading.main_thread()
@@ -1238,16 +1514,16 @@ def _read_cpu_name():
                 value = winreg.QueryValueEx(key, "ProcessorNameString")[0]
                 if str(value).strip():
                     return " ".join(str(value).split())
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_read_cpu_name: import winreg", _swallowed_error)
     else:
         try:
             with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     if line.lower().startswith("model name"):
                         return " ".join(line.split(":", 1)[1].split())
-        except Exception:
-            pass
+        except Exception as _swallowed_error:
+            _log_swallowed("_read_cpu_name: with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='re", _swallowed_error)
     return " ".join(str(platform.processor() or "").split())
 
 
@@ -1255,15 +1531,16 @@ def _read_avx2():
     if os.name == "nt":
         try:
             return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_read_avx2: return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent", _swallowed_error)
             return None
     try:
         with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if line.lower().startswith("flags"):
                     return " avx2" in (" " + line.lower())
-    except Exception:
-        pass
+    except Exception as _swallowed_error:
+        _log_swallowed("_read_avx2: with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='re", _swallowed_error)
     return None
 
 
@@ -1636,7 +1913,7 @@ __all__ = [
     "feature_locked", "menu_fps", "lane_ceiling", "lane_slots", "effective_factor", "level_allows", "new_throttle",
     "make_fingerprint",
     "build_profile", "classify_tier", "BusyWindow", "LossTracker", "SystemCpuSampler", "format_status",
-    "gate", "activity", "priority_scope", "background_active", "enforcing", "set_enabled",
+    "gate", "activity", "priority_scope", "in_priority_scope", "first_start_scan_plan", "first_start_scans_concurrent", "background_active", "enforcing", "set_enabled",
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
