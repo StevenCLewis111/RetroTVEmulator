@@ -1,8 +1,8 @@
 """Small, dependency-free updater for the Retro TV Emulator.
 
-Owns: manifest fetch and validation, package download, SHA-256 and zip-safety
-checks, staging, the background "is there an update" check, and handing a
-staged payload to update_helper.py.
+Owns: the update source (the GitHub Releases of the project), package download,
+SHA-256 and zip-safety checks, staging, the background "is there an update"
+check, and handing a staged payload to update_helper.py.
 Does not own: the file swap itself (update_helper.py, a separate process) or
 any update UI (retro_tv_emulator.py).
 
@@ -11,19 +11,11 @@ downloads and validates a hash-checked zip, stages it in a private update
 directory, and asks update_helper.py to do the Windows file swap after this
 process exits.
 
-Manifest shape:
-
-    {
-        "version": "1.2.3",
-        "url": "https://example.invalid/retro-tv-1.2.3.zip",
-        "sha256": "<64 lowercase hex characters>",
-        "notes": "Optional release notes"
-    }
-
-The manifest URL is intentionally supplied by configuration/environment rather
-than hardcoded to a particular hosting service.  That keeps the application
-usable for private or locally hosted releases without embedding credentials or
-provider-specific SDKs.
+How an update is found: the app lists the repository's releases (pre-releases
+included), takes every zip with a V1.2.3 style number in its name, picks the
+highest, and offers it when that number is higher than the installed one. Nothing
+inside the zip is compared. The download is checked against the SHA-256 that
+GitHub reports for the uploaded file.
 """
 
 from __future__ import annotations
@@ -31,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import os
 import re
 import shutil
@@ -76,10 +67,20 @@ log = logging.getLogger("retro_tv.auto_updater")
 UPDATE_DIR_NAME = ".retro_tv_updates"
 STAGED_RECORD_NAME = "staged_update.json"
 PENDING_RECORD_NAME = "pending_update.json"
-MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024  # 1 GiB safety ceiling
+# VALUES CHANGE HERE: the largest package the app will download (the build is close to 1 GiB, so a 1 GiB ceiling would reject it as it grows) and the seconds the download waits on the connection before giving up
+MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB safety ceiling
+DOWNLOAD_TIMEOUT_SECONDS = 60
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 VERSION_RE = re.compile(r"^[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$")
+
+# WARNING: a release zip is found by the V1.2.3 style number in its file name, e.g. "Retro TV Emulator Alpha V1.0.1.zip"; a zip without one is never offered.
+ZIP_VERSION_RE = re.compile(r"[vV](\d+\.\d+\.\d+)")
+
+# VALUES CHANGE HERE: the GitHub update source; the owner/repository whose Releases (pre-releases included) hold the release zips, and how many of the newest releases are read per check (the environment RETRO_TV_UPDATE_GITHUB_REPO or the config update_github_repo overrides the repository; a blank repository turns this source off)
+UPDATE_GITHUB_REPO = "StevenCLewis111/RetroTVEmulator"
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_RELEASES_PER_PAGE = 30
 
 
 class UpdateError(RuntimeError):
@@ -144,62 +145,52 @@ def version_is_newer(candidate, current):
 
 
 def current_version(base_dir, config=None):
-    """Read the installed version without requiring pygame or the media DB."""
+    """Read the installed version without requiring pygame or the media DB: the RETRO_TV_VERSION override, then version.json (written by update_helper.py), then the V1.2.3 number in the running exe's own name; 0.0.0 when none is found."""
     env_version = os.environ.get("RETRO_TV_VERSION")
     if env_version:
         return str(env_version).strip()
 
-    config = config if isinstance(config, dict) else {}
-    configured = config.get("app_version")
-    if configured:
-        return str(configured).strip()
+    value = _read_json(os.path.join(base_dir, "version.json"), {})
+    if isinstance(value, dict):
+        value = str(value.get("version", "") or "").strip()
+        if VERSION_RE.fullmatch(value):
+            return value
 
-    for filename in ("version.json", "VERSION"):
-        path = os.path.join(base_dir, filename)
-        if filename.endswith(".json"):
-            value = _read_json(path, {})
-            if isinstance(value, dict):
-                value = value.get("version")
-        else:
-            try:
-                with open(path, "r", encoding="utf-8") as handle:
-                    value = handle.read().strip()
-            except (FileNotFoundError, OSError):
-                value = None
-        if value:
-            return str(value).strip()
-
-    # PyInstaller release folders/executables commonly carry the release version.
-    # Use that as a fallback so a packaged build does not report its own version as
-    # available merely because version.json was not copied beside the exe.
-    _base_abs = os.path.abspath(base_dir)
-    _candidates = [
-        os.path.basename(_base_abs),
-        os.path.basename(os.path.dirname(_base_abs)),
-        os.path.basename(os.path.abspath(sys.argv[0])),
-        os.path.basename(os.path.abspath(sys.executable)),
-    ]
-    for candidate in _candidates:
-        match = re.search(r"(?:v|version[ _-]*)?(\d+\.\d+\.\d+)", candidate, re.IGNORECASE)
+    # NOTE: every build's exe name carries its number (Retro TV Emulator Alpha V1.0.1.exe), so a build with no version.json still knows what it is and is not offered an update that would replace it with an older or equal one.
+    for name in (sys.executable, sys.argv[0] if sys.argv else ""):
+        match = ZIP_VERSION_RE.search(os.path.basename(str(name or "")))
         if match:
             return match.group(1)
 
-    # NOTE: development/source copies have no release stamp, so 0.0.0 is the
-    # "no update" baseline.
+    # NOTE: development/source copies have no release stamp, so 0.0.0 is the "no update" baseline.
     return "0.0.0"
 
 
-def manifest_url(config=None):
+def github_settings(config=None):
+    """Returns (owner/repository, api_base) for the GitHub update source; the repository is an empty string when none is set."""
     config = config if isinstance(config, dict) else {}
-    return (
-        os.environ.get("RETRO_TV_UPDATE_MANIFEST_URL")
-        or config.get("update_manifest_url")
-        or "https://retrotvemulator.com/update-manifest.json"
-    ).strip()
+    repo = str(os.environ.get("RETRO_TV_UPDATE_GITHUB_REPO") or config.get("update_github_repo") or UPDATE_GITHUB_REPO or "").strip()
+    base = str(os.environ.get("RETRO_TV_UPDATE_GITHUB_API_BASE") or GITHUB_API_BASE).strip().rstrip("/")
+    return repo, base
+
+
+def update_source_configured(config=None):
+    """True when there is somewhere to look for an update: a GitHub repository is set."""
+    repo, _github_base = github_settings(config)
+    return bool(repo)
+
+
+def version_from_zip_name(name):
+    """Returns the 'major.minor.patch' text in a release zip's file name, or None when the name is not a .zip with a V1.2.3 style number."""
+    text = str(name or "")
+    if not text.lower().endswith(".zip"):
+        return None
+    match = ZIP_VERSION_RE.search(text)
+    return match.group(1) if match else None
 
 
 # ============================================================================
-# SECTION: Manifest fetch, validation & update check
+# SECTION: Release fetch, validation & update check
 # ============================================================================
 
 
@@ -216,8 +207,8 @@ def _validate_url(url, label="URL"):
     return str(url)
 
 
-def _fetch_json(url, timeout=DEFAULT_TIMEOUT_SECONDS):
-    _validate_url(url, "Update manifest URL")
+def _fetch_json(url, timeout=DEFAULT_TIMEOUT_SECONDS, what="GitHub releases list", expect_list=False):
+    _validate_url(url, "Update source URL")
     request = urllib.request.Request(
         url,
         headers={
@@ -230,31 +221,39 @@ def _fetch_json(url, timeout=DEFAULT_TIMEOUT_SECONDS):
             raw = response.read(2 * 1024 * 1024 + 1)
     except (urllib.error.URLError, OSError) as exc:
         _server_breadcrumb(
-            log, logging.WARNING, f"update-manifest-fetch:{url}",
-            "[UPDATE DIAG] Update manifest fetch failed url=%s: %s", url, exc,
+            log, logging.WARNING, f"update-fetch:{url}",
+            "[UPDATE DIAG] Update source fetch failed url=%s: %s", url, exc,
         )
-        raise UpdateError(f"Could not reach update manifest: {exc}") from exc
+        raise UpdateError(f"Could not reach {what}: {exc}") from exc
     if len(raw) > 2 * 1024 * 1024:
-        raise UpdateError("Update manifest is too large")
+        raise UpdateError(f"The {what} is too large")
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise UpdateError("Update manifest is not valid UTF-8 JSON") from exc
+        raise UpdateError(f"The {what} is not valid UTF-8 JSON") from exc
+    if expect_list:
+        if not isinstance(value, list):
+            raise UpdateError(f"The {what} must be a JSON list")
+        return value
     if not isinstance(value, dict):
-        raise UpdateError("Update manifest must be a JSON object")
+        raise UpdateError(f"The {what} must be a JSON object")
     return value
 
 
 def validate_manifest(raw):
+    """Validates the record built from a GitHub release asset: a display version, an https (or local test) download address and the SHA-256 GitHub reports for the file."""
     if not isinstance(raw, dict):
-        raise UpdateError("Update manifest must be a JSON object")
-    version = str(raw.get("version", "")).strip()
-    parse_version(version)
+        raise UpdateError("Update record must be a JSON object")
+    version = str(raw.get("version", "") or "").strip() or "Latest Build"
     url = _validate_url(raw.get("url", ""), "Update package URL")
     digest = str(raw.get("sha256", "")).strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise UpdateError("Update manifest has no valid SHA-256 digest")
-    package_name = os.path.basename(urllib.parse.urlparse(url).path) or f"retro-tv-{version}.zip"
+        raise UpdateError("Update record has no valid SHA-256 digest")
+    package_name = re.sub(
+        r"[^A-Za-z0-9._ ()+-]", "_",
+        os.path.basename(str(raw.get("file_name") or raw.get("package_name") or "")
+                         or urllib.parse.urlparse(url).path),
+    ) or "retro-tv-update.zip"
     return {
         "version": version,
         "url": url,
@@ -264,32 +263,77 @@ def validate_manifest(raw):
     }
 
 
+def check_github_for_update(installed, repo, api_base=GITHUB_API_BASE, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Lists the repository's releases (pre-releases included), picks the zip with the highest V1.2.3 number in its name and reports whether it is newer than the installed build; the download is checked against the SHA-256 GitHub reports for that file."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        raise UpdateError("The GitHub repository is not valid; it must look like owner/name")
+    releases = _fetch_json(
+        f"{api_base}/repos/{repo}/releases?per_page={GITHUB_RELEASES_PER_PAGE}",
+        timeout=timeout, what="GitHub releases list", expect_list=True,
+    )
+    best = None
+    zips_seen = 0
+    for release in releases:
+        if not isinstance(release, dict) or release.get("draft"):
+            continue
+        for asset in (release.get("assets") or []):
+            if not isinstance(asset, dict) or str(asset.get("state", "uploaded")) != "uploaded":
+                continue
+            version = version_from_zip_name(asset.get("name", ""))
+            if version is None:
+                continue
+            zips_seen += 1
+            rank = (parse_version(version), str(release.get("published_at", "") or ""))
+            if best is None or rank > best[0]:
+                best = (rank, version, release, asset)
+    if best is None:
+        log.info("[UPDATE] source=github repo=%s releases_seen=%d zips_with_a_version=0 installed=%s available=False", repo, len(releases), installed)
+        return {
+            "available": False,
+            "configured": True,
+            "current_version": installed,
+            "message": f"You are up to date ({installed}).",
+        }
+    _rank, version, release, asset = best
+    digest = str(asset.get("digest", "") or "").strip().lower()
+    sha256 = digest.split(":", 1)[1] if digest.startswith("sha256:") else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise UpdateError(f"GitHub reports no SHA-256 for {asset.get('name', 'the update zip')}; upload the zip to the release again")
+    record = validate_manifest({
+        "version": version,
+        "url": asset.get("browser_download_url", ""),
+        "sha256": sha256,
+        "file_name": asset.get("name", ""),
+        "notes": str(release.get("body", "") or "").strip()[:500],
+    })
+    available = version_is_newer(version, installed)
+    log.info("[UPDATE] source=github repo=%s zips_with_a_version=%d newest_posted=%s installed=%s available=%s",
+             repo, zips_seen, version, installed, available)
+    return {
+        "available": available,
+        "configured": True,
+        "current_version": installed,
+        "manifest": record,
+        "message": (
+            f"Version {version} is available."
+            if available else
+            f"You are up to date ({installed})."
+        ),
+    }
+
+
 def check_for_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
-    """Fetch and validate the manifest, returning a UI-friendly result."""
-    url = manifest_url(config)
+    """Looks for a newer release on GitHub, returning a UI-friendly result."""
     installed = current_version(base_dir, config)
-    if not url:
+    repo, github_base = github_settings(config)
+    if not repo:
         return {
             "available": False,
             "configured": False,
             "current_version": installed,
             "message": "Update source is not configured.",
         }
-
-    raw = _fetch_json(url, timeout=timeout)
-    manifest = validate_manifest(raw)
-    available = version_is_newer(manifest["version"], installed)
-    return {
-        "available": available,
-        "configured": True,
-        "current_version": installed,
-        "manifest": manifest,
-        "message": (
-            f"Version {manifest['version']} is available."
-            if available else
-            f"You are up to date ({installed})."
-        ),
-    }
+    return check_github_for_update(installed, repo, github_base, timeout=timeout)
 
 
 # ============================================================================
@@ -314,7 +358,7 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progres
                         break
                     total += len(block)
                     if total > MAX_DOWNLOAD_BYTES:
-                        raise UpdateError("Update package exceeds the 1 GiB safety limit")
+                        raise UpdateError("Update package exceeds the 4 GiB safety limit")
                     digest.update(block)
                     output.write(block)
                     if progress_callback is not None:
@@ -383,19 +427,22 @@ def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS, progress_c
     package_path = os.path.join(work_dir, manifest["package_name"])
     stage_path = os.path.join(work_dir, "payload")
     try:
-        _bytes, digest = _download_package(manifest["url"], package_path, timeout=timeout, progress_callback=progress_callback)
+        _bytes, digest = _download_package(manifest["url"], package_path, timeout=max(timeout, DOWNLOAD_TIMEOUT_SECONDS), progress_callback=progress_callback)
         if digest.lower() != manifest["sha256"].lower():
             _server_breadcrumb(
                 log, logging.WARNING, f"update-sha-mismatch:{manifest['version']}",
-                "[UPDATE DIAG] Update package hash mismatch version=%s",
-                manifest["version"],
+                "[UPDATE DIAG] Update package SHA-256 mismatch version=%s", manifest["version"],
             )
-            raise UpdateError("Update package SHA-256 does not match the manifest")
+            raise UpdateError("Update package SHA-256 does not match what GitHub reports")
         os.makedirs(stage_path, exist_ok=True)
         payload_root = _extract_package(package_path, stage_path)
+        # WARNING: the helper deletes only the folder holding the payload, so a package with one root folder would leave this near-1 GiB zip behind on every update.
+        try:
+            os.remove(package_path)
+        except OSError:
+            pass
         record = {
             "version": manifest["version"],
-            "sha256": manifest["sha256"],
             "notes": manifest.get("notes", ""),
             "staged_path": os.path.abspath(payload_root),
             "created_at": time.time(),
@@ -407,16 +454,6 @@ def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS, progress_c
         raise
 
 
-def stage_available_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
-    result = check_for_update(base_dir, config=config, timeout=timeout)
-    if not result.get("available"):
-        return result
-    staged = stage_update(base_dir, result["manifest"], timeout=timeout)
-    result["staged"] = staged
-    result["message"] = f"Version {staged['version']} is ready to install."
-    return result
-
-
 # ============================================================================
 # SECTION: Background check
 # ============================================================================
@@ -424,11 +461,11 @@ def stage_available_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECOND
 
 def background_check_loop(base_dir, config_provider, result_callback, stop_event,
                           initial_delay=120, interval=DEFAULT_CHECK_INTERVAL_SECONDS):
-    """Check manifests quietly; never download or install in the background.
+    """Check the update source quietly; never download or install in the background.
 
     The first check waits until normal boot work has settled.  Subsequent
     checks are deliberately infrequent, and each check reads configuration
-    again so changing/removing the manifest URL takes effect without a
+    again so changing the repository takes effect without a
     restart.  A manual button press is still required to download and stage
     anything.
     """
@@ -437,7 +474,7 @@ def background_check_loop(base_dir, config_provider, result_callback, stop_event
     while not stop_event.is_set():
         try:
             config = config_provider() or {}
-            if manifest_url(config):
+            if update_source_configured(config):
                 result = check_for_update(base_dir, config=config)
                 if result_callback is not None:
                     result_callback(result)
@@ -538,7 +575,7 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
         except OSError:
             if os.name != "nt":
                 raise
-            # NOTE: a job that does not allow breakaway refuses the flag; start without it rather than not at all.
+            # WARNING: a job that forbids breakaway refuses the flag; the retry without it keeps the helper starting at all.
             kwargs["creationflags"] = _detached
             process = subprocess.Popen(command, **kwargs)
     except (OSError, ValueError) as exc:
@@ -555,6 +592,7 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
 # ============================================================================
 __all__ = [
     "UpdateError", "parse_version", "version_is_newer", "current_version",
-    "manifest_url", "validate_manifest", "check_for_update", "stage_update",
-    "stage_available_update", "background_check_loop", "launch_staged_update",
+    "github_settings", "update_source_configured", "version_from_zip_name",
+    "validate_manifest", "check_github_for_update", "check_for_update",
+    "stage_update", "background_check_loop", "launch_staged_update",
 ]

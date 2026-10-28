@@ -1,7 +1,7 @@
 """
 Menu navigation core: one table per menu layer says where each highlight cell leads for up, down, left and right, and one function moves the highlight by it.
 
-Owns: the direction names, key_to_direction(), key_to_action(), action_keys(), action_key() and pressed_actions() (the one place a raw key becomes a direction, accept or back, and back again), is_accept(), is_back(), the slider rules (SLIDER_SPECS, slider_adjust), NavTable and Remember (the table and the
+Owns: the direction names, key_to_direction(), key_to_action(), action_keys(), action_key() and pressed_actions() (the one place a raw key becomes a direction, accept or back, and back again), is_accept(), is_back(), the slider rules (SLIDER_SPECS, slider_adjust, REACTIVE_STRENGTH_SPEC, reactive_strength_adjust), NavTable and Remember (the table and the
 "go back to where you came from" rule), navigate() (the one move function), and the tables and cell/index converters for the
 System tab (system_table, system_cell, system_index), Advanced Settings (advanced_table, advanced_cell, advanced_index), the Channels tab
 (channels_table, channels_cell, channels_index, channels_page_of), Channel settings (channel_settings_table, channel_settings_cell,
@@ -585,15 +585,31 @@ SLIDER_SPECS = {
 }
 
 
+# VALUES CHANGE HERE: the Reactive Strength slider on a music channel's editor (config key on the channel, value when unset, lowest, highest). It is not in SLIDER_SPECS because it lives on the channel, not in db.config, and is not a Video or Theme cell; it moves by the same SLIDER_STEP through the same rule.
+REACTIVE_STRENGTH_SPEC = ("reactive_visualizer_strength", 50, 0, 100)
+
+
+def _slider_move(store, spec, direction):
+    """Moves the value a spec names one SLIDER_STEP in `store` (clamped and snapped to the step) and returns True; False for any direction other than left or right."""
+    if direction not in (LEFT, RIGHT):
+        return False
+    key, default, low, high = spec
+    moved = store.get(key, default) + (SLIDER_STEP if direction == RIGHT else -SLIDER_STEP)
+    store[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
+    return True
+
+
 def slider_adjust(config, cell, direction):
     """Moves a slider one step for a left or right press and returns True when the cell is a slider (the value is clamped and snapped to the step); False for any other cell or direction."""
     spec = SLIDER_SPECS.get(cell)
-    if spec is None or direction not in (LEFT, RIGHT):
+    if spec is None:
         return False
-    key, default, low, high = spec
-    moved = config.get(key, default) + (SLIDER_STEP if direction == RIGHT else -SLIDER_STEP)
-    config[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
-    return True
+    return _slider_move(config, spec, direction)
+
+
+def reactive_strength_adjust(ch_info, direction):
+    """Moves a channel's Reactive Strength one SLIDER_STEP for a left or right press, exactly as the Video and Theme sliders move; returns True when it moved."""
+    return _slider_move(ch_info, REACTIVE_STRENGTH_SPEC, direction)
 
 
 # VALUES CHANGE HERE (milliseconds): the fastest a value control (slider, volume) may step, however fast the key is pressed or held. Keep it below the held-key repeat intervals in HOLD_RULES so a hold is never dropped.
@@ -786,8 +802,8 @@ def _build_games_table(page, total, kiosk):
 # ============================================================================
 
 # WARNING: these lists must match the column split in the Games sub-menu drawing in ui.py (_menu_left_order, _menu_right_order, and the splash panel that fills the right column), or the table and the picture disagree about which cell is where.
-GAMES_SUB_MENU_LEFT = ("controller_map", "stick_deadzone", "game_screen_mode", "scan_for_cores", "clear_cores")
-GAMES_SUB_MENU_RIGHT = ("menu_bg_select_image", "multitap_toggle", "scroll_style", "scan_for_roms", "clear_roms")
+GAMES_SUB_MENU_LEFT = ("controller_map", "menu_bg_select_image", "game_screen_mode", "scan_for_cores", "clear_cores")
+GAMES_SUB_MENU_RIGHT = ("stick_deadzone", "multitap_toggle", "scroll_style", "scan_for_roms", "clear_roms")
 GAMES_SUB_RIGHT_COLUMN = ("dvd_captions_toggle", "dvd_resume_toggle", "splash_toggle", "splash_select_image", "splash_select_video",
                           "add_bios", "relocate_roms_folder", "clear_console_roms")
 GAMES_SUB_CONSOLE_LEFT = ("core_select", "controller_map")
@@ -2309,7 +2325,7 @@ def dvd_hold_due(held_ms, now, cooldown):
 __all__ = [
     "UP", "DOWN", "LEFT", "RIGHT", "DIRECTIONS", "TAB_BAR", "PANEL", "CLOSE",
     "ACCEPT", "BACK", "Remember", "NavTable", "key_to_direction", "key_to_action", "action_keys", "action_key", "pressed_actions", "is_accept", "is_back", "navigate",
-    "SLIDER_STEP", "SLIDER_SPECS", "slider_adjust", "VALUE_STEP_MIN_MS", "step_ready",
+    "SLIDER_STEP", "SLIDER_SPECS", "REACTIVE_STRENGTH_SPEC", "slider_adjust", "reactive_strength_adjust", "VALUE_STEP_MIN_MS", "step_ready",
     "system_cell", "system_index", "system_table",
     "advanced_cell", "advanced_index", "advanced_table",
     "GAMES_SUB_MENU_LEFT", "GAMES_SUB_MENU_RIGHT", "GAMES_SUB_RIGHT_COLUMN", "games_sub_cell", "games_sub_index", "games_sub_table",

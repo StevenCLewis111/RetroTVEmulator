@@ -5048,26 +5048,51 @@ def _launch_explorer_fallback():
         log.warning(f"[STARTUP] Could not launch explorer.exe fallback: {e}")
 
 
+def _read_registry_text(path, name):
+    """Returns the text of one value under HKEY_CURRENT_USER, or None when the key or value does not exist; it only reads."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+        return str(value)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning("[STARTUP] Could not read registry value %s\\%s: %s", path, name, e)
+        return None
+
+
 def _set_start_on_boot(enabled):
     if os.name != "nt":
         print("[STARTUP] Not running on Windows — start-on-boot toggle has no effect here.")
         return False
     try:
         import winreg
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _LEGACY_STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE) as legacy_key:
-                try:
-                    winreg.DeleteValue(legacy_key, _LEGACY_STARTUP_REG_NAME)
-                except FileNotFoundError:
-                    pass
-        except FileNotFoundError:
-            pass
+        # WARNING: shell mode writes to the registry only when the owner turns it on in Advanced Settings; turning it off (or Reset Settings) writes only when the registry still holds this app's own entry, so a PC that never used shell mode is never touched.
+        _shell_is_ours = bool(enabled)
+        _legacy_text = None
+        if not enabled:
+            _shell_is_ours = "--as-shell" in (_read_registry_text(_STARTUP_REG_PATH, _STARTUP_REG_NAME) or "")
+            _legacy_text = _read_registry_text(_LEGACY_STARTUP_REG_PATH, _LEGACY_STARTUP_REG_NAME)
+            if not _shell_is_ours and _legacy_text is None:
+                log.info("[STARTUP] Shell mode is off and the registry holds no Retro TV entry -- nothing written.")
+                return True
+        if enabled or _legacy_text is not None:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _LEGACY_STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE) as legacy_key:
+                    try:
+                        winreg.DeleteValue(legacy_key, _LEGACY_STARTUP_REG_NAME)
+                    except FileNotFoundError:
+                        pass
+            except FileNotFoundError:
+                pass
 
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
-            if enabled:
-                winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _get_startup_command())
-            else:
-                winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _DEFAULT_SHELL)
+        if _shell_is_ours:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+                if enabled:
+                    winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _get_startup_command())
+                else:
+                    winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, _DEFAULT_SHELL)
         return True
     except Exception as e:
         log.warning(f"[STARTUP] Failed to {'enable' if enabled else 'disable'} start-on-boot: {e}")
@@ -7112,10 +7137,8 @@ app_state = {
     "_update_available": False,
     "_update_ready": False,
     "_update_status": "",
+    "_update_up_to_date": False,
     "_update_record": None,
-    "show_update_confirm": False,
-    "update_confirm_shown_at": 0,
-    "update_download_active": False,
     "update_download_progress": 0.0,
     "ch03_screensaver_active": False,
     "ch03_screensaver_last_input": 0,
@@ -7326,7 +7349,7 @@ from media import (
 import ui
 from ui import render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_update_prompt, render_clear_confirm_popup, fit_design_canvas, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
     get_server_picker_entries, get_server_picker_selectable_count, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
-    UPDATER_AND_SERVER_FEATURES_ENABLED, GPU_RENDER_MODE_ENABLED
+    UPDATER_AND_SERVER_FEATURES_ENABLED, SERVER_TOGGLE_ENABLED, GPU_RENDER_MODE_ENABLED
 from visualizers import VisualizerDeck
 
 explorer_queue = queue.Queue()
@@ -8664,11 +8687,11 @@ def _store_loudness_gain(norm_path, gain):
     if db is not None:
         learned_offset = _take_learned_offset_applied(norm_path)
         if stored:
+            owner_row = True
             try:
                 owner_row = hub.read(norm_path)["scan_version"] == media.OWNER_GAIN_SCAN_VERSION
             except Exception as _swallowed_error:
                 _log_swallowed("_store_loudness_gain: reading the saved row", _swallowed_error)
-                owner_row = True
             if not owner_row:
                 _learning_set("applied", os.path.normpath(norm_path), learned_offset or None)
     return stored
@@ -16514,7 +16537,7 @@ def _wake_drive_with_read(root, candidates, deadline):
                 _f.read(65536)
             return True
         except Exception as _swallowed_error:
-            _log_swallowed("_wake_drive_with_read: reading the start of %s" % os.path.basename(path), _swallowed_error)
+            _log_swallowed("_wake_drive_with_read: reading the start of a candidate file", _swallowed_error)
     return False
 
 
@@ -17286,13 +17309,14 @@ def _open_update_popup(record, automatic):
     if automatic and db is not None and db.config.get("update_prompt_skip_confirm", False):
         log.info("[UPDATE] popup skipped: the owner chose not to see update prompts (a manual check in System still shows it)")
         return False
-    if app_state.get("show_clear_confirm", False) or app_state.get("show_update_confirm", False):
+    if app_state.get("show_clear_confirm", False):
         return False
     app_state["update_prompt_version"] = str((record or {}).get("version", "") or "")
     app_state["clear_confirm_selection"] = "No"
     app_state["clear_confirm_target"] = "app_update"
     app_state["clear_confirm_focus"] = "buttons"
-    app_state["clear_confirm_dont_show_again"] = False
+    # WARNING: the box must start ticked when Don't show this again is saved, or a manual check could never turn the boot prompt back on.
+    app_state["clear_confirm_dont_show_again"] = bool(db is not None and db.config.get("update_prompt_skip_confirm", False))
     app_state["clear_confirm_shown_at"] = pygame.time.get_ticks()
     app_state["show_clear_confirm"] = True
     return True
@@ -17304,37 +17328,39 @@ def _set_update_result(result, automatic=False):
         return
     if result.get("available"):
         app_state["_update_available"] = True
+        app_state["_update_up_to_date"] = False
         app_state["_update_status"] = result.get("message", "Update available.")
         app_state["_update_record"] = result.get("staged") or result.get("manifest")
-        # WARNING: show the same shared Yes/No update popup for both the boot
-        # check and the later background check; previously background results
-        # only changed a status string, so a posted release could be missed.
+        # WARNING: the boot check and the background check must both open the same Yes/No update popup, or a posted release is missed.
         _open_update_popup(app_state["_update_record"], automatic)
         log.info("[UPDATE] %s", app_state["_update_status"])
     elif result.get("error"):
+        app_state["_update_up_to_date"] = False
         app_state["_update_status"] = result["message"]
         log.warning("[UPDATE] %s", app_state["_update_status"])
     elif result.get("message"):
+        # WARNING: a result with no newer release must clear the update flags, or the System button keeps offering Update Now; only a manual check shows Up to Date.
+        app_state["_update_available"] = False
+        app_state["_update_ready"] = False
+        if result.get("configured", True) and not automatic:
+            app_state["_update_up_to_date"] = True
         app_state["_update_status"] = result["message"]
         log.info("[UPDATE] %s", app_state["_update_status"])
 
 
 def _start_update_check(boot=False):
-    """Check for an update; boot checks wait for confirmation before staging."""
+    """Looks for a newer release; nothing is downloaded until the owner answers Yes on the popup, for the boot check and the manual one alike."""
     if app_state.get("_update_check_inflight", False):
         return
     app_state["_update_check_inflight"] = True
+    app_state["_update_up_to_date"] = False
     app_state["_update_status"] = "Checking for updates..."
     base_dir = _update_base_dir()
     config = dict(db.config) if db is not None else {}
 
     def _worker():
         try:
-            result = auto_updater.check_for_update(base_dir, config=config) if boot else auto_updater.stage_available_update(base_dir, config=config)
-            if result.get("staged"):
-                app_state["_update_record"] = result["staged"]
-                app_state["_update_ready"] = True
-                app_state["_update_available"] = True
+            result = auto_updater.check_for_update(base_dir, config=config)
             _set_update_result(result, automatic=boot)
         except Exception as exc:
             app_state["_update_status"] = f"Update check failed: {exc}"
@@ -22789,22 +22815,13 @@ def _attempt_self_relaunch():
 
 
 def _launch_staged_update():
+    """Hands an already staged update to the helper and quits; returns False when nothing is staged."""
     record = app_state.get("_update_record")
-    if not record:
-        _start_update_check()
+    if not record or not record.get("staged_path"):
+        app_state["_update_status"] = "No update package is staged."
+        log.warning("[UPDATE] %s", app_state["_update_status"])
         return False
     try:
-        if not record.get("staged_path"):
-            app_state["update_download_active"] = True
-            app_state["update_download_progress"] = 0.0
-            def _update_progress(done, total):
-                app_state["update_download_progress"] = (done / total) if total else None
-            record = auto_updater.stage_update(
-                _update_base_dir(), record, progress_callback=_update_progress
-            )
-            app_state["_update_record"] = record
-            app_state["update_download_progress"] = 1.0
-            app_state["update_download_active"] = False
         helper_pid = auto_updater.launch_staged_update(
             _update_base_dir(),
             record,
@@ -22817,7 +22834,6 @@ def _launch_staged_update():
         pygame.event.post(pygame.event.Event(pygame.QUIT))
         return True
     except Exception as exc:
-        app_state["update_download_active"] = False
         app_state["_update_status"] = f"Could not start installer: {exc}"
         log.warning("[UPDATE] %s", app_state["_update_status"])
         return False
@@ -22827,19 +22843,23 @@ def _launch_staged_update():
 # SECTION: Update install (popup Yes)
 # ============================================================================
 
-# VALUES CHANGE HERE (ms the full bar stays up before the app hands over to the updater and restarts, and ms an error stays up before the popup closes; the download reads 97% at most until the file is checked and unpacked)
-UPDATE_INSTALL_HOLD_AT_100_MS = 700
-UPDATE_INSTALL_ERROR_SHOW_MS = 4000
-UPDATE_INSTALL_DOWNLOAD_CAP = 0.97
+# WARNING: the 700, 4000 and 0.97 fallbacks must match UPDATE_INSTALL_HOLD_AT_100_MS, UPDATE_INSTALL_ERROR_SHOW_MS and UPDATE_INSTALL_DOWNLOAD_CAP in performance_governor.py; they are used only when that module fails to import.
+UPDATE_INSTALL_HOLD_AT_100_MS = performance_governor.UPDATE_INSTALL_HOLD_AT_100_MS if performance_governor is not None else 700
+UPDATE_INSTALL_ERROR_SHOW_MS = performance_governor.UPDATE_INSTALL_ERROR_SHOW_MS if performance_governor is not None else 4000
+UPDATE_INSTALL_DOWNLOAD_CAP = performance_governor.UPDATE_INSTALL_DOWNLOAD_CAP if performance_governor is not None else 0.97
 
 
-def _remember_update_prompt_skip():
-    """Saves the Don't show this again choice from the update popup: automatic checks stop opening it; the manual check in System still does."""
+def _remember_update_prompt_skip(skip=True):
+    """Saves the Don't show this again box from the update popup, ticked or unticked: ticked, automatic checks stop opening it (the manual check in System still does); unticked, they open it again."""
     if db is None:
         return
-    db.config["update_prompt_skip_confirm"] = True
+    skip = bool(skip)
+    if bool(db.config.get("update_prompt_skip_confirm", False)) == skip:
+        return
+    db.config["update_prompt_skip_confirm"] = skip
     db.save_settings()
-    log.info("[UPDATE] owner ticked Don't show this again; automatic update prompts are now off")
+    log.info("[UPDATE] owner %s Don't show this again; automatic update prompts are now %s",
+             "ticked" if skip else "unticked", "off" if skip else "on")
 
 
 def _close_update_popup():
@@ -24741,9 +24761,8 @@ while True:
                 )
                 _cc_focus = app_state.get("clear_confirm_focus", "buttons")
                 if event.key == pygame.K_ESCAPE:
-                    if (app_state.get("clear_confirm_target") == "app_update"
-                            and app_state.get("clear_confirm_dont_show_again", False)):
-                        _remember_update_prompt_skip()
+                    if app_state.get("clear_confirm_target") == "app_update":
+                        _remember_update_prompt_skip(app_state.get("clear_confirm_dont_show_again", False))
                     app_state["clear_confirm_dont_show_again"] = False
                     app_state["show_clear_confirm"] = False
                     app_state["clear_confirm_target"] = None
@@ -24860,9 +24879,8 @@ while True:
                                 db.save_settings()
                             print(f"[SETTINGS] Screen Saver = False (confirmed after burn-in warning, "
                                   f"skip_confirm={app_state.get('clear_confirm_dont_show_again', False)}).")
-                    if (_cc_target == "app_update" and app_state.get("clear_confirm_selection") != "Yes"
-                            and app_state.get("clear_confirm_dont_show_again", False)):
-                        _remember_update_prompt_skip()
+                    if _cc_target == "app_update" and app_state.get("clear_confirm_selection") != "Yes":
+                        _remember_update_prompt_skip(app_state.get("clear_confirm_dont_show_again", False))
                     print(f"[SETTINGS ENGINE] Clear-confirm popup: committing '{app_state.get('clear_confirm_selection')}' for target '{_cc_target}'.")
                     app_state["show_clear_confirm"]     = False
                     app_state["clear_confirm_target"]   = None
@@ -25518,6 +25536,9 @@ while True:
                         if _as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED:
                             # WARNING: the Server subsystem is disabled in packaging; this row is a deliberate no-op.
                             pass
+                        elif _as_row_id == "server_option" and not SERVER_TOGGLE_ENABLED:
+                            # WARNING: the Server Mode toggle is greyed out for now (ui.SERVER_TOGGLE_ENABLED); the row can be reached but pressing it changes nothing.
+                            pass
                         elif _as_row_id == "server_option":
                             db.config["server_mode_enabled"] = not db.config.get("server_mode_enabled", False)
                             if (not db.config["server_mode_enabled"]
@@ -25550,6 +25571,9 @@ while True:
                                 pass
                             elif app_state.get("_update_ready", False):
                                 _launch_staged_update()
+                            elif app_state.get("_update_available", False) and app_state.get("_update_record"):
+                                # WARNING: Update Now must reopen the popup without a fresh check; the check is only for Look for Updates.
+                                _open_update_popup(app_state["_update_record"], False)
                             else:
                                 _start_update_check()
                         elif _as_row_id == "performance_mode":
@@ -26087,13 +26111,12 @@ while True:
                         continue
 
                     if is_music_mode and sub_row == 3 and ch_info.get("reactive_visualizer_enabled", True) and event.key in (pygame.K_a, pygame.K_d):
+                        # WARNING: this slider must move exactly like the Video and Theme sliders: the same SLIDER_STEP and rule (menu_nav.reactive_strength_adjust), the same step gate, and the same deferred save; the menu picture redraws at once because _channel_menu_fingerprint in ui.py includes this value.
                         if not menu_nav.step_ready(app_state.setdefault("_step_gate", {}), "reactive_strength", now_ticks):
                             continue
-                        current_strength = max(0, min(100, int(ch_info.get("reactive_visualizer_strength", 50))))
-                        _moved_strength = current_strength + (10 if event.key == pygame.K_d else -10)
-                        ch_info["reactive_visualizer_strength"] = max(0, min(100, (_moved_strength // 10) * 10))
-                        # WARNING: deferred save like the Video sliders; a synchronous save per press stalls frames and makes the slider look like it skips.
-                        _mark_settings_dirty()
+                        _rs_dir = menu_nav.key_to_direction(event.key)
+                        if menu_nav.reactive_strength_adjust(ch_info, _rs_dir):
+                            _mark_settings_dirty()
                         continue
 
                     if is_music_mode and sub_row == 4 and event.key in (pygame.K_a, pygame.K_d):
@@ -27361,6 +27384,11 @@ while True:
                 _splash_now = pygame.time.get_ticks()
                 app_state["last_input_time"] = _splash_now
                 app_state["splash_shown_at"] = _splash_now
+            if app_state.get("show_clear_confirm", False):
+                # WARNING: a boot update popup opens while the loading screen is still up; its 20 second idle timer must start when it first appears, not when it was queued.
+                _popup_now = pygame.time.get_ticks()
+                app_state["last_input_time"] = _popup_now
+                app_state["clear_confirm_shown_at"] = _popup_now
             
             if 'game_deck' in globals() and game_deck is not None:
                 try:
@@ -29542,14 +29570,6 @@ while True:
         elif app_state.get("menu_layer") == "DVD_BTN_MAP":
             render_dvd_button_mapping_popup(_menu_surf, app_state, db)
 
-    elif app_state.get("show_update_confirm", False):
-        render_update_prompt(_overlay_target(screen), active_theme, db)
-        render_update_download_progress(
-            _overlay_target(screen), active_theme, db,
-            "DOWNLOADING UPDATE...",
-            progress_fraction=app_state.get("update_download_progress"),
-        )
-
     elif app_state.get("show_quit_confirm", False):
         render_quit_prompt(_overlay_target(screen), active_theme, db)
         
@@ -29652,6 +29672,11 @@ while True:
         _fe_render(screen, active_theme, (_fe_x, _fe_y, _fe_w, _fe_h))
 
     # WARNING: the confirm popup and the Controls splash are drawn here, outside the show_menu branch above, so they show whether or not the Settings menu is open. The key handler swallows keys for them on the same flags, so a popup drawn only inside the menu branch is invisible on boot and eats C and M. The update popup wins over the splash; the splash shows again once it is answered.
+    # WARNING: the update popup is drawn on top of the Controls splash, so a boot update prompt shows over it; every other confirm popup still replaces the splash.
+    if app_state.get("show_splash", False) and (
+            not app_state.get("show_clear_confirm", False)
+            or app_state.get("clear_confirm_target") == "app_update"):
+        render_controls_splash(_overlay_target_for_menu(screen), active_theme, db, app_state=app_state)
     if app_state.get("show_clear_confirm", False):
         _popup_target = _overlay_target(screen)
         render_clear_confirm_popup(_popup_target, active_theme, db, app_state)
@@ -29659,8 +29684,6 @@ while True:
             _update_install_tick(now_ticks_ms)
             if app_state.get("update_install_active", False):
                 _draw_update_install_overlay(_popup_target)
-    elif app_state.get("show_splash", False):
-        render_controls_splash(_overlay_target_for_menu(screen), active_theme, db, app_state=app_state)
 
     _lr_active = (
         game_deck is not None

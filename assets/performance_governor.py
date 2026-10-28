@@ -359,6 +359,15 @@ HUB_ROW_GENERATION_START_TOLERANCE_SECONDS = 60.0
 # VALUES CHANGE HERE (schedule hub future rows: how many hours ahead of the clock the background step works out what each channel will air and saves it in the hub for the guide to read; 192 is the guide's seven day span plus one extra day)
 HUB_FUTURE_HOURS_AHEAD = 192.0
 
+# VALUES CHANGE HERE (update install: milliseconds the full bar stays up before the app hands over to the updater and restarts)
+UPDATE_INSTALL_HOLD_AT_100_MS = 700
+
+# VALUES CHANGE HERE (update install: milliseconds an update error stays up before the popup closes)
+UPDATE_INSTALL_ERROR_SHOW_MS = 4000
+
+# VALUES CHANGE HERE (update install: the download bar reads at most this fraction until the file is checked and unpacked)
+UPDATE_INSTALL_DOWNLOAD_CAP = 0.97
+
 # VALUES CHANGE HERE (schedule hub future rows: seconds the background step waits after working out one channel, before the next channel, so playback is never crowded)
 HUB_FUTURE_BETWEEN_CHANNELS_SECONDS = 4.0
 

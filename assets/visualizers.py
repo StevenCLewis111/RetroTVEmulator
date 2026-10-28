@@ -316,8 +316,7 @@ class VisualizerDeck:
         else:
             style = self.current_running_style if self.active_mode == "Random" else self.active_mode
 
-        # Pulsate is the shared beat-driven expansion/glow layer. Keep normal
-        # level and spectrum reactivity for styles that do not use that effect.
+        # WARNING: Pulsate is the shared beat-driven expansion/glow layer, so styles that do not use that effect keep only normal level and spectrum reactivity.
         react_pulse = 0.0 if style in {"GlowBraid", "Kaleidoscope", "Lightning"} else (react["pulse"] if react is not None else 0.0)
 
         # WARNING: (1, 1, 1), not pure black: (0, 0, 0) is the game-overlay transparency key.

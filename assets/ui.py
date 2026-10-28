@@ -807,6 +807,9 @@ def get_current_guide_time_idx(app_state, db):
 
 UPDATER_AND_SERVER_FEATURES_ENABLED = True
 
+# VALUES CHANGE HERE: False greys out the Server Mode toggle in Advanced Settings (the row can still be reached with the keys and controller but cannot be turned on or off); True lets it be switched again.
+SERVER_TOGGLE_ENABLED = False
+
 GPU_RENDER_MODE_ENABLED = True
 
 SYSTEM_ROW_META = {
@@ -3056,6 +3059,8 @@ def _channel_menu_fingerprint(ch_info):
         ch_info.get("active", True),
         ch_info.get("is_visualizer", False),
         ch_info.get("visualizer_style", "Random"),
+        ch_info.get("reactive_visualizer_enabled", True),
+        ch_info.get("reactive_visualizer_strength", 50),
         ch_info.get("name", ""),
         ch_info.get("scheduling_mode", "random_slots"),
         ch_info.get("block_mode", "full_day"),
@@ -3524,7 +3529,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 elif app_state.get("_update_ready", False):
                     btn_txt = "Install Update"
                 elif app_state.get("_update_available", False):
-                    btn_txt = "Update Available"
+                    btn_txt = "Update Now"
+                elif app_state.get("_update_up_to_date", False):
+                    btn_txt = "Up to Date"
                 elif "not configured" in str(app_state.get("_update_status", "")).lower():
                     btn_txt = "Updates Unconfigured"
                 elif "failed" in str(app_state.get("_update_status", "")).lower():
@@ -3637,7 +3644,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         elif app_state.get("_update_ready", False):
             _as_update_txt = "Install Update"
         elif app_state.get("_update_available", False):
-            _as_update_txt = "Update Available"
+            _as_update_txt = "Update Now"
+        elif app_state.get("_update_up_to_date", False):
+            _as_update_txt = "Up to Date"
         elif "not configured" in str(app_state.get("_update_status", "")).lower():
             _as_update_txt = "Updates Unconfigured"
         elif "failed" in str(app_state.get("_update_status", "")).lower():
@@ -3719,7 +3728,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 pygame.draw.rect(menu_canvas, (25, 45, 80), (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), border_radius=6)
                 if _as_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=6)
-                _as_disabled_row = (_as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
+                _as_disabled_row = (_as_row_id == "server_option" and not (UPDATER_AND_SERVER_FEATURES_ENABLED and SERVER_TOGGLE_ENABLED))
                 _as_lbl_col = (105, 105, 115) if _as_disabled_row else TEXT_WHITE
                 _as_draw_text(f_ch_label, _as_toggle_labels[_as_row_id], _as_lbl_col, _as_bar_y, _as_focused)
 
@@ -6170,7 +6179,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 "controller_map": "CONTROLLER MAPPING",
                 "stick_deadzone": "STICK DEADZONE",
                 "multitap_toggle": "MULTITAP (ALL CONSOLES)",
-                "menu_bg_select_image": "SET MENU BACKGROUND IMAGE",
+                "menu_bg_select_image": "BACKGROUND IMAGE",
                 "scroll_style": f"SCROLL STYLE:  {CONSOLE_SCROLL_STYLE_LABELS.get(_cur_scroll_style, 'CAROUSEL')}",
                 "text_color":   f"TEXT COLOR:  {_cur_text_color.upper()}",
                 "scan_for_roms": "SCAN FOR ROMS",
@@ -6181,9 +6190,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             }
 
             if console_key == "MENU":
-                _menu_left_order  = ["controller_map", "stick_deadzone", "game_screen_mode",
+                _menu_left_order  = ["controller_map", "menu_bg_select_image", "game_screen_mode",
                                       "scan_for_cores", "clear_cores"]
-                _menu_right_order = ["menu_bg_select_image", "multitap_toggle", "scroll_style",
+                _menu_right_order = ["stick_deadzone", "multitap_toggle", "scroll_style",
                                      "scan_for_roms", "clear_roms"]
                 _left_ids  = [r for r in _menu_left_order if r in grid_row_ids]
                 _right_ids = [r for r in _menu_right_order if r in grid_row_ids]
@@ -6855,7 +6864,6 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     }
     _burnin_key = (target, _burnin_turning_on)
     _is_burnin_family = _burnin_key in _BURNIN_TITLES
-    # NOTE: the update popup carries the same Don't show this again box as the burn-in warnings.
     _has_checkbox = _is_burnin_family or target == "app_update"
     _update_version = str(state.get("update_prompt_version", "") or "").strip()
     _update_body = [
@@ -7015,6 +7023,7 @@ __all__ = [
     "REMOTE_REMAP_ACTIONS",
     "SELECTION_BORDER_WIDTH",
     "SERVER_MENU_BTN_SEL",
+    "SERVER_TOGGLE_ENABLED",
     "SYSTEM_ROW_META",
     "UPDATER_AND_SERVER_FEATURES_ENABLED",
     "clamp_guide_time_idx",

@@ -2857,17 +2857,17 @@ def sub_lasts(layout):
 
 EXPECTED_SUB = {
     "MENU": {
-        "controller_map": "W:- S:stick_deadzone A:- D:menu_bg_select_image",
-        "stick_deadzone": "W:controller_map S:game_screen_mode A:- D:multitap_toggle",
+        "controller_map": "W:- S:menu_bg_select_image A:- D:stick_deadzone",
+        "stick_deadzone": "W:- S:multitap_toggle A:controller_map D:-",
         "scan_for_roms": "W:scroll_style S:clear_roms A:scan_for_cores D:-",
         "clear_roms": "W:scan_for_roms S:close A:clear_cores D:-",
         "scan_for_cores": "W:game_screen_mode S:clear_cores A:- D:scan_for_roms",
         "clear_cores": "W:scan_for_cores S:close A:- D:clear_roms",
-        "menu_bg_select_image": "W:- S:multitap_toggle A:controller_map D:-",
-        "multitap_toggle": "W:menu_bg_select_image S:scroll_style A:stick_deadzone D:-",
+        "menu_bg_select_image": "W:controller_map S:game_screen_mode A:- D:multitap_toggle",
+        "multitap_toggle": "W:stick_deadzone S:scroll_style A:menu_bg_select_image D:-",
         "scroll_style": "W:multitap_toggle S:scan_for_roms A:game_screen_mode D:text_color",
         "text_color": "W:multitap_toggle S:scan_for_roms A:scroll_style D:-",
-        "game_screen_mode": "W:stick_deadzone S:scan_for_cores A:- D:scroll_style",
+        "game_screen_mode": "W:menu_bg_select_image S:scan_for_cores A:- D:scroll_style",
         "close": "W:clear_cores S:- A:clear_cores D:-",
     },
     "DVD": {
@@ -4824,6 +4824,23 @@ def case_sliders():
     check(mn.SLIDER_SPECS["bg_hue"][1:] == (220, 0, 360) and mn.SLIDER_SPECS["ui_hue"][1:] == (140, 0, 360) and mn.SLIDER_SPECS["opacity"][1:] == (50, 0, 100), "slider ranges and defaults match the Theme and Video drawing")
     held = {mn.repeat_allowed("VIDEO_ROWS", key) for key in (pygame.K_a, pygame.K_d)}
     check(held == {True}, "held slider keys still repeat on Video sliders")
+    key, default, low, high = mn.REACTIVE_STRENGTH_SPEC
+    check(key == "reactive_visualizer_strength" and (default, low, high) == (50, 0, 100), "Reactive Strength spec is the 0 to 100 channel value that starts at 50")
+    for value in list(range(-12, 125)):
+        for direction in (mn.LEFT, mn.RIGHT):
+            ch_info = {key: value}
+            check(mn.reactive_strength_adjust(ch_info, direction) is True and ch_info[key] == old_slider(value, direction, low, high), "reactive strength %d %s moves like the Video sliders" % (value, direction))
+    ch_info = {}
+    mn.reactive_strength_adjust(ch_info, mn.RIGHT)
+    check(ch_info[key] == 55, "reactive strength starts from 50 and moves 5")
+    for direction in (mn.UP, mn.DOWN):
+        ch_info = {key: 40}
+        check(mn.reactive_strength_adjust(ch_info, direction) is False and ch_info == {key: 40}, "reactive strength ignores %s" % direction)
+    check(mn.reactive_strength_adjust({key: 40}, None) is False, "reactive strength ignores a key that is not a direction")
+    check(mn.repeat_allowed("CHANNEL_SUB_MENU", pygame.K_a) and mn.repeat_allowed("CHANNEL_SUB_MENU", pygame.K_d), "held keys repeat on the music channel editor like the Video sliders")
+    f_low = ui._channel_menu_fingerprint({"is_visualizer": True, "reactive_visualizer_strength": 50})
+    check(f_low != ui._channel_menu_fingerprint({"is_visualizer": True, "reactive_visualizer_strength": 55}), "menu picture redraws when Reactive Strength changes")
+    check(f_low != ui._channel_menu_fingerprint({"is_visualizer": True, "reactive_visualizer_strength": 50, "reactive_visualizer_enabled": False}), "menu picture redraws when Reactive Visualizer is toggled")
 
 
 # ============================================================================
@@ -4845,6 +4862,7 @@ def run_slider_block(runner, state, config, key):
     dirty = Dirty()
     env = make_env()
     env["_mark_settings_dirty"] = dirty
+    env["now_ticks"] = 100000
     work = dict(state)
     with Quiet():
         fell = runner(types.SimpleNamespace(key=key), work, db, env)
@@ -7645,12 +7663,16 @@ def stick_case_screen():
     check([mn.stick_dz_player_step(1, mn.LEFT), mn.stick_dz_player_step(1, mn.RIGHT), mn.stick_dz_player_step(3, mn.RIGHT),
            mn.stick_dz_player_step(4, mn.RIGHT), mn.stick_dz_player_step(4, mn.LEFT)] == [1, 2, 4, None, 3],
           "Left and Right step the player square, and Right from Player 4 leaves toward Close")
-    check("stick_deadzone" in mn.GAMES_SUB_MENU_LEFT, "the MENU page has the Stick Deadzone row")
-    check(mn.GAMES_SUB_MENU_LEFT.index("stick_deadzone") == mn.GAMES_SUB_MENU_LEFT.index("controller_map") + 1, "the row sits under Controller Mapping")
+    check(mn.GAMES_SUB_MENU_RIGHT[0] == "stick_deadzone", "the MENU page has the Stick Deadzone row at the top of the right column")
+    check(mn.GAMES_SUB_MENU_LEFT.index("menu_bg_select_image") == mn.GAMES_SUB_MENU_LEFT.index("controller_map") + 1, "the Background Image row sits under Controller Mapping")
+    with open(ui.__file__, "r", encoding="utf-8") as _ui_file:
+        _ui_text = _ui_file.read()
+    check('"menu_bg_select_image": "BACKGROUND IMAGE",' in _ui_text and "SET MENU BACKGROUND IMAGE" not in _ui_text, "the menu background row is labelled Background Image")
     rows = ui.get_games_sub_menu_rows(None, {}, "MENU", True)
     check("stick_deadzone" in rows, "the MENU console lists the row")
     table = mn.games_sub_table(rows + [mn.CLOSE], False)
-    check(table.cells["controller_map"].get(mn.DOWN) == "stick_deadzone", "down from Controller Mapping reaches Stick Deadzone")
+    check(table.cells["controller_map"].get(mn.DOWN) == "menu_bg_select_image", "down from Controller Mapping reaches Background Image")
+    check(table.cells["controller_map"].get(mn.RIGHT) == "stick_deadzone" and table.cells["stick_deadzone"].get(mn.LEFT) == "controller_map", "Right from Controller Mapping reaches Stick Deadzone and Left returns")
 
     cfg = {key_on: True}
     check(gd.adjust_stick_setting(cfg, "deadzone", 1) == 1, "deadzone steps up by 1")
@@ -16555,7 +16577,7 @@ class TestFailurePointTextGameDeck(_SectionCase):
 
 
 def suite_failure_point_text_other_scripts():
-    for name, expected in (("media.py", 28), ("performance_governor.py", 8), ("ui.py", 5), ("libretro_core.py", 3), ("media_library.py", 23)):
+    for name, expected in (("media.py", 29), ("performance_governor.py", 8), ("ui.py", 5), ("libretro_core.py", 3), ("media_library.py", 23)):
         converted_handler_checks(name, expected)
     check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
 
@@ -19645,6 +19667,1220 @@ class TestBootDriveWake(unittest.TestCase):
         prewarm = get_function_source("_prewarm_boot_channel_paths")
         self.assertLess(prewarm.index("_boot_drive_wake_done.wait("), prewarm.index("_gather_other_channels_now_playing_targets("))
         self.assertTrue(hasattr(gov, "BOOT_DRIVE_WAKE_SECONDS"))
+
+
+# ============================================================================
+# SECTION: Update flow (popup, install bar, helper swap, versioned exe, rollback)
+# ============================================================================
+
+
+def _load_updater_script(name):
+    """Loads auto_updater.py or update_helper.py from the project; a stand-in for server_diagnostics is used only when the real one is not on the path."""
+    import importlib.util
+    try:
+        __import__("server_diagnostics")
+    except Exception:
+        stub = types.ModuleType("server_diagnostics")
+
+        def _breadcrumb(log, level, key, message, *args, **kwargs):
+            log.log(level, message, *args)
+        stub.breadcrumb = _breadcrumb
+        sys.modules["server_diagnostics"] = stub
+    for folder in (ROOT, os.path.join(ROOT, "updater"), os.path.join(ROOT, "assets")):
+        path = os.path.join(folder, name + ".py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("_t_" + name, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    raise LookupError(name + ".py not found")
+
+
+class _FakeProcess:
+    def __init__(self, exit_code=None):
+        self._exit_code = exit_code
+        self.pid = 4242
+
+    def poll(self):
+        return self._exit_code
+
+
+class TestUpdateHelperSwap(unittest.TestCase):
+    """update_helper.apply_update on a temp install folder: renamed exe, version stamp, old exe cleanup, rollback."""
+
+    OLD_EXE = "Retro TV Emulator V1.4.2.exe"
+    NEW_EXE = "Retro TV Emulator V1.4.3.exe"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.h = _load_updater_script("update_helper")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rtv-upd-test-")
+        self.install = os.path.join(self.tmp, "install")
+        self.staged = os.path.join(self.tmp, "work", "payload")
+        os.makedirs(os.path.join(self.install, "main"))
+        os.makedirs(self.staged)
+        self._write(self.install, self.OLD_EXE, "old exe")
+        self._write(self.install, os.path.join("_internal", "lib.dll"), "old lib")
+        self._write(self.install, os.path.join("main", "user.txt"), "user data")
+        self._write(self.staged, os.path.join("_internal", "lib.dll"), "new lib")
+        self._write(self.staged, os.path.join("main", "user.txt"), "SHOULD NOT COPY")
+        self.h.HEALTH_CHECK_SECONDS = 0.6
+        self.calls = []
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, folder, name, text):
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def _read(self, folder, name):
+        with open(os.path.join(folder, name), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _metadata(self, version="1.4.3"):
+        path = os.path.join(self.tmp, "pending_update.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "install_dir": self.install, "staged_path": self.staged, "parent_pid": 0,
+                "version": version,
+                "relaunch_command": [os.path.join(self.install, self.OLD_EXE), "--relaunched"],
+            }, handle)
+        return path
+
+    def _run(self, exit_codes, version="1.4.3"):
+        codes = list(exit_codes)
+
+        def fake_popen(command, **kwargs):
+            self.calls.append(list(command))
+            return _FakeProcess(codes.pop(0) if codes else None)
+        with mock.patch.object(self.h.subprocess, "Popen", fake_popen):
+            return self.h.apply_update(self._metadata(version))
+
+    def test_a_renamed_exe_is_launched_and_the_old_one_deleted(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self.assertEqual(self._run([None]), 0)
+        self.assertEqual(self.calls[0], [os.path.join(self.install, self.NEW_EXE), "--relaunched"])
+        self.assertTrue(os.path.isfile(os.path.join(self.install, self.NEW_EXE)))
+        self.assertFalse(os.path.exists(os.path.join(self.install, self.OLD_EXE)))
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "lib.dll")), "new lib")
+
+    def test_the_version_stamp_names_the_new_version(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self._run([None])
+        self.assertEqual(json.loads(self._read(self.install, "version.json")), {"version": "1.4.3"})
+
+    def test_the_stamp_makes_the_updater_see_the_new_version(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self._run([None])
+        updater = _load_updater_script("auto_updater")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RETRO_TV_VERSION", None)
+            self.assertEqual(updater.current_version(self.install, {}), "1.4.3")
+            self.assertFalse(updater.version_is_newer("1.4.3", updater.current_version(self.install, {})))
+
+    def test_the_main_folder_is_never_written(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self._run([None])
+        self.assertEqual(self._read(self.install, os.path.join("main", "user.txt")), "user data")
+
+    def test_the_same_named_exe_is_replaced_and_launched_by_its_own_name(self):
+        self._write(self.staged, self.OLD_EXE, "new exe same name")
+        self._run([None], version="1.4.3")
+        self.assertEqual(self.calls[0][0], os.path.join(self.install, self.OLD_EXE))
+        self.assertEqual(self._read(self.install, self.OLD_EXE), "new exe same name")
+        self.assertEqual(json.loads(self._read(self.install, "version.json"))["version"], "1.4.3")
+
+    def test_a_failed_start_puts_every_old_file_back(self):
+        self._write(self.install, "version.json", json.dumps({"version": "1.4.2"}))
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        with self.assertRaises(RuntimeError):
+            self._run([1, None])
+        self.assertEqual(self._read(self.install, self.OLD_EXE), "old exe")
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "lib.dll")), "old lib")
+        self.assertFalse(os.path.exists(os.path.join(self.install, self.NEW_EXE)))
+        self.assertEqual(json.loads(self._read(self.install, "version.json")), {"version": "1.4.2"})
+        self.assertEqual(self.calls[1], [os.path.join(self.install, self.OLD_EXE), "--relaunched"])
+
+    def test_a_failed_start_with_no_earlier_stamp_leaves_none(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        with self.assertRaises(RuntimeError):
+            self._run([1, None])
+        self.assertFalse(os.path.exists(os.path.join(self.install, "version.json")))
+
+    def test_an_old_exe_that_cannot_be_deleted_does_not_fail_the_update(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        with mock.patch.object(self.h, "_remove_with_retry", return_value=False):
+            self.assertEqual(self._run([None]), 0)
+        self.assertEqual(json.loads(self._read(self.install, "version.json"))["version"], "1.4.3")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_the_old_exe_survives_until_the_new_one_has_stayed_up(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        seen = []
+        original = self.h._remove_with_retry
+
+        def watching(path, *a, **k):
+            seen.append(os.path.isfile(os.path.join(self.install, self.NEW_EXE)))
+            return original(path, *a, **k)
+        with mock.patch.object(self.h, "_remove_with_retry", watching):
+            self._run([None])
+        self.assertEqual(seen, [True])
+
+    def test_staged_and_pending_files_are_cleaned_up(self):
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self._run([None])
+        self.assertFalse(os.path.exists(self.staged))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "pending_update.json")))
+
+    def test_renamed_exe_rules(self):
+        h = self.h
+        cmd = [os.path.join(self.install, self.OLD_EXE)]
+
+        def files(*names):
+            return [("/s/" + n, n) for n in names]
+        self.assertEqual(h._renamed_exe(files(self.NEW_EXE), cmd, self.install), (self.NEW_EXE, cmd[0]))
+        self.assertEqual(h._renamed_exe(files(self.OLD_EXE), cmd, self.install), (None, None))
+        self.assertEqual(h._renamed_exe(files(self.NEW_EXE, "Retro TV Emulator V1.4.4.exe"), cmd, self.install), (None, None))
+        self.assertEqual(h._renamed_exe(files("RetroTVUpdateHelper.exe"), cmd, self.install), (None, None))
+        self.assertEqual(h._renamed_exe(files("sub/" + self.NEW_EXE), cmd, self.install), (None, None))
+        self.assertEqual(h._renamed_exe(files("Other Program V1.4.3.exe"), cmd, self.install), (None, None))
+        self.assertEqual(h._renamed_exe(files(self.NEW_EXE), [os.path.join(self.tmp, self.OLD_EXE)], self.install), (None, None))
+        self.assertEqual(h._renamed_exe(files(self.NEW_EXE), [], self.install), (None, None))
+
+    def test_copy_and_remove_wait_out_a_locked_file(self):
+        src = os.path.join(self.tmp, "a.txt")
+        dst = os.path.join(self.tmp, "b.txt")
+        self._write(self.tmp, "a.txt", "x")
+        real = shutil.copy2
+        state = {"n": 0}
+
+        def flaky(a, b):
+            state["n"] += 1
+            if state["n"] < 3:
+                raise PermissionError("locked")
+            return real(a, b)
+        with mock.patch.object(self.h.shutil, "copy2", flaky):
+            self.h._copy_with_retry(src, dst, attempts=5, delay=0.01)
+        self.assertEqual(state["n"], 3)
+        self.assertTrue(self.h._remove_with_retry(dst, attempts=2, delay=0.01))
+        self.assertTrue(self.h._remove_with_retry(dst, attempts=2, delay=0.01))
+        with mock.patch.object(self.h.os, "unlink", side_effect=PermissionError("locked")):
+            self._write(self.tmp, "c.txt", "x")
+            self.assertFalse(self.h._remove_with_retry(os.path.join(self.tmp, "c.txt"), attempts=2, delay=0.01))
+
+    def test_liveness_check_sees_a_running_and_a_finished_process(self):
+        import subprocess as sp
+        child = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(self.h._pid_alive(child.pid))
+            self.assertFalse(self.h._pid_alive(0))
+        finally:
+            child.kill()
+            child.wait()
+        self.assertFalse(self.h._pid_alive(child.pid))
+
+    def test_the_users_saved_setup_is_never_overwritten_by_files_in_the_zip(self):
+        saved = {
+            "retro_config.json": '{"user": "mine"}',
+            "_retro_tv_device_id": "device-123",
+            "playback_runtime.json": "runtime-mine",
+            os.path.join("controllers", "emulator_config.json"): "controllers-mine",
+            os.path.join("server", ".json", "server1", "retro.config.json"): "server-mine",
+            os.path.join("_internal", "retro_config.json"): "internal-mine",
+            "app_log.txt": "log-mine",
+        }
+        for name, text in saved.items():
+            self._write(self.install, name, text)
+            self._write(self.staged, name, "SHIPPED DEFAULT")
+        self._write(self.install, os.path.join("_internal", "assets", "defaults.json"), "old defaults")
+        self._write(self.staged, os.path.join("_internal", "assets", "defaults.json"), "new defaults")
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self.assertEqual(self._run([None]), 0)
+        for name, text in saved.items():
+            self.assertEqual(self._read(self.install, name), text, name)
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "assets", "defaults.json")), "new defaults")
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "lib.dll")), "new lib")
+        self.assertEqual(self._read(self.install, os.path.join("main", "user.txt")), "user data")
+        self.assertTrue(os.path.isfile(os.path.join(self.install, self.NEW_EXE)))
+        self.assertFalse(os.path.exists(os.path.join(self.install, self.OLD_EXE)))
+
+    def test_a_saved_setup_file_the_install_does_not_have_yet_is_copied_from_the_zip_only_inside_internal(self):
+        self._write(self.staged, os.path.join("_internal", "retro_config.json"), "shipped default")
+        self._write(self.staged, os.path.join("_internal", "server", ".json", "server2", "retro.config.json"), "shipped server")
+        self._write(self.staged, "retro_config.json", "shipped root default")
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self.assertEqual(self._run([None]), 0)
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "retro_config.json")), "shipped default")
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "server", ".json", "server2", "retro.config.json")), "shipped server")
+        self.assertFalse(os.path.exists(os.path.join(self.install, "retro_config.json")))
+
+    def test_a_failed_start_rolls_back_and_still_leaves_the_saved_setup_alone(self):
+        self._write(self.install, "retro_config.json", "user config")
+        self._write(self.staged, "retro_config.json", "SHIPPED DEFAULT")
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        with self.assertRaises(Exception):
+            self._run([1, None])
+        self.assertEqual(self._read(self.install, "retro_config.json"), "user config")
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "lib.dll")), "old lib")
+        self.assertTrue(os.path.isfile(os.path.join(self.install, self.OLD_EXE)))
+
+    def test_the_saved_setup_table_names_what_the_app_writes_beside_its_exe(self):
+        for relative in ("retro_config.json", "playback_runtime.json", "_probe_inflight.json", "_retro_tv_device_id",
+                         "controllers/emulator_config.json", "Server/.json/server3/retro.config.json", "_internal/retro_config.json"):
+            self.assertTrue(self.h._is_user_state(relative), relative)
+        for relative in ("lib.dll", "assets/defaults.json", "Retro TV Emulator V1.4.4.exe", "server/server_service.py", "main/images/x.png"):
+            self.assertFalse(self.h._is_user_state(relative), relative)
+
+
+class TestUpdateOnlyTouchesItsArea(unittest.TestCase):
+    """update_helper: an update writes only the exe files at the top of the install and the files under _internal (never _internal/main); it never deletes anything and never changes any other file or folder, with the same exe name kept (Alpha, Beta, Release builds)."""
+
+    EXE = "Retro TV Emulator Alpha.exe"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.h = _load_updater_script("update_helper")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rtv-upd-area-")
+        self.install = os.path.join(self.tmp, "install")
+        self.staged = os.path.join(self.tmp, "work", "payload")
+        os.makedirs(self.install)
+        os.makedirs(self.staged)
+        self.h.HEALTH_CHECK_SECONDS = 0.6
+        self.calls = []
+        self.owner_files = {
+            "retro_config.json": "owner config",
+            "playback_runtime.json": "owner runtime",
+            "app_log.txt": "owner log",
+            "crash_log.txt": "owner crash",
+            "vlc-debug.log": "owner vlc",
+            "notes.txt": "owner note",
+            "version.json": "owner stamp",
+            os.path.join("main", "scans", "ch01.json"): "owner scan",
+            os.path.join("main", "images", "logo.png"): "owner logo",
+            os.path.join("main", "videos", "clip.mp4"): "owner video",
+            os.path.join("_internal", "main", "scans", "ch02.json"): "owner internal scan",
+            os.path.join("_internal", "main", "images", "bezel.png"): "owner internal image",
+            os.path.join("server", ".json", "s1", "retro.config.json"): "owner server slot",
+            os.path.join("controllers", "emulator_config.json"): "owner controllers",
+            os.path.join("GPU", "keep.py"): "owner gpu",
+            os.path.join("_internal", "retro_config.json"): "owner internal config",
+        }
+        for name, text in self.owner_files.items():
+            self._write(self.install, name, text)
+        self._write(self.install, self.EXE, "old exe")
+        self._write(self.install, os.path.join("_internal", "lib.dll"), "old lib")
+        self._write(self.install, os.path.join("_internal", "gone_from_zip.dll"), "only on the install")
+        self._write(self.install, "extra_root.dll", "root dll the zip does not ship")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, folder, name, text):
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def _read(self, folder, name):
+        with open(os.path.join(folder, name), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _snapshot(self):
+        found = {}
+        for root, _dirs, names in os.walk(self.install):
+            for name in names:
+                if name == "update_helper.log":
+                    continue
+                path = os.path.join(root, name)
+                with open(path, "rb") as handle:
+                    found[os.path.relpath(path, self.install)] = handle.read()
+        return found
+
+    def _ship_everything(self):
+        self._write(self.staged, self.EXE, "new exe")
+        self._write(self.staged, "RetroTVUpdateHelper.exe", "new helper")
+        self._write(self.staged, os.path.join("_internal", "lib.dll"), "new lib")
+        self._write(self.staged, os.path.join("_internal", "newfile.dll"), "new internal file")
+        self._write(self.staged, os.path.join("_internal", "assets", "menu_nav.py"), "new nav")
+        for name in self.owner_files:
+            self._write(self.staged, name, "SHIPPED, MUST NOT LAND")
+        self._write(self.staged, "extra_root.dll", "SHIPPED ROOT DLL")
+        self._write(self.staged, "readme.txt", "SHIPPED ROOT TEXT")
+        self._write(self.staged, "brand_new.json", "SHIPPED NEW ROOT JSON")
+        self._write(self.staged, os.path.join("assets", "defaults.json"), "SHIPPED OUTSIDE FOLDER")
+        self._write(self.staged, os.path.join("main", "scans", "new.json"), "SHIPPED INTO MAIN")
+        self._write(self.staged, os.path.join("_internal", "main", "scans", "new.json"), "SHIPPED INTO INTERNAL MAIN")
+
+    def _run(self, exit_codes=(None,)):
+        codes = list(exit_codes)
+
+        def fake_popen(command, **kwargs):
+            self.calls.append(list(command))
+            return _FakeProcess(codes.pop(0) if codes else None)
+        path = os.path.join(self.tmp, "pending_update.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"install_dir": self.install, "staged_path": self.staged, "parent_pid": 0, "version": "",
+                       "relaunch_command": [os.path.join(self.install, self.EXE), "--relaunched"]}, handle)
+        with mock.patch.object(self.h.subprocess, "Popen", fake_popen):
+            return self.h.apply_update(path)
+
+    def test_only_the_exe_files_and_the_internal_files_change(self):
+        before = self._snapshot()
+        self._ship_everything()
+        self.assertEqual(self._run(), 0)
+        after = self._snapshot()
+        changed = {name for name in after if before.get(name) != after[name]}
+        expected = {self.EXE, "RetroTVUpdateHelper.exe", os.path.join("_internal", "lib.dll"),
+                    os.path.join("_internal", "newfile.dll"), os.path.join("_internal", "assets", "menu_nav.py")}
+        self.assertEqual(changed, expected)
+
+    def test_nothing_is_deleted(self):
+        before = self._snapshot()
+        self._ship_everything()
+        self._run()
+        self.assertEqual(set(before) - set(self._snapshot()), set())
+
+    def test_the_same_named_exe_is_replaced_and_started_by_its_own_name(self):
+        self._ship_everything()
+        self._run()
+        self.assertEqual(self._read(self.install, self.EXE), "new exe")
+        self.assertEqual(self.calls[0], [os.path.join(self.install, self.EXE), "--relaunched"])
+
+    def test_the_main_folders_the_root_files_and_the_saved_setup_are_untouched(self):
+        self._ship_everything()
+        self._run()
+        for name, text in self.owner_files.items():
+            self.assertEqual(self._read(self.install, name), text, name)
+        for name in ("brand_new.json", "readme.txt", os.path.join("assets", "defaults.json"),
+                     os.path.join("main", "scans", "new.json"), os.path.join("_internal", "main", "scans", "new.json")):
+            self.assertFalse(os.path.exists(os.path.join(self.install, name)), name)
+        self.assertEqual(self._read(self.install, "extra_root.dll"), "root dll the zip does not ship")
+
+    def test_a_failed_start_puts_the_exe_and_internal_files_back_and_touches_nothing_else(self):
+        before = self._snapshot()
+        self._ship_everything()
+        with self.assertRaises(RuntimeError):
+            self._run([1, None])
+        self.assertEqual(self._snapshot(), before)
+
+    def test_the_area_rule(self):
+        h = self.h
+        for relative in ("Retro TV Emulator Alpha.exe", "RetroTVUpdateHelper.exe", "x.EXE", "_internal/lib.dll",
+                         "_internal\\assets\\a.py", "_INTERNAL/sub/deep/file.txt"):
+            self.assertTrue(h._in_update_area(relative), relative)
+        for relative in ("retro_config.json", "app_log.txt", "lib.dll", "version.json", "RetroTVUpdateHelper.exe.old",
+                         "main/images/a.png", "assets/a.py", "server/x.py", "controllers/emulator_config.json",
+                         "GPU/a.py", "_internal_extra/a.dll", "updater/RetroTVUpdateHelper.exe"):
+            self.assertFalse(h._in_update_area(relative), relative)
+
+    def test_the_main_folder_inside_internal_stays_protected_even_though_internal_is_writable(self):
+        self.assertTrue(self.h._is_protected("_internal/main/images/a.png"))
+        self._write(self.staged, os.path.join("_internal", "main", "images", "a.png"), "x")
+        self._write(self.staged, os.path.join("_internal", "lib.dll"), "x")
+        names = [relative for _src, relative in self.h._payload_files(self.staged, self.install)]
+        self.assertEqual(names, [os.path.join("_internal", "lib.dll")])
+
+    def test_the_listed_folders_inside_main_are_updated_and_everything_else_in_main_stays_protected(self):
+        h = self.h
+        for relative in ("_internal/main/licenses/a.txt", "_internal/main/models/m.bin", "_internal/main/images/bezel/b.png",
+                         "_internal/main/images/loading/l.png", "_internal/main/images/logos/x/y.png",
+                         "_internal/main/images/screensaver/s.png", "_internal/main/images/Wireframes/w.png",
+                         "_INTERNAL\\main\\images\\Bezel\\b.png"):
+            self.assertFalse(h._is_protected(relative), relative)
+        for relative in ("_internal/main/images/a.png", "_internal/main/images/splash screen images/a.png",
+                         "_internal/main/roms/a.gb", "_internal/main/videos/a.mp4", "_internal/main/audio/a.mp3",
+                         "_internal/main/loudness/a.json", "_internal/main/media_library/a.db", "_internal/main/README.md",
+                         "_internal/main/cores/a.dll", "_internal/main/imagesbezel/a.png", "_internal/main/modelsx/a.bin", "main/images/bezel/a.png"):
+            self.assertTrue(h._is_protected(relative), relative)
+        self._write(self.staged, os.path.join("_internal", "main", "images", "bezel", "b.png"), "new bezel")
+        self._write(self.staged, os.path.join("_internal", "main", "images", "splash screen images", "s.png"), "x")
+        self._write(self.staged, os.path.join("_internal", "main", "roms", "r.gb"), "x")
+        names = sorted(relative for _src, relative in self.h._payload_files(self.staged, self.install))
+        self.assertEqual(names, [os.path.join("_internal", "main", "images", "bezel", "b.png")])
+
+    def test_the_table_values_are_the_exe_ending_and_the_internal_folder(self):
+        self.assertEqual(self.h.UPDATE_ROOT_FILE_ENDINGS, (".exe",))
+        self.assertEqual(self.h.UPDATE_WRITABLE_FOLDERS, ("_internal",))
+
+    def test_every_skipped_file_is_written_to_the_helper_log(self):
+        self._write(self.staged, "brand_new.json", "x")
+        self._write(self.staged, os.path.join("assets", "a.py"), "x")
+        self._write(self.staged, self.EXE, "x")
+        with self.assertLogs("retro_tv.update_helper", level="INFO") as captured:
+            self.h._payload_files(self.staged, self.install)
+        text = "\n".join(captured.output)
+        self.assertIn("Skipped brand_new.json", text)
+        self.assertIn("Skipped " + os.path.join("assets", "a.py"), text)
+        self.assertNotIn("Skipped " + self.EXE, text)
+
+
+class TestAutoUpdaterCheckAndStage(unittest.TestCase):
+    """auto_updater: a posted version higher than the installed one is offered, anything else is not; a real local download is hash checked and staged."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.u = _load_updater_script("auto_updater")
+
+    def test_only_a_higher_version_counts(self):
+        u = self.u
+        self.assertTrue(u.version_is_newer("1.4.3", "1.4.2"))
+        self.assertTrue(u.version_is_newer("V1.4.10", "1.4.9"))
+        self.assertTrue(u.version_is_newer("1.5.0", "1.4.99"))
+        self.assertTrue(u.version_is_newer("2.0", "1.9.9"))
+        self.assertFalse(u.version_is_newer("1.4.2", "1.4.2"))
+        self.assertFalse(u.version_is_newer("1.4.1", "1.4.2"))
+
+    def _check(self, posted, installed):
+        releases = [{"tag_name": "x", "draft": False, "published_at": "2026-10-28T09:00:00Z",
+                     "assets": [{"name": "Retro TV Emulator Alpha V%s.zip" % posted, "state": "uploaded",
+                                 "digest": "sha256:" + "a" * 64, "browser_download_url": "https://example.invalid/x.zip"}]}]
+        with mock.patch.object(self.u, "_fetch_json", return_value=releases), \
+                mock.patch.object(self.u, "current_version", return_value=installed):
+            return self.u.check_for_update(tempfile.gettempdir(), config={})
+
+    def test_a_posted_higher_version_is_available(self):
+        self.assertTrue(self._check("1.4.3", "1.4.2")["available"])
+
+    def test_the_same_or_a_lower_posted_version_is_not(self):
+        self.assertFalse(self._check("1.4.2", "1.4.2")["available"])
+        self.assertFalse(self._check("1.4.1", "1.4.2")["available"])
+
+    def test_the_stamp_beats_the_folder_name(self):
+        with tempfile.TemporaryDirectory(prefix="Retro TV V1.4.2 ") as tmp:
+            with open(os.path.join(tmp, "version.json"), "w", encoding="utf-8") as handle:
+                json.dump({"version": "1.4.3"}, handle)
+            os.environ.pop("RETRO_TV_VERSION", None)
+            self.assertEqual(self.u.current_version(tmp, {}), "1.4.3")
+
+    def test_a_local_download_is_hash_checked_staged_and_reports_progress(self):
+        import hashlib
+        import http.server
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            serve = os.path.join(tmp, "serve")
+            os.makedirs(serve)
+            zpath = os.path.join(serve, "pkg.zip")
+            with zipfile.ZipFile(zpath, "w") as archive:
+                archive.writestr("Retro TV Emulator V1.4.3.exe", "exe")
+                archive.writestr("lib.dll", "lib")
+            digest = hashlib.sha256(open(zpath, "rb").read()).hexdigest()
+
+            class Quiet(http.server.SimpleHTTPRequestHandler):
+                def __init__(self, *a, **k):
+                    super().__init__(*a, directory=serve, **k)
+
+                def log_message(self, *a):
+                    pass
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                url = "http://127.0.0.1:%d/pkg.zip" % server.server_address[1]
+                base = os.path.join(tmp, "install")
+                os.makedirs(base)
+                seen = []
+                record = self.u.stage_update(base, {"version": "1.4.3", "url": url, "sha256": digest},
+                                             progress_callback=lambda done, total: seen.append((done, total)))
+                self.assertTrue(os.path.isfile(os.path.join(record["staged_path"], "Retro TV Emulator V1.4.3.exe")))
+                self.assertTrue(seen and seen[-1][0] == seen[-1][1] > 0)
+                with self.assertRaises(self.u.UpdateError):
+                    self.u.stage_update(base, {"version": "1.4.3", "url": url, "sha256": "0" * 64})
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_the_helper_is_started_outside_the_apps_job_and_told_the_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = os.path.join(tmp, "payload")
+            os.makedirs(staged)
+            started = []
+
+            def fake_popen(command, **kwargs):
+                started.append((command, kwargs))
+                return _FakeProcess()
+            with mock.patch.object(self.u.subprocess, "Popen", fake_popen), \
+                    mock.patch.object(self.u, "_helper_command", return_value=["helper"]):
+                pid = self.u.launch_staged_update(tmp, {"staged_path": staged, "version": "1.4.3"}, ["app.exe", "--relaunched"], parent_pid=77)
+            self.assertEqual(pid, 4242)
+            with open(os.path.join(tmp, self.u.UPDATE_DIR_NAME, self.u.PENDING_RECORD_NAME), encoding="utf-8") as handle:
+                pending = json.load(handle)
+            self.assertEqual((pending["parent_pid"], pending["version"]), (77, "1.4.3"))
+            self.assertEqual(started[0][0][:1] + started[0][0][1:2], ["helper", "--apply"])
+        self.assertIn("CREATE_BREAKAWAY_FROM_JOB", inspect.getsource(self.u.launch_staged_update))
+
+
+class TestUpdatePopupAndInstallBar(unittest.TestCase):
+    """The main script's update popup, Don't show this again, the install worker and the restart hand-over, run in an isolated namespace."""
+
+    def setUp(self):
+        self.ticks = [1000]
+        self.posted = []
+        self.saved = []
+        self.logs = []
+
+        class Log:
+            def info(s, *a, **k): outer.logs.append(("info", a))
+            def warning(s, *a, **k): outer.logs.append(("warning", a))
+        outer = self
+        self.stage_calls = []
+        self.launch_calls = []
+        self.ns = {
+            "app_state": {}, "log": Log(), "threading": threading, "os": os,
+            "pygame": types.SimpleNamespace(
+                QUIT=256, time=types.SimpleNamespace(get_ticks=lambda: self.ticks[0]),
+                event=types.SimpleNamespace(post=self.posted.append, Event=lambda t: ("event", t))),
+            "db": types.SimpleNamespace(config={}, save_settings=lambda: self.saved.append(True)),
+            "UPDATE_INSTALL_HOLD_AT_100_MS": 700, "UPDATE_INSTALL_ERROR_SHOW_MS": 4000, "UPDATE_INSTALL_DOWNLOAD_CAP": 0.97,
+            "_update_base_dir": lambda: "/base",
+            "_build_relaunch_command": lambda: ["app.exe", "--relaunched"],
+        }
+        for name in ("_open_update_popup", "_remember_update_prompt_skip", "_close_update_popup",
+                     "_begin_update_install", "_update_install_tick", "_launch_staged_update"):
+            exec(get_function_source(name), self.ns)
+        self.state = self.ns["app_state"]
+
+    def _stub_updater(self, stage=None, launch=None):
+        def default_stage(base, record, progress_callback=None):
+            self.stage_calls.append(record)
+            progress_callback(50, 100)
+            self.ns["_seen_mid"] = self.state.get("update_download_progress")
+            progress_callback(100, 100)
+            self.ns["_seen_end"] = self.state.get("update_download_progress")
+            return dict(record, staged_path="/staged")
+
+        def default_launch(base, record, command, parent_pid=None):
+            self.launch_calls.append((base, record, command, parent_pid))
+            return 99
+        self.ns["auto_updater"] = types.SimpleNamespace(stage_update=stage or default_stage, launch_staged_update=launch or default_launch)
+
+    def _wait_staged(self):
+        deadline = time.time() + 5
+        while time.time() < deadline and not (self.state.get("update_install_done_at") or self.state.get("update_install_error")):
+            time.sleep(0.01)
+
+    def test_a_boot_check_is_held_back_by_dont_show_but_a_manual_check_is_not(self):
+        self.ns["db"].config["update_prompt_skip_confirm"] = True
+        self.assertFalse(self.ns["_open_update_popup"]({"version": "1.4.3"}, True))
+        self.assertFalse(self.state.get("show_clear_confirm", False))
+        self.assertTrue(self.ns["_open_update_popup"]({"version": "1.4.3"}, False))
+        self.assertEqual(self.state["clear_confirm_target"], "app_update")
+
+    def test_the_popup_opens_on_no_with_the_box_unticked(self):
+        self.assertTrue(self.ns["_open_update_popup"]({"version": "1.4.3"}, True))
+        self.assertEqual(self.state["clear_confirm_selection"], "No")
+        self.assertFalse(self.state["clear_confirm_dont_show_again"])
+        self.assertEqual(self.state["update_prompt_version"], "1.4.3")
+        self.assertFalse(self.ns["_open_update_popup"]({"version": "1.4.4"}, True))
+
+    def test_dont_show_again_is_saved(self):
+        self.ns["_remember_update_prompt_skip"]()
+        self.assertTrue(self.ns["db"].config["update_prompt_skip_confirm"])
+        self.assertEqual(self.saved, [True])
+        self.ns["db"] = None
+        self.ns["_remember_update_prompt_skip"]()
+
+    def test_no_and_escape_both_remember_a_ticked_box(self):
+        self.assertEqual(MAIN_SRC.count('_remember_update_prompt_skip(app_state.get("clear_confirm_dont_show_again", False))'), 2)
+        self.assertIn('_cc_target == "app_update" and app_state.get("clear_confirm_selection") != "Yes"', MAIN_SRC)
+        self.assertIn('if app_state.get("clear_confirm_target") == "app_update":\n                        _remember_update_prompt_skip(', MAIN_SRC)
+
+    def test_yes_downloads_in_the_background_and_the_bar_is_capped_until_unpacked(self):
+        self._stub_updater()
+        self.state["_update_record"] = {"version": "1.4.3", "url": "u"}
+        self.ns["_open_update_popup"](self.state["_update_record"], True)
+        self.assertTrue(self.ns["_begin_update_install"]())
+        self._wait_staged()
+        self.assertAlmostEqual(self.ns["_seen_mid"], 0.5)
+        self.assertAlmostEqual(self.ns["_seen_end"], 0.97)
+        self.assertEqual(self.state["update_download_progress"], 1.0)
+        self.assertTrue(self.state["update_install_active"])
+        self.assertEqual(self.state["_update_record"]["staged_path"], "/staged")
+        self.assertEqual(len(self.stage_calls), 1)
+        self.assertTrue(self.ns["_begin_update_install"]())
+        self.assertEqual(len(self.stage_calls), 1)
+
+    def test_an_already_staged_update_goes_straight_to_the_full_bar(self):
+        self._stub_updater()
+        self.state["_update_record"] = {"version": "1.4.3", "staged_path": "/staged"}
+        self.assertTrue(self.ns["_begin_update_install"]())
+        self.assertEqual(self.state["update_download_progress"], 1.0)
+        self.assertEqual(self.state["update_install_done_at"], 1000)
+        self.assertEqual(self.stage_calls, [])
+
+    def test_yes_with_no_update_record_does_nothing(self):
+        self._stub_updater()
+        self.assertFalse(self.ns["_begin_update_install"]())
+        self.assertFalse(self.state.get("update_install_active", False))
+
+    def test_the_restart_waits_for_the_full_bar_then_starts_once(self):
+        self._stub_updater()
+        self.state["_update_record"] = {"version": "1.4.3", "staged_path": "/staged"}
+        self.ns["_begin_update_install"]()
+        self.ns["_update_install_tick"](1100)
+        self.assertEqual(self.launch_calls, [])
+        self.ns["_update_install_tick"](1000 + 700)
+        self.ns["_update_install_tick"](1000 + 900)
+        self.assertEqual(len(self.launch_calls), 1)
+        self.assertEqual(self.launch_calls[0][2], ["app.exe", "--relaunched"])
+        self.assertEqual(self.posted, [("event", 256)])
+
+    def test_a_failed_download_shows_the_error_then_closes_the_popup(self):
+        def boom(base, record, progress_callback=None):
+            raise RuntimeError("no network")
+        self._stub_updater(stage=boom)
+        self.ns["_open_update_popup"]({"version": "1.4.3"}, True)
+        self.state["_update_record"] = {"version": "1.4.3", "url": "u"}
+        self.ns["_begin_update_install"]()
+        self._wait_staged()
+        self.assertIn("no network", self.state["update_install_error"])
+        err_at = self.state["update_install_error_at"]
+        self.ns["_update_install_tick"](err_at + 100)
+        self.assertTrue(self.state["show_clear_confirm"])
+        self.ns["_update_install_tick"](err_at + 4000)
+        self.assertFalse(self.state["show_clear_confirm"])
+        self.assertFalse(self.state["update_install_active"])
+        self.assertEqual(self.state["update_install_error"], "")
+
+    def test_a_helper_that_will_not_start_shows_an_error(self):
+        def refuse(*a, **k):
+            raise RuntimeError("helper missing")
+        self._stub_updater(launch=refuse)
+        self.state["_update_record"] = {"version": "1.4.3", "staged_path": "/staged"}
+        self.ns["_begin_update_install"]()
+        self.ns["_update_install_tick"](1700)
+        self.assertIn("helper missing", self.state["update_install_error"])
+        self.assertEqual(self.posted, [])
+
+    def test_the_system_tab_restart_refuses_when_nothing_is_staged(self):
+        self._stub_updater()
+        self.state["_update_record"] = {"version": "1.4.3"}
+        self.assertFalse(self.ns["_launch_staged_update"]())
+        self.assertEqual(self.launch_calls, [])
+
+    def test_the_leftovers_are_gone_and_the_numbers_live_in_the_governor_table(self):
+        for name in ("render_update_download_progress", "show_update_confirm", "update_confirm_shown_at", "update_download_active"):
+            self.assertNotIn(name, MAIN_SRC)
+        for name in ("UPDATE_INSTALL_HOLD_AT_100_MS", "UPDATE_INSTALL_ERROR_SHOW_MS", "UPDATE_INSTALL_DOWNLOAD_CAP"):
+            match = re.search(r"^%s = performance_governor\.%s if performance_governor is not None else (\S+)$" % (name, name), MAIN_SRC, re.M)
+            self.assertIsNotNone(match, name)
+            self.assertEqual(float(match.group(1)), float(getattr(gov, name)))
+
+
+class TestUpdateButtonAndPopupRules(unittest.TestCase):
+    """The owner's update rules: Update Now / Look for Updates / Up to Date on the System button, the popup over the Controls splash, and the Don't show this again box that shows and saves the real choice."""
+
+    def setUp(self):
+        self.saved = []
+        self.logs = []
+
+        class Log:
+            def info(s, *a, **k): outer.logs.append(("info", a))
+            def warning(s, *a, **k): outer.logs.append(("warning", a))
+        outer = self
+        self.ns = {
+            "app_state": {}, "log": Log(),
+            "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: 1000)),
+            "db": types.SimpleNamespace(config={}, save_settings=lambda: self.saved.append(True)),
+        }
+        for name in ("_open_update_popup", "_remember_update_prompt_skip", "_set_update_result"):
+            exec(get_function_source(name), self.ns)
+        self.state = self.ns["app_state"]
+
+    def test_the_box_shows_the_saved_choice_and_unticking_turns_the_boot_prompt_back_on(self):
+        self.ns["_open_update_popup"]({"version": "1.4.4"}, False)
+        self.assertFalse(self.state["clear_confirm_dont_show_again"])
+        self.ns["_remember_update_prompt_skip"](True)
+        self.assertTrue(self.ns["db"].config["update_prompt_skip_confirm"])
+        self.state["show_clear_confirm"] = False
+        self.ns["_open_update_popup"]({"version": "1.4.4"}, False)
+        self.assertTrue(self.state["clear_confirm_dont_show_again"])
+        self.ns["_remember_update_prompt_skip"](False)
+        self.assertFalse(self.ns["db"].config["update_prompt_skip_confirm"])
+        self.assertEqual(self.saved, [True, True])
+        self.ns["_remember_update_prompt_skip"](False)
+        self.assertEqual(self.saved, [True, True])
+        self.state["show_clear_confirm"] = False
+        self.assertTrue(self.ns["_open_update_popup"]({"version": "1.4.4"}, True))
+
+    def test_a_manual_check_that_finds_nothing_says_up_to_date_but_a_quiet_one_does_not(self):
+        self.ns["_set_update_result"]({"available": False, "configured": True, "message": "You are up to date (1.4.3)."}, automatic=True)
+        self.assertFalse(self.state.get("_update_up_to_date", False))
+        self.ns["_set_update_result"]({"available": False, "configured": True, "message": "You are up to date (1.4.3)."}, automatic=False)
+        self.assertTrue(self.state["_update_up_to_date"])
+        self.state["_update_up_to_date"] = False
+        self.ns["_set_update_result"]({"available": False, "configured": False, "message": "Update source is not configured."}, automatic=False)
+        self.assertFalse(self.state["_update_up_to_date"])
+
+    def test_a_found_update_sets_update_now_and_opens_the_popup_and_a_gone_one_clears_it(self):
+        record = {"version": "1.4.4", "url": "u"}
+        self.ns["_set_update_result"]({"available": True, "manifest": record, "message": "Version 1.4.4 is available."}, automatic=True)
+        self.assertTrue(self.state["_update_available"])
+        self.assertFalse(self.state["_update_up_to_date"])
+        self.assertTrue(self.state["show_clear_confirm"])
+        self.assertEqual(self.state["_update_record"], record)
+        self.state["show_clear_confirm"] = False
+        self.ns["_set_update_result"]({"available": False, "configured": True, "message": "You are up to date (1.4.3)."}, automatic=False)
+        self.assertFalse(self.state["_update_available"])
+
+    def test_the_boot_check_and_the_manual_check_both_only_look_and_the_button_follows_the_rules(self):
+        body = re.search(r"def _start_update_check\(.*?\n\n\n", MAIN_SRC, re.S).group(0)
+        self.assertIn("auto_updater.check_for_update(base_dir, config=config)", body)
+        self.assertNotIn("stage_available_update", body)
+        self.assertIn('_open_update_popup(app_state["_update_record"], False)', MAIN_SRC)
+        ui_src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+        self.assertEqual(ui_src.count('"Update Now"'), 2)
+        self.assertEqual(ui_src.count('"Up to Date"'), 2)
+        self.assertNotIn('"Update Available"', ui_src)
+        self.assertIn('"label": "Look for Updates"', ui_src)
+
+    def test_the_update_popup_sits_on_top_of_the_controls_splash_and_its_timer_starts_when_it_first_shows(self):
+        draw = MAIN_SRC.index('app_state.get("clear_confirm_target") == "app_update"):\n        render_controls_splash')
+        popup = MAIN_SRC.index("render_clear_confirm_popup(_popup_target", draw)
+        self.assertLess(draw, popup)
+        self.assertNotIn("elif app_state.get(\"show_splash\", False):\n        render_controls_splash(_overlay_target_for_menu", MAIN_SRC)
+        loading_end = MAIN_SRC.index('print("[TELEMETRY - PART 14] Preloader finished.')
+        timer = MAIN_SRC.index('app_state["clear_confirm_shown_at"] = _popup_now', loading_end)
+        self.assertLess(timer - loading_end, 1500)
+        self.assertIn('app_state["last_input_time"] = _popup_now', MAIN_SRC[loading_end:timer + 200])
+
+
+class _FakeRegistry:
+    """A stand-in for winreg that keeps values in memory and records every open for writing and every write."""
+
+    HKEY_CURRENT_USER = "HKCU"
+    KEY_READ = 1
+    KEY_SET_VALUE = 2
+    REG_SZ = 1
+
+    def __init__(self, values=None, keys=None):
+        self.values = dict(values or {})
+        self.keys = set(keys if keys is not None else [path for path, _name in self.values])
+        self.write_opens = []
+        self.writes = []
+
+    def OpenKey(self, hive, path, reserved=0, access=1):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        if access & self.KEY_SET_VALUE:
+            self.write_opens.append(path)
+        registry = self
+
+        class _Handle:
+            def __enter__(self_inner):
+                return (path, registry)
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        return _Handle()
+
+    def QueryValueEx(self, key, name):
+        path = key[0]
+        if (path, name) not in self.values:
+            raise FileNotFoundError(name)
+        return self.values[(path, name)], self.REG_SZ
+
+    def SetValueEx(self, key, name, reserved, kind, value):
+        self.writes.append(("set", key[0], name, value))
+        self.values[(key[0], name)] = value
+
+    def DeleteValue(self, key, name):
+        if (key[0], name) not in self.values:
+            raise FileNotFoundError(name)
+        self.writes.append(("delete", key[0], name))
+        del self.values[(key[0], name)]
+
+
+class TestShellModeStaysOff(unittest.TestCase):
+    """retro_tv_emulator._set_start_on_boot: shell mode writes to the registry only when the owner turns it on, and turning it off writes only when the registry holds this app's own entry."""
+
+    SHELL = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    OURS = '"C:\\Retro TV\\Retro TV Emulator.exe" --as-shell'
+
+    def _call(self, enabled, registry):
+        messages = []
+        stub_log = types.SimpleNamespace(
+            info=lambda *a, **k: messages.append(("info", a)),
+            warning=lambda *a, **k: messages.append(("warning", a)),
+        )
+        ns = {
+            "os": types.SimpleNamespace(name="nt", path=os.path),
+            "sys": types.SimpleNamespace(frozen=True, executable="C:\\Retro TV\\Retro TV Emulator.exe"),
+            "log": stub_log,
+            "_STARTUP_REG_PATH": self.SHELL,
+            "_STARTUP_REG_NAME": "Shell",
+            "_DEFAULT_SHELL": "explorer.exe",
+            "_LEGACY_STARTUP_REG_PATH": self.RUN,
+            "_LEGACY_STARTUP_REG_NAME": "RetroTVEmulator",
+            "__file__": "retro_tv_emulator.py",
+        }
+        for name in ("_get_startup_command", "_read_registry_text", "_set_start_on_boot"):
+            exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            result = ns["_set_start_on_boot"](enabled)
+        return result, messages
+
+    def test_never_enabled_pc_is_not_written_when_shell_mode_is_off(self):
+        registry = _FakeRegistry(keys=[self.SHELL, self.RUN])
+        result, _messages = self._call(False, registry)
+        self.assertTrue(result)
+        self.assertEqual(registry.write_opens, [])
+        self.assertEqual(registry.writes, [])
+
+    def test_missing_registry_keys_are_not_written_or_created(self):
+        registry = _FakeRegistry(keys=[])
+        result, _messages = self._call(False, registry)
+        self.assertTrue(result)
+        self.assertEqual(registry.write_opens, [])
+        self.assertEqual(registry.writes, [])
+
+    def test_the_normal_windows_shell_is_left_alone_when_shell_mode_is_off(self):
+        registry = _FakeRegistry({(self.SHELL, "Shell"): "explorer.exe"}, keys=[self.SHELL, self.RUN])
+        self._call(False, registry)
+        self.assertEqual(registry.write_opens, [])
+        self.assertEqual(registry.values[(self.SHELL, "Shell")], "explorer.exe")
+
+    def test_another_programs_shell_is_left_alone_when_shell_mode_is_off(self):
+        registry = _FakeRegistry({(self.SHELL, "Shell"): "C:\\Other\\kiosk.exe"}, keys=[self.SHELL, self.RUN])
+        self._call(False, registry)
+        self.assertEqual(registry.write_opens, [])
+        self.assertEqual(registry.values[(self.SHELL, "Shell")], "C:\\Other\\kiosk.exe")
+
+    def test_turning_it_off_puts_the_normal_shell_back_when_the_entry_is_ours(self):
+        registry = _FakeRegistry({(self.SHELL, "Shell"): self.OURS}, keys=[self.SHELL, self.RUN])
+        result, _messages = self._call(False, registry)
+        self.assertTrue(result)
+        self.assertEqual(registry.values[(self.SHELL, "Shell")], "explorer.exe")
+
+    def test_an_old_run_entry_is_removed_when_off_and_the_shell_is_not_touched(self):
+        registry = _FakeRegistry({(self.RUN, "RetroTVEmulator"): "old"}, keys=[self.SHELL, self.RUN])
+        self._call(False, registry)
+        self.assertNotIn((self.RUN, "RetroTVEmulator"), registry.values)
+        self.assertEqual(registry.write_opens, [self.RUN])
+        self.assertNotIn((self.SHELL, "Shell"), registry.values)
+
+    def test_turning_it_on_writes_the_shell_entry_and_removes_the_old_run_entry(self):
+        registry = _FakeRegistry({(self.RUN, "RetroTVEmulator"): "old"}, keys=[self.SHELL, self.RUN])
+        result, _messages = self._call(True, registry)
+        self.assertTrue(result)
+        self.assertIn("--as-shell", registry.values[(self.SHELL, "Shell")])
+        self.assertNotIn((self.RUN, "RetroTVEmulator"), registry.values)
+
+    def test_a_failed_write_is_logged_and_reported(self):
+        registry = _FakeRegistry(keys=[self.RUN])
+        result, messages = self._call(True, registry)
+        self.assertFalse(result)
+        self.assertTrue(any(kind == "warning" for kind, _args in messages))
+
+    def test_the_setting_is_off_by_default_everywhere(self):
+        self.assertIn('"start_on_boot": False,', MAIN_SRC)
+        for path in (os.path.join(ROOT, "assets", "media.py"), os.path.join(ROOT, "media.py")):
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    self.assertNotIn('"start_on_boot": True', handle.read())
+                break
+
+    def test_only_the_owners_choices_can_turn_it_on(self):
+        calls = []
+        for node in ast.walk(MAIN_TREE):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "_set_start_on_boot"):
+                calls.append((node.lineno, node.args[0].value if isinstance(node.args[0], ast.Constant) else None))
+        enable_lines = [line for line, value in calls if value is True]
+        self.assertEqual(len(enable_lines), 2, "the boot re-apply and the confirmed Advanced Settings choice are the only two places that turn it on")
+        lines = MAIN_SRC.splitlines()
+        boot_gate = "".join(lines[enable_lines[0] - 3:enable_lines[0] - 1])
+        self.assertIn('db.config.get("start_on_boot", False)', boot_gate)
+        confirm_gate = "".join(lines[enable_lines[1] - 3:enable_lines[1] - 1])
+        self.assertIn('"boot_on_start"', confirm_gate)
+
+    def test_reset_settings_only_asks_for_off(self):
+        source = get_function_source("_execute_system_reset_all_settings")
+        self.assertIn("_set_start_on_boot(False)", source)
+        self.assertNotIn("_set_start_on_boot(True)", source)
+
+
+class TestUpdateFromGitHub(unittest.TestCase):
+    """auto_updater: the update source is the project's GitHub Releases (pre-releases included); the zip with the highest V1.2.3 number in its name is offered when it is newer than the installed build, and the download is checked against the SHA-256 GitHub reports for that file."""
+
+    REPO = "StevenCLewis111/RetroTVEmulator"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.u = _load_updater_script("auto_updater")
+
+    def _serve(self, releases_for, payloads):
+        import http.server
+        requests = []
+
+        class Fake(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                requests.append(self.path)
+                if self.path.startswith("/repos/%s/releases" % TestUpdateFromGitHub.REPO):
+                    body = json.dumps(releases_for(self.server)).encode()
+                elif self.path in payloads:
+                    body = payloads[self.path]
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, "http://127.0.0.1:%d" % server.server_address[1], requests
+
+    def _zip_bytes(self, tmp, exe_name):
+        import zipfile
+        path = os.path.join(tmp, "pkg.zip")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(exe_name, "exe")
+            archive.writestr("_internal/lib.dll", "lib")
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def test_the_highest_zip_across_releases_and_prereleases_is_offered_checked_and_staged(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._zip_bytes(tmp, "Retro TV Emulator (Alpha Build).exe")
+            sha = hashlib.sha256(data).hexdigest()
+
+            def releases(server):
+                base = "http://127.0.0.1:%d" % server.server_address[1]
+                return [
+                    {"tag_name": "V1.0.1", "draft": False, "prerelease": True, "published_at": "2026-10-28T09:00:00Z", "body": "second alpha",
+                     "assets": [
+                         {"name": "notes.txt", "state": "uploaded", "digest": "sha256:" + "0" * 64, "browser_download_url": base + "/dl/notes.txt"},
+                         {"name": "Retro.TV.Emulator.V1.0.1.zip", "state": "uploaded", "digest": "sha256:" + sha, "browser_download_url": base + "/dl/v101.zip"},
+                     ]},
+                    {"tag_name": "V9.9.9", "draft": True, "prerelease": False, "published_at": "2026-10-28T10:00:00Z",
+                     "assets": [{"name": "Retro.TV.Emulator.V9.9.9.zip", "state": "uploaded", "digest": "sha256:" + "1" * 64, "browser_download_url": base + "/dl/v999.zip"}]},
+                    {"tag_name": "AlphaBuild", "draft": False, "prerelease": True, "published_at": "2026-10-28T07:44:00Z",
+                     "assets": [{"name": "Retro TV Emulator (Alpha Build).zip", "state": "uploaded", "digest": "sha256:" + "2" * 64, "browser_download_url": base + "/dl/old.zip"}]},
+                    {"tag_name": "V1.0.0", "draft": False, "prerelease": False, "published_at": "2026-10-20T09:00:00Z",
+                     "assets": [{"name": "Retro.TV.Emulator.V1.0.0.zip", "state": "uploaded", "digest": "sha256:" + "3" * 64, "browser_download_url": base + "/dl/v100.zip"}]},
+                ]
+
+            server, base, requests = self._serve(releases, {"/dl/v101.zip": data})
+            try:
+                install = os.path.join(tmp, "install")
+                os.makedirs(install)
+                with open(os.path.join(install, "version.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"version": "1.0.0"}, handle)
+                with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": base}):
+                    result = self.u.check_for_update(install, config={})
+                    self.assertTrue(result["available"])
+                    self.assertEqual(result["manifest"]["version"], "1.0.1")
+                    self.assertEqual(result["manifest"]["package_name"], "Retro.TV.Emulator.V1.0.1.zip")
+                    self.assertEqual(result["manifest"]["sha256"], sha)
+                    self.assertEqual(result["manifest"]["notes"], "second alpha")
+                    self.assertTrue(any(path.startswith("/repos/%s/releases" % self.REPO) for path in requests))
+                    seen = []
+                    record = self.u.stage_update(install, result["manifest"], progress_callback=lambda done, total: seen.append((done, total)))
+                    self.assertTrue(os.path.isfile(os.path.join(record["staged_path"], "Retro TV Emulator (Alpha Build).exe")))
+                    self.assertEqual(record["version"], "1.0.1")
+                    self.assertNotIn("sha256", record)
+                    self.assertNotIn("md5", record)
+                    self.assertTrue(seen and seen[-1][0] == seen[-1][1] > 0)
+                    with self.assertRaises(self.u.UpdateError):
+                        self.u.stage_update(install, dict(result["manifest"], sha256="4" * 64))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_the_same_or_a_lower_posted_number_is_not_offered(self):
+        def releases(server):
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            return [{"tag_name": "V1.0.1", "draft": False, "prerelease": True, "published_at": "2026-10-28T09:00:00Z",
+                     "assets": [{"name": "Retro.TV.Emulator.V1.0.1.zip", "state": "uploaded", "digest": "sha256:" + "a" * 64, "browser_download_url": base + "/dl/x.zip"}]}]
+        server, base, _requests = self._serve(releases, {})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                for installed in ("1.0.1", "1.0.2", "1.1.0"):
+                    with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": base, "RETRO_TV_VERSION": installed}):
+                        result = self.u.check_for_update(tmp, config={})
+                    self.assertFalse(result["available"], installed)
+                    self.assertIn("up to date", result["message"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_number_compares_as_a_number_not_as_text(self):
+        def releases(server):
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            return [{"tag_name": "V1.10.0", "draft": False, "prerelease": False, "published_at": "2026-10-28T09:00:00Z",
+                     "assets": [{"name": "Retro.TV.Emulator.V1.10.0.zip", "state": "uploaded", "digest": "sha256:" + "a" * 64, "browser_download_url": base + "/dl/x.zip"}]}]
+        server, base, _requests = self._serve(releases, {})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": base, "RETRO_TV_VERSION": "1.9.0"}):
+                    self.assertTrue(self.u.check_for_update(tmp, config={})["available"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_build_with_no_stamp_counts_as_zero_and_is_offered_the_first_zip(self):
+        def releases(server):
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            return [{"tag_name": "V1.0.0", "draft": False, "prerelease": True, "published_at": "2026-10-28T09:00:00Z",
+                     "assets": [{"name": "Retro.TV.Emulator.V1.0.0.zip", "state": "uploaded", "digest": "sha256:" + "a" * 64, "browser_download_url": base + "/dl/x.zip"}]}]
+        server, base, _requests = self._serve(releases, {})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": base}):
+                    with mock.patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("RETRO_TV_VERSION", None)
+                        self.assertEqual(self.u.current_version(tmp, {}), "0.0.0")
+                        self.assertTrue(self.u.check_for_update(tmp, config={})["available"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_zip_with_no_number_in_its_name_is_never_offered(self):
+        def releases(server):
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            return [{"tag_name": "AlphaBuild", "draft": False, "prerelease": True, "published_at": "2026-10-28T07:44:00Z",
+                     "assets": [{"name": "Retro TV Emulator (Alpha Build).zip", "state": "uploaded", "digest": "sha256:" + "a" * 64, "browser_download_url": base + "/dl/x.zip"}]}]
+        server, base, _requests = self._serve(releases, {})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": base, "RETRO_TV_VERSION": "1.0.0"}):
+                    result = self.u.check_for_update(tmp, config={})
+            self.assertFalse(result["available"])
+            self.assertNotIn("manifest", result)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_zip_that_github_has_no_checksum_for_is_refused_with_a_clear_message(self):
+        def releases(server):
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            return [{"tag_name": "V1.0.1", "draft": False, "prerelease": True, "published_at": "2026-10-28T09:00:00Z",
+                     "assets": [{"name": "Retro.TV.Emulator.V1.0.1.zip", "state": "uploaded", "digest": None, "browser_download_url": base + "/dl/x.zip"}]}]
+        server, base, _requests = self._serve(releases, {})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": base, "RETRO_TV_VERSION": "1.0.0"}):
+                    with self.assertRaises(self.u.UpdateError) as caught:
+                        self.u.check_for_update(tmp, config={})
+            self.assertIn("SHA-256", str(caught.exception))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_unreachable_or_rate_limited_github_is_a_clear_error_not_a_silent_fallback(self):
+        import http.server
+
+        class Limited(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(403)
+                self.end_headers()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Limited)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.dict(os.environ, {"RETRO_TV_UPDATE_GITHUB_API_BASE": "http://127.0.0.1:%d" % server.server_address[1], "RETRO_TV_VERSION": "1.0.0"}):
+                    with self.assertRaises(self.u.UpdateError):
+                        self.u.check_for_update(tmp, config={})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_bad_repository_name_is_refused_before_any_request(self):
+        for bad in ("", "no-slash", "a/b/c", "owner/na me", "owner/name?x=1"):
+            with self.assertRaises(self.u.UpdateError):
+                self.u.check_github_for_update("1.0.0", bad)
+
+    def test_the_default_source_is_this_projects_github_and_a_blank_repository_means_not_configured(self):
+        self.assertEqual(self.u.UPDATE_GITHUB_REPO, "StevenCLewis111/RetroTVEmulator")
+        self.assertEqual(self.u.github_settings({})[0], self.REPO)
+        self.assertEqual(self.u.github_settings({"update_github_repo": "a/b"})[0], "a/b")
+        self.assertTrue(self.u.update_source_configured({}))
+        with mock.patch.object(self.u, "UPDATE_GITHUB_REPO", ""):
+            self.assertEqual(self.u.github_settings({})[0], "")
+            self.assertFalse(self.u.update_source_configured({}))
+            result = self.u.check_for_update(tempfile.gettempdir(), config={})
+        self.assertFalse(result["configured"])
+        self.assertIn("not configured", result["message"])
+
+    def test_a_release_zip_is_recognised_by_the_number_in_its_name(self):
+        v = self.u.version_from_zip_name
+        self.assertEqual(v("Retro TV Emulator Alpha V1.0.1.zip"), "1.0.1")
+        self.assertEqual(v("Retro.TV.Emulator.Alpha.V1.0.1.zip"), "1.0.1")
+        self.assertEqual(v("retro tv emulator v1.10.0.ZIP"), "1.10.0")
+        self.assertIsNone(v("Retro TV Emulator V1.2.3.rar"))
+        self.assertIsNone(v("notes.zip"))
+        self.assertIsNone(v(""))
+
+    def test_the_installed_number_comes_from_the_override_then_the_stamp_then_the_exe_name(self):
+        u = self.u
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RETRO_TV_VERSION", None)
+                with mock.patch.object(u.sys, "executable", r"C:\x\Retro TV Emulator Alpha V1.0.4.exe"):
+                    self.assertEqual(u.current_version(tmp, {}), "1.0.4")
+                    with open(os.path.join(tmp, "version.json"), "w", encoding="utf-8") as handle:
+                        json.dump({"version": "1.0.5"}, handle)
+                    self.assertEqual(u.current_version(tmp, {}), "1.0.5")
+                    with open(os.path.join(tmp, "version.json"), "w", encoding="utf-8") as handle:
+                        json.dump({"version": "Alpha Build"}, handle)
+                    self.assertEqual(u.current_version(tmp, {}), "1.0.4")
+                with mock.patch.dict(os.environ, {"RETRO_TV_VERSION": "2.0.0"}):
+                    self.assertEqual(u.current_version(tmp, {}), "2.0.0")
+
+    def test_nothing_from_the_old_drive_manifest_or_md5_routes_is_left(self):
+        for name in ("check_drive_for_update", "validate_drive_record", "drive_settings", "manifest_url",
+                     "installed_package", "package_is_newer", "_redact", "stage_available_update",
+                     "DEFAULT_MANIFEST_URL", "UPDATE_DRIVE_FOLDER_ID", "UPDATE_DRIVE_API_KEY"):
+            self.assertFalse(hasattr(self.u, name), name)
+        self.assertNotIn("md5", inspect.getsource(self.u).lower())
+
+    def test_the_helper_stamps_the_new_number_so_the_next_check_reads_it(self):
+        helper = _load_updater_script("update_helper")
+        with tempfile.TemporaryDirectory() as tmp:
+            helper._write_stamp(tmp, "1.0.1")
+            with open(os.path.join(tmp, "version.json"), encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), {"version": "1.0.1"})
+            self.assertEqual(self.u.current_version(tmp, {}), "1.0.1")
+
+
+class TestServerToggleGreyedOut(unittest.TestCase):
+    """Advanced Settings: the Server Mode toggle is greyed out and cannot be changed, but the row can still be reached with the keys and controller."""
+
+    def test_the_switch_is_off_and_exported(self):
+        self.assertIs(ui.SERVER_TOGGLE_ENABLED, False)
+        self.assertIn("SERVER_TOGGLE_ENABLED", ui.__all__)
+
+    def test_pressing_the_row_changes_nothing_while_the_switch_is_off(self):
+        body = re.search(r'_as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED:.*?elif _as_row_id == "server_menu_open":', MAIN_SRC, re.S).group(0)
+        blocked = body.index('elif _as_row_id == "server_option" and not SERVER_TOGGLE_ENABLED:')
+        changes = body.index('db.config["server_mode_enabled"] = not')
+        self.assertLess(blocked, changes)
+        self.assertIn("pass", body[blocked:changes])
+
+    def test_the_row_is_drawn_grey_and_still_gets_its_focus_border(self):
+        src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+        self.assertIn('_as_disabled_row = (_as_row_id == "server_option" and not (UPDATER_AND_SERVER_FEATURES_ENABLED and SERVER_TOGGLE_ENABLED))', src)
+        draw = src[src.index("_as_disabled_row = ("):]
+        self.assertLess(draw.index("_as_disabled_row"), draw.index("(32, 32, 40) if _as_disabled_row"))
+        before = src[:src.index("_as_disabled_row = (")]
+        self.assertIn("if _as_focused:\n                    _aa_rounded_rect(menu_canvas, NEON_GREEN", before[-400:])
 
 
 if __name__ == "__main__":
