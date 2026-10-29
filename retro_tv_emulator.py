@@ -1165,9 +1165,72 @@ def _get_channel_visualizer_style(ch_conf):
     return (ch_conf or {}).get("visualizer_style", "Random")
 
 
+# ============================================================================
+# SECTION: Start by the update helper
+# ============================================================================
+
+
+def _parent_process_name():
+    """The file name of this process's parent, read with the Windows process snapshot; empty when it cannot be read."""
+    if sys.platform != "win32":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _snap = _k32.CreateToolhelp32Snapshot(0x2, 0)
+    if not _snap or _snap == wintypes.HANDLE(-1).value:
+        return ""
+    try:
+        _entry = _PROCESSENTRY32W()
+        _entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        _names, _parent_pid, _me = {}, None, os.getpid()
+        _ok = _k32.Process32FirstW(_snap, ctypes.byref(_entry))
+        while _ok:
+            _names[_entry.th32ProcessID] = _entry.szExeFile
+            if _entry.th32ProcessID == _me:
+                _parent_pid = _entry.th32ParentProcessID
+            _ok = _k32.Process32NextW(_snap, ctypes.byref(_entry))
+        return (_names.get(_parent_pid) or "") if _parent_pid else ""
+    finally:
+        _k32.CloseHandle(_snap)
+
+
+def _started_by_update_helper():
+    """True when this process was started by RetroTVUpdateHelper.exe (or update_helper.py in a source run)."""
+    try:
+        _pname = _parent_process_name().lower()
+        if _pname == "retrotvupdatehelper.exe":
+            return True
+        if _pname.startswith("python"):
+            try:
+                import psutil as _psutil
+                return any(os.path.basename(str(_a)).lower() == "update_helper.py" for _a in _psutil.Process(os.getpid()).parent().cmdline())
+            except Exception:
+                return False
+    except Exception as _parent_err:
+        log.warning(f"[FAILURE] _started_by_update_helper: could not read the parent process: {_parent_err}")
+    return False
+
+
+_STARTED_BY_UPDATE_HELPER = _started_by_update_helper()
+
+
 def _read_boot_fullscreen_pref():
-    # WARNING: an auto-relaunch (crash, heartbeat stall, post-update) always boots fullscreen, whatever kiosk_mode_enabled / start_on_boot say.
-    if _IS_RELAUNCH:
+    # WARNING: an auto-relaunch (crash, heartbeat stall) boots fullscreen, but a start by the update helper never does, so an update from any older build still follows the saved kiosk, shell and start-on-boot settings.
+    if _IS_RELAUNCH and not _STARTED_BY_UPDATE_HELPER:
         return True
     try:
         _cfg_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "retro_config.json")
@@ -1649,6 +1712,7 @@ def _frame_path_note(gpu_frame, presented, draw_ms, present_ms, size, scanlines_
 # ============================================================================
 
 _BOOT_FULLSCREEN = _read_boot_fullscreen_pref()
+print(f"[BOOT] start flags: relaunched_flag={_IS_RELAUNCH} started_by_update_helper={_STARTED_BY_UPDATE_HELPER} fullscreen={_BOOT_FULLSCREEN}", flush=True)
 print(f"Boot display mode: {'FULLSCREEN' if _BOOT_FULLSCREEN else 'WINDOWED'} "
       f"(kiosk_mode_enabled/start_on_boot based). at", time.time(), flush=True)
 
@@ -8108,7 +8172,14 @@ def _ensure_ch03_menu_music_seeded():
     _existing_music = db.config.get("ch03_menu_music", [])
     if _existing_music:
         _gain_fixed = False
+        _default_track = os.path.join(resolve_main_dir(), "audio", "Game Music", "gamemusic.mp3")
         for _entry in _existing_music:
+            # WARNING: an update renames the install folder, which leaves the saved path of the shipped track pointing at the old folder; only that one dead entry is pointed at this install's copy, every other setting is left as saved.
+            _saved_path = _entry.get("path", "") if isinstance(_entry, dict) else ""
+            if (_saved_path and not os.path.isfile(_saved_path) and os.path.isfile(_default_track)
+                    and _saved_path.replace("/", "\\").lower().endswith("\\main\\audio\\game music\\gamemusic.mp3")):
+                _entry["path"] = _default_track
+                _gain_fixed = True
             if (isinstance(_entry, dict) and _ch03_entry_is_default_music(_entry)
                     and abs(float(_entry.get("gain", 0) or 0) - _CH03_DEFAULT_MUSIC_GAIN_LEGACY) < 1e-9):
                 _entry["gain"] = _CH03_DEFAULT_MUSIC_GAIN_PRECACHED
@@ -13744,10 +13815,12 @@ def initialize_vlc_on_demand():
             vlc_engine = VLCEngineWrapper(engine_label="main")
             
             log.info("[DEBUG VLC MASTER] Core framework ready and operational.")
-            try:
-                sys.stdout.flush()
-            except Exception as _swallowed_error:
-                _log_swallowed("initialize_vlc_on_demand: sys.stdout.flush()", _swallowed_error)
+            # WARNING: a windowed build (no console) has sys.stdout set to None, so the flush is skipped there; the handler flushes below are the ones that matter for the log file.
+            if sys.stdout is not None:
+                try:
+                    sys.stdout.flush()
+                except Exception as _swallowed_error:
+                    _log_swallowed("initialize_vlc_on_demand: sys.stdout.flush()", _swallowed_error)
             for _h in logging.getLogger().handlers:
                 try:
                     _h.flush()
@@ -22743,11 +22816,14 @@ RELAUNCH_WINDOW_SEC = 600
 # ============================================================================
 
 
-def _build_relaunch_command():
+def _build_relaunch_command(after_update=False):
     if getattr(sys, "frozen", False):
         _cmd = [sys.executable] + sys.argv[1:]
     else:
         _cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+    if after_update:
+        # WARNING: a restart after an update is a normal start, so it carries no --relaunched flag (that flag forces fullscreen); the saved kiosk, shell and start-on-boot settings decide the display mode.
+        return [_arg for _arg in _cmd if _arg != "--relaunched"]
     if "--relaunched" not in _cmd:
         _cmd.append("--relaunched")
     return _cmd
@@ -22825,7 +22901,7 @@ def _launch_staged_update():
         helper_pid = auto_updater.launch_staged_update(
             _update_base_dir(),
             record,
-            _build_relaunch_command(),
+            _build_relaunch_command(after_update=True),
             parent_pid=os.getpid(),
         )
         app_state["_update_status"] = f"Installing update (helper {helper_pid})..."

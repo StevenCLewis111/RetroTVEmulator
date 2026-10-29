@@ -33,6 +33,7 @@ import builtins
 import collections
 import copy
 import json
+import logging
 import contextlib
 import ctypes
 import datetime
@@ -52,6 +53,7 @@ import time
 import tokenize
 import types
 import unittest
+import zipfile
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -20238,7 +20240,7 @@ class TestUpdatePopupAndInstallBar(unittest.TestCase):
             "db": types.SimpleNamespace(config={}, save_settings=lambda: self.saved.append(True)),
             "UPDATE_INSTALL_HOLD_AT_100_MS": 700, "UPDATE_INSTALL_ERROR_SHOW_MS": 4000, "UPDATE_INSTALL_DOWNLOAD_CAP": 0.97,
             "_update_base_dir": lambda: "/base",
-            "_build_relaunch_command": lambda: ["app.exe", "--relaunched"],
+            "_build_relaunch_command": lambda after_update=False: ["app.exe"] if after_update else ["app.exe", "--relaunched"],
         }
         for name in ("_open_update_popup", "_remember_update_prompt_skip", "_close_update_popup",
                      "_begin_update_install", "_update_install_tick", "_launch_staged_update"):
@@ -20327,7 +20329,7 @@ class TestUpdatePopupAndInstallBar(unittest.TestCase):
         self.ns["_update_install_tick"](1000 + 700)
         self.ns["_update_install_tick"](1000 + 900)
         self.assertEqual(len(self.launch_calls), 1)
-        self.assertEqual(self.launch_calls[0][2], ["app.exe", "--relaunched"])
+        self.assertEqual(self.launch_calls[0][2], ["app.exe"])
         self.assertEqual(self.posted, [("event", 256)])
 
     def test_a_failed_download_shows_the_error_then_closes_the_popup(self):
@@ -20881,6 +20883,291 @@ class TestServerToggleGreyedOut(unittest.TestCase):
         self.assertLess(draw.index("_as_disabled_row"), draw.index("(32, 32, 40) if _as_disabled_row"))
         before = src[:src.index("_as_disabled_row = (")]
         self.assertIn("if _as_focused:\n                    _aa_rounded_rect(menu_canvas, NEON_GREEN", before[-400:])
+
+
+class TestUpdateLongPaths(unittest.TestCase):
+    """Updates must unpack, copy and clean up through extended-length Windows paths, because the staged folder plus the whisper model-cache names pass 260 characters (WinError 3 in the owner's log)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.u = _load_updater_script("auto_updater")
+        cls.h = _load_updater_script("update_helper")
+
+    def test_a_windows_path_gets_the_extended_prefix_once(self):
+        for module in (self.u, self.h):
+            self.assertEqual(module._extended("C:\\Users\\steve\\a"), "\\\\?\\C:\\Users\\steve\\a")
+            self.assertEqual(module._extended("\\\\?\\C:\\Users\\steve\\a"), "\\\\?\\C:\\Users\\steve\\a")
+            self.assertEqual(module._extended("\\\\nas\\share\\a"), "\\\\?\\UNC\\nas\\share\\a")
+
+    def test_other_systems_keep_their_paths(self):
+        if os.name != "nt":
+            self.assertEqual(self.u._long("/tmp/x"), "/tmp/x")
+            self.assertEqual(self.h._long("/tmp/x"), "/tmp/x")
+
+    def test_a_deep_package_unpacks_every_file_through_the_long_path_form(self):
+        u = self.u
+        deep = "Retro TV Emulator V1.0.1/_internal/main/models/whisper/models--Systran--faster-whisper-base.en/snapshots/" + "3" * 40 + "/model.bin"
+        with tempfile.TemporaryDirectory() as tmp:
+            package = os.path.join(tmp, "p.zip")
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("Retro TV Emulator V1.0.1/Retro TV Emulator V1.0.1.exe", "exe")
+                archive.writestr("Retro TV Emulator V1.0.1/_internal/empty_dir/", "")
+                archive.writestr(deep, "model")
+            stage = os.path.join(tmp, "payload")
+            os.makedirs(stage)
+            used = []
+            real_long = u._long
+            with mock.patch.object(u, "_long", side_effect=lambda value: (used.append(value), real_long(value))[1]):
+                root = u._extract_package(package, stage)
+            self.assertEqual(os.path.basename(root), "Retro TV Emulator V1.0.1")
+            self.assertTrue(any(value.endswith("model.bin") for value in used))
+            self.assertEqual(open(os.path.join(root, *deep.split("/")[1:]), encoding="utf-8").read(), "model")
+            self.assertTrue(os.path.isdir(os.path.join(root, "_internal", "empty_dir")))
+            self.assertEqual(open(os.path.join(root, "Retro TV Emulator V1.0.1.exe"), encoding="utf-8").read(), "exe")
+
+    def test_an_unsafe_package_is_still_refused(self):
+        u = self.u
+        with tempfile.TemporaryDirectory() as tmp:
+            package = os.path.join(tmp, "p.zip")
+            with zipfile.ZipFile(package, "w") as archive:
+                archive.writestr("../escape.txt", "x")
+            os.makedirs(os.path.join(tmp, "payload"))
+            with self.assertRaises(u.UpdateError):
+                u._extract_package(package, os.path.join(tmp, "payload"))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "escape.txt")))
+
+    def test_the_helper_reads_copies_and_cleans_up_through_the_long_path_form(self):
+        h = self.h
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = os.path.join(tmp, "work", "payload")
+            install = os.path.join(tmp, "install")
+            os.makedirs(os.path.join(staged, "_internal", "x"))
+            os.makedirs(install)
+            with open(os.path.join(staged, "_internal", "x", "a.bin"), "w", encoding="utf-8") as handle:
+                handle.write("a")
+            used = []
+            real_long = h._long
+            with mock.patch.object(h, "_long", side_effect=lambda value: (used.append(value), real_long(value))[1]):
+                files = h._payload_files(staged, install)
+                backup_dir, copied, absent = h._backup_targets(install, files)
+                h._apply_payload(install, files)
+                shutil.rmtree(backup_dir, ignore_errors=True)
+            self.assertEqual([relative for _source, relative in files], [os.path.join("_internal", "x", "a.bin")])
+            self.assertEqual(absent, [os.path.join("_internal", "x", "a.bin")])
+            self.assertTrue(os.path.isfile(os.path.join(install, "_internal", "x", "a.bin")))
+            self.assertIn(staged, used)
+            self.assertTrue(any(value.endswith("a.bin") for value in used))
+
+
+class TestWindowedBuildHasNoStdout(unittest.TestCase):
+    """A windowed build has sys.stdout = None; the VLC start-up must not log a failure for flushing it."""
+
+    def test_the_stdout_flush_is_skipped_when_there_is_no_stdout(self):
+        start = MAIN_SRC.index("def initialize_vlc_on_demand")
+        block = MAIN_SRC[start:MAIN_SRC.index("sys.stdout.flush()", start)]
+        self.assertTrue(block.rstrip().endswith("if sys.stdout is not None:\n                try:"))
+
+
+class TestUpdateRenamesInstallFolder(unittest.TestCase):
+    """update_helper: the install folder takes the new version in its name, the saved settings are never written, and a failed start puts everything back."""
+
+    OLD_DIR = "Retro TV Emulator (Alpha Build) V1.0.0"
+    NEW_DIR = "Retro TV Emulator (Alpha Build) V1.0.1"
+    OLD_EXE = "Retro TV Emulator (Alpha Build) V1.0.0.exe"
+    NEW_EXE = "Retro TV Emulator (Alpha Build) V1.0.1.exe"
+    CONFIG = '{"config": {"kiosk_mode_enabled": false, "start_on_boot": false}}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.h = _load_updater_script("update_helper")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rtv-rename-test-")
+        self.install = os.path.join(self.tmp, self.OLD_DIR)
+        self.staged = os.path.join(self.tmp, self.OLD_DIR, ".retro_tv_updates", "download-x", "payload", self.NEW_DIR)
+        self._write(self.install, self.OLD_EXE, "old exe")
+        self._write(self.install, "retro_config.json", self.CONFIG)
+        self._write(self.install, os.path.join("_internal", "lib.dll"), "old lib")
+        self._write(self.staged, self.NEW_EXE, "new exe")
+        self._write(self.staged, "retro_config.json", '{"config": {"kiosk_mode_enabled": true}}')
+        self._write(self.staged, os.path.join("_internal", "retro_config.json"), '{"config": {"start_on_boot": true}}')
+        self._write(self.staged, os.path.join("_internal", "lib.dll"), "new lib")
+        self.h.HEALTH_CHECK_SECONDS = 0.6
+        self.calls = []
+
+    def tearDown(self):
+        self.h._close_log()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, folder, name, text):
+        path = os.path.join(folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def _run(self, exit_codes, version="1.0.1"):
+        codes = list(exit_codes)
+        meta = os.path.join(self.install, ".retro_tv_updates", "pending_update.json")
+        os.makedirs(os.path.dirname(meta), exist_ok=True)
+        with open(meta, "w", encoding="utf-8") as handle:
+            json.dump({"install_dir": self.install, "staged_path": self.staged, "parent_pid": 0, "version": version,
+                       "relaunch_command": [os.path.join(self.install, self.OLD_EXE)]}, handle)
+
+        def fake_popen(command, **kwargs):
+            self.calls.append((list(command), kwargs.get("cwd")))
+            return _FakeProcess(codes.pop(0) if codes else None)
+        self.h._close_log()
+        with mock.patch.object(self.h.subprocess, "Popen", fake_popen):
+            try:
+                return self.h.apply_update(meta)
+            finally:
+                self.h._close_log()
+
+    def test_the_folder_name_takes_the_new_version(self):
+        self.assertEqual(self._run([None]), 0)
+        new_dir = os.path.join(self.tmp, self.NEW_DIR)
+        self.assertFalse(os.path.exists(self.install))
+        self.assertTrue(os.path.isfile(os.path.join(new_dir, self.NEW_EXE)))
+        self.assertFalse(os.path.exists(os.path.join(new_dir, self.OLD_EXE)))
+        self.assertEqual(self.calls[0], ([os.path.join(new_dir, self.NEW_EXE)], new_dir))
+        self.assertEqual(json.load(open(os.path.join(new_dir, "version.json"), encoding="utf-8")), {"version": "1.0.1"})
+        self.assertFalse(os.path.exists(os.path.join(new_dir, ".retro_tv_updates", "download-x", "payload")))
+
+    def test_the_saved_settings_are_never_overwritten(self):
+        self._run([None])
+        new_dir = os.path.join(self.tmp, self.NEW_DIR)
+        self.assertEqual(open(os.path.join(new_dir, "retro_config.json"), encoding="utf-8").read(), self.CONFIG)
+
+    def test_a_failed_start_puts_the_folder_name_and_files_back(self):
+        with self.assertRaises(RuntimeError):
+            self._run([3, None])
+        self.assertTrue(os.path.isdir(self.install))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, self.NEW_DIR)))
+        self.assertEqual(open(os.path.join(self.install, "_internal", "lib.dll"), encoding="utf-8").read(), "old lib")
+        self.assertEqual(open(os.path.join(self.install, "retro_config.json"), encoding="utf-8").read(), self.CONFIG)
+        self.assertEqual(self.calls[-1], ([os.path.join(self.install, self.OLD_EXE)], self.install))
+
+    def test_the_name_stays_when_the_switch_is_off_or_the_new_name_is_taken_or_it_has_no_version(self):
+        h = self.h
+        with mock.patch.object(h, "UPDATE_RENAMES_INSTALL_FOLDER", False):
+            self._run([None])
+        self.assertTrue(os.path.isdir(self.install))
+        os.makedirs(os.path.join(self.tmp, self.NEW_DIR), exist_ok=True)
+        self.assertIsNone(h._new_install_dir(self.install, "1.0.1"))
+        self.assertIsNone(h._new_install_dir(os.path.join(self.tmp, "RetroTVappTest"), "1.0.1"))
+        self.assertIsNone(h._new_install_dir(os.path.join(self.tmp, "Retro TV 2.0 test"), "1.0.1"))
+        self.assertIsNone(h._new_install_dir(self.install, "Alpha Build"))
+        self.assertEqual(h._new_install_dir(os.path.join(self.tmp, "Retro v1.0.0 x"), "1.0.1"), os.path.join(self.tmp, "Retro v1.0.1 x"))
+
+    def test_rebase_maps_paths_into_the_renamed_folder(self):
+        h = self.h
+        old, new = os.path.join(self.tmp, "a"), os.path.join(self.tmp, "b")
+        self.assertEqual(h._rebase(os.path.join(old, "x", "y.exe"), old, new), os.path.join(new, "x", "y.exe"))
+        self.assertEqual(h._rebase(old, old, new), new)
+        other = os.path.join(self.tmp, "ab", "y.exe")
+        self.assertEqual(h._rebase(other, old, new), other)
+
+
+class TestUpdateHelperRunsOutsideInstall(unittest.TestCase):
+    """auto_updater: the helper exe runs from a temp copy with a working folder outside the install, so Windows lets it rename the install folder."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.u = _load_updater_script("auto_updater")
+
+    def test_the_exe_is_copied_out_and_a_failed_copy_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = os.path.join(tmp, "install", "RetroTVUpdateHelper.exe")
+            os.makedirs(os.path.dirname(helper))
+            with open(helper, "wb") as handle:
+                handle.write(b"exe bytes")
+            moved = self.u._helper_outside_install([helper])
+            try:
+                self.assertEqual(len(moved), 1)
+                self.assertNotEqual(os.path.dirname(moved[0]), os.path.dirname(helper))
+                self.assertEqual(os.path.basename(moved[0]), "RetroTVUpdateHelper.exe")
+                self.assertEqual(open(moved[0], "rb").read(), b"exe bytes")
+            finally:
+                shutil.rmtree(os.path.dirname(moved[0]), ignore_errors=True)
+            missing = os.path.join(tmp, "install", "nothing.exe")
+            self.assertEqual(self.u._helper_outside_install([missing]), [missing])
+            self.assertEqual(self.u._helper_outside_install(["python", "update_helper.py"]), ["python", "update_helper.py"])
+
+    def test_the_helper_starts_with_a_working_folder_outside_the_install(self):
+        u = self.u
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = os.path.join(tmp, "payload")
+            os.makedirs(staged)
+            seen = {}
+
+            def fake_popen(command, **kwargs):
+                seen["cwd"] = kwargs.get("cwd")
+                return types.SimpleNamespace(pid=1)
+            with mock.patch.object(u.subprocess, "Popen", fake_popen), \
+                    mock.patch.object(u, "_helper_command", return_value=[os.path.join(tmp, "x.exe")]), \
+                    mock.patch.object(u, "_helper_outside_install", side_effect=lambda command: command):
+                u.launch_staged_update(tmp, {"staged_path": staged, "version": "1.0.1"}, ["app.exe"])
+            self.assertEqual(os.path.normcase(seen["cwd"]), os.path.normcase(tempfile.gettempdir()))
+            self.assertNotEqual(os.path.normcase(seen["cwd"]), os.path.normcase(tmp))
+
+
+class TestUpdateRestartFollowsSavedSettings(unittest.TestCase):
+    """The app after an update: a normal start (no --relaunched), so kiosk / shell (start on boot) mean fullscreen and everything else means windowed; the shipped music track path follows the renamed folder."""
+
+    def _function(self, name, **names):
+        match = re.search(r"^def %s\(.*?(?=^\S)" % name, MAIN_SRC, re.S | re.M)
+        namespace = dict(names)
+        exec(compile(match.group(0), name, "exec"), namespace)
+        return namespace[name]
+
+    def test_the_update_restart_command_has_no_relaunched_flag(self):
+        argv = ["app.exe", "--relaunched", "--as-shell"]
+        fake_sys = types.SimpleNamespace(frozen=True, executable="app.exe", argv=argv)
+        build = self._function("_build_relaunch_command", sys=fake_sys, os=os)
+        self.assertEqual(build(after_update=True), ["app.exe", "--as-shell"])
+        self.assertEqual(build(), ["app.exe", "--relaunched", "--as-shell"])
+        fresh = self._function("_build_relaunch_command", sys=types.SimpleNamespace(frozen=True, executable="app.exe", argv=["app.exe"]), os=os)
+        self.assertEqual(fresh(), ["app.exe", "--relaunched"])
+        self.assertEqual(fresh(after_update=True), ["app.exe"])
+
+    def test_the_update_call_asks_for_the_normal_start(self):
+        self.assertIn("_build_relaunch_command(after_update=True)", MAIN_SRC)
+        self.assertGreaterEqual(MAIN_SRC.count("_build_relaunch_command()"), 1)
+
+    def test_boot_display_follows_the_saved_settings_on_a_normal_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_sys = types.SimpleNamespace(argv=[os.path.join(tmp, "app.exe")])
+            read = self._function("_read_boot_fullscreen_pref", sys=fake_sys, os=os, _IS_RELAUNCH=False,
+                                  log=logging.getLogger("t"), logging=logging)
+            for kiosk, boot, expected in ((False, False, False), (True, False, True), (False, True, True), (True, True, True)):
+                with open(os.path.join(tmp, "retro_config.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"config": {"kiosk_mode_enabled": kiosk, "start_on_boot": boot}}, handle)
+                self.assertEqual(read(), expected, (kiosk, boot))
+            relaunched = self._function("_read_boot_fullscreen_pref", sys=fake_sys, os=os, _IS_RELAUNCH=True,
+                                        log=logging.getLogger("t"), logging=logging)
+            self.assertTrue(relaunched())
+
+    def test_the_saved_music_path_follows_the_renamed_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_dir = os.path.join(tmp, "Retro V1.0.1", "_internal", "main")
+            track = os.path.join(main_dir, "audio", "Game Music", "gamemusic.mp3")
+            os.makedirs(os.path.dirname(track))
+            with open(track, "wb") as handle:
+                handle.write(b"x")
+            dead = "C:\\Users\\steve\\Desktop\\Retro V1.0.0\\_internal\\main\\audio\\Game Music\\gamemusic.mp3"
+            other = os.path.join(tmp, "elsewhere", "song.mp3")
+            saved = []
+            db = types.SimpleNamespace(config={"ch03_menu_music": [{"path": dead, "gain": 0.32}, {"path": other, "gain": 0.5}], "kiosk_mode_enabled": False},
+                                       save_settings=lambda: saved.append(1))
+            names = dict(os=os, db=db, resolve_main_dir=lambda: main_dir, _CH03_DEFAULT_MUSIC_GAIN_LEGACY=0.31,
+                         _CH03_DEFAULT_MUSIC_GAIN_PRECACHED=0.32)
+            names["_ch03_entry_is_default_music"] = self._function("_ch03_entry_is_default_music", os=os, resolve_main_dir=lambda: main_dir)
+            self._function("_ensure_ch03_menu_music_seeded", **names)()
+            entries = db.config["ch03_menu_music"]
+            self.assertEqual(entries[0]["path"], track)
+            self.assertEqual(entries[1], {"path": other, "gain": 0.5})
+            self.assertEqual(db.config["kiosk_mode_enabled"], False)
+            self.assertTrue(saved)
 
 
 if __name__ == "__main__":

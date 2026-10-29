@@ -77,6 +77,22 @@ def _read_json(path):
         return json.load(handle)
 
 
+def _extended(absolute_windows_path):
+    """Turns an absolute Windows path into the extended-length form (\\\\?\\...) that lifts the 260-character limit; an already extended path is returned unchanged."""
+    if absolute_windows_path.startswith("\\\\?\\"):
+        return absolute_windows_path
+    if absolute_windows_path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute_windows_path[2:]
+    return "\\\\?\\" + absolute_windows_path
+
+
+def _long(path):
+    """Returns the path in a form that works past 260 characters on Windows (a deep staged update folder plus the model-cache names exceeds that); other systems get the path unchanged."""
+    if os.name != "nt":
+        return path
+    return _extended(os.path.abspath(path))
+
+
 def _pid_alive(pid):
     if not pid:
         return False
@@ -170,11 +186,12 @@ def _in_update_area(relative):
 
 def _payload_files(staged_path, install_dir=None):
     files = []
-    for root, dirs, names in os.walk(staged_path):
+    base = _long(staged_path)
+    for root, dirs, names in os.walk(base):
         dirs[:] = sorted(d for d in dirs if d != "__pycache__")
         for name in sorted(names):
             source = os.path.join(root, name)
-            relative = os.path.relpath(source, staged_path)
+            relative = os.path.relpath(source, base)
             # NOTE: the 'main' folder holds user data (scan data, images, videos,
             # bios, roms), so an update must never write into it.
             if _is_protected(relative):
@@ -184,7 +201,7 @@ def _payload_files(staged_path, install_dir=None):
                 log.info("[UPDATE DIAG] Skipped %s (outside the update area: an exe at the top of the install or a file under _internal)", relative)
                 continue
             # WARNING: a shipped copy of a saved setup file must never overwrite the user's own, or every setting, device id and server slot they made is lost on update.
-            if install_dir is not None and _is_user_state(relative) and os.path.isfile(os.path.join(install_dir, relative)):
+            if install_dir is not None and _is_user_state(relative) and os.path.isfile(_long(os.path.join(install_dir, relative))):
                 log.info("[UPDATE DIAG] Kept the existing %s (saved setup is never overwritten)", relative)
                 continue
             files.append((source, relative))
@@ -197,12 +214,12 @@ def _backup_targets(install_dir, files):
     absent = []
     for _source, relative in files:
         target = os.path.join(install_dir, relative)
-        if not os.path.isfile(target):
+        if not os.path.isfile(_long(target)):
             absent.append(relative)
             continue
         backup = os.path.join(backup_dir, relative)
-        os.makedirs(os.path.dirname(backup), exist_ok=True)
-        shutil.copy2(target, backup)
+        os.makedirs(_long(os.path.dirname(backup)), exist_ok=True)
+        shutil.copy2(_long(target), _long(backup))
         copied.append(relative)
     return backup_dir, copied, absent
 
@@ -211,11 +228,11 @@ def _restore(install_dir, backup_dir, copied, absent):
     for relative in copied:
         backup = os.path.join(backup_dir, relative)
         target = os.path.join(install_dir, relative)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copy2(backup, target)
+        os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
+        shutil.copy2(_long(backup), _long(target))
     for relative in absent:
         try:
-            os.unlink(os.path.join(install_dir, relative))
+            os.unlink(_long(os.path.join(install_dir, relative)))
         except FileNotFoundError:
             pass
 
@@ -237,7 +254,7 @@ def _copy_with_retry(source, target, attempts=40, delay=0.25):
     """Copies one file, waiting out the short time Windows keeps a just-closed file locked."""
     for attempt in range(attempts):
         try:
-            shutil.copy2(source, target)
+            shutil.copy2(_long(source), _long(target))
             return
         except PermissionError:
             if attempt == attempts - 1:
@@ -248,7 +265,7 @@ def _copy_with_retry(source, target, attempts=40, delay=0.25):
 def _apply_payload(install_dir, files):
     for source, relative in files:
         target = os.path.join(install_dir, relative)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
         _move_running_helper_aside(target)
         _copy_with_retry(source, target)
 
@@ -288,6 +305,67 @@ def _renamed_exe(files, command, install_dir):
     if len(matches) == 1:
         return matches[0], old_path
     return None, None
+
+
+# VALUES CHANGE HERE: True renames the install folder to carry the new version (Retro TV Emulator (Alpha Build) V1.0.0 becomes ...V1.0.1) when its name holds one V-numbered version; False leaves the folder name alone.
+UPDATE_RENAMES_INSTALL_FOLDER = False
+
+
+def _new_install_dir(install_dir, new_version):
+    """The path the install folder should have after this update, or None when its name carries no single V1.2.3 style number, the number is already right, or that name is taken."""
+    if not re.fullmatch(r"\d+(?:\.\d+)+", str(new_version or "")):
+        return None
+    parent, name = os.path.split(os.path.abspath(install_dir))
+    tokens = _VERSION_TOKEN_RE.findall(name)
+    if len(tokens) != 1 or tokens[0][:1] not in ("v", "V"):
+        return None
+    renamed = name.replace(tokens[0], tokens[0][0] + str(new_version), 1)
+    candidate = os.path.join(parent, renamed)
+    if renamed == name or os.path.exists(candidate):
+        return None
+    return candidate
+
+
+def _rebase(path, old_dir, new_dir):
+    """Maps a path inside old_dir to the same place inside new_dir; any other path is returned unchanged."""
+    absolute = os.path.abspath(path)
+    old = os.path.abspath(old_dir)
+    if os.path.normcase(absolute) == os.path.normcase(old):
+        return new_dir
+    if os.path.normcase(absolute).startswith(os.path.normcase(old) + os.sep):
+        return os.path.join(new_dir, absolute[len(old) + 1:])
+    return path
+
+
+def _helper_runs_inside(install_dir):
+    """True when this process still sits in the install folder (its exe or its working folder), which makes Windows refuse to rename that folder."""
+    here = os.path.normcase(os.path.abspath(install_dir)) + os.sep
+    places = [os.getcwd()]
+    if getattr(sys, "frozen", False):
+        places.append(sys.executable)
+    return any((os.path.normcase(os.path.abspath(place)) + os.sep).startswith(here) for place in places)
+
+
+def _close_log():
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception as _close_exc:
+            logging.getLogger(__name__).debug("could not close the helper log: %s", _close_exc)
+
+
+def _rename_folder_with_retry(source, target, attempts=40, delay=0.25):
+    """Renames a folder, waiting out the short time Windows keeps one locked after its last program closed; returns True when it worked."""
+    for attempt in range(attempts):
+        try:
+            os.rename(source, target)
+            return True
+        except OSError:
+            if attempt == attempts - 1:
+                return False
+            time.sleep(delay)
+    return False
 
 
 def _remove_with_retry(path, attempts=40, delay=0.25):
@@ -336,6 +414,101 @@ def _restore_stamp(install_dir, previous):
 # ============================================================================
 
 
+# ============================================================================
+# SECTION: Shortcut & pin repointing
+# ============================================================================
+
+# VALUES CHANGE HERE: True points desktop, Start menu and taskbar-pin shortcuts that aim at the old exe or the old install folder at the new ones after an update; False leaves every shortcut alone.
+UPDATE_REPOINTS_SHORTCUTS = True
+# VALUES CHANGE HERE: seconds the shortcut repair may run before it is abandoned (the update itself is never held up by its result).
+SHORTCUT_REPAIR_TIMEOUT_SECONDS = 60
+
+# WARNING: this script only rewrites .lnk files whose target is the old exe or inside the old install folder; changing the match makes it edit unrelated shortcuts.
+_SHORTCUT_SCRIPT = r"""
+param([string]$OldExe, [string]$NewExe, [string]$OldDir, [string]$NewDir)
+$ErrorActionPreference = 'Continue'
+$sh = New-Object -ComObject WScript.Shell
+$oldRoot = $OldDir.TrimEnd('\')
+$newRoot = $NewDir.TrimEnd('\')
+function Move-Path([string]$p) {
+  if (-not $p) { return $p }
+  if ($p.Equals($OldExe, 'OrdinalIgnoreCase')) { return $NewExe }
+  if ($p.Equals($oldRoot, 'OrdinalIgnoreCase')) { return $newRoot }
+  if ($p.StartsWith($oldRoot + '\', 'OrdinalIgnoreCase')) { return $newRoot + '\' + $p.Substring($oldRoot.Length + 1) }
+  return $p
+}
+$roots = @(
+  [Environment]::GetFolderPath('Desktop'),
+  [Environment]::GetFolderPath('CommonDesktopDirectory'),
+  [Environment]::GetFolderPath('Programs'),
+  [Environment]::GetFolderPath('CommonPrograms'),
+  (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch')
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+foreach ($root in $roots) {
+  Get-ChildItem -LiteralPath $root -Filter *.lnk -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+    $file = $_.FullName
+    try {
+      $s = $sh.CreateShortcut($file)
+      $target = $s.TargetPath
+      $moved = Move-Path $target
+      if ($moved -ne $target) {
+        $s.TargetPath = $moved
+        $s.WorkingDirectory = Move-Path $s.WorkingDirectory
+        $loc = $s.IconLocation
+        $comma = $loc.LastIndexOf(',')
+        if ($comma -gt 0) { $iconPath = $loc.Substring(0, $comma); $iconIndex = $loc.Substring($comma) } else { $iconPath = $loc; $iconIndex = '' }
+        $newIcon = Move-Path $iconPath
+        if ($newIcon -ne $iconPath) { $s.IconLocation = $newIcon + $iconIndex }
+        $s.Save()
+        Write-Output ('UPDATED|' + $file)
+      }
+    } catch {
+      Write-Output ('FAILED|' + $file + '|' + $_.Exception.Message)
+    }
+  }
+}
+"""
+
+
+def _repoint_shortcuts(old_exe, new_exe, old_dir, new_dir):
+    """Points every shortcut and taskbar pin that aimed at the old exe or old install folder at the new ones; logs the result and never raises."""
+    if os.name != "nt" or not UPDATE_REPOINTS_SHORTCUTS:
+        return
+    old_exe, new_exe = os.path.abspath(old_exe), os.path.abspath(new_exe)
+    old_dir, new_dir = os.path.abspath(old_dir), os.path.abspath(new_dir)
+    if os.path.normcase(old_exe) == os.path.normcase(new_exe) and os.path.normcase(old_dir) == os.path.normcase(new_dir):
+        return
+    script_dir = None
+    try:
+        script_dir = tempfile.mkdtemp(prefix="retro-tv-shortcuts-")
+        script_path = os.path.join(script_dir, "repoint_shortcuts.ps1")
+        with open(script_path, "w", encoding="utf-8-sig") as handle:
+            handle.write(_SHORTCUT_SCRIPT)
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", script_path, "-OldExe", old_exe, "-NewExe", new_exe,
+             "-OldDir", old_dir, "-NewDir", new_dir],
+            capture_output=True, text=True, timeout=SHORTCUT_REPAIR_TIMEOUT_SECONDS,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+        updated = 0
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("UPDATED|"):
+                updated += 1
+                log.info("[UPDATE DIAG] Shortcut repointed: %s", line.split("|", 1)[1])
+            elif line.startswith("FAILED|"):
+                log.warning("[UPDATE DIAG] Shortcut could not be repointed: %s", line.split("|", 1)[1])
+        if result.returncode != 0:
+            log.warning("[UPDATE DIAG] Shortcut repair exited with code %s: %s",
+                        result.returncode, (result.stderr or "").strip()[:300])
+        log.info("[UPDATE DIAG] Shortcut repair finished: %d shortcut(s) repointed", updated)
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] Shortcut repair failed: %s", exc)
+    finally:
+        if script_dir:
+            shutil.rmtree(script_dir, ignore_errors=True)
+
+
 def apply_update(metadata_path):
     metadata = _read_json(metadata_path)
     install_dir = os.path.abspath(metadata["install_dir"])
@@ -345,7 +518,7 @@ def apply_update(metadata_path):
     _configure_logging(install_dir)
     log.info("[UPDATE DIAG] Helper starting version=%s install_dir=%s",
              metadata.get("version", ""), install_dir)
-    if not os.path.isdir(install_dir) or not os.path.isdir(staged_path):
+    if not os.path.isdir(install_dir) or not os.path.isdir(_long(staged_path)):
         raise RuntimeError("Update install directory or staged payload is missing")
     if not isinstance(command, list) or not command:
         raise RuntimeError("Update relaunch command is missing")
@@ -373,6 +546,7 @@ def apply_update(metadata_path):
     new_version = str(metadata.get("version", "") or "").strip()
     previous_stamp = _read_stamp(install_dir)
     backup_dir, copied, absent = _backup_targets(install_dir, files)
+    where = install_dir
     try:
         _apply_payload(install_dir, files)
         if new_version:
@@ -381,9 +555,24 @@ def apply_update(metadata_path):
             except OSError as stamp_exc:
                 log.warning("[UPDATE DIAG] Could not write %s (version=%s): %s",
                             VERSION_STAMP_NAME, new_version, stamp_exc)
+        # WARNING: the folder is renamed before the new app starts and only when this helper is running from outside it; settings files are never touched, and a failed rename just leaves the old folder name.
+        target_dir = _new_install_dir(install_dir, new_version) if UPDATE_RENAMES_INSTALL_FOLDER else None
+        if target_dir and _helper_runs_inside(install_dir):
+            log.info("[UPDATE DIAG] Folder rename skipped: this helper runs from inside the install folder")
+            target_dir = None
+        if target_dir:
+            _close_log()
+            if _rename_folder_with_retry(install_dir, target_dir):
+                where = target_dir
+            _configure_logging(where)
+            if where == install_dir:
+                log.warning("[UPDATE DIAG] Could not rename the install folder to %s; keeping the old name", target_dir)
+            else:
+                log.info("[UPDATE DIAG] Install folder renamed: %s -> %s", install_dir, where)
+                launch_command[0] = _rebase(launch_command[0], install_dir, where)
         process = subprocess.Popen(
             launch_command,
-            cwd=install_dir,
+            cwd=where,
             close_fds=True,
             creationflags=(
                 getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
@@ -397,7 +586,8 @@ def apply_update(metadata_path):
             if process.poll() is not None:
                 raise RuntimeError("Updated application exited during startup")
             time.sleep(0.25)
-        if old_exe_path and not _remove_with_retry(old_exe_path):
+        _repoint_shortcuts(old_exe_path or command[0], launch_command[0], install_dir, where)
+        if old_exe_path and not _remove_with_retry(_rebase(old_exe_path, install_dir, where)):
             log.warning("[UPDATE DIAG] Could not delete the old exe %s; the new version is running",
                         old_exe_path)
     except Exception as exc:
@@ -406,12 +596,17 @@ def apply_update(metadata_path):
             "[UPDATE DIAG] Update apply failed, restoring backup: %s", exc,
             interval=0.0,
         )
-        _restore(install_dir, backup_dir, copied, absent)
-        _restore_stamp(install_dir, previous_stamp)
+        if where != install_dir:
+            _close_log()
+            if _rename_folder_with_retry(where, install_dir):
+                where = install_dir
+            _configure_logging(where)
+        _restore(where, backup_dir, copied, absent)
+        _restore_stamp(where, previous_stamp)
         try:
             subprocess.Popen(
-                command,
-                cwd=install_dir,
+                [_rebase(command[0], install_dir, where)] + list(command[1:]),
+                cwd=where,
                 close_fds=True,
                 creationflags=(
                     getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
@@ -422,10 +617,10 @@ def apply_update(metadata_path):
             pass
         raise
     finally:
-        shutil.rmtree(backup_dir, ignore_errors=True)
-        shutil.rmtree(os.path.dirname(staged_path), ignore_errors=True)
+        shutil.rmtree(_long(backup_dir), ignore_errors=True)
+        shutil.rmtree(_long(os.path.dirname(_rebase(staged_path, install_dir, where))), ignore_errors=True)
         try:
-            os.unlink(metadata_path)
+            os.unlink(_rebase(metadata_path, install_dir, where))
         except FileNotFoundError:
             pass
     log.info("[UPDATE DIAG] Helper finished successfully version=%s",

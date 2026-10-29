@@ -375,6 +375,22 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progres
     return total, digest.hexdigest()
 
 
+def _extended(absolute_windows_path):
+    """Turns an absolute Windows path into the extended-length form (\\\\?\\...) that lifts the 260-character limit; an already extended path is returned unchanged."""
+    if absolute_windows_path.startswith("\\\\?\\"):
+        return absolute_windows_path
+    if absolute_windows_path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute_windows_path[2:]
+    return "\\\\?\\" + absolute_windows_path
+
+
+def _long(path):
+    """Returns the path in a form that works past 260 characters on Windows (a deep staged update folder plus the model-cache names exceeds that); other systems get the path unchanged."""
+    if os.name != "nt":
+        return path
+    return _extended(os.path.abspath(path))
+
+
 def _safe_zip_member(info):
     name = info.filename.replace("\\", "/")
     if not name or name.startswith("/") or re.match(r"^[A-Za-z]:/", name):
@@ -398,17 +414,28 @@ def _extract_package(package_path, stage_root):
                 raise UpdateError("Update package is empty")
             if any(not _safe_zip_member(info) for info in members):
                 raise UpdateError("Update package contains an unsafe path")
-            archive.extractall(stage_root)
+            # WARNING: members are written one by one through extended-length paths, because the staged folder sits deep inside the install and the whisper model-cache names push a path past Windows' 260-character limit (WinError 3); extractall cannot do that.
+            for info in members:
+                parts = [part for part in info.filename.replace("\\", "/").split("/") if part not in ("", ".")]
+                if not parts:
+                    continue
+                target = os.path.join(stage_root, *parts)
+                if info.is_dir():
+                    os.makedirs(_long(target), exist_ok=True)
+                    continue
+                os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
+                with archive.open(info) as source, open(_long(target), "wb") as output:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
     except zipfile.BadZipFile as exc:
         raise UpdateError("Downloaded update is not a valid zip archive") from exc
 
     # NOTE: accepts either a flat package or a single-root-folder package.
     entries = [
         os.path.join(stage_root, name)
-        for name in os.listdir(stage_root)
+        for name in os.listdir(_long(stage_root))
         if name not in ("__MACOSX",)
     ]
-    if len(entries) == 1 and os.path.isdir(entries[0]):
+    if len(entries) == 1 and os.path.isdir(_long(entries[0])):
         return entries[0]
     return stage_root
 
@@ -434,7 +461,7 @@ def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS, progress_c
                 "[UPDATE DIAG] Update package SHA-256 mismatch version=%s", manifest["version"],
             )
             raise UpdateError("Update package SHA-256 does not match what GitHub reports")
-        os.makedirs(stage_path, exist_ok=True)
+        os.makedirs(_long(stage_path), exist_ok=True)
         payload_root = _extract_package(package_path, stage_path)
         # WARNING: the helper deletes only the folder holding the payload, so a package with one root folder would leave this near-1 GiB zip behind on every update.
         try:
@@ -450,7 +477,7 @@ def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS, progress_c
         _atomic_json_write(os.path.join(update_dir, STAGED_RECORD_NAME), record)
         return record
     except Exception:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(_long(work_dir), ignore_errors=True)
         raise
 
 
@@ -538,12 +565,34 @@ def _helper_command(base_dir):
     return [sys.executable, helper]
 
 
+def _helper_outside_install(command):
+    """Runs the helper exe from a private temp copy: Windows refuses to rename the install folder while an exe inside it is running, and the helper renames that folder to carry the new version. Falls back to the original exe when the copy fails."""
+    if len(command) != 1 or not str(command[0]).lower().endswith(".exe"):
+        return command
+    try:
+        parent = tempfile.gettempdir()
+        for name in os.listdir(parent):
+            stale = os.path.join(parent, name)
+            if name.startswith("retro-tv-update-helper-") and time.time() - os.path.getmtime(stale) > 24 * 3600:
+                shutil.rmtree(_long(stale), ignore_errors=True)
+        folder = tempfile.mkdtemp(prefix="retro-tv-update-helper-")
+        copy = os.path.join(folder, os.path.basename(command[0]))
+        shutil.copy2(_long(command[0]), _long(copy))
+        return [copy]
+    except OSError as exc:
+        _server_breadcrumb(
+            log, logging.WARNING, "update-helper-copy",
+            "[UPDATE DIAG] Could not copy the helper outside the install folder, so the folder keeps its name: %s", exc,
+        )
+        return command
+
+
 def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
     """Hand a staged payload to the detached swap helper and return its PID."""
     if not isinstance(staged, dict):
         raise UpdateError("No staged update is available")
     staged_path = os.path.abspath(str(staged.get("staged_path", "")))
-    if not os.path.isdir(staged_path):
+    if not os.path.isdir(_long(staged_path)):
         raise UpdateError("The staged update payload is missing")
     if not isinstance(relaunch_command, (list, tuple)) or not relaunch_command:
         raise UpdateError("The application relaunch command is invalid")
@@ -559,8 +608,9 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
         "created_at": time.time(),
     }
     _atomic_json_write(pending_path, pending)
-    command = _helper_command(base_dir) + ["--apply", pending_path]
-    kwargs = {"cwd": base_dir, "close_fds": True}
+    command = _helper_outside_install(_helper_command(base_dir)) + ["--apply", pending_path]
+    # WARNING: the helper must not start with the install folder as its working folder, or Windows will not let it rename that folder.
+    kwargs = {"cwd": tempfile.gettempdir(), "close_fds": True}
     _detached = 0
     if os.name == "nt":
         _detached = (
