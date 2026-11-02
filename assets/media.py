@@ -9881,6 +9881,10 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
 # SECTION: Database
 # ============================================================================
 
+# WARNING: the fallback numbers below must match SETTINGS_SAVE_DELAY_SECONDS, SETTINGS_SAVE_REPORT_SECONDS in performance_governor.py; they are used only when that module fails to import.
+SETTINGS_SAVE_DELAY_SECONDS = _perf_governor.SETTINGS_SAVE_DELAY_SECONDS if _perf_governor is not None else 2.0
+SETTINGS_SAVE_REPORT_SECONDS = _perf_governor.SETTINGS_SAVE_REPORT_SECONDS if _perf_governor is not None else 60.0
+
 
 class RetroDatabase:
 
@@ -9907,6 +9911,16 @@ class RetroDatabase:
         self._main_channels_cache = {}
         self._channels_lock = threading.Lock()
         self._channels_save_generation = 0
+
+        # WARNING: retro_config.json is written only by the SettingsWriter thread or flush_settings(); save_settings() only asks, so a caller (the screen thread above all) never waits for the write. The quit path must call flush_settings() or the last change is lost.
+        self._deferred_save_cond = threading.Condition()
+        self._deferred_save_due = None
+        self._deferred_save_thread = None
+        self._settings_write_lock = threading.Lock()
+        # WARNING: held while channels_path and channels_db are switched together and while the settings are written, so a write never puts one source's channels in the other's file.
+        self._channels_source_lock = threading.RLock()
+        self._settings_save_stats = {"writes": 0, "requests": 0, "bytes": 0, "encode_ms": 0.0, "encode_max_ms": 0.0,
+                                     "write_ms": 0.0, "write_max_ms": 0.0, "since": time.monotonic()}
 
         # WARNING: the config and channels writers must never target the same physical file.
         # WARNING: the runtime file and the settings save's temporary file live in root/logs (LOGS_FOLDER_NAME in retro_tv_emulator.py), so nothing pops up beside the exe while the app saves.
@@ -10088,10 +10102,11 @@ class RetroDatabase:
             log.error("Channel redirect rejected invalid path: %r", path)
             return False
 
-        old_path = self.channels_path
-        self.save_channels(force=True)
-        self.channels_path = target_path
-        self._load_channels_from_path(target_path)
+        with self._channels_source_lock:
+            old_path = self.channels_path
+            self.save_channels(force=True)
+            self.channels_path = target_path
+            self._load_channels_from_path(target_path)
         log.info(
             "Channel source redirected old=%s new=%s exists=%s",
             old_path, target_path, os.path.exists(target_path),
@@ -10620,8 +10635,11 @@ class RetroDatabase:
             log.error("Channel source write failed path=%s: %s", path, save_err)
 
     def save_config(self):
-        """Save just db.config to config_path."""
+        """Save db.config: through the settings writer while the channels live in retro_config.json, or now, with the main channels kept aside, while a server slot holds the channels."""
         if not getattr(self, "ready_flag", False):
+            return
+        if self.channels_path == self.config_path:
+            self._request_deferred_save()
             return
         config_snapshot = self._snapshot_config()
         if config_snapshot is None:
@@ -10647,40 +10665,152 @@ class RetroDatabase:
             ).start()
 
     def save_settings(self):
-        """Save everything -- config AND channels."""
+        """Asks the settings writer to save config and channels within SETTINGS_SAVE_DELAY_SECONDS; never writes on the caller's thread."""
         if not getattr(self, "ready_flag", False):
             return
-        if self.channels_path == self.config_path:
-            snapshot = self._snapshot_settings()
-            if snapshot is None:
-                return
-            self._main_channels_cache = snapshot["channels"]
-            self._write_config_snapshot(snapshot["config"], self._next_save_generation())
-        else:
-            self.save_config()
-            self.save_channels(force=True)
+        self._request_deferred_save()
 
     def save_settings_async(self, force=False):
-        """Save config and channels, async by default."""
+        """Asks the settings writer to save config and channels; force=True also writes it now on the caller's thread and returns when it is on disk."""
         if not getattr(self, "ready_flag", False):
             return
-        if self.channels_path == self.config_path:
-            snapshot = self._snapshot_settings()
-            if snapshot is None:
-                return
-            self._main_channels_cache = snapshot["channels"]
-            generation = self._next_save_generation()
-            if force:
-                self._write_config_snapshot(snapshot["config"], generation)
-            else:
-                threading.Thread(
-                    target=self._write_config_snapshot,
-                    args=(snapshot["config"], generation),
-                    daemon=True,
-                ).start()
+        self._request_deferred_save()
+        if force:
+            self.flush_settings()
+
+    # ========================================================================
+    # SECTION: Settings writer thread
+    # ========================================================================
+
+    def _request_deferred_save(self):
+        """Marks the settings as changed; the SettingsWriter thread writes them SETTINGS_SAVE_DELAY_SECONDS after the first unsaved request, with every change asked for in between."""
+        with self._deferred_save_cond:
+            self._settings_save_stats["requests"] += 1
+            if self._deferred_save_due is None:
+                self._deferred_save_due = time.monotonic() + SETTINGS_SAVE_DELAY_SECONDS
+            if self._deferred_save_thread is None or not self._deferred_save_thread.is_alive():
+                self._deferred_save_thread = threading.Thread(
+                    target=self._deferred_save_worker, name="SettingsWriter", daemon=True)
+                self._deferred_save_thread.start()
+            self._deferred_save_cond.notify_all()
+
+    def _deferred_save_worker(self):
+        """SettingsWriter thread: waits for a request, waits out its delay, then writes."""
+        while True:
+            with self._deferred_save_cond:
+                while True:
+                    due = self._deferred_save_due
+                    if due is None:
+                        self._deferred_save_cond.wait()
+                        continue
+                    left = due - time.monotonic()
+                    if left <= 0:
+                        self._deferred_save_due = None
+                        break
+                    self._deferred_save_cond.wait(timeout=left)
+            try:
+                self._write_settings_now()
+            except Exception as write_err:
+                log.error("[SETTINGS SAVE] the settings writer failed: %s: %s", type(write_err).__name__, write_err)
+
+    def flush_settings(self):
+        """Writes a settings save that is still waiting, now, on the caller's thread, and waits for a write already running; the quit path calls it."""
+        if not getattr(self, "ready_flag", False):
+            return
+        with self._deferred_save_cond:
+            waiting = self._deferred_save_due is not None
+            self._deferred_save_due = None
+        if waiting:
+            self._write_settings_now()
         else:
-            self.save_config()
-            self.save_channels(force=force)
+            with self._settings_write_lock:
+                pass
+
+    def _encode_main_settings(self):
+        """Returns the text of retro_config.json (compact JSON of config and channels, runtime-only keys left out), or None when it cannot be made."""
+        # WARNING: the whole tree is turned into text by one json.dumps call, which Python runs without letting another thread change the trees halfway, so the file always holds one moment's settings; json.dump(indent=...) runs in Python code, takes many times longer and can be interrupted.
+        try:
+            with self._remote_schedule_lock:
+                if self._remote_schedule_active and self._remote_local_channels_snapshot is not None:
+                    self._fold_live_unlocked_into_snapshot_locked()
+                    source = self._remote_local_channels_snapshot
+                else:
+                    source = self.channels_db
+                channels_view = {}
+                for key, info in list(source.items()):
+                    if isinstance(info, dict) and any(k in info for k in RUNTIME_ONLY_CHANNEL_KEYS):
+                        info = dict(info)
+                        for runtime_key in RUNTIME_ONLY_CHANNEL_KEYS:
+                            info.pop(runtime_key, None)
+                    channels_view[key] = info
+                return json.dumps({"config": self.config, "channels": channels_view})
+        except Exception as encode_err:
+            log.error("[SETTINGS SAVE] the settings could not be turned into JSON, nothing written: %s: %s",
+                      type(encode_err).__name__, encode_err)
+            return None
+
+    @staticmethod
+    def _atomic_write_text(tmp_path, final_path, text):
+        """Writes text to tmp_path, fsyncs it, then renames it onto final_path."""
+        os.makedirs(os.path.dirname(tmp_path) or ".", exist_ok=True)
+        with open(tmp_path, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, final_path)
+
+    def _write_settings_now(self):
+        """Writes config and channels on this thread: retro_config.json in one compact write, or, while a server slot holds the channels, the config file and the slot file as before."""
+        if not getattr(self, "ready_flag", False):
+            return
+        with self._settings_write_lock:
+            with self._channels_source_lock:
+                if self.channels_path != self.config_path:
+                    try:
+                        self.save_config()
+                        self.save_channels(force=True)
+                    except Exception as save_err:
+                        log.error("[SETTINGS SAVE] writing the config and the server slot's channels failed: %s", save_err)
+                    return
+                started = time.perf_counter()
+                text = self._encode_main_settings()
+                encoded = time.perf_counter()
+                if text is None:
+                    return
+                generation = self._next_save_generation()
+                try:
+                    with self._save_lock:
+                        with self._save_request_lock:
+                            if generation != self._save_generation:
+                                return
+                        self._atomic_write_text(os.path.join(self.logs_dir, "retro_config.json.tmp"), self.config_path, text)
+                except Exception as save_err:
+                    log.error("[SETTINGS SAVE] writing %s failed: %s: %s", self.config_path, type(save_err).__name__, save_err)
+                    return
+                written = time.perf_counter()
+            self._note_settings_write((encoded - started) * 1000.0, (written - encoded) * 1000.0, len(text))
+
+    def _note_settings_write(self, encode_ms, write_ms, size):
+        """Counts one settings write and writes the [SETTINGS SAVE] summary at most once per SETTINGS_SAVE_REPORT_SECONDS."""
+        with self._deferred_save_cond:
+            stats = self._settings_save_stats
+            stats["writes"] += 1
+            stats["bytes"] = size
+            stats["encode_ms"] += encode_ms
+            stats["encode_max_ms"] = max(stats["encode_max_ms"], encode_ms)
+            stats["write_ms"] += write_ms
+            stats["write_max_ms"] = max(stats["write_max_ms"], write_ms)
+            now = time.monotonic()
+            if now - stats["since"] < SETTINGS_SAVE_REPORT_SECONDS:
+                return
+            line = ("[SETTINGS SAVE] %d write(s) for %d request(s) in the last %.0fs; retro_config.json %.1f MB; "
+                    "making the text avg %.0f ms max %.0f ms (the screen waits this long); writing to disk avg %.0f ms max %.0f ms (in the background)"
+                    % (stats["writes"], stats["requests"], now - stats["since"], stats["bytes"] / 1048576.0,
+                       stats["encode_ms"] / stats["writes"], stats["encode_max_ms"],
+                       stats["write_ms"] / stats["writes"], stats["write_max_ms"]))
+            self._settings_save_stats = {"writes": 0, "requests": 0, "bytes": size, "encode_ms": 0.0, "encode_max_ms": 0.0,
+                                         "write_ms": 0.0, "write_max_ms": 0.0, "since": now}
+        log.info(line)
 
     def factory_reset(self):
 

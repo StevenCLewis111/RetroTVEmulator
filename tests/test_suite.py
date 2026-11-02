@@ -10893,7 +10893,7 @@ def suite_logs_folder():
         check(needle in MAIN_SRC, "%s are written in root/logs" % where)
     media_src = read(os.path.join(ROOT, "media.py"))
     check('self.runtime_path = os.path.join(self.logs_dir, "playback_runtime.json")' in media_src
-          and media_src.count('os.path.join(self.logs_dir, "retro_config.json.tmp")') == 2 and 'self.config_path + ".tmp"' not in media_src,
+          and media_src.count('os.path.join(self.logs_dir, "retro_config.json.tmp")') == 3 and 'self.config_path + ".tmp"' not in media_src,
           "the runtime file and the settings save's temporary file are written in root/logs")
     check('os.path.join(root_dir, "logs", "controllers")' in read(os.path.join(ROOT, "game_deck.py")), "the controller setup is kept in root/logs/controllers")
     check('os.path.join(os.path.abspath(base_dir), "logs", UPDATE_DIR_NAME)' in read(os.path.join(ROOT, "updater", "auto_updater.py")),
@@ -12271,6 +12271,7 @@ SCHED_RECORD_FUNCS = [
     "_snapshot_track_durations", "_start_order_seed", "_save_file_probe_facts", "_hub_note_measured_duration", "_timeline_whole_episode_durations",
     "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "calculate_slotted_playback_state",
     "_block_overrun_anchor", "_channel_is_server_streamed", "_note_aired_cycle", "_note_missed_blocks", "_priority_probe_pending_schedule", "_pending_probe_worker", "_pending_backlog_may_run", "_probe_pending_schedule_one", "_set_saved_lineup",
+    "_pending_paths_signature", "_stored_pending_signature",
 ]
 
 SCHED_RECORD_ENGINE_STUBS = {
@@ -24197,6 +24198,663 @@ class TestLoudnessScanStage1(_SectionCase):
 
     def test_loudness_scan_stage1(self):
         self.run_section(suite_loudness_scan_stage1)
+
+
+# ============================================================================
+# SECTION: Settings are written by the settings writer thread (V289, log audit L1, L2, L12)
+# ============================================================================
+
+
+def _settings_writer_db(tmp, delay):
+    """A real RetroDatabase whose files live in tmp, with the writer delay set to delay seconds; returns (db, restore)."""
+    old_argv0 = sys.argv[0]
+    old_delay = media.SETTINGS_SAVE_DELAY_SECONDS
+    sys.argv[0] = os.path.join(tmp, "Retro TV Emulator.exe")
+    media.SETTINGS_SAVE_DELAY_SECONDS = delay
+    try:
+        rdb = media.RetroDatabase()
+    finally:
+        sys.argv[0] = old_argv0
+    deadline = time.monotonic() + 10.0
+    while not rdb.ready_flag and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    def restore():
+        media.SETTINGS_SAVE_DELAY_SECONDS = old_delay
+    return rdb, restore
+
+
+def suite_settings_writer():
+    import performance_governor as gov
+    check(gov.SETTINGS_SAVE_DELAY_SECONDS == 2.0, "the owner's 2 seconds is the writer's delay in the governor")
+    check(media.SETTINGS_SAVE_DELAY_SECONDS == gov.SETTINGS_SAVE_DELAY_SECONDS and media.SETTINGS_SAVE_REPORT_SECONDS == gov.SETTINGS_SAVE_REPORT_SECONDS,
+          "media.py reads both settings-writer values from the governor")
+    tmp = tempfile.mkdtemp()
+    restore = lambda: None
+    try:
+        rdb, restore = _settings_writer_db(tmp, 0.4)
+        check(rdb.ready_flag, "the test database finished loading")
+        cfg = rdb.config_path
+        writes = []
+        real_write = rdb._atomic_write_text
+
+        def counting_write(tmp_path, final_path, text):
+            writes.append((threading.current_thread().name, final_path))
+            real_write(tmp_path, final_path, text)
+        rdb._atomic_write_text = counting_write
+
+        rdb.channels_db["05"]["name"] = "FIRST"
+        rdb.channels_db["05"]["_sched_mode_request"] = {"to": "two_slots", "since": 1}
+        started = time.monotonic()
+        for i in range(25):
+            rdb.save_settings()
+        took = time.monotonic() - started
+        check(took < 0.05, "25 save requests return at once on the caller's thread (%.3fs)" % took)
+        check(not os.path.exists(cfg) and writes == [], "nothing is written on the caller's thread when it asks")
+        rdb.channels_db["05"]["name"] = "SECOND"
+        time.sleep(1.2)
+        check(len(writes) == 1, "the 25 requests and the change after them go into one write (%d)" % len(writes))
+        check(writes and writes[0] == ("SettingsWriter", cfg), "the write runs on the SettingsWriter thread into retro_config.json (%s)" % (writes[:1],))
+        with open(cfg, encoding="utf-8") as handle:
+            text = handle.read()
+        data = json.loads(text)
+        check(data["channels"]["05"]["name"] == "SECOND", "the write holds the change made while the request waited")
+        check("\n" not in text and '"config"' in text and '"channels"' in text, "retro_config.json is written as compact JSON with its config and channels")
+        check("_sched_mode_request" not in data["channels"]["05"], "a runtime-only key is still never saved")
+        check("_sched_mode_request" in rdb.channels_db["05"], "the runtime-only key stays on the live channel")
+        check(not os.path.exists(os.path.join(tmp, "logs", "retro_config.json.tmp")), "the temporary file is renamed into place")
+
+        writes.clear()
+        rdb.channels_db["05"]["name"] = "FLUSHED"
+        rdb.save_settings()
+        rdb.flush_settings()
+        check(len(writes) == 1 and writes[0][0] == threading.current_thread().name, "flush_settings writes the waiting save at once on the caller's thread")
+        with open(cfg, encoding="utf-8") as handle:
+            check(json.load(handle)["channels"]["05"]["name"] == "FLUSHED", "the flushed file holds the last change")
+        time.sleep(0.7)
+        check(len(writes) == 1, "a flushed request is not written a second time by the writer")
+
+        writes.clear()
+        rdb.channels_db["06"]["name"] = "FORCED"
+        rdb.save_settings_async(force=True)
+        check(len(writes) == 1, "save_settings_async(force=True) still writes before it returns")
+        writes.clear()
+        rdb.save_settings_async()
+        check(writes == [], "save_settings_async() only asks")
+        time.sleep(0.8)
+        check(len(writes) == 1 and writes[0][0] == "SettingsWriter", "and the writer writes it")
+
+        writes.clear()
+        rdb.save_config()
+        time.sleep(0.8)
+        check(len(writes) == 1 and writes[0][0] == "SettingsWriter", "save_config also goes through the writer while the channels live in retro_config.json")
+
+        errors = []
+        handler = logging.Handler()
+        handler.emit = lambda record: errors.append(record.getMessage())
+        media.log.addHandler(handler)
+        try:
+            def failing_write(tmp_path, final_path, text):
+                raise OSError("disk full")
+            rdb._atomic_write_text = failing_write
+            rdb.save_settings()
+            rdb.flush_settings()
+        finally:
+            media.log.removeHandler(handler)
+        check(sum("[SETTINGS SAVE]" in e and "disk full" in e for e in errors) == 1, "a failed write writes one [SETTINGS SAVE] line saying why (%s)" % errors)
+        rdb._atomic_write_text = counting_write
+
+        slot = os.path.join(tmp, "slot", "retro.config.json")
+        os.makedirs(os.path.dirname(slot))
+        with open(slot, "w") as handle:
+            json.dump({"channels": {}}, handle)
+        rdb.reload_channels_from(slot)
+        writes.clear()
+        rdb.channels_db["07"]["name"] = "IN SLOT"
+        rdb.save_settings()
+        time.sleep(0.8)
+        with open(slot, encoding="utf-8") as handle:
+            check(json.load(handle)["channels"]["07"]["name"] == "IN SLOT", "while a server slot holds the channels, the writer saves them into the slot's file")
+        with open(cfg, encoding="utf-8") as handle:
+            main_channels = json.load(handle)["channels"]
+        check(main_channels["06"]["name"] == "FORCED", "retro_config.json keeps the main channels while a slot is active")
+        check(main_channels.get("07", {}).get("name") != "IN SLOT", "the slot's channels never go into retro_config.json")
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    exit_src = main_function_source("_hard_exit_process")
+    check("flush_settings()" in exit_src and exit_src.index("flush_settings()") < exit_src.index("_clear_run_marker()"),
+          "a clean quit writes the waiting settings save before the process ends and before the running marker is cleared")
+    service_src = main_function_source("_reconcile_server_service")
+    check(service_src.index("flush_settings()") < service_src.index("ensure_running"), "the server service is started only after the waiting save is on disk")
+    probe_src = main_function_source("_priority_probe_pending_schedule")
+    check("save_settings_async(force=True)" not in probe_src and "save_settings_async()" in probe_src,
+          "stored background probe results ask for a save instead of writing on the calling thread")
+    check("save_settings_async(force=True)" not in main_function_source("_probe_and_patch_durations"), "the commercial check's final save only asks")
+
+
+def suite_pending_signature():
+    ns = {}
+    exec(main_function_code("_pending_paths_signature"), ns)
+    exec(main_function_code("_stored_pending_signature"), ns)
+    sig, stored = ns["_pending_paths_signature"], ns["_stored_pending_signature"]
+    paths = ["C:\\tv\\b.mkv", "C:\\tv\\a.mkv", "C:\\tv\\c.mkv"]
+    check(sig(paths) == sig(reversed(paths)), "the same pending files give the same fingerprint in any order")
+    check(sig(paths) != sig(paths[:2]), "one file more or less gives another fingerprint")
+    check(len(sig(paths)) == 40, "the fingerprint is 40 characters, not the paths")
+    old_log = {"sched_pending_signature": sorted(paths)}
+    check(stored(old_log) == sig(paths), "a full path list saved by the old version means the same as its fingerprint")
+    check(old_log["sched_pending_signature"] == sig(paths), "and is replaced by the fingerprint in place")
+    check(stored({}) == sig([]), "no saved signature means the same as nothing pending, as before")
+    check(stored({"sched_pending_signature": []}) == sig([]), "an empty old list means nothing pending")
+    check(stored({"sched_pending_signature": sig(paths)}) == sig(paths), "a saved fingerprint is read as it is")
+    body = main_function_source("calculate_slotted_playback_state")
+    check("_stored_pending_signature(playback_log) != _pending_signature" in body and "tuple(sorted(" not in body.split("_pending_changed")[0][-400:],
+          "the scheduler compares fingerprints, not full path lists")
+
+
+def suite_pending_probe_once():
+    import performance_governor as gov
+    ns = {"os": os, "time": time, "threading": threading, "db": mock.MagicMock(), "log": mock.MagicMock(),
+          "_channel_is_server_streamed": lambda ch: False, "initialize_vlc_on_demand": lambda: None,
+          "_governor_priority_scope": gov.priority_scope, "set_live_playback_priority": lambda on: None,
+          "performance_governor": gov, "_PENDING_SCHEDULE_PROBE_PARALLEL": 1, "_PENDING_PROBE_URGENT_COUNT": 4,
+          "media": media, "_pending_backlog_may_run": lambda state, now_m: True}
+    probed = []
+    stored = []
+    ns.update({"_read_file_probe_facts": lambda path: {},
+               "_probe_duration_and_dims_combined": lambda path: probed.append(path) or (60.0, None),
+               "_patch_probed_gain": lambda kind, ch, sub, path, duration=None, dims=None: stored.append(path)})
+    exec(main_assignment_code("_PENDING_PROBE_REQUEST_STALE_SECONDS"), ns)
+    exec(main_assignment_code("_pending_probe_state"), ns)
+    ns["_PENDING_PROBE_RETRY_SECONDS"] = 0.05
+    exec(main_function_code("_probe_pending_schedule_one"), ns)
+    exec(main_function_code("_pending_probe_worker"), ns)
+    exec(main_function_code("_priority_probe_pending_schedule"), ns)
+    tracks = [{"path": "/m/a.mp4"}, {"path": "/m/b.mp4"}]
+    ns["_priority_probe_pending_schedule"]("19", "schedules", "4-8am", tracks)
+    time.sleep(2.5)
+    check(sorted(probed) == sorted(os.path.normpath(t["path"]) for t in tracks),
+          "a file whose result waits to be stored is probed once, not again every retry (%d probes)" % len(probed))
+    ns["_priority_probe_pending_schedule"]("19", "schedules", "4-8am", tracks)
+    check(sorted(stored) == sorted(os.path.normpath(t["path"]) for t in tracks), "each file is stored once (%s)" % stored)
+    check(ns["_pending_probe_state"]["awaiting_store"] == set(), "a stored result is no longer waiting")
+    time.sleep(0.4)
+    check(len(probed) >= 3, "once stored, a file the library still lacks is tried again after the retry time")
+    ns["_priority_probe_pending_schedule"]("19", "schedules", "4-8am", [])
+
+
+class TestSettingsWriter(_SectionCase):
+    """Settings are written by one writer thread at most 2 s after a change, compact, and flushed on quit"""
+
+    def test_settings_writer(self):
+        self.run_section(suite_settings_writer)
+
+
+class TestPendingSignature(_SectionCase):
+    """A block's pending files are remembered as a fingerprint; an old saved list means the same"""
+
+    def test_pending_signature(self):
+        self.run_section(suite_pending_signature)
+
+
+class TestPendingProbeOnce(_SectionCase):
+    """A pending file whose result waits to be stored is not probed and stored again"""
+
+    def test_pending_probe_once(self):
+        self.run_section(suite_pending_probe_once)
+
+
+# ============================================================================
+# SECTION: Show changes and tunes (V290, log audit stage 2: L3, L4, L5, L10)
+# ============================================================================
+
+
+def _stall_busy_marker(release):
+    release.wait(5.0)
+
+
+def suite_stall_stack():
+    import performance_governor as gov
+    check((gov.STALL_STACK_FIRST_MS, gov.STALL_STACK_REPEAT_MS, gov.STALL_STACK_MAX_PER_FRAME, gov.STALL_STACK_DEPTH) == (1000, 2000, 6, 14),
+          "the stall-stack values live in the governor")
+    lines = []
+    ns = {"os": os, "sys": sys, "time": time, "threading": threading, "app_state": {"current_channel": "05"},
+          "_app_shutting_down": threading.Event(),
+          "log": types.SimpleNamespace(warning=lambda msg, *a: lines.append(msg % a)),
+          "_main_frame_clock": {"start": None, "n": 0, "sampled_n": -1, "samples": 0, "last_sample": 0.0},
+          "STALL_STACK_FIRST_MS": 200, "STALL_STACK_REPEAT_MS": 300, "STALL_STACK_MAX_PER_FRAME": 2, "STALL_STACK_DEPTH": 14}
+    _exec_emulator_functions(ns, "_stall_stack_text", "_make_stall_stack_tick")
+    tick = ns["_make_stall_stack_tick"]()
+    clock = ns["_main_frame_clock"]
+    tick()
+    check(lines == [], "nothing is written before the main loop has started a frame")
+    clock["start"], clock["n"] = time.monotonic(), 1
+    tick()
+    check(lines == [], "a frame shorter than the first value writes nothing")
+    release = threading.Event()
+    results = []
+
+    def sampler():
+        time.sleep(0.3)
+        tick()
+        tick()
+        time.sleep(0.35)
+        tick()
+        time.sleep(0.35)
+        tick()
+        results.append(list(lines))
+        release.set()
+    worker = threading.Thread(target=sampler)
+    clock["start"] = time.monotonic()
+    worker.start()
+    _stall_busy_marker(release)
+    worker.join(5.0)
+    got = results[0] if results else []
+    check(len(got) == 2, "a long frame writes its first line, waits the repeat time for the next, and stops at the most per frame (%d)" % len(got))
+    check(got and "[STALL STACK] frame 1 has run" in got[0] and "on channel 05" in got[0], "the line names the frame, its running time and the channel")
+    check(got and "_stall_busy_marker" in got[0] and "test_suite.py" in got[0] and " > " in got[0],
+          "the line names where the screen thread is: file, line and function, innermost last (%s)" % (got[:1],))
+    lines.clear()
+    clock["start"], clock["n"] = time.monotonic() - 0.5, 2
+    tick()
+    check(len(lines) == 1 and "frame 2" in lines[0], "a new long frame starts its own count")
+    ns["_app_shutting_down"].set()
+    lines.clear()
+    clock["start"], clock["n"] = time.monotonic() - 0.5, 3
+    tick()
+    check(lines == [], "nothing is written while the app closes")
+    loop_top = MAIN_SRC[MAIN_SRC.index("\nwhile True:\n    _prof_begin()"):][:200]
+    check('_main_frame_clock["start"] = time.monotonic()' in loop_top and '_main_frame_clock["n"] += 1' in loop_top,
+          "the main loop writes the start of every frame")
+    sched = main_function_source("_background_watchdog_scheduler")
+    check('("stall_stack", 1.0, _stall_stack_tick' in sched, "the check runs once a second on the shared watchdog thread, no new thread")
+
+
+def suite_open_in_flight():
+    ns = {"time": time, "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 8.0, "WEDGED_STOP_TIMEOUT_S": 5, "PRE_OPEN_DIMS_PROBE_BOUND_S": 0.35}
+    _exec_emulator_functions(ns, "_engine_open_in_flight")
+    flight = ns["_engine_open_in_flight"]
+    engine = types.SimpleNamespace(_open_inflight=None)
+    check(flight(engine) is False and flight(None) is False, "no open in flight when nothing is opening")
+    engine._open_inflight = (7, time.monotonic())
+    check(flight(engine) is True, "an open that has not handed its file to VLC is in flight")
+    engine._open_inflight = (7, time.monotonic() - 30.0)
+    check(flight(engine) is False, "a mark older than the longest an open can take counts as gone, so a lost mark never blocks for good")
+    play = MAIN_SRC[MAIN_SRC.index("def play_file_segmented(self, filepath"):MAIN_SRC.index("def _display_dims_from_player(self)")]
+    check("self._open_inflight = (_attempt_id, time.monotonic())" in play, "every play marks its open as in flight from the start")
+    wrapper = play[play.index("def _open_and_play(verify_off_thread=False):"):play.index("def _open_and_play_steps(")]
+    check("finally:" in wrapper and "_open_handed_over()" in wrapper, "the mark is cleared once the file is handed to VLC or the open gives up")
+    check(play.count("_open_handed_over()") >= 3, "the missing-file refusal and the wedged-stop give-up clear the mark too")
+    loop = MAIN_SRC[MAIN_SRC.index("# SECTION: Video end & stall detection"):]
+    check("_engine_open_in_flight(vlc_engine)" in loop[:loop.index("is_video_finished = False") + 600],
+          "while an open is in flight the end-of-video check and the watchdog wait")
+    mid = loop[:loop.index("Mid-stream content change on ch")]
+    check("and not _open_confirm_pending\n" in mid[-2500:], "the mid-stream check waits while an open is in flight, so a slow tune never opens the same file twice")
+
+
+def suite_next_item_prep():
+    import performance_governor as gov
+    check(gov.NEXT_ITEM_PREP_ITEMS == 3 and gov.NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS == 60.0, "the next-item values live in the governor")
+    timeline = [{"path": "/tv/now.mkv"}, {"path": "/ads/a.mp4", "is_commercial": True}, {"path": "/tv/next.mkv"},
+                {"path": "/ads/a.mp4"}, {"path": "/music/song.mp3"}, {"path": "/tv/later.avi"}, {"path": "/tv/much_later.mkv"}]
+    ns = {"os": os, "media": media, "NEXT_ITEM_PREP_ITEMS": 3,
+          "_next_n_from_block_timeline": lambda ch, cur, n=4: timeline[:n],
+          "_scan_snapshot_channel": lambda ch: None}
+    _exec_emulator_functions(ns, "_next_item_prep_paths", "_next_n_from_ordered", "_paths_from_entry")
+    norm = os.path.normpath
+    got = ns["_next_item_prep_paths"]("05", "/tv/now.mkv")
+    check(got == [norm("/ads/a.mp4"), norm("/tv/next.mkv")], "the next items of the block, nearest first, each once, never the playing file (%s)" % got)
+    ns["NEXT_ITEM_PREP_ITEMS"] = 6
+    got = ns["_next_item_prep_paths"]("05", "/tv/now.mkv")
+    check(got == [norm("/ads/a.mp4"), norm("/tv/next.mkv"), norm("/tv/later.avi"), norm("/tv/much_later.mkv")], "songs are left out (%s)" % got)
+    ns["NEXT_ITEM_PREP_ITEMS"] = 3
+    ns["_next_n_from_block_timeline"] = lambda ch, cur, n=4: None
+    ns["_scan_snapshot_channel"] = lambda ch: {"ordered": [{"path": "/tv/x.mkv"}, {"path": "/tv/now.mkv"}, {"path": "/tv/y.mkv"},
+                                                           {"is_pair": True, "path": "/tv/p1.mkv", "pair_ep1_path": "/tv/p1.mkv", "pair_ep2_path": "/tv/p2.mkv"}]}
+    got = ns["_next_n_from_block_timeline"]("05", "/tv/now.mkv") is None and ns["_next_item_prep_paths"]("05", "/tv/now.mkv")
+    check(got and got[0] == norm("/tv/y.mkv") and norm("/tv/now.mkv") not in got, "with no cached timeline the saved lineup gives the next items (%s)" % got)
+    ns["_scan_snapshot_channel"] = lambda ch: None
+    check(ns["_next_item_prep_paths"]("05", "/tv/now.mkv") == [], "no known order means nothing to prepare")
+
+    scanned = []
+    infos = []
+    pending = threading.Event()
+    app = {"_live_playback_channel": "05"}
+    ns2 = {"os": os, "time": time, "threading": threading, "app_state": app, "media": media,
+           "_app_shutting_down": threading.Event(), "NEXT_ITEM_PREP_ITEMS": 3, "NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS": 60.0,
+           "PICTURE_BOX_PAUSE_RECHECK_SECONDS": 0.05, "_LOUDNESS_PRIORITY_PENDING": pending,
+           "performance_governor": types.SimpleNamespace(first_start_scan_plan=lambda: (False, "weak PC")),
+           "_log_swallowed": lambda where, error: None, "_picture_box_done": {norm("/tv/done.mkv")}, "_scan_pb_has_box": set(),
+           "_cached_path_exists": lambda p: True,
+           "_next_item_prep_paths": lambda ch, f: [norm("/ads/a.mp4"), norm("/tv/done.mkv"), norm("/tv/next.mkv")],
+           "_picture_box_before_loudness": lambda p: scanned.append((p, threading.current_thread().name)),
+           "log": types.SimpleNamespace(info=lambda msg, *a: infos.append(msg % a), warning=lambda msg, *a: infos.append(msg % a))}
+    exec(compile(MAIN_SRC[MAIN_SRC.index("_next_item_prep_state = {"):MAIN_SRC.index("\n", MAIN_SRC.index("_next_item_prep_state = {"))], "<state>", "exec"), ns2)
+    _exec_emulator_functions(ns2, "_request_next_item_prep", "_first_start_scans_run_alone", "_next_item_prep_worker")
+    pending.set()
+    ns2["_request_next_item_prep"]("05", "/tv/now.mkv")
+    time.sleep(0.3)
+    check(scanned == [], "on a PC that runs first-start scans in sequence, nothing is scanned beside the playing file's own scans")
+    pending.clear()
+    time.sleep(0.4)
+    check([p for p, _t in scanned] == [norm("/ads/a.mp4"), norm("/tv/next.mkv")], "then the next items without a picture box are scanned, nearest first (%s)" % scanned)
+    check(all(t == "NextItemPrep" for _p, t in scanned), "on the NextItemPrep thread, never on the screen thread")
+    check(any("[NEXT ITEM] ch05: picture box ready ahead for a.mp4, next.mkv" in i for i in infos), "one line says what was made ready (%s)" % infos)
+    scanned.clear()
+    ns2["_request_next_item_prep"]("07", "/tv/now.mkv")
+    time.sleep(0.3)
+    check(scanned == [], "a request for a channel that is not on air any more does nothing")
+    ns2["_app_shutting_down"].set()
+    ns2["_next_item_prep_state"]["wake"].set()
+    conf = main_function_source("_confirm_playback_started")
+    check("_request_next_item_prep(ch_key, file_path)" in conf, "every confirmed start of a show or commercial asks for the next items to be made ready")
+
+
+def suite_lane_hold_named():
+    seq = [("pause", "background scans are paused"), ("pause", "background scans are paused"),
+           ("first_start", "weak PC"), (None, "")]
+    infos = []
+    ns = {"time": time, "_app_shutting_down": types.SimpleNamespace(wait=lambda s: False),
+          "_picture_box_lane_hold_reason": lambda: seq.pop(0), "PICTURE_BOX_PAUSE_RECHECK_SECONDS": 0.0,
+          "log": types.SimpleNamespace(info=lambda msg, *a: infos.append(msg % a))}
+    _exec_emulator_functions(ns, "_picture_box_lane_wait")
+    check(ns["_picture_box_lane_wait"]() is False, "the lane goes on when nothing holds it")
+    check(sum("lane waiting: background scans are paused" in i for i in infos) == 1, "a pause hold is named once when it starts (%s)" % infos)
+    check(sum("first-start scans run in sequence" in i for i in infos) == 1, "a first-start hold is named once")
+    resumed = [i for i in infos if "lane resumed" in i]
+    check(len(resumed) == 1 and "first_start" in resumed[0] and "pause" in resumed[0], "the resume line says how long each hold lasted (%s)" % resumed)
+
+
+def suite_gpu_rating():
+    import performance_governor as gov
+    cases = {
+        "NVIDIA GeForce GT 1030": ("nvidia", 2016, "B", ("h264", "hevc", "vp9")),
+        "Intel(R) HD Graphics 4600": ("intel", 2013, "A", ("h264",)),
+        "Intel(R) UHD Graphics 630": ("intel", 2017, "B", ("h264", "hevc", "vp9")),
+        "NVIDIA GeForce RTX 3060": ("nvidia", 2020, "C", ("h264", "hevc", "vp9", "av1")),
+        "AMD Radeon RX 580 Series": ("amd", 2016, "B", ("h264", "hevc")),
+        "Intel(R) HD Graphics 5500": ("intel", 2014, "B", ("h264",)),
+        "Mobile Intel(R) 4 Series Express Chipset Family (GMA 4500)": ("intel", 2008, "A", ()),
+    }
+    for name, (vendor, year, age, decoders) in cases.items():
+        r = gov.rate_gpu(name)
+        check((r["vendor"], r["year"], r["class"], r["decoders"]) == (vendor, year, age, decoders),
+              "%s rates as %s ~%s class %s %s (%s)" % (name, vendor, year, age, decoders, r))
+    odd = gov.rate_gpu("Some Future Card 9000")
+    check(odd["family"] == "unknown" and odd["decoders"] is None, "a chip the table does not know is unknown, not 'no decoder'")
+    check(gov.rate_gpu("Microsoft Basic Render Driver")["software"], "the Windows software renderer is not a real card")
+    best = gov.rate_gpus(["Intel(R) HD Graphics 4600", "NVIDIA GeForce GT 1030", "Microsoft Basic Render Driver"])
+    check([r["name"] for r in best] == ["NVIDIA GeForce GT 1030", "Intel(R) HD Graphics 4600"],
+          "the newest card with a decoder comes first and the software renderer is left out")
+    text = gov.gpu_rating_text(best[0])
+    check("~2016" in text and "decodes h264/hevc/vp9" in text, "the boot line says the card's year and formats (%s)" % text)
+    profile = gov.MachineProfile(gpu_tier="dedicated", gpu_names=("NVIDIA GeForce GT 1030",))
+    with mock.patch.object(gov.os, "name", "nt"):
+        check(gov.vlc_hw_decode_allowed(profile), "a card with a decoder lets VLC decode on it")
+        check(gov.vlc_hw_decode_allowed(gov.MachineProfile(gpu_tier="onboard", gpu_names=("Future Chip X",))),
+              "an unknown card may try; VLC falls back to the CPU by itself")
+        check(not gov.vlc_hw_decode_allowed(gov.MachineProfile(gpu_tier="onboard", gpu_names=("Intel GMA 950",))),
+              "a card with no decoder is not asked")
+        check(not gov.vlc_hw_decode_allowed(gov.MachineProfile(gpu_tier="none", gpu_names=())),
+              "no real card, no hardware decoding")
+        with mock.patch.object(gov, "VLC_HW_DECODE_ENABLED", False):
+            check(not gov.vlc_hw_decode_allowed(profile), "the switch turns it off")
+    with mock.patch.object(gov.os, "name", "posix"):
+        check(not gov.vlc_hw_decode_allowed(profile), "only on Windows")
+    scan = gov.run_boot_scan(profile, cpu_name="Intel(R) Core(TM) i5-4570 CPU @ 3.20GHz", avx2=True)
+    check(scan["gpus"] and scan["gpus"][0]["name"] == "NVIDIA GeForce GT 1030" and scan["gpu_class"] == "B",
+          "the boot scan carries the GPU rating")
+
+
+def suite_vlc_decode_threads():
+    import performance_governor as gov
+    check(not hasattr(gov, "VLC_AVCODEC_THREADS_BY_TIER"), "the per-tier thread table is replaced by the core formula")
+    got = {}
+    for cores in (1, 2, 4, 8, 16):
+        profile = gov.MachineProfile(physical_cores=cores, logical_cores=cores, effective_physical=cores, tier="WEAK")
+        with mock.patch.object(gov, "_shell_boost", lambda mode, p: False):
+            got[cores] = gov.vlc_decoder_threads(profile)
+    check(got == {1: 1, 2: 1, 4: 3, 8: 4, 16: 4}, "decode threads follow the cores, one left for the screen, at most 4 (%s)" % got)
+
+
+def suite_video_hw_decode_request():
+    src = MAIN_SRC
+    block = src[src.index("def _open_and_play_steps(verify_off_thread=False):"):]
+    block = block[:block.index("_opened_at_position = False")]
+    check('elif self.engine_label != "dvd" and not is_dvd_iso and _main_video_hw_decode_allowed():' in block
+          and block.count('media.add_option(":avcodec-hw=any")') == 2,
+          "the main engine asks VLC for card decoding on each file, the DVD engine keeps its own rule")
+    ns = {"performance_governor": types.SimpleNamespace(vlc_hw_decode_allowed=lambda: True),
+          "_log_warn_throttled": lambda *a, **k: None}
+    _exec_emulator_functions(ns, "_main_video_hw_decode_allowed")
+    check(ns["_main_video_hw_decode_allowed"]() is True, "the governor's rating decides")
+
+    def _boom():
+        raise RuntimeError("x")
+    ns["performance_governor"] = types.SimpleNamespace(vlc_hw_decode_allowed=_boom)
+    check(ns["_main_video_hw_decode_allowed"]() is False, "a failed check leaves decoding on the CPU")
+    ns["performance_governor"] = None
+    check(ns["_main_video_hw_decode_allowed"]() is False, "no governor, CPU decoding")
+
+
+def suite_video_decode_reader():
+    out = []
+    start = MAIN_SRC.index("_vlc_decode_watch = {")
+    end = MAIN_SRC.index("def _vlc_log_writer_loop():")
+    ns = {"os": os, "log": types.SimpleNamespace(info=lambda msg, *a: out.append(msg % a))}
+    exec(compile(MAIN_SRC[start:end], "<decode-reader>", "exec"), ns)
+    feed = ns["_note_vlc_decode_line"]
+    off_run = [
+        "[06:01:51.347] avcodec debug: codec (h264) started",
+        '[06:01:51.347] main debug: using video decoder module "avcodec"',
+        "[06:01:51.394] avcodec debug: codec (ac3) started",
+        "[06:01:51.425] main debug: `file:///C:/Users/S/Videos/Counting%20Cars.mkv' successfully opened",
+        "[06:01:51.441] main debug: original format sz 1280x720, of (0,0), vsz 1280x720, 4cc DX11, sar 1:1",
+        '[06:01:51.456] main debug: looking for hw decoder module matching "none": 2 candidates',
+        "[06:01:51.456] main debug: no hw decoder modules matched",
+        "[06:01:51.488] main debug: original format sz 1280x720, of (0,0), vsz 1280x720, 4cc DXA9, sar 1:1",
+        '[06:01:51.488] main debug: looking for hw decoder module matching "none": 2 candidates',
+        "[06:01:51.488] main debug: no hw decoder modules matched",
+        "[06:01:51.488] main debug: original format sz 1280x738, of (0,0), vsz 1280x720, 4cc I420, sar 1:1",
+        "[06:01:52.000] main debug: original format sz 1280x738, of (0,0), vsz 1280x720, 4cc I420, sar 1:1",
+    ]
+    for line in off_run:
+        feed(line)
+    check(out == ["[VIDEO DECODE] CPU decodes Counting Cars.mkv (h264, I420): graphics card decoding is switched off for this file"],
+          "the owner's old run reads as switched off, one line per video (%s)" % out)
+    del out[:]
+    hw_run = [
+        "avcodec debug: codec (hevc) started", 'main debug: using video decoder module "avcodec"',
+        "main debug: `file:///C:/m/Show%20One.mkv' successfully opened",
+        "d3d11va info: Using D3D11VA (NVIDIA GeForce GT 1030, vendor 10de(NVIDIA)) for hardware decoding",
+        "main debug: original format sz 1280x720, of (0,0), vsz 1280x720, 4cc DX11, sar 1:1",
+        'main debug: using hw decoder module "d3d11va"',
+    ]
+    for line in hw_run:
+        feed(line)
+    check(len(out) == 1 and out[0].startswith("[VIDEO DECODE] graphics card decodes Show One.mkv (hevc, d3d11va, D3D11VA (NVIDIA GeForce GT 1030")
+          and "for hardware decoding" not in out[0], "a card decode names the file, the format and the card (%s)" % out)
+    del out[:]
+    for line in ("avcodec debug: codec (h264) started", 'main debug: using video decoder module "avcodec"',
+                 "main debug: `file:///C:/m/Hi10.mkv' successfully opened",
+                 "main debug: original format sz 1, 4cc DX11, x", "main debug: no hw decoder modules matched",
+                 "main debug: original format sz 1, 4cc I420, x"):
+        feed(line)
+    check(out == ["[VIDEO DECODE] CPU decodes Hi10.mkv (h264, I420): the graphics card could not open this file's format"],
+          "a format the card cannot open falls back to the CPU and says so (%s)" % out)
+    del out[:]
+    for line in ("avcodec debug: codec (mpeg4) started", 'main debug: using video decoder module "avcodec"',
+                 "main debug: `file:///C:/m/Old.avi' successfully opened", "main debug: original format sz 1, 4cc I420, x"):
+        feed(line)
+    check(out == ["[VIDEO DECODE] CPU decodes Old.avi (mpeg4, I420): the graphics card has no decoder for this format"],
+          "a format with no card decoder says so (%s)" % out)
+    writer = get_function_source("_vlc_log_writer_loop")
+    check(writer.index("_note_vlc_decode_line(line_text)") < writer.index("f.write(line_text"),
+          "the reader runs on the VLC log writer thread, not VLC's own thread")
+
+
+def suite_governor_frame_time():
+    import performance_governor as gov
+    w = gov.BusyWindow(window_seconds=10.0)
+    for i in range(20):
+        w.add(20.0, 100.0 + i * 0.05, 1000.0 / 30.0, "menu")
+    ratio, worst, n = w.ratio_stats(101.0, "menu", 1000.0 / 60.0)
+    check(n == 20 and abs(ratio - 0.6) < 0.01, "a 20 ms Lite-menu frame at 30 fps is 60%% of its time, not 120%% (%s)" % ratio)
+    w.add(400.0, 101.0, 1000.0 / 30.0, "menu")
+    ratio2, worst2, _ = w.ratio_stats(101.0, "menu")
+    check(abs(ratio2 - 0.6) < 0.01 and worst2 > 10, "one slow frame raises the worst, not the busy share")
+    for i in range(10):
+        w.add(15.0, 101.0, 1000.0 / 60.0, "video")
+    check(w.ratio_stats(101.0, "video")[2] == 10, "each screen's frames are judged on their own")
+    old = gov.BusyWindow(window_seconds=10.0)
+    old.add(8.0, 5.0)
+    check(old.ratio_stats(5.0, None, 16.0)[0] == 0.5 and old.stats(5.0)[0] == 8.0, "frames without a frame time use the fallback")
+    for name in ("_governor_screen_kind", "_governor_note_tick_wait"):
+        check(("def %s(" % name) in MAIN_SRC, "%s is in the main script" % name)
+    check("_governor_note_tick_wait((time.perf_counter() - _gov_tick_t0) * 1000.0, _tick_fps, _governor_screen_kind(_gd))" in MAIN_SRC,
+          "the loop hands the governor the rate it really waited for and the screen")
+    feed = {"tick_wait_ms": 0.0, "tick_budget_ms": None, "tick_kind": None}
+    ns = {"_governor_feed": feed, "app_state": {"is_playing_video": True},
+          "_lite_menu_screen_active": lambda gd: False}
+    _exec_emulator_functions(ns, "_governor_screen_kind", "_governor_note_tick_wait")
+    ns["_governor_note_tick_wait"](3.0, 30.0, ns["_governor_screen_kind"](None))
+    check(abs(feed["tick_budget_ms"] - 33.333) < 0.01 and feed["tick_kind"] == "video" and feed["tick_wait_ms"] == 3.0,
+          "the feed keeps the wait, the frame time and the screen")
+    ns["_lite_menu_screen_active"] = lambda gd: True
+    check(ns["_governor_screen_kind"](None) == "menu", "a menu screen counts as menu")
+    check(ns["_governor_screen_kind"](types.SimpleNamespace(mode="GAME", _libretro_core=object())) == "game", "a running game counts as game")
+
+
+def suite_governor_own_load():
+    import performance_governor as gov
+
+    def run(own, added, seconds, learn_first=False):
+        t = gov.Throttle(1000.0 / 60.0)
+        now = 5000.0
+        if learn_first:
+            t.update({"busy_ratio": own, "busy_kind": "video", "background_active": False}, now)
+        levels = []
+        for _ in range(seconds):
+            r = own + added * gov.LEVEL_FACTOR[t.level]
+            t.update({"busy_ratio": r, "busy_worst_ratio": r, "busy_kind": "video",
+                      "background_active": True, "background_lanes": "probe_and_duration"}, now)
+            levels.append(t.level)
+            now += 1.0
+        return t, levels
+
+    t, levels = run(1.12, 0.05, 120)
+    check(max(levels[-60:]) == 0 and t.own_load("video") is not None and t.own_load("video") > 1.1,
+          "a screen over its time by itself is learned as its own load and the scans are not held (%s)" % levels[-60:])
+    t, levels = run(1.15, 0.6, 120)
+    check(min(levels[-60:]) >= 2, "real background pressure still narrows the scans (%s)" % levels[-60:])
+    t, levels = run(0.7, 0.9, 60, learn_first=True)
+    check(abs(t.own_load("video") - 0.7) < 1e-9 and max(levels) >= 1, "the calm reading is the own load and the extra is blamed")
+    t = gov.Throttle(1000.0 / 60.0)
+    t.update({"busy_ratio": 0.9, "busy_kind": "menu", "background_active": False}, 100.0)
+    t.update({"busy_ratio": 0.5, "busy_kind": "menu", "background_active": True}, 101.0)
+    check(abs(t.own_load("menu") - 0.5) < 1e-9, "a lighter reading lowers the own load at once")
+    check(t.own_load("video") is None, "each screen learns its own")
+    t = gov.Throttle(1000.0 / 60.0)
+    t.note_event("channel_change", now=200.0)
+    t.update({"busy_ratio": 3.0, "busy_kind": "video", "background_active": False}, 200.5)
+    check(t.own_load("video") is None, "frames inside an event are not learned")
+    t = gov.Throttle(1000.0 / 60.0)
+    t.update({"busy_ratio": 0.8, "busy_kind": "video", "background_active": False}, 300.0)
+    tgt, reason, _imm = t._target({"busy_ratio": 0.85, "busy_kind": "video", "background_active": True})
+    check(tgt == 0, "background adding less than the minimum excess is not pressure")
+    tgt, reason, _imm = t._target({"busy_ratio": 1.6, "busy_kind": "video", "background_active": True, "background_lanes": "x"})
+    check(tgt == 3 and "own=80%" in reason, "pressure is min(busy, 1 + excess) and the reason names the own load (%s %s)" % (tgt, reason))
+    status = gov.format_status(t, gov.MachineProfile(), {"busy_ratio": 1.2, "busy_kind": "video", "frame_time_ms": 16.7})
+    check("screen=video" in status and "busy=120%" in status and "own=80%" in status and "frame_time=16.7ms" in status,
+          "the status line shows the screen, its frame time, busy and own load (%s)" % status)
+    for name in ("BUSY_RATIO_PERCENTILE", "OWN_LOAD_LEARN_RATE", "OWN_LOAD_SETTLE_SECONDS", "OWN_LOAD_MIN_GAIN",
+                 "OWN_LOAD_MIN_EXCESS", "OWN_LOAD_LOG_STEP", "OWN_LOAD_LOG_INTERVAL_SECONDS", "VLC_HW_DECODE_ENABLED",
+                 "BOOT_SCAN_GPU_TABLE", "BOOT_SCAN_GPU_YEAR_CLASS", "VLC_AVCODEC_THREADS_RESERVED_CORES"):
+        check(hasattr(gov, name), "%s lives in the governor" % name)
+
+
+def suite_build_number_116():
+    tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
+    vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
+    check(vals.get("BUILD_VERSION") == "1.1.6", "build_info.py says 1.1.6 (%s)" % vals)
+
+
+class TestStallStack(_SectionCase):
+    """A main-loop frame that runs past a second writes where the screen thread is"""
+
+    def test_stall_stack(self):
+        self.run_section(suite_stall_stack)
+
+
+class TestOpenInFlight(_SectionCase):
+    """While a play has not handed its file to VLC, the end check and the mid-stream check wait"""
+
+    def test_open_in_flight(self):
+        self.run_section(suite_open_in_flight)
+
+
+class TestNextItemPrep(_SectionCase):
+    """When a show starts, the picture boxes of the next items are made ready on their own thread"""
+
+    def test_next_item_prep(self):
+        self.run_section(suite_next_item_prep)
+
+
+class TestLaneHoldNamed(_SectionCase):
+    """The picture-box lane names every hold and how long each lasted"""
+
+    def test_lane_hold_named(self):
+        self.run_section(suite_lane_hold_named)
+
+
+class TestGpuRating(_SectionCase):
+    """The boot scan rates each graphics card by age and video decoder"""
+
+    def test_gpu_rating(self):
+        self.run_section(suite_gpu_rating)
+
+
+class TestVlcDecodeThreads(_SectionCase):
+    """VLC's CPU decode threads follow the cores"""
+
+    def test_vlc_decode_threads(self):
+        self.run_section(suite_vlc_decode_threads)
+
+
+class TestVideoHwDecodeRequest(_SectionCase):
+    """The main engine asks VLC to decode each video on the graphics card when the rating allows"""
+
+    def test_video_hw_decode_request(self):
+        self.run_section(suite_video_hw_decode_request)
+
+
+class TestVideoDecodeReader(_SectionCase):
+    """One [VIDEO DECODE] line per video says card or CPU and why"""
+
+    def test_video_decode_reader(self):
+        self.run_section(suite_video_decode_reader)
+
+
+class TestGovernorFrameTime(_SectionCase):
+    """Each frame is judged against the frame time it really ran at"""
+
+    def test_governor_frame_time(self):
+        self.run_section(suite_governor_frame_time)
+
+
+class TestGovernorOwnLoad(_SectionCase):
+    """The governor blames background work only for what it adds over the screen's own load"""
+
+    def test_governor_own_load(self):
+        self.run_section(suite_governor_own_load)
+
+
+class TestBuildNumber116(_SectionCase):
+    """This build is 1.1.6"""
+
+    def test_build_number_116(self):
+        self.run_section(suite_build_number_116)
 
 
 if __name__ == "__main__":

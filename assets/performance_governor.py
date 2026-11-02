@@ -113,9 +113,13 @@ DURATION_WORKERS_WHILE_PLAYING_DIVISOR = 3
 LOUDNESS_DISPATCH_WORKERS_BASE = 1
 LOUDNESS_DISPATCH_WORKERS_SPARE = 2
 
-# VALUES CHANGE HERE (VLC video decoder threads per hardware tier; applied once, when the VLC engine is created)
-VLC_AVCODEC_THREADS_BY_TIER = {"WEAK": 1, "LOW": 2, "REFERENCE": 2, "STRONG": 3}
-VLC_AVCODEC_THREADS_DEFAULT = 2
+# VALUES CHANGE HERE (VLC video decoder threads: the PC's effective physical cores less the reserved cores (left for the screen), never below the minimum or above the maximum; applied once, when the VLC engine is created; they do work only when the graphics card cannot decode a file)
+VLC_AVCODEC_THREADS_RESERVED_CORES = 1
+VLC_AVCODEC_THREADS_MIN = 1
+VLC_AVCODEC_THREADS_MAX = 4
+
+# VALUES CHANGE HERE (VLC hardware video decoding: when on, every video file the main engine opens asks VLC to decode on the graphics card, on Windows, when the boot scan found a real graphics card whose rating has a video decoder (or a card it cannot rate); a file the card cannot decode is decoded by the CPU, file by file)
+VLC_HW_DECODE_ENABLED = True
 
 # VALUES CHANGE HERE (Whisper thread formulas; P = effective physical cores)
 WHISPER_THREADS_LITE = 2
@@ -204,6 +208,15 @@ RAM_FINGERPRINT_BUCKET_GB = 4.0
 
 # VALUES CHANGE HERE (signal feed)
 BUSY_WINDOW_SECONDS = 2.0
+# VALUES CHANGE HERE (pressure test: each frame's busy time is judged against the frame time of the rate the app really ran that frame at (Lite menus run at the menu cap, games at the core's rate); the window's busy share is this percentile of those frame shares, so a few slow frames do not read as overload)
+BUSY_RATIO_PERCENTILE = 0.75
+# VALUES CHANGE HERE (the screen's own load, learned per screen (video, menu, game, other): learned while no background work runs, once the load level has held at the top for the settle seconds (all non-priority work is paused then), and when the last narrowing step has held for the settle seconds without lowering the busy share by the minimum gain; a reading below it lowers it at once; background work is blamed only for the share above it, and only when that share is at least the minimum excess; learn rate = how far one reading moves it; a move of at least the log step is logged, at most once per log interval per screen)
+OWN_LOAD_LEARN_RATE = 0.2
+OWN_LOAD_SETTLE_SECONDS = 6.0
+OWN_LOAD_MIN_GAIN = 0.05
+OWN_LOAD_MIN_EXCESS = 0.10
+OWN_LOAD_LOG_STEP = 0.10
+OWN_LOAD_LOG_INTERVAL_SECONDS = 60.0
 STALL_LOG_MS = 100.0
 MIN_BUSY_SAMPLES = 5
 FEED_INTERVAL_SECONDS = 1.0
@@ -278,9 +291,10 @@ ADVANCED_MENU_SCROLL_SPEED_PX = 55
 ADVANCED_MENU_SCROLL_PAUSE_SECONDS = 1.0
 ADVANCED_MENU_SCROLL_STEPS_PER_SECOND = 20
 
-# VALUES CHANGE HERE (Step 8 gates and attribution)
+# VALUES CHANGE HERE (Step 8 gates and attribution; a job that has waited GATE_MAX_WAIT_SECONDS runs anyway, at most GATE_STARVED_MAX_CONCURRENT such jobs at a time, and never while a channel tune or a game holds the machine)
 GATE_POLL_SECONDS = 0.25
 GATE_MAX_WAIT_SECONDS = 60.0
+GATE_STARVED_MAX_CONCURRENT = 1
 
 # VALUES CHANGE HERE (tuning to a channel: background work that has not started yet waits up to this many seconds, or until the channel's first show is playing, so the tune gets the PC to itself)
 TUNE_BACKGROUND_HOLD_SECONDS = 3.0
@@ -315,6 +329,41 @@ BOOT_SCAN_FALLBACK_CLASS = "C"
 BOOT_SCAN_EFFECTS_MAX_MODE = "standard"
 BOOT_SCAN_FINGERPRINT_BUCKET_GB = 4.0
 
+# VALUES CHANGE HERE (boot GPU rating: each graphics chip name is matched against these patterns top to bottom, first match wins: (pattern, vendor, family, about the year it came out, the video formats its decoder plays); an empty format list = no video decoder; a chip that matches nothing is rated "unknown" and is still allowed to try hardware decoding)
+BOOT_SCAN_GPU_TABLE = (
+    (r"basic render|basic display", "microsoft", "software", 0, ()),
+    (r"rtx\s*50\d\d", "nvidia", "rtx 50", 2025, ("h264", "hevc", "vp9", "av1")),
+    (r"rtx\s*40\d\d", "nvidia", "rtx 40", 2022, ("h264", "hevc", "vp9", "av1")),
+    (r"rtx\s*30\d\d|rtx\s*a\d{3,4}", "nvidia", "rtx 30", 2020, ("h264", "hevc", "vp9", "av1")),
+    (r"rtx\s*20\d\d|gtx\s*16\d\d|quadro rtx", "nvidia", "rtx 20 / gtx 16", 2018, ("h264", "hevc", "vp9")),
+    (r"gtx?\s*10[3-8]0|titan x|quadro p\d", "nvidia", "gtx 10 / gt 1030", 2016, ("h264", "hevc", "vp9")),
+    (r"gtx\s*9[5-9]0|gtx\s*750|gtx\s*9\d0m|quadro m\d", "nvidia", "gtx 900 / 750", 2014, ("h264",)),
+    (r"g[tx]{1,2}x?\s*[67]\d0|quadro k\d", "nvidia", "gt/gtx 600-700", 2012, ("h264",)),
+    (r"g[tx]{1,2}x?\s*[45]\d0|quadro [0-9]{3,4}\b", "nvidia", "gt/gtx 400-500", 2010, ("h264",)),
+    (r"geforce|quadro|nvs", "nvidia", "older geforce", 2008, ("h264",)),
+    (r"\barc\b", "intel", "arc", 2022, ("h264", "hevc", "vp9", "av1")),
+    (r"iris\(r\)?\s*xe|uhd graphics 7\d\d|uhd graphics$|intel\(r\) graphics$", "intel", "xe", 2020, ("h264", "hevc", "vp9", "av1")),
+    (r"uhd graphics 6\d\d\b|hd graphics 6\d\d\b|iris\(r\)?\s*plus graphics 6\d\d\b", "intel", "uhd/hd 600", 2017, ("h264", "hevc", "vp9")),
+    (r"hd graphics 5\d\d\b|iris\(r\)?\s*(pro )?graphics 5\d\d\b|iris\(r\)?\s*plus graphics 6[45]0", "intel", "hd 500", 2015, ("h264", "hevc")),
+    (r"hd graphics [56]\d{3}|iris\(r\)?\s*(pro )?graphics 6\d{3}", "intel", "hd 5000-6000", 2014, ("h264",)),
+    (r"hd graphics 4\d{3}|iris\(r\)?\s*(pro )?graphics 5\d{3}", "intel", "hd 4000-5000 (haswell)", 2013, ("h264",)),
+    (r"hd graphics (2500|4000)", "intel", "hd 2500/4000", 2012, ("h264",)),
+    (r"hd graphics", "intel", "hd graphics (older)", 2011, ("h264",)),
+    (r"\bgma\b|media accelerator", "intel", "gma", 2008, ()),
+    (r"rx\s*9\d{3}", "amd", "rx 9000", 2025, ("h264", "hevc", "vp9", "av1")),
+    (r"rx\s*7\d{3}|radeon 7[0-9]0m", "amd", "rx 7000", 2022, ("h264", "hevc", "vp9", "av1")),
+    (r"rx\s*6\d{3}|radeon 6[0-9]0m", "amd", "rx 6000", 2020, ("h264", "hevc", "vp9", "av1")),
+    (r"rx\s*5\d{3}\b", "amd", "rx 5000", 2019, ("h264", "hevc", "vp9")),
+    (r"vega|radeon\(tm\)? graphics$|radeon graphics$|radeon vii", "amd", "vega / apu", 2017, ("h264", "hevc", "vp9")),
+    (r"rx\s*[45][0-9]0\b|rx\s*5[0-9]0x?\b", "amd", "rx 400-500", 2016, ("h264", "hevc")),
+    (r"r[579]\s*[23m]\d\d|r9 fury|r9 nano", "amd", "r5/r7/r9", 2013, ("h264",)),
+    (r"hd\s*[78]\d{3}", "amd", "hd 7000-8000", 2012, ("h264",)),
+    (r"hd\s*[56]\d{3}", "amd", "hd 5000-6000", 2010, ("h264",)),
+    (r"radeon|firepro|ati ", "amd", "older radeon", 2008, ("h264",)),
+)
+# VALUES CHANGE HERE (GPU age class from its year: up to the first year = A (old), up to the second = B, newer = C)
+BOOT_SCAN_GPU_YEAR_CLASS = ((2013, "A"), (2018, "B"), (9999, "C"))
+
 
 # VALUES CHANGE HERE (GPU frame path: adapter choice "monitor" or "fastest"; start-up self-check picture size, per-channel tolerance out of 255 and the share of values allowed past it; failures in a row before the GPU path is switched off for the run; device losses allowed per run; seconds to wait before reopening after a failure; frames of one path collected before a [GPU FRAME] log line is written)
 GPU_ADAPTER_POLICY = "monitor"
@@ -329,6 +378,12 @@ GPU_FRAME_LOG_INTERVAL_FRAMES = 600
 # VALUES CHANGE HERE (menu key trace: key events landing in one frame that write a [MENU NAV BURST] warning; loop profile: frames collected before a [LOOP PROFILE] line is written, 0 = off)
 MENU_NAV_BURST_WARN_EVENTS = 3
 LOOP_PROFILE_LOG_INTERVAL_FRAMES = 600
+
+# VALUES CHANGE HERE (stall stacks: when one main-loop frame has run longer than the first ms, a [STALL STACK] line in app_log.txt names where the screen thread is, again every repeat ms while that frame goes on, at most the max lines per frame, each with the innermost depth calls)
+STALL_STACK_FIRST_MS = 1000
+STALL_STACK_REPEAT_MS = 2000
+STALL_STACK_MAX_PER_FRAME = 6
+STALL_STACK_DEPTH = 14
 
 # VALUES CHANGE HERE (guide history rebuild: most recent missed block occurrences recorded per channel at a block change)
 GUIDE_REPLAY_MAX_BLOCKS = 60
@@ -874,6 +929,10 @@ DIALOGUE_CACHE_MAX_ENTRIES = 64
 CATCH_UP_REUSE_SECONDS = 2.0
 COMMERCIAL_MAX_SECONDS = 5 * 60
 BREAK_MAX_PER_HALF_HOUR = 2
+
+# VALUES CHANGE HERE (media.py, settings save: a change to retro_config.json is written by the settings writer thread at most this many seconds after it was asked for, and every change asked for in that time goes into the same write (owner 2026-11-02: 2 seconds); one [SETTINGS SAVE] summary line is written at most once per report seconds)
+SETTINGS_SAVE_DELAY_SECONDS = 2.0
+SETTINGS_SAVE_REPORT_SECONDS = 60.0
 
 # ============================================================================
 # SECTION: Menu and guide drawing values (read by ui.py)
@@ -1534,9 +1593,10 @@ def apply_cv2_threads(mode=None):
 
 
 def vlc_decoder_threads(profile=None):
-    """Video decoder thread count for the VLC engine, chosen from the hardware tier."""
+    """Video decoder thread count for the VLC engine, chosen from the PC's effective physical cores."""
     profile = profile or get_profile()
-    value = int(VLC_AVCODEC_THREADS_BY_TIER.get(profile.tier, VLC_AVCODEC_THREADS_DEFAULT))
+    value = int(profile.effective_physical) - VLC_AVCODEC_THREADS_RESERVED_CORES
+    value = max(VLC_AVCODEC_THREADS_MIN, min(VLC_AVCODEC_THREADS_MAX, value))
     if _shell_boost(_state["mode"], profile):
         value += SHELL_VLC_AVCODEC_THREAD_BONUS
     return value
@@ -2471,6 +2531,10 @@ GAME_DISPLAY_ASPECTS = {"NES": 4.0 / 3.0, "SNES": 4.0 / 3.0}
 PICTURE_BOX_PRE_SHOW_BUDGET_S = 8.0
 PICTURE_BOX_PRE_SHOW_PARALLEL = 6
 
+# VALUES CHANGE HERE (next-item prep: when a file starts on the channel on air, the picture boxes of the next this-many items of its block are scanned ahead, nearest first, as priority work, so each one opens without a picture-box wait; on a PC whose plan runs first-start scans in sequence it first waits up to the wait seconds for the playing file's own first-start scans)
+NEXT_ITEM_PREP_ITEMS = 3
+NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS = 60.0
+
 
 # ============================================================================
 # SECTION: Picture box, flat-bar detection
@@ -2609,6 +2673,13 @@ class Throttle:
         self._last_unattributed_log = 0.0
         self._quiet_since = None
         self._quiet_announced = False
+        self._own_load = {}
+        self._own_load_logged = {}
+        self._top_since = None
+        self._step_check = None
+        self._last_ratio = None
+        self._last_own_note = 0.0
+        self._own_note = ""
         self._lock = threading.Lock()
 
     def note_event(self, kind, now=None):
@@ -2626,23 +2697,77 @@ class Throttle:
     def event_kind(self):
         return self._event_kind
 
-    def _target(self, signals):
+    def _busy_ratios(self, signals):
+        """(busy share, worst share) of the frame time from the signals; the shares come from the feed, or from the averages and this throttle's frame budget."""
+        ratio = signals.get("busy_ratio")
+        worst = signals.get("busy_worst_ratio")
         budget = self.frame_budget_ms
+        if ratio is None and signals.get("busy_avg_ms") is not None and budget > 0:
+            ratio = signals["busy_avg_ms"] / budget
+        if worst is None and signals.get("busy_worst_ms") is not None and budget > 0:
+            worst = signals["busy_worst_ms"] / budget
+        return ratio, worst
+
+    def own_load(self, kind):
+        """The learned share of the frame time this screen kind uses by itself, or None before it is learned."""
+        return self._own_load.get(str(kind or "screen"))
+
+    def _learn_own_load(self, signals, now):
+        """Learns the screen's own load from a calm reading (no background work, or the top level held long enough), and lowers it at once on any lighter reading."""
+        ratio, _worst = self._busy_ratios(signals)
+        if ratio is None:
+            return
+        kind = str(signals.get("busy_kind") or "screen")
+        own = self._own_load.get(kind)
+        top_settled = (self.level >= MAX_LEVEL and self._top_since is not None
+                       and now - self._top_since >= OWN_LOAD_SETTLE_SECONDS)
+        step = self._step_check
+        no_gain = (step is not None and now - step[0] >= OWN_LOAD_SETTLE_SECONDS
+                   and ratio > step[1] - OWN_LOAD_MIN_GAIN)
+        if own is not None and ratio < own:
+            new = ratio
+            how = "lighter reading"
+        elif signals.get("background_active") is False or top_settled or no_gain:
+            new = ratio if own is None else own + OWN_LOAD_LEARN_RATE * (ratio - own)
+            if signals.get("background_active") is False:
+                how = "no background work"
+            elif top_settled:
+                how = "all background work held"
+            else:
+                how = "narrowing to level %d did not lower it (%d%% before)" % (self.level, round(step[1] * 100))
+        else:
+            return
+        self._own_load[kind] = new
+        logged = self._own_load_logged.get(kind)
+        if logged is None or (abs(new - logged[0]) >= OWN_LOAD_LOG_STEP
+                              and now - logged[1] >= OWN_LOAD_LOG_INTERVAL_SECONDS):
+            self._own_load_logged[kind] = (new, now)
+            log.info("[GOVERNOR] screen's own load %s=%d%% of its frame time (%s)", kind, round(new * 100), how)
+
+    def _target(self, signals):
         target = 0
         reasons = []
         immediate = False
-        avg = signals.get("busy_avg_ms")
-        worst = signals.get("busy_worst_ms")
-        if avg is not None and budget > 0:
-            ratio = avg / budget
+        self._own_note = ""
+        ratio, worst = self._busy_ratios(signals)
+        if ratio is not None:
+            kind = str(signals.get("busy_kind") or "screen")
+            own = self._own_load.get(kind)
+            pressure = ratio
+            if own is not None:
+                excess = ratio - own
+                pressure = min(ratio, 1.0 + excess) if excess >= OWN_LOAD_MIN_EXCESS else 0.0
+                if pressure == 0.0 and ratio >= BUSY_RATIO_LEVELS[0][0]:
+                    self._own_note = "%s busy=%d%% own=%d%%" % (kind, round(ratio * 100), round(own * 100))
             lvl = 0
             for threshold, level in BUSY_RATIO_LEVELS:
-                if ratio >= threshold:
+                if pressure >= threshold:
                     lvl = level
-            if lvl and worst is not None and worst / budget >= WORST_BUMP_RATIO:
+            if lvl and worst is not None and worst - (own or 0.0) >= WORST_BUMP_RATIO:
                 lvl = min(MAX_LEVEL, lvl + 1)
             if lvl:
-                reasons.append("busy_avg=%.1fms(%d%%)" % (avg, round(ratio * 100)))
+                reasons.append("busy=%d%%%s" % (round(ratio * 100),
+                                                (" own=%d%%" % round(own * 100)) if own is not None else ""))
             target = max(target, lvl)
         cpu = signals.get("system_cpu_pct")
         if cpu is not None:
@@ -2683,8 +2808,16 @@ class Throttle:
     def update(self, signals, now=None):
         now = time.monotonic() if now is None else now
         with self._lock:
+            if now >= self._event_until:
+                self._learn_own_load(signals, now)
+            self._last_ratio = self._busy_ratios(signals)[0]
             target, reason, immediate = self._target(signals)
             self._note_quiet(signals, target, now)
+            if (self._own_note and signals.get("background_active")
+                    and now - self._last_own_note >= ATTRIBUTION_LOG_INTERVAL_SECONDS):
+                self._last_own_note = now
+                log.info("[GOVERNOR] frames over their time from the screen's own work, background work not narrowed: %s",
+                         self._own_note)
             if self._unattributed_target > self.level and now - self._last_unattributed_log >= ATTRIBUTION_LOG_INTERVAL_SECONDS:
                 self._last_unattributed_log = now
                 log.info("[GOVERNOR] pressure NOT attributable to background work (none running): would_level=%d (%s)",
@@ -2720,8 +2853,8 @@ class Throttle:
     def _note_quiet(self, signals, target, now):
         """Starts or ends the quiet-PC timer from this tick's signals and logs when the scans speed up or slow back down."""
         cpu = signals.get("system_cpu_pct")
-        avg = signals.get("busy_avg_ms")
-        light = avg is None or self.frame_budget_ms <= 0 or avg / self.frame_budget_ms <= SCAN_QUIET_MAX_BUSY_RATIO
+        ratio, _worst = self._busy_ratios(signals)
+        light = ratio is None or ratio <= SCAN_QUIET_MAX_BUSY_RATIO
         quiet = (target == 0 and self.level == 0 and cpu is not None
                  and cpu <= SCAN_QUIET_MAX_SYSTEM_CPU_PCT and light)
         if quiet:
@@ -2748,6 +2881,15 @@ class Throttle:
         old = self.level
         self.level = max(0, min(MAX_LEVEL, new_level))
         self._last_change = now
+        if self.level >= MAX_LEVEL:
+            if old < MAX_LEVEL:
+                self._top_since = now
+        else:
+            self._top_since = None
+        if self.level > old and self._last_ratio is not None:
+            self._step_check = (now, self._last_ratio)
+        elif self.level < old:
+            self._step_check = None
         if self.level > old:
             self._last_hold = now
         if self.level != old:
@@ -2775,8 +2917,8 @@ class BusyWindow:
         self.window_seconds = float(window_seconds)
         self._samples = collections.deque()
 
-    def add(self, busy_ms, now):
-        self._samples.append((now, float(busy_ms)))
+    def add(self, busy_ms, now, budget_ms=None, kind=None):
+        self._samples.append((now, float(busy_ms), float(budget_ms) if budget_ms else None, kind))
         self._trim(now)
 
     def _trim(self, now):
@@ -2788,8 +2930,24 @@ class BusyWindow:
         self._trim(now)
         if not self._samples:
             return None, None, 0
-        values = [v for _, v in self._samples]
+        values = [v for _, v, _b, _k in self._samples]
         return sum(values) / len(values), max(values), len(values)
+
+    def ratio_stats(self, now, kind=None, default_budget_ms=None):
+        """(busy share at BUSY_RATIO_PERCENTILE, worst share, count) of the frames of `kind` (all frames when None), each judged against its own frame time."""
+        self._trim(now)
+        ratios = []
+        for _t, busy, budget, sample_kind in self._samples:
+            if kind is not None and sample_kind != kind:
+                continue
+            budget = budget or default_budget_ms
+            if budget and budget > 0:
+                ratios.append(busy / budget)
+        if not ratios:
+            return None, None, 0
+        ratios.sort()
+        index = min(len(ratios) - 1, max(0, int(round(BUSY_RATIO_PERCENTILE * (len(ratios) - 1)))))
+        return ratios[index], ratios[-1], len(ratios)
 
 
 class LossTracker:
@@ -2883,12 +3041,17 @@ def format_status(throttle, profile, signals, mode=None):
         value = signals.get(key)
         return template % value if value is not None else "n/a"
 
-    avg = signals.get("busy_avg_ms")
-    ratio = ("%d%%" % round(avg * 100.0 / profile.frame_budget_ms)) if avg is not None else "n/a"
-    return ("[GOVERNOR] status ch=%s level=%d factor=%.2f busy_avg=%s(%s) busy_worst=%s flip_avg=%s cpu=%s "
+    busy_ratio, _worst_ratio = throttle._busy_ratios(signals)
+    ratio = ("%d%%" % round(busy_ratio * 100.0)) if busy_ratio is not None else "n/a"
+    kind = signals.get("busy_kind") or "screen"
+    own = throttle.own_load(kind)
+    return ("[GOVERNOR] status ch=%s level=%d factor=%.2f screen=%s frame_time=%s busy=%s own=%s busy_avg=%s "
+            "busy_worst=%s flip_avg=%s cpu=%s "
             "lost_pic=%s lost_aud=%s drive_degraded=%s event=%s bg=%s mode=%s%s" % (
                 signals.get("channel", "n/a"), throttle.level, throttle.factor(profile, mode),
-                _fmt("busy_avg_ms", "%.1fms"), ratio, _fmt("busy_worst_ms", "%.0fms"),
+                kind, _fmt("frame_time_ms", "%.1fms"), ratio,
+                ("%d%%" % round(own * 100.0)) if own is not None else "learning",
+                _fmt("busy_avg_ms", "%.1fms"), _fmt("busy_worst_ms", "%.0fms"),
                 _fmt("flip_avg_ms", "%.1fms"), _fmt("system_cpu_pct", "%.0f%%"),
                 _fmt("lost_pictures", "%d"), _fmt("lost_audio", "%d"),
                 "yes" if signals.get("drive_degraded") else "no",
@@ -2938,6 +3101,7 @@ class ActivityTracker:
 
 _activity = ActivityTracker()
 _gate_tls = threading.local()
+_starved_slots = threading.BoundedSemaphore(GATE_STARVED_MAX_CONCURRENT)
 _gate_state = {"throttle": None, "enabled": True, "waits": 0, "starved": 0, "last_wait_log": 0.0, "tune_until": 0.0}
 
 
@@ -3068,6 +3232,7 @@ def gate(lane, priority=False, timeout=None, label=""):
         return
     priority = bool(priority) or _is_priority_context()
     admitted = False
+    starved_slot = False
     if priority or not enforcing():
         _activity.begin(lane)
         admitted = True
@@ -3088,12 +3253,17 @@ def gate(lane, priority=False, timeout=None, label=""):
                 if timeout is not None:
                     _gate_state["waits"] += 1
                     break
-                _gate_state["starved"] += 1
-                _activity.begin(lane)
-                admitted = True
-                log.info("[GOVERNOR] gate wait cap %.0fs reached, running anyway: lane=%s %s level=%d",
-                         GATE_MAX_WAIT_SECONDS, lane, label, level)
-                break
+                # WARNING: releasing every capped waiter at once stalled the whole app on weak PCs; let one through at a time and never during a tune or a game.
+                if tune_in_progress() or game_needs_all() or not _starved_slots.acquire(blocking=False):
+                    deadline = time.monotonic() + GATE_POLL_SECONDS * 8
+                else:
+                    starved_slot = True
+                    _gate_state["starved"] += 1
+                    _activity.begin(lane)
+                    admitted = True
+                    log.info("[GOVERNOR] gate wait cap %.0fs reached, running anyway (one at a time): lane=%s %s level=%d",
+                             GATE_MAX_WAIT_SECONDS, lane, label, level)
+                    break
             time.sleep(GATE_POLL_SECONDS)
         if waited and admitted:
             now = time.monotonic()
@@ -3109,6 +3279,8 @@ def gate(lane, priority=False, timeout=None, label=""):
         if admitted:
             held.discard(lane)
             _activity.end(lane)
+        if starved_slot:
+            _starved_slots.release()
 
 
 # ============================================================================
@@ -3249,6 +3421,59 @@ def rate_cpu(cpu_name, physical_cores, ram_total_gb):
             "class_source": source, "note": note, "reasons": reasons, "borderline": borderline}
 
 
+_GPU_VENDOR_PATTERNS = (("nvidia", r"nvidia|geforce|quadro|titan"), ("intel", r"intel"),
+                        ("amd", r"\bamd\b|radeon|\bati\b|firepro"), ("microsoft", r"microsoft"))
+
+
+def rate_gpu(gpu_name):
+    """Rates one graphics chip from its name: vendor, family, about the year it came out, its age class and the video formats its decoder plays (None = not known)."""
+    low = " ".join(str(gpu_name or "").lower().split())
+    vendor = "unknown"
+    for label, pattern in _GPU_VENDOR_PATTERNS:
+        if re.search(pattern, low):
+            vendor = label
+            break
+    for pattern, row_vendor, family, year, decoders in BOOT_SCAN_GPU_TABLE:
+        if row_vendor == vendor and re.search(pattern, low):
+            age_class = _class_from_threshold(year, BOOT_SCAN_GPU_YEAR_CLASS) if year else None
+            return {"name": str(gpu_name), "vendor": vendor, "family": family, "year": year or None,
+                    "class": age_class, "decoders": tuple(decoders), "software": family == "software"}
+    return {"name": str(gpu_name), "vendor": vendor, "family": "unknown", "year": None,
+            "class": None, "decoders": None, "software": False}
+
+
+def rate_gpus(gpu_names):
+    """Rates every real graphics chip; the best one (newest with a decoder, then newest) comes first."""
+    rated = [r for r in (rate_gpu(n) for n in gpu_names or ()) if not r["software"]]
+
+    def _rank(r):
+        decodes = 1 if (r["decoders"] is None or r["decoders"]) else 0
+        return (decodes, r["year"] or 0)
+    return sorted(rated, key=_rank, reverse=True)
+
+
+def gpu_rating_text(rating):
+    """One short line for a rated chip, for the log."""
+    if rating["decoders"] is None:
+        decode = "decoder unknown"
+    elif rating["decoders"]:
+        decode = "decodes " + "/".join(rating["decoders"])
+    else:
+        decode = "no video decoder"
+    return "%s (%s %s, ~%s, class %s, %s)" % (rating["name"], rating["vendor"], rating["family"],
+                                             rating["year"] or "year unknown", rating["class"] or "?", decode)
+
+
+def vlc_hw_decode_allowed(profile=None):
+    """True when the main video engine should ask VLC to decode on the graphics card: the switch is on, this is Windows and a real graphics card was found whose rating has a video decoder (or could not be rated)."""
+    if not VLC_HW_DECODE_ENABLED or os.name != "nt":
+        return False
+    profile = profile or get_profile()
+    if str(getattr(profile, "gpu_tier", "none")) not in ("dedicated", "onboard"):
+        return False
+    return any(r["decoders"] is None or r["decoders"] for r in rate_gpus(profile.gpu_names))
+
+
 def run_boot_scan(profile, cpu_name=None, avx2=None):
     """Scores the machine from CPU model, cores, RAM and GPU; returns the per-capability caps (scan and caption caps are applied by _limit_mode)."""
     if cpu_name is None:
@@ -3278,12 +3503,15 @@ def run_boot_scan(profile, cpu_name=None, avx2=None):
         "video": start_mode,
         "gpu": "%s" % profile.gpu_tier,
     }
+    gpus = rate_gpus(profile.gpu_names)
     return {
         "cpu_name": cpu_name, "vendor": rating["vendor"], "generation": rating["generation"],
         "base_class": rating["base_class"], "class": label, "class_source": rating["class_source"],
         "note": rating["note"], "reasons": reasons, "avx2": avx2, "borderline": rating["borderline"],
         "tier": tier, "start_mode": start_mode, "caps": caps,
         "hardware_fingerprint": make_hardware_fingerprint(profile, cpu_name),
+        "gpus": gpus, "gpu_class": gpus[0]["class"] if gpus else None,
+        "video_hw_decode": vlc_hw_decode_allowed(profile),
     }
 
 
@@ -3344,6 +3572,9 @@ def _log_boot_scan(profile):
         caps["scan"], caps["caption"], caps["effects"], caps["video"], caps["gpu"],
         result["hardware_fingerprint"], "; ".join(result["reasons"]) or "none",
         (" note=" + result["note"]) if result["note"] else "")
+    log.info("[GOVERNOR BOOT SCAN] gpu rating: %s; video decoding on the graphics card: %s",
+             "; ".join(gpu_rating_text(r) for r in result.get("gpus") or ()) or "no real graphics card",
+             "yes" if result.get("video_hw_decode") else "no")
     return result
 
 
@@ -3531,7 +3762,7 @@ __all__ = [
     "build_profile", "classify_tier", "BusyWindow", "LossTracker", "SystemCpuSampler", "format_status",
     "gate", "activity", "priority_scope", "in_priority_scope", "first_start_scan_plan", "first_start_scans_concurrent", "background_active", "enforcing", "set_enabled",
     "register_throttle", "current_level",
-    "run_boot_scan", "get_boot_scan", "parse_cpu_class", "make_hardware_fingerprint",
+    "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
     "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode",
     "scan_pace_seconds", "quiet_seconds", "pc_is_quiet", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",

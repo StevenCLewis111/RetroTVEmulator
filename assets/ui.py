@@ -4886,7 +4886,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             is_audio_dir_focused = (sub_r == _audio_row_idx)
             pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (row_x, audio_y, row_w, vis_row_h), border_radius=6)
             if is_audio_dir_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, audio_y, row_w, vis_row_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            lbl_audio = f_ch_label.render("AUDIO FILES: (ADD)", True, NEON_GREEN if is_audio_dir_focused else TEXT_WHITE)
+            _audio_ct = len(ch_info.get("schedules", {}).get("Music Tracks", []))
+            lbl_audio = f_ch_label.render(f"AUDIO FILES: ({'ADD' if _audio_ct == 0 else _audio_ct})", True, NEON_GREEN if is_audio_dir_focused else TEXT_WHITE)
             menu_canvas.blit(lbl_audio, (row_x + 20, audio_y + vis_row_h // 2 - lbl_audio.get_height() // 2))
 
             _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
@@ -5163,7 +5164,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     for _try_size in range(22, 9, -1):
                         _cand_font = _get_font("Courier New", _try_size, bold=True)
                         _widest = max(
-                            _cand_font.render(f"{n.upper()} (ADD)", True, TEXT_WHITE).get_width()
+                            _cand_font.render(f"{n.upper()} (9999)", True, TEXT_WHITE).get_width()
                             for n in _slot_names
                         )
                         if _widest <= _cw - _pad:

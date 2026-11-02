@@ -852,6 +852,13 @@ def _hard_exit_process(code):
     """Terminate this process immediately, bypassing Windows' DLL unload sequence (unlike os._exit() / sys.exit())."""
     # WARNING: code 0 is a clean quit and removes the running marker; every other code leaves it so the next start reports an unclean exit.
     if code == 0:
+        # WARNING: settings are written by the SettingsWriter thread up to 2 s after a change; a clean quit must write the waiting save here, before the process is ended, or the last changes are lost.
+        try:
+            _exit_db = globals().get("db")
+            if _exit_db is not None and hasattr(_exit_db, "flush_settings"):
+                _exit_db.flush_settings()
+        except Exception as _flush_error:
+            log.warning("[QUIT] _hard_exit_process: writing the waiting settings save failed: %s", _flush_error)
         _clear_run_marker()
     try:
         _flush_app_log()
@@ -4452,6 +4459,53 @@ def _menu_nav_frame_end(begin, frame_events):
 
 _loop_profile = {"t": None, "stages": {}, "frames": 0, "total": 0.0, "worst": 0.0}
 
+# WARNING: the main loop writes the start time of every frame here and the stall-stack check reads it from the watchdog thread; without it no [STALL STACK] line is ever written.
+_main_frame_clock = {"start": None, "n": 0, "sampled_n": -1, "samples": 0, "last_sample": 0.0}
+# WARNING: the fallback numbers below must match STALL_STACK_FIRST_MS, STALL_STACK_REPEAT_MS, STALL_STACK_MAX_PER_FRAME, STALL_STACK_DEPTH in performance_governor.py; they are used only when that module fails to import.
+STALL_STACK_FIRST_MS = performance_governor.STALL_STACK_FIRST_MS if performance_governor is not None else 1000
+STALL_STACK_REPEAT_MS = performance_governor.STALL_STACK_REPEAT_MS if performance_governor is not None else 2000
+STALL_STACK_MAX_PER_FRAME = performance_governor.STALL_STACK_MAX_PER_FRAME if performance_governor is not None else 6
+STALL_STACK_DEPTH = performance_governor.STALL_STACK_DEPTH if performance_governor is not None else 14
+
+
+def _stall_stack_text(frame, depth):
+    """The innermost depth calls of a thread's stack as one line, innermost last: file:line function."""
+    import traceback as _tb
+    calls = _tb.extract_stack(frame)[-int(depth):]
+    return " > ".join("%s:%d %s" % (os.path.basename(c.filename), c.lineno, c.name) for c in calls)
+
+
+def _make_stall_stack_tick():
+    """Writes a [STALL STACK] line naming where the screen thread is while one main-loop frame runs past STALL_STACK_FIRST_MS, again every STALL_STACK_REPEAT_MS while it goes on."""
+    main_ident = threading.main_thread().ident
+
+    def _tick():
+        clock = _main_frame_clock
+        started = clock.get("start")
+        if started is None or _app_shutting_down.is_set():
+            return
+        frame_no = clock.get("n")
+        now = time.monotonic()
+        running_ms = (now - started) * 1000.0
+        if running_ms < STALL_STACK_FIRST_MS:
+            return
+        if clock.get("sampled_n") != frame_no:
+            clock["sampled_n"] = frame_no
+            clock["samples"] = 0
+            clock["last_sample"] = 0.0
+        if clock["samples"] >= STALL_STACK_MAX_PER_FRAME:
+            return
+        if clock["samples"] and (now - clock["last_sample"]) * 1000.0 < STALL_STACK_REPEAT_MS:
+            return
+        frame = sys._current_frames().get(main_ident)
+        if frame is None or clock.get("n") != frame_no:
+            return
+        clock["samples"] += 1
+        clock["last_sample"] = now
+        log.warning("[STALL STACK] frame %d has run %.1fs on channel %s; the screen thread is in: %s",
+                    frame_no, running_ms / 1000.0, app_state.get("current_channel"), _stall_stack_text(frame, STALL_STACK_DEPTH))
+    return _tick
+
 
 def _loop_profile_interval():
     """Returns how many frames are collected before a [LOOP PROFILE] line is written, or 0 when off or the governor is missing."""
@@ -6829,6 +6883,8 @@ def _confirm_playback_started(ch_key, attempt_id, file_path, seek_offset, slot_s
             db.save_playback_anchor()
         except Exception as e:
             log.warning("_confirm_playback_started: failed to persist playback_anchor for ch%s: %s", ch_key, e)
+        if mode in ("Video", "Commercial"):
+            _request_next_item_prep(ch_key, file_path)
 
 
 def _make_live_playback_start_callback(ch_key, state, start_reason):
@@ -7789,6 +7845,8 @@ def _reconcile_server_service():
         return False
     try:
         if _server_service_should_run():
+            # WARNING: the server service reads server mode from retro_config.json on disk; the waiting settings save must be written first, or the service starts, reads the old file and stops itself.
+            db.flush_settings()
             return bool(server_service.ensure_running(db.base_dir))
         server_service.set_autostart(db.base_dir, False)
     except Exception as exc:
@@ -9568,10 +9626,10 @@ _PENDING_PROBE_REQUEST_STALE_SECONDS = (performance_governor.PENDING_SCHEDULE_PR
 # WARNING: the fallback must match PENDING_PROBE_URGENT_COUNT in performance_governor.py; used only when that module fails to import.
 _PENDING_PROBE_URGENT_COUNT = (performance_governor.PENDING_PROBE_URGENT_COUNT
                                if performance_governor is not None else 4)
-# WARNING: this dict is the only state of the pending probe; the worker threads never touch the database, only the calling thread stores results.
+# WARNING: this dict is the only state of the pending probe; the worker threads never touch the database, only the calling thread stores results. A path in "awaiting_store" has a result waiting in "results" and must not be probed again until a caller has stored it, or the same result is stored several times.
 _pending_probe_state = {"lock": threading.Lock(), "wake": threading.Event(), "requests": {},
                         "results": [], "in_flight": set(), "retry_at": {}, "threads": [], "active": 0,
-                        "urgent_active": 0, "last_backlog": 0.0}
+                        "urgent_active": 0, "last_backlog": 0.0, "awaiting_store": set()}
 
 
 def _pending_probe_worker():
@@ -9589,7 +9647,8 @@ def _pending_probe_worker():
                     del state["requests"][key]
                     continue
                 for rank, path in enumerate(request["paths"]):
-                    if path in state["in_flight"] or state["retry_at"].get(path, 0.0) > now_m:
+                    if (path in state["in_flight"] or path in state["awaiting_store"]
+                            or state["retry_at"].get(path, 0.0) > now_m):
                         continue
                     if best is None or rank < best[0]:
                         best = (rank, key, path)
@@ -9637,6 +9696,7 @@ def _pending_probe_worker():
                 state["retry_at"][path] = time.monotonic() + _PENDING_PROBE_RETRY_SECONDS
                 if result is not None:
                     state["results"].append((key, result, time.monotonic() - started))
+                    state["awaiting_store"].add(path)
 
 
 def _pending_backlog_may_run(state, now_m):
@@ -9683,6 +9743,7 @@ def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tra
             state["requests"].pop(key, None)
         finished = state["results"]
         state["results"] = []
+        state["awaiting_store"].difference_update(item[0] for _key, item, _took in finished)
         waiting = len(norm_paths)
         state["threads"] = [t for t in state["threads"] if t.is_alive()]
         missing_workers = (max(1, _PENDING_SCHEDULE_PROBE_PARALLEL) - len(state["threads"])) if norm_paths else 0
@@ -9704,7 +9765,7 @@ def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tra
                  result_key[0], result_key[2], os.path.basename(norm_path), duration, took, max(0, waiting - 1))
     if finished:
         try:
-            db.save_settings_async(force=True)
+            db.save_settings_async()
         except Exception as exc:
             log.warning("[SCHEDULER] could not persist background duration probes: %s", exc)
 
@@ -11014,7 +11075,7 @@ def _probe_and_patch_durations(ch_key, container_key, sub_key, items_pool, _resu
     finally:
         _scan_report_head("commercial_check")
         _clear_probe_batch(batch_id)
-    try: db.save_settings_async(force=True)
+    try: db.save_settings_async()
     except Exception as e: log.warning("Final settings save failed after duration probe for %s/%s: %s", container_key, sub_key, e)
     _drop_summary = ""
     if _removed_long_commercials or _removed_silent_commercials or _removed_unplayable:
@@ -12789,6 +12850,17 @@ def _reassert_live_stereo_mode_throttled():
 DVD_FILE_HW_DECODE = True
 
 
+def _main_video_hw_decode_allowed():
+    """True when the main video engine asks VLC to decode each file on the graphics card (the governor's GPU rating decides)."""
+    if performance_governor is None:
+        return False
+    try:
+        return bool(performance_governor.vlc_hw_decode_allowed())
+    except Exception as _hw_err:
+        _log_warn_throttled("main_video_hw_decode", "[VIDEO DECODE] graphics card check failed, the CPU decodes: %s", _hw_err)
+        return False
+
+
 # ============================================================================
 # SECTION: VLC engine initialization
 # ============================================================================
@@ -13219,7 +13291,13 @@ def initialize_vlc_on_demand():
                     _attempt_id = next(_playback_attempt_ids)
                     self._current_attempt_id = _attempt_id
                     self._current_attempt_file = filepath
+                    # WARNING: set until this attempt has handed its file to VLC (or given up); the mid-stream check reads it, and without it a tune whose picture box takes more than 2 s opens the same file a second time.
+                    self._open_inflight = (_attempt_id, time.monotonic())
                     _governor_note_event("play_file")
+
+                    def _open_handed_over():
+                        if getattr(self, "_open_inflight", (None,))[0] == _attempt_id:
+                            self._open_inflight = None
 
                     def _confirm(success, deferred):
                         if on_confirmed is not None:
@@ -13250,6 +13328,7 @@ def initialize_vlc_on_demand():
                     if not _cached_path_exists(filepath):
                         log.warning("[ATTEMPT %s] play_file_segmented: file does not exist, refusing to play: %s",
                                      _attempt_id, filepath)
+                        _open_handed_over()
                         _confirm(False, deferred=False)
                         return False
 
@@ -13366,6 +13445,12 @@ def initialize_vlc_on_demand():
 
                     def _open_and_play(verify_off_thread=False):
                         try:
+                            return _open_and_play_steps(verify_off_thread)
+                        finally:
+                            _open_handed_over()
+
+                    def _open_and_play_steps(verify_off_thread=False):
+                        try:
                             media = self.instance.media_new(media_source)
                             if self.engine_label == "dvd" and not is_dvd_iso and DVD_FILE_HW_DECODE:
                                 try:
@@ -13376,6 +13461,13 @@ def initialize_vlc_on_demand():
                                     log.warning("[DVD DECODE] could not request hardware decode for %s "
                                                 "(staying on software): %s",
                                                 os.path.basename(str(filepath)), _hw_e)
+                            elif self.engine_label != "dvd" and not is_dvd_iso and _main_video_hw_decode_allowed():
+                                try:
+                                    # WARNING: VLC switches hardware decoding off for every player that hands frames to the app (avcodec-hw=none); only this per-file option turns it back on, and VLC decodes the file on the CPU by itself when the card cannot open it.
+                                    media.add_option(":avcodec-hw=any")
+                                except Exception as _hw_e:
+                                    log.warning("[VIDEO DECODE] could not ask VLC to decode %s on the graphics card "
+                                                "(the CPU decodes it): %s", os.path.basename(str(filepath)), _hw_e)
                             _opened_at_position = False
                             if (SEEK_AT_OPEN and seek_seconds and seek_seconds > 0
                                     and not is_dvd_iso):
@@ -13617,6 +13709,7 @@ def initialize_vlc_on_demand():
                             log.warning("[ATTEMPT %s][STOP RACE GUARD] stop() for %s never completed (or engine "
                                         "went wedged) -- abandoning this open; wedge-replacement will "
                                         "handle recovery", _aid, _fp)
+                            _open_handed_over()
                             _confirm(False, deferred=True)
 
                     import threading as _t_deferred_open
@@ -17951,6 +18044,7 @@ _governor_feed = {
     "throttle": None, "busy": None, "loss": None, "cpu": None, "signature": None,
     "last_feed": 0.0, "tick_wait_ms": 0.0, "vlc_media": None, "vlc_media_key": None,
     "vlc_stats_logged": False, "stall_count": 0, "flip": None,
+    "tick_budget_ms": None, "tick_kind": None, "frame_kind": None,
 }
 
 
@@ -17975,8 +18069,24 @@ def _governor_note_event(kind):
             _log_swallowed("_governor_note_event: _throttle.note_event(kind)", _swallowed_error)
 
 
-def _governor_note_tick_wait(wait_ms):
-    _governor_feed["tick_wait_ms"] = wait_ms
+def _governor_screen_kind(game_deck_ref):
+    """Which screen the frame belongs to for the pressure test: game, menu, video or other."""
+    if (game_deck_ref is not None and getattr(game_deck_ref, "mode", None) == "GAME"
+            and getattr(game_deck_ref, "_libretro_core", None) is not None):
+        return "game"
+    if _lite_menu_screen_active(game_deck_ref):
+        return "menu"
+    if app_state.get("is_playing_video", False):
+        return "video"
+    return "other"
+
+
+def _governor_note_tick_wait(wait_ms, tick_fps=None, kind=None):
+    """Records how long the frame-rate wait took, the frame time of the rate it waited for, and the screen it was for."""
+    f = _governor_feed
+    f["tick_wait_ms"] = wait_ms
+    f["tick_budget_ms"] = (1000.0 / tick_fps) if tick_fps and tick_fps > 0 else None
+    f["tick_kind"] = kind
 
 
 def _governor_note_flip(flip_ms):
@@ -18061,6 +18171,14 @@ def _governor_feed_tick(now):
     if _avg is not None and _n >= performance_governor.MIN_BUSY_SAMPLES:
         _signals["busy_avg_ms"] = _avg
         _signals["busy_worst_ms"] = _worst
+    _kind = f["frame_kind"] or "other"
+    _ratio, _worst_ratio, _rn = f["busy"].ratio_stats(now, _kind, _throttle.frame_budget_ms)
+    _signals["busy_kind"] = _kind
+    if _ratio is not None and _rn >= performance_governor.MIN_BUSY_SAMPLES:
+        _signals["busy_ratio"] = _ratio
+        _signals["busy_worst_ratio"] = _worst_ratio
+    if f["tick_budget_ms"]:
+        _signals["frame_time_ms"] = f["tick_budget_ms"]
     _cpu = f["cpu"].percent()
     if _cpu is not None:
         _signals["system_cpu_pct"] = _cpu
@@ -18105,8 +18223,9 @@ def _governor_feed_frame(gap_ms):
         f["tick_wait_ms"] = 0.0
         _busy_ms = max(0.0, gap_ms - _wait_ms)
         _in_event = _throttle.in_event(_now)
+        f["frame_kind"] = f["tick_kind"]
         if not _in_event:
-            f["busy"].add(_busy_ms, _now)
+            f["busy"].add(_busy_ms, _now, f["tick_budget_ms"], f["tick_kind"])
         if gap_ms >= performance_governor.STALL_LOG_MS:
             f["stall_count"] += 1
             log.info("[GOVERNOR] stall gap=%dms busy=%.0fms classified=%s%s", gap_ms, _busy_ms,
@@ -18883,6 +19002,24 @@ def _timeline_whole_episode_durations(timeline):
         for i in run["indexes"]:
             whole[i] = run["end"]
     return whole
+
+
+def _pending_paths_signature(paths):
+    """A short fingerprint of a block's pending file paths, the same for the same set of paths in any order."""
+    import hashlib
+    joined = "\n".join(sorted(str(p) for p in paths if p))
+    return hashlib.sha1(joined.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _stored_pending_signature(playback_log):
+    """The block's saved pending fingerprint; a full path list saved by an older version is turned into its fingerprint and stored that way, with the same meaning."""
+    stored = playback_log.get("sched_pending_signature")
+    if isinstance(stored, str):
+        return stored
+    signature = _pending_paths_signature(stored or ())
+    if stored is not None:
+        playback_log["sched_pending_signature"] = signature
+    return signature
 
 
 def _freeze_aired_prefix_durations(timeline, target_show, cached_durations,
@@ -19820,6 +19957,14 @@ def _new_channel_first_show_worker():
 _PICTURE_BOX_PRE_SHOW_BUDGET_S = performance_governor.PICTURE_BOX_PRE_SHOW_BUDGET_S if performance_governor is not None else 8.0
 
 
+def _engine_open_in_flight(engine):
+    """True while the engine's latest play_file_segmented has not handed its file to VLC yet; a mark older than the longest the open can take counts as gone."""
+    inflight = getattr(engine, "_open_inflight", None) if engine is not None else None
+    if not inflight:
+        return False
+    return time.monotonic() - inflight[1] < _PICTURE_BOX_PRE_SHOW_BUDGET_S + WEDGED_STOP_TIMEOUT_S + PRE_OPEN_DIMS_PROBE_BOUND_S
+
+
 def _decide_picture_box_before_show(path):
     """Returns the file's stored picture box for the play path, scanning it first when it has none and waiting up to the pre-show budget; None for non-video, unreadable or held-back files, or when the scan has no answer in time."""
     # WARNING: this runs before the first frame of a play; it must never wait longer than _PICTURE_BOX_PRE_SHOW_BUDGET_S.
@@ -20035,20 +20180,130 @@ def _picture_box_lane_hold_reason():
 
 
 def _picture_box_lane_wait():
-    """Blocks the picture-box scan thread while it may not start a file; True when the app is shutting down."""
+    """Blocks the picture-box scan thread while it may not start a file; True when the app is shutting down. Each hold is named once in the log when it starts, and the resume line says how long each hold lasted."""
     _held_at = time.monotonic()
-    _first_start_logged = False
+    _held_by = {}
+    _last_kind, _last_at = None, _held_at
     while True:
         _kind, _why = _picture_box_lane_hold_reason()
+        _now = time.monotonic()
+        if _last_kind is not None:
+            _held_by[_last_kind] = _held_by.get(_last_kind, 0.0) + (_now - _last_at)
+        _last_kind, _last_at = _kind, _now
         if _kind is None:
-            if _first_start_logged:
-                log.info("[PICTURE BOX] lane resumed after %.1fs", time.monotonic() - _held_at)
+            if _held_by:
+                log.info("[PICTURE BOX] lane resumed after %.1fs (%s)", _now - _held_at,
+                         ", ".join("%s %.0fs" % (_k, _v) for _k, _v in sorted(_held_by.items())))
             return False
-        if _kind == "first_start" and not _first_start_logged:
-            _first_start_logged = True
-            log.info("[PICTURE BOX] lane waiting: the playing file's first-start scans run in sequence (%s)", _why)
+        if _kind not in _held_by:
+            _held_by[_kind] = 0.0
+            if _kind == "first_start":
+                log.info("[PICTURE BOX] lane waiting: the playing file's first-start scans run in sequence (%s)", _why)
+            else:
+                log.info("[PICTURE BOX] lane waiting: %s (the governor's load level or a new channel's first show)", _why)
         if _app_shutting_down.wait(PICTURE_BOX_PAUSE_RECHECK_SECONDS):
             return True
+
+
+# WARNING: the fallback numbers below must match NEXT_ITEM_PREP_ITEMS, NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS in performance_governor.py; they are used only when that module fails to import.
+NEXT_ITEM_PREP_ITEMS = performance_governor.NEXT_ITEM_PREP_ITEMS if performance_governor is not None else 3
+NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS = performance_governor.NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS if performance_governor is not None else 60.0
+# WARNING: only _request_next_item_prep writes "request" and only the NextItemPrep thread takes it; a newer request replaces an older one that has not started.
+_next_item_prep_state = {"lock": threading.Lock(), "wake": threading.Event(), "request": None, "thread": None}
+
+
+def _request_next_item_prep(ch_key, file_path):
+    """Asks the NextItemPrep thread to get the next items after file_path on ch_key ready, replacing an older request."""
+    if not ch_key or not file_path:
+        return
+    state = _next_item_prep_state
+    with state["lock"]:
+        state["request"] = (str(ch_key).zfill(2), file_path)
+        if state["thread"] is None or not state["thread"].is_alive():
+            state["thread"] = threading.Thread(target=_next_item_prep_worker, name="NextItemPrep", daemon=True)
+            state["thread"].start()
+    state["wake"].set()
+
+
+def _next_item_prep_paths(ch_key, file_path):
+    """The video files of the next NEXT_ITEM_PREP_ITEMS items after file_path in ch_key's block, nearest first, each once; [] when the block's order is not known."""
+    items = _next_n_from_block_timeline(ch_key, file_path, n=NEXT_ITEM_PREP_ITEMS + 1)
+    if items is not None:
+        paths = [it.get("path", "") for it in items[1:]]
+    else:
+        rec = _scan_snapshot_channel(ch_key)
+        if not rec or not rec.get("ordered"):
+            return []
+        paths = [p for entry in _next_n_from_ordered(rec["ordered"], file_path, n=NEXT_ITEM_PREP_ITEMS + 1)
+                 for p in _paths_from_entry(entry)]
+    current = os.path.normpath(file_path)
+    out = []
+    for p in paths:
+        if not p:
+            continue
+        norm_p = os.path.normpath(p)
+        if norm_p == current or norm_p in out:
+            continue
+        if os.path.splitext(norm_p)[1].lower() not in media.VIDEO_DISPLAY_EXTS:
+            continue
+        out.append(norm_p)
+    return out[:NEXT_ITEM_PREP_ITEMS]
+
+
+def _first_start_scans_run_alone():
+    """True while the playing file's first-start scans run and this PC's plan says nothing else may scan beside them."""
+    if not _LOUDNESS_PRIORITY_PENDING.is_set():
+        return False
+    if performance_governor is None:
+        return True
+    try:
+        together, _why = performance_governor.first_start_scan_plan()
+    except Exception as e:
+        _log_swallowed("_first_start_scans_run_alone: reading the first-start plan", e)
+        return True
+    return not together
+
+
+def _next_item_prep_worker():
+    """NextItemPrep thread: for the latest request, stores the picture box of each next item that has none, nearest first, as priority work; a newer request or another channel going on air stops the older one."""
+    state = _next_item_prep_state
+    while not _app_shutting_down.is_set():
+        state["wake"].wait()
+        state["wake"].clear()
+        with state["lock"]:
+            request, state["request"] = state["request"], None
+        if request is None:
+            continue
+        ch_key, file_path = request
+
+        def _stale():
+            return (state["request"] is not None or _app_shutting_down.is_set()
+                    or str(app_state.get("_live_playback_channel", "") or "").zfill(2) != ch_key)
+
+        _waited_from = time.monotonic()
+        while (_first_start_scans_run_alone() and not _stale()
+               and time.monotonic() - _waited_from < NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS):
+            if _app_shutting_down.wait(PICTURE_BOX_PAUSE_RECHECK_SECONDS):
+                return
+        if _stale():
+            continue
+        try:
+            paths = _next_item_prep_paths(ch_key, file_path)
+        except Exception as e:
+            log.warning("[NEXT ITEM] ch%s: working out the next items after %s failed: %s", ch_key, os.path.basename(str(file_path)), e)
+            continue
+        started = time.monotonic()
+        made = []
+        for norm_p in paths:
+            if _stale():
+                break
+            if norm_p in _picture_box_done or norm_p in _scan_pb_has_box or not _cached_path_exists(norm_p):
+                continue
+            _picture_box_before_loudness(norm_p)
+            made.append(os.path.basename(norm_p))
+        if made:
+            log.info("[NEXT ITEM] ch%s: picture box ready ahead for %s in %.1fs (after %s)",
+                     ch_key, ", ".join(made), time.monotonic() - started, os.path.basename(str(file_path)))
 
 
 def _picture_box_scan_worker():
@@ -21276,10 +21531,10 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                 != SHORT_EPISODE_PAIRING_VERSION
         )
 
-        _pending_signature = tuple(sorted(t.get("path", "") for t in _pending_tracks if t.get("path")))
+        _pending_signature = _pending_paths_signature(t.get("path", "") for t in _pending_tracks if t.get("path"))
         _pending_changed = (
             not _is_new_block
-            and tuple(playback_log.get("sched_pending_signature", ())) != _pending_signature
+            and _stored_pending_signature(playback_log) != _pending_signature
         )
         _durations_stale_raw = (
             (not _is_new_block)
@@ -24228,10 +24483,55 @@ def _make_heartbeat_watchdog_tick():
     return _tick
 
 
+_vlc_decode_watch = {"codec": None, "pending_codec": None, "file": "", "hw_desc": "", "tried": 0, "off": False, "told": True}
+
+
+def _note_vlc_decode_line(line_text):
+    """Reads VLC's log lines for each video's decoder pick and logs one [VIDEO DECODE] line per video: graphics card or CPU, and why."""
+    w = _vlc_decode_watch
+    text = str(line_text)
+    if "codec (" in text and ") started" in text:
+        w["pending_codec"] = text.split("codec (", 1)[1].split(")", 1)[0]
+    elif 'using video decoder module "' in text:
+        w.update(codec=w["pending_codec"] or "?", hw_desc="", tried=0, off=False, told=False)
+    elif "' successfully opened" in text and "`" in text:
+        _url = text.split("`", 1)[1].rsplit("' successfully opened", 1)[0]
+        from urllib.parse import unquote as _unquote_decode
+        w["file"] = os.path.basename(_unquote_decode(_url).replace("\\", "/"))
+    elif w["told"]:
+        return
+    elif "for hardware decoding" in text and "Using " in text:
+        w["hw_desc"] = text.split("Using ", 1)[1].rsplit(" for hardware decoding", 1)[0]
+    elif 'using hw decoder module "' in text:
+        w["told"] = True
+        log.info("[VIDEO DECODE] graphics card decodes %s (%s, %s%s)", w["file"] or "?", w["codec"],
+                 text.split('using hw decoder module "', 1)[1].split('"', 1)[0],
+                 (", " + w["hw_desc"]) if w["hw_desc"] else "")
+    elif 'looking for hw decoder module matching "none"' in text:
+        w["off"] = True
+    elif "no hw decoder modules matched" in text:
+        w["tried"] += 1
+    elif "main debug: original format" in text and " 4cc " in text:
+        _fourcc = text.split(" 4cc ", 1)[1].split(",", 1)[0].strip()
+        if not _fourcc.upper().startswith("DX"):
+            w["told"] = True
+            if w.get("off"):
+                _why = "graphics card decoding is switched off for this file"
+            elif w["tried"]:
+                _why = "the graphics card could not open this file's format"
+            else:
+                _why = "the graphics card has no decoder for this format"
+            log.info("[VIDEO DECODE] CPU decodes %s (%s, %s): %s", w["file"] or "?", w["codec"], _fourcc, _why)
+
+
 def _vlc_log_writer_loop():
     f = None
     while True:
         line_text = _vlc_log_queue.get()
+        try:
+            _note_vlc_decode_line(line_text)
+        except Exception as _decode_watch_err:
+            _log_warn_throttled("vlc_decode_watch", "[VIDEO DECODE] reading VLC's decoder pick failed: %s", _decode_watch_err)
         try:
             path = VLC_DEBUG_LOG_PATH
             if not path:
@@ -24388,11 +24688,13 @@ def _background_watchdog_scheduler():
     _heartbeat_tick = _make_heartbeat_watchdog_tick()
     _vlc_log_tick = _make_vlc_log_watchdog_tick()
     _guide_preload_tick = _make_guide_preload_watchdog_tick()
+    _stall_stack_tick = _make_stall_stack_tick()
 
     _checks = (
         ("heartbeat", 5.0, _heartbeat_tick, "_heartbeat_watchdog_loop"),
         ("vlc_log", 5.0, _vlc_log_tick, "_vlc_log_watchdog_loop"),
         ("guide_preload", 1.0, _guide_preload_tick, "_guide_preload_watchdog"),
+        ("stall_stack", 1.0, _stall_stack_tick, "_stall_stack_check"),
     )
     _next_due = {name: 0.0 for name, *_ in _checks}
 
@@ -25039,6 +25341,8 @@ _MODULE_DEFINED.set()
 
 while True:
     _prof_begin()
+    _main_frame_clock["start"] = time.monotonic()
+    _main_frame_clock["n"] += 1
 
     # ========================================================================
     # SECTION: Frame setup, heartbeat & housekeeping
@@ -28651,7 +28955,8 @@ while True:
         _engine_wedged_this_frame = True
     is_video_finished = False
     _switch_pending = app_state.get("_pending_channel_activation") is not None
-    _open_confirm_pending = vlc_engine is not None and getattr(vlc_engine, "_open_confirm_pending_attempt", None) is not None
+    _open_confirm_pending = vlc_engine is not None and (
+        getattr(vlc_engine, "_open_confirm_pending_attempt", None) is not None or _engine_open_in_flight(vlc_engine))
     _finish_reason = None
     if vlc_engine is not None and app_state.get("is_playing_video", False) and not _switch_pending and not _open_confirm_pending and not _engine_wedged_this_frame and not _surf_quiet:
         try:
@@ -29035,6 +29340,7 @@ while True:
             and getattr(vlc_engine, "ready_flag", False)
             and current_playback_state.get("file")
             and not _switch_pending
+            and not _open_confirm_pending
             and vlc_engine.player.get_state() not in (vlc.State.Opening, vlc.State.Buffering)
             and pygame.time.get_ticks() - app_state.get("last_video_play_started_at", 0) > 2000):
         try:
@@ -31219,6 +31525,6 @@ while True:
     _gov_tick_t0 = time.perf_counter()
     _prof_mark("tail")
     clock.tick(_tick_fps)
-    _governor_note_tick_wait((time.perf_counter() - _gov_tick_t0) * 1000.0)
+    _governor_note_tick_wait((time.perf_counter() - _gov_tick_t0) * 1000.0, _tick_fps, _governor_screen_kind(_gd))
     _prof_mark("wait")
     _prof_end()
