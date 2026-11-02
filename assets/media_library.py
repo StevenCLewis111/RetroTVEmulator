@@ -21,7 +21,6 @@ import subprocess
 import random
 import threading
 import time
-import zlib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -1101,7 +1100,6 @@ _BI_MIN_AGREEING_SHARE = _governor.BURNED_IN_MIN_AGREEING_SHARE if _governor is 
 
 def _bi_dilate(mask, reach):
     """Boolean dilation by a square of +-reach pixels (numpy only)."""
-    import numpy as np
     out = mask.copy()
     h, w = mask.shape
     for dy in range(-reach, reach + 1):
@@ -1530,14 +1528,6 @@ class ProbeLibrary:
             return False
         held = self.library.get_entry(content_key)
         return bool(held and held.get("gain_checked"))
-
-    def mark_gain_checked(self, file_path: str) -> bool:
-        """Marks the file's saved gain as double-checked; returns False when the library cannot key the file."""
-        content_key = self.keys.resolve(file_path)
-        if content_key is None:
-            return False
-        self.library.upsert_fields(content_key, gain_checked=1)
-        return True
 
     def store_owner_gain(self, file_path: str, total_db: float):
         """Replaces the file's saved gain with the owner's chosen total dB; the scanned number is gone, the scan version is set to the owner mark so the gain always counts as current and no scan replaces it, and the manual offset is 0."""
@@ -2089,14 +2079,6 @@ class GainHub(_PathMemoHub):
             return bool(self.probe_library.gain_is_checked(path))
         except Exception as _swallowed_error:
             _log_swallowed("GainHub.is_checked: reading the gain check mark from the library", _swallowed_error)
-            return False
-
-    def mark_checked(self, path):
-        """Marks the file's scanned gain as double-checked. Returns False when the library cannot key the file."""
-        try:
-            return bool(self.probe_library.mark_gain_checked(path))
-        except Exception as _swallowed_error:
-            _log_swallowed("GainHub.mark_checked: saving the gain check mark to the library", _swallowed_error)
             return False
 
     def read_group(self, group_key):
@@ -2651,6 +2633,16 @@ class ScheduleHub:
             _log_swallowed("ScheduleHub._decode_guide_entry: the row's guide entry is unreadable, the cell is drawn from the file alone", _swallowed_error)
             return None
         return value if isinstance(value, dict) else None
+
+    def clear_all_schedule_data(self):
+        """Empties every channel's schedule: the planned, airing and aired rows, the future rows, the slot records and the play orders; returns {table: rows removed}."""
+        # WARNING: only for a fresh start (no retro_config.json at boot, owner order 2026-11-02); everywhere else aired rows are history and stay (R26).
+        removed = {}
+        with self.library._lock:
+            with self.library._conn as conn:
+                for table in ("hub_schedule_row", "hub_future_row", "hub_schedule_set", "hub_play_order", "hub_play_state"):
+                    removed[table] = conn.execute("DELETE FROM %s" % table).rowcount
+        return removed
 
     def replace_future_rows(self, channel, rows):
         """Saves the channel's projected future rows, replacing the ones saved before, in one saved change; each row is a dictionary with slot_key, position, path, kind, planned_start, used_length and guide_entry. Returns how many rows were written."""

@@ -9,17 +9,19 @@ channel_settings_index), the Video tab (video_table, video_cell, video_index) an
 theme_row2_column), the Games tab list (games_table, games_cell, games_index, games_page_of), the Games sub-menu (games_sub_table, games_sub_cell,
 games_sub_index), the DVD button map (dvd_map_table, dvd_map_cell, dvd_map_index), Save Profile (save_profile_rows, save_profile_table, save_profile_cell,
 save_profile_index) and the controller map (ctrl_map_rows, ctrl_map_table, ctrl_map_cell, ctrl_map_index, ctrl_map_squares_step),
-the confirm popups and the controls splash (confirm_cell, confirm_answer, confirm_focus, confirm_table, splash_cell, splash_focus, splash_table), the Channels per-channel sub-menu (channel_sub_layout, channel_sub_close_row, channel_sub_cell, channel_sub_index, channel_sub_table), the tab bar (tabs_cell, tabs_table, TAB_PANEL_LAYERS), the single-column lists of the Server menu, server picker, server slot actions, audio track picker and Holiday sub-menu (column_move), the wrapping Remote Remap list (ring_move), the Server Slots grid (server_slots_cell, server_slots_index, server_slots_table), the TV guide (guide_move, guide_row_step) the game channel (deck_browse_step, deck_list_step, deck_arrows_step, deck_confirm_choice), held-key repeat (HOLD_RULES, HOLD_STUCK_MS, HoldState, hold_rule, hold_due, hold_stuck, hold_step, hold_pick, hold_released, hold_conflict, repeat_allowed, press_is_duplicate), the joystick (JOY_*, joystick_action), channel number entry (DIGIT_ENTRY_*, key_to_digit, digit_entry_step, digit_entry_due, digit_entry_channel), name entry for the channel name and the server slot name (NAME_*, name_entry_step), the DVD controls (DVD_* ids, canonical codes, default keys and skip numbers, dvd_canonical, dvd_default_binding, dvd_action, dvd_translate, dvd_return_menu_step, dvd_swallows_transport, dvd_skip_blocked, dvd_tap_seek, dvd_hold_seek, dvd_hold_direction, dvd_hold_due), and the file explorer's mouse and keyboard rules (PARENT, the EXPLORER_* numbers, explorer_wheel, explorer_wheel_button, explorer_thumb, explorer_scroll_from_thumb, explorer_scrollbar_press, explorer_scrollbar_drag, explorer_select, explorer_double_click, explorer_drag_moved, explorer_drag_step, explorer_button_at and the row and hit helpers).
+the confirm popups and the controls splash (confirm_cell, confirm_answer, confirm_focus, confirm_table, splash_cell, splash_focus, splash_table), the Channels per-channel sub-menu (channel_sub_layout, channel_sub_close_row, channel_sub_cell, channel_sub_index, channel_sub_table), the tab bar (tabs_cell, tabs_table, TAB_PANEL_LAYERS), the single-column lists of the Server menu, server picker, server slot actions, audio track picker and Holiday sub-menu (column_move), the wrapping Remote Remap list (ring_move), the Server Slots grid (server_slots_cell, server_slots_index, server_slots_table), the TV guide (guide_move, guide_row_step) the game channel (deck_browse_step, deck_list_step, deck_arrows_step, deck_confirm_choice), held-key repeat (HOLD_RULES, HOLD_STUCK_MS, HoldState, hold_rule, hold_due, hold_stuck, hold_step, hold_pick, hold_released, hold_conflict, repeat_allowed, press_is_duplicate, NAV_MOVE_MIN_MS, move_allowed), the joystick (JOY_*, joystick_action), channel number entry (DIGIT_ENTRY_*, key_to_digit, digit_entry_step, digit_entry_due, digit_entry_channel), name entry for the channel name and the server slot name (NAME_*, name_entry_step), the DVD controls (DVD_* ids, canonical codes, default keys and skip numbers, dvd_canonical, dvd_default_binding, dvd_action, dvd_translate, dvd_return_menu_step, dvd_swallows_transport, dvd_skip_blocked, dvd_tap_seek, dvd_hold_seek, dvd_hold_direction, dvd_hold_due), and the file explorer's mouse and keyboard rules (PARENT, the EXPLORER_* numbers, explorer_wheel, explorer_wheel_button, explorer_thumb, explorer_scroll_from_thumb, explorer_scrollbar_press, explorer_scrollbar_drag, explorer_select, explorer_double_click, explorer_drag_moved, explorer_drag_step, explorer_button_at and the row and hit helpers).
 Does not own: any drawing, any pygame event, any selection number stored in app_state (the callers convert with the cell/index functions), what an explorer button or row does once it is picked.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 try:
     import performance_governor as _governor
-except Exception:
+except Exception as _governor_import_error:
     _governor = None
+    logging.getLogger(__name__).warning("[MENU NAV] could not import performance_governor, using the fallback values written in menu_nav.py: %s", _governor_import_error)
 
 # ============================================================================
 # SECTION: Directions and the table
@@ -148,6 +150,8 @@ NO_REPEAT_LAYERS = ("GAMES_CTRL_MAP", "DVD_BTN_MAP", "REMOTE_REMAP_CAPTURE", "NU
 # WARNING: the fallback numbers below must match NAV_DUP_HELD_MS, NAV_DUP_PATH_MS in performance_governor.py; they are used only when that module fails to import.
 NAV_DUP_HELD_MS = _governor.NAV_DUP_HELD_MS if _governor is not None else 250
 NAV_DUP_PATH_MS = _governor.NAV_DUP_PATH_MS if _governor is not None else 50
+# WARNING: the fallback number below must match NAV_MOVE_MIN_MS in performance_governor.py; it is used only when that module fails to import.
+NAV_MOVE_MIN_MS = _governor.NAV_MOVE_MIN_MS if _governor is not None else 150
 
 
 def repeat_allowed(layer, key, suppressed=False):
@@ -163,6 +167,19 @@ def press_is_duplicate(since_ms, same_key_code, still_down):
     if still_down and since_ms < NAV_DUP_HELD_MS:
         return True
     return bool(not same_key_code and since_ms < NAV_DUP_PATH_MS)
+
+
+def move_allowed(gate, now_ms, frame_id, min_ms=None):
+    """Returns True when a fresh W/A/S/D press may move the highlight: no move yet in this frame and at least NAV_MOVE_MIN_MS since the last one; an allowed press is recorded in gate (a dict), a refused one is not, so pressing faster never pushes the next move further away."""
+    min_ms = NAV_MOVE_MIN_MS if min_ms is None else min_ms
+    last_ms = gate.get("ms")
+    if gate.get("frame") == frame_id:
+        return False
+    if last_ms is not None and 0 <= now_ms - last_ms < min_ms:
+        return False
+    gate["ms"] = now_ms
+    gate["frame"] = frame_id
+    return True
 
 
 def navigate(app_state, layer, table, cell, direction):
@@ -2217,6 +2234,9 @@ _SDLK_SCANCODE_MASK = 0x40000000
 DVD_REMOTE_PLAY_PAUSE = _SDLK_SCANCODE_MASK | 261
 DVD_REMOTE_REWIND = _SDLK_SCANCODE_MASK | 285
 DVD_REMOTE_FAST_FORWARD = _SDLK_SCANCODE_MASK | 286
+# WARNING: most keyboards send their skip buttons as next track and previous track (SDL 258 and 259), not as fast forward and rewind (owner log 2026-11-02 01:12, "Ignored key 1073742082 / 1073742083"); the DVD player takes them as fast forward and rewind too.
+DVD_KEYBOARD_NEXT_TRACK = _SDLK_SCANCODE_MASK | 258
+DVD_KEYBOARD_PREV_TRACK = _SDLK_SCANCODE_MASK | 259
 # WARNING: the fallback numbers below must match DVD_SKIP_TAP_MS, DVD_SKIP_HOLD_MS, DVD_SKIP_END_GUARD_MS, DVD_SKIP_COOLDOWN_MS, DVD_SKIP_HOLD_START_MS in performance_governor.py; they are used only when that module fails to import.
 DVD_SKIP_TAP_MS = _governor.DVD_SKIP_TAP_MS if _governor is not None else 30000
 DVD_SKIP_HOLD_MS = _governor.DVD_SKIP_HOLD_MS if _governor is not None else 5000
@@ -2238,14 +2258,14 @@ def dvd_default_binding(action):
 
 
 def dvd_action(key, remote=False):
-    """Returns the DVD action a canonical key means, or None; with remote=True the remote's own rewind and fast-forward keys count for those two."""
+    """Returns the DVD action a canonical key means, or None; with remote=True the remote's own rewind and fast-forward keys, and a keyboard's previous-track and next-track keys, count for those two."""
     for action in DVD_ACTIONS:
         if key == dvd_canonical(action):
             return action
     if remote:
-        if key == DVD_REMOTE_FAST_FORWARD:
+        if key in (DVD_REMOTE_FAST_FORWARD, DVD_KEYBOARD_NEXT_TRACK):
             return DVD_FAST_FORWARD
-        if key == DVD_REMOTE_REWIND:
+        if key in (DVD_REMOTE_REWIND, DVD_KEYBOARD_PREV_TRACK):
             return DVD_REWIND
     return None
 

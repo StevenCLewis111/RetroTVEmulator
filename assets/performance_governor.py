@@ -281,6 +281,9 @@ ADVANCED_MENU_SCROLL_STEPS_PER_SECOND = 20
 # VALUES CHANGE HERE (Step 8 gates and attribution)
 GATE_POLL_SECONDS = 0.25
 GATE_MAX_WAIT_SECONDS = 60.0
+
+# VALUES CHANGE HERE (tuning to a channel: background work that has not started yet waits up to this many seconds, or until the channel's first show is playing, so the tune gets the PC to itself)
+TUNE_BACKGROUND_HOLD_SECONDS = 3.0
 BOOT_PREWARM_GATE_WAIT_SECONDS = 5.0
 WHISPER_GATE_KEEP_LEAD_SECONDS = 10.0
 WHISPER_GATE_MAX_HOLD_SECONDS = 30.0
@@ -357,6 +360,9 @@ HUB_ROW_GENERATION_START_TOLERANCE_SECONDS = 60.0
 
 # VALUES CHANGE HERE (schedule hub future rows: how many hours ahead of the clock the background step works out what each channel will air and saves it in the hub for the guide to read; 192 is the guide's seven day span plus one extra day)
 HUB_FUTURE_HOURS_AHEAD = 192.0
+
+# VALUES CHANGE HERE (guide future: the first this many hours ahead are redrawn whenever a file length comes in; past them, each further day of this length is redrawn only once every file in it has a measured length, so the far guide does not keep shifting)
+GUIDE_LIVE_HOURS = 24.0
 
 # VALUES CHANGE HERE (update install: milliseconds the full bar stays up before the app hands over to the updater and restarts)
 UPDATE_INSTALL_HOLD_AT_100_MS = 700
@@ -959,6 +965,9 @@ THEME_SLIDER_FIRST_GAP_TRIM_PX = 18
 # VALUES CHANGE HERE (menu_nav.py, double presses in milliseconds: a second press of one key with no release between counts as the same press inside the first window; the same press arriving by a different key code counts as one inside the second)
 NAV_DUP_HELD_MS = 250
 NAV_DUP_PATH_MS = 50
+
+# VALUES CHANGE HERE (menu_nav.py, highlight speed limit: the fewest milliseconds between two W/A/S/D highlight moves made by separate presses in the menu, the TV guide and the file explorer; a press that comes sooner, or a second press in the same frame, is thrown away rather than saved; a held key keeps its own repeat pace from HOLD_RULES)
+NAV_MOVE_MIN_MS = 150
 
 # VALUES CHANGE HERE (menu_nav.py, sliders: one left or right press moves SLIDER_STEP; each slider is (config key, value when unset, lowest, highest); the Reactive Strength slider on a music channel's editor the same way; the fastest a value control (slider, volume) may step in milliseconds, however fast the key is pressed or held, kept below the held-key repeat intervals in HOLD_RULES so a hold is never dropped)
 SLIDER_STEP = 5
@@ -1634,6 +1643,112 @@ def pc_is_quiet(now=None):
     return quiet_seconds(now) >= SCAN_QUIET_AFTER_SECONDS
 
 
+_scan_turns = {}
+_scan_turns_lock = threading.Lock()
+
+
+def scan_report_head(kind, rank, now=None):
+    """Records how urgent a scan's next file is, as (scan class, tier), or None when the scan has nothing waiting."""
+    now = time.monotonic() if now is None else now
+    with _scan_turns_lock:
+        entry = _scan_turns.setdefault(kind, {"rank": None, "reported": now, "progress": now})
+        if rank is not None and entry["rank"] is None:
+            entry["progress"] = now
+        entry["rank"] = None if rank is None else tuple(rank)
+        entry["reported"] = now
+
+
+def scan_note_progress(kind, now=None):
+    """Records that a scan finished a file."""
+    now = time.monotonic() if now is None else now
+    with _scan_turns_lock:
+        _scan_turns.setdefault(kind, {"rank": None, "reported": now, "progress": now})["progress"] = now
+
+
+def _scan_more_urgent(kind, rank, now):
+    """The other scans whose next file is in a more urgent scan class than rank and that are still reporting and finishing files."""
+    if rank is None:
+        return []
+    out = []
+    with _scan_turns_lock:
+        for other, entry in _scan_turns.items():
+            if other == kind or entry["rank"] is None:
+                continue
+            if now - entry["reported"] > SCAN_TURN_STALE_SECONDS or now - entry["progress"] > SCAN_TURN_STUCK_SECONDS:
+                continue
+            if entry["rank"][0] < rank[0]:
+                out.append(other)
+    return out
+
+
+def scan_should_yield(kind, rank, now=None):
+    """True when another scan has a more urgent file waiting, so this scan leaves the shared scan threads to it for now."""
+    return bool(_scan_more_urgent(kind, rank, time.monotonic() if now is None else now))
+
+
+def scan_is_most_urgent(kind, now=None):
+    """True when this scan's next file is at least as urgent as every other scan's, so it may use the scan threads the others are leaving."""
+    now = time.monotonic() if now is None else now
+    with _scan_turns_lock:
+        mine = _scan_turns.get(kind, {}).get("rank")
+    return mine is not None and not _scan_more_urgent(kind, mine, now) and not any(
+        e["rank"] is not None and e["rank"][0] == mine[0] and other != kind and now - e["reported"] <= SCAN_TURN_STALE_SECONDS
+        for other, e in list(_scan_turns.items()))
+
+
+_game_state = {"active": False, "ticks": collections.deque(), "behind_since": None, "steady_since": None}
+_game_lock = threading.Lock()
+
+
+def set_game_active(active):
+    """Tells the governor whether a game core is running (loaded and not paused)."""
+    with _game_lock:
+        if bool(active) != _game_state["active"]:
+            _game_state["active"] = bool(active)
+            _game_state["ticks"].clear()
+            _game_state["behind_since"] = None
+            _game_state["steady_since"] = None
+
+
+def game_active():
+    return _game_state["active"]
+
+
+def note_game_tick(caught_up, now=None):
+    """Records one drawn game frame and whether the core had to run extra frames to catch up."""
+    now = time.monotonic() if now is None else now
+    with _game_lock:
+        ticks = _game_state["ticks"]
+        ticks.append((now, bool(caught_up)))
+        while ticks and now - ticks[0][0] > GAME_BEHIND_WINDOW_SECONDS:
+            ticks.popleft()
+        behind = len(ticks) >= 10 and sum(1 for _t, c in ticks if c) > GAME_BEHIND_CATCHUP_SHARE * len(ticks)
+        if behind:
+            if _game_state["behind_since"] is None:
+                _game_state["behind_since"] = now
+                log.info("[GOVERNOR] the game is falling behind: background scans wait until it is steady for %.0fs", GAME_STEADY_SECONDS)
+            _game_state["steady_since"] = None
+        elif _game_state["behind_since"] is not None:
+            if _game_state["steady_since"] is None:
+                _game_state["steady_since"] = now
+            elif now - _game_state["steady_since"] >= GAME_STEADY_SECONDS:
+                _game_state["behind_since"] = None
+                _game_state["steady_since"] = None
+                log.info("[GOVERNOR] the game is steady again: background scans continue at the game pace")
+
+
+def game_needs_all(now=None):
+    """True while a game is running and falling behind (or has not yet been steady for GAME_STEADY_SECONDS since)."""
+    with _game_lock:
+        return _game_state["active"] and _game_state["behind_since"] is not None
+
+
+def ffmpeg_scans_running():
+    """How many ffmpeg scans are running right now, priority work included."""
+    with _activity._lock:
+        return sum(_activity._inflight.get(lane, 0) for lane in FFMPEG_SCAN_LANES)
+
+
 def scan_threads(profile=None, mode=None):
     """How many of the scans (duration, picture box, loudness, visualizer music) may work on a not-airing-now file at the same time on this PC, in this mode, at this load level; 1 means they share one thread."""
     profile = profile or get_profile()
@@ -1643,18 +1758,25 @@ def scan_threads(profile=None, mode=None):
     count = min(count, affordable_threads(profile, mode), SCAN_THREADS_MAX)
     level = current_level() if enforcing() else 0
     count = int(count * effective_factor(level, profile, mode))
+    if game_active():
+        count = min(count, GAME_SCAN_THREADS)
     return max(1, count)
 
 
 @contextlib.contextmanager
-def scan_thread_slot(kind, priority=False, stop=None):
+def scan_thread_slot(kind, priority=False, stop=None, rank=None):
     """Holds one of the shared scan threads around one file of non-airing scan work; yields True when admitted, False when stop was set while waiting. Airing-now work, priority scopes and the UI thread never wait."""
     if priority or _is_priority_context():
         yield True
         return
     start = time.monotonic()
     admitted = True
-    while not _activity.try_begin(SCAN_THREADS_LANE, scan_threads()):
+    while True:
+        # WARNING: waiting for its turn behind a more urgent scan is not a stuck wait, so it never counts toward the wait cap; only waiting for a free scan thread does.
+        if scan_should_yield(kind, rank):
+            start = time.monotonic()
+        elif _activity.try_begin(SCAN_THREADS_LANE, scan_threads()):
+            break
         if stop is not None and stop.is_set():
             admitted = False
             break
@@ -1674,6 +1796,7 @@ def scan_thread_slot(kind, priority=False, stop=None):
         yield True
     finally:
         _activity.end(SCAN_THREADS_LANE)
+        scan_note_progress(kind)
 
 
 def scan_gpu_decode_allowed(profile=None):
@@ -1920,6 +2043,15 @@ GUIDE_BACKOFF_MULTIPLIER = 2.0
 UPCOMING_PROBE_RESWEEP_COOLDOWN_SECONDS = 30.0
 UPCOMING_PROBE_SAVE_THROTTLE_SECONDS = 10.0
 GUIDE_PRELOAD_POLL_SECONDS = 0.5
+
+# VALUES CHANGE HERE (schedule timelines: how many built block timelines are kept so the same lineup asked for again (the screen, the guide, the scheduler's background threads) is handed back at once instead of being built again; each holds one block's entries)
+TIMELINE_MEMO_SIZE = 24
+
+# VALUES CHANGE HERE (guide while closed: the background copy of the guide is rebuilt at most once every this many seconds while the guide is not on screen, unless something asks for it (a channel edit, opening the guide); while the guide is open it is rebuilt as soon as anything changes)
+GUIDE_CLOSED_REBUILD_SECONDS = 15.0
+
+# VALUES CHANGE HERE (Python turn-taking: seconds a Python thread may run before it must give another thread a turn; the screen thread waits at most about this long for its turn behind background Python work; Python's own default is 0.005)
+PYTHON_SWITCH_INTERVAL_SECONDS = 0.001
 ORDERED_CONTENT_CACHE_TTL_MS = 8000
 LOUDNESS_TIMEOUT_BACKOFF_SECONDS = (600, 1800, 7200, 21600)
 
@@ -2399,6 +2531,19 @@ SCAN_THREADS_CORES_PER_THREAD = 1.0
 SCAN_THREADS_MAX = 4
 SCAN_THREADS_LANE = "scan_threads"
 
+# VALUES CHANGE HERE (scan turns: each scan (duration, picture box, loudness, music) reports how urgent its next file is (its scan class: airing now, upcoming commercials, the next shows, the deep backlog); a scan whose next file is less urgent than another scan's waits for its turn instead of taking a shared scan thread; a report older than the stale seconds, or a scan that has finished no file for the stuck seconds, does not make others wait)
+SCAN_TURN_STALE_SECONDS = 10.0
+SCAN_TURN_STUCK_SECONDS = 90.0
+
+# VALUES CHANGE HERE (ffmpeg scan lanes that count toward one overall cap: background scan work may not start while this many scans are already running as the threads the app may use in this mode; priority work is never held but is counted)
+FFMPEG_SCAN_LANES = ("probe_and_duration", "loudness_and_bake", "cropdetect_threads", "music_loudness")
+
+# VALUES CHANGE HERE (games: while a game core runs, the scans keep going on this many shared scan threads in total; the game counts as falling behind when more than the share of its frames in the last window seconds needed catching up, and then background scans wait until it has been steady for the steady seconds)
+GAME_SCAN_THREADS = 1
+GAME_BEHIND_WINDOW_SECONDS = 5.0
+GAME_BEHIND_CATCHUP_SHARE = 0.10
+GAME_STEADY_SECONDS = 10.0
+
 # VALUES CHANGE HERE (GPU help for scans: when the PC has a real GPU of a listed tier, the picture-box scan decodes its video on the GPU with this ffmpeg hwaccel, which takes the decode work off the CPU; seconds allowed for the one-time check that this ffmpeg has the hwaccel; GPU decodes that may fail in a run before the scan goes back to CPU decoding for the rest of the run; the loudness, duration and music scans read audio or file headers only and have nothing for the GPU to do)
 SCAN_GPU_DECODE_ENABLED = True
 SCAN_GPU_DECODE_TIERS = ("dedicated", "onboard")
@@ -2558,9 +2703,13 @@ class Throttle:
             if target > self.level:
                 if self._over_since is None:
                     self._over_since = now
-                if immediate or now - self._over_since >= SUSTAIN_SECONDS:
+                if immediate:
                     self._set_level(target, "tighten: " + reason, now)
                     self._over_since = None
+                elif now - self._over_since >= SUSTAIN_SECONDS:
+                    # WARNING: one level per SUSTAIN_SECONDS of pressure, never a jump straight to the target, so the scans are narrowed only as far as it takes (audit stage 5, 2026-11-02: it went 0->4->0 in 35 s cycles); lost audio still jumps at once.
+                    self._set_level(self.level + 1, "tighten: " + reason, now)
+                    self._over_since = now
             else:
                 self._over_since = None
                 if (target < self.level and now - self._last_hold >= RELAX_COOLDOWN_SECONDS
@@ -2789,7 +2938,32 @@ class ActivityTracker:
 
 _activity = ActivityTracker()
 _gate_tls = threading.local()
-_gate_state = {"throttle": None, "enabled": True, "waits": 0, "starved": 0, "last_wait_log": 0.0}
+_gate_state = {"throttle": None, "enabled": True, "waits": 0, "starved": 0, "last_wait_log": 0.0, "tune_until": 0.0}
+
+
+@contextlib.contextmanager
+def background_activity(lane):
+    """Marks Python-heavy background work (guide builds, future guide rows, hub saves, the scan snapshot) as running, so the governor counts it as its own background work instead of unexplained pressure."""
+    _activity.begin(lane)
+    try:
+        yield
+    finally:
+        _activity.end(lane)
+
+
+def hold_background_for_tune():
+    """Holds every background gate that has not admitted its work yet while a channel is being tuned, for at most TUNE_BACKGROUND_HOLD_SECONDS."""
+    _gate_state["tune_until"] = time.monotonic() + TUNE_BACKGROUND_HOLD_SECONDS
+
+
+def release_tune_hold():
+    """Ends the tune hold once the new channel's show is playing."""
+    _gate_state["tune_until"] = 0.0
+
+
+def tune_in_progress():
+    """True while a channel tune holds background work."""
+    return time.monotonic() < _gate_state["tune_until"]
 
 
 def register_throttle(throttle):
@@ -2904,7 +3078,9 @@ def gate(lane, priority=False, timeout=None, label=""):
         waited = False
         while True:
             level = current_level()
-            if level_allows(level, "background") and _activity.try_begin(lane, _lane_limit(lane, level)):
+            if (not tune_in_progress() and not game_needs_all() and level_allows(level, "background")
+                    and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < affordable_threads())
+                    and _activity.try_begin(lane, _lane_limit(lane, level))):
                 admitted = True
                 break
             waited = True

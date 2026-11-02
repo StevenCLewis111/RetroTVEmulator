@@ -1,3 +1,3 @@
 # VALUES CHANGE HERE: written by write_build_info.py before each build; empty in a source run, which then reads version.json instead.
-BUILD_VERSION = ""
-BUILD_TYPE = ""
+BUILD_VERSION = "1.1.5"
+BUILD_TYPE = "Alpha"

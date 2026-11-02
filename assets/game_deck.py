@@ -1020,6 +1020,39 @@ if _WIN:
 
 _hid_identity_cache = None
 _HID_IDENTITY_CACHE_TTL = _gov.HID_IDENTITY_CACHE_TTL_SECONDS
+_hid_api_cache = None
+
+
+def _hid_api():
+    """Returns (setupapi, hid, kernel32) loaded privately with every function the controller identity scan calls declared, so Windows handles keep all 64 bits."""
+    global _hid_api_cache
+    if _hid_api_cache is not None:
+        return _hid_api_cache
+    # WARNING: private copies, not ctypes.windll, so these declarations never change how other code calls the same functions; without them a 64-bit handle is cut to 32 bits and Windows crashes the app (owner crash log 2026-11-01, game_deck.py SetupDiEnumDeviceInterfaces).
+    setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+    hid = ctypes.WinDLL("hid", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    HANDLE, PVOID, DWORD, BOOL = ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, wintypes.BOOL
+    setupapi.SetupDiGetClassDevsW.restype = HANDLE
+    setupapi.SetupDiGetClassDevsW.argtypes = [PVOID, wintypes.LPCWSTR, wintypes.HWND, DWORD]
+    setupapi.SetupDiEnumDeviceInterfaces.restype = BOOL
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [HANDLE, PVOID, PVOID, DWORD, PVOID]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.restype = BOOL
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [HANDLE, PVOID, PVOID, DWORD, PVOID, PVOID]
+    setupapi.SetupDiGetDeviceRegistryPropertyW.restype = BOOL
+    setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [HANDLE, PVOID, DWORD, PVOID, PVOID, DWORD, PVOID]
+    setupapi.SetupDiDestroyDeviceInfoList.restype = BOOL
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [HANDLE]
+    kernel32.CreateFileW.restype = HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, DWORD, DWORD, PVOID, DWORD, DWORD, HANDLE]
+    kernel32.CloseHandle.restype = BOOL
+    kernel32.CloseHandle.argtypes = [HANDLE]
+    hid.HidD_GetAttributes.restype = ctypes.c_ubyte
+    hid.HidD_GetAttributes.argtypes = [HANDLE, PVOID]
+    hid.HidD_GetSerialNumberString.restype = ctypes.c_ubyte
+    hid.HidD_GetSerialNumberString.argtypes = [HANDLE, PVOID, DWORD]
+    _hid_api_cache = (setupapi, hid, kernel32)
+    return _hid_api_cache
 
 
 def _scan_hid_identities():
@@ -1027,11 +1060,9 @@ def _scan_hid_identities():
     if not _WIN or _is_running_under_wine():
         return out
     try:
-        setupapi = ctypes.windll.setupapi
-        hid      = ctypes.windll.hid
-        kernel32 = ctypes.windll.kernel32
+        setupapi, hid, kernel32 = _hid_api()
     except Exception as _swallowed_error:
-        _log_swallowed("_scan_hid_identities: setupapi = ctypes.windll.setupapi", _swallowed_error)
+        _log_swallowed("_scan_hid_identities: setupapi, hid, kernel32 = _hid_api()", _swallowed_error)
         return out
 
     h_devinfo = None
@@ -1065,7 +1096,7 @@ def _scan_hid_identities():
             fixed_cbsize = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
             ctypes.memmove(buf, ctypes.byref(ctypes.c_ulong(fixed_cbsize)), 4)
             ok = setupapi.SetupDiGetDeviceInterfaceDetailW(
-                h_devinfo, ctypes.byref(iface), buf, needed,
+                h_devinfo, ctypes.byref(iface), buf, needed.value,
                 ctypes.byref(needed), ctypes.byref(devinfo_data))
             if not ok:
                 continue
@@ -4577,8 +4608,11 @@ class ExternalGameDeck:
                     self._scan_roms("DVD")
                 else:
                     self.dvd_exit_confirm = False
+            elif _nav.is_back(key):
+                self.dvd_exit_confirm = False
+                log.info("[DVD INPUT] Quit-confirm: Back -> closed as No, the DVD keeps playing.")
             else:
-                log.info(f"[DVD INPUT] Quit-confirm open: ignoring key {key} (only A/D/Enter are live).")
+                log.info(f"[DVD INPUT] Quit-confirm open: ignoring key {key} (only A/D/Enter/Back are live).")
             return True
 
         if self.dvd_return_menu_confirm:
@@ -4603,8 +4637,11 @@ class ExternalGameDeck:
                           "(WASD now controls menu navigation).")
                 else:
                     self.dvd_return_menu_confirm = False
+            elif _nav.is_back(key):
+                self.dvd_return_menu_confirm = False
+                log.info("[DVD INPUT] Back-to-main-confirm: Back -> closed as No, the DVD keeps playing.")
             else:
-                log.info(f"[DVD INPUT] Back-to-main-confirm open: ignoring key {key} (only A/D/Enter are live).")
+                log.info(f"[DVD INPUT] Back-to-main-confirm open: ignoring key {key} (only A/D/Enter/Back are live).")
             return True
 
         if self.dvd_splash_playing:
@@ -4967,6 +5004,9 @@ class ExternalGameDeck:
         try:
             with open(self.config_path, "r", encoding="utf-8") as fp:
                 cfg = json.load(fp)
+        except FileNotFoundError:
+            # WARNING: no emulator_config.json yet is normal on a first start; it is written below (owner 2026-11-02: no warning for it).
+            cfg = {}
         except Exception as _swallowed_error:
             _log_swallowed("ExternalGameDeck._assign_default_cores_after_scan: with open(self.config_path, 'r', encoding='utf-8') as fp:", _swallowed_error)
             cfg = {}
@@ -4990,6 +5030,7 @@ class ExternalGameDeck:
             log.info(f"[CORES] {console}: default active core set to {chosen}")
         if changed:
             try:
+                os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
                 with open(self.config_path, "w", encoding="utf-8") as fp:
                     json.dump(cfg, fp, indent=2)
             except Exception as e:
@@ -9695,6 +9736,11 @@ class ExternalGameDeck:
             pad_snapshot_end()
             GAME_FRAME_TIMER.tick_end("play" if self._gft_runs > 0 else "idle", self._libretro_console,
                                       self._gft_runs, self._LIBRETRO_MAX_CATCHUP_FRAMES)
+            if self._gft_runs > 0:
+                try:
+                    _gov.note_game_tick(self._gft_runs > 1)
+                except Exception as _swallowed_error:
+                    _log_swallowed("_render_libretro: _gov.note_game_tick", _swallowed_error)
 
     def _render_libretro_impl(self, screen, dest_rect, crt_cfg=None, overlay_open=False, pixel_cfg=None):
         core = self._libretro_core

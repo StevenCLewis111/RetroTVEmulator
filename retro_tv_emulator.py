@@ -111,6 +111,128 @@ def _move_root_working_files_into_logs():
 _ROOT_MOVED_INTO_LOGS = _move_root_working_files_into_logs()
 
 
+# ============================================================================
+# SECTION: App folder icon
+# ============================================================================
+FOLDER_ICON_PARTS = ("images", "loading", "folder.ico")
+FOLDER_ICON_INI_NAME = "desktop.ini"
+FOLDER_ICON_INI_MARK = "; Retro TV Emulator folder icon"
+
+
+def _folder_icon_ini_text(icon_ref):
+    """The desktop.ini text that gives the app folder its icon, used only when Windows' own folder-settings call is not available; icon_ref is the icon's path relative to the app folder (absolute when it is on another drive)."""
+    return "%s\r\n[.ShellClassInfo]\r\nIconResource=%s,0\r\nIconFile=%s\r\nIconIndex=0\r\n" % (FOLDER_ICON_INI_MARK, icon_ref, icon_ref)
+
+
+def _folder_icon_ini_icon(text):
+    """The icon path a desktop.ini's IconResource (or IconFile) names, without its icon number; '' when it names none."""
+    for line in (text or "").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip().lower() in ("iconresource", "iconfile") and value.strip():
+            return value.strip().rsplit(",", 1)[0].strip() if key.strip().lower() == "iconresource" else value.strip()
+    return ""
+
+
+def _folder_icon_via_shell(root, icon_ref):
+    """Sets the folder's icon with Windows' own folder-settings call (SHGetSetFolderCustomSettings), which writes desktop.ini, marks the folder and tells Explorer at once; True when Windows accepted it."""
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    class _FolderCustomSettings(_ctypes.Structure):
+        _fields_ = [("dwSize", _wintypes.DWORD), ("dwMask", _wintypes.DWORD), ("pvid", _ctypes.c_void_p),
+                    ("pszWebViewTemplate", _wintypes.LPWSTR), ("cchWebViewTemplate", _wintypes.DWORD),
+                    ("pszWebViewTemplateVersion", _wintypes.LPWSTR), ("pszInfoTip", _wintypes.LPWSTR), ("cchInfoTip", _wintypes.DWORD),
+                    ("pclsid", _ctypes.c_void_p), ("dwFlags", _wintypes.DWORD), ("pszIconFile", _wintypes.LPWSTR),
+                    ("cchIconFile", _wintypes.DWORD), ("iIconIndex", _ctypes.c_int), ("pszLogo", _wintypes.LPWSTR), ("cchLogo", _wintypes.DWORD)]
+
+    shell32 = _ctypes.WinDLL("shell32")
+    shell32.SHGetSetFolderCustomSettings.restype = _ctypes.c_long
+    shell32.SHGetSetFolderCustomSettings.argtypes = [_ctypes.POINTER(_FolderCustomSettings), _wintypes.LPCWSTR, _wintypes.DWORD]
+    settings = _FolderCustomSettings()
+    settings.dwSize = _ctypes.sizeof(settings)
+    settings.dwMask = 0x10
+    _icon_buf = _ctypes.create_unicode_buffer(icon_ref)
+    settings.pszIconFile = _ctypes.cast(_icon_buf, _wintypes.LPWSTR)
+    settings.cchIconFile = 0
+    settings.iIconIndex = 0
+    return shell32.SHGetSetFolderCustomSettings(_ctypes.byref(settings), root, 0x2) >= 0
+
+
+def _folder_icon_notify(root):
+    """Tells Explorer the folder and the folder it sits in changed, and waits until Explorer has taken it, so open windows and the desktop redraw the icon now."""
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+    shell32 = _ctypes.WinDLL("shell32")
+    shell32.SHChangeNotify.restype = None
+    shell32.SHChangeNotify.argtypes = [_wintypes.LONG, _wintypes.UINT, _ctypes.c_void_p, _ctypes.c_void_p]
+    # WARNING: SHCNF_PATHW | SHCNF_FLUSH: the call returns once Explorer has handled it; the folder itself (SHCNE_UPDATEITEM) and the folder that lists it (SHCNE_UPDATEDIR) both need telling, or the listing keeps the cached plain folder until Windows refreshes its icon cache on its own.
+    shell32.SHChangeNotify(0x00002000, 0x0005 | 0x1000, _ctypes.c_wchar_p(root), None)
+    shell32.SHChangeNotify(0x00001000, 0x0005 | 0x1000, _ctypes.c_wchar_p(os.path.dirname(os.path.abspath(root))), None)
+
+
+def _set_app_folder_icon(root, main_dir):
+    """Gives the app folder the Retro TV folder icon (main/images/loading/folder.ico) and has Explorer show it at once; a desktop.ini naming some other icon is left alone; returns a line for the log."""
+    icon = os.path.join(main_dir, *FOLDER_ICON_PARTS)
+    if not os.path.isfile(icon):
+        return "no folder.ico at %s, folder icon not set" % icon
+    try:
+        icon_ref = os.path.relpath(icon, root)
+    except ValueError:
+        icon_ref = icon
+    if icon_ref.startswith(".."):
+        icon_ref = icon
+    ini = os.path.join(root, FOLDER_ICON_INI_NAME)
+    have = None
+    if os.path.isfile(ini):
+        for _enc in ("utf-16", "utf-8", "mbcs" if os.name == "nt" else "latin-1"):
+            try:
+                with open(ini, "r", encoding=_enc, newline="") as _fh:
+                    have = _fh.read()
+                break
+            except (UnicodeError, LookupError):
+                continue
+        _named = _folder_icon_ini_icon(have)
+        _ours = bool(have) and (FOLDER_ICON_INI_MARK in have or os.path.normcase(os.path.basename(_named)) == os.path.normcase(FOLDER_ICON_PARTS[-1]))
+        if not _ours:
+            return "a desktop.ini the app did not write is already in the app folder, folder icon left as it is"
+        # WARNING: an older desktop.ini of the app's own (it carries FOLDER_ICON_INI_MARK) is set again once through Windows' folder settings, so a folder whose icon never showed gets it now.
+        if (FOLDER_ICON_INI_MARK not in have or os.name != "nt") and os.path.normcase(os.path.normpath(_named)) == os.path.normcase(os.path.normpath(icon_ref)):
+            if os.name == "nt":
+                _folder_icon_notify(root)
+            return "folder icon already set"
+    if os.name != "nt":
+        with open(ini, "w", encoding="utf-16", newline="") as _fh:
+            _fh.write(_folder_icon_ini_text(icon_ref))
+        return "desktop.ini written (folder icons show only on Windows)"
+    # WARNING: Windows' own folder-settings call is the documented way to give a folder an icon: it writes desktop.ini in the form Explorer reads, marks the folder and broadcasts the change, so the icon shows at once instead of when Windows next refreshes its icon cache (owner 2026-11-02: "can we make it right away"). The hand-written desktop.ini is only the fallback.
+    _how = "Windows folder settings"
+    try:
+        _done = _folder_icon_via_shell(root, icon_ref)
+    except Exception as _shell_error:
+        logging.getLogger(__name__).warning("[FOLDER ICON] Windows folder settings call failed, writing desktop.ini instead: %s", _shell_error)
+        _done = False
+    if not _done:
+        _how = "desktop.ini written by the app"
+        import ctypes as _ctypes
+        from ctypes import wintypes as _wintypes
+        kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetFileAttributesW.restype = _wintypes.DWORD
+        kernel32.GetFileAttributesW.argtypes = [_wintypes.LPCWSTR]
+        kernel32.SetFileAttributesW.restype = _wintypes.BOOL
+        kernel32.SetFileAttributesW.argtypes = [_wintypes.LPCWSTR, _wintypes.DWORD]
+        if os.path.isfile(ini):
+            kernel32.SetFileAttributesW(ini, 0x80)
+        with open(ini, "w", encoding="utf-16", newline="") as _fh:
+            _fh.write(_folder_icon_ini_text(icon_ref))
+        # WARNING: Windows reads a folder's desktop.ini only when the folder is marked read-only or system; read-only on a folder blocks nothing, it only tells Explorer to look.
+        kernel32.SetFileAttributesW(ini, 0x2 | 0x4)
+        _attrs = kernel32.GetFileAttributesW(root)
+        if _attrs != 0xFFFFFFFF and not _attrs & 0x1:
+            kernel32.SetFileAttributesW(root, _attrs | 0x1)
+    _folder_icon_notify(root)
+    return "folder icon set: %s (%s), Explorer told to redraw it now" % (icon_ref, _how)
+
+
 def _early_crash_path():
     try:
         _dir = os.path.join(_app_logs_dir(), "temp")
@@ -244,6 +366,9 @@ except Exception as _governor_import_err:
     performance_governor = None
     _PERFORMANCE_GOVERNOR_IMPORT_ERROR = _governor_import_err
 
+# WARNING: background threads that do a lot of Python make the screen thread wait for its turn; a shorter switch interval gives it a turn sooner (audit stage 3, 2026-11-02). The fallback number must match PYTHON_SWITCH_INTERVAL_SECONDS in performance_governor.py.
+sys.setswitchinterval(performance_governor.PYTHON_SWITCH_INTERVAL_SECONDS if performance_governor is not None else 0.001)
+
 # WARNING: shell mode (--as-shell, Windows shell replaced) must be set before the governor starts, because the thread and core limits are read from it.
 if performance_governor is not None:
     performance_governor.set_shell_mode("--as-shell" in sys.argv)
@@ -267,6 +392,8 @@ _HUB_FUTURE_BETWEEN_CHANNELS_SECONDS = performance_governor.HUB_FUTURE_BETWEEN_C
 _HUB_FUTURE_START_DELAY_SECONDS = performance_governor.HUB_FUTURE_START_DELAY_SECONDS if performance_governor is not None else 45.0
 _HUB_FUTURE_REFRESH_SECONDS = performance_governor.HUB_FUTURE_REFRESH_SECONDS if performance_governor is not None else 900.0
 _HUB_FUTURE_IDLE_SECONDS = performance_governor.HUB_FUTURE_IDLE_SECONDS if performance_governor is not None else 30.0
+# WARNING: the fallback number below must match GUIDE_LIVE_HOURS in performance_governor.py; it is used only when that module fails to import.
+_GUIDE_LIVE_HOURS = performance_governor.GUIDE_LIVE_HOURS if performance_governor is not None else 24.0
 # WARNING: the 0.5 fallback must match HUB_MODE_SWITCH_SETTLE_SECONDS in performance_governor.py; it is used only when that module fails to import.
 _HUB_MODE_SWITCH_SETTLE_SECONDS = performance_governor.HUB_MODE_SWITCH_SETTLE_SECONDS if performance_governor is not None else 0.5
 # WARNING: the 1000 fallback must match LOOP_BLOCKED_GAP_MS in performance_governor.py; it is used only when that module fails to import.
@@ -360,6 +487,15 @@ log = logging.getLogger(__name__)
 log.info("=== App start %s ===", broadcast_clock.now().replace(tzinfo=None).isoformat())
 for _moved_line in _ROOT_MOVED_INTO_LOGS:
     log.info("[LOGS FOLDER] %s", _moved_line)
+def _folder_icon_job():
+    """Sets the app folder icon on its own thread, because telling Explorer waits until Explorer has redrawn."""
+    try:
+        log.info("[FOLDER ICON] %s", _set_app_folder_icon(_app_root_dir(), resolve_main_dir()))
+    except Exception as _folder_icon_error:
+        log.warning("[FOLDER ICON] could not set the app folder icon: %s", _folder_icon_error)
+
+
+threading.Thread(target=_folder_icon_job, daemon=True, name="FolderIcon").start()
 
 
 
@@ -6654,6 +6790,8 @@ def _confirm_playback_started(ch_key, attempt_id, file_path, seek_offset, slot_s
 
     app_state["is_playing_video"] = True
     app_state["_live_playback_channel"] = ch_key
+    if performance_governor is not None:
+        performance_governor.release_tune_hold()
     _clear_channel_playback_failure(ch_key)
     if extra_state:
         app_state.update(extra_state)
@@ -9123,7 +9261,7 @@ def _changed_file_sweep_loop():
     if _app_shutting_down.wait(_background_scan_pace_seconds(_CHANGED_FILE_SWEEP_INTERVAL_S)):
         return
     while True:
-        while _background_scan_should_pause():
+        while _python_heavy_should_pause():
             if _app_shutting_down.wait(2.0):
                 return
         try:
@@ -9481,7 +9619,9 @@ def _pending_probe_worker():
                 with _governor_priority_scope():
                     result = _probe_pending_schedule_one(path)
             else:
-                result = _probe_pending_schedule_one(path)
+                with _scan_thread_slot("pending", SCAN_CLASS_DEEP) as _slot_ok:
+                    if _slot_ok:
+                        result = _probe_pending_schedule_one(path)
         except Exception as exc:
             log.warning("[SCHEDULER] background probe of %s failed: %s", os.path.basename(path), exc)
         finally:
@@ -9500,8 +9640,12 @@ def _pending_probe_worker():
 
 
 def _pending_backlog_may_run(state, now_m):
-    """True when a backlog (not-needed-soon) file may be probed now: the PC's load level is low, no live open is in flight, and the governor's spacing since the last backlog probe has passed. Called with the state lock held."""
+    """True when a backlog (not-needed-soon) file may be probed now: the background scans are not paused, it is not another scan's turn, the PC's load level is low, no live open is in flight, and the governor's spacing since the last backlog probe has passed. Called with the state lock held."""
     if media._LIVE_PLAYBACK_PRIORITY.is_set():
+        return False
+    if _background_scan_should_pause():
+        return False
+    if performance_governor is not None and performance_governor.scan_should_yield("pending", _scan_rank(SCAN_CLASS_DEEP)):
         return False
     if performance_governor is None:
         return now_m - state.get("last_backlog", 0.0) >= 1.5
@@ -10800,42 +10944,49 @@ def _probe_and_patch_durations(ch_key, container_key, sub_key, items_pool, _resu
             _cached = _read_file_probe_facts(norm_p)
             probed = _cached.get("duration")
             probed_gain = _cached.get("gain")
-            if probed is None:
-                try:
-                    probed = _probe_duration_guarded(norm_p)
-                except Exception as _swallowed_error:
-                    _log_swallowed("_probe_and_patch_durations: probed = _probe_duration_guarded(norm_p)", _swallowed_error)
-                    probed = None
-            if probed_gain is None:
-                try:
-                    if _is_drive_degraded(norm_p):
-                        raise LoudnessProbeTimeoutError(norm_p)
-                    probed_gain = _probe_loudness_guarded(
-                        norm_p, raise_on_no_audio=True,
-                        treat_fallback_as_unknown=True,
-                        raise_on_unplayable=True)
-                except NoAudioStreamError as _naerr:
-                    _drop_media_from_pool(ch_key, sub_key, norm_p,
-                                           getattr(_naerr, "reason", "no audio track"),
-                                           container_key=container_key)
-                    _removed_silent_commercials += 1
-                    _save_file_probe_facts(norm_p, duration=probed)
-                    _update_probe_batch_progress(batch_id, items_pool[i + 1:])
-                    continue
-                except UnplayableMediaError as _uerr:
-                    _strikes = _register_unplayable_strike(norm_p, _uerr.reason)
-                    _save_file_probe_facts(norm_p, duration=probed)
-                    if _strikes >= UNPLAYABLE_STRIKE_THRESHOLD:
+            # WARNING: this check of newly saved commercial and holiday files is scan work like any other: it waits while the background scans are paused and takes a shared scan thread in the commercial class, so the scan turns can put it ahead of far-off work (audit stage 2, 2026-11-02).
+            while _background_scan_should_pause():
+                if _app_shutting_down.wait(DURATION_PRECACHE_PAUSE_RECHECK_SECONDS):
+                    return
+            with _scan_thread_slot("commercial_check", SCAN_CLASS_COMMERCIAL) as _slot_ok:
+                if not _slot_ok:
+                    return
+                if probed is None:
+                    try:
+                        probed = _probe_duration_guarded(norm_p)
+                    except Exception as _swallowed_error:
+                        _log_swallowed("_probe_and_patch_durations: probed = _probe_duration_guarded(norm_p)", _swallowed_error)
+                        probed = None
+                if probed_gain is None:
+                    try:
+                        if _is_drive_degraded(norm_p):
+                            raise LoudnessProbeTimeoutError(norm_p)
+                        probed_gain = _probe_loudness_guarded(
+                            norm_p, raise_on_no_audio=True,
+                            treat_fallback_as_unknown=True,
+                            raise_on_unplayable=True)
+                    except NoAudioStreamError as _naerr:
                         _drop_media_from_pool(ch_key, sub_key, norm_p,
-                                               f"confirmed unplayable ({_uerr.reason}, "
-                                               f"{_strikes} strikes)",
+                                               getattr(_naerr, "reason", "no audio track"),
                                                container_key=container_key)
-                        _removed_unplayable += 1
-                    _update_probe_batch_progress(batch_id, items_pool[i + 1:])
-                    continue
-                except Exception as _swallowed_error:
-                    _log_swallowed("_probe_and_patch_durations: if _is_drive_degraded(norm_p):", _swallowed_error)
-                    probed_gain = None
+                        _removed_silent_commercials += 1
+                        _save_file_probe_facts(norm_p, duration=probed)
+                        _update_probe_batch_progress(batch_id, items_pool[i + 1:])
+                        continue
+                    except UnplayableMediaError as _uerr:
+                        _strikes = _register_unplayable_strike(norm_p, _uerr.reason)
+                        _save_file_probe_facts(norm_p, duration=probed)
+                        if _strikes >= UNPLAYABLE_STRIKE_THRESHOLD:
+                            _drop_media_from_pool(ch_key, sub_key, norm_p,
+                                                   f"confirmed unplayable ({_uerr.reason}, "
+                                                   f"{_strikes} strikes)",
+                                                   container_key=container_key)
+                            _removed_unplayable += 1
+                        _update_probe_batch_progress(batch_id, items_pool[i + 1:])
+                        continue
+                    except Exception as _swallowed_error:
+                        _log_swallowed("_probe_and_patch_durations: if _is_drive_degraded(norm_p):", _swallowed_error)
+                        probed_gain = None
             if _is_commercial_block and probed and probed > COMMERCIAL_MAX_SECONDS:
                 if _drop_media_from_pool(ch_key, sub_key, norm_p,
                                           f"{int(probed)}s > {COMMERCIAL_MAX_SECONDS}s, too long to be a commercial",
@@ -10861,6 +11012,7 @@ def _probe_and_patch_durations(ch_key, container_key, sub_key, items_pool, _resu
             else:
                 _time.sleep(0.8 if pool_size > 100 else 0.4)
     finally:
+        _scan_report_head("commercial_check")
         _clear_probe_batch(batch_id)
     try: db.save_settings_async(force=True)
     except Exception as e: log.warning("Final settings save failed after duration probe for %s/%s: %s", container_key, sub_key, e)
@@ -10949,6 +11101,7 @@ def _fe_close(commit):
                 print(f"[FILE EXPLORER] {block} -> {len(entries)} file(s) for ch {ch_key} "
                       f"(+{len(new_paths)} new, -{removed_n} removed"
                       + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
+                _note_scan_work_added()
                 if new_paths:
                     threading.Thread(
                         target=_probe_and_patch_durations,
@@ -10968,6 +11121,7 @@ def _fe_close(commit):
                 print(f"[FILE EXPLORER] Holiday {hkey} -> {len(entries)} file(s) for ch {ch_key} "
                       f"(+{len(new_paths)} new, -{removed_n} removed"
                       + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
+                _note_scan_work_added()
                 if new_paths:
                     threading.Thread(
                         target=_probe_and_patch_durations,
@@ -11938,11 +12092,11 @@ def _fe_render(screen, active_theme, fe_rect):
 
     if app_state.get("file_explorer_bulkscan_pending", False):
         _bs_done, _bs_total = app_state.get("file_explorer_bulkscan_progress", (0, 0))
-        _bs_label = "FOLDER SCAN... (BACK TO CANCEL)"
+        # WARNING: the box fits about 26 characters; the label stays just LOADING ROMS..... (owner 2026-11-01), the bar shows how far the scan is, and Back still cancels.
+        _bs_label = "LOADING ROMS....."
         _bs_frac  = None
         if _bs_total > 0:
             _bs_frac = min(1.0, _bs_done / _bs_total)
-            _bs_label = f"FOLDER SCAN... {int(_bs_frac * 100)}% (BACK TO CANCEL)"
         _fe_draw_busy_overlay(screen, fx, fy, fw, fh, UI_C, PANEL_C, BG_C,
                                _bs_label, progress_fraction=_bs_frac)
 
@@ -12014,7 +12168,6 @@ visualizer_deck = None
 
 _app_shutting_down = threading.Event()
 
-_deferred_metadata_probe_lock = threading.Lock()
 
 vlc_boot_requested = False
 
@@ -12286,18 +12439,8 @@ def _vlc_track_language(label):
 
 
 def _audio_track_rows(tracks, header_streams):
-    """The picker rows as (track id, label): VLC's label, with the file's own language and format added when VLC's label names no language and VLC and the file list the same number of tracks."""
-    rows = []
-    same_count = len(header_streams) == len(tracks)
-    for index, (tid, label) in enumerate(tracks):
-        shown = label or "Track %s" % tid
-        if same_count and not _vlc_track_language(shown):
-            info = header_streams[index]
-            extra = ", ".join(part for part in (info.get("lang", "").upper(), info.get("desc", "")[:40]) if part)
-            if extra:
-                shown = "%s (%s)" % (shown, extra)
-        rows.append((tid, shown))
-    return rows
+    """The picker rows as (track id, label): the track name exactly as VLC gives it ("Track 1", "Track 2 - [English]"), or "Track N" when VLC gives none; header_streams is not shown."""
+    return [(tid, label or "Track %s" % tid) for tid, label in tracks]
 
 
 def _pick_preferred_audio_track(tracks, header_streams, current_id):
@@ -15499,7 +15642,7 @@ def _run_first_pass_now_playing_sweep():
                 _new_channels = _current_channels - _known_channels
                 if _new_channels:
                     _interrupted = False
-                    for new_ch in sorted(_new_channels):
+                    for new_ch in sorted(_new_channels, key=_channel_scan_rank):
                         _known_channels.add(new_ch)
                         ch_info = db.channels_db.get(new_ch, {})
                         if not ch_info or not ch_info.get("active", True):
@@ -15805,7 +15948,7 @@ def _compute_channel_scan_progress(snap, lookups_left):
 
 def _publish_channel_scan_progress(snap):
     """Writes app_state["_channel_scan_progress"] = {channel: (done, total)}; the Channels tab only reads it."""
-    lookups_left = [0 if _background_scan_should_pause() else SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD]
+    lookups_left = [0 if _python_heavy_should_pause() else SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD]
     progress = _compute_channel_scan_progress(snap, lookups_left)
     app_state["_channel_scan_progress"] = progress
     for ch_str, (done, total) in progress.items():
@@ -15823,15 +15966,21 @@ def _scan_snapshot_worker():
     global _scan_snapshot
     if db is None:
         return
+    _woke_for_added = _scan_files_added_generation[0]
     while not _app_shutting_down.is_set():
         try:
-            fresh = _build_scan_snapshot()
+            _added_seen = _scan_files_added_generation[0]
+            with _background_activity("scan_snapshot"):
+                fresh = _build_scan_snapshot()
             with _scan_snapshot_lock:
                 _scan_snapshot = fresh
             _publish_channel_scan_progress(fresh)
+            if _added_seen != _woke_for_added:
+                _woke_for_added = _added_seen
+                _scan_work_generation[0] += 1
         except Exception as e:
             log.warning("[SCAN SNAPSHOT] rebuild failed: %s", e)
-        if _app_shutting_down.wait(SCAN_SNAPSHOT_INTERVAL_S):
+        if _scan_idle_wait(SCAN_SNAPSHOT_INTERVAL_S, _scan_files_added_generation):
             return
 
 
@@ -16116,7 +16265,8 @@ def _music_precache_worker():
             queue = _gather_music_probe_queue()
             if not queue:
                 _flush()
-                if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_IDLE_SLEEP_SECONDS)):
+                _scan_report_head("music")
+                if _scan_idle_wait(_scan_pace(MUSIC_PRECACHE_IDLE_SLEEP_SECONDS)):
                     return
                 continue
             _queue_built_at = time.monotonic()
@@ -16125,10 +16275,10 @@ def _music_precache_worker():
                     return
                 if time.monotonic() - _queue_built_at >= SCAN_PIPELINE_PREEMPT_CHECK_SECONDS:
                     break
-                if _background_scan_should_pause():
+                # WARNING: a pause waits on this song; moving on to the next would scan the playlist out of order.
+                while _background_scan_should_pause():
                     if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
                         return
-                    continue
                 with _scan_thread_slot("music", _scan_cls) as _slot_ok:
                     if not _slot_ok:
                         return
@@ -16450,6 +16600,10 @@ def _make_guide_preload_watchdog_tick():
         _guide_is_open = app_state.get("current_channel") == "04"
         if not _guide_is_open and not _guide_dirty_event.is_set():
             return
+        # WARNING: the preloader pauses on purpose while a game core runs (see _guide_preload_worker), so that time is never a stall (owner 2026-11-02: no false warnings).
+        _lr_core = getattr(game_deck, "_libretro_core", None) if game_deck is not None else None
+        if _lr_core is not None and getattr(_lr_core, "is_loaded", False) and not getattr(_lr_core, "is_frozen", False):
+            return
         _staleness = time.time() - _guide_preload_last_tick_ts
         if _staleness < STALL_THRESHOLD_S:
             return
@@ -16482,9 +16636,12 @@ def _guide_preload_worker():
     global _guide_preload_scratch_surface, _guide_preload_last_tick_ts
     # WARNING: the fallback numbers below must match GUIDE_PRELOAD_POLL_SECONDS in performance_governor.py; they are used only when that module fails to import.
     GUIDE_POLL_S = performance_governor.GUIDE_PRELOAD_POLL_SECONDS if performance_governor is not None else 0.5
+    # WARNING: the fallback number below must match GUIDE_CLOSED_REBUILD_SECONDS in performance_governor.py; it is used only when that module fails to import.
+    GUIDE_CLOSED_REBUILD_S = performance_governor.GUIDE_CLOSED_REBUILD_SECONDS if performance_governor is not None else 15.0
     _tick_count = 0
     _winsize_wait_since = None
     _initial_build_pending = True
+    _last_closed_build = 0.0
     while True:
         try:
             if _app_shutting_down.is_set():
@@ -16496,13 +16653,19 @@ def _guide_preload_worker():
             if not pygame.display.get_init() or not pygame.font.get_init():
                 time.sleep(GUIDE_POLL_S)
                 continue
+            _asked = True
             if _initial_build_pending:
                 _initial_build_pending = False
             else:
-                _guide_dirty_event.wait(timeout=GUIDE_POLL_S)
+                _asked = _guide_dirty_event.wait(timeout=GUIDE_POLL_S)
                 _guide_dirty_event.clear()
             if _app_shutting_down.is_set():
                 return
+            # WARNING: while the guide is not on screen, a length or loudness that came in is caught at most every GUIDE_CLOSED_REBUILD_SECONDS and not while Python-heavy work must wait; a rebuild someone asks for (opening the guide, a channel edit) always runs at once (audit stage 3, 2026-11-02: 629 rebuilds in 15 minutes with the guide closed).
+            if not _asked and app_state.get("current_channel") != "04":
+                if _python_heavy_should_pause() or time.monotonic() - _last_closed_build < GUIDE_CLOSED_REBUILD_S:
+                    _guide_preload_last_tick_ts = time.time()
+                    continue
             if db is None or not pygame.display.get_init() or not pygame.font.get_init():
                 _log_warn_throttled(
                     "guide_preload_bail_prereq",
@@ -16525,8 +16688,14 @@ def _guide_preload_worker():
                     or _guide_preload_scratch_surface.get_size() != (_w, _h)):
                 _guide_preload_scratch_surface = pygame.Surface((_w, _h))
             _content_rect = pygame.Rect(0, 0, _w, _h)
-            guide_preload_tick(_guide_preload_scratch_surface, app_state, db,
-                                _theme_snapshot, target_rect=_content_rect)
+            if app_state.get("current_channel") != "04":
+                with _background_activity("guide_build"):
+                    guide_preload_tick(_guide_preload_scratch_surface, app_state, db,
+                                        _theme_snapshot, target_rect=_content_rect)
+                _last_closed_build = time.monotonic()
+            else:
+                guide_preload_tick(_guide_preload_scratch_surface, app_state, db,
+                                    _theme_snapshot, target_rect=_content_rect)
             _tick_count += 1
             _guide_preload_last_tick_ts = time.time()
         except Exception as e:
@@ -16593,13 +16762,28 @@ def _probe_upcoming_media():
         # WARNING: the loudness scan runs at the same pace with Loudness Scan on or off; off only stops playback from using the gains.
         return _scan_class_pace_seconds(scan_class, base_seconds)
 
-    def _pipeline_workers_now():
-        # WARNING: while a video is playing, stay serial; never compete for disk/CPU with what is on screen.
+    def _pipeline_loudness_done(norm_p):
+        """True when the file needs no loudness scan: its gain is stored, it was scanned this pass, or it is resting after a failed try."""
+        if _read_file_probe_facts(norm_p).get("gain") is not None:
+            return True
+        with _pass_state_lock:
+            if _this_pass_results.get(norm_p, {}).get("gain") is not None:
+                return True
+        return _loudness_probe_in_cooldown(norm_p)
+
+    def _pipeline_workers_now(head_cls=None):
+        # WARNING: while a video is playing it stays serial unless loudness is the most urgent scan (the others are waiting for it) and the load level allows; then it uses the scan threads the others leave, up to its own lane.
         spare = not app_state.get("is_playing_video", False)
         if performance_governor is None:
             return 1
         try:
-            return max(1, performance_governor.loudness_dispatch_workers(spare=spare, cap=LOUDNESS_PROBE_MAX_CONCURRENT))
+            _base = max(1, performance_governor.loudness_dispatch_workers(spare=spare, cap=LOUDNESS_PROBE_MAX_CONCURRENT))
+            if (head_cls is not None and head_cls != SCAN_CLASS_DEEP and performance_governor.scan_is_most_urgent("loudness")
+                    and (performance_governor.current_level() if performance_governor.enforcing() else 0) <= 1):
+                _lane = performance_governor.lane_slots("loudness_and_bake", performance_governor.current_level() if performance_governor.enforcing() else 0,
+                                                       performance_governor.get_profile())
+                return max(_base, min(_lane, performance_governor.scan_threads()))
+            return _base
         except Exception as _swallowed_error:
             _log_swallowed("_pipeline_workers_now: return max(1, performance_governor.loudness_dispatch_workers", _swallowed_error)
             return 1
@@ -16618,7 +16802,7 @@ def _probe_upcoming_media():
         tiers = _gather_probe_priority_queue()
         total_pending = sum(len(t) for t in tiers)
         if total_pending == 0:
-            if _app_shutting_down.wait(IDLE_SLEEP):
+            if _scan_idle_wait(IDLE_SLEEP):
                 return
             continue
 
@@ -16839,6 +17023,7 @@ def _probe_upcoming_media():
         _last_preempt_check = _time.perf_counter()
         _saved_n = 0
         _pi = 0
+        _need_pi = 0
         while _pi < len(_pipeline_items):
             if _app_shutting_down.is_set():
                 return
@@ -16854,11 +17039,17 @@ def _probe_upcoming_media():
                 if any(_it[3] not in _attempted for _it in _gather_probe_priority_queue()[0]):
                     _preempted = True
                     break
-            _workers_now = _pipeline_workers_now()
+            while _need_pi < len(_pipeline_items) and (_need_pi < _pi or _pipeline_loudness_done(_pipeline_items[_need_pi][5])):
+                _need_pi += 1
+            if _need_pi < len(_pipeline_items):
+                _scan_report_head("loudness", _pipeline_items[_need_pi][0], _pipeline_items[_need_pi][1])
+            else:
+                _scan_report_head("loudness")
+            _workers_now = _pipeline_workers_now(_head_cls)
             _chunk = [_it for _it in _pipeline_items[_pi:_pi + _workers_now] if _it[0] == _head_cls]
             _pi += len(_chunk)
             _attempted.update(_it[5] for _it in _chunk)
-            with _scan_thread_slot("loudness", _head_cls) as _slot_ok:
+            with _scan_thread_slot("loudness", _head_cls, _chunk[0][1]) as _slot_ok:
                 if not _slot_ok:
                     return
                 try:
@@ -16892,7 +17083,8 @@ def _probe_upcoming_media():
                 _log_swallowed("_probe_upcoming_media: app_state['guide_refresh_token'] = app_state.get('guide_refresh_token', 0) + 1", _swallowed_error)
 
         if not _preempted:
-            if _app_shutting_down.wait(IDLE_SLEEP):
+            _scan_report_head("loudness")
+            if _scan_idle_wait(IDLE_SLEEP):
                 return
 
 
@@ -17468,6 +17660,9 @@ def _caption_precache_worker():
             if not _captions_enabled():
                 break
 
+            while _background_scan_should_pause():
+                if _app_shutting_down.wait(_scan_pace(BETWEEN_CHEAP_CHECKS)):
+                    return
             if media.file_facts(norm_p)["caption_kind"]:
                 continue
 
@@ -18056,6 +18251,14 @@ def _background_subsystem_worker():
     print("Starting database...")
     db = RetroDatabase(detected_aspect_ratio=DETECTED_ASPECT_RATIO)
     print("Database ready.")
+    if getattr(db, "config_was_missing", False):
+        try:
+            import media_library as _ml_fresh
+            _fresh_removed = _ml_fresh.shared_schedule_hub().clear_all_schedule_data()
+            log.info("[FRESH START] no retro_config.json at boot: the guide's old schedule was emptied (%s) and the old station positions dropped",
+                     ", ".join("%s %d" % (k, v) for k, v in _fresh_removed.items()))
+        except Exception as _fresh_error:
+            log.warning("[FRESH START] could not empty the guide's old schedule: %s", _fresh_error)
     _mark_boot_step("db")
     threading.Thread(target=_wake_media_drives, daemon=True, name="BootDriveWake").start()
     _install_duration_hub()
@@ -18246,6 +18449,10 @@ def _background_subsystem_worker():
     _mark_boot_step("vlc_engine")
     app_state["_joystick_init_done"] = True
 
+    while not _MODULE_DEFINED.wait(0.1):
+        if _app_shutting_down.is_set():
+            return
+
     threading.Thread(target=_scan_snapshot_worker, daemon=True, name="ScanSnapshot").start()
     threading.Thread(target=_carry_config_file_data_into_hub, daemon=True, name="HubCarryOver").start()
 
@@ -18277,6 +18484,9 @@ def _background_subsystem_worker():
     threading.Thread(target=_background_watchdog_scheduler, daemon=True, name="BackgroundWatchdogScheduler").start()
 
     print("[TELEMETRY - PART 2A] All background systems loaded.")
+
+# WARNING: set just before the main loop, once every function below this point exists; the background worker waits for it before starting the threads defined further down (owner crash 2026-11-01 23:38: NameError _background_watchdog_scheduler on a fast boot).
+_MODULE_DEFINED = threading.Event()
 
 print("Launching background thread...")
 threading.Thread(target=_background_subsystem_worker, daemon=True).start()
@@ -19318,14 +19528,54 @@ def _governor_level_if_enforcing():
     return None
 
 
+_scan_files_added_generation = [0]
+_scan_work_generation = [0]
+
+
+def _note_scan_work_added():
+    """Tells the scan snapshot that files were added; it rebuilds at once and then wakes every scan thread resting between passes, so they see the new files in the right order."""
+    _scan_files_added_generation[0] += 1
+
+
+def _scan_idle_wait(seconds, generation=_scan_work_generation):
+    """Rests a scan thread between passes for up to `seconds`, ending early when `generation` moves on; True when the app is shutting down."""
+    _seen = generation[0]
+    _until = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        _left = _until - time.monotonic()
+        if _left <= 0 or generation[0] != _seen:
+            return _app_shutting_down.is_set()
+        if _app_shutting_down.wait(min(0.25, _left)):
+            return True
+
+
 def _background_scan_should_pause():
-    """True while no new background work may start: a game is being played, or the governor level does not allow background work."""
-    if _is_game_actively_playing():
+    """True while no new background scan may start: a channel just set up is having its first show scanned, a game is falling behind, or the governor level does not allow background work. While a game runs smoothly the scans go on, on the game's one shared scan thread."""
+    # WARNING: owner order 2026-11-02: during a game the scans go slower, not stopped; they stop only while the game itself is falling behind (performance_governor.game_needs_all). Python-heavy work keeps the full game pause, see _python_heavy_should_pause.
+    if _NEW_CHANNEL_SCAN_ACTIVE.is_set():
+        return True
+    if performance_governor is None:
+        if _is_game_actively_playing():
+            return True
+    elif performance_governor.game_needs_all():
         return True
     level = _governor_level_if_enforcing()
     if level is not None:
         return not performance_governor.level_allows(level, "background")
     return False
+
+
+def _background_activity(lane):
+    """Context manager marking Python-heavy background work as running for the governor (see performance_governor.background_activity)."""
+    if performance_governor is None:
+        import contextlib as _ctx
+        return _ctx.nullcontext()
+    return performance_governor.background_activity(lane)
+
+
+def _python_heavy_should_pause():
+    """True while Python-heavy background work (future guide rows, the changed-file sweep, library look-ups for the scan progress) may not start: whenever the background scans may not, and for as long as a game is being played, because that work takes turns with the game's own frames on the one Python thread at a time."""
+    return _background_scan_should_pause() or _is_game_actively_playing()
 
 
 def _background_scan_pace_seconds(base_seconds):
@@ -19370,13 +19620,31 @@ def _scan_class_pace_seconds(scan_class, base_seconds):
         return _background_scan_pace_seconds(base_seconds)
 
 
-def _scan_thread_slot(kind, scan_class):
-    """Context manager holding one of the governor's shared scan threads for one file; files airing now never wait. Yields False when the app is shutting down."""
+def _scan_rank(scan_class, tier=0):
+    """How urgent a file is for the scan turns: (scan class, tier), smaller is sooner; a music scan's "now", "next" and "deep" map to the same classes as the TV scans."""
+    if isinstance(scan_class, str):
+        scan_class = {"now": SCAN_CLASS_NOW, "next": SCAN_CLASS_NEXT, "deep": SCAN_CLASS_DEEP}.get(scan_class, SCAN_CLASS_DEEP)
+    return (int(scan_class), int(tier or 0))
+
+
+def _scan_report_head(kind, scan_class=None, tier=0):
+    """Tells the governor how urgent this scan's next file is, or that it has nothing waiting (scan_class None)."""
+    if performance_governor is None:
+        return
+    try:
+        performance_governor.scan_report_head(kind, None if scan_class is None else _scan_rank(scan_class, tier))
+    except Exception as _swallowed_error:
+        _log_swallowed("_scan_report_head: performance_governor.scan_report_head", _swallowed_error)
+
+
+def _scan_thread_slot(kind, scan_class, tier=0):
+    """Context manager holding one of the governor's shared scan threads for one file: the scan's next file is reported for the scan turns, a less urgent file waits while another scan has a more urgent one, and files airing now never wait. Yields False when the app is shutting down."""
     if performance_governor is None:
         import contextlib as _ctx
         return _ctx.nullcontext(True)
+    _scan_report_head(kind, scan_class, tier)
     return performance_governor.scan_thread_slot(kind, priority=_scan_class_name(scan_class) == "now",
-                                                 stop=_app_shutting_down)
+                                                 stop=_app_shutting_down, rank=_scan_rank(scan_class, tier))
 
 
 _picture_box_path_locks = {}
@@ -19478,6 +19746,77 @@ def _pipeline_stage_picture_box(norm_p):
     return norm_p in _picture_box_done
 
 
+# ============================================================================
+# SECTION: First show of a channel just set up
+# ============================================================================
+# WARNING: owner order 2026-11-02: the moment a channel's files are saved, the show it would be airing gets its duration and picture box first, while the other background scans pause at their next file, so the channel can come on as soon as it is turned to (loudness may follow later); channels set up one after another are done in that order.
+_NEW_CHANNEL_SCAN_ACTIVE = threading.Event()
+_new_channel_queue = []
+_new_channel_queue_lock = threading.Lock()
+_new_channel_wake = threading.Event()
+_new_channel_thread = None
+
+
+_channel_added_order = {}
+
+
+def _channel_scan_rank(ch_key):
+    """Where a channel's files go among those of the same scan class: channels set up before this run by number, then channels set up during this run in the order they were set up."""
+    ch = str(ch_key or "").zfill(2)
+    _added = _channel_added_order.get(ch)
+    return (0, int(ch) if ch.isdigit() else 0) if _added is None else (1, _added)
+
+
+def _queue_new_channel_first_show(ch_key):
+    """Puts a channel whose files were just saved in line for its first-show scan and starts the scan thread when it is not running."""
+    global _new_channel_thread
+    ch = str(ch_key).zfill(2)
+    _channel_added_order.setdefault(ch, len(_channel_added_order))
+    _note_scan_work_added()
+    with _new_channel_queue_lock:
+        if ch not in _new_channel_queue:
+            _new_channel_queue.append(ch)
+        if _new_channel_thread is None or not _new_channel_thread.is_alive():
+            _new_channel_thread = threading.Thread(target=_new_channel_first_show_worker, daemon=True, name="NewChannelFirstShow")
+            _new_channel_thread.start()
+    _new_channel_wake.set()
+
+
+def _new_channel_airing_paths(ch):
+    """The file the channel would be airing right now, exactly as a tune would open it, and its block."""
+    _state = calculate_slotted_playback_state(ch) or {}
+    _file = _state.get("file") or ""
+    return ([os.path.normpath(_file)] if _file else []), (_state.get("block") or "Full Day")
+
+
+def _new_channel_first_show_worker():
+    """Scans each queued channel's airing show for its duration and picture box, in the order the channels were set up, with the other background scans paused."""
+    while not _app_shutting_down.is_set():
+        _new_channel_wake.wait(1.0)
+        _new_channel_wake.clear()
+        while not _app_shutting_down.is_set():
+            with _new_channel_queue_lock:
+                if not _new_channel_queue:
+                    _NEW_CHANNEL_SCAN_ACTIVE.clear()
+                    break
+                _ch = _new_channel_queue.pop(0)
+                _NEW_CHANNEL_SCAN_ACTIVE.set()
+            _t0 = time.monotonic()
+            try:
+                _paths, _block = _new_channel_airing_paths(_ch)
+                for _path in _paths:
+                    if not _cached_path_exists(_path):
+                        continue
+                    with _governor_priority_scope():
+                        _dur = _scan_duration_reported(_read_file_probe_facts(_path), False) or _scan_store_duration("channel", _ch, _block, _path)
+                        _box = _pipeline_stage_picture_box(_path)
+                    log.info("[NEW CHANNEL] ch%s: first show %s scanned ahead of the other scans: duration %s, picture box %s, %.1fs",
+                             _ch, os.path.basename(_path), "stored" if _dur else "not found", "stored" if _box else "not yet", time.monotonic() - _t0)
+            except Exception as _new_channel_error:
+                log.warning("[NEW CHANNEL] ch%s: first-show scan failed, the normal scans will reach it: %s", _ch, _new_channel_error)
+    _NEW_CHANNEL_SCAN_ACTIVE.clear()
+
+
 _PICTURE_BOX_PRE_SHOW_BUDGET_S = performance_governor.PICTURE_BOX_PRE_SHOW_BUDGET_S if performance_governor is not None else 8.0
 
 
@@ -19551,7 +19890,8 @@ def _order_scan_pipeline(tiers, deep_items):
             ranked.append((cls, tier_idx, kind, ch_key, block_key, norm_p))
     for kind, ch_key, block_key, norm_p in deep_items:
         ranked.append((SCAN_CLASS_DEEP, 4, kind, ch_key, block_key, norm_p))
-    ranked.sort(key=lambda it: (it[0], it[1]))
+    # WARNING: within a scan class, channels go in the order they were set up (owner 2026-11-02), the same order as the first-show scan; the watched channel's own scan is started at the tune and never waits for this order.
+    ranked.sort(key=lambda it: (it[0], it[1], _channel_scan_rank(it[3]) if it[2] == "channel" else (0, 0)))
     out, seen = [], set()
     for it in ranked:
         if it[5] in seen:
@@ -19645,7 +19985,7 @@ def _duration_scan_worker():
             if _scan_drive_on_hold(_norm_p):
                 continue
             _attempted.add(_norm_p)
-            with _scan_thread_slot("duration", _cls) as _slot_ok:
+            with _scan_thread_slot("duration", _cls, _tier_idx) as _slot_ok:
                 if not _slot_ok:
                     return
                 try:
@@ -19670,7 +20010,8 @@ def _duration_scan_worker():
         if _regather:
             continue
         _attempted.clear()
-        if _app_shutting_down.wait(DURATION_PRECACHE_IDLE_SLEEP_SECONDS if _items else DURATION_PRECACHE_PAUSE_RECHECK_SECONDS):
+        _scan_report_head("duration")
+        if _scan_idle_wait(DURATION_PRECACHE_IDLE_SLEEP_SECONDS if _items else DURATION_PRECACHE_PAUSE_RECHECK_SECONDS):
             return
 
 
@@ -19742,7 +20083,7 @@ def _picture_box_scan_worker():
             if _scan_drive_on_hold(_norm_p):
                 continue
             _attempted.add(_norm_p)
-            with _scan_thread_slot("picture_box", _cls) as _slot_ok:
+            with _scan_thread_slot("picture_box", _cls, _tier_idx) as _slot_ok:
                 if not _slot_ok:
                     return
                 try:
@@ -19765,7 +20106,8 @@ def _picture_box_scan_worker():
         if _regather:
             continue
         _attempted.clear()
-        if _app_shutting_down.wait(PICTURE_BOX_IDLE_SLEEP_SECONDS if _items else PICTURE_BOX_PAUSE_RECHECK_SECONDS):
+        _scan_report_head("picture_box")
+        if _scan_idle_wait(PICTURE_BOX_IDLE_SLEEP_SECONDS if _items else PICTURE_BOX_PAUSE_RECHECK_SECONDS):
             return
 
 
@@ -19875,6 +20217,31 @@ def _hub_future_snapshot(ch_info):
     return _snap
 
 
+def _settle_future_rows(new_rows, saved_rows, now_epoch, live_hours=None):
+    """The future rows to save: every new row inside the live hours, then whole further days of new rows while every row of the day has a measured length, then the rows saved before for what lies beyond; None when that is exactly what is saved already."""
+    # WARNING: owner order 2026-11-02: the first GUIDE_LIVE_HOURS are always up to date, and each day past them is redrawn only once all its lengths are measured, so estimates being replaced one by one never keep moving the far guide; with nothing saved yet, the new rows are used whole so the guide fills at once.
+    _day = 3600.0 * float(_GUIDE_LIVE_HOURS if live_hours is None else live_hours)
+    _new = sorted(new_rows, key=lambda r: float(r["planned_start"]))
+    _horizon = float(now_epoch) + _day
+    _last_start = max((float(r["planned_start"]) for r in _new), default=_horizon)
+    if saved_rows:
+        while _horizon <= _last_start:
+            _window = [r for r in _new if _horizon <= float(r["planned_start"]) < _horizon + _day]
+            if not _window or any(r.get("length_source") == "estimate" for r in _window):
+                break
+            _horizon += _day
+        _kept_new = [r for r in _new if float(r["planned_start"]) < _horizon]
+        _seam = max([_horizon] + [float(r["planned_start"]) + float(r["used_length"] or 0) for r in _kept_new])
+        _settled = _kept_new + [dict(r) for r in sorted(saved_rows, key=lambda r: float(r["planned_start"]))
+                                if float(r["planned_start"]) >= _seam - 0.5]
+    else:
+        _settled = _new
+    _key = lambda r: (str(r.get("path")), round(float(r["planned_start"]), 1), round(float(r.get("used_length") or 0), 1))
+    if saved_rows and [_key(r) for r in _settled] == [_key(r) for r in sorted(saved_rows, key=lambda r: float(r["planned_start"]))]:
+        return None
+    return _settled
+
+
 def _hub_future_for_channel(channel_key, now=None, force=False):
     """Works out what one channel will air from the end of the cycle on air until HUB_FUTURE_HOURS_AHEAD from now, from the prebuilt order and the saved show positions, and saves it in the hub as future rows. Returns the number of rows saved, 0 when nothing needed doing, or None when it could not be done."""
     # WARNING: this only plans; it never changes the channel's saved positions or what airs, a channel whose block on air is not the last block built is left to the scheduler (R16, R18), and a failure is logged once and never reaches the scheduler.
@@ -19930,7 +20297,12 @@ def _hub_future_for_channel(channel_key, now=None, force=False):
                 _row["slot_key"] = _slot
                 _rows.append(_row)
         import media_library as _ml
-        _written = _ml.shared_schedule_hub().replace_future_rows(_channel, _rows)
+        _hub_f = _ml.shared_schedule_hub()
+        _rows = _settle_future_rows(_rows, _hub_f.future_rows_between(_channel, _now_epoch, _now_epoch + 3600.0 * (_HUB_FUTURE_HOURS_AHEAD + 48.0)), _now_epoch)
+        if _rows is None:
+            _hub_future_state[_channel] = (_signature, _mono)
+            return 0
+        _written = _hub_f.replace_future_rows(_channel, _rows)
         _hub_future_state[_channel] = (_signature, _mono)
         _hub_future_log_once(_channel, "ok", "[HUB FUTURE] ch%s: %d row(s) saved for the next %.0f hours from the prebuilt order in %.0f ms",
                              _channel, _written, _HUB_FUTURE_HOURS_AHEAD, (time.perf_counter() - _t0) * 1000.0)
@@ -19953,7 +20325,7 @@ def _hub_future_log_once(channel, kind, message, *args):
 
 def _hub_future_worker():
     """Background thread: after boot, one channel per pass, saves what each channel will air in the next hours as hub future rows, only while the governor allows background work."""
-    # WARNING: nothing here may run during boot or crowd playback: it waits HUB_FUTURE_START_DELAY_SECONDS, stops while _background_scan_should_pause() says so, and sleeps between channels.
+    # WARNING: nothing here may run during boot or crowd playback: it waits HUB_FUTURE_START_DELAY_SECONDS, stops while _python_heavy_should_pause() says so, and sleeps between channels.
     if db is None:
         return
     if _app_shutting_down.wait(_HUB_FUTURE_START_DELAY_SECONDS):
@@ -19970,11 +20342,12 @@ def _hub_future_worker():
         for _ch in _channels:
             if _app_shutting_down.is_set():
                 return
-            if _background_scan_should_pause():
+            if _python_heavy_should_pause():
                 if _app_shutting_down.wait(_HUB_FUTURE_IDLE_SECONDS):
                     return
                 continue
-            _written = _hub_future_for_channel(_ch)
+            with _background_activity("hub_future"):
+                _written = _hub_future_for_channel(_ch)
             if _written:
                 _did += 1
                 if _app_shutting_down.wait(_background_scan_pace_seconds(_HUB_FUTURE_BETWEEN_CHANNELS_SECONDS)):
@@ -20009,7 +20382,48 @@ def _hub_bundles_for(channel, raw_tracks):
         return None
 
 
-def _sync_hub_rows_for_block(channel_key, block_key, timeline, target_show, position_in_playlist, bundle_tracks=None, clock_shift_seconds=0.0):
+_hub_row_sync_pending = {}
+_hub_row_sync_lock = threading.Lock()
+_hub_row_sync_wake = threading.Event()
+_hub_row_sync_thread = None
+
+
+def _request_hub_row_sync(channel_key, block_key, timeline, target_show, position_in_playlist, bundle_tracks=None, clock_shift_seconds=0.0):
+    """Hands the hub row save for a block to the HubRowSync thread with the moment it was asked for; a newer request for the same channel replaces one not saved yet."""
+    # WARNING: saving a block's rows took about 0.3 s per save on the thread that draws the screen (owner log 2026-11-01 22:03:16, a 1448 ms freeze tuning to ch09); it runs on its own thread and goes through the governor's gate, so it waits while a channel is being tuned.
+    global _hub_row_sync_thread
+    _now_epoch = broadcast_clock.now().timestamp()
+    with _hub_row_sync_lock:
+        _hub_row_sync_pending[_hub_channel_key(channel_key)] = (
+            channel_key, block_key, timeline, target_show, position_in_playlist, bundle_tracks, clock_shift_seconds, _now_epoch)
+        if _hub_row_sync_thread is None or not _hub_row_sync_thread.is_alive():
+            _hub_row_sync_thread = threading.Thread(target=_hub_row_sync_worker, daemon=True, name="HubRowSync")
+            _hub_row_sync_thread.start()
+    _hub_row_sync_wake.set()
+
+
+def _hub_row_sync_worker():
+    """Saves the requested hub rows one channel at a time, each inside the governor's gate."""
+    while not _app_shutting_down.is_set():
+        _hub_row_sync_wake.wait(1.0)
+        _hub_row_sync_wake.clear()
+        while True:
+            with _hub_row_sync_lock:
+                if not _hub_row_sync_pending:
+                    break
+                _channel = next(iter(_hub_row_sync_pending))
+                _args = _hub_row_sync_pending.pop(_channel)
+            try:
+                if performance_governor is None:
+                    _sync_hub_rows_for_block(*_args[:7], now_epoch=_args[7])
+                else:
+                    with performance_governor.gate("hub_rows", label="ch%s" % _channel):
+                        _sync_hub_rows_for_block(*_args[:7], now_epoch=_args[7])
+            except Exception as _hub_row_sync_error:
+                _log_warn_throttled("hub_row_sync_" + _channel, "[HUB SCHEDULE] ch%s: the rows could not be saved: %s", _channel, _hub_row_sync_error)
+
+
+def _sync_hub_rows_for_block(channel_key, block_key, timeline, target_show, position_in_playlist, bundle_tracks=None, clock_shift_seconds=0.0, now_epoch=None):
     """Keeps the hub's rows for the block in step with the clock: writes the planned rows, rewrites the planned ones when lengths change, opens a new set of rows when the block was rebuilt with other files, run again, or its slot mode changed and held, marks what has passed as aired and what is on now as airing."""
     # WARNING: this only records; nothing reads the rows yet, so a failure here must never stop the scheduler, it acts only when the timeline, the airing entry, the block's start or the slot mode changed so it costs nothing on most calls, a second caller while one is writing leaves at once instead of waiting, and a slot mode that has not held for HUB_MODE_SWITCH_SETTLE_SECONDS changes nothing yet.
     if not _hub_sync_lock.acquire(blocking=False):
@@ -20035,7 +20449,7 @@ def _sync_hub_rows_for_block(channel_key, block_key, timeline, target_show, posi
         _seen = _hub_rows_seen.get(_key)
         if _seen is not None and _seen[4] != _mode and _mono - _hub_mode_since[_key[0]][1] < _HUB_MODE_SWITCH_SETTLE_SECONDS:
             return
-        _now_epoch = broadcast_clock.now().timestamp()
+        _now_epoch = broadcast_clock.now().timestamp() if now_epoch is None else float(now_epoch)
         _clock_moment = _now_epoch + float(clock_shift_seconds or 0)
         _start_epoch = _clock_moment - float(position_in_playlist or 0)
         if (_seen is not None and _seen[0] == _signature and _seen[1] == _airing and _seen[4] == _mode
@@ -21417,7 +21831,7 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       if _hub_pick is not None:
           target_show = _hub_pick
 
-      _sync_hub_rows_for_block(target_clean_key, block_key, timeline, target_show, position_in_playlist, raw_tracks, _clock_shift_seconds)
+      _request_hub_row_sync(target_clean_key, block_key, timeline, target_show, position_in_playlist, raw_tracks, _clock_shift_seconds)
 
       seek_pos    = position_in_playlist - target_show["start_time"]
       actual_seek = target_show.get("seek_offset", 0) + seek_pos
@@ -22095,6 +22509,9 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         _static_sound_stop("change_channel")
     
     old_ch = app_state.get("current_channel", "05")
+
+    if not internal_advance and performance_governor is not None:
+        performance_governor.hold_background_for_tune()
 
     _outgoing_live_snapshot = None
     if old_ch not in ("03", "04") and vlc_engine is not None:
@@ -24618,6 +25035,8 @@ except Exception as _swallowed_error:
     def _bridge_key_is_injected(_key):
         return False
 
+_MODULE_DEFINED.set()
+
 while True:
     _prof_begin()
 
@@ -24637,6 +25056,7 @@ while True:
         
     events = pygame.event.get()
     now_ticks = pygame.time.get_ticks()
+    app_state["_nav_frame_id"] = app_state.get("_nav_frame_id", 0) + 1
 
     _loop_gap_ms = now_ticks - app_state.get("_loop_prev_ticks", now_ticks)
     app_state["_loop_prev_ticks"] = now_ticks
@@ -24715,6 +25135,8 @@ while True:
         _fgap_ms = now_ticks - _fgap_last
         _last_frame_gap_ms = _fgap_ms
         _governor_feed_frame(_fgap_ms)
+        if performance_governor is not None:
+            performance_governor.set_game_active(_is_game_actively_playing())
         _log_frame_time_sample(_fgap_ms, app_state.get("current_channel"))
         if _fgap_ms >= 200:
             _fgap_threads = ", ".join(
@@ -24885,6 +25307,8 @@ while True:
                     db.config["guide_onair_since"] = _onair_since
 
                 db.save_settings_async()
+                if newly_added_paths:
+                    _queue_new_channel_first_show(target_ch)
                 
 
                 if str(app_state.get("current_channel", "")).zfill(2) == str(target_ch).zfill(2):
@@ -24980,83 +25404,8 @@ while True:
                             _log_warn_throttled("rtv_L14717", f"[FILE ADD] Warning: pre-cache rotation failed "
                                   f"for '{active_b}' ch{target_ch}: {_pre_err}")
 
-                def _deferred_metadata_probing_worker(ch_key, block_key, items_pool):
-                    import time as _time
-                    with _deferred_metadata_probe_lock:
-                        initialize_vlc_on_demand()
-                        pygame.time.wait(300)
-                        is_vis = db.channels_db.get(ch_key, {}).get("is_visualizer", False)
-                        save_counter = 0
-                        pool_size = len(items_pool)
-                        for i, item_path in enumerate(items_pool):
-                            _mpt_item_t0 = _time.perf_counter()
-                            norm_p = os.path.normpath(item_path)
-                            _live_fp = None
-                            if vlc_engine is not None:
-                                _live_fp = getattr(vlc_engine, "current_filepath", None)
-                            if _live_fp and os.path.normpath(_live_fp) == norm_p:
-                                log.info("[METADATA PROBE] skipping %s this pass -- "
-                                         "it's currently playing live", os.path.basename(norm_p))
-                                continue
-                            if _is_drive_degraded(norm_p):
-                                _log_warn_throttled(
-                                    "rtv_L23648_drive_degraded",
-                                    f"[METADATA PROBE] skipping items on a degraded drive "
-                                    f"this pass ({_drive_latency_summary(norm_p)}) -- "
-                                    f"most recent: {os.path.basename(norm_p)}")
-                                _time.sleep(0.05)
-                                continue
-                            _cached = _read_file_probe_facts(norm_p)
-                            probed = _cached.get("duration")
-                            probed_gain = _cached.get("gain")
-                            if probed is None:
-                                try:
-                                    probed = _probe_duration_guarded(norm_p)
-                                except Exception as e:
-                                    probed = None
-                                    _log_warn_throttled("rtv_L14737", f"[DURATION PROBE] {norm_p}: {e}")
-                            got_real_duration = bool(probed and probed > 0)
-                            if probed_gain is None:
-                                try:
-                                    probed_gain = (_probe_music_loudness_guarded(norm_p) if is_vis
-                                                   else _probe_loudness_guarded(norm_p))
-                                except Exception as e:
-                                    probed_gain = None
-                                    _log_warn_throttled("rtv_L14744", f"[LOUDNESS PROBE] {norm_p}: {e}")
-                            if got_real_duration or probed_gain:
-                                _patch_probed_gain(
-                                    "channel", ch_key, block_key, norm_p,
-                                    gain=probed_gain,
-                                    duration=(int(probed) if got_real_duration else None),
-                                )
-                            save_counter += 1
-                            batch_size = 5 if pool_size < 50 else 25
-                            if i == 0 or save_counter >= batch_size:
-                                db.save_settings_async()
-                                save_counter = 0
-                            _mpt_item_ms = (_time.perf_counter() - _mpt_item_t0) * 1000.0
-                            if _mpt_item_ms > 500.0:
-                                log.warning(
-                                    "[METADATA PROBE TIMING] slow item: %.0fms for %s "
-                                    "(is_playing_video=%s, item %d/%d)",
-                                    _mpt_item_ms, os.path.basename(norm_p),
-                                    app_state.get("is_playing_video", False), i + 1, pool_size)
-                            _pace = 3.0 if app_state.get("is_playing_video", False) else 1.0
-                            if i < 2:
-                                _time.sleep(0.05 * _pace)
-                            elif i < 15:
-                                _time.sleep(0.1 * _pace)
-                            else:
-                                _time.sleep((0.15 if pool_size > 100 else 0.1) * _pace)
-                        if save_counter > 0:
-                            db.save_settings_async(force=True)
-                            if 'app_state' in globals():
-                                app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
-                        print(f"[PERSISTENCE SUCCESS] Throttled background prober done for {len(items_pool)} file(s) in Channel {ch_key} / {block_key}.")
-
-                import threading
-                if newly_added_paths:
-                    threading.Thread(target=_deferred_metadata_probing_worker, args=(target_ch, active_b, list(newly_added_paths)), daemon=True).start()
+                # WARNING: no separate scanner for the files just added (removed 2026-11-02, it measured every added file in folder order outside the scan order, the pause and games); the ordered scans are told below and pick them up at once.
+                _note_scan_work_added()
     except Exception as e:
         _failed_ch    = locals().get("target_ch", "?")
         _failed_block = locals().get("active_b", "?")
@@ -25329,6 +25678,20 @@ while True:
                     continue
                 app_state["_nav_last_down"][event.key] = (now_ticks, _raw_key_before_translate)
 
+            _nav_gated = False
+            if (not getattr(event, "menu_repeat", False)
+                    and event.key in _NAV_DUP_KEYS
+                    and (app_state.get("show_menu", False)
+                         or app_state.get("current_channel") == "04"
+                         or app_state.get("file_explorer_active", False))
+                    and app_state.get("menu_layer") not in menu_nav.NO_REPEAT_LAYERS
+                    and not (app_state.get("menu_layer") == "DVD_BTN_MAP" and app_state.get("dvd_map_capturing", False))
+                    and not app_state.get("editing_channel_name", False)
+                    and not app_state.get("editing_server_slot_name", False)):
+                # WARNING: the highlight speed limit (owner 2026-11-01): a press too soon after the last move, or a second one in the same frame (a pile-up after a freeze), is thrown away, not saved; the key still counts as held so a hold repeats as before.
+                _nav_gated = not menu_nav.move_allowed(
+                    app_state.setdefault("_nav_move_gate", {}), now_ticks, app_state.get("_nav_frame_id", 0))
+
             if not getattr(event, "menu_repeat", False):
                 app_state["_held_keys"].add(event.key)
                 app_state.setdefault("_held_key_down_ticks", {})[event.key] = now_ticks
@@ -25336,8 +25699,10 @@ while True:
             if not getattr(event, "synthetic", False):
                 app_state["_held_keys_source"][_raw_key_before_translate] = event.key
             if app_state.get("show_menu", False) and not getattr(event, "menu_repeat", False):
-                _menu_nav_trace("down", event.key, "raw=%s synthetic=%s" % (
+                _menu_nav_trace("gated" if _nav_gated else "down", event.key, "raw=%s synthetic=%s" % (
                     pygame.key.name(_raw_key_before_translate), bool(getattr(event, "synthetic", False))))
+            if _nav_gated:
+                continue
 
             if app_state.get("current_channel") == "03":
                 app_state["ch03_screensaver_last_input"] = now_ticks
@@ -25713,7 +26078,8 @@ while True:
                     and getattr(game_deck, "mode", "BROWSE") == "DVD_PLAYER"
                     and (getattr(game_deck, "dvd_exit_confirm", False)
                          or getattr(game_deck, "dvd_return_menu_confirm", False))):
-                if menu_nav.deck_confirm_choice(menu_nav.key_to_direction(event.key)) is not None or menu_nav.is_accept(event.key):
+                if (menu_nav.deck_confirm_choice(menu_nav.key_to_direction(event.key)) is not None
+                        or menu_nav.is_accept(event.key) or menu_nav.is_back(event.key)):
                     print(f"[DVD GATE] Confirm popup open -> routing '{pygame.key.name(event.key)}' to DVD deck.")
                     game_deck.handle_event(event)
                     continue
@@ -28263,6 +28629,9 @@ while True:
     _watchdog_owner_ch = _live_pb_raw.zfill(2) if _live_pb_raw else ch
     if _watchdog_owner_ch == ch:
         _owner_playback_state = current_playback_state
+    elif not app_state.get("is_playing_video", False):
+        # WARNING: the owner channel's answer is read only by the video watchdog, which runs only while a video plays; asking the scheduler for it on every frame of the games channel or a menu rebuilt that channel's schedule on the screen thread (audit stage 4, 2026-11-02: frame setup up to 361 ms on ch03).
+        _owner_playback_state = {}
     else:
         try:
             _owner_playback_state = calculate_slotted_playback_state(_watchdog_owner_ch)

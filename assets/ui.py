@@ -5467,7 +5467,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             pygame.draw.circle(menu_canvas, COLOR_MENU_KNOB_GREYED if _tog_greyed else TEXT_WHITE, (_knob_x, _sw_y + _sw_h // 2), 9)
 
         is_clear_focused = (sub_r == menu_nav.HOLIDAY_CLEAR_ROW)
-        _clear_x, _clear_y, _clear_w, _clear_h = cx + content_w - 270, content_y + content_h - 52, 120, 40
+        _clear_x, _clear_y, _clear_w, _clear_h = cx + 35, content_y + content_h - 52, 200, 40
         pygame.draw.rect(menu_canvas, OFF_RED, (_clear_x, _clear_y, _clear_w, _clear_h), border_radius=4)
         if is_clear_focused:
             _aa_rounded_rect(menu_canvas, NEON_GREEN, (_clear_x, _clear_y, _clear_w, _clear_h), SELECTION_BORDER_WIDTH, border_radius=4)

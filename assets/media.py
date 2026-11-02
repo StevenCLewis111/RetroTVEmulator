@@ -8,6 +8,7 @@ import sys
 import json
 import contextlib
 import copy
+import hashlib
 import datetime
 import ctypes
 import difflib
@@ -5325,16 +5326,44 @@ def bumper_tracks_for_channel(ch_info):
     )
 
 
+# WARNING: the fallback number below must match TIMELINE_MEMO_SIZE in performance_governor.py; it is used only when that module fails to import.
+TIMELINE_MEMO_SIZE = _perf_governor.TIMELINE_MEMO_SIZE if _perf_governor is not None else 24
+_timeline_memo = collections.OrderedDict()
+_timeline_memo_lock = threading.Lock()
+
+
 def build_channel_timeline(video_tracks, commercial_tracks, ch_info, day_seed, commercial_state=None):
-    """Builds one guide timeline, including channel-scheduled fade bumpers around each show."""
+    """Builds one guide timeline, including channel-scheduled fade bumpers around each show; the same inputs asked for again get the timeline already built, as fresh copies of its entries."""
+    # WARNING: build_block_timeline is a pure function of these inputs (it reads no clock, file or cache and changes none of them), so a timeline built once can be handed back for the same inputs; every caller gets its own copies of the entries and of the commercial state, because callers change them (audit stage 4, 2026-11-02: 2234 identical builds in 15 minutes, up to 361 ms each on the screen thread).
     fade_in_tracks, fade_out_tracks = bumper_tracks_for_channel(ch_info)
-    return build_block_timeline(
-        video_tracks, commercial_tracks, ch_info.get("commercial_placement", "interrupt_half_hour"), day_seed,
-        interrupt_floor_seconds=commercial_interrupt_floor_seconds(ch_info),
+    placement = ch_info.get("commercial_placement", "interrupt_half_hour")
+    floor = commercial_interrupt_floor_seconds(ch_info)
+    try:
+        key = hashlib.md5(repr((video_tracks, commercial_tracks, placement, day_seed, floor, commercial_state,
+                                fade_in_tracks, fade_out_tracks)).encode("utf-8", "replace")).digest()
+    except Exception as _key_error:
+        _log_swallowed("build_channel_timeline: memo key", _key_error)
+        key = None
+    if key is not None:
+        with _timeline_memo_lock:
+            hit = _timeline_memo.get(key)
+            if hit is not None:
+                _timeline_memo.move_to_end(key)
+        if hit is not None:
+            return [dict(e) for e in hit[0]], hit[1], copy.deepcopy(hit[2])
+    timeline, total, new_state = build_block_timeline(
+        video_tracks, commercial_tracks, placement, day_seed,
+        interrupt_floor_seconds=floor,
         commercial_state=commercial_state,
         fade_in_tracks=fade_in_tracks,
         fade_out_tracks=fade_out_tracks,
     )
+    if key is not None:
+        with _timeline_memo_lock:
+            _timeline_memo[key] = ([dict(e) for e in timeline], total, copy.deepcopy(new_state))
+            while len(_timeline_memo) > max(1, int(TIMELINE_MEMO_SIZE)):
+                _timeline_memo.popitem(last=False)
+    return timeline, total, new_state
 
 
 def _entry_row_files(entry):
@@ -9885,6 +9914,14 @@ class RetroDatabase:
         self.runtime_path = os.path.join(self.logs_dir, "playback_runtime.json")
         self._runtime_lock = threading.Lock()
         self._runtime_save_generation = 0
+
+        # WARNING: no retro_config.json at boot means a fresh start (owner order 2026-11-02): the old stations' positions are dropped here and the main script empties the guide's schedule in the library, so a new build never shows someone's old guide.
+        self.config_was_missing = not os.path.exists(self.config_path)
+        if self.config_was_missing and os.path.isfile(self.runtime_path):
+            try:
+                os.remove(self.runtime_path)
+            except OSError as _runtime_remove_error:
+                _log_swallowed("RetroDatabase.__init__: os.remove(self.runtime_path)", _runtime_remove_error)
 
 
         # WARNING: keep the remote overlay separate from normal save/load so a remote snapshot is never persisted over the user's channels.

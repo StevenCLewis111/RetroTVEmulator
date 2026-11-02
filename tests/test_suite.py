@@ -4635,7 +4635,7 @@ def check_popup(name, state, key, got):
             want["clear_confirm_shown_at"] = 777
         check(after == want, label + " got %r want %r" % (after, want))
     elif name == "DVD_GATE":
-        routed = key in (pygame.K_a, pygame.K_d, pygame.K_RETURN)
+        routed = key in (pygame.K_a, pygame.K_d, pygame.K_RETURN, pygame.K_ESCAPE)
         check(handled == ([key] if routed else []), label + " routing")
         check(fell == (not routed and key in (pygame.K_UP, pygame.K_DOWN)), label + " swallow or fall through")
     elif name == "CONTROLS_SPLASH":
@@ -8079,7 +8079,7 @@ def suite_block_scan():
     done, tot = n["_compute_channel_scan_progress"](n["_build_scan_snapshot"](), [400])["05"]
     queued = [it[3] for it in n["_gather_deep_backlog_queue"]()]
     check(tot == 5, "a file reused in two blocks counts once in the bar (got %d)" % tot)
-    ns_order = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3}
+    ns_order = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch))}
     exec(compile(get_function_source("_order_scan_pipeline"), "<extracted:_order_scan_pipeline>", "exec"), ns_order)
     tiers = [[("channel", "05", "Morning", os.path.normpath("/m/Morning_0.mkv"))], [], [], []]
     items = ns_order["_order_scan_pipeline"](tiers, [("channel", "05", it[2], it[3]) for it in n["_gather_deep_backlog_queue"]()])
@@ -10221,6 +10221,626 @@ def suite_static_sound_on_grey():
           "a channel airing Static still plays its noise every frame it is on air")
 
 
+def suite_v273_small_fixes():
+    import ast
+    start = MAIN_SRC.index('_bs_done, _bs_total = ')
+    block = MAIN_SRC[start:MAIN_SRC.index("_fe_draw_busy_overlay(", start)]
+    labels = [ln.split("=", 1)[1].strip() for ln in block.splitlines() if ln.strip().startswith("_bs_label")]
+    check(labels == ['"LOADING ROMS....."'], "the ROM scan bar says only LOADING ROMS..... (%s)" % labels)
+    check("_bs_frac = min(1.0, _bs_done / _bs_total)" in block, "the ROM scan bar still fills as the scan goes")
+    tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
+    vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
+    check(re.fullmatch(r"\d+\.\d+\.\d+", str(vals.get("BUILD_VERSION", ""))) is not None and vals.get("BUILD_TYPE"),
+          "build_info.py holds a build number and build type (%s)" % vals)
+    updater = _load_updater_script("auto_updater", keep_build_number=True)
+    old_env = os.environ.pop("RETRO_TV_VERSION", None)
+    try:
+        tmp = tempfile.mkdtemp(prefix="build_number_")
+        with open(os.path.join(tmp, "version.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"version": "1.0.0"}')
+        check(updater.current_version(tmp) == vals.get("BUILD_VERSION"), "the app reports the number built into it ahead of an older version.json")
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        if old_env is not None:
+            os.environ["RETRO_TV_VERSION"] = old_env
+
+
+def suite_splash_per_console():
+    import game_deck as gd
+    import media as md
+    tmp = tempfile.mkdtemp(prefix="splash_per_console_")
+    old = md.resolve_splash_images_dir
+    try:
+        for con in ("NES", "SNES", "GENESIS", "DVD"):
+            os.makedirs(os.path.join(tmp, con))
+            with open(os.path.join(tmp, con, con + "SplashScreen.png"), "wb") as fh:
+                fh.write(b"png")
+        picked = os.path.join(tmp, "NES", "my_pick.png")
+        with open(picked, "wb") as fh:
+            fh.write(b"png")
+        md.resolve_splash_images_dir = lambda: tmp
+        deck = types.SimpleNamespace(console_splash_enabled={"NES": True, "SNES": False, "GENESIS": True},
+                                     console_splash_path={"NES": picked}, dvd_splash_enabled=False, dvd_splash_path="")
+        cls = gd.ExternalGameDeck
+        shown = {}
+        for con in ("NES", "SNES", "GENESIS", "N64", "DVD"):
+            on = cls._is_console_splash_enabled(deck, con)
+            shown[con] = os.path.basename(cls._get_console_splash_path(deck, con)) if on else ""
+        check(shown == {"NES": "my_pick.png", "SNES": "", "GENESIS": "GENESISSplashScreen.png", "N64": "", "DVD": ""},
+              "each console decides for itself: a console with its splash off shows none even when a splash file is in its folder, one with a picked file shows that, one that is on with nothing picked gets its own folder's SplashScreen.png (%s)" % shown)
+    finally:
+        md.resolve_splash_images_dir = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    deck_src = read(os.path.join(ROOT, "game_deck.py"))
+    check("if self.active_console and self._is_console_splash_enabled(self.active_console):" in deck_src
+          and "if self._is_console_splash_enabled(console):\n            _c_splash_path = self._get_console_splash_path(console)" in deck_src
+          and 'self._get_console_splash_path("DVD") if self.dvd_splash_enabled else ""' in deck_src,
+          "the game load screen, the splash video and the DVD splash each look at that console's own on switch first")
+
+
+def suite_nav_speed_limit():
+    import menu_nav as mn
+    check(gov.NAV_MOVE_MIN_MS == 150 and mn.NAV_MOVE_MIN_MS == gov.NAV_MOVE_MIN_MS, "the highlight speed limit is 150 ms and lives in the governor")
+    gate = {}
+    taps = [(0, 1), (60, 5), (120, 9), (149, 10), (150, 11), (151, 12), (300, 20), (300, 20), (310, 21)]
+    moved = [t for t, f in taps if mn.move_allowed(gate, t, f)]
+    check(moved == [0, 150, 300], "presses inside 150 ms of the last move, and a second one in the same frame, are thrown away (%s)" % moved)
+    gate = {}
+    burst = [mn.move_allowed(gate, 5000, 77) for _ in range(6)]
+    check(burst == [True, False, False, False, False, False], "six presses that pile up in one frame after a freeze make one move")
+    gate = {}
+    moved = [t for t in range(0, 600, 40) if mn.move_allowed(gate, t, t)]
+    check(moved == [0, 160, 320, 480], "mashing every 40 ms moves once each time 150 ms has passed since the last move; thrown-away presses never push the next move further away (%s)" % moved)
+    block = MAIN_SRC[MAIN_SRC.index("_nav_gated = False"):MAIN_SRC.index("if _nav_gated:\n                continue")]
+    check('not getattr(event, "menu_repeat", False)' in block and "menu_nav.NO_REPEAT_LAYERS" in block
+          and "editing_channel_name" in block and "menu_nav.move_allowed(" in block,
+          "the limit covers fresh presses only, never a held key's repeats, the remap capture screens or name typing")
+    held_at = MAIN_SRC.index('app_state["_held_keys"].add(event.key)', MAIN_SRC.index("_nav_gated = False"))
+    check(held_at < MAIN_SRC.index("if _nav_gated:\n                continue"), "a thrown-away press still counts as held, so holding the key repeats as before")
+    check('app_state["_nav_frame_id"] = app_state.get("_nav_frame_id", 0) + 1' in MAIN_SRC, "each frame has its own number for the one-move-per-frame rule")
+
+
+def suite_hid_scan_handles():
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+    import game_deck as gd
+
+    class _Fn(object):
+        restype = None
+        argtypes = None
+
+    class _Dll(object):
+        def __init__(self, name, use_last_error=False):
+            self._name = name
+        def __getattr__(self, attr):
+            fn = _Fn()
+            object.__setattr__(self, attr, fn)
+            return fn
+    had_windll = hasattr(_ct, "WinDLL")
+    old = getattr(_ct, "WinDLL", None)
+    old_wt = getattr(gd, "wintypes", None)
+    _ct.WinDLL = _Dll
+    gd.wintypes = _wt
+    gd._hid_api_cache = None
+    try:
+        setupapi, hid, kernel32 = gd._hid_api()
+        handle_out = [setupapi.SetupDiGetClassDevsW.restype, kernel32.CreateFileW.restype]
+        check(all(r is _ct.c_void_p for r in handle_out), "the device list and device file handles come back as full 64-bit values (%s)" % handle_out)
+        handle_in = [setupapi.SetupDiEnumDeviceInterfaces.argtypes[0], setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes[0],
+                     setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes[0], setupapi.SetupDiDestroyDeviceInfoList.argtypes[0],
+                     hid.HidD_GetAttributes.argtypes[0], hid.HidD_GetSerialNumberString.argtypes[0], kernel32.CloseHandle.argtypes[0]]
+        check(all(a is _ct.c_void_p for a in handle_in), "every call that is handed a handle back takes it as a full 64-bit value")
+        check(gd._hid_api() is gd._hid_api_cache, "the declarations are made once")
+    finally:
+        gd._hid_api_cache = None
+        if had_windll:
+            _ct.WinDLL = old
+        else:
+            del _ct.WinDLL
+        if old_wt is None:
+            try:
+                del gd.wintypes
+            except AttributeError:
+                pass
+    deck_src = read(os.path.join(ROOT, "game_deck.py"))
+    scan = deck_src[deck_src.index("def _scan_hid_identities"):deck_src.index("def _get_hid_identities")]
+    check("ctypes.windll" not in scan and "_hid_api()" in scan, "the controller scan uses the declared private copies, not the shared untyped ctypes.windll")
+
+
+def suite_folder_icon():
+    start = MAIN_SRC.index("FOLDER_ICON_PARTS = ")
+    ns = {"os": os}
+    exec(MAIN_SRC[start:MAIN_SRC.index("def _early_crash_path")], ns)
+    setter = ns["_set_app_folder_icon"]
+    tmp = tempfile.mkdtemp(prefix="folder_icon_")
+    try:
+        root = os.path.join(tmp, "Retro TV Emulator")
+        main = os.path.join(root, "_internal", "main")
+        os.makedirs(os.path.join(main, "images", "loading"))
+        check("not set" in setter(root, main) and not os.path.exists(os.path.join(root, "desktop.ini")),
+              "with no folder.ico nothing is written")
+        with open(os.path.join(main, "images", "loading", "folder.ico"), "wb") as fh:
+            fh.write(b"ico")
+        setter(root, main)
+        with open(os.path.join(root, "desktop.ini"), encoding="utf-16", newline="") as fh:
+            text = fh.read()
+        ref = os.path.join("_internal", "main", "images", "loading", "folder.ico")
+        check("[.ShellClassInfo]\r\n" in text and ("IconResource=%s,0" % ref) in text,
+              "desktop.ini points at folder.ico by a path relative to the app folder, so a moved or renamed folder keeps its icon (%r)" % text)
+        check(setter(root, main) == "folder icon already set", "a second start leaves it as it is")
+        with open(os.path.join(root, "desktop.ini"), "w", encoding="utf-8") as fh:
+            fh.write("[.ShellClassInfo]\nLocalizedResourceName=Mine\n")
+        check("left as it is" in setter(root, main), "a desktop.ini the app did not write is never replaced")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    check('log.info("[FOLDER ICON] %s", _set_app_folder_icon(_app_root_dir(), resolve_main_dir()))' in MAIN_SRC
+          and 'threading.Thread(target=_folder_icon_job, daemon=True, name="FolderIcon").start()' in MAIN_SRC,
+          "the app sets the folder icon on start, on its own thread, and logs what it did")
+    fn = MAIN_SRC[MAIN_SRC.index("def _set_app_folder_icon"):MAIN_SRC.index("def _folder_icon_job")]
+    check(fn.index("_folder_icon_via_shell(root, icon_ref)") < fn.index("_folder_icon_ini_text(icon_ref))\n        # WARNING: Windows reads"),
+          "Windows' own folder-settings call sets the icon; writing desktop.ini by hand is only the fallback")
+    check(fn.count("_folder_icon_notify(root)") == 2, "Explorer is told to redraw both when the icon is set and when it was set before")
+    note = MAIN_SRC[MAIN_SRC.index("def _folder_icon_notify"):MAIN_SRC.index("def _set_app_folder_icon")]
+    check("0x00002000, 0x0005 | 0x1000" in note and "0x00001000, 0x0005 | 0x1000" in note and "os.path.dirname(os.path.abspath(root))" in note,
+          "the folder and the folder that lists it are both refreshed, and the call waits until Explorer has taken it")
+    ns2 = {"os": os}
+    exec(MAIN_SRC[MAIN_SRC.index("FOLDER_ICON_PARTS = "):MAIN_SRC.index("def _folder_icon_via_shell")], ns2)
+    check(ns2["_folder_icon_ini_icon"]("[.ShellClassInfo]\r\nIconResource=main\\images\\loading\\folder.ico,0\r\n") == "main\\images\\loading\\folder.ico",
+          "the icon a desktop.ini names is read back, so the app knows its own")
+    helper = read(os.path.join(ROOT, "updater", "update_helper.py"))
+    check('UPDATE_ROOT_FILE_ENDINGS = (".exe",)' in helper, "an update writes only exe files at the top of the app folder, so desktop.ini is never touched by one")
+
+
+def suite_v276_fixes():
+    import menu_nav as mn
+    import media_library as ml
+    start = MAIN_SRC.index("def _background_subsystem_worker")
+    worker = MAIN_SRC[start:MAIN_SRC.index("\nprint(\"Launching background thread...\")", start)]
+    wait_at = worker.index("while not _MODULE_DEFINED.wait(0.1):")
+    for late in ("_duration_scan_worker", "_picture_box_scan_worker", "_hub_future_worker", "_background_watchdog_scheduler"):
+        check(worker.index("target=%s" % late) > wait_at, "the background worker waits until every function exists before starting %s" % late)
+    check(MAIN_SRC.index("_MODULE_DEFINED.set()") > MAIN_SRC.index("def _screensaver_step") and MAIN_SRC.index("_MODULE_DEFINED.set()") < MAIN_SRC.index("\nwhile True:\n    _prof_begin()"),
+          "the ready signal is given after the last function and just before the main loop")
+    check(mn.dvd_action(mn.DVD_KEYBOARD_NEXT_TRACK, remote=True) == mn.DVD_FAST_FORWARD and mn.dvd_action(mn.DVD_KEYBOARD_PREV_TRACK, remote=True) == mn.DVD_REWIND,
+          "a keyboard's next-track and previous-track keys skip forward and back in the DVD player")
+    check(mn.DVD_KEYBOARD_NEXT_TRACK == 1073742082 and mn.DVD_KEYBOARD_PREV_TRACK == 1073742083, "they are the two key codes the owner's keyboard sent")
+    deck_src = read(os.path.join(ROOT, "game_deck.py"))
+    check(deck_src.count("elif _nav.is_back(key):\n                self.dvd_exit_confirm = False") == 1
+          and deck_src.count("elif _nav.is_back(key):\n                self.dvd_return_menu_confirm = False") == 1,
+          "Back (B on a controller, Escape) closes either DVD confirm as No")
+    check("or menu_nav.is_accept(event.key) or menu_nav.is_back(event.key)):" in MAIN_SRC, "the DVD confirm gate passes Back to the DVD player instead of swallowing it")
+    ui_src = read(os.path.join(ROOT, "ui.py") if os.path.exists(os.path.join(ROOT, "ui.py")) else os.path.join(ROOT, "assets", "ui.py"))
+    check("_clear_x, _clear_y, _clear_w, _clear_h = cx + 35, content_y + content_h - 52, 200, 40" in ui_src,
+          "the Holiday menu's Clear Media button sits on the left, lined up with the rows, and is wider")
+    check(mn.holiday_table().step("clear", mn.RIGHT, {}) == mn.CLOSE, "Right from Clear Media still reaches Close")
+    tmp = tempfile.mkdtemp(prefix="fresh_start_")
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        hub = ml.ScheduleHub(lib)
+        conn = lib._conn
+        conn.execute("INSERT INTO hub_play_order (list_id, path_key, path, position) VALUES ('ch05', 'k', 'p', 0)")
+        conn.execute("INSERT INTO hub_play_state (list_id, pass_no) VALUES ('ch05', 3)")
+        hub.put_rows("05", "slot", [{"position": 0, "path": "old.mp4", "kind": "show", "planned_start": 1000.0, "used_length": 60.0, "state": "planned"}])
+        lib.store_path_key("C:/a.mp4", 1, 1.0, "content1")
+        removed = hub.clear_all_schedule_data()
+        left = {t: conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in ("hub_schedule_row", "hub_future_row", "hub_schedule_set", "hub_play_order", "hub_play_state")}
+        check(all(v == 0 for v in left.values()) and removed["hub_play_order"] == 1, "a fresh start empties every schedule table (%s, %s)" % (left, removed))
+        check(conn.execute("SELECT COUNT(*) FROM path_keys").fetchone()[0] == 1, "the file facts (lengths, loudness, picture boxes) are kept")
+        lib.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    media_src = read(os.path.join(ROOT, "media.py"))
+    check("self.config_was_missing = not os.path.exists(self.config_path)" in media_src
+          and media_src.index("self.config_was_missing = not os.path.exists(self.config_path)") < media_src.index("threading.Thread(target=self.load_settings_async"),
+          "a missing retro_config.json is noticed before the settings are loaded, and the old station positions are dropped")
+    check(MAIN_SRC.index("clear_all_schedule_data()") < MAIN_SRC.index("_install_duration_hub()\n\n    try:\n        _apply_mixer_channels_setting()"),
+          "the old guide schedule is emptied before anything reads it")
+
+
+def suite_v277_quiet_logs():
+    import json as _json
+    import game_deck as gd
+    start = MAIN_SRC.index("def _make_guide_preload_watchdog_tick")
+    tick = MAIN_SRC[start:MAIN_SRC.index("def _guide_preload_worker", start)]
+    check(tick.index('getattr(_lr_core, "is_loaded", False) and not getattr(_lr_core, "is_frozen", False)') < tick.index("_staleness = time.time()"),
+          "the guide preloader watchdog never counts the time it pauses on purpose while a game runs")
+    tmp = tempfile.mkdtemp(prefix="cores_first_")
+    try:
+        cores = os.path.join(tmp, "cores", "NES")
+        os.makedirs(cores)
+        open(os.path.join(cores, "fceumm_libretro.dll"), "wb").close()
+        deck = types.SimpleNamespace(config_path=os.path.join(tmp, "logs", "controllers", "emulator_config.json"), cores_dir=os.path.join(tmp, "cores"))
+        seen = []
+        old = gd._log_swallowed
+        gd._log_swallowed = lambda where, err: seen.append(where)
+        try:
+            gd.ExternalGameDeck._assign_default_cores_after_scan(deck, ["NES"])
+        finally:
+            gd._log_swallowed = old
+        check(seen == [], "no emulator_config.json yet writes no failure line (%s)" % seen)
+        with open(deck.config_path, encoding="utf-8") as fh:
+            check(_json.load(fh).get("NES") == "fceumm_libretro.dll", "the file is still made with the default core, folder and all")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_tune_priority():
+    import performance_governor as pg
+    check(gov.TUNE_BACKGROUND_HOLD_SECONDS == 3.0, "the tune hold is 3 s at most and lives in the governor")
+    pg.release_tune_hold()
+    check(not pg.tune_in_progress(), "no hold until a channel is tuned")
+    pg.hold_background_for_tune()
+    check(pg.tune_in_progress(), "tuning a channel holds background work")
+    pg.release_tune_hold()
+    check(not pg.tune_in_progress(), "the first show playing ends the hold")
+    gate_src = read(os.path.join(ROOT, "performance_governor.py"))
+    check("if (not tune_in_progress() and not game_needs_all() and level_allows(level, \"background\")" in gate_src, "a background gate does not admit new work while a tune is in progress")
+    cc = MAIN_SRC[MAIN_SRC.index("def change_channel("):]
+    check(cc.index("performance_governor.hold_background_for_tune()") < cc.index("_mute_guard_log(\"ARM (real channel change)\""),
+          "a channel change starts the hold before the show is opened")
+    conf = MAIN_SRC[MAIN_SRC.index("def _confirm_playback_started"):]
+    check("performance_governor.release_tune_hold()" in conf[:conf.index("_anchor_seek = seek_offset")], "the hold ends when VLC has accepted the show")
+    ns = {"threading": threading, "broadcast_clock": types.SimpleNamespace(now=lambda: datetime.datetime(2026, 11, 2, 12, 0, 0)),
+          "_hub_channel_key": lambda c: str(c).zfill(2), "_app_shutting_down": threading.Event(), "performance_governor": None,
+          "_log_warn_throttled": lambda *a, **k: None}
+    exec(MAIN_SRC[MAIN_SRC.index("_hub_row_sync_pending = {}"):MAIN_SRC.index("def _sync_hub_rows_for_block(")], ns)
+    done = []
+    ns["_sync_hub_rows_for_block"] = lambda *a, now_epoch=None: done.append((a[0], a[4], now_epoch))
+    started = threading.Event()
+    ns["_hub_row_sync_lock"].acquire()
+    try:
+        ns["_hub_row_sync_pending"]["09"] = ("09", "b", [], None, 1.0, None, 0.0, 1.0)
+    finally:
+        ns["_hub_row_sync_lock"].release()
+    ns["_request_hub_row_sync"]("9", "b", [], None, 2.0)
+    deadline = time.time() + 3
+    while not done and time.time() < deadline:
+        time.sleep(0.02)
+    ns["_app_shutting_down"].set()
+    ns["_hub_row_sync_wake"].set()
+    want_epoch = datetime.datetime(2026, 11, 2, 12, 0, 0).timestamp()
+    check(done == [("9", 2.0, want_epoch)], "the save runs on its own thread with the moment it was asked for, and a newer request for the channel replaces the older one (%s)" % done)
+    check(MAIN_SRC[MAIN_SRC.index("def calculate_slotted_playback_state"):].count("_sync_hub_rows_for_block(") == 0, "the scheduler never saves hub rows on the caller's thread")
+
+
+def suite_new_channel_first_show():
+    start = MAIN_SRC.index("_NEW_CHANNEL_SCAN_ACTIVE = threading.Event()")
+    code = MAIN_SRC[start:MAIN_SRC.index("_PICTURE_BOX_PRE_SHOW_BUDGET_S = ", start)]
+    order, paused_during = [], []
+    ns = {"threading": threading, "time": time, "os": os, "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
+          "_app_shutting_down": threading.Event(), "_cached_path_exists": lambda p: True,
+          "_read_file_probe_facts": lambda p: {}, "_scan_duration_reported": lambda facts, has: False,
+          "_governor_priority_scope": lambda: contextlib.nullcontext(), "_note_scan_work_added": lambda: None}
+    exec(code, ns)
+    ns["calculate_slotted_playback_state"] = lambda ch: {"file": "D:/movies/%s_first.mp4" % ch, "block": "Full Day"}
+    def _dur(kind, ch, block, path):
+        paused_during.append(ns["_NEW_CHANNEL_SCAN_ACTIVE"].is_set())
+        order.append(("duration", ch, os.path.basename(path)))
+        return 5400.0
+    def _box(path):
+        order.append(("picture box", os.path.basename(path)))
+        return True
+    ns["_scan_store_duration"], ns["_pipeline_stage_picture_box"] = _dur, _box
+    _hold = threading.Event()
+    _placeholder = threading.Thread(target=_hold.wait, daemon=True)
+    _placeholder.start()
+    ns["_new_channel_thread"] = _placeholder
+    ns["_queue_new_channel_first_show"]("9")
+    ns["_queue_new_channel_first_show"]("10")
+    ns["_queue_new_channel_first_show"]("9")
+    check(ns["_new_channel_queue"] == ["09", "10"], "a channel saved twice before its scan waits in line once")
+    _hold.set()
+    _placeholder.join(1)
+    threading.Thread(target=ns["_new_channel_first_show_worker"], daemon=True).start()
+    deadline = time.time() + 3
+    while len(order) < 4 and time.time() < deadline:
+        time.sleep(0.02)
+    time.sleep(0.1)
+    check(order == [("duration", "09", "09_first.mp4"), ("picture box", "09_first.mp4"), ("duration", "10", "10_first.mp4"), ("picture box", "10_first.mp4")],
+          "each channel just set up gets its airing show's duration and picture box, in the order the channels were made, once each (%s)" % order)
+    check(paused_during == [True, True] and not ns["_NEW_CHANNEL_SCAN_ACTIVE"].is_set(),
+          "the other background scans are paused while it runs and resume after")
+    ns["_app_shutting_down"].set()
+    ns["_new_channel_wake"].set()
+    ns["_channel_added_order"].clear()
+    for ch in ("09", "06", "07"):
+        ns["_channel_added_order"].setdefault(ch, len(ns["_channel_added_order"]))
+    ranked = sorted(["07", "05", "09", "06", "12"], key=ns["_channel_scan_rank"])
+    check(ranked == ["05", "12", "09", "06", "07"], "channels from before this run go by number, then channels set up now in the order they were set up (%s)" % ranked)
+    order_ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": ns["_channel_scan_rank"]}
+    exec(main_function_code("_order_scan_pipeline"), order_ns)
+    out = order_ns["_order_scan_pipeline"]([[("channel", "07", "Full Day", "/7.mkv"), ("channel", "09", "Full Day", "/9.mkv"), ("channel", "06", "Full Day", "/6.mkv")], [], [], []], [])
+    check([it[3] for it in out] == ["09", "06", "07"], "the airing shows' loudness, length and picture box scans follow the same order (%s)" % [it[3] for it in out])
+    check("for new_ch in sorted(_new_channels, key=_channel_scan_rank):" in MAIN_SRC, "the first-pass loudness sweep takes new channels in that order too")
+    pause = MAIN_SRC[MAIN_SRC.index("def _background_scan_should_pause"):]
+    check(pause.index("_NEW_CHANNEL_SCAN_ACTIVE.is_set()") < pause.index("def _background_scan_pace_seconds"),
+          "the duration, picture box, loudness and future guide scans all pause through the shared background pause")
+    explorer = MAIN_SRC[MAIN_SRC.index("[FILE EXPLORER] (schedule) {active_b}"):]
+    check("if newly_added_paths:\n                    _queue_new_channel_first_show(target_ch)" in explorer[:explorer.index("if str(app_state.get(\"current_channel\", \"\")).zfill(2) == str(target_ch).zfill(2):")],
+          "saving a channel's files in the explorer starts its first-show scan at once, whichever channel is on screen")
+
+
+def suite_one_scan_order_for_new_files():
+    check("_deferred_metadata_probing_worker" not in MAIN_SRC and "[METADATA PROBE TIMING]" not in MAIN_SRC and "_deferred_metadata_probe_lock" not in MAIN_SRC,
+          "the separate scanner for files just added is gone; the ordered scans measure them")
+    save = MAIN_SRC[MAIN_SRC.index("[FILE EXPLORER] (schedule) {active_b}"):]
+    save = save[:save.index("except Exception as e:\n        _failed_ch")]
+    check(save.count("_note_scan_work_added()") == 1 and "_queue_new_channel_first_show(target_ch)" in save,
+          "a schedule save queues the first show and tells the ordered scans about the new files")
+    for label in ("[FILE EXPLORER] {block} -> {len(entries)} file(s) for ch {ch_key}", "[FILE EXPLORER] Holiday {hkey} -> {len(entries)} file(s) for ch {ch_key}"):
+        part = MAIN_SRC[MAIN_SRC.index(label):]
+        check(part.index("_note_scan_work_added()") < part.index("if new_paths:"), "a commercial or holiday save tells the ordered scans too")
+    start = MAIN_SRC.index("_scan_files_added_generation = [0]")
+    ns = {"time": time, "_app_shutting_down": threading.Event()}
+    exec(MAIN_SRC[start:MAIN_SRC.index("def _background_scan_should_pause", start)], ns)
+    t0 = time.monotonic()
+    threading.Timer(0.3, lambda: ns["_scan_work_generation"].__setitem__(0, ns["_scan_work_generation"][0] + 1)).start()
+    stopped = ns["_scan_idle_wait"](20.0)
+    took = time.monotonic() - t0
+    check(not stopped and took < 1.5, "a scan resting between passes wakes as soon as new work is published (%.2fs)" % took)
+    ns["_note_scan_work_added"]()
+    check(ns["_scan_files_added_generation"][0] == 1 and ns["_scan_work_generation"][0] == 1,
+          "adding files wakes the snapshot first, not the scans")
+    snap = MAIN_SRC[MAIN_SRC.index("def _scan_snapshot_worker"):]
+    snap = snap[:snap.index("_logged_missing_probe_paths = set()")]
+    check(snap.index("_scan_snapshot = fresh") < snap.index("_scan_work_generation[0] += 1")
+          and "_scan_idle_wait(SCAN_SNAPSHOT_INTERVAL_S, _scan_files_added_generation)" in snap,
+          "the snapshot rebuilds at once when files are added and only then wakes the scans, so they see the new files")
+    for waits in ("if _scan_idle_wait(DURATION_PRECACHE_IDLE_SLEEP_SECONDS", "if _scan_idle_wait(PICTURE_BOX_IDLE_SLEEP_SECONDS",
+                  "if _scan_idle_wait(_scan_pace(MUSIC_PRECACHE_IDLE_SLEEP_SECONDS)):"):
+        check(waits in MAIN_SRC, "the scan rest wakes on new files: %s" % waits)
+    check(MAIN_SRC.count("if _scan_idle_wait(IDLE_SLEEP):") == 2, "the loudness pipeline's rests wake on new files")
+
+
+def suite_guide_settled_days():
+    check(gov.GUIDE_LIVE_HOURS == 24.0, "the live part of the guide is 24 hours and lives in the governor")
+    ns = {"_GUIDE_LIVE_HOURS": 24.0}
+    exec(main_function_code("_settle_future_rows"), ns)
+    settle = ns["_settle_future_rows"]
+    H = 3600.0
+    def rows(start_h, count, length_h, estimate_from=None, tag="new"):
+        out = []
+        for i in range(count):
+            st = (start_h + i * length_h) * H
+            out.append({"path": "%s%d" % (tag, i), "planned_start": st, "used_length": length_h * H, "slot_key": "s", "position": i,
+                        "length_source": "estimate" if estimate_from is not None and st >= estimate_from * H else "measured", "guide_entry": {}})
+        return out
+    first = rows(10, 40, 2, estimate_from=30)
+    check(settle(first, [], 0.0) == sorted(first, key=lambda r: r["planned_start"]), "with nothing saved yet the whole new future is used, so the guide fills at once")
+    saved = [dict(r, path="old%d" % i, length_source=None) for i, r in enumerate(rows(10, 40, 2))]
+    out = settle(rows(10, 40, 2, estimate_from=30, tag="new"), saved, 0.0)
+    news = [r for r in out if r["path"].startswith("new")]
+    olds = [r for r in out if r["path"].startswith("old")]
+    check(news and max(r["planned_start"] for r in news) < 24 * H and min(r["planned_start"] for r in olds) >= 24 * H,
+          "inside the first 24 hours the new rows are used; past them a day with estimated lengths keeps the rows saved before")
+    out2 = settle(rows(10, 40, 2, estimate_from=60, tag="new"), saved, 0.0)
+    news2 = [r for r in out2 if r["path"].startswith("new")]
+    check(max(r["planned_start"] for r in news2) < 48 * H and max(r["planned_start"] for r in news2) >= 24 * H
+          and all(r["planned_start"] >= 48 * H for r in out2 if r["path"].startswith("old")),
+          "a day past the first 24 hours whose lengths are all measured is redrawn whole; the next day, still estimated, stays as it was")
+    out3 = settle(rows(10, 40, 2, tag="new"), saved, 0.0)
+    check(all(r["path"].startswith("new") for r in out3), "once every day is measured the whole future is new")
+    check(settle(saved, saved, 0.0) is None, "nothing is written when the settled future equals what is saved, so the guide is not rebuilt for nothing")
+    src = MAIN_SRC[MAIN_SRC.index("def _hub_future_for_channel"):]
+    src = src[:src.index("_hub_future_logged = {}")]
+    check(src.index("_settle_future_rows(_rows, _hub_f.future_rows_between(") < src.index("_hub_f.replace_future_rows(_channel, _rows)")
+          and "if _rows is None:" in src, "the future rows are settled against what is saved before they are written")
+
+
+def suite_scan_turns():
+    import performance_governor as pg
+    pg._scan_turns.clear()
+    t = 1000.0
+    pg.scan_report_head("loudness", (2, 1), now=t)
+    pg.scan_report_head("duration", (3, 4), now=t)
+    pg.scan_report_head("picture_box", (3, 6), now=t)
+    check(pg.scan_should_yield("duration", (3, 4), now=t + 1) and pg.scan_should_yield("picture_box", (3, 6), now=t + 1),
+          "lengths and picture boxes far ahead wait while loudness has a next show waiting")
+    check(not pg.scan_should_yield("loudness", (2, 1), now=t + 1) and pg.scan_is_most_urgent("loudness", now=t + 1),
+          "loudness takes the turn and may use the threads the others leave")
+    pg.scan_report_head("loudness", (1, 0), now=t + 2)
+    pg.scan_report_head("duration", (2, 0), now=t + 2)
+    check(pg.scan_should_yield("duration", (2, 0), now=t + 3), "an unscanned commercial airing soon goes ahead of the next shows")
+    check(not pg.scan_should_yield("duration", (2, 0), now=t + 2 + pg.SCAN_TURN_STALE_SECONDS + 1),
+          "a scan that stopped reporting no longer holds the others")
+    pg.scan_report_head("loudness", (1, 0), now=t + 200)
+    pg._scan_turns["loudness"]["progress"] = t + 200 - pg.SCAN_TURN_STUCK_SECONDS - 1
+    check(not pg.scan_should_yield("duration", (2, 0), now=t + 200), "a scan stuck on one file no longer holds the others")
+    pg.scan_report_head("loudness", None, now=t + 201)
+    check(not pg.scan_should_yield("duration", (3, 9), now=t + 201), "a scan with nothing waiting holds nobody")
+    check(not pg.scan_should_yield("duration", (2, 0), now=t + 201) and not pg.scan_should_yield("x", None), "equal or unknown urgency never waits")
+    pg._scan_turns.clear()
+    pg.set_game_active(True)
+    try:
+        check(pg.scan_threads() == pg.GAME_SCAN_THREADS, "while a game runs the scans share %d scan thread" % pg.GAME_SCAN_THREADS)
+        check(not pg.game_needs_all(), "a smooth game does not stop the scans")
+        g0 = 5000.0
+        for i in range(60):
+            pg.note_game_tick(i % 3 == 0, now=g0 + i * 0.016)
+        check(pg.game_needs_all(), "a game that keeps having to catch up stops the background scans")
+        for i in range(60):
+            pg.note_game_tick(False, now=g0 + 10 + i * 0.016)
+        check(pg.game_needs_all(), "they stay stopped until the game has been steady for a while")
+        for i in range(800):
+            pg.note_game_tick(False, now=g0 + 12 + i * 0.016)
+        check(not pg.game_needs_all(), "a steady game lets the scans go on again at the game pace")
+    finally:
+        pg.set_game_active(False)
+    check(not pg.game_needs_all() and pg.scan_threads() >= 1, "leaving the game returns to normal")
+    gate_src = read(os.path.join(ROOT, "performance_governor.py"))
+    check("and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < affordable_threads())" in gate_src and "not game_needs_all()" in gate_src,
+          "background scan work may not start past the overall cap or while a game falls behind; priority work never waits")
+    slot = gate_src[gate_src.index("def scan_thread_slot"):]
+    slot = slot[:slot.index("def scan_gpu_decode_allowed")]
+    check(slot.index("if scan_should_yield(kind, rank):\n            start = time.monotonic()") < slot.index("_activity.try_begin(SCAN_THREADS_LANE, scan_threads())")
+          and "scan_note_progress(kind)" in slot, "waiting for a turn never counts as a stuck wait, and a finished file is recorded")
+    for wiring in ('with _scan_thread_slot("duration", _cls, _tier_idx) as _slot_ok:', 'with _scan_thread_slot("picture_box", _cls, _tier_idx) as _slot_ok:',
+                   'with _scan_thread_slot("loudness", _head_cls, _chunk[0][1]) as _slot_ok:', 'with _scan_thread_slot("music", _scan_cls) as _slot_ok:',
+                   'with _scan_thread_slot("commercial_check", SCAN_CLASS_COMMERCIAL) as _slot_ok:', 'with _scan_thread_slot("pending", SCAN_CLASS_DEEP) as _slot_ok:'):
+        check(wiring in MAIN_SRC, "every scanner takes its turn: %s" % wiring)
+    check('_scan_report_head("loudness", _pipeline_items[_need_pi][0], _pipeline_items[_need_pi][1])' in MAIN_SRC,
+          "loudness reports its next file that still needs loudness, not files already done")
+    pause = MAIN_SRC[MAIN_SRC.index("def _background_scan_should_pause"):MAIN_SRC.index("def _background_scan_pace_seconds")]
+    check("performance_governor.game_needs_all()" in pause and "return _background_scan_should_pause() or _is_game_actively_playing()" in pause,
+          "scans stop for a game only when it falls behind; Python-heavy work still waits for the whole game")
+    fut = MAIN_SRC[MAIN_SRC.index("def _hub_future_worker"):]
+    check("if _python_heavy_should_pause():" in fut[:3000], "the future guide rows wait for the whole game")
+    check("performance_governor.set_game_active(_is_game_actively_playing())" in MAIN_SRC
+          and "_gov.note_game_tick(self._gft_runs > 1)" in read(os.path.join(ROOT, "game_deck.py")),
+          "the governor knows when a game runs and how its frames keep up")
+    music = MAIN_SRC[MAIN_SRC.index("def _music_precache_worker"):]
+    check("while _background_scan_should_pause():\n                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):" in music,
+          "the music scan waits on a pause instead of skipping songs")
+
+
+def suite_python_heavy_work():
+    check(gov.GUIDE_CLOSED_REBUILD_SECONDS == 15.0 and gov.PYTHON_SWITCH_INTERVAL_SECONDS == 0.001, "the closed-guide rebuild spacing and the Python turn setting live in the governor")
+    check("sys.setswitchinterval(performance_governor.PYTHON_SWITCH_INTERVAL_SECONDS if performance_governor is not None else 0.001)" in MAIN_SRC,
+          "Python hands the screen thread a turn sooner")
+    w = MAIN_SRC[MAIN_SRC.index("def _guide_preload_worker"):]
+    w = w[:w.index("\ndef ", 10)]
+    check("_asked = _guide_dirty_event.wait(timeout=GUIDE_POLL_S)" in w
+          and "if not _asked and app_state.get(\"current_channel\") != \"04\":" in w
+          and "_python_heavy_should_pause() or time.monotonic() - _last_closed_build < GUIDE_CLOSED_REBUILD_S" in w,
+          "with the guide closed a rebuild nobody asked for waits its spacing and for Python-heavy work to be allowed")
+    check(w.index("if not _asked and app_state") < w.index("guide_preload_tick(_guide_preload_scratch_surface"), "the check comes before the rebuild")
+    check("_guide_preload_last_tick_ts = time.time()\n                    continue" in w, "a skipped rebuild still tells the watchdog the preloader is alive")
+    cc = MAIN_SRC[MAIN_SRC.index("def change_channel("):]
+    check("if new_ch == \"04\":\n        _guide_dirty_event.set()" in cc, "opening the guide asks for a rebuild at once")
+
+
+def suite_schedule_off_screen_thread():
+    import media as md
+    check(gov.TIMELINE_MEMO_SIZE == 24 and md.TIMELINE_MEMO_SIZE == gov.TIMELINE_MEMO_SIZE, "the number of kept timelines lives in the governor")
+    tracks = [{"path": "D:/s/Show - S01E%02d.mkv" % i, "duration": 660 + (i % 3) * 660} for i in range(40)]
+    comms = [{"path": "D:/c/c%d.mp4" % i, "duration": 30, "is_commercial": True} for i in range(20)]
+    info = {"commercial_placement": "interrupt_half_hour"}
+    md._timeline_memo.clear()
+    calls = []
+    real = md.build_block_timeline
+    md.build_block_timeline = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        first = md.build_channel_timeline(tracks, comms, info, 77, {"pos": 2})
+        second = md.build_channel_timeline([dict(t) for t in tracks], comms, info, 77, {"pos": 2})
+        check(len(calls) == 1, "the same lineup asked for twice is built once (%d builds)" % len(calls))
+        check(first == second, "the timeline handed back is the same as the one built")
+        check(all(a is not b for a, b in zip(first[0], second[0])) and first[2] is not second[2],
+              "each caller gets its own copies of the entries and the commercial state")
+        second[0][0]["path"] = "changed"
+        third = md.build_channel_timeline(tracks, comms, info, 77, {"pos": 2})
+        check(third[0][0]["path"] != "changed", "a caller changing its copy never changes the kept timeline")
+        tracks[5]["duration"] = 2700
+        md.build_channel_timeline(tracks, comms, info, 77, {"pos": 2})
+        md.build_channel_timeline(tracks, comms, info, 78, {"pos": 2})
+        check(len(calls) == 3, "a new length or another day builds again")
+        for seed in range(100, 140):
+            md.build_channel_timeline(tracks, comms, info, seed, None)
+        check(len(md._timeline_memo) == md.TIMELINE_MEMO_SIZE, "only the newest timelines are kept")
+    finally:
+        md.build_block_timeline = real
+        md._timeline_memo.clear()
+    fs = MAIN_SRC[MAIN_SRC.index("_live_pb_raw = str(app_state.get(\"_live_playback_channel\""):]
+    fs = fs[:fs.index("_prof_mark(\"frame_setup\")")]
+    check(fs.index("elif not app_state.get(\"is_playing_video\", False):") < fs.index("calculate_slotted_playback_state(_watchdog_owner_ch)"),
+          "the owner channel's schedule is asked for only while a video plays")
+
+
+def suite_governor_steps():
+    import performance_governor as pg
+    t = pg.Throttle(1000.0 / 60.0)
+    heavy = {"busy_avg_ms": t.frame_budget_ms * 2.5, "busy_worst_ms": t.frame_budget_ms * 2.5, "background_active": True, "background_lanes": "loudness_and_bake"}
+    levels = []
+    now = 10000.0
+    for i in range(int(12 / 0.5)):
+        levels.append(t.update(heavy, now + i * 0.5))
+    seen = sorted(set(levels))
+    check(seen == [0, 1, 2, 3, 4], "heavy pressure narrows the scans one level at a time (%s)" % seen)
+    first4 = levels.index(4) * 0.5
+    check(first4 >= 4 * pg.SUSTAIN_SECONDS - 0.5, "reaching level 4 takes four steps of %.0f s, not one jump (%.1fs)" % (pg.SUSTAIN_SECONDS, first4))
+    t2 = pg.Throttle(1000.0 / 60.0)
+    level = t2.update({"lost_audio": 5, "background_active": True, "background_lanes": "x"}, 20000.0)
+    check(level == pg.LOST_AUDIO_IMMEDIATE_LEVEL, "lost sound still narrows at once")
+    with pg.background_activity("guide_build"):
+        active, lanes = pg.background_active()
+        check(active and "guide_build" in lanes, "a guide build counts as the governor's own background work (%s)" % lanes)
+    for marker in ('with _background_activity("guide_build"):', 'with _background_activity("hub_future"):', 'with _background_activity("scan_snapshot"):'):
+        check(marker in MAIN_SRC, "Python-heavy work is counted: %s" % marker)
+
+
+def suite_load_order():
+    import builtins
+
+    def _targets(node, out):
+        if isinstance(node, ast.Name): out.add(node.id)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for e in node.elts: _targets(e, out)
+        elif isinstance(node, ast.Starred): _targets(node.value, out)
+
+    def binds(stmt):
+        out=set()
+        for n in ast.walk(stmt):
+            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): out.add(n.name)
+            elif isinstance(n,(ast.Import,ast.ImportFrom)):
+                for a in n.names: out.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n,ast.Assign):
+                for t in n.targets: _targets(t,out)
+            elif isinstance(n,(ast.AnnAssign,ast.AugAssign)): _targets(n.target,out)
+            elif isinstance(n,(ast.For,ast.comprehension)): _targets(n.target,out)
+            elif isinstance(n,ast.withitem) and n.optional_vars is not None: _targets(n.optional_vars,out)
+            elif isinstance(n,ast.ExceptHandler) and n.name: out.add(n.name)
+            elif isinstance(n,ast.NamedExpr): _targets(n.target,out)
+            elif isinstance(n,ast.Global): out.update(n.names)
+        return out
+
+    def loads_at_load(stmt):
+        """Names read while the statement itself runs at import time (not inside function bodies)."""
+        found=[]
+        def visit(n, local):
+            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                for d in n.decorator_list: visit(d, local)
+                for d in n.args.defaults + [x for x in n.args.kw_defaults if x is not None]: visit(d, local)
+                return
+            if isinstance(n,ast.Lambda):
+                for d in n.args.defaults: visit(d, local)
+                return
+            if isinstance(n,(ast.ListComp,ast.SetComp,ast.DictComp,ast.GeneratorExp)):
+                inner=set(local)
+                for g in n.generators: _targets(g.target, inner)
+                for child in ast.iter_child_nodes(n): visit(child, inner)
+                return
+            if isinstance(n,ast.Name) and isinstance(n.ctx,ast.Load) and n.id not in local:
+                found.append((n.id,n.lineno))
+            for child in ast.iter_child_nodes(n): visit(child, local)
+        visit(stmt, set())
+        return found
+
+    def problems(src):
+        tree=ast.parse(src)
+        bound=set(dir(builtins))|{"__file__","__name__","__doc__","__spec__","__builtins__"}
+        out=[]
+        for stmt in tree.body:
+            mine=binds(stmt)
+            guarded=isinstance(stmt,ast.Try) and any(isinstance(h.type,ast.Name) and h.type.id in("NameError","Exception","BaseException") or h.type is None for h in stmt.handlers)
+            if not guarded:
+                for name,line in loads_at_load(stmt):
+                    if name not in bound and name not in mine:
+                        out.append((name,line))
+            bound|=mine
+        return out
+
+
+    scripts = ["retro_tv_emulator.py", "media.py", "media_library.py", "game_deck.py", "performance_governor.py",
+               "menu_nav.py", "ui.py", "libretro_core.py", "visualizers.py"]
+    for name in scripts:
+        path = os.path.join(ROOT, name) if os.path.exists(os.path.join(ROOT, name)) else os.path.join(ROOT, "assets", name)
+        if not os.path.exists(path):
+            continue
+        found = problems(read(path))
+        check(not found, "%s reads no name at load before it exists (%s)" % (name, found[:5]))
+    check(problems("A = B\nB = 1\n") == [("B", 1)] and problems("B = 1\nA = B\ndef f():\n    return C\nC = 2\n") == [],
+          "the check finds a name read at load before it is made, and leaves function bodies alone")
+
+
 def suite_logs_folder():
     tmp = tempfile.mkdtemp(prefix="logs_folder_")
     try:
@@ -10280,6 +10900,118 @@ def suite_logs_folder():
           "update downloads are made in root/logs")
     helper = read(os.path.join(ROOT, "updater", "update_helper.py"))
     check('os.path.join(logs_dir, "update_helper.log")' in helper and '"logs")' in helper, "the update helper writes its log in root/logs and an update never replaces anything there")
+
+
+class TestV273SmallFixes(_SectionCase):
+    """Owner 2026-11-01: the ROM scan bar says just LOADING ROMS....., and build_info.py holds the build number"""
+
+    def test_v273_small_fixes(self):
+        self.run_section(suite_v273_small_fixes)
+
+
+class TestSplashPerConsole(_SectionCase):
+    """Owner 2026-11-01: the SplashScreen.png already in a console's folder is used only for consoles whose splash is on and that picked nothing else"""
+
+    def test_splash_per_console(self):
+        self.run_section(suite_splash_per_console)
+
+
+class TestNavSpeedLimit(_SectionCase):
+    """Owner 2026-11-01: the highlight can't move faster than once every 150 ms, and a press that comes too soon is thrown away, not saved, so fast pressing never runs past the target"""
+
+    def test_nav_speed_limit(self):
+        self.run_section(suite_nav_speed_limit)
+
+
+class TestHidScanHandles(_SectionCase):
+    """Owner crash log 2026-11-01: the controller identity scan cut Windows' 64-bit device-list handle to 32 bits and the app died with an access violation"""
+
+    def test_hid_scan_handles(self):
+        self.run_section(suite_hid_scan_handles)
+
+
+class TestFolderIcon(_SectionCase):
+    """Owner 2026-11-01: the app folder shows the Retro TV folder icon from main/images/loading/folder.ico"""
+
+    def test_folder_icon(self):
+        self.run_section(suite_folder_icon)
+
+
+class TestV276Fixes(_SectionCase):
+    """Owner 2026-11-02: boot crash NameError, DVD keyboard skip keys, Back on the DVD confirm, Holiday Clear button, a fresh start shows no old guide"""
+
+    def test_v276_fixes(self):
+        self.run_section(suite_v276_fixes)
+
+
+class TestV277QuietLogs(_SectionCase):
+    """Owner 2026-11-02: no false guide-preloader stall during a game, no failure line because the controller file does not exist yet"""
+
+    def test_v277_quiet_logs(self):
+        self.run_section(suite_v277_quiet_logs)
+
+
+class TestTunePriority(_SectionCase):
+    """Owner 2026-11-02: the hub row save runs on its own thread, and tuning a channel holds background work until the first show plays"""
+
+    def test_tune_priority(self):
+        self.run_section(suite_tune_priority)
+
+
+class TestNewChannelFirstShow(_SectionCase):
+    """Owner 2026-11-02: the moment a channel is set up, its first show's duration and picture box are scanned ahead of everything else, without tuning to it"""
+
+    def test_new_channel_first_show(self):
+        self.run_section(suite_new_channel_first_show)
+
+
+class TestOneScanOrderForNewFiles(_SectionCase):
+    """Owner 2026-11-02 (audit E): no separate scanner for files just added; the ordered scans wake and take them in order"""
+
+    def test_one_scan_order_for_new_files(self):
+        self.run_section(suite_one_scan_order_for_new_files)
+
+
+class TestGuideSettledDays(_SectionCase):
+    """Owner 2026-11-02: the guide's first 24 hours update as lengths come in; each later day updates only once all its lengths are measured"""
+
+    def test_guide_settled_days(self):
+        self.run_section(suite_guide_settled_days)
+
+
+class TestScanTurns(_SectionCase):
+    """Owner 2026-11-02 (audit stage 2): the scans share the PC by how soon each file airs, games slow them without stopping them, and one overall cap"""
+
+    def test_scan_turns(self):
+        self.run_section(suite_scan_turns)
+
+
+class TestPythonHeavyWork(_SectionCase):
+    """Owner 2026-11-02 (audit stage 3): the closed guide is not rebuilt for every new length, and Python takes turns with the screen more often"""
+
+    def test_python_heavy_work(self):
+        self.run_section(suite_python_heavy_work)
+
+
+class TestScheduleOffScreenThread(_SectionCase):
+    """Owner 2026-11-02 (audit stage 4): the same timeline is never built twice, and the screen thread no longer asks for a channel nothing is playing"""
+
+    def test_schedule_off_screen_thread(self):
+        self.run_section(suite_schedule_off_screen_thread)
+
+
+class TestGovernorSteps(_SectionCase):
+    """Owner 2026-11-02 (audit stage 5): the governor narrows one level at a time and counts its own Python-heavy work"""
+
+    def test_governor_steps(self):
+        self.run_section(suite_governor_steps)
+
+
+class TestLoadOrder(_SectionCase):
+    """Owner crash 2026-11-02 03:55 (NameError SCAN_CLASS_NOW at start): no script reads a name at load before the line that makes it"""
+
+    def test_load_order(self):
+        self.run_section(suite_load_order)
 
 
 class TestLogsFolder(_SectionCase):
@@ -11542,6 +12274,13 @@ SCHED_RECORD_FUNCS = [
 ]
 
 SCHED_RECORD_ENGINE_STUBS = {
+    "_background_scan_should_pause": lambda: False,
+    "_governor_level_if_enforcing": lambda: None,
+    "_is_game_actively_playing": lambda: False,
+    "_scan_class_name": lambda c: "deep",
+    "_scan_rank": lambda c, t=0: (c, t),
+    "_scan_report_head": lambda *a, **k: None,
+    "_scan_thread_slot": lambda *a, **k: contextlib.nullcontext(True),
     "initialize_vlc_on_demand": lambda *a, **k: None,
     "set_live_playback_priority": lambda *a, **k: None,
     "_probe_duration_and_dims_combined": lambda path, *a, **k: (0, None),
@@ -11552,6 +12291,7 @@ SCHED_RECORD_ENGINE_STUBS = {
     "_store_loudness_gain": lambda path, gain: False,
     "performance_governor": None,
     "_sync_hub_rows_for_block": lambda *args, **kwargs: None,
+    "_request_hub_row_sync": lambda *args, **kwargs: None,
     "_write_missed_blocks_to_hub": lambda *args, **kwargs: None,
     "_hub_airing_entry": lambda *args, **kwargs: None,
     "copy": __import__("copy"),
@@ -12833,7 +13573,7 @@ def suite_duration_scan_ahead():
         "_scan_duration_failed": lambda p: failed.append(p) or False,
         "_background_scan_pace_seconds": lambda base: base,
         "_scan_class_pace_seconds": lambda cls, base: 0.0 if cls == 0 else base,
-        "_scan_thread_slot": lambda kind, cls: contextlib.nullcontext(True),
+        "_scan_thread_slot": lambda kind, cls, tier=0: contextlib.nullcontext(True), "_scan_report_head": lambda *a, **k: None, "_scan_idle_wait": lambda seconds, *a: stop.wait(seconds),
         "SCAN_CLASS_NOW": 0,
         "BETWEEN_LOUDNESS_PROBES_SECONDS": 0.5,
         "SCAN_PIPELINE_PREEMPT_CHECK_SECONDS": 5.0,
@@ -12915,7 +13655,7 @@ def suite_picture_box_lane():
         "_picture_box_done": done, "_scan_pb_has_box": has_box,
         "_background_scan_pace_seconds": lambda base: base,
         "_scan_class_pace_seconds": lambda cls, base: 0.0 if cls == 0 else base,
-        "_scan_thread_slot": lambda kind, cls: contextlib.nullcontext(True),
+        "_scan_thread_slot": lambda kind, cls, tier=0: contextlib.nullcontext(True), "_scan_report_head": lambda *a, **k: None, "_scan_idle_wait": lambda seconds, *a: stop.wait(seconds),
         "SCAN_CLASS_NOW": 0,
         "PICTURE_BOX_BETWEEN_FILES_SECONDS": 1.0,
         "PICTURE_BOX_IDLE_SLEEP_SECONDS": 20.0,
@@ -13079,7 +13819,7 @@ def suite_scan_lanes_finish():
             "_scan_drive_on_hold": lambda p: False, "_governor_priority_scope": contextlib.nullcontext,
             "_governor_nullscope": contextlib.nullcontext, "_background_scan_pace_seconds": lambda b: b,
             "_scan_class_pace_seconds": lambda cls, b: 0.0 if cls == 0 else b,
-            "_scan_thread_slot": lambda kind, cls: contextlib.nullcontext(True),
+            "_scan_thread_slot": lambda kind, cls, tier=0: contextlib.nullcontext(True), "_scan_report_head": lambda *a, **k: None, "_scan_idle_wait": lambda seconds, *a: stop.wait(seconds),
             "_scan_store_duration": store_fn, "_scan_duration_failed": lambda p: False,
             "_pipeline_stage_picture_box": stage_fn, "_picture_box_done": set(), "_scan_pb_has_box": set(),
             
@@ -16133,7 +16873,7 @@ def suite_timeline_mirrors_to_hub():
 
     src = MAIN_SRC
     live = src[src.index("def calculate_slotted_playback_state"):]
-    check("_sync_hub_rows_for_block(target_clean_key, block_key, timeline, target_show, position_in_playlist, raw_tracks, _clock_shift_seconds)" in live
+    check("_request_hub_row_sync(target_clean_key, block_key, timeline, target_show, position_in_playlist, raw_tracks, _clock_shift_seconds)" in live
           and "_mirror_block_timeline_to_hub" not in src, "the live scheduler keeps the hub's rows in step once the airing entry is known")
     check("_mark_hub_row_static(ch_key, file_path)" in src[src.index("def _register_channel_playback_failure"):], "a file that goes to Static marks its hub row static")
 
@@ -16384,7 +17124,7 @@ def suite_hub_airing_entry():
 
     src = MAIN_SRC
     live = src[src.index("def calculate_slotted_playback_state"):]
-    check(live.index("_hub_pick = _hub_airing_entry(") < live.index("_sync_hub_rows_for_block(target_clean_key")
+    check(live.index("_hub_pick = _hub_airing_entry(") < live.index("_request_hub_row_sync(target_clean_key")
           and "_position_before_guard = position_in_playlist" in live and "target_show = _hub_pick" in live,
           "the live scheduler asks the hub for the airing entry after the repeat guard and before the hub's rows are brought up to date")
     check("_clock_shift_seconds = position_in_playlist - _position_before_guard" in live, "the guard's shift of the clock position is measured and passed on")
@@ -16838,7 +17578,8 @@ def suite_hub_future_worker():
         _hub_mode_ns(ns)
         ns["db"] = sns["db"]
         ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
-        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_hub_future_for_channel"):
+        ns["_GUIDE_LIVE_HOURS"] = 24.0
+        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel"):
             exec(main_function_code(name), ns)
         ns["_missed_block_day_seeds"] = sns["_missed_block_day_seeds"]
         ns["_hub_future_state"] = {}
@@ -16856,8 +17597,8 @@ def suite_hub_future_worker():
         check(hub.rows("05") == [] and hub.at("05", rows[0]["planned_start"] + 1) is None, "the schedule's rows are untouched and cannot see them")
         check(run("05") == 0, "nothing changed and the rows are fresh, so nothing is worked out again")
         mono["t"] += 901.0
-        check(run("05") == saved, "after the refresh seconds the future is worked out again, so a new file length reaches rows still ahead")
-        check(run("05", force=True) == saved, "a forced pass works it out again")
+        check(run("05") == 0 and ns["_hub_future_state"]["05"][1] == mono["t"], "after the refresh seconds the future is worked out again; rows that came out the same are not written again (V280)")
+        check(run("05", force=True) == 0, "a forced pass works it out again and writes nothing when nothing changed")
         channels["05"]["broken_files"] = [channels["05"]["schedules"]["Morning"][0]["path"]]
         changed = run("05")
         check(isinstance(changed, int) and changed > 0, "a changed file list makes the channel's future work out again at once")
@@ -16875,7 +17616,7 @@ def suite_hub_future_worker():
         src = MAIN_SRC
         worker = get_function_source("_hub_future_worker")
         check("_HUB_FUTURE_START_DELAY_SECONDS" in worker and worker.index("_HUB_FUTURE_START_DELAY_SECONDS") < worker.index("_hub_future_for_channel("), "the worker waits after boot before it works out anything")
-        check("_background_scan_should_pause()" in worker and "_background_scan_pace_seconds(" in worker, "the worker stops while the governor holds background work and paces itself between channels")
+        check("_python_heavy_should_pause()" in worker and "_background_scan_pace_seconds(" in worker, "the worker stops while the governor holds background work and paces itself between channels")
         check('target=_hub_future_worker' in src and src.index("target=_hub_future_worker") > src.index('_mark_boot_step("vlc_engine")'), "the worker thread starts after the boot steps, never inside the boot path")
         check(get_function_source("_hub_future_for_channel").count("_cached_path_exists") >= 2, "the projection uses the same file check as the scheduler")
     finally:
@@ -16911,7 +17652,8 @@ def suite_hub_future_holiday_rows():
             _hub_mode_ns(ns)
             ns["db"] = sns["db"]
             ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
-            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_hub_future_for_channel"):
+            ns["_GUIDE_LIVE_HOURS"] = 24.0
+            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel"):
                 exec(main_function_code(name), ns)
             ns["_hub_future_state"], ns["_hub_future_logged"] = {}, {}
             run = ns["_hub_future_for_channel"]
@@ -17584,7 +18326,7 @@ def suite_add_media_prebuild_rows():
 
     src = MAIN_SRC
     handler = src[src.index("_vt_add, _, _ = build_block_rotation("):]
-    handler = handler[:handler.index("_deferred_metadata_probing_worker")]
+    handler = handler[:handler.index("_note_scan_work_added()")]
     check("_write_prebuilt_block_to_hub(target_ch, _bkey_add, _vt_add, _raw_add)" in handler and handler.index("_brc_add[_bkey_add] = {") < handler.index("_write_prebuilt_block_to_hub("),
           "the Add Media prebuild records its lineup right after it stores it in the block cache")
 
@@ -18064,7 +18806,7 @@ class TestFailurePointText(_SectionCase):
 
 
 def suite_failure_point_text_game_deck():
-    converted_handler_checks("game_deck.py", 55)
+    converted_handler_checks("game_deck.py", 56)
     path = os.path.join(ROOT, "game_deck.py")
     module = load_deck_module(path, "game_deck_failure_text")
     check(module._log_swallowed is gov.log_swallowed, "game_deck uses the one shared helper from performance_governor.py")
@@ -20292,7 +21034,7 @@ class TestHolidayFilesAreScanned(unittest.TestCase):
 
     def test_the_holiday_item_reaches_every_scan_lane_through_the_one_pipeline(self):
         order = {}
-        ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3}
+        ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch))}
         exec(main_function_code("_order_scan_pipeline"), ns)
         out = ns["_order_scan_pipeline"]([[], [], [], []], [("channel", "05", "halloween", "/m/h.mkv")])
         self.assertEqual(out, [(3, 4, "channel", "05", "halloween", "/m/h.mkv")])
@@ -21196,8 +21938,8 @@ class TestBootDriveWake(unittest.TestCase):
 # ============================================================================
 
 
-def _load_updater_script(name):
-    """Loads auto_updater.py or update_helper.py from the project; a stand-in for server_diagnostics is used only when the real one is not on the path."""
+def _load_updater_script(name, keep_build_number=False):
+    """Loads auto_updater.py or update_helper.py from the project; a stand-in for server_diagnostics is used only when the real one is not on the path; unless keep_build_number, the number in build_info.py is set aside so the tests see a copy with no number built in."""
     import importlib.util
     try:
         __import__("server_diagnostics")
@@ -21214,6 +21956,8 @@ def _load_updater_script(name):
             spec = importlib.util.spec_from_file_location("_t_" + name, path)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            if not keep_build_number and hasattr(module, "_build_info"):
+                module._build_info = None
             return module
     raise LookupError(name + ".py not found")
 
@@ -22837,7 +23581,8 @@ def suite_pending_probe_priority_and_pacing():
     src = read(MAIN_SCRIPT)
     check("_pending_backlog_may_run" in src and "rank < _PENDING_PROBE_URGENT_COUNT" in src,
           "the worker ranks files and paces the backlog")
-    ns = {"time": time, "media": media, "performance_governor": gov}
+    ns = {"time": time, "media": media, "performance_governor": gov, "_background_scan_should_pause": lambda: False,
+          "_scan_rank": lambda c, t=0: (c, t), "SCAN_CLASS_DEEP": 3}
     exec(main_function_code("_pending_backlog_may_run"), ns)
     media._LIVE_PLAYBACK_PRIORITY.clear()
     with mock.patch.object(gov, "pending_backlog_allowed", lambda: True), \
@@ -22900,7 +23645,7 @@ def suite_shared_scan_pacing():
         body = get_function_source(worker)
         check("_scan_class_pace_seconds(" in body and "_scan_thread_slot(" in body,
               "%s uses the shared pace and the shared scan threads" % worker)
-    check("_loudness_scan_pace(_head_cls, BETWEEN_PROBES)" in src and '_scan_thread_slot("loudness", _head_cls)' in src,
+    check("_loudness_scan_pace(_head_cls, BETWEEN_PROBES)" in src and '_scan_thread_slot("loudness", _head_cls, _chunk[0][1])' in src,
           "the loudness chain uses the shared pace and the shared scan threads")
 
 
@@ -23159,8 +23904,9 @@ def suite_audio_track_english_first():
           "with no language in VLC's labels the file's own stream languages decide")
     check(pick([(1, "Track 1 - [French]"), (2, "Track 2 - [German]")], [], 1)[0] is None,
           "no English track: the playing track is kept")
-    rows = ns["_audio_track_rows"]([(1, "Track 1"), (2, "Track 2")], [{"lang": "jpn", "desc": "ac3, 48000 Hz, 5.1"}, {"lang": "eng", "desc": "aac, 48000 Hz, stereo"}])
-    check("ENG" in rows[1][1] and "JPN" in rows[0][1], "the menu shows each track's language when VLC's label has none")
+    rows = ns["_audio_track_rows"]([(1, "Track 1"), (2, "Track 2"), (3, "")], [{"lang": "jpn", "desc": "ac3, 48000 Hz, 5.1"}, {"lang": "eng", "desc": "aac, 48000 Hz, stereo"}, {"lang": "", "desc": "aac"}])
+    check([r[1] for r in rows] == ["Track 1", "Track 2", "Track 3"],
+          "the Audio Track menu shows only the track names, with no language, format or other details added (owner 2026-11-01)")
     check(ns["_audio_track_rows"]([(2, "Track 2 - [English]")], [{"lang": "eng", "desc": "x"}])[0][1] == "Track 2 - [English]",
           "a label that already names its language is shown as VLC gives it")
     src = read(MAIN_SCRIPT)
