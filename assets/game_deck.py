@@ -22,7 +22,7 @@ import menu_nav as _nav
 import performance_governor as _gov
 import media as _media_listing
 
-from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info,
+from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info, console_splash_file,
                     is_dvd_disc_source, apply_video_effects,
                     generate_captions_via_asr_chunked, _asr_slot, resolve_caption_source)
 
@@ -44,12 +44,6 @@ except Exception:
     def _log_swallowed(where, error):
         """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
         return None
-
-
-try:
-    from dvdnav_highlight import DvdnavShadowSession
-except Exception:
-    DvdnavShadowSession = None
 
 
 # ============================================================================
@@ -121,7 +115,7 @@ def _list_archive_entries(archive_path):
 
 _ARCHIVE_CONTENT_CACHE = collections.OrderedDict()
 _ARCHIVE_CONTENT_CACHE_LOCK = threading.Lock()
-_ARCHIVE_CONTENT_CACHE_MAX_ENTRIES = 5000
+_ARCHIVE_CONTENT_CACHE_MAX_ENTRIES = _gov.GAME_ARCHIVE_CACHE_MAX_ENTRIES
 
 
 def _archive_matches_console(archive_path, console):
@@ -138,7 +132,8 @@ def _archive_matches_console(archive_path, console):
     try:
         st = os.stat(archive_path)
         cache_key = (os.path.abspath(archive_path), st.st_size, st.st_mtime, console)
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_archive_matches_console: st = os.stat(archive_path)", _swallowed_error)
         pass
 
     if cache_key is not None:
@@ -478,16 +473,7 @@ CONSOLE_SCROLL_STYLE_LABELS = {
 }
 
 LIST_TEXT_COLOR_NAMES = ["white", "black", "red", "orange", "yellow", "green", "blue", "purple"]
-LIST_TEXT_COLOR_RGB = {
-    "white":  (255, 255, 255),
-    "black":  (0, 0, 0),
-    "red":    (220, 60, 60),
-    "orange": (230, 140, 40),
-    "yellow": (230, 210, 60),
-    "green":  (80, 220, 120),
-    "blue":   (80, 140, 230),
-    "purple": (170, 90, 220),
-}
+LIST_TEXT_COLOR_RGB = _gov.GAME_LIST_TEXT_COLORS
 
 
 # ============================================================================
@@ -557,17 +543,13 @@ PREFERRED_CORE_ORDER = {
     "PSX":          ["mednafenpsx", "beetlepsx", "pcsxrearmed", "swanstation", "mednafenpsxhw"],
 }
 
-_LIBRETRO_LOAD_TAU_MS = {
-    "PSX": 9000,
-}
-_LIBRETRO_LOAD_TAU_MS_DEFAULT = 1200
+_LIBRETRO_LOAD_TAU_MS = _gov.GAME_LOAD_BAR_TAU_MS
+_LIBRETRO_LOAD_TAU_MS_DEFAULT = _gov.GAME_LOAD_BAR_TAU_MS_DEFAULT
 
-_LIBRETRO_HOLD_AT_100_MS = 350
+_LIBRETRO_HOLD_AT_100_MS = _gov.GAME_LOAD_HOLD_AT_100_MS
 
-_LIBRETRO_FIRST_FRAME_GIVEUP_MS = {
-    "PSX": 75000,
-}
-_LIBRETRO_FIRST_FRAME_GIVEUP_MS_DEFAULT = 20000
+_LIBRETRO_FIRST_FRAME_GIVEUP_MS = _gov.GAME_FIRST_FRAME_GIVEUP_MS
+_LIBRETRO_FIRST_FRAME_GIVEUP_MS_DEFAULT = _gov.GAME_FIRST_FRAME_GIVEUP_MS_DEFAULT
 
 _CORE_NAME_PAIRS = sorted(CORE_NAME_TO_CONSOLES.items(), key=lambda kv: len(kv[0]), reverse=True)
 
@@ -666,7 +648,8 @@ def console_bezel_currently_active(console, db):
     con_prof_cfg = db.config.get("console_profiles", {}).get(console, {})
     try:
         active = int(con_prof_cfg.get("active", 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("console_bezel_currently_active: active = int(con_prof_cfg.get('active', 1))", _swallowed_error)
         active = 1
     profiles_map = con_prof_cfg.get("profiles", {})
     this_prof = profiles_map.get(active, profiles_map.get(str(active), {}))
@@ -720,7 +703,8 @@ def find_psx_disc_siblings(rom_path):
                 continue
             try:
                 disc_num = int(om.group(1))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as _swallowed_error:
+                _log_swallowed("find_psx_disc_siblings: disc_num = int(om.group(1))", _swallowed_error)
                 continue
             discs.append((disc_num, os.path.join(folder, other)))
 
@@ -1036,11 +1020,9 @@ if _WIN:
 
 _hid_identity_cache = None
 _HID_IDENTITY_CACHE_TTL = _gov.HID_IDENTITY_CACHE_TTL_SECONDS
-_hid_scan_failed_logged = False
 
 
 def _scan_hid_identities():
-    global _hid_scan_failed_logged
     out = []
     if not _WIN or _is_running_under_wine():
         return out
@@ -1048,7 +1030,8 @@ def _scan_hid_identities():
         setupapi = ctypes.windll.setupapi
         hid      = ctypes.windll.hid
         kernel32 = ctypes.windll.kernel32
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_scan_hid_identities: setupapi = ctypes.windll.setupapi", _swallowed_error)
         return out
 
     h_devinfo = None
@@ -1131,9 +1114,8 @@ def _scan_hid_identities():
 
             if entry["vid"] is not None:
                 out.append(entry)
-    except Exception:
-        if not _hid_scan_failed_logged:
-            _hid_scan_failed_logged = True
+    except Exception as _swallowed_error:
+        _log_swallowed("_scan_hid_identities: reading the controller identities from Windows", _swallowed_error)
     finally:
         if h_devinfo:
             try:
@@ -1177,7 +1159,8 @@ def _enrich_signature_with_hid_identity(jid, vid, pid, base_sig):
         if h["location"]:
             return f"{base_sig}:port:{h['location']}"
         return base_sig
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_enrich_signature_with_hid_identity: identities = _get_hid_identities()", _swallowed_error)
         return base_sig
 
 
@@ -1212,11 +1195,13 @@ def _try_dinput_read_all_impl():
     out = {}
     try:
         winmm = ctypes.windll.winmm
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_try_dinput_read_all_impl: winmm = ctypes.windll.winmm", _swallowed_error)
         return out
     try:
         num_devs = winmm.joyGetNumDevs()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_try_dinput_read_all_impl: num_devs = winmm.joyGetNumDevs()", _swallowed_error)
         return out
     if num_devs == 0 and "num_devs_zero" not in _dinput_diag_logged:
         _dinput_diag_logged.add("num_devs_zero")
@@ -1362,11 +1347,6 @@ def _slot_signature(slot):
 # ============================================================================
 _PAD_COUNTERS = {"joy_reads": 0, "hid_scans": 0, "hid_ms": 0.0}
 
-try:
-    import performance_governor as _pad_governor
-except Exception:
-    _pad_governor = None
-
 _pad_snapshot = {"slots": None, "thread": None}
 _pad_poller = None
 _pad_poller_lock = threading.Lock()
@@ -1390,10 +1370,9 @@ class _PadPoller:
     """Background thread that reads every controller at GAME_PAD_POLL_HZ and keeps the newest result for the game thread."""
 
     def __init__(self):
-        gov = _pad_governor
-        self.period = 1.0 / max(1.0, float(gov.GAME_PAD_POLL_HZ))
-        self.max_age = float(gov.GAME_PAD_SNAPSHOT_MAX_AGE_SECONDS)
-        self.idle_stop = float(gov.GAME_PAD_POLL_IDLE_STOP_SECONDS)
+        self.period = 1.0 / max(1.0, float(_gov.GAME_PAD_POLL_HZ))
+        self.max_age = float(_gov.GAME_PAD_SNAPSHOT_MAX_AGE_SECONDS)
+        self.idle_stop = float(_gov.GAME_PAD_POLL_IDLE_STOP_SECONDS)
         self.latest = None
         self.ready = threading.Event()
         self.stop_event = threading.Event()
@@ -1461,7 +1440,7 @@ class _PadPoller:
 def pad_poller_ensure():
     """Starts the background controller reader if it is not running and returns it, or None when it cannot be used."""
     global _pad_poller
-    if _pad_governor is None or _is_running_under_wine():
+    if _is_running_under_wine():
         return None
     with _pad_poller_lock:
         p = _pad_poller
@@ -1494,7 +1473,7 @@ def pad_warmup_done(elapsed_ms):
     p = _pad_poller
     if p is None or p.ready.is_set():
         return True
-    if elapsed_ms >= float(_pad_governor.GAME_PAD_WARMUP_MAX_WAIT_SECONDS) * 1000.0:
+    if elapsed_ms >= float(_gov.GAME_PAD_WARMUP_MAX_WAIT_SECONDS) * 1000.0:
         if not p.cap_logged:
             p.cap_logged = True
             log.warning("[GAME PAD] load bar stopped waiting for the first controller read after %d ms", elapsed_ms)
@@ -1876,7 +1855,6 @@ class _LinuxJoystickReader:
         self._fd            = None
         self._state         = _GPState()
         self._failed        = False
-        self._perm_denied   = False
         self._opened_at     = None
         self._last_event_at = None
         self.signature       = _linux_js_sysfs_signature(path)
@@ -1893,7 +1871,6 @@ class _LinuxJoystickReader:
         except PermissionError as e:
             self._fd = None
             self._failed = True
-            self._perm_denied = True
             log.warning("Linux joystick fallback found %s but couldn't read it "
                         "(permission denied: %s)", self._path, e)
             _gamepad_perm_denied_path = self._path
@@ -1917,7 +1894,8 @@ class _LinuxJoystickReader:
                     chunk = os.read(self._fd, _JS_EVENT_SIZE)
                 except BlockingIOError:
                     break
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("_LinuxJoystickReader.read: chunk = os.read(self._fd, _JS_EVENT_SIZE)", _swallowed_error)
                     break
                 if len(chunk) < _JS_EVENT_SIZE:
                     break
@@ -2024,7 +2002,8 @@ def _stick_percent(config, name, enabled, player=1):
         return default
     try:
         value = int(config.get(stick_config_key(key, player), default))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("_stick_percent: value = int(config.get(stick_config_key(key, player), default))", _swallowed_error)
         value = default
     return max(low, min(high, value))
 
@@ -2202,16 +2181,16 @@ def _draw_stick_test(panel, center_x, center_y, sticks, ui_color, font, config, 
         cx = center_x - 350 + radius + index * 360
         raw = sticks[index] if sticks else (0, 0)
         out = correct_stick_pair(raw[0], raw[1], settings.deadzone, settings.sensitivity)
-        pygame.draw.circle(panel, (25, 38, 62), (cx, center_y), radius)
-        pygame.draw.circle(panel, (90, 90, 110), (cx, center_y), radius, 1)
+        pygame.draw.circle(panel, _gov.COLOR_GAME_STICK_RING_FILL, (cx, center_y), radius)
+        pygame.draw.circle(panel, _gov.COLOR_GAME_STICK_RING_EDGE, (cx, center_y), radius, 1)
         if settings.deadzone > 0.0:
-            pygame.draw.circle(panel, (200, 160, 40), (cx, center_y), max(1, int(radius * settings.deadzone)), 1)
+            pygame.draw.circle(panel, _gov.COLOR_GAME_STICK_DEADZONE_RING, (cx, center_y), max(1, int(radius * settings.deadzone)), 1)
         line = int(radius * threshold / STICK_MAX)
-        pygame.draw.line(panel, (70, 110, 160), (cx - line, center_y - radius), (cx - line, center_y + radius), 1)
-        pygame.draw.line(panel, (70, 110, 160), (cx + line, center_y - radius), (cx + line, center_y + radius), 1)
-        pygame.draw.line(panel, (70, 110, 160), (cx - radius, center_y - line), (cx + radius, center_y - line), 1)
-        pygame.draw.line(panel, (70, 110, 160), (cx - radius, center_y + line), (cx + radius, center_y + line), 1)
-        for pair, color, size in ((raw, (150, 150, 165), 4), (out, ui_color, 5)):
+        pygame.draw.line(panel, _gov.COLOR_GAME_STICK_THRESHOLD_LINE, (cx - line, center_y - radius), (cx - line, center_y + radius), 1)
+        pygame.draw.line(panel, _gov.COLOR_GAME_STICK_THRESHOLD_LINE, (cx + line, center_y - radius), (cx + line, center_y + radius), 1)
+        pygame.draw.line(panel, _gov.COLOR_GAME_STICK_THRESHOLD_LINE, (cx - radius, center_y - line), (cx + radius, center_y - line), 1)
+        pygame.draw.line(panel, _gov.COLOR_GAME_STICK_THRESHOLD_LINE, (cx - radius, center_y + line), (cx + radius, center_y + line), 1)
+        for pair, color, size in ((raw, _gov.COLOR_GAME_STICK_RAW, 4), (out, ui_color, 5)):
             fx, fy = pair[0] / STICK_MAX, pair[1] / STICK_MAX
             magnitude = math.hypot(fx, fy)
             if magnitude > 1.0:
@@ -2220,10 +2199,10 @@ def _draw_stick_test(panel, center_x, center_y, sticks, ui_color, font, config, 
         text_x = cx + radius + 14
         names = " ".join(stick_direction_names(out[0], out[1], threshold)) or "-"
         for row, (text, color) in enumerate((
-                ("%s STICK" % title, (180, 180, 180)),
-                ("RAW  %6d %6d" % raw, (150, 150, 165)),
+                ("%s STICK" % title, _gov.COLOR_GAME_LABEL_GREY),
+                ("RAW  %6d %6d" % raw, _gov.COLOR_GAME_STICK_RAW),
                 ("OUT  %6d %6d" % out, ui_color),
-                ("FIRES  %s" % names, (180, 180, 180)))):
+                ("FIRES  %s" % names, _gov.COLOR_GAME_LABEL_GREY))):
             panel.blit(font.render(text, True, color), (text_x, center_y - radius + 6 + row * 22))
 
 
@@ -2254,7 +2233,7 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
     selected = _nav.stick_dz_cell(rows, cursor)
 
     def option_color(cell):
-        return ui_color if selected == cell else (180, 180, 180)
+        return ui_color if selected == cell else _gov.COLOR_GAME_LABEL_GREY
 
     title = f_title.render("STICK DEADZONE", True, ui_color)
     panel.blit(title, (center_x - title.get_width() // 2, 20))
@@ -2267,8 +2246,8 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
     left = center_x - group_w // 2
     panel.blit(lbl, (left, row_y))
     sw_x, sw_y = left + lbl.get_width() + 14, row_y + lbl.get_height() // 2 - sw_h // 2
-    pygame.draw.rect(panel, (40, 167, 69) if enabled else (45, 65, 100), (sw_x, sw_y, sw_w, sw_h), border_radius=12)
-    pygame.draw.circle(panel, (255, 255, 255), (sw_x + sw_w - 14 if enabled else sw_x + 14, sw_y + sw_h // 2), 9)
+    pygame.draw.rect(panel, _gov.COLOR_GAME_SWITCH_ON if enabled else _gov.COLOR_GAME_SWITCH_OFF, (sw_x, sw_y, sw_w, sw_h), border_radius=12)
+    pygame.draw.circle(panel, _gov.COLOR_TEXT_WHITE, (sw_x + sw_w - 14 if enabled else sw_x + 14, sw_y + sw_h // 2), 9)
     if selected == _nav.STICK_DZ_SWITCH:
         pygame.draw.rect(panel, ui_color, (sw_x, sw_y, sw_w, sw_h), SELECTION_BORDER_WIDTH, border_radius=12)
 
@@ -2283,17 +2262,17 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
             text = f_opt.render(labels[name], True, option_color(name))
             panel.blit(text, (label_x, y_pos))
             bar_y = y_pos + text.get_height() // 2 - bar_h // 2
-            pygame.draw.rect(panel, (45, 65, 100), (bar_x, bar_y, bar_w, bar_h), border_radius=5)
+            pygame.draw.rect(panel, _gov.COLOR_GAME_SWITCH_OFF, (bar_x, bar_y, bar_w, bar_h), border_radius=5)
             fill = int(bar_w * (value - low) / float(high - low))
-            pygame.draw.rect(panel, (40, 167, 69), (bar_x, bar_y, fill, bar_h), border_radius=5)
-            pygame.draw.circle(panel, (255, 255, 255), (bar_x + fill, bar_y + bar_h // 2), 9)
+            pygame.draw.rect(panel, _gov.COLOR_GAME_SWITCH_ON, (bar_x, bar_y, fill, bar_h), border_radius=5)
+            pygame.draw.circle(panel, _gov.COLOR_TEXT_WHITE, (bar_x + fill, bar_y + bar_h // 2), 9)
             if selected == name:
                 pygame.draw.circle(panel, ui_color, (bar_x + fill, bar_y + bar_h // 2), 9, SELECTION_BORDER_WIDTH)
             number = f_opt.render("%d%%" % value, True, option_color(name))
             panel.blit(number, (bar_x + bar_w + 22, y_pos))
         reset = f_opt.render("[ RESET TO DEFAULTS ]", True, option_color(_nav.STICK_DZ_RESET))
         panel.blit(reset, (center_x - reset.get_width() // 2, row_y + row_gap * (len(_nav.STICK_DZ_SETTINGS) + 1)))
-        hint = f_small.render("LEFT / RIGHT change the highlighted value", True, (120, 120, 140))
+        hint = f_small.render("LEFT / RIGHT change the highlighted value", True, _gov.COLOR_GAME_HINT_TEXT)
         panel.blit(hint, (center_x - hint.get_width() // 2, 54))
         _draw_stick_test(panel, center_x, 408, sticks, ui_color, f_small, config, player)
 
@@ -2307,27 +2286,27 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
         if is_active:
             fill = ui_color
         elif connected:
-            fill = (70, 70, 95)
+            fill = _gov.COLOR_GAME_PLAYER_BOX_CONNECTED
         else:
-            fill = (35, 35, 45)
-        txt_col = (20, 20, 20) if is_active else ((200, 200, 210) if connected else (90, 90, 95))
+            fill = _gov.COLOR_GAME_PLAYER_BOX_EMPTY
+        txt_col = _gov.COLOR_GAME_PLAYER_TEXT_LIT if is_active else (_gov.COLOR_GAME_PLAYER_TEXT_CONNECTED if connected else _gov.COLOR_GAME_PLAYER_TEXT_OFF)
         pygame.draw.rect(panel, fill, (sq_x, sq_y, sq_size, sq_size), border_radius=6)
         if selected == _nav.STICK_DZ_PLAYERS and is_active:
-            pygame.draw.rect(panel, (255, 255, 255), (sq_x, sq_y, sq_size, sq_size), 2, border_radius=6)
+            pygame.draw.rect(panel, _gov.COLOR_TEXT_WHITE, (sq_x, sq_y, sq_size, sq_size), 2, border_radius=6)
         num_surf = f_opt.render(str(p), True, txt_col)
         panel.blit(num_surf, (sq_x + sq_size // 2 - num_surf.get_width() // 2, sq_y + sq_size // 2 - num_surf.get_height() // 2))
     squares_right = sq_x0 + _nav.STICK_DZ_PLAYER_COUNT * (sq_size + sq_gap) - sq_gap
     who = f_small.render("PLAYER %d SETTINGS" % player, True, option_color(_nav.STICK_DZ_PLAYERS))
     panel.blit(who, (squares_right + 14, sq_y + sq_size // 2 - who.get_height() // 2))
 
-    off_red = (220, 53, 69)
+    off_red = _gov.COLOR_GAME_OFF_RED
     close_w, close_h = 110, 40
     close_x = base_w - close_w - 25
     close_y = base_h - 52
     pygame.draw.rect(panel, off_red, (close_x, close_y, close_w, close_h), border_radius=4)
     if selected == _nav.CLOSE:
         pygame.draw.rect(panel, ui_color, (close_x, close_y, close_w, close_h), SELECTION_BORDER_WIDTH, border_radius=4)
-    close_lbl = f_opt.render("Close", True, (255, 255, 255))
+    close_lbl = f_opt.render("Close", True, _gov.COLOR_TEXT_WHITE)
     panel.blit(close_lbl, (close_x + close_w // 2 - close_lbl.get_width() // 2, close_y + close_h // 2 - close_lbl.get_height() // 2))
 
     if target_w > 0 and target_h > 0:
@@ -3156,14 +3135,14 @@ if _WIN:
 
 
 def resolve_emulator_config_path():
-    """Return the path to emulator_config.json under <root>/controllers/."""
+    """Return the path to emulator_config.json under <root>/logs/controllers/."""
     root_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    controllers_dir = os.path.join(root_dir, "controllers")
+    controllers_dir = os.path.join(root_dir, "logs", "controllers")
     new_path = os.path.join(controllers_dir, "emulator_config.json")
     try:
         os.makedirs(controllers_dir, exist_ok=True)
     except Exception as e:
-        log.warning("[CONFIG] Could not create controllers/ folder (%s) -- "
+        log.warning("[CONFIG] Could not create logs/controllers/ folder (%s) -- "
                      "emulator_config.json will fail to save: %s", controllers_dir, e)
         return new_path
     if not os.path.exists(new_path):
@@ -3210,7 +3189,7 @@ class ExternalGameDeck:
 
         self._console_arrow_flash_dir   = None
         self._console_arrow_flash_until = 0
-        self._CONSOLE_ARROW_FLASH_MS    = 220
+        self._CONSOLE_ARROW_FLASH_MS    = _gov.GAME_CONSOLE_ARROW_FLASH_MS
 
         self._scan_lock          = threading.Lock()
         self._scan_thread        = None
@@ -3239,23 +3218,20 @@ class ExternalGameDeck:
         self.ui_overlay_hwnd = None
         self._fit_rect = None
         self.parent_hwnd = None
-        self.is_visible = False
         self.is_embedded = False
         self.is_frozen = False
         self._pause_reasons = set()
-        self.original_style = None
         self.active_console = None
         self.current_browse_dir = ""
 
         self.ready_flag = False
-        self.ui_color = (0, 255, 128)
+        self.ui_color = _gov.DEFAULT_THEME["ui"]
         self.scroll_style = "carousel"
-        self.list_text_color = (255, 255, 255)
+        self.list_text_color = _gov.COLOR_TEXT_WHITE
         self.emulator_loading  = False
         self.emulator_load_pct = 0
         self.emulator_load_msg = ""
 
-        self._viewport_lock = __import__("threading").Lock()
         self.overlay_ready = False
 
         self._audio_vol_lock = threading.Lock()
@@ -3278,9 +3254,7 @@ class ExternalGameDeck:
 
         self.dvd_last_dir = ""
         self.dvd_file_path = ""
-        self._dvd_highlight_shadow = None
         self.dvd_splash_playing = False
-        self.dvd_hud_until = 0
         self.dvd_splash_done = False
         self.dvd_splash_enabled = False
         self.dvd_splash_path = ""
@@ -3301,7 +3275,6 @@ class ExternalGameDeck:
         self.dvd_paused = False
         self.dvd_resume_pending = False
         self.dvd_paused_frame = None
-        self._dvd_last_fit_geom = None
         self.dvd_awaiting_resume = False
         self.dvd_captions = False
         self.dvd_captions_enabled = False
@@ -3335,8 +3308,6 @@ class ExternalGameDeck:
         self._dvd_iso_watchdog_deadline = 0
         self._dvd_iso_watchdog_armed_at = 0
 
-        self.dvd_was_in_menu_on_leave = False
-        self.dvd_saved_title = 1
 
         self.dvd_iso_backgrounded = False
 
@@ -3350,16 +3321,11 @@ class ExternalGameDeck:
         self._libretro_suppress_start_select = False
 
         self._active_mapping_console = "GBA"
-        self._console_mappings = {}
         self.ctrl_mapping = self._load_controller_mapping("GBA")
         self.ctrl_mapping_active_btn = None
-        self.ctrl_mapping_mode = "controller"
         self._wf_surface_cache = {}
         self._wf_tinted_cache  = {}
         self._wf_tint_color_cache = {}
-        self._gba_wf_surface = None
-        self._gba_wf_tinted  = None
-        self._gba_wf_tint_color = None
         self._seq_remap_active = False
         self._ctrl_labels = {}
         self._last_xinput_btns = 0
@@ -3369,7 +3335,6 @@ class ExternalGameDeck:
         self._active_mapping_player = 1
         self._ctrl_map_player_sel = 1
         self._mapping_player_by_console = {}
-        self._mapping_reassign_wait_started = None
         self._ctrl_map_on_pick = False
         self._pick_flow_pending_player = None
         self._pick_layout_popup_player = None
@@ -3505,7 +3470,8 @@ class ExternalGameDeck:
             if os.path.exists(path):
                 try:
                     self._logo_raw_cache[console] = pygame.image.load(path).convert_alpha()
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._preload_logos_async: self._logo_raw_cache[console] = pygame.image.load(path).convert_alp...", _swallowed_error)
                     self._logo_raw_cache[console] = None
             else:
                 self._logo_raw_cache[console] = None
@@ -3530,7 +3496,8 @@ class ExternalGameDeck:
                 prof_cfg.get("border_enabled", prof_cfg.get("gb_border", False)))
             try:
                 self._libretro_border_style = int(prof_cfg.get("border_style", 1))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as _swallowed_error:
+                _log_swallowed("ExternalGameDeck.sync_profile_from_db: self._libretro_border_style = int(prof_cfg.get('border_style', 1))", _swallowed_error)
                 self._libretro_border_style = 1
         else:
             self._libretro_border_enabled = False
@@ -3564,7 +3531,8 @@ class ExternalGameDeck:
         n = self.console_bezel_style_count(self._libretro_console)
         try:
             style = int(style)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _swallowed_error:
+            _log_swallowed("ExternalGameDeck.set_border_style_live: style = int(style)", _swallowed_error)
             style = 1
         self._libretro_border_style     = max(1, min(style, n))
         self._libretro_border_surf      = None
@@ -3652,10 +3620,10 @@ class ExternalGameDeck:
 
     _BORDER_DEFAULT_RECT_FRAC = (48 / 256, 40 / 224, 160 / 256, 144 / 224)
 
-    _HANDHELD_BEZEL_FIT_MARGIN = 0.90
+    _HANDHELD_BEZEL_FIT_MARGIN = _gov.GAME_HANDHELD_BEZEL_FIT_MARGIN
 
-    _CONFIRM_BURN_IN_MS = 20000
-    _LIBRETRO_MAX_CATCHUP_FRAMES = 4
+    _CONFIRM_BURN_IN_MS = int(_gov.CONFIRM_POPUP_IDLE_CLOSE_SECONDS * 1000)
+    _LIBRETRO_MAX_CATCHUP_FRAMES = _gov.GAME_MAX_CATCHUP_FRAMES
 
     # ========================================================================
     # SECTION: Border loading & drawing
@@ -3670,7 +3638,8 @@ class ExternalGameDeck:
             transparent = alpha < 24
             try:
                 import cv2
-            except ImportError:
+            except ImportError as _swallowed_error:
+                _log_swallowed("ExternalGameDeck._detect_border_cutout_frac: import cv2", _swallowed_error)
                 cv2 = None
             if cv2 is not None:
                 rect = self._cutout_rect_cv2(transparent, w, h, np, cv2)
@@ -3786,7 +3755,8 @@ class ExternalGameDeck:
                 for f in sorted(os.listdir(bezel_dir)):
                     if os.path.splitext(f)[1].lower() in exts:
                         path = os.path.join(bezel_dir, f); break
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("ExternalGameDeck._border_source_path: for f in sorted(os.listdir(bezel_dir)):", _swallowed_error)
                 path = None
         return path
 
@@ -3800,7 +3770,8 @@ class ExternalGameDeck:
             return prepared
         try:
             mtime = os.path.getmtime(path)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._prepare_border_asset: mtime = os.path.getmtime(path)", _swallowed_error)
             mtime = 0
         key = (console, path, mtime)
         prepared["path"] = path
@@ -4046,7 +4017,7 @@ class ExternalGameDeck:
                 _fit_x, _fit_y, _fit_w, _fit_h = _contain_fit_rect(
                     _lay_w, _lay_h, (inner_x, inner_y, inner_w, inner_h))
             if _fit_w < inner_w or _fit_h < inner_h:
-                _bezel_bar_color = (1, 1, 1)
+                _bezel_bar_color = _gov.COLOR_SCREEN_BLACK
                 try:
                     _main_gd = sys.modules.get("__main__")
                     _bezel_bar_fn = getattr(_main_gd, "_video_bar_color", None)
@@ -4193,22 +4164,22 @@ class ExternalGameDeck:
                     log.info(f"[GAMEDECK] '{reason}' cleared but still frozen -- "
                           f"remaining pause reasons: {sorted(self._pause_reasons)}")
 
-    DVD_LOAD_SCREEN_MS = 1600
+    DVD_LOAD_SCREEN_MS = _gov.DVD_LOAD_SCREEN_MS
 
-    DVD_CUSTOM_SPLASH_MS = 3000
+    DVD_CUSTOM_SPLASH_MS = _gov.DVD_CUSTOM_SPLASH_MS
 
     DVD_SPLASH_VIDEO_EXTS = DVD_SPLASH_VIDEO_EXTS
     DVD_SPLASH_IMAGE_EXTS = DVD_SPLASH_IMAGE_EXTS
 
-    DVD_SPLASH_VIDEO_MAX_MS = 60000
+    DVD_SPLASH_VIDEO_MAX_MS = _gov.DVD_SPLASH_VIDEO_MAX_MS
 
-    DVD_ISO_OPEN_TIMEOUT_MS = 9000
+    DVD_ISO_OPEN_TIMEOUT_MS = _gov.DVD_ISO_OPEN_TIMEOUT_MS
 
-    DVD_ISO_OPEN_FAIL_GRACE_MS = 700
+    DVD_ISO_OPEN_FAIL_GRACE_MS = _gov.DVD_ISO_OPEN_FAIL_GRACE_MS
 
-    DVD_MENU_FLIP_DEBOUNCE_MS = 400
+    DVD_MENU_FLIP_DEBOUNCE_MS = _gov.DVD_MENU_FLIP_DEBOUNCE_MS
 
-    DVD_END_STATE_GRACE_MS = 2500
+    DVD_END_STATE_GRACE_MS = _gov.DVD_END_STATE_GRACE_MS
 
     # ========================================================================
     # SECTION: Input: key translation, config refresh & events
@@ -4290,7 +4261,7 @@ class ExternalGameDeck:
         _scroll_style = db_config.get("console_scroll_style", "carousel")
         self.scroll_style = _scroll_style if _scroll_style in CONSOLE_SCROLL_STYLES else "carousel"
         _text_color_name = db_config.get("menu_text_color", "white")
-        self.list_text_color = LIST_TEXT_COLOR_RGB.get(_text_color_name, (255, 255, 255))
+        self.list_text_color = LIST_TEXT_COLOR_RGB.get(_text_color_name, _gov.COLOR_TEXT_WHITE)
         if migration_changed:
             log.info("[ROM MIGRATION] Reassigned Neo Geo Pocket files by extension: "
                      "NGP=%d (.ngp), NGPC=%d (.ngc)",
@@ -4445,7 +4416,6 @@ class ExternalGameDeck:
     def _poll_dvd_hold(self):
         if self.dvd_in_menu or getattr(self, "dvd_exit_confirm", False) or getattr(self, "dvd_return_menu_confirm", False):
             self._dvd_skip_hold_start = 0
-            self._dvd_skip_dir = 0
             return
 
         now = pygame.time.get_ticks()
@@ -4468,12 +4438,10 @@ class ExternalGameDeck:
 
         if dir_held == 0:
             self._dvd_skip_hold_start = 0
-            self._dvd_skip_dir = 0
             return
 
         if not getattr(self, "_dvd_skip_hold_start", 0):
             self._dvd_skip_hold_start = now
-            self._dvd_skip_dir = dir_held
 
         held_ms = now - self._dvd_skip_hold_start
         cooldown = getattr(self, "_dvd_skip_cooldown", 0)
@@ -4490,7 +4458,6 @@ class ExternalGameDeck:
                               ">>" if dir_held > 0 else "<<", t, new_t, length)
                 except Exception as e:
                     log.warning("DVD seek during held skip failed: %s", e)
-            self.dvd_hud_until = now + 3000
             self._dvd_skip_cooldown = now + _nav.DVD_SKIP_COOLDOWN_MS
 
     # ========================================================================
@@ -4511,7 +4478,7 @@ class ExternalGameDeck:
     }
 
     def _draw_dvd_osd_icon(self, screen, cx, cy, icon_key, ui_col, radius=46):
-        white = (255, 255, 255)
+        white = _gov.COLOR_TEXT_WHITE
 
         pygame.gfxdraw.aacircle(screen, cx, cy, radius, ui_col)
         pygame.gfxdraw.filled_circle(screen, cx, cy, radius, ui_col)
@@ -4560,8 +4527,6 @@ class ExternalGameDeck:
 
         if _dir is not None:
             vlc.navigate(_dir)
-            if self._dvd_highlight_shadow is not None:
-                self._dvd_highlight_shadow.mirror_navigate(_dir)
             if _dir == "activate":
                 self._dvd_menu_manual_override = False
 
@@ -4608,7 +4573,6 @@ class ExternalGameDeck:
                     self._dvd_splash_is_video = False
                     self.dvd_paused_frame = None
                     self.dvd_in_menu = False
-                    self._close_dvd_highlight_shadow()
                     self.mode = "ROMLIST"
                     self._scan_roms("DVD")
                 else:
@@ -4690,7 +4654,6 @@ class ExternalGameDeck:
         _transport = _nav.dvd_action(key, remote=True)
 
         if _transport == _nav.DVD_PLAY_PAUSE:
-            self.dvd_hud_until = pygame.time.get_ticks() + 5000
             if vlc:
                 try:
                     vlc.player.pause()
@@ -4701,7 +4664,6 @@ class ExternalGameDeck:
             return True
 
         if _transport == _nav.DVD_FAST_FORWARD:
-            self.dvd_hud_until = pygame.time.get_ticks() + 5000
             _now_ff = pygame.time.get_ticks()
             if _nav.dvd_skip_blocked(_now_ff, getattr(self, "_dvd_skip_cooldown", 0)):
                 return True
@@ -4713,7 +4675,6 @@ class ExternalGameDeck:
                     vlc.player.set_time(new_t)
                     self._set_dvd_osd(f">> +{_nav.DVD_SKIP_TAP_MS // 1000}s")
                     self._dvd_skip_hold_start = _now_ff
-                    self._dvd_skip_dir = 1
                     self._dvd_skip_cooldown = _now_ff + _nav.DVD_SKIP_COOLDOWN_MS
                     log.info("[DVD SEEK] +30s: %sms -> %sms (length=%sms)", t, new_t, length)
                 except Exception as e:
@@ -4721,7 +4682,6 @@ class ExternalGameDeck:
             return True
 
         if _transport == _nav.DVD_REWIND:
-            self.dvd_hud_until = pygame.time.get_ticks() + 5000
             _now_rw = pygame.time.get_ticks()
             if _nav.dvd_skip_blocked(_now_rw, getattr(self, "_dvd_skip_cooldown", 0)):
                 return True
@@ -4732,7 +4692,6 @@ class ExternalGameDeck:
                     vlc.player.set_time(new_t)
                     self._set_dvd_osd(f"<< -{_nav.DVD_SKIP_TAP_MS // 1000}s")
                     self._dvd_skip_hold_start = _now_rw
-                    self._dvd_skip_dir = -1
                     self._dvd_skip_cooldown = _now_rw + _nav.DVD_SKIP_COOLDOWN_MS
                     log.info("[DVD SEEK] -30s: %sms -> %sms", t, new_t)
                 except Exception as e:
@@ -4794,9 +4753,11 @@ class ExternalGameDeck:
                             ext = os.path.splitext(entry.name.lower())[1]
                             if ext in exts:
                                 return True
-                    except OSError:
+                    except OSError as _swallowed_error:
+                        _log_swallowed("ExternalGameDeck._dvd_folder_has_content_live: if entry.is_dir():", _swallowed_error)
                         continue
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._dvd_folder_has_content_live: with os.scandir(folder_path) as it:", _swallowed_error)
             pass
         return False
 
@@ -4904,7 +4865,8 @@ class ExternalGameDeck:
                 try:
                     if entry.is_dir() and not entry.name.startswith((".", "$")):
                         yield from _iter_matched_folders(entry.path, depth + 1)
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck.bulk_scan_for_roms._iter_matched_folders: if entry.is_dir() and (not entry.name.startswith(('.', '$'))):", _swallowed_error)
                     continue
 
         candidates_by_folder = []
@@ -4967,7 +4929,8 @@ class ExternalGameDeck:
                     elif entry.is_file() and entry.name.lower().endswith("_libretro.dll"):
                         for console in match_consoles_for_core_filename(entry.name):
                             found.setdefault(console, []).append(entry.path)
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck.bulk_scan_for_cores._walk: if entry.is_dir() and (not entry.name.startswith(('.', '$'))):", _swallowed_error)
                     continue
 
         _walk(parent_folder, 0)
@@ -5004,7 +4967,8 @@ class ExternalGameDeck:
         try:
             with open(self.config_path, "r", encoding="utf-8") as fp:
                 cfg = json.load(fp)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._assign_default_cores_after_scan: with open(self.config_path, 'r', encoding='utf-8') as fp:", _swallowed_error)
             cfg = {}
         changed = False
         for console in consoles:
@@ -5013,7 +4977,8 @@ class ExternalGameDeck:
             dest_dir = os.path.join(self.cores_dir, console)
             try:
                 present = [f for f in os.listdir(dest_dir) if f.lower().endswith(".dll")]
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("ExternalGameDeck._assign_default_cores_after_scan: present = [f for f in os.listdir(dest_dir) if f.lower().endswith('....", _swallowed_error)
                 present = []
             if not present:
                 continue
@@ -5099,7 +5064,7 @@ class ExternalGameDeck:
         re.IGNORECASE,
     )
 
-    _LIVE_RESCAN_INTERVAL_MS = 1500
+    _LIVE_RESCAN_INTERVAL_MS = _gov.GAME_LIVE_RESCAN_INTERVAL_MS
 
     @classmethod
     def _clean_rom_display_name(cls, name):
@@ -5184,7 +5149,8 @@ class ExternalGameDeck:
                         continue
                     try:
                         is_dir = entry.is_dir()
-                    except OSError:
+                    except OSError as _swallowed_error:
+                        _log_swallowed("ExternalGameDeck._scan_roms_worker: is_dir = entry.is_dir()", _swallowed_error)
                         continue
                     if is_dir:
                         if console == "DVD":
@@ -5335,7 +5301,8 @@ class ExternalGameDeck:
                     continue
                 try:
                     is_dir = entry.is_dir()
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._scan_folder_entries: is_dir = entry.is_dir()", _swallowed_error)
                     continue
                 if is_dir:
                     if console == "DVD" and self._dvd_folder_has_content(entry.path, set(exts)):
@@ -5841,7 +5808,6 @@ class ExternalGameDeck:
         self._dvd_menu_flip_since = 0
         self._dvd_menu_flip_candidate = None
         self._dvd_menu_manual_override = False
-        self.dvd_was_in_menu_on_leave = False
         self._dvd_iso_watchdog_armed = False
         self._dvd_iso_watchdog_deadline = 0
 
@@ -5853,17 +5819,18 @@ class ExternalGameDeck:
             log.warning("VLC clear_frame_buffer before DVD load screen failed: %s", e)
 
         self._dvd_splash_is_video = False
-        if self.dvd_splash_enabled and self.dvd_splash_path:
-            if self._dvd_path_is_video(self.dvd_splash_path) and os.path.exists(self.dvd_splash_path):
+        _dvd_splash_file = self._get_console_splash_path("DVD") if self.dvd_splash_enabled else ""
+        if _dvd_splash_file:
+            if self._dvd_path_is_video(_dvd_splash_file):
                 try:
-                    _handed = vlc.play_file_segmented(self.dvd_splash_path, 0, gain=1.0)
+                    _handed = vlc.play_file_segmented(_dvd_splash_file, 0, gain=1.0)
                     self._dvd_splash_is_video = bool(_handed)
                     if _handed:
-                        log.info(f"[DVD] Playing custom splash video: {os.path.basename(self.dvd_splash_path)}")
+                        log.info(f"[DVD] Playing custom splash video: {os.path.basename(_dvd_splash_file)}")
                     else:
                         log.warning("DVD splash video was not accepted by VLC, falling back to default load screen.")
                 except Exception as e:
-                    log.warning("Failed to start DVD splash video %s: %s", self.dvd_splash_path, e)
+                    log.warning("Failed to start DVD splash video %s: %s", _dvd_splash_file, e)
                     self._dvd_splash_is_video = False
 
         self.dvd_splash_playing = True
@@ -5871,14 +5838,6 @@ class ExternalGameDeck:
         self._dvd_splash_start_time = pygame.time.get_ticks()
         self._dvd_main_ever_played = False
         log.info("[DVD] Showing load screen before starting playback.")
-
-    def _close_dvd_highlight_shadow(self):
-        if self._dvd_highlight_shadow is not None:
-            try:
-                self._dvd_highlight_shadow.close()
-            except Exception as e:
-                log.warning("DVD highlight shadow session close failed: %s", e)
-            self._dvd_highlight_shadow = None
 
     def _play_dvd_main(self, seek_seconds=0):
         vlc = self.vlc_engine
@@ -5908,16 +5867,6 @@ class ExternalGameDeck:
                 self._dvd_iso_watchdog_armed = True
                 self._dvd_iso_watchdog_armed_at = pygame.time.get_ticks()
                 self._dvd_iso_watchdog_deadline = self._dvd_iso_watchdog_armed_at + self.DVD_ISO_OPEN_TIMEOUT_MS
-
-                if DvdnavShadowSession is not None:
-                    try:
-                        if self._dvd_highlight_shadow is not None:
-                            self._dvd_highlight_shadow.close()
-                        self._dvd_highlight_shadow = DvdnavShadowSession()
-                        self._dvd_highlight_shadow.open(self.dvd_file_path)
-                    except Exception as _hl_e:
-                        log.warning("DVD highlight shadow session open failed: %s", _hl_e)
-                        self._dvd_highlight_shadow = None
             else:
                 self._dvd_iso_watchdog_armed = False
                 if self.dvd_is_disc_image:
@@ -6278,7 +6227,6 @@ class ExternalGameDeck:
 
         self.deck_process = None
         self.game_hwnd    = None
-        self.is_visible   = False
         self.is_embedded  = False
         self.is_frozen    = False
         self.emulator_loading = False
@@ -6292,7 +6240,7 @@ class ExternalGameDeck:
         log.info(f"[GAMEDECK] Retro TV restored. Back in ROM list at index {self.rom_index}.")
 
     def _controller_exit_watcher(self):
-        HOLD_MS = 600
+        HOLD_MS = _gov.GAME_CONTROLLER_EXIT_HOLD_MS
 
         KEYEVENTF_KEYUP = 0x0002
         INPUT_KEYBOARD  = 1
@@ -6342,8 +6290,9 @@ class ExternalGameDeck:
             """Return the effective physical-bit -> logical-button map."""
             try:
                 return self._ensure_xi_map(console, 1)
-            except Exception:
+            except Exception as _swallowed_error:
                 # WARNING: the watcher must stay usable during early startup.
+                _log_swallowed("ExternalGameDeck._controller_exit_watcher._active_controller_map: return self._ensure_xi_map(console, 1)", _swallowed_error)
                 return {
                     logical: bit
                     for bit, logical in _get_console_def(console)["xinput_map"].items()
@@ -6715,7 +6664,6 @@ class ExternalGameDeck:
         self.ui_overlay_hwnd = None
         self.deck_process = None
         self.game_hwnd    = None
-        self.is_visible   = False
         self.is_embedded  = False
         self.is_frozen    = False
         self.active_console = None
@@ -6729,7 +6677,6 @@ class ExternalGameDeck:
         self.dvd_exit_confirm     = False
         self.dvd_return_menu_confirm = False
         self.dvd_paused           = False
-        self.dvd_was_in_menu_on_leave = False
 
     # ========================================================================
     # SECTION: Controller mapping: storage & player slots
@@ -6818,7 +6765,6 @@ class ExternalGameDeck:
     def _player_reassign_cancel_if_other(self, player_num):
         if _reassign_armed_player is not None and _reassign_armed_player != player_num:
             _player_reassign_cancel()
-            self._mapping_reassign_wait_started = None
 
     def _player_slot_pickable(self, player_num, console=None):
         if console is None:
@@ -6835,7 +6781,6 @@ class ExternalGameDeck:
 
     def start_menu_controller_pick(self):
         _menu_reassign_arm()
-        self._mapping_reassign_wait_started = time.monotonic()
 
     def _after_controller_picked(self, player_num):
         slot = _player_slot_of.get(player_num)
@@ -6972,7 +6917,6 @@ class ExternalGameDeck:
 
     def start_mapping_reassign(self, player_num):
         _player_reassign_arm(player_num)
-        self._mapping_reassign_wait_started = time.monotonic()
 
     def mapping_reassign_pending(self):
         return _reassign_armed_player is not None or _menu_reassign_armed
@@ -6989,7 +6933,6 @@ class ExternalGameDeck:
     def cancel_any_mapping_reassign(self):
         self._player_reassign_cancel_if_other(-1)
         _menu_reassign_cancel()
-        self._mapping_reassign_wait_started = None
 
     def poll_player_reassign(self):
         result = _player_reassign_poll()
@@ -7005,7 +6948,7 @@ class ExternalGameDeck:
     # SECTION: Controller mapping: UI, clicks & sequential remap
     # ========================================================================
 
-    def render_controller_mapping_ui(self, surface, rect, ui_color=(0, 255, 128), db=None, console=None):
+    def render_controller_mapping_ui(self, surface, rect, ui_color=_gov.DEFAULT_THEME["ui"], db=None, console=None):
         if console is None:
             console = "GBA"
         console_label = CONSOLE_LABELS.get(console, console)
@@ -7116,10 +7059,6 @@ class ExternalGameDeck:
                 self._wf_surface_cache[console] = raw
                 self._wf_tinted_cache[console]     = None
                 self._wf_tint_color_cache[console] = None
-                if console == "GBA":
-                    self._gba_wf_surface    = raw
-                    self._gba_wf_tinted     = None
-                    self._gba_wf_tint_color = None
             except Exception as e:
                 log.warning(f"[GAMEDECK MAPPING UI] Could not load wireframe for {console}: {e}")
                 self._wf_surface_cache[console] = None
@@ -7188,9 +7127,6 @@ class ExternalGameDeck:
                     tinted.blit(inv, (0, 0))
                 self._wf_tinted_cache[console]     = tinted
                 self._wf_tint_color_cache[console] = ui_color
-                if console == "GBA":
-                    self._gba_wf_tinted     = tinted
-                    self._gba_wf_tint_color = ui_color
 
             tinted_surf = self._wf_tinted_cache[console]
             draw_x = img_x + (img_area_w - tinted_surf.get_width())  // 2
@@ -7203,16 +7139,16 @@ class ExternalGameDeck:
             draw_y = img_y
             iw = img_area_w
             ih = img_area_h
-            pygame.draw.rect(surface, (40, 50, 40), (draw_x, draw_y, iw, ih))
-            pygame.draw.rect(surface, (60, 80, 60), (draw_x, draw_y, iw, ih), 2)
+            pygame.draw.rect(surface, _gov.COLOR_GAME_WIREFRAME_MISSING_FILL, (draw_x, draw_y, iw, ih))
+            pygame.draw.rect(surface, _gov.COLOR_GAME_WIREFRAME_MISSING_EDGE, (draw_x, draw_y, iw, ih), 2)
             if not hasattr(self, '_wf_fallback_fonts'):
                 self._wf_fallback_fonts = (
                     pygame.font.SysFont("Courier New", 18, bold=True),
                     pygame.font.SysFont("Courier New", 12),
                 )
             f_nf_big, f_nf_sml = self._wf_fallback_fonts
-            lbl_nf1  = f_nf_big.render("IMAGE NOT FOUND", True, (100, 120, 100))
-            lbl_nf2  = f_nf_sml.render(f"Place {console}_wireframe.png in main/images/Wireframes/", True, (60, 80, 60))
+            lbl_nf1  = f_nf_big.render("IMAGE NOT FOUND", True, _gov.COLOR_GAME_WIREFRAME_MISSING_TEXT)
+            lbl_nf2  = f_nf_sml.render(f"Place {console}_wireframe.png in main/images/Wireframes/", True, _gov.COLOR_GAME_WIREFRAME_MISSING_HINT)
             surface.blit(lbl_nf1, (draw_x + iw // 2 - lbl_nf1.get_width() // 2, draw_y + ih // 2 - 20))
             surface.blit(lbl_nf2, (draw_x + iw // 2 - lbl_nf2.get_width() // 2, draw_y + ih // 2 + 8))
 
@@ -7247,9 +7183,8 @@ class ExternalGameDeck:
                 return _N64_C_BTN_DEFAULT_LABELS[btn]
             return "---"
 
-        # VALUES CHANGE HERE
-        left_col_right_edge  = x + int(w * 0.22)
-        right_col_left_edge  = x + int(w * 0.78)
+        left_col_right_edge  = x + int(w * _gov.GAME_MAP_LEFT_COLUMN_EDGE_FRAC)
+        right_col_left_edge  = x + int(w * _gov.GAME_MAP_RIGHT_COLUMN_EDGE_FRAC)
 
         label_h         = int(ih * 0.20) if not LEFT_BTNS else max(int(ih * 0.10), int(ih * 0.96 / max(len(LEFT_BTNS), len(RIGHT_BTNS), 1)))
         label_block_top = draw_y + int(ih * 0.02)
@@ -7265,12 +7200,12 @@ class ExternalGameDeck:
         def _draw_btn_label(btn, right_edge, row_y, align_right=True, fixed_box_x=None):
             is_active = (active_btn == btn)
 
-            name_col = (255, 220, 0) if is_active else (180, 180, 180)
+            name_col = _gov.COLOR_ARCADE_GOLD if is_active else _gov.COLOR_GAME_LABEL_GREY
             name_surf = f_label.render(btn, True, name_col)
             value_text = "..." if is_active else _ctrl_label_for_btn(btn)
 
-            VAL_BOX_W, VAL_BOX_H = 56, name_surf.get_height() + 6
-            BOX_GAP = 6
+            VAL_BOX_W, VAL_BOX_H = _gov.GAME_MAP_VALUE_BOX_W_PX, name_surf.get_height() + _gov.GAME_MAP_VALUE_BOX_PAD_PX
+            BOX_GAP = _gov.GAME_MAP_VALUE_BOX_GAP_PX
 
             if align_right:
                 box_x  = right_edge - VAL_BOX_W
@@ -7288,15 +7223,15 @@ class ExternalGameDeck:
 
             surface.blit(name_surf, (name_x, name_y))
 
-            box_bg = (90, 30, 30) if is_active else (60, 60, 80)
+            box_bg = _gov.COLOR_GAME_VALUE_BOX_ACTIVE if is_active else _gov.COLOR_GAME_VALUE_BOX
             pygame.draw.rect(surface, box_bg, (box_x, box_y, VAL_BOX_W, VAL_BOX_H), border_radius=4)
-            box_border = ui_color if is_active else (120, 120, 140)
+            box_border = ui_color if is_active else _gov.COLOR_GAME_VALUE_BOX_EDGE
             pygame.draw.rect(surface, box_border, (box_x, box_y, VAL_BOX_W, VAL_BOX_H), SELECTION_BORDER_WIDTH, border_radius=4)
 
-            val_surf = f_small.render(value_text, True, (255, 255, 255))
+            val_surf = f_small.render(value_text, True, _gov.COLOR_TEXT_WHITE)
             if val_surf.get_width() > VAL_BOX_W - 6:
                 f_val_tiny = _cached_font("Courier New", 10, bold=True)
-                val_surf = f_val_tiny.render(value_text, True, (255, 255, 255))
+                val_surf = f_val_tiny.render(value_text, True, _gov.COLOR_TEXT_WHITE)
             surface.blit(val_surf, (box_x + VAL_BOX_W // 2 - val_surf.get_width() // 2,
                                      box_y + VAL_BOX_H // 2 - val_surf.get_height() // 2))
 
@@ -7309,9 +7244,9 @@ class ExternalGameDeck:
             bright = ui_color if is_active else (ui_color[0] // 2, ui_color[1] // 2, ui_color[2] // 2)
             is_lit = (not is_active) and (btn in getattr(self, "_ctrl_test_lit", ()))
             if is_lit:
-                pygame.draw.line(surface, (60, 200, 90), line_anchor, hotspot, 2)
-                pygame.draw.circle(surface, (90, 255, 130), hotspot, 6)
-                pygame.draw.circle(surface, (90, 255, 130), hotspot, 6, 1)
+                pygame.draw.line(surface, _gov.COLOR_GAME_HOTSPOT_LINE, line_anchor, hotspot, 2)
+                pygame.draw.circle(surface, _gov.COLOR_GAME_HOTSPOT_DOT, hotspot, 6)
+                pygame.draw.circle(surface, _gov.COLOR_GAME_HOTSPOT_DOT, hotspot, 6, 1)
             else:
                 pygame.draw.line(surface, dim, line_anchor, hotspot, 2)
                 pygame.draw.circle(surface, bright, hotspot, 4 if is_active else 3)
@@ -7329,7 +7264,7 @@ class ExternalGameDeck:
             r = _draw_btn_label(btn, left_col_right_edge, row_y, align_right=True)
             btn_rects[btn] = r
 
-        BOX_GAP = 6
+        BOX_GAP = _gov.GAME_MAP_VALUE_BOX_GAP_PX
         right_col_max_name_w = max((f_label.render(b, True, (0, 0, 0)).get_width() for b in RIGHT_BTNS), default=0)
         right_col_box_x = right_col_left_edge + right_col_max_name_w + BOX_GAP
 
@@ -7348,8 +7283,8 @@ class ExternalGameDeck:
                             "JoyLeft": "L-Joy L", "JoyRight": "L-Joy R"}
 
             sample_h  = f_label.get_height()
-            VAL_BOX_W, VAL_BOX_H = 56, sample_h + 6
-            BOX_GAP   = 6
+            VAL_BOX_W, VAL_BOX_H = _gov.GAME_MAP_VALUE_BOX_W_PX, sample_h + _gov.GAME_MAP_VALUE_BOX_PAD_PX
+            BOX_GAP   = _gov.GAME_MAP_VALUE_BOX_GAP_PX
             f_joy_dim = (ui_color[0] // 4, ui_color[1] // 4, ui_color[2] // 4)
 
             row_pitch     = VAL_BOX_H + 10
@@ -7370,26 +7305,26 @@ class ExternalGameDeck:
             def _draw_joy_row(jkey, cx, row_idx, box_x):
                 row_y = row_area_top + row_idx * row_pitch + VAL_BOX_H // 2
                 is_lit = jkey in joy_lit_set
-                name_surf = f_label.render(joy_labels[jkey], True, (180, 180, 180))
+                name_surf = f_label.render(joy_labels[jkey], True, _gov.COLOR_GAME_LABEL_GREY)
                 name_x  = box_x - BOX_GAP - name_surf.get_width()
                 box_y   = row_y - VAL_BOX_H // 2
                 name_y  = row_y - name_surf.get_height() // 2
                 surface.blit(name_surf, (name_x, name_y))
-                pygame.draw.rect(surface, (60, 60, 80), (box_x, box_y, VAL_BOX_W, VAL_BOX_H), border_radius=4)
-                pygame.draw.rect(surface, (120, 120, 140), (box_x, box_y, VAL_BOX_W, VAL_BOX_H), 2, border_radius=4)
-                val_surf = f_small.render(joy_defaults[jkey], True, (255, 255, 255))
+                pygame.draw.rect(surface, _gov.COLOR_GAME_VALUE_BOX, (box_x, box_y, VAL_BOX_W, VAL_BOX_H), border_radius=4)
+                pygame.draw.rect(surface, _gov.COLOR_GAME_VALUE_BOX_EDGE, (box_x, box_y, VAL_BOX_W, VAL_BOX_H), 2, border_radius=4)
+                val_surf = f_small.render(joy_defaults[jkey], True, _gov.COLOR_TEXT_WHITE)
                 if val_surf.get_width() > VAL_BOX_W - 6:
                     f_val_tiny = _cached_font("Courier New", 10, bold=True)
-                    val_surf = f_val_tiny.render(joy_defaults[jkey], True, (255, 255, 255))
+                    val_surf = f_val_tiny.render(joy_defaults[jkey], True, _gov.COLOR_TEXT_WHITE)
                 surface.blit(val_surf, (box_x + VAL_BOX_W // 2 - val_surf.get_width() // 2,
                                          box_y + VAL_BOX_H // 2 - val_surf.get_height() // 2))
                 fx, fy = joy_hotspots.get(jkey, (0.5, 0.5))
                 hotspot = (int(draw_x + fx * iw), int(draw_y + fy * ih))
                 line_anchor = (box_x + VAL_BOX_W // 2, box_y)
                 if is_lit:
-                    pygame.draw.line(surface, (60, 200, 90), line_anchor, hotspot, 2)
-                    pygame.draw.circle(surface, (90, 255, 130), hotspot, 6)
-                    pygame.draw.circle(surface, (90, 255, 130), hotspot, 6, 1)
+                    pygame.draw.line(surface, _gov.COLOR_GAME_HOTSPOT_LINE, line_anchor, hotspot, 2)
+                    pygame.draw.circle(surface, _gov.COLOR_GAME_HOTSPOT_DOT, hotspot, 6)
+                    pygame.draw.circle(surface, _gov.COLOR_GAME_HOTSPOT_DOT, hotspot, 6, 1)
                 else:
                     pygame.draw.line(surface, f_joy_dim, line_anchor, hotspot, 2)
                     joy_dot_color = (ui_color[0] // 2, ui_color[1] // 2, ui_color[2] // 2)
@@ -7419,11 +7354,11 @@ class ExternalGameDeck:
 
         if console == "MENU":
             lit = menu_nav_connected()
-            fill    = ui_color if lit else (35, 35, 45)
-            txt_col = (20, 20, 20) if lit else (90, 90, 95)
+            fill    = ui_color if lit else _gov.COLOR_GAME_PLAYER_BOX_EMPTY
+            txt_col = _gov.COLOR_GAME_PLAYER_TEXT_LIT if lit else _gov.COLOR_GAME_PLAYER_TEXT_OFF
             pygame.draw.rect(surface, fill, (sq_x0, sq_y, sq_size, sq_size), border_radius=6)
             if is_focused_row and not getattr(self, "_ctrl_map_on_pick", False):
-                pygame.draw.rect(surface, (255, 255, 255), (sq_x0, sq_y, sq_size, sq_size), 2, border_radius=6)
+                pygame.draw.rect(surface, _gov.COLOR_TEXT_WHITE, (sq_x0, sq_y, sq_size, sq_size), 2, border_radius=6)
             num_surf = f_opt.render("1", True, txt_col)
             surface.blit(num_surf, (sq_x0 + sq_size // 2 - num_surf.get_width() // 2,
                                      sq_y + sq_size // 2 - num_surf.get_height() // 2))
@@ -7441,18 +7376,18 @@ class ExternalGameDeck:
                              and (p == nav_player))
                 is_armed  = (reassign_pending_player == p)
                 if is_armed:
-                    fill = (200, 160, 30)
+                    fill = _gov.COLOR_GAME_PLAYER_BOX_ARMED
                 elif is_active:
                     fill = ui_color
                 elif connected:
-                    fill = (70, 70, 95)
+                    fill = _gov.COLOR_GAME_PLAYER_BOX_CONNECTED
                 else:
-                    fill = (35, 35, 45)
-                txt_col = (20, 20, 20) if (is_active or is_armed) else (
-                    (200, 200, 210) if connected else (90, 90, 95))
+                    fill = _gov.COLOR_GAME_PLAYER_BOX_EMPTY
+                txt_col = _gov.COLOR_GAME_PLAYER_TEXT_LIT if (is_active or is_armed) else (
+                    _gov.COLOR_GAME_PLAYER_TEXT_CONNECTED if connected else _gov.COLOR_GAME_PLAYER_TEXT_OFF)
                 pygame.draw.rect(surface, fill, (sq_x, sq_y, sq_size, sq_size), border_radius=6)
                 if is_navved:
-                    pygame.draw.rect(surface, (255, 255, 255), (sq_x, sq_y, sq_size, sq_size), 2, border_radius=6)
+                    pygame.draw.rect(surface, _gov.COLOR_TEXT_WHITE, (sq_x, sq_y, sq_size, sq_size), 2, border_radius=6)
                 num_surf = f_opt.render(str(p), True, txt_col)
                 surface.blit(num_surf, (sq_x + sq_size // 2 - num_surf.get_width() // 2,
                                          sq_y + sq_size // 2 - num_surf.get_height() // 2))
@@ -7470,8 +7405,8 @@ class ExternalGameDeck:
             nav_player     = getattr(self, "_ctrl_map_player_sel", active_player)
             pick_target    = nav_player if is_focused_row else active_player
             pick_pickable  = self._player_slot_pickable(pick_target)
-        pick_col = (90, 90, 95) if not pick_pickable else (ui_color if pick_is_navved else (200, 200, 210))
-        pygame.draw.rect(surface, (45, 45, 55), pick_rect, border_radius=6)
+        pick_col = _gov.COLOR_GAME_PLAYER_TEXT_OFF if not pick_pickable else (ui_color if pick_is_navved else _gov.COLOR_GAME_PLAYER_TEXT_CONNECTED)
+        pygame.draw.rect(surface, _gov.COLOR_GAME_PICK_BUTTON, pick_rect, border_radius=6)
         pygame.draw.rect(surface, pick_col, pick_rect, SELECTION_BORDER_WIDTH, border_radius=6)
         pick_lbl = f_small.render("PICK CONTROLLER", True, pick_col)
         surface.blit(pick_lbl, (pick_rect.centerx - pick_lbl.get_width() // 2,
@@ -7479,20 +7414,19 @@ class ExternalGameDeck:
 
         cursor = getattr(self, "_ctrl_map_cursor", 0)
 
-        # VALUES CHANGE HERE
-        opt_gap    = 40
-        gap_top    = wireframe_bottom + 14
+        opt_gap    = _gov.GAME_MAP_OPTION_GAP_PX
+        gap_top    = wireframe_bottom + _gov.GAME_MAP_OPTIONS_TOP_GAP_PX
         if console == "NES":
-            gap_top -= int(h * 0.04)
+            gap_top -= int(h * _gov.GAME_MAP_NES_OPTIONS_LIFT_FRAC)
         if console == "N64":
             opt_y = gap_top
         else:
-            opt_y = gap_top + 20
+            opt_y = gap_top + _gov.GAME_MAP_OPTIONS_DROP_PX
         center_x   = x + w // 2
 
         def _draw_option(idx, label, y_pos, extra_right=None, warn=False):
             is_sel = (cursor == idx)
-            col    = (255, 90, 90) if warn else (ui_color if is_sel else (180, 180, 180))
+            col    = _gov.COLOR_GAME_WARNING_TEXT if warn else (ui_color if is_sel else _gov.COLOR_GAME_LABEL_GREY)
             lbl    = f_opt.render(label, True, col)
             lx     = center_x - lbl.get_width() // 2
             if extra_right:
@@ -7519,24 +7453,23 @@ class ExternalGameDeck:
             map_label = f"MAPPING  —  press button for: {active_btn}"
         else:
             map_label = "[ MAP CONTROLLER ]"
-        r0 = _draw_option(1, map_label, opt_y, warn=_reject_active)
+        _draw_option(1, map_label, opt_y, warn=_reject_active)
 
         is_n64 = (console == "N64")
         if not is_n64:
             sad      = self.ctrl_mapping.get("stick_as_dpad", False)
-            sw_bg    = (40, 167, 69) if sad else (45, 65, 100)
+            sw_bg    = _gov.COLOR_GAME_SWITCH_ON if sad else _gov.COLOR_GAME_SWITCH_OFF
             sw_w, sw_h = 55, 24
             sw_surf  = pygame.Surface((sw_w, sw_h), pygame.SRCALPHA)
             pygame.draw.rect(sw_surf, sw_bg, (0, 0, sw_w, sw_h), border_radius=12)
             handle_x = sw_w - 14 if sad else 14
-            pygame.draw.circle(sw_surf, (255, 255, 255), (handle_x, sw_h // 2), 9)
-            r1 = _draw_option(2, "L-STICK AS D-PAD", opt_y + opt_gap, sw_surf)
+            pygame.draw.circle(sw_surf, _gov.COLOR_TEXT_WHITE, (handle_x, sw_h // 2), 9)
+            _draw_option(2, "L-STICK AS D-PAD", opt_y + opt_gap, sw_surf)
             close_idx = 3
         else:
-            r1 = None
             close_idx = 2
 
-        OFF_RED = (220, 53, 69)
+        OFF_RED = _gov.COLOR_GAME_OFF_RED
         close_w, close_h = 110, 40
         close_x = x + w - close_w - 25
         close_y = y + h - 52
@@ -7544,14 +7477,13 @@ class ExternalGameDeck:
         pygame.draw.rect(surface, OFF_RED, (close_x, close_y, close_w, close_h), border_radius=4)
         if is_close_sel:
             pygame.draw.rect(surface, ui_color, (close_x, close_y, close_w, close_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        lbl_close = f_opt.render("Close", True, (255, 255, 255))
+        lbl_close = f_opt.render("Close", True, _gov.COLOR_TEXT_WHITE)
         surface.blit(lbl_close, (close_x + close_w // 2 - lbl_close.get_width() // 2,
                                   close_y + close_h // 2 - lbl_close.get_height() // 2))
-        r2 = pygame.Rect(close_x, close_y, close_w, close_h)
 
         if seq_running and active_btn:
             ctrl_bottom = y + h - 6
-            hint_lbl = f_small.render("BACKSPACE to skip button   ESC to cancel remap", True, (120, 120, 60))
+            hint_lbl = f_small.render("BACKSPACE to skip button   ESC to cancel remap", True, _gov.COLOR_GAME_REMAP_HINT)
             surface.blit(hint_lbl, (center_x - hint_lbl.get_width() // 2, ctrl_bottom - 14))
 
         if _target_w > 0 and _target_h > 0:
@@ -7676,7 +7608,7 @@ class ExternalGameDeck:
         if pressed_bit is None:
             return
 
-        REMAP_CAPTURE_COOLDOWN = 0.30
+        REMAP_CAPTURE_COOLDOWN = _gov.GAME_REMAP_CAPTURE_COOLDOWN_SECONDS
         now = time.monotonic()
         if now - getattr(self, "_remap_last_capture_ts", 0.0) < REMAP_CAPTURE_COOLDOWN:
             return
@@ -7767,7 +7699,8 @@ class ExternalGameDeck:
                 ratio = target_h / raw.get_height()
                 surf  = pygame.transform.smoothscale(
                     raw, (int(raw.get_width() * ratio), int(target_h)))
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("ExternalGameDeck._get_logo: ratio = target_h / raw.get_height()", _swallowed_error)
                 surf = None
         cache[target_h] = surf
         return surf
@@ -7806,7 +7739,8 @@ class ExternalGameDeck:
                     scaled_w = max(1, int(round(raw_w * ratio)))
                     scaled_h = max(1, int(round(raw_h * ratio)))
                     surf = pygame.transform.smoothscale(raw, (scaled_w, scaled_h))
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("ExternalGameDeck._get_boxed_logo: raw_w, raw_h = (raw.get_width(), raw.get_height())", _swallowed_error)
                 surf = None
 
         cache[key] = surf
@@ -7818,16 +7752,15 @@ class ExternalGameDeck:
     def _draw_legend(self, screen, cx, y, h, groups):
         f     = self._font_small
         col_w = 130
-        # VALUES CHANGE HERE
-        row_h = 20
+        row_h = _gov.GAME_LEGEND_ROW_H_PX
         total_w = col_w * len(groups)
         block_x = cx - total_w // 2
-        y_title = y + h - 3 * row_h - 8
+        y_title = y + h - 3 * row_h - _gov.GAME_LEGEND_BOTTOM_PAD_PX
         y_ctrl  = y_title + row_h
         y_kb    = y_ctrl  + row_h
         tc = self.list_text_color
         title_col = tc
-        key_col   = (max(0, tc[0] - 60), max(0, tc[1] - 60), max(0, tc[2] - 60))
+        key_col   = tuple(max(0, c - _gov.GAME_LEGEND_KEY_DARKEN) for c in tc[:3])
         for i, (action, ctrl_key, kb_key) in enumerate(groups):
             col_cx = block_x + i * col_w + col_w // 2
             for text, color, row_y in [
@@ -7853,7 +7786,8 @@ class ExternalGameDeck:
             try:
                 scaled_bg = _scale_to_canvas(bg_surf, w, h)
                 screen.blit(scaled_bg, (x, y))
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("ExternalGameDeck.render: scaled_bg = _scale_to_canvas(bg_surf, w, h)", _swallowed_error)
                 screen.fill((0, 0, 0), rect)
         else:
             screen.fill((0, 0, 0), rect)
@@ -7893,13 +7827,13 @@ class ExternalGameDeck:
                                         logo_centre_y - lbl_c.get_height() // 2))
 
                 if not custom_splash_shown:
-                    lbl_m = self._font_mid.render(msg, True, (150, 150, 150))
+                    lbl_m = self._font_mid.render(msg, True, _gov.COLOR_GAME_LOADING_TEXT)
                     screen.blit(lbl_m, (cx - lbl_m.get_width() // 2, y + h // 2 - 30))
 
                 display_pct = pct
                 bw = int(w * 0.5); bh = 10
                 bx = cx - bw // 2;  by = y + h // 2 + 12
-                pygame.draw.rect(screen, (22, 22, 22), (bx, by, bw, bh), border_radius=5)
+                pygame.draw.rect(screen, _gov.COLOR_GAME_LOADING_BAR_TRACK, (bx, by, bw, bh), border_radius=5)
                 filled = int(bw * display_pct / 100)
                 if filled > 0:
                     pygame.draw.rect(screen, self.ui_color,
@@ -7907,7 +7841,7 @@ class ExternalGameDeck:
                     pygame.draw.circle(screen, self.ui_color,
                                        (bx + filled, by + bh // 2), bh)
 
-                lbl_p = self._font_small.render(f"{display_pct}%", True, (80, 80, 80))
+                lbl_p = self._font_small.render(f"{display_pct}%", True, _gov.COLOR_GAME_LOADING_PERCENT)
                 screen.blit(lbl_p, (cx - lbl_p.get_width() // 2, by + bh + 10))
 
             else:
@@ -7966,23 +7900,23 @@ class ExternalGameDeck:
         if n == 0: return
 
         if n == 1:
-            slots = [(0, cy, int(h * 0.38), (255, 255, 255))]
+            slots = [(0, cy, int(h * 0.38), _gov.COLOR_TEXT_WHITE)]
         elif n == 2:
             if self.console_index == 0:
                 slots = [
-                    (0, cy,                 int(h * 0.38), (255, 255, 255)),
-                    (1, cy + int(h * 0.22), int(h * 0.22), (255, 255, 255)),
+                    (0, cy,                 int(h * 0.38), _gov.COLOR_TEXT_WHITE),
+                    (1, cy + int(h * 0.22), int(h * 0.22), _gov.COLOR_TEXT_WHITE),
                 ]
             else:
                 slots = [
-                    (-1, cy - int(h * 0.22), int(h * 0.22), (255, 255, 255)),
-                    (0,  cy,                 int(h * 0.38), (255, 255, 255)),
+                    (-1, cy - int(h * 0.22), int(h * 0.22), _gov.COLOR_TEXT_WHITE),
+                    (0,  cy,                 int(h * 0.38), _gov.COLOR_TEXT_WHITE),
                 ]
         else:
             slots = [
-                (-1, cy - int(h * 0.22), int(h * 0.22), (255, 255, 255)),
-                (0,  cy,                 int(h * 0.38), (255, 255, 255)),
-                (1,  cy + int(h * 0.22), int(h * 0.22), (255, 255, 255)),
+                (-1, cy - int(h * 0.22), int(h * 0.22), _gov.COLOR_TEXT_WHITE),
+                (0,  cy,                 int(h * 0.38), _gov.COLOR_TEXT_WHITE),
+                (1,  cy + int(h * 0.22), int(h * 0.22), _gov.COLOR_TEXT_WHITE),
             ]
 
         for offset, slot_y, logo_h, color in slots:
@@ -8002,15 +7936,14 @@ class ExternalGameDeck:
             ("Back",     "B",   "ESC"),
         ])
 
-    # VALUES CHANGE HERE
-    _NAV_ARROW_SIZE = 15
+    _NAV_ARROW_SIZE = _gov.GAME_NAV_ARROW_SIZE_PX
 
     def _draw_console_switch_arrow(self, screen, direction, cx, cy, can_switch, flashed):
         """Draw a filled triangle pointing `direction` ('left'/'right'/'up'/'down') instead of a font glyph."""
         if flashed:
             color = self.ui_color
         elif not can_switch:
-            color = (90, 90, 90)
+            color = _gov.COLOR_GAME_ARROW_DISABLED
         else:
             color = self.list_text_color
 
@@ -8053,8 +7986,7 @@ class ExternalGameDeck:
         if not flash_active:
             self._console_arrow_flash_dir = None
 
-        # VALUES CHANGE HERE
-        ARROW_PAD = 46
+        ARROW_PAD = _gov.GAME_CONSOLE_ARROW_PAD_PX
         if orientation == "side":
             arrow_gap = logo_w // 2 + ARROW_PAD
             self._draw_console_switch_arrow(
@@ -8099,9 +8031,9 @@ class ExternalGameDeck:
             self._romlist_error_msg = ""
             return
         try:
-            FADE_MS = 500
+            FADE_MS = _gov.GAME_MESSAGE_FADE_MS
             alpha = 255 if remaining > FADE_MS else int(255 * remaining / FADE_MS)
-            lbl = self._font_mid.render(self._romlist_error_msg, True, (255, 90, 90))
+            lbl = self._font_mid.render(self._romlist_error_msg, True, _gov.COLOR_GAME_WARNING_TEXT)
             lbl.set_alpha(alpha)
             screen.blit(lbl, (cx - lbl.get_width() // 2, top_y + 6))
         except Exception as _swallowed_error:
@@ -8117,8 +8049,7 @@ class ExternalGameDeck:
         block_x = cx - total_w // 2
         back_col_cx = block_x + back_i * col_w + col_w // 2 if groups else cx
 
-        # VALUES CHANGE HERE
-        PUSH_PAST_BACK = 140
+        PUSH_PAST_BACK = _gov.GAME_ROMLIST_ARROW_PAST_BACK_PX
 
         arrow_col_x = back_col_cx + PUSH_PAST_BACK
 
@@ -8126,10 +8057,9 @@ class ExternalGameDeck:
         arrow_col_x = min(arrow_col_x, x + w - _arrow_right_margin)
 
         list_area_top    = y + list_top_offset
-        # VALUES CHANGE HERE
-        list_area_bottom = y + h - 90
+        list_area_bottom = y + h - _gov.GAME_ROMLIST_BOTTOM_SPACE_PX
         list_area_mid    = (list_area_top + list_area_bottom) // 2
-        arrow_gap = 46
+        arrow_gap = _gov.GAME_ROMLIST_ARROW_GAP_PX
         arrow_up_y   = list_area_mid - arrow_gap
         arrow_down_y = list_area_mid + arrow_gap
 
@@ -8145,15 +8075,11 @@ class ExternalGameDeck:
         cx = x + w // 2
         console = self.active_console or ""
 
-        _BTN_INSET_BOX_W = 226
-        _BTN_INSET_BOX_H = 72
-        # VALUES CHANGE HERE
-        _HEADER_TALLER   = 1.35
-        _scale  = w / 1036.0
-        box_w   = _BTN_INSET_BOX_W * _scale
-        box_h   = _BTN_INSET_BOX_H * _scale * _HEADER_TALLER
+        _scale  = w / float(_gov.MENU_CANVAS_W)
+        box_w   = _gov.GAME_ROMLIST_LOGO_BOX_W_PX * _scale
+        box_h   = _gov.GAME_ROMLIST_LOGO_BOX_H_PX * _scale * _gov.GAME_ROMLIST_LOGO_HEADER_TALLER
         box_x   = cx - box_w / 2
-        box_y   = y + 20
+        box_y   = y + _gov.GAME_ROMLIST_LOGO_TOP_PX
         logo_header = self._get_boxed_logo(console, box_w, box_h)
 
         if logo_header is not None:
@@ -8186,7 +8112,7 @@ class ExternalGameDeck:
 
         if not self.roms:
             if not self._scan_pending:
-                msg = self._font_mid.render(self.status_msg or "No files found.", True, (200, 80, 80))
+                msg = self._font_mid.render(self.status_msg or "No files found.", True, _gov.COLOR_GAME_NO_FILES_TEXT)
                 screen.blit(msg, (cx - msg.get_width() // 2, y + h // 2 - 12))
             self._draw_romlist_console_arrows(screen, x, y, w, h, list_top_offset, groups=_romlist_groups)
             self._draw_legend(screen, cx, y, h, _romlist_groups)
@@ -8208,7 +8134,7 @@ class ExternalGameDeck:
             display_name, full_path = self.roms[i]
             selected     = (i == self.rom_index) and self.romlist_focus == "list"
             if display_name.startswith("[MISSING] ") or display_name.startswith("[OFFLINE] "):
-                color = (255, 150, 90) if selected else (200, 100, 60)
+                color = _gov.COLOR_GAME_MISSING_ROM_SELECTED if selected else _gov.COLOR_GAME_MISSING_ROM
             else:
                 color        = self.ui_color if selected else self.list_text_color
             display_str  = f"> {display_name} <" if selected else display_name
@@ -8243,7 +8169,7 @@ class ExternalGameDeck:
         by = y + (h - box_h) // 2
 
         dim = pygame.Surface((w, h), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 90))
+        dim.fill(_gov.COLOR_GAME_BUSY_DIM)
         screen.blit(dim, (x, y))
 
         pygame.draw.rect(screen, panel_c, (bx, by, box_w, box_h))
@@ -8281,7 +8207,7 @@ class ExternalGameDeck:
         return self.DVD_LOAD_SCREEN_MS
 
     def _get_dvd_custom_splash_surface(self):
-        path = self.dvd_splash_path
+        path = self._get_console_splash_path("DVD")
         if not path or self._dvd_path_is_video(path):
             self._dvd_custom_splash_surf = None
             self._dvd_custom_splash_surf_path = None
@@ -8305,9 +8231,9 @@ class ExternalGameDeck:
         return bool(self.console_splash_enabled.get(console_key, False))
 
     def _get_console_splash_path(self, console_key):
-        if console_key == "DVD":
-            return self.dvd_splash_path
-        return self.console_splash_path.get(console_key, "") or ""
+        """Returns the splash file for a console: the picked one when it is on disk, else <CONSOLE>SplashScreen.png from its folder, else ''."""
+        picked = self.dvd_splash_path if console_key == "DVD" else (self.console_splash_path.get(console_key, "") or "")
+        return console_splash_file(console_key, picked)
 
     def _get_console_custom_splash_surface(self, console_key):
         path = self._get_console_splash_path(console_key)
@@ -8393,14 +8319,14 @@ class ExternalGameDeck:
             screen.blit(lbl_c, (cx - lbl_c.get_width() // 2,
                                 logo_centre_y - lbl_c.get_height() // 2))
 
-        lbl_m = self._font_mid.render(msg, True, (150, 150, 150))
+        lbl_m = self._font_mid.render(msg, True, _gov.COLOR_GAME_LOADING_TEXT)
         screen.blit(lbl_m, (cx - lbl_m.get_width() // 2, y + h // 2 - 30))
 
         import math as _math
         display_pct = int(_math.sqrt(pct / 100.0) * 100) if pct < 100 else 100
         bw = int(w * 0.5); bh = 10
         bx = cx - bw // 2;  by = y + h // 2 + 12
-        pygame.draw.rect(screen, (22, 22, 22), (bx, by, bw, bh), border_radius=5)
+        pygame.draw.rect(screen, _gov.COLOR_GAME_LOADING_BAR_TRACK, (bx, by, bw, bh), border_radius=5)
         filled = int(bw * display_pct / 100)
         if filled > 0:
             pygame.draw.rect(screen, self.ui_color,
@@ -8408,7 +8334,7 @@ class ExternalGameDeck:
             pygame.draw.circle(screen, self.ui_color,
                                (bx + filled, by + bh // 2), bh)
 
-        lbl_p = self._font_small.render(f"{display_pct}%", True, (80, 80, 80))
+        lbl_p = self._font_small.render(f"{display_pct}%", True, _gov.COLOR_GAME_LOADING_PERCENT)
         screen.blit(lbl_p, (cx - lbl_p.get_width() // 2, by + bh + 10))
 
     def _render_dvd_splash_video_frame(self, screen, rect):
@@ -8479,7 +8405,7 @@ class ExternalGameDeck:
             return surf
 
     def _dvd_fit_aspect(self, surf):
-        """Return the standard shape (4:3 / 16:9 / 9:16) Normal mode lays this DVD picture out as."""
+        """Return the standard shape (PICTURE_STANDARD_ASPECTS) Normal mode lays this DVD picture out as."""
         # WARNING: must match _snap_standard_aspect in retro_tv_emulator.py so a disc gets the same bars as a TV station of that shape.
         try:
             main = sys.modules.get("__main__")
@@ -8657,11 +8583,13 @@ class ExternalGameDeck:
                         self._dvd_iso_watchdog_armed = False
                         try:
                             _vlc_err = vlc.get_last_error()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("ExternalGameDeck._render_dvd_player: _vlc_err = vlc.get_last_error()", _swallowed_error)
                             _vlc_err = ""
                         try:
                             _vlc_log_tail = vlc.get_recent_vlc_log()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("ExternalGameDeck._render_dvd_player: _vlc_log_tail = vlc.get_recent_vlc_log()", _swallowed_error)
                             _vlc_log_tail = ""
                         log.warning(f"[DVD DEBUG] disc-open watchdog FAILED (source={self.dvd_file_path!r}): "
                               f"{_fail_reason} -- libVLC error: {_vlc_err or '(none reported -- check vlc-debug.log tail below, libvlc_errmsg() is unreliable across threads)'} "
@@ -8677,7 +8605,6 @@ class ExternalGameDeck:
                         self.dvd_splash_done = False
                         self.dvd_paused_frame = None
                         self.dvd_in_menu = False
-                        self._close_dvd_highlight_shadow()
                         self.mode = "ROMLIST"
                         if not _gd_is_drive_responsive(self.dvd_file_path):
                             self.note_drive_launch_failure(self.dvd_file_path)
@@ -8698,7 +8625,8 @@ class ExternalGameDeck:
             else:
                 try:
                     candidate_in_menu = vlc.is_menu_active()
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("ExternalGameDeck._render_dvd_player: candidate_in_menu = vlc.is_menu_active()", _swallowed_error)
                     candidate_in_menu = self.dvd_in_menu
                 if candidate_in_menu != self._dvd_menu_flip_candidate:
                     self._dvd_menu_flip_candidate = candidate_in_menu
@@ -8726,7 +8654,8 @@ class ExternalGameDeck:
                     if now - self._dvd_end_state_since >= self.DVD_END_STATE_GRACE_MS:
                         try:
                             _title_at_bail = getattr(vlc, "_current_title", "?")
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("ExternalGameDeck._render_dvd_player: _title_at_bail = getattr(vlc, '_current_title', '?')", _swallowed_error)
                             _title_at_bail = "?"
                         log.warning(f"[DVD DEBUG] END-STATE WATCHDOG FIRED: state={state} "
                               f"title={_title_at_bail} grace_elapsed_ms={now - self._dvd_end_state_since} "
@@ -8741,7 +8670,6 @@ class ExternalGameDeck:
                         self.dvd_splash_done     = False
                         self.dvd_paused_frame    = None
                         self.dvd_in_menu         = False
-                        self._close_dvd_highlight_shadow()
                         if self.dvd_resume_enabled and self.dvd_file_path:
                             self._dvd_clear_resume_position(self.dvd_file_path)
                         self.mode = "ROMLIST"
@@ -8821,14 +8749,6 @@ class ExternalGameDeck:
                     _safe_rect = pygame.Rect(x, y, w, h).clip(screen.get_rect())
                     if _safe_rect.width > 0 and _safe_rect.height > 0:
                         self.dvd_paused_frame = screen.subsurface(_safe_rect).copy()
-                    if all(k in _dvd_blit_geom for k in ("dest_x", "dest_y", "draw_w", "draw_h")):
-                        self._dvd_last_fit_geom = (
-                            surf.get_width(), surf.get_height(),
-                            _dvd_blit_geom["dest_x"], _dvd_blit_geom["dest_y"],
-                            _dvd_blit_geom["draw_w"], _dvd_blit_geom["draw_h"])
-                    else:
-                        self._dvd_last_fit_geom = (surf.get_width(), surf.get_height(),
-                                                    *_contain_fit_rect(surf.get_width(), surf.get_height(), (x, y, w, h)))
                     frame_drawn = True
             except Exception as e:
                 _log_warn_throttled("dvd_frame_blit", "DVD frame grab/blit failed this frame: %s", e)
@@ -8837,18 +8757,6 @@ class ExternalGameDeck:
             frame_drawn = True
         if not frame_drawn:
             screen.fill((0, 0, 0), rect)
-
-        if (frame_drawn and self._dvd_menu_is_up() and vlc is not None
-                and self._dvd_highlight_shadow is not None
-                and self._dvd_highlight_shadow.is_open):
-            try:
-                _fit_geom = getattr(self, "_dvd_last_fit_geom", None) or (vlc.width, vlc.height, x, y, w, h)
-                _hl_rect = self._dvd_highlight_shadow.get_highlight_rect_px(*_fit_geom)
-                if _hl_rect:
-                    pygame.draw.rect(screen, (255, 220, 0), _hl_rect, 3, border_radius=3)
-            except Exception as _hl_draw_e:
-                _log_warn_throttled("dvd_highlight_draw",
-                                     "DVD highlight overlay draw failed: %s", _hl_draw_e)
 
         if not self.dvd_exit_confirm and not self.dvd_return_menu_confirm:
             _main_mod = sys.modules.get("__main__")
@@ -8868,8 +8776,9 @@ class ExternalGameDeck:
                     else 140)
             _r, _g, _b = _cs.hsv_to_rgb(_hue / 360.0, 0.90, 1.00)
             ui_col = (int(_r * 255), int(_g * 255), int(_b * 255))
-        except Exception:
-            ui_col = getattr(self, 'ui_color', (0, 255, 128))
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._render_dvd_player: import colorsys as _cs, sys as _sys2", _swallowed_error)
+            ui_col = getattr(self, 'ui_color', _gov.DEFAULT_THEME["ui"])
 
         if self.dvd_osd_msg and now < self.dvd_osd_until:
             icon_key = self._DVD_OSD_ICON_MAP.get(self.dvd_osd_msg)
@@ -8909,15 +8818,15 @@ class ExternalGameDeck:
             f_btn   = _cached_font("Courier New", 17, bold=True)
             f_hint2 = _cached_font("Courier New", 17, bold=True)
 
-            lbl_q = f_title.render("EXIT DVD PLAYER?", True, (255, 220, 0))
+            lbl_q = f_title.render("EXIT DVD PLAYER?", True, _gov.COLOR_ARCADE_GOLD)
             screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
 
             box_radius      = 4
             focus_thickness = SELECTION_BORDER_WIDTH
             btn_w, btn_h    = 110, 36
             btn_y           = box_y + 85
-            OFF_RED         = (220, 53, 69)
-            NEUTRAL_BTN     = (45, 80, 130)
+            OFF_RED         = _gov.COLOR_GAME_OFF_RED
+            NEUTRAL_BTN     = _gov.COLOR_GAME_NEUTRAL_BUTTON
 
             yes_btn_x = cx - 100 - btn_w // 2
             no_btn_x  = cx + 100 - btn_w // 2
@@ -8925,16 +8834,16 @@ class ExternalGameDeck:
             pygame.draw.rect(screen, OFF_RED, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_exit_selection == "Yes":
                 pygame.draw.rect(screen, accent_col, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_yes = f_btn.render("YES", True, (255, 255, 255))
+            lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
 
             pygame.draw.rect(screen, NEUTRAL_BTN, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_exit_selection == "No":
                 pygame.draw.rect(screen, accent_col, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_no = f_btn.render("NO", True, (255, 255, 255))
+            lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
 
-            lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, (160, 160, 160))
+            lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, _gov.COLOR_GAME_POPUP_HINT)
             screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
 
         if self.dvd_return_menu_confirm:
@@ -8966,15 +8875,15 @@ class ExternalGameDeck:
             f_btn   = _cached_font("Courier New", 17, bold=True)
             f_hint2 = _cached_font("Courier New", 17, bold=True)
 
-            lbl_q = f_title.render("RETURN TO MAIN MENU?", True, (255, 220, 0))
+            lbl_q = f_title.render("RETURN TO MAIN MENU?", True, _gov.COLOR_ARCADE_GOLD)
             screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
 
             box_radius      = 4
             focus_thickness = SELECTION_BORDER_WIDTH
             btn_w, btn_h    = 110, 36
             btn_y           = box_y + 85
-            CONFIRM_BLUE    = (45, 110, 200)
-            NEUTRAL_BTN     = (45, 80, 130)
+            CONFIRM_BLUE    = _gov.COLOR_GAME_CONFIRM_BLUE
+            NEUTRAL_BTN     = _gov.COLOR_GAME_NEUTRAL_BUTTON
 
             yes_btn_x = cx - 100 - btn_w // 2
             no_btn_x  = cx + 100 - btn_w // 2
@@ -8982,16 +8891,16 @@ class ExternalGameDeck:
             pygame.draw.rect(screen, CONFIRM_BLUE, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_return_menu_selection == "Yes":
                 pygame.draw.rect(screen, accent_col, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_yes = f_btn.render("YES", True, (255, 255, 255))
+            lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
 
             pygame.draw.rect(screen, NEUTRAL_BTN, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_return_menu_selection == "No":
                 pygame.draw.rect(screen, accent_col, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_no = f_btn.render("NO", True, (255, 255, 255))
+            lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
 
-            lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, (160, 160, 160))
+            lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, _gov.COLOR_GAME_POPUP_HINT)
             screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
 
     # ========================================================================
@@ -9109,10 +9018,9 @@ class ExternalGameDeck:
         except Exception as e:
             log.warning(f"[GAMEDECK MAPPING] Gamepad-map save failed for {console} player {player}: {e}")
 
-    _MAX_ARCHIVE_ENTRIES = 20000
-    # VALUES CHANGE HERE
-    _MAX_EXTRACT_ENTRY_BYTES = 8 * 1024 ** 3
-    _MAX_ARCHIVE_COMPRESSION_RATIO = 300
+    _MAX_ARCHIVE_ENTRIES = _gov.GAME_ARCHIVE_MAX_ENTRIES
+    _MAX_EXTRACT_ENTRY_BYTES = _gov.GAME_ARCHIVE_MAX_ENTRY_BYTES
+    _MAX_ARCHIVE_COMPRESSION_RATIO = _gov.GAME_ARCHIVE_MAX_COMPRESSION_RATIO
 
     # ========================================================================
     # SECTION: Libretro: ROM archive extraction
@@ -9421,8 +9329,7 @@ class ExternalGameDeck:
 
     def _reap_abandoned_libretro_launch(self, abandoned_req_id):
         """Reap a core.load_rom() result that arrives after its loading screen already gave up; that background call cannot be cancelled."""
-        # VALUES CHANGE HERE
-        deadline = time.time() + 600
+        deadline = time.time() + _gov.GAME_LATE_CORE_LOAD_WAIT_SECONDS
         while time.time() < deadline:
             with self._libretro_launch_lock:
                 result = self._libretro_launch_result
@@ -9436,7 +9343,7 @@ class ExternalGameDeck:
                           f"timed-out launch (req_id={abandoned_req_id}) that "
                           f"finished after all -- unloaded it.")
                 return
-            time.sleep(1.0)
+            time.sleep(_gov.GAME_LATE_CORE_LOAD_POLL_SECONDS)
 
     def _poll_libretro_launch(self):
         if not self._libretro_launch_pending:
@@ -9861,7 +9768,8 @@ class ExternalGameDeck:
             _core_fps = float(core.fps)
             if not (40.0 <= _core_fps <= 120.0):
                 _core_fps = 60.0
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("ExternalGameDeck._render_libretro_impl: _core_fps = float(core.fps)", _swallowed_error)
             _core_fps = 60.0
         _frame_dur = 1.0 / _core_fps
         if self._libretro_last_run_wall is None:
@@ -10015,15 +9923,15 @@ class ExternalGameDeck:
         f_btn   = _cached_font("Courier New", 17, bold=True)
         f_hint2 = _cached_font("Courier New", 17, bold=True)
 
-        lbl_q = f_title.render("EXIT GAME?", True, (255, 220, 0))
+        lbl_q = f_title.render("EXIT GAME?", True, _gov.COLOR_ARCADE_GOLD)
         screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
 
         box_radius      = 4
         focus_thickness = SELECTION_BORDER_WIDTH
         btn_w, btn_h    = 110, 36
         btn_y           = box_y + 85
-        OFF_RED         = (220, 53, 69)
-        NEUTRAL_BTN     = (45, 80, 130)
+        OFF_RED         = _gov.COLOR_GAME_OFF_RED
+        NEUTRAL_BTN     = _gov.COLOR_GAME_NEUTRAL_BUTTON
 
         yes_btn_x = cx - 100 - btn_w // 2
         no_btn_x  = cx + 100 - btn_w // 2
@@ -10031,16 +9939,16 @@ class ExternalGameDeck:
         pygame.draw.rect(screen, OFF_RED, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
         if self.game_exit_selection == "Yes":
             pygame.draw.rect(screen, accent_col, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-        lbl_yes = f_btn.render("YES", True, (255, 255, 255))
+        lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
         screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
 
         pygame.draw.rect(screen, NEUTRAL_BTN, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
         if self.game_exit_selection == "No":
             pygame.draw.rect(screen, accent_col, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-        lbl_no = f_btn.render("NO", True, (255, 255, 255))
+        lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
         screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
 
-        lbl_h = f_hint2.render("\u2190/\u2192 OR A/D  SELECT     A  CONFIRM     B  CANCEL", True, (160, 160, 160))
+        lbl_h = f_hint2.render("\u2190/\u2192 OR A/D  SELECT     A  CONFIRM     B  CANCEL", True, _gov.COLOR_GAME_POPUP_HINT)
         screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
 
     # ========================================================================
@@ -10231,12 +10139,12 @@ def _libretro_blit_scaled(screen, surf, dest_rect, mode=None, console=None):
 
 def _libretro_draw_osd(screen, dest_rect, msg, ms_remaining, ms_total):
     try:
-        FADE_MS  = 500
+        FADE_MS  = _gov.GAME_MESSAGE_FADE_MS
         alpha    = 255 if ms_remaining > FADE_MS else int(255 * ms_remaining / FADE_MS)
         alpha    = max(0, min(255, alpha))
         font_size = max(14, dest_rect[3] // 20)
         font      = _cached_font("consolas", font_size, bold=True)
-        text_surf = font.render(msg, True, (255, 255, 180))
+        text_surf = font.render(msg, True, _gov.COLOR_GAME_OSD_TEXT)
         tw, th    = text_surf.get_size()
         pad_x, pad_y = 18, 8
         pill_w = tw + pad_x * 2; pill_h = th + pad_y * 2
@@ -10260,7 +10168,7 @@ def _libretro_draw_disconnect_banner(screen, dest_rect, player_num):
         label = f"PLAYER {player_num}'S CONTROLLER DISCONNECTED — RECONNECT TO RESUME"
         font_size = max(16, dest_rect[3] // 22)
         font      = _cached_font("Arial", font_size, bold=True)
-        text_surf = font.render(label, True, (255, 255, 255))
+        text_surf = font.render(label, True, _gov.COLOR_TEXT_WHITE)
         tw, th    = text_surf.get_size()
         pad_x, pad_y = 20, 12
         bar_w = min(tw + pad_x * 2, dest_rect[2] - 20)
@@ -10268,8 +10176,8 @@ def _libretro_draw_disconnect_banner(screen, dest_rect, player_num):
         bar_x = dest_rect[0] + (dest_rect[2] - bar_w) // 2
         bar_y = dest_rect[1] + (dest_rect[3] - bar_h) // 2
         bar = pygame.Surface((bar_w, bar_h), pygame.SRCALPHA)
-        bar.fill((120, 20, 20, 225))
-        pygame.draw.rect(bar, (255, 90, 90, 255), bar.get_rect(), width=3)
+        bar.fill(_gov.COLOR_GAME_DISCONNECT_FILL)
+        pygame.draw.rect(bar, _gov.COLOR_BANNER_EDGE, bar.get_rect(), width=3)
         bar.blit(text_surf, (pad_x, pad_y))
         screen.blit(bar, (bar_x, bar_y))
     except Exception as e:

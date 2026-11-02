@@ -22,6 +22,18 @@ if sys.platform != "win32":
 
 log = logging.getLogger(__name__)
 
+
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+try:
+    from performance_governor import log_swallowed as _log_swallowed
+except Exception:
+    def _log_swallowed(where, error):
+        """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
+        return None
+
+
 # ============================================================================
 # SECTION: ctypes bindings & constants
 # ============================================================================
@@ -182,7 +194,8 @@ def release(ptr) -> None:
     try:
         if ptr is not None and (ptr.value if isinstance(ptr, VOIDP) else ptr):
             call(ptr, RELEASE, ctypes.c_ulong, [])
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("release: if ptr is not None and (ptr.value if isinstance(ptr, VOIDP) else ptr):", _swallowed_error)
         pass
 
 
@@ -331,7 +344,6 @@ class GPUCore:
         self._rtv = VOIDP()
         self._staging = VOIDP()
         self._staging_size = None
-        self._listeners = []
         self.info = {}
         try:
             self._create(adapter_policy)
@@ -339,7 +351,9 @@ class GPUCore:
             self.close()
             raise
 
-    # -- setup ---------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Setup
+    # ========================================================================
     def _create(self, policy):
         dxgi = ctypes.WinDLL("dxgi")
         dxgi.CreateDXGIFactory1.argtypes = [ctypes.POINTER(GUID), ctypes.POINTER(VOIDP)]
@@ -392,7 +406,9 @@ class GPUCore:
         checked_call("CreateRenderTargetView(back buffer)", self._device, DEV_CreateRenderTargetView,
                      [VOIDP, VOIDP, ctypes.POINTER(VOIDP)], self._backbuffer, None, ctypes.byref(self._rtv))
 
-    # -- properties ------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Properties
+    # ========================================================================
     @property
     def device(self):
         return self._device
@@ -405,21 +421,15 @@ class GPUCore:
     def size(self):
         return self._width, self._height
 
-    @property
-    def back_buffer_rtv(self):
-        return self._rtv
-
     def describe(self) -> str:
         i = self.info
         return ("adapter=%s dedicated=%dMB feature_level=%s chosen_because=%s monitor_matched=%s all=[%s]" % (
             i.get("adapter"), i.get("dedicated_mb", 0), i.get("feature_level"), i.get("chosen_because"),
             i.get("monitor_matched"), "; ".join(i.get("adapters", []))))
 
-    # -- resize ------------------------------------------------------------------
-    def add_resize_listener(self, on_release, on_recreate) -> None:
-        """Registers callbacks: on_release() before the buffers are resized, on_recreate(width, height) after."""
-        self._listeners.append((on_release, on_recreate))
-
+    # ========================================================================
+    # SECTION: Resize
+    # ========================================================================
     def _unbind_targets(self):
         call(self._context, CTX_OMSetRenderTargets, None, [UINT, ctypes.POINTER(VOIDP), VOIDP], 0, None, None)
 
@@ -430,8 +440,6 @@ class GPUCore:
         if (width, height) == (self._width, self._height):
             return
         self._unbind_targets()
-        for on_release, _ in self._listeners:
-            on_release()
         self._release_staging()
         release(self._rtv)
         release(self._backbuffer)
@@ -441,10 +449,10 @@ class GPUCore:
                      [UINT, UINT, UINT, UINT, UINT], 0, width, height, DXGI_FORMAT_UNKNOWN, 0)
         self._width, self._height = width, height
         self._create_back_buffer_view()
-        for _, on_recreate in self._listeners:
-            on_recreate(width, height)
 
-    # -- per frame -----------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Per frame
+    # ========================================================================
     def begin_frame(self):
         """Binds the back buffer as the render target with a full-size viewport and returns its view."""
         self._require_open()
@@ -459,7 +467,9 @@ class GPUCore:
         self._require_open()
         return checked_call("SwapChain::Present", self._swapchain, SWAP_Present, [UINT, UINT], self._sync_interval, 0)
 
-    # -- readback ----------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Readback
+    # ========================================================================
     def _release_staging(self):
         release(self._staging)
         self._staging = VOIDP()
@@ -504,7 +514,9 @@ class GPUCore:
             raise GPUCoreError("back-buffer probe returned BGRA %s, expected about %s" % (got, want))
         return {"pixel_bgra": got}
 
-    # -- teardown ------------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Teardown
+    # ========================================================================
     def _require_open(self):
         if self._closed:
             raise GPUCoreError("GPUCore is closed")
@@ -517,14 +529,9 @@ class GPUCore:
         try:
             if self._context:
                 self._unbind_targets()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("GPUCore.close: if self._context:", _swallowed_error)
             pass
-        for on_release, _ in self._listeners:
-            try:
-                on_release()
-            except Exception:
-                pass
-        self._listeners = []
         for obj in (self._staging, self._rtv, self._backbuffer, self._swapchain, self._context, self._device,
                     self._factory):
             release(obj)

@@ -60,7 +60,9 @@ def _configure_logging(install_dir):
     if log.handlers:
         return
     try:
-        path = os.path.join(install_dir, "update_helper.log")
+        logs_dir = os.path.join(install_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        path = os.path.join(logs_dir, "update_helper.log")
         handler = logging.handlers.RotatingFileHandler(
             path, maxBytes=256 * 1024, backupCount=1, encoding="utf-8")
         handler.setFormatter(logging.Formatter(
@@ -136,7 +138,7 @@ USER_STATE_FILES = (
     "app_log.txt", "crash_log.txt", "crash_log_previous.txt", "vlc-debug.log", "vlc-debug_previous.log",
     "tester_report.txt",
 )
-USER_STATE_DIRS = ("server/.json",)
+USER_STATE_DIRS = ("server/.json", "logs")
 
 # VALUES CHANGE HERE: where an update may write. At the top of the install folder only files with one of these endings are written (the exe files); below it only the folders named here are written, and _internal/main stays protected. Anything else in the zip is skipped. Lower case, forward slashes.
 UPDATE_ROOT_FILE_ENDINGS = (".exe",)
@@ -391,20 +393,42 @@ def _read_stamp(install_dir):
         return None
 
 
+def _set_stamp_attributes(path, protected):
+    """Marks version.json hidden, system and read-only (protected) or plain; does nothing off Windows."""
+    if os.name != "nt":
+        return
+    import ctypes
+    ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x1 | 0x2 | 0x4 if protected else 0x80)
+
+
 def _write_stamp(install_dir, version):
-    """Records the installed version in version.json: the app reads it first, so the new build knows its own number from its first boot."""
-    with open(os.path.join(install_dir, VERSION_STAMP_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"version": str(version)}, handle)
+    """Records the installed version in version.json, keeps its build type, and protects the file from accidental deletion."""
+    path = os.path.join(install_dir, VERSION_STAMP_NAME)
+    payload = {"version": str(version)}
+    try:
+        previous = json.loads((_read_stamp(install_dir) or b"{}").decode("utf-8"))
+        if isinstance(previous, dict) and str(previous.get("build", "") or "").strip():
+            payload["build"] = str(previous["build"]).strip()
+    except (ValueError, UnicodeDecodeError):
+        pass
+    try:
+        _set_stamp_attributes(path, False)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    finally:
+        _set_stamp_attributes(path, True)
 
 
 def _restore_stamp(install_dir, previous):
     path = os.path.join(install_dir, VERSION_STAMP_NAME)
     try:
+        _set_stamp_attributes(path, False)
         if previous is None:
             os.unlink(path)
         else:
             with open(path, "wb") as handle:
                 handle.write(previous)
+            _set_stamp_attributes(path, True)
     except OSError:
         pass
 

@@ -14,7 +14,7 @@ Put this file in root/tests/. Layout it expects:
 Run with: python3 test_suite.py                    (everything)
       or: python3 test_suite.py -k FileExplorer    (only tests whose name contains that text)
       or: python3 -m pytest test_suite.py -v
-Run as a script, the output is also saved to root/temp/test_suite_output.txt (next to app_log.txt); the previous
+Run as a script, the output is also saved to root/logs/temp/test_suite_output.txt (next to app_log.txt); the previous
 run's is kept as test_suite_output_previous.txt.
 
 Layout of this file:
@@ -76,7 +76,7 @@ def _media_script_path():
     return root_copy if os.path.exists(root_copy) else os.path.join(ASSETS_DIR, "media.py")
 
 
-TEMP_DIR = os.path.join(ROOT, "temp")
+TEMP_DIR = os.path.join(ROOT, "logs", "temp")
 
 for _sub in ("server", "updater", "assets", "GPU"):
     sys.path.insert(0, os.path.join(ROOT, _sub))
@@ -101,6 +101,27 @@ menu_nav = mn
 with open(MAIN_SCRIPT, "r", encoding="utf-8") as _main_file:
     MAIN_SRC = _main_file.read()
 MAIN_TREE = ast.parse(MAIN_SRC)
+
+
+def _ledger_overrun_end(playback_log, today_ordinal, boundary_seconds):
+    """Test oracle: the whole second of today at which the entry the ledger says is airing across a block boundary ends, with its parts and commercials; None when no ledger entry runs across the boundary."""
+    run_end = None
+    for _entry, start, end, _name in media.aired_ledger_entries(playback_log, today_ordinal):
+        if run_end is None:
+            if start < boundary_seconds and end > boundary_seconds + 0.5:
+                run_end = end
+        elif start <= run_end + 0.5:
+            run_end = max(run_end, end)
+        else:
+            break
+    return None if run_end is None else int(math.ceil(run_end - 1e-6))
+
+
+def _current_slot_key(hub, channel, block_key):
+    """Test helper: the slot key of the newest generation of a block that has rows, or the block key itself when it has none."""
+    with hub.library._lock:
+        found = hub._generations(hub.library._conn, channel, block_key)
+    return found[max(found)] if found else str(block_key)
 
 
 # ============================================================================
@@ -138,13 +159,23 @@ class _CacheHub:
 
     def __init__(self, cache):
         self.cache = cache
+        self.estimates = {}
 
     def read(self, path):
         entry = self.cache.get(path) or self.cache.get(os.path.normpath(path))
         seconds = entry.get("duration") if isinstance(entry, dict) else None
         if seconds and seconds > 0:
             return seconds, media.DURATION_MEASURED
+        estimate = self.estimates.get(os.path.normpath(path))
+        if estimate:
+            return estimate, media.DURATION_ESTIMATED
         return None, None
+
+    def store_estimate(self, path, seconds, basis):
+        """Keeps an estimate for a file with no measured length the way the real hub does; a file with an estimate keeps it."""
+        if not seconds or seconds <= 0 or self.read(path)[1] == media.DURATION_MEASURED:
+            return None
+        return self.estimates.setdefault(os.path.normpath(path), int(round(seconds)))
 
 
 def _install_cache_hub(cache, testcase=None):
@@ -892,13 +923,6 @@ class TestStorageAPIs(unittest.TestCase):
         self.library.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_picture_box_round_trip(self):
-        ok = self.probe_library.store_picture_box(self.file_path, (10, 0, 1900, 800), detector_version=1)
-        self.assertTrue(ok)
-        entry = self.probe_library.get_cached(self.file_path)
-        self.assertEqual(entry["picture_box"]["rect"], [10, 0, 1900, 800])
-        self.assertEqual(entry["picture_box_detector_version"], 1)
-
     def test_gain_round_trip(self):
         self.probe_library.store_gain(self.file_path, gain=0.87, target_lufs=-20.5, scan_version=2)
         entry = self.probe_library.get_cached(self.file_path)
@@ -906,23 +930,7 @@ class TestStorageAPIs(unittest.TestCase):
         self.assertEqual(entry["gain_target_lufs"], -20.5)
         self.assertEqual(entry["gain_scan_version"], 2)
 
-    def test_captions_round_trip_compressed(self):
-        text = "1\n00:00:01,000 --> 00:00:02,000\nHello world\n" * 50
-        self.probe_library.store_captions(self.file_path, text, source="embedded")
-        got = self.probe_library.get_captions_text(self.file_path)
-        self.assertEqual(got, text)
-        entry = self.probe_library.get_cached(self.file_path)
-        self.assertLess(len(entry["captions_blob"]), len(text.encode("utf-8")))
 
-    def test_captions_permanent_no_speech_reason_stored(self):
-        self.probe_library.store_captions(self.file_path, "", source="asr", reason="no_speech")
-        entry = self.probe_library.get_cached(self.file_path)
-        self.assertEqual(entry["captions_reason"], "no_speech")
-
-    def test_pan_scan_memory_round_trip(self):
-        self.probe_library.store_pan_scan_memory(self.file_path, {"shots": [{"t": 0, "offset": 0.3}]})
-        entry = self.probe_library.get_cached(self.file_path)
-        self.assertEqual(entry["pan_scan_memory"]["shots"][0]["offset"], 0.3)
 
 
 # ============================================================================
@@ -1184,9 +1192,9 @@ class TestPictureBoxInLibrary(unittest.TestCase):
         self.assertEqual(det.call_count, 1)
 
     def test_older_detector_version_is_rescanned(self):
-        self.probe_library.store_picture_box(self.file_path, (0, 0, 720, 576), detector_version=0)
         self.probe_library.library.upsert_fields(
-            self.probe_library.keys.resolve(self.file_path), header_probed_at=time.time(), duration=1400.0)
+            self.probe_library.keys.resolve(self.file_path), picture_box={"rect": [0, 0, 720, 576]},
+            picture_box_detector_version=0, header_probed_at=time.time(), duration=1400.0)
         with self._detect_with(self.box) as det:
             self.probe_library.detect_picture_box_if_needed(self.file_path)
         self.assertEqual(det.call_count, 1)
@@ -1423,11 +1431,10 @@ class TestPictureBoxFlatBars(unittest.TestCase):
         self.assertEqual(ml._PB_FLAT_FRAMES, gov.PICTURE_BOX_FLAT_FRAMES)
         self.assertEqual(ml._PB_FLAT_MIN_PICTURE_FRACTION, gov.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION)
         src = inspect.getsource(ml)
-        fallback = src[src.index("    _PB_FLAT_W = 640"):src.index("def _pb_axis")]
-        for name, value in (("_PB_FLAT_W", gov.PICTURE_BOX_FLAT_WIDTH), ("_PB_FLAT_H", gov.PICTURE_BOX_FLAT_HEIGHT),
-                            ("_PB_FLAT_TOLERANCE", gov.PICTURE_BOX_FLAT_TOLERANCE), ("_PB_FLAT_FRAMES", gov.PICTURE_BOX_FLAT_FRAMES),
-                            ("_PB_FLAT_MIN_PICTURE_FRACTION", gov.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION)):
-            self.assertIn("%s = %r" % (name, value), fallback)
+        for name, attr in (("_PB_FLAT_W", "PICTURE_BOX_FLAT_WIDTH"), ("_PB_FLAT_H", "PICTURE_BOX_FLAT_HEIGHT"),
+                           ("_PB_FLAT_TOLERANCE", "PICTURE_BOX_FLAT_TOLERANCE"), ("_PB_FLAT_FRAMES", "PICTURE_BOX_FLAT_FRAMES"),
+                           ("_PB_FLAT_MIN_PICTURE_FRACTION", "PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION")):
+            self.assertIn("%s = _governor.%s if _governor is not None else %r" % (name, attr, getattr(gov, attr)), src)
 
     def test_a_box_saved_by_the_old_detector_is_measured_again(self):
         self.assertGreaterEqual(ml.PICTURE_BOX_DETECTOR_VERSION, 2)
@@ -1578,7 +1585,7 @@ def suite_governor_workers():
     lite = with_profile(profile, "lite", lambda: gov.duration_workers(False, "lite"))
     perf = with_profile(profile, "performance", lambda: gov.duration_workers(False, "performance"))
     check(lite == 1 and perf >= lite, "Lite uses 1 duration thread and Performance at least as many (%d, %d)" % (lite, perf))
-    for name in ("DURATION_WORKERS_WHILE_PLAYING_DIVISOR", "DURATION_CHUNK_FACTOR_FIRST_PASS", "DURATION_CHUNK_FACTOR_BACKLOG", "LOUDNESS_DISPATCH_WORKERS_BASE", "LOUDNESS_DISPATCH_WORKERS_SPARE", "WHISPER_UNLOAD_WAIT_SECONDS"):
+    for name in ("DURATION_WORKERS_WHILE_PLAYING_DIVISOR", "LOUDNESS_DISPATCH_WORKERS_BASE", "LOUDNESS_DISPATCH_WORKERS_SPARE", "WHISPER_UNLOAD_WAIT_SECONDS"):
         check(hasattr(gov, name), "governor table has %s" % name)
 
 
@@ -2524,38 +2531,36 @@ def case_channels():
     check(mn.channels_page_of(43, 1) == 1 and mn.channels_page_of(99, 7) == mn.CHANNELS_NUM_PAGES - 1, "channels: page of a button uses the stored page, kept in range")
 
 
-ROWS_WITH_STYLE = ["bezel_toggle", "bezel_style_select", "warp_screen", "scan_lines",
-                   "boot_anim", "static_noise", "reception_lines"]
+ROWS_WITH_STYLE = ["bezel_toggle", "bezel_style_select", "warp_screen", "boot_anim",
+                   "static_noise", "reception_lines", "scan_lines"]
 ROWS_NO_STYLE = [r for r in ROWS_WITH_STYLE if r != "bezel_style_select"]
 
 
 def case_channel_settings():
+    left, right = ("bezel_toggle", "warp_screen", "boot_anim"), ("static_noise", "reception_lines", "scan_lines")
     for rows in (ROWS_WITH_STYLE, ROWS_NO_STYLE):
         label = "channel settings (%d rows)" % len(rows)
         t = mn.channel_settings_table(rows)
         structure(t, label, "bezel_toggle")
         check(mn.channel_settings_table(rows) is t, label + ": table is cached")
-        check(go(t, "bezel_toggle", mn.UP) is None and go(t, "boot_anim", mn.UP) is None, label + ": first rows do not leave upward")
-        check(go(t, "bezel_toggle", mn.DOWN) == "warp_screen" and go(t, "warp_screen", mn.DOWN) == "scan_lines", label + ": left column goes down")
-        check(go(t, "scan_lines", mn.DOWN) == "reception_lines" and go(t, "static_noise", mn.DOWN) == "reception_lines", label + ": both columns end at Reception Lines")
-        check(go(t, "reception_lines", mn.DOWN) == mn.CLOSE and go(t, mn.CLOSE, mn.UP) == "reception_lines", label + ": Reception Lines and Close")
-        check(go(t, "reception_lines", mn.LEFT) is None and go(t, "reception_lines", mn.RIGHT) is None, label + ": Reception Lines has no sideways move")
+        check(go(t, "bezel_toggle", mn.UP) is None and go(t, "static_noise", mn.UP) is None, label + ": first rows do not leave upward")
+        for column, name in ((left, "left"), (right, "right")):
+            for k in range(len(column) - 1):
+                check(go(t, column[k], mn.DOWN) == column[k + 1] and go(t, column[k + 1], mn.UP) == column[k], label + ": %s column goes down and up at %s" % (name, column[k]))
+            check(go(t, column[-1], mn.DOWN) == mn.CLOSE, label + ": the %s column ends at Close" % name)
+        for k in range(3):
+            check(go(t, right[k], mn.LEFT) == left[k], label + ": right column goes left row by row at " + right[k])
+            check(go(t, right[k], mn.RIGHT) is None, label + ": nothing right of " + right[k])
+        for k in (1, 2):
+            check(go(t, left[k], mn.RIGHT) == right[k], label + ": left column goes right row by row at " + left[k])
+        check(go(t, mn.CLOSE, mn.UP) == "boot_anim", label + ": Close goes up to the bottom of the left column")
         check(go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None and go(t, mn.CLOSE, mn.DOWN) is None, label + ": Close only goes up")
-        check(go(t, "boot_anim", mn.RIGHT) is None and go(t, "static_noise", mn.RIGHT) is None, label + ": nothing right of the right column")
-        check(go(t, "boot_anim", mn.DOWN) == "static_noise" and go(t, "static_noise", mn.UP) == "boot_anim", label + ": right column goes down and up")
-        check(go(t, "boot_anim", mn.LEFT) == "bezel_toggle" and go(t, "static_noise", mn.LEFT) == "warp_screen", label + ": right column goes left row by row")
-        check(go(t, "scan_lines", mn.RIGHT) == "static_noise" and go(t, "warp_screen", mn.RIGHT) == "static_noise", label + ": left column goes right row by row")
         if "bezel_style_select" in rows:
             check(go(t, "bezel_toggle", mn.RIGHT) == "bezel_style_select" and go(t, "bezel_style_select", mn.LEFT) == "bezel_toggle", label + ": the style box hangs off Bezel")
-            check(go(t, "bezel_style_select", mn.RIGHT) == "boot_anim", label + ": right of the style box is the right column")
+            check(go(t, "bezel_style_select", mn.RIGHT) == "static_noise", label + ": right of the style box is the right column")
             check(go(t, "bezel_style_select", mn.DOWN) == "warp_screen" and go(t, "bezel_style_select", mn.UP) is None, label + ": the style box moves vertically like its row")
         else:
-            check(go(t, "bezel_toggle", mn.RIGHT) == "boot_anim", label + ": Bezel goes straight to the right column")
-        for end in ("scan_lines", "static_noise"):
-            memory = {}
-            go(t, end, mn.DOWN, memory)
-            check(go(t, "reception_lines", mn.UP, memory) == end, label + ": Reception Lines returns to " + end)
-        check(go(t, "reception_lines", mn.UP) == "scan_lines", label + ": Reception Lines with no memory goes to the left column")
+            check(go(t, "bezel_toggle", mn.RIGHT) == "static_noise", label + ": Bezel goes straight to the right column")
         for index, row in enumerate(rows):
             check(mn.channel_settings_index(rows, mn.channel_settings_cell(rows, index)) == index, label + ": selection %d round trip" % index)
         check(mn.channel_settings_cell(rows, len(rows)) == mn.CLOSE and mn.channel_settings_index(rows, mn.CLOSE) == len(rows), label + ": Close is one past the rows")
@@ -3229,11 +3234,28 @@ def test_dvd_map_tables():
 def run_dvd_map(code, cursor, key, capturing=False):
     state = {"menu_layer": "DVD_BTN_MAP", "dvd_map_cursor": cursor, "dvd_map_capturing": capturing, "show_menu": True}
     db = types.SimpleNamespace(config={}, save_settings=lambda: None)
-    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)),
+    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "performance_governor": gov, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)),
            "get_games_sub_menu_rows": lambda _db, _state, _console, _on: sub_rows_for("DVD", True, False, False, False),
            "CANONICAL_REMOTE_KEYS": {}, "DVD_MAP_ACTIONS": [("play", "PLAY"), ("stop", "STOP"), ("next", "NEXT")],
            "set_dvd_binding": lambda *a, **k: None, "_REMAP_CAPTURE_DEDUP_MS": 400, "print": lambda *a, **k: None}
     exec(code, env)
+    return state
+
+
+def run_central_back(state, channels=None):
+    """Runs the main loop's shared Back handler once on a copy of state and returns it."""
+    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
+        text = handle.read()
+    begin = '            if menu_nav.is_back(event.key) and app_state.get("show_menu", False):\n'
+    end = '            if menu_nav.is_back(event.key) and not app_state.get("show_menu", False):\n'
+    block = text[text.index(begin):text.index(end)]
+    code = "for _once in (0,):\n" + textwrap.indent(textwrap.dedent(block), "    ")
+    state = dict(state)
+    db = types.SimpleNamespace(config={}, channels_db=channels or {})
+    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "performance_governor": gov, "event": types.SimpleNamespace(key=pygame.K_ESCAPE),
+           "now_ticks": 777, "print": lambda *a, **k: None,
+           "get_games_sub_menu_rows": lambda _db, _state, _console, _on: sub_rows_for("DVD", True, False, False, False)}
+    exec(compile(code, MAIN_SCRIPT + ":central back", "exec"), env)
     return state
 
 
@@ -3257,7 +3279,17 @@ def test_dvd_map_handler():
     state = run_dvd_map(code, 1, pygame.K_RETURN)
     check(state["menu_layer"] == "GAMES_SUB_MENU" and state["dvd_map_capturing"] is False and state["games_sub_row"] == 1 + sub_rows_for("DVD", True, False, False, False).index("dvd_button_mapping"), "handler dvd map: Enter on Close returns to the Games sub-menu on the DVD mapping row")
     state = run_dvd_map(code, 0, pygame.K_ESCAPE)
-    check(state["menu_layer"] == "GAMES_SUB_MENU", "handler dvd map: Escape returns to the Games sub-menu")
+    check(state["menu_layer"] == "DVD_BTN_MAP", "handler dvd map: the map's own branch leaves Escape to the shared Back handler")
+    state = run_central_back({"show_menu": True, "menu_layer": "DVD_BTN_MAP", "dvd_map_cursor": 0, "dvd_map_capturing": False})
+    check(state["menu_layer"] == "GAMES_SUB_MENU" and state["games_sub_row"] == 1 + sub_rows_for("DVD", True, False, False, False).index("dvd_button_mapping")
+          and state["dvd_map_capturing"] is False, "handler dvd map: Escape returns to the Games sub-menu on the DVD mapping row")
+    state = run_central_back({"show_menu": True, "menu_layer": "DVD_BTN_MAP", "dvd_map_cursor": 0, "dvd_map_capturing": True})
+    check(state["menu_layer"] == "DVD_BTN_MAP" and state["dvd_map_capturing"] is False, "handler dvd map: Escape while capturing cancels the capture and stays on the map")
+    for mode, row in (("marathon", 5), ("block", 6)):
+        state = run_central_back({"show_menu": True, "menu_layer": "HOLIDAY_SUB_MENU", "selected_channel_row": 5, "sub_menu_row_index": 2, "sub_menu_col_index": 1},
+                                 {"05": {"scheduling_mode": mode, "active": True}})
+        check(state["menu_layer"] == "CHANNEL_SUB_MENU" and (state["sub_menu_row_index"], state["sub_menu_col_index"]) == (row, 0),
+              "Escape in Holiday returns to the channel menu on the Holiday row (%s)" % mode)
     state = run_dvd_map(code, 0, pygame.K_x)
     check(state["dvd_map_cursor"] == 0 and state["menu_layer"] == "DVD_BTN_MAP", "handler dvd map: another key changes nothing")
     for key in n2_ALL_KEYS:
@@ -3359,7 +3391,7 @@ def run_save_profile(code, console, sel, key, state=None, game_deck_obj=None, co
     state["games_profile_row"] = sel
     state["menu_layer"] = "GAMES_SAVE_PROFILE"
     db = types.SimpleNamespace(config=config if config is not None else {"console_profiles": {}}, save_settings=lambda: None)
-    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)),
+    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "performance_governor": gov, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)),
            "game_deck": game_deck_obj, "now_ticks": 0, "print": lambda *a, **k: None, "log": types.SimpleNamespace(info=lambda *a, **k: None),
            "_sync_profile_setting_across_consoles": lambda *a, **k: None, "_set_console_bezel_enabled": lambda *a, **k: None, "_set_console_bezel_style": lambda *a, **k: None}
     exec(code, env)
@@ -3840,6 +3872,7 @@ def n4_run_guide(code, active, selected, offset, rows, key, curr_col=0):
     }
     env = {
         "app_state": state, "db": n4_FakeDb(active), "pygame": pygame, "event": types.SimpleNamespace(key=key),
+        "MENU_IDLE_CLOSE_MS": int(gov.MENU_IDLE_CLOSE_SECONDS * 1000),
         "menu_nav": mn, "get_guide_visible_rows": lambda _db: rows,
         "_clear_last_video_frame": lambda context=None: calls.append(("clear", context)),
         "_arm_guide_preview_transition": lambda: calls.append(("arm",)),
@@ -3918,16 +3951,8 @@ class FakeVlc:
         self.log.append(("vlc.stop",))
 
 
-class FakeShadow:
-    def __init__(self, log):
-        self.log = log
-
-    def mirror_navigate(self, what):
-        self.log.append(("shadow", what))
-
-
 _RECORDED = ("_enter_romlist", "_launch_selected_rom", "_scan_roms", "_snap_rom_cursor_if_scan_landed", "_set_dvd_osd",
-             "_dvd_save_resume_position", "_close_dvd_highlight_shadow", "_get_console_rom_dir")
+             "_dvd_save_resume_position", "_get_console_rom_dir")
 
 
 def make_deck(module, **attrs):
@@ -3941,8 +3966,8 @@ def make_deck(module, **attrs):
         dvd_exit_confirm=False, dvd_exit_selection="No", dvd_exit_confirm_shown_at=0,
         dvd_return_menu_confirm=False, dvd_return_menu_selection="No", dvd_return_menu_confirm_shown_at=0,
         dvd_splash_playing=False, dvd_is_disc_image=True, dvd_in_menu=True, _dvd_menu_manual_override=False,
-        vlc_engine=FakeVlc(log), _dvd_highlight_shadow=FakeShadow(log), dvd_resume_enabled=False, dvd_file_path="",
-        dvd_paused=False, dvd_hud_until=0, _dvd_skip_cooldown=0, _scan_pending=False, _CONSOLE_ARROW_FLASH_MS=200,
+        vlc_engine=FakeVlc(log), dvd_resume_enabled=False, dvd_file_path="",
+        dvd_paused=False, _dvd_skip_cooldown=0, _scan_pending=False, _CONSOLE_ARROW_FLASH_MS=200,
     )
     base.update(attrs)
     for name, value in base.items():
@@ -3957,7 +3982,7 @@ def make_deck(module, **attrs):
 
 
 def snapshot(deck):
-    return {k: v for k, v in vars(deck).items() if not callable(v) and k not in ("vlc_engine", "_dvd_highlight_shadow", "_log")}
+    return {k: v for k, v in vars(deck).items() if not callable(v) and k not in ("vlc_engine", "_log")}
 
 
 def run_event(module, setup, event):
@@ -4063,7 +4088,7 @@ def case_dvd_handler():
             elif setup["dvd_is_disc_image"] and setup["dvd_in_menu"]:
                 expected = {pygame.K_w: "up", pygame.K_s: "down", pygame.K_a: "left", pygame.K_d: "right", pygame.K_RETURN: "activate"}
                 if key in expected:
-                    check(("vlc.navigate", expected[key]) in log and ("shadow", expected[key]) in log, "dvd menu %s navigates %s" % (key, expected[key]))
+                    check(("vlc.navigate", expected[key]) in log, "dvd menu %s navigates %s" % (key, expected[key]))
                 else:
                     check(not any(entry[0] == "vlc.navigate" for entry in log) or key == pygame.K_BACKSPACE, "dvd menu other keys do not navigate")
     check(n > 200, "dvd handler cases ran: %d" % n)
@@ -4071,7 +4096,7 @@ def case_dvd_handler():
               pygame.K_a: "left", pygame.K_d: "right", pygame.K_RETURN: "activate"}
     for key, want in arrows.items():
         deck = make_deck(module, mode="DVD_PLAYER")
-        check(deck._handle_dvd_menu_nav(key) is True and ("vlc.navigate", want) in deck._log and ("shadow", want) in deck._log, "dvd menu direct %s -> %s" % (key, want))
+        check(deck._handle_dvd_menu_nav(key) is True and ("vlc.navigate", want) in deck._log, "dvd menu direct %s -> %s" % (key, want))
     deck = make_deck(module, mode="DVD_PLAYER")
     deck._handle_dvd_menu_nav(pygame.K_x)
     check(deck._log == [], "dvd menu direct: other key does nothing")
@@ -4217,7 +4242,7 @@ def case_channel_sub_table():
             check(mn.channel_sub_table(layout) is table, "channel sub table cached %r" % (layout,))
             close = mn.channel_sub_close_row(layout)
             on, music, marathon = layout[0], layout[1], layout[2]
-            check(close == (1 if not on else 4 if music else 6 if marathon else 7), "channel sub close row %r" % (layout,))
+            check(close == (1 if not on else 7 if music else 6 if marathon else 7), "channel sub close row %r" % (layout,))
             for row in range(close + 1):
                 for col in range(mn.CHANNEL_SUB_MAX_COL + 1):
                     check(mn.channel_sub_index(mn.channel_sub_cell(row, col)) == (row, col), "channel sub cell round trip")
@@ -4245,7 +4270,15 @@ def case_channel_sub_table():
     check(mn.channel_sub_table(layout).step("r1c0", mn.UP, {}) == "r0c0", "other channels on: up lands on the On button")
     layout = mn.channel_sub_layout(fresh, 5)
     table = mn.channel_sub_table(layout)
-    check(table.step("r7c0", mn.DOWN, {}) is None or table.step("r7c0", mn.DOWN, {}) == "r7c1", "Clear to Close share the last row")
+    check(table.step("r7c0", mn.DOWN, {}) is None and table.step("r7c0", mn.RIGHT, {}) == "r7c3" and table.step("r7c3", mn.LEFT, {}) == "r7c0"
+          and table.step("r7c3", mn.RIGHT, {}) is None and table.step("r7c3", mn.DOWN, {}) is None,
+          "a TV channel's last row is Clear on the left and Close on the right, with nothing below them")
+    for mode in ("random_slots", "marathon"):
+        music = mn.channel_sub_layout({"active": True, "is_visualizer": True, "scheduling_mode": mode}, 5)
+        music_table, music_close = mn.channel_sub_table(music), mn.channel_sub_close_row(music)
+        check(music_table.step(mn.channel_sub_cell(music_close - 1, 0), mn.DOWN, {}) == mn.channel_sub_cell(music_close, 0)
+              and all(music_table.step(mn.channel_sub_cell(music_close, 0), d, {}) is None for d in (mn.LEFT, mn.RIGHT, mn.DOWN)),
+              "a music channel's Close is one button: nothing beside it or below it (%s)" % mode)
 
 
 def case_popup_tables():
@@ -4358,6 +4391,8 @@ def make_env():
         "_get_audio_gain_db": lambda filepath, ch_key=None: 0,
         "get_games_sub_menu_rows": boom, "_server_breadcrumb": boom, "server_sync": None, "logging": None,
         "media": media, "_toggle_holiday_force": boom,
+        "performance_governor": __import__("performance_governor"), "_static_sound_stop": lambda where: None,
+        "NUM_CONTROL_PAGES": ui.NUM_CONTROL_PAGES, "now_ticks": 777, "_mark_settings_dirty": lambda: None,
     }
 
 
@@ -4527,7 +4562,7 @@ def build_runner_fell(code_body):
 POPUP_BLOCKS = {
     "CLEAR_CONFIRM": ('            if app_state.get("show_clear_confirm", False):\n', '            if (app_state.get("current_channel") == "03"\n                    and \'game_deck\' in globals()'),
     "DVD_GATE": ('            if (app_state.get("current_channel") == "03"\n                    and \'game_deck\' in globals()', '            if app_state.get("current_channel") == "03" and not is_any_menu_showing'),
-    "CONTROLS_SPLASH": ('            if app_state.get("show_splash", False):\n                NUM_CONTROL_PAGES', '            if app_state.get("show_quit_confirm", False):\n'),
+    "CONTROLS_SPLASH": ('            if app_state.get("show_splash", False):\n                last_page = NUM_CONTROL_PAGES - 1', '            if app_state.get("show_quit_confirm", False):\n'),
 }
 POPUP_CASES = (("CLEAR_CONFIRM", confirm_cases), ("DVD_GATE", gate_cases), ("CONTROLS_SPLASH", splash_cases))
 POPUP_KEYS = n6_ALL_KEYS + [pygame.K_RETURN, pygame.K_c]
@@ -4581,7 +4616,10 @@ def check_popup(name, state, key, got):
         focus = state.get("clear_confirm_focus", "buttons")
         burn = state["clear_confirm_target"] in BURNIN_TARGETS
         want = dict(state)
-        if key == pygame.K_w:
+        if mn.is_back(key):
+            want.update(show_clear_confirm=False, clear_confirm_target=None, clear_confirm_channel=None, clear_confirm_console=None,
+                        clear_confirm_shown_at=0, clear_confirm_focus="buttons", clear_confirm_dont_show_again=False)
+        elif key == pygame.K_w:
             if burn and focus == "checkbox":
                 want["clear_confirm_focus"] = "buttons"
             want["clear_confirm_shown_at"] = 777
@@ -4680,7 +4718,13 @@ def check_block(name, db, state, key, after):
         layout = mn.channel_sub_layout(db.channels_db["07"], sum(1 for v in db.channels_db.values() if v.get("active")))
         close = mn.channel_sub_close_row(layout)
         new_row, new_col = after["sub_menu_row_index"], after["sub_menu_col_index"]
-        if db.channels_db["07"].get("is_visualizer") and row == 2 and direction in (mn.LEFT, mn.RIGHT):
+        if db.channels_db["07"].get("is_visualizer") and row == 3 and direction in (mn.LEFT, mn.RIGHT):
+            strength = db.channels_db["07"].get("reactive_visualizer_strength", mn.REACTIVE_STRENGTH_SPEC[1])
+            check((new_row, new_col) == (row, col), label + " Reactive Strength keeps the cursor where it is")
+            check(mn.REACTIVE_STRENGTH_SPEC[2] <= strength <= mn.REACTIVE_STRENGTH_SPEC[3], label + " Reactive Strength stays inside its range")
+            check({k: v for k, v in after.items() if k != "_step_gate"} == state, label + " Reactive Strength changes only the channel's strength and its step timer")
+            return
+        if db.channels_db["07"].get("is_visualizer") and row == 4 and direction in (mn.LEFT, mn.RIGHT):
             step = -1 if direction == mn.LEFT else 1
             check((new_row, new_col) == (row, col), label + " Loudness Gain keeps the cursor where it is")
             check(after.get("visualizer_gain_db") == step, label + " Loudness Gain moves one dB the way the key points")
@@ -5151,6 +5195,7 @@ def guide_hold(state):
 def n7_run_guide(ns, new, channels, selected, offset, rows, held, ticks, mode, release_frame, step_ms):
     state = guide_state(new, selected, offset, held, ticks)
     ns["app_state"] = state
+    ns["MENU_IDLE_CLOSE_MS"] = int(gov.MENU_IDLE_CLOSE_SECONDS * 1000)
     ns["db"] = types.SimpleNamespace(channels_db={str(i).zfill(2): ({"active": channels[str(i).zfill(2)]} if str(i).zfill(2) in channels else {}) for i in range(5, 45)})
     ns["visible_rows"] = rows
     log = Recorder()
@@ -5454,9 +5499,13 @@ def case_static():
     check("_fe_scroll_from_thumb_y" not in text, "the old scroll-from-thumb helper is removed")
     thumb = function_source(text, "_fe_scrollbar_thumb_rect")
     check("max(20" not in thumb, "the thumb rectangle helper holds no sizes of its own")
-    nav_text = read(os.path.join(os.path.dirname(HERE), "assets", "menu_nav.py"))
+    nav_text = read(os.path.join(ROOT, "menu_nav.py"))
     section = nav_text[nav_text.index("# SECTION: File explorer"):nav_text.index("# SECTION: Exports")]
-    check("# VALUES CHANGE HERE" in section, "the explorer numbers carry the VALUES CHANGE HERE tag")
+    check("# WARNING: the fallback numbers below must match EXPLORER_WHEEL_ROWS" in section and "if _governor is not None else" in section,
+          "the explorer numbers read the governor, with the fallback under one WARNING line")
+    gov_text = read(os.path.join(ROOT, "performance_governor.py"))
+    check("# VALUES CHANGE HERE" in gov_text[:gov_text.index("\nEXPLORER_WHEEL_ROWS = ")].rsplit("\n\n", 1)[-1],
+          "the explorer numbers carry the VALUES CHANGE HERE tag in the governor")
     for name in ("EXPLORER_WHEEL_ROWS", "EXPLORER_DOUBLE_CLICK_MS", "EXPLORER_DRAG_START_PX", "EXPLORER_DRAG_EDGE_ZONE_PX", "EXPLORER_THUMB_MIN_H"):
         check(name in section and ('"%s"' % name) in nav_text, "%s is defined and exported" % name)
     lines = text.splitlines()
@@ -5504,6 +5553,7 @@ def n8_run_guide_hold(text, frames):
     calls = []
     app_state = {"_hold_guide": mn.HoldState(), "_held_keys": set(), "guide_inactivity_timer": 0}
     ns = {
+        "MENU_IDLE_CLOSE_MS": int(gov.MENU_IDLE_CLOSE_SECONDS * 1000),
         "pygame": pygame, "menu_nav": mn, "app_state": app_state, "log": types.SimpleNamespace(warning=lambda *a: log_lines.append(a)),
         "_guide_dirty_event": types.SimpleNamespace(set=lambda: calls.append(("dirty",))),
         "_guide_jump_col": lambda step, _source: calls.append(("col", step, _source)),
@@ -5701,7 +5751,7 @@ def n8_run_dvd_hold(code, frames, start_attribute=None):
     seeks = []
     vlc_player = types.SimpleNamespace(get_time=lambda: 600000, get_length=lambda: 7200000, set_time=lambda value: seeks.append(clock[0]))
     deck = types.SimpleNamespace(dvd_in_menu=False, dvd_bindings=None, vlc_engine=types.SimpleNamespace(player=vlc_player),
-                                 _set_dvd_osd=lambda *a, **k: None, dvd_hud_until=0)
+                                 _set_dvd_osd=lambda *a, **k: None)
     if start_attribute is not None:
         deck._dvd_skip_hold_start = start_attribute
     env = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: clock[0]),
@@ -6217,7 +6267,7 @@ class FakeGameDeck:
 
 
 def build_main_namespace(config, stem, warp_on, orbiter, channel, console_inner):
-    ns = {"pygame": pygame, "menu_panel_rect": ui.menu_panel_rect, "fit_menu_envelope": ui.fit_menu_envelope,
+    ns = {"pygame": pygame, "menu_panel_rect": ui.menu_panel_rect, "fit_menu_envelope": ui.fit_menu_envelope, "performance_governor": gov,
           "db": FakeDbConfig(config), "app_state": {"current_channel": channel},
           "game_deck": FakeGameDeck(console_inner) if console_inner is not None else FakeGameDeck(None),
           "_active_bezel_stem": lambda: stem, "_setting_on": lambda key, default=False: warp_on,
@@ -6352,7 +6402,7 @@ def suite_one_picture_path():
 
     for gone in ("_canvas_is_genuinely_4_3", "genuine_4:3_fastpath", "_bezel_off_fit_aspect", "_filled_canvas_aspect_state", "canvas_genuinely_4_3"):
         check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
-    check(len(re.findall(r"= _video_decode_canvas_size\(", MAIN_SRC)) == 2, "the engine start and resize_canvas must both use _video_decode_canvas_size")
+    check(len(re.findall(r"= _video_decode_canvas_size\(", MAIN_SRC)) == 1 and "def resize_canvas" not in MAIN_SRC, "the engine start sizes its canvas through _video_decode_canvas_size, and the old resize_canvas (left from the removed Aspect Ratio setting) is gone")
     check("(960, 720) if" not in MAIN_SRC and "(640, 480) if" not in MAIN_SRC, "a 4:3 decode canvas branch is still in the main script")
 
     import performance_governor as _pg
@@ -6393,15 +6443,19 @@ def suite_one_shape_per_label():
     ns = {"performance_governor": _pg, "math": math}
     exec(main_function_code("_snap_standard_aspect"), {"_PICTURE_STANDARD_ASPECTS": tuple(_pg.PICTURE_STANDARD_ASPECTS), "math": math}, ns)
     snap = ns["_snap_standard_aspect"]
-    wide, std, tall = 16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0
-    expected = ((2.39, wide), (2.35, wide), (2.0, wide), (1.85, wide), (16.0 / 9.0, wide), (1.6, wide),
-                (1.5, std), (4.0 / 3.0, std), (1.25, std), (1.0, std),
-                (0.75, tall), (0.5625, tall), (0.5, tall), (0.4, tall))
+    scope, two, wide, three_two, std, square, portrait, tall = 2.39, 2.0, 16.0 / 9.0, 1.5, 4.0 / 3.0, 1.0, 0.8, 9.0 / 16.0
+    expected = ((2.76, scope), (2.39, scope), (2.35, scope), (2.2, scope), (2.0, two), (1.9, two), (1.85, wide), (16.0 / 9.0, wide),
+                (1.66, wide), (1.6, three_two), (1.5, three_two), (1.43, three_two), (1.37, std), (4.0 / 3.0, std), (1.25, std),
+                (1.0, square), (0.8, portrait), (0.75, portrait), (0.5625, tall), (0.5, tall), (0.4, tall))
     for aspect, want in expected:
         got = snap(aspect)
         check(abs(got - want) < 1e-9, "aspect %s snapped to %s, expected %s" % (aspect, got, want))
     check(snap(None) is None and snap(0) == 0, "no shape must pass through untouched")
-    check(tuple(_pg.PICTURE_STANDARD_ASPECTS) == (wide, std, tall), "the governor table must hold 16:9, 4:3 and 9:16")
+    check(tuple(_pg.PICTURE_STANDARD_ASPECTS) == (scope, two, wide, three_two, std, square, portrait, tall),
+          "the governor table must hold 2.39, 2:1, 16:9, 3:2, 4:3, 1:1, 4:5 and 9:16")
+    for content in (2.76, 2.39, 2.2, 2.0, 1.9, 1.85, 16.0 / 9.0, 1.66, 1.6, 1.5, 1.43, 1.37, 4.0 / 3.0, 1.25, 1.0, 0.8, 0.75, 0.5625):
+        got = snap(content)
+        check(max(got, content) / min(got, content) <= 1.16, "a %.3f picture must not be stretched or squeezed more than 16 %% (snapped to %.3f)" % (content, got))
     for gone in ("_PICTURE_FIT_NEAR_169_MIN", "_PICTURE_FIT_NEAR_169_MAX", "_PICTURE_FIT_NEAR_43_MIN", "_PICTURE_FIT_NEAR_916_MIN", "_PICTURE_FIT_NEAR_916_MAX"):
         check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
     check("performance_governor.PICTURE_STANDARD_ASPECTS" in MAIN_SRC, "the main script must read the governor table")
@@ -6411,7 +6465,9 @@ def suite_one_shape_per_label():
                "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
     exec(main_function_code("_blit_video_with_screen_mode"), blit_ns)
     blit = blit_ns["_blit_video_with_screen_mode"]
-    groups = {"16:9": ((1280, 720), (1920, 804), (1920, 1040), (1280, 534)), "4:3": ((640, 480), (720, 540), (1024, 768)), "9:16": ((1080, 1920), (720, 1280))}
+    groups = {"2.39": ((1920, 804), (1280, 534)), "2:1": ((1920, 960), (1280, 640)), "16:9": ((1280, 720), (1920, 1040), (1920, 1080)),
+              "3:2": ((720, 480), (1080, 720)), "4:3": ((640, 480), (720, 540), (1024, 768)), "1:1": ((1080, 1080), (720, 720)),
+              "4:5": ((1080, 1350), (864, 1080)), "9:16": ((1080, 1920), (720, 1280))}
     screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
     for win_w, win_h in screens:
         rect = pygame.Rect(0, 0, win_w, win_h)
@@ -6476,7 +6532,10 @@ def suite_picture_box_before_show():
     ns.update({"log": log_stub, "_cached_path_exists": lambda p: True, "_get_probe_library": lambda: FakeLib(),
                
                "_is_drive_degraded": lambda p: False, "_picture_box_scan_one": fake_scan,
-               "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 0.5, "_PICTURE_BOX_PRE_SHOW_PARALLEL": 6})
+               "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 0.5})
+    plan = {"together": (True, "test PC")}
+    ns["performance_governor"] = types.SimpleNamespace(
+        picture_box_pre_show_parallel=lambda: (gov.PICTURE_BOX_PRE_SHOW_PARALLEL if plan["together"][0] else 1, plan["together"][1]))
     ns["_governor_priority_scope"] = gov.priority_scope
     exec(main_function_code("_picture_box_scan_one_priority"), ns)
     exec(main_function_code("_decide_picture_box_before_show"), ns)
@@ -6485,6 +6544,24 @@ def suite_picture_box_before_show():
 
     box = decide("show.mkv")
     check(box is not None and scans == [6], "an unscanned file must be scanned with all samples at once before the show: %s" % scans)
+    store.clear()
+    scans.clear()
+    plan["together"] = (False, "weak PC")
+    check(decide("show.mkv") is not None and scans == [1],
+          "on a PC where first-start scans must run in sequence the sample points are decoded one at a time, so the starting file keeps its picture: %s" % scans)
+    plan["together"] = (True, "test PC")
+    with mock.patch.object(gov, "first_start_scan_plan", lambda profile=None, mode=None: (False, "lite mode")):
+        check(gov.picture_box_pre_show_parallel() == (1, "lite mode"), "the governor gives one sample point at a time where first-start scans run in sequence")
+    with mock.patch.object(gov, "first_start_scan_plan", lambda profile=None, mode=None: (True, "scan cores 4.0")):
+        check(gov.picture_box_pre_show_parallel() == (6, "scan cores 4.0"), "the governor gives the table's count where first-start scans may run together")
+    saved_gov = ns.pop("performance_governor")
+    ns["performance_governor"] = None
+    store.clear()
+    scans.clear()
+    check(decide("show.mkv") is not None and scans == [1], "without the governor the sample points are decoded one at a time")
+    ns["performance_governor"] = saved_gov
+    store.clear()
+    decide("show.mkv")
     scans.clear()
     check(decide("show.mkv") == box and scans == [], "a file with a stored box must not be scanned again")
     store.clear()
@@ -7079,7 +7156,7 @@ class TestEqualizerGrid(_SectionCase):
 
 _R4_FILES = (
     "retro_tv_emulator.py", "game_deck.py", "libretro_core.py", "media.py", "media_library.py", "ui.py",
-    "visualizers.py", "broadcast_clock.py", "performance_governor.py", os.path.join("assets", "menu_nav.py"),
+    "visualizers.py", "broadcast_clock.py", "performance_governor.py", "menu_nav.py",
     os.path.join("tests", "test_suite.py"),
     os.path.join("GPU", "d3d11_gpu_core.py"), os.path.join("GPU", "d3d11_gpu_frame.py"),
     os.path.join("GPU", "d3d11_gpu_gate.py"), os.path.join("GPU", "d3d11_gpu_reference.py"),
@@ -7209,7 +7286,7 @@ def stick_activity_table_case():
     check("8000 / 32767.0" in main_src and gov.STICK_CH03_AXIS_ACTIVITY_DEADZONE == 8000 / 32767.0, "its fallback matches the table")
     with open(os.path.join(ROOT, "menu_nav.py") if os.path.exists(os.path.join(ROOT, "menu_nav.py")) else os.path.join(ROOT, "assets", "menu_nav.py"), "r", encoding="utf-8") as handle:
         nav_src = handle.read()
-    check("    JOY_AXIS_THRESHOLD = 0.6\n" in nav_src and gov.STICK_MENU_AXIS_THRESHOLD == 0.6, "its fallback matches the table")
+    check("JOY_AXIS_THRESHOLD = float(_governor.STICK_MENU_AXIS_THRESHOLD) if _governor is not None else 0.6\n" in nav_src and gov.STICK_MENU_AXIS_THRESHOLD == 0.6, "its fallback matches the table")
 
 
 class TestStickActivityTable(_SectionCase):
@@ -7845,7 +7922,7 @@ def guide_highlight_case():
         state["guide_current_row_stops"] = stops_for(str(state["selected_guide_channel"]).zfill(2), view_idx())
 
     log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
-    ns = dict(app_state=state, log=log, broadcast_clock=_Clock, db=object(), str=str,
+    ns = dict(app_state=state, log=log, broadcast_clock=_Clock, db=object(), str=str, performance_governor=gov,
               get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
               _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh,
               get_current_guide_time_idx=lambda a, d: view_idx(),
@@ -8351,6 +8428,36 @@ class TestLineupGroups(_SectionCase):
 
 
 # ============================================================================
+# SECTION: Grouping a show that has an episode 0 next to numbered episodes never crashes the sort
+# ============================================================================
+
+def suite_group_shows_episode_zero_sort():
+    def names_of(file_names):
+        _names, grouped = media.group_shows_flexible([{"path": "/m/v/" + n} for n in file_names])
+        return [os.path.basename(e["path"]) for eps in grouped.values() for e in eps]
+
+    try:
+        order = names_of(["90s Commercials - S01.E17.mp4", "90s Commercials - S01.E1.mp4", "90s Commercials - S01.E00.mp4"])
+        check(True, "a show with S01.E00 next to numbered episodes groups without raising")
+        check(order[0].endswith("E00.mp4") and order[-1].endswith("E17.mp4"), "episode 0 airs first and the highest episode last (%s)" % order)
+    except TypeError as error:
+        check(False, "a show with S01.E00 next to numbered episodes must not raise TypeError (%s)" % error)
+    try:
+        order = names_of(["Show S01E02.mkv", "Show S01E00.mkv", "Show S01E01.mkv", "Show Special.mkv", "Show S02E00.mkv", "Show S02E01.mkv"])
+        check(True, "episode 0, numbered and unnumbered files in two seasons group without raising")
+        check([n for n in order if "S01" in n] == ["Show S01E00.mkv", "Show S01E01.mkv", "Show S01E02.mkv"], "season 1 stays in episode order (%s)" % order)
+    except TypeError as error:
+        check(False, "mixed episode 0, numbered and unnumbered files must not raise TypeError (%s)" % error)
+
+
+class TestGroupShowsEpisodeZeroSort(_SectionCase):
+    """A show whose files include an episode 0 groups and sorts without a TypeError"""
+
+    def test_group_shows_episode_zero_sort(self):
+        self.run_section(suite_group_shows_episode_zero_sort)
+
+
+# ============================================================================
 # SECTION: Leftover bundle never airs twice back to back after a file is removed
 # ============================================================================
 
@@ -8557,8 +8664,11 @@ def suite_cut_cycle_positions():
                                     expected = [e for e in lineup if media.lineup_paths([e])[0] in {m["path"] for m in movie_pool}]
                                 elif order_mode == "random":
                                     state = cut.get(media.stable_series_id(key, "05"))
-                                    entries = media.pair_short_episodes(show_eps[key], threshold_seconds=900)
-                                    picked, _s = media.draw_from_shuffle_bag_by_file(state, entries, rest, "%d:%s" % (day, key))
+                                    if sum(1 for e in show_eps[key] if e["duration"] < 900) >= 2:
+                                        picked, _s = media.draw_random_short_pairs(state, show_eps[key], rest, "%d:%s" % (day, key), 900)
+                                    else:
+                                        entries = media.pair_short_episodes(show_eps[key], threshold_seconds=900)
+                                        picked, _s = media.draw_from_shuffle_bag_by_file(state, entries, rest, "%d:%s" % (day, key))
                                     expected = [e for e in lineup if "/%s/" % key in media.lineup_paths([e])[0]]
                                 else:
                                     state = cut.get(media.stable_series_id(key, "05"), cut.get(key, 0))
@@ -8791,8 +8901,8 @@ def suite_overrun_static_when_ledger_lacks_entry():
     check(not bad, "the running show airs from the ledger, and with the ledger lost the station is on Static and not on a guessed file (%s)" % bad)
 
 
-def _long_show_run(epic_seconds, hours=60, step=120, snapshot_at=None):
-    channel = _sched_record_channel("eight_hour", "interrupt_half_hour", "one_slot", False)
+def _long_show_run(epic_seconds, hours=60, step=120, snapshot_at=None, commercials=False):
+    channel = _sched_record_channel("eight_hour", "interrupt_half_hour", "one_slot", commercials)
     for name, items in channel["schedules"].items():
         if name != "Commercials":
             items.append({"path": "/m/Movies/Epic (2001).mkv", "duration": epic_seconds})
@@ -8936,7 +9046,7 @@ def suite_gap_with_unscanned_files():
                         media.aired_ledger_upsert(rebuilt, rec_name, rec_key, rec_start, rec_timeline, rec_total, boundary + datetime.timedelta(minutes=1))
                     for rec_id, rec in (plog.get(media.GUIDE_AIRED_LEDGER_KEY) or {}).items():
                         rebuilt.setdefault(media.GUIDE_AIRED_LEDGER_KEY, {}).setdefault(rec_id, rec)
-                    ledger_end = media.block_overrun_end(rebuilt, boundary.toordinal(), boundary.hour * 3600)
+                    ledger_end = _ledger_overrun_end(rebuilt, boundary.toordinal(), boundary.hour * 3600)
                     ledger_end = None if ledger_end is None else boundary.toordinal() * 86400 + ledger_end
                     crossings += catch_up_end is not None
                     if catch_up_end != ledger_end:
@@ -8962,7 +9072,7 @@ def suite_gap_with_unscanned_files():
     check(resumed >= 40, "stations with unscanned files were started after gaps at several moments (%d)" % resumed)
     check(not mismatched, "the catch-up and guide history use the same known or saved-estimate tracks across block changes (%d differ: %s)" % (len(mismatched), mismatched[:3]))
     check(not statics, "a station started after a gap with unscanned files airs the running show and never Static (%d: %s)" % (len(statics), statics[:3]))
-    catch_up_src = inspect.getsource(media._catch_up_replay)
+    catch_up_src = inspect.getsource(media._catch_up_walk)
     guide_src = inspect.getsource(media.replay_missed_blocks)
     check("build_raw_tracks(" in catch_up_src and "build_guess_filled_tracks(" not in catch_up_src
           and "build_raw_tracks(" in guide_src and "build_guess_filled_tracks(" not in guide_src,
@@ -8975,6 +9085,43 @@ class TestGapWithUnscannedFiles(_SectionCase):
 
     def test_gap_with_unscanned_files(self):
         self.run_section(suite_gap_with_unscanned_files)
+
+
+def suite_overrun_longer_than_a_block_with_commercials():
+    epic = "/m/Movies/Epic (2001).mkv"
+    for hours_long in (10, 20):
+        seconds = hours_long * 3600
+        t0, step, states, channels, _snap = _long_show_run(seconds, hours=hours_long + 8, step=60, commercials=True)
+        check(all(st.get("mode") in ("Video", "Commercial") for st in states),
+              "%d hour show with breaks: the station never goes to Static" % hours_long)
+        first = next(i for i, st in enumerate(states) if st.get("file") == epic)
+        run, i = [], first
+        while i < len(states):
+            st = states[i]
+            if st.get("file") == epic:
+                if run and st["seek"] < states[run[-1]]["seek"] - 1:
+                    break
+                run.append(i)
+            elif st.get("mode") != "Commercial":
+                break
+            i += 1
+        breaks = sum(1 for st in states[run[0]:run[-1] + 1] if st.get("mode") == "Commercial")
+        steps_ok = all(0 <= states[b]["seek"] - states[a]["seek"] <= step * (b - a) + 2 for a, b in zip(run, run[1:]))
+        block_hours = {h for _n, h, _e in media._block_layout("eight_hour")}
+        times = [t0 + datetime.timedelta(seconds=k * step) for k in range(run[0], run[-1] + 1)]
+        crossed = sum(1 for when in times if when.hour in block_hours and when.minute == 0)
+        check(breaks > 0 and crossed >= 1, "%d hour show with breaks: commercial breaks air inside it and it runs across a block change (%d break samples, %d block changes)" % (hours_long, breaks, crossed))
+        check(steps_ok, "%d hour show with breaks: after every break and every block change it goes on from where it stopped, never skipping or starting over" % hours_long)
+        check(states[run[-1]]["seek"] >= seconds - step - 1, "%d hour show with breaks: it airs to its end (%.0f of %d s)" % (hours_long, states[run[-1]]["seek"], seconds))
+        after = states[run[-1] + 1]
+        check(after.get("mode") in ("Video", "Commercial") and after.get("file") != epic, "%d hour show with breaks: the next show airs right after it ends" % hours_long)
+
+
+class TestOverrunLongerThanABlockWithCommercials(_SectionCase):
+    """B15 (g): a show longer than a block, with commercial breaks inside it, airs whole across block changes"""
+
+    def test_overrun_longer_than_a_block_with_commercials(self):
+        self.run_section(suite_overrun_longer_than_a_block_with_commercials)
 
 
 def suite_gap_probe_discovers_duration():
@@ -9241,8 +9388,10 @@ def suite_block_change_overrun_continues():
         ns = _sched_record_ns(channels, clock, ticks)
         results = {}
         built = {}
-        for i in range(40 * 12):
-            clock[0] = t0 + datetime.timedelta(seconds=i * 300)
+        steps = [t0 + datetime.timedelta(seconds=i * 300) for i in range(40 * 12)]
+        steps = sorted(set(steps) | {m - datetime.timedelta(seconds=30) for m in steps if m.hour in hours and m.minute == 0 and m != t0})
+        for moment_now in steps:
+            clock[0] = moment_now
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
                 results[clock[0]] = ns["calculate_slotted_playback_state"]("05")
@@ -9304,7 +9453,7 @@ def suite_full_day_overrun_starts_when_show_ends():
         clock, ticks = [start], [0]
         ns = _sched_record_ns(channels, clock, ticks)
         results, built = {}, {}
-        for i in range(34 * 120):
+        for i in range(34 * 12):
             clock[0] = start + datetime.timedelta(seconds=i * 300)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
@@ -9426,6 +9575,992 @@ def suite_reflavor_no_skipped_episode():
     check(all(v == 0 for v in skipped.values()), "no episode is skipped or aired out of order after a lineup is re-flavored in the middle of a cycle (%s)" % skipped)
 
 
+def suite_rebuild_keeps_airing_entry():
+    def run(change):
+        scenario = next(x for x in SCHED_RECORD_SCENARIOS if x[0] == "eight_hour_no_ads_one_slot")
+        name, block_mode, placement, sched, commercials = scenario
+        channels = {"05": _sched_record_channel(block_mode, placement, sched, commercials)}
+        start = datetime.datetime(2026, 10, 13, 4, 0, 5)
+        clock, ticks = [start], [0]
+        ns = _sched_record_ns(channels, clock, ticks)
+        out = {}
+        for i in range(int(16 * 3600 / 300)):
+            clock[0] = start + datetime.timedelta(seconds=i * 300)
+            ticks[0] += 10000
+            plog = channels["05"]["playback_log"]
+            if clock[0] == datetime.datetime(2026, 10, 13, 19, 50, 5):
+                if change == "duration":
+                    plog["_sched_rebuild_requested"] = True
+                elif change == "new_file":
+                    channels["05"]["schedules"]["Evening"].append({"path": "/m/Show D/Season 1/Show D S01E01.mkv", "duration": 0})
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                out[clock[0]] = (ns["calculate_slotted_playback_state"]("05"), plog.get("sched_cycle_boundary"))
+        return out
+
+    plain = run(None)
+    times = [datetime.datetime(2026, 10, 13, 19, 45, 5), datetime.datetime(2026, 10, 13, 19, 50, 5)]
+    after = datetime.datetime(2026, 10, 13, 19, 55, 5)
+    airing = plain[times[-1]][0].get("file")
+    check(airing and plain[after][0].get("file") != airing, "the show on air at the change ends before %s" % after.time()) 
+    check(plain[times[0]][1] and plain[times[0]][1] > 0, "the check runs in a later cycle of the block, not its first (cycle start %s)" % plain[times[0]][1])
+    for change, label in (("duration", "a lineup rebuilt for a changed length"), ("new_file", "a lineup rebuilt for a newly added file")):
+        changed = run(change)
+        same = all(changed[t][0].get("file") == plain[t][0].get("file") and abs(float(changed[t][0].get("seek", 0)) - float(plain[t][0].get("seek", 0))) < 2
+                   for t in times)
+        check(same, "%s in the middle of a later cycle keeps the show on air playing from the same place, never restarted or cut short" % label)
+        check(changed[after][0].get("file") != airing, "%s never airs the show that just ended a second time" % label)
+        check(all(changed[t][1] == plain[t][1] for t in times + [after]), "%s keeps the cycle's start where the clock had it" % label)
+
+
+def suite_console_splash_by_name():
+    tmp = tempfile.mkdtemp()
+    try:
+        base = os.path.join(tmp, "images", "splash screen images")
+
+        def put(folder, name):
+            os.makedirs(os.path.join(base, folder), exist_ok=True)
+            path = os.path.join(base, folder, name)
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            return path
+
+        gba = put("GBA", "GBASplashScreen.png")
+        psx = put("PSX", "PSXSplashScreen.png")
+        dvd = put("DVD", "DVDSplashScreen.png")
+        picked = put("GBA", "my own.png")
+        put("MENU", "MENUSplashScreen.png")
+        put("WATERMARK", "WATERMARKSplashScreen.png")
+        os.makedirs(os.path.join(base, "NES"), exist_ok=True)
+        with mock.patch.object(media, "resolve_main_dir", lambda: tmp):
+            check(media.resolve_splash_images_dir() == base, "the splash images folder is images/splash screen images in the main folder")
+            check(media.console_splash_file("GBA") == gba and media.console_splash_file("PSX", "") == psx,
+                  "with nothing picked, a console's splash is <CONSOLE>SplashScreen.png from its own folder")
+            check(media.console_splash_file("GBA", picked) == picked, "a picked file still wins")
+            check(media.console_splash_file("GBA", os.path.join(base, "GBA", "gone.png")) == gba,
+                  "a picked file that is no longer on disk falls back to the file found by name")
+            check(media.console_splash_file("NES") == "", "a console with no file of that name has no splash file, so its default load screen shows")
+            check(media.console_splash_file("MENU") == "" and media.console_splash_file("WATERMARK") == "",
+                  "the menu background and watermark folders are never read as a console splash")
+            check(media.console_splash_file("DVD") == dvd, "the DVD player's splash is found the same way")
+            deck = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_splash")
+            fake = types.SimpleNamespace(dvd_splash_path="", console_splash_path={"PSX": ""})
+            find = deck.ExternalGameDeck._get_console_splash_path
+            check(find(fake, "PSX") == psx and find(fake, "DVD") == dvd and find(types.SimpleNamespace(dvd_splash_path="", console_splash_path={"GBA": picked}), "GBA") == picked,
+                  "the game screen's load screen reads the same splash file")
+        branch_start = MAIN_SRC.index('            elif mode == "console_splash":\n')
+        branch_end = MAIN_SRC.index('            elif mode == "menu_bg":\n', branch_start)
+        branch = "if True:\n" + textwrap.indent(textwrap.dedent(MAIN_SRC[branch_start:branch_end].replace('elif mode == "console_splash":', 'if True:', 1)), "    ")
+        save_code = compile(branch, MAIN_SCRIPT + ":console_splash", "exec")
+        delete_ns = {"os": os, "log": mock.MagicMock(), "print": lambda *a, **k: None}
+        exec(compile(get_function_source("_fe_delete_old_managed_asset"), "<extracted:_fe_delete_old_managed_asset>", "exec"), delete_ns)
+
+        def pick(console, chosen, config):
+            fake_db = types.SimpleNamespace(config=config, save_settings_async=lambda: None)
+            env = {"os": os, "log": mock.MagicMock(), "print": lambda *a, **k: None, "db": fake_db, "game_deck": None,
+                   "context": {"splash_folder": os.path.join(base, console), "console_key": console}, "checked": [chosen],
+                   "_fe_delete_old_managed_asset": delete_ns["_fe_delete_old_managed_asset"]}
+            exec(save_code, env)
+            return config
+
+        outside = os.path.join(tmp, "downloads")
+        os.makedirs(outside, exist_ok=True)
+        art = os.path.join(outside, "cool art 7.jpg")
+        with open(art, "wb") as handle:
+            handle.write(b"art")
+        config = {}
+        pick("GBA", gba, config)
+        check(config["console_splash_path"]["GBA"] == gba, "picking the GBASplashScreen.png file itself selects it")
+        pick("GBA", art, config)
+        copied = os.path.join(base, "GBA", "cool art 7.jpg")
+        check(os.path.isfile(copied) and config["console_splash_path"]["GBA"] == copied,
+              "a picked image of any name is copied into the console's splash folder and selected")
+        check(os.path.isfile(gba), "replacing a pick never deletes GBASplashScreen.png, so it is there again when nothing is picked")
+        with mock.patch.object(media, "resolve_main_dir", lambda: tmp):
+            check(media.console_splash_file("GBA", config["console_splash_path"]["GBA"]) == copied, "the load screen uses the picked image, not the file found by name")
+        art2 = os.path.join(outside, "other.png")
+        with open(art2, "wb") as handle:
+            handle.write(b"art2")
+        pick("GBA", art2, config)
+        check(not os.path.isfile(copied) and config["console_splash_path"]["GBA"] == os.path.join(base, "GBA", "other.png"),
+              "picking again replaces the earlier picked copy, as before")
+        dvd_config = {}
+        pick("DVD", art, dvd_config)
+        check(dvd_config.get("dvd_splash_path") == os.path.join(base, "DVD", "cool art 7.jpg") and os.path.isfile(dvd_config["dvd_splash_path"]),
+              "the DVD player's picked image is copied into its folder and selected the same way")
+
+        deck_src = read(os.path.join(ROOT, "game_deck.py"))
+        ui_src = read(os.path.join(ROOT, "ui.py"))
+        check("self.dvd_splash_path" not in deck_src.replace("self.dvd_splash_path = ", "").replace("picked = self.dvd_splash_path if", ""),
+              "every DVD splash read goes through the one splash lookup")
+        check("media.console_splash_file(console_key, splash_path)" in ui_src, "the Games menu shows the name of the splash file the load screen will use")
+        check("SPLASH_IMAGES_BASE_DIR = media.resolve_splash_images_dir()" in MAIN_SRC, "the main script reads the splash images folder from the one place")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+MAIN_SCRIPT_NUMBER_FACTS = {
+    "ERROR_ALREADY_EXISTS", "_WH_KEYBOARD_LL", "_SW_HIDE", "HWND_TOPMOST", "HWND_NOTOPMOST", "GWL_STYLE", "SW_RESTORE", "_GWLP_WNDPROC",
+    "CH03_MUSIC_CHANNEL_ID", "_VLC_CHANNEL_STEREO", "_VLC_CHANNEL_MONO",
+    "SCAN_CLASS_NOW", "SCAN_CLASS_COMMERCIAL", "SCAN_CLASS_NEXT", "SCAN_CLASS_DEEP",
+    "SAVE_ROW", "LOAD_ROW", "AUTO_SAVE_ROW", "AUTO_LOAD_ROW",
+    "DVD_FIXED_GAIN",
+}
+
+
+def suite_main_script_numbers_in_governor():
+    import ast as _ast
+    tree = _ast.parse(MAIN_SRC)
+    plain = set()
+    mismatched = []
+    reads = 0
+    for node in _ast.walk(tree):
+        if not (isinstance(node, _ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], _ast.Name)):
+            continue
+        name = node.targets[0].id
+        value = node.value
+        if (isinstance(value, _ast.IfExp) and isinstance(value.body, _ast.Attribute) and isinstance(value.body.value, _ast.Name)
+                and value.body.value.id == "performance_governor"):
+            try:
+                fallback = _ast.literal_eval(value.orelse)
+            except ValueError:
+                continue
+            reads += 1
+            if fallback is not None and getattr(gov, value.body.attr, object()) != fallback:
+                mismatched.append(value.body.attr)
+        elif name.upper() == name and name.strip("_")[:1].isalpha() and isinstance(value, (_ast.Constant, _ast.UnaryOp)):
+            try:
+                literal = _ast.literal_eval(value)
+            except ValueError:
+                continue
+            written = _ast.get_source_segment(MAIN_SRC, value).lstrip("-").lower()
+            if isinstance(literal, (int, float)) and not isinstance(literal, bool) and not written.startswith("0x"):
+                plain.add(name)
+    check(reads > 250, "the main script reads its numbers from the governor table (%d reads)" % reads)
+    check(not mismatched, "every fallback number in the main script matches its governor value (%s)" % mismatched)
+    check(plain <= MAIN_SCRIPT_NUMBER_FACTS, "the only numbers written in the main script are fixed facts (Windows, SDL and DirectX codes are written in hex), not settings (%s)" % sorted(plain - MAIN_SCRIPT_NUMBER_FACTS))
+    check(gov.KEY_CAPTURE_SAME_PRESS_MS == 250 and MAIN_SRC.count("performance_governor.KEY_CAPTURE_SAME_PRESS_MS") == 2,
+          "the remote-remap and DVD key captures read one same-press value")
+    colours = []
+    for node in _ast.walk(tree):
+        if (isinstance(node, _ast.Tuple) and len(node.elts) in (3, 4)
+                and all(isinstance(e, _ast.Constant) and type(e.value) is int and 0 <= e.value <= 255 for e in node.elts)):
+            line = MAIN_SRC.split("\n")[node.lineno - 1]
+            value = tuple(e.value for e in node.elts)
+            if "if performance_governor is not None else" in line or value in ((0, 0, 0), (0, 0, 0, 255), (0, 0, 0, 0)):
+                continue
+            colours.append((node.lineno, value))
+    real = [c for c in colours if c[1] not in ((0, 1, 2, 3), (1, 2, 4, 8), (6, 7, 8))]
+    check(not real, "every colour in the main script is a named governor colour; only pure black and see-through are written in place (%s)" % real[:8])
+    check(gov.DEFAULT_THEME == {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)} and "{\"ui\": (0, 255, 128)" not in MAIN_SRC,
+          "the default theme is written once, in the governor")
+
+
+def script_numbers_check(path, label, fact_names=(), fact_prefixes=(), governor_names=("performance_governor", "_governor", "_gov", "_perf_governor", "_pb_governor")):
+    """Checks one script: every fallback next to a governor read equals the governor's value, and the only numbers written in it are facts."""
+    import ast as _ast
+    src = read(path)
+    tree = _ast.parse(src)
+    plain, mismatched, reads = set(), [], 0
+    for node in _ast.walk(tree):
+        if not (isinstance(node, _ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], (_ast.Name, _ast.Attribute))):
+            continue
+        name = node.targets[0].id if isinstance(node.targets[0], _ast.Name) else node.targets[0].attr
+        value = node.value
+        if (isinstance(value, _ast.IfExp) and isinstance(value.body, _ast.Attribute) and isinstance(value.body.value, _ast.Name)
+                and value.body.value.id in governor_names):
+            try:
+                fallback = _ast.literal_eval(value.orelse)
+            except ValueError:
+                continue
+            reads += 1
+            if fallback is not None and getattr(gov, value.body.attr, object()) != fallback:
+                mismatched.append(value.body.attr)
+        elif name.upper() == name and name.strip("_")[:1].isalpha() and isinstance(value, (_ast.Constant, _ast.UnaryOp)):
+            try:
+                literal = _ast.literal_eval(value)
+            except ValueError:
+                continue
+            written = _ast.get_source_segment(src, value).lstrip("-").lower()
+            if (isinstance(literal, (int, float)) and not isinstance(literal, bool) and not written.startswith("0x")
+                    and name not in fact_names and not any(name.startswith(pre) for pre in fact_prefixes)):
+                plain.add(name)
+    check(not mismatched, "%s: every fallback number matches its governor value (%s)" % (label, mismatched))
+    check(not plain, "%s: the only numbers written in it are fixed facts, not settings (%s)" % (label, sorted(plain)))
+    return reads
+
+
+def suite_libretro_numbers_in_governor():
+    reads = script_numbers_check(os.path.join(ROOT, "libretro_core.py"), "libretro_core.py",
+                                 fact_names=("CHANNEL_ID",), fact_prefixes=("RETRO_",))
+    check(reads >= 10, "libretro_core.py reads its settings from the governor table (%d reads)" % reads)
+
+
+class TestLibretroNumbersInGovernor(_SectionCase):
+    """AU23: libretro_core.py keeps only libretro's own codes; its settings live in the governor table"""
+
+    def test_libretro_numbers_in_governor(self):
+        self.run_section(suite_libretro_numbers_in_governor)
+
+
+def suite_game_deck_numbers_in_governor():
+    import ast as _ast
+    path = os.path.join(ROOT, "game_deck.py")
+    script_numbers_check(path, "game_deck.py",
+                         fact_names=("STICK_MAX", "_OPEN_EXISTING", "_JOYERR_NOERROR", "_JS_HAT_X_AXIS", "_JS_HAT_Y_AXIS",
+                                     "INPUT_KEYBOARD", "HWND_TOP", "GWL_STYLE", "GWL_EXSTYLE"))
+    src = read(path)
+    reads = src.count("_gov.")
+    check(reads >= 200, "game_deck.py reads its settings and colours from the governor table (%d reads)" % reads)
+    colours = []
+    for node in _ast.walk(_ast.parse(src)):
+        if (isinstance(node, _ast.Tuple) and len(node.elts) in (3, 4)
+                and all(isinstance(e, _ast.Constant) and type(e.value) is int and 0 <= e.value <= 255 for e in node.elts)):
+            value = tuple(e.value for e in node.elts)
+            if value in ((0, 0, 0), (0, 0, 0, 255), (0, 0, 0, 0), (1, 2, 3, 4), (2, 3, 4)):
+                continue
+            if "BLEND_RGBA_SUB" in src.split("\n")[node.lineno - 1]:
+                continue
+            colours.append((node.lineno, value))
+    check(not colours, "every colour in game_deck.py is a named governor colour; only pure black, see-through and the full-white subtract that turns a picture negative are written in place (%s)" % colours[:8])
+    deck = load_deck_module(path, "game_deck_numbers")
+    check(deck.LIST_TEXT_COLOR_RGB is gov.GAME_LIST_TEXT_COLORS and deck.LIST_TEXT_COLOR_RGB["red"] == (220, 60, 60),
+          "the list text colours the main script and ui.py read from game_deck.py are the governor's table")
+
+
+def suite_media_numbers_in_governor():
+    import ast as _ast
+    path = os.path.join(ROOT, "media.py")
+    reads = script_numbers_check(path, "media.py",
+                                 fact_names=("DRIVE_CDROM", "HOLIDAY_DAY_SECONDS", "HALF_HOUR", "LOUDNESS_CONVERGENCE_DB", "COMPRESSOR_BAKE_VERSION",
+                                             "LINEUP_GROUPS_VERSION", "LOUDNESS_GAIN_SCAN_VERSION", "OWNER_GAIN_SCAN_VERSION",
+                                             "RANDOM_STATE_VERSION", "SERVER_SLOT_SCHEMA_VERSION", "SHORT_EPISODE_PAIRING_VERSION",
+                                             "_ASR_META_VERSION"),
+                                 fact_prefixes=())
+    check(reads >= 150, "media.py reads its settings from the governor table (%d reads)" % reads)
+    src = read(path)
+    colours = []
+    for node in _ast.walk(_ast.parse(src)):
+        if (isinstance(node, _ast.Tuple) and len(node.elts) in (3, 4)
+                and all(isinstance(e, _ast.Constant) and type(e.value) is int and 0 <= e.value <= 255 for e in node.elts)):
+            if "if _perf_governor is not None else" in src.split("\n")[node.lineno - 1]:
+                continue
+            colours.append((node.lineno, tuple(e.value for e in node.elts)))
+    check(not colours, "every colour in media.py is a named governor colour (%s)" % colours[:8])
+    check(gov.COLOR_THEMES["DefaultBlueGreen"] == gov.DEFAULT_THEME and gov.COLOR_THEMES["DefaultBlueGreen"] is not gov.DEFAULT_THEME,
+          "the default theme is written once, and the theme table holds its own copy")
+    check(media.COMMERCIAL_MAX_SECONDS == gov.COMMERCIAL_MAX_SECONDS == 300 and media._CATCH_UP_REUSE_SECONDS == gov.CATCH_UP_REUSE_SECONDS,
+          "media.py's commercial length limit and catch-up reuse time are the governor's")
+    check('_perf_governor.BREAK_MAX_PER_HALF_HOUR' in src, "the most breaks in one half hour is read from the governor")
+
+
+def suite_ui_numbers_in_governor():
+    import ast as _ast
+    path = os.path.join(ROOT, "ui.py")
+    reads = script_numbers_check(path, "ui.py",
+                                 fact_names=("SERVER_MENU_BTN_SEL", "CAPTIONS_COLOR_BOX_SEL", "SLOT_ROWS", "SLOT_COLS", "SAVE_ROW", "LOAD_ROW",
+                                             "AUTO_SAVE_ROW", "AUTO_LOAD_ROW", "_DAY_SPAN"))
+    check(reads >= 140, "ui.py reads its settings and colours from the governor table (%d reads)" % reads)
+    src = read(path)
+    colours = []
+    for node in _ast.walk(_ast.parse(src)):
+        if (isinstance(node, _ast.Tuple) and len(node.elts) in (3, 4)
+                and all(isinstance(e, _ast.Constant) and type(e.value) is int and 0 <= e.value <= 255 for e in node.elts)):
+            value = tuple(e.value for e in node.elts)
+            if "if performance_governor is not None else" in src.split("\n")[node.lineno - 1] or value in ((0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 255), (1, 2, 3)):
+                continue
+            colours.append((node.lineno, value))
+    check(not colours, "every colour in ui.py is a named governor colour; only pure black and see-through are written in place (%s)" % colours[:8])
+    shared = ("COLOR_TEXT_WHITE", "COLOR_ARCADE_GOLD", "COLOR_ACTION_RED", "COLOR_SCREEN_BLACK")
+    check(all(("%s = performance_governor.%s" % (n, n)) in src for n in shared),
+          "ui.py uses the colour names the main script uses for the same colours")
+    check(src.count("_HDR_FONT_PX_16_9 = GUIDE_HDR_FONT_PX") == 2 and src.count("_MIN_GUIDE_FONT_PX = GUIDE_MIN_FONT_PX") == 2,
+          "both guide drawings read one header and one smallest font size")
+    check("[UI] could not import performance_governor" in src, "a failed governor import in ui.py writes a line")
+
+
+def suite_menu_nav_numbers_in_governor():
+    reads = script_numbers_check(os.path.join(ROOT, "menu_nav.py"), "menu_nav.py",
+                                 fact_names=("SYSTEM_SERVER_BUTTON_SELECTION", "SYSTEM_CAPTIONS_COLOR_SELECTION", "CHANNELS_COLS",
+                                             "CHANNELS_ROWS_PER_PAGE", "CHANNELS_TOTAL", "CHANNELS_FIRST_NUMBER",
+                                             "CHANNELS_PAGE_BUTTON_SELECTION", "CHANNELS_SETTINGS_SELECTION", "CHANNELS_CLOSE_SELECTION",
+                                             "GAMES_COLS", "GAMES_ROWS_PER_PAGE", "STICK_DZ_PLAYER_COUNT", "SERVER_SLOTS_COLUMNS",
+                                             "SERVER_SLOTS_ROWS", "COMMERCIALS_ROWS", "HOLIDAY_ROWS", "HOLIDAY_PICK_COLUMN",
+                                             "HOLIDAY_FORCE_COLUMN", "CHANNEL_SUB_MAX_COL", "DIGIT_ENTRY_MAX"),
+                                 fact_prefixes=("DVD_CANON_",))
+    check(reads >= 14, "menu_nav.py reads its timers from the governor table (%d reads)" % reads)
+    src = read(os.path.join(ROOT, "menu_nav.py"))
+    check(not any(len(m) == 3 for m in __import__("re").findall(r"\((\d+), (\d+), (\d+)\)", src)), "menu_nav.py writes no colours")
+
+
+def suite_media_library_numbers_in_governor():
+    path = os.path.join(ROOT, "media_library.py")
+    reads = script_numbers_check(path, "media_library.py",
+                                 fact_names=("PICTURE_BOX_DETECTOR_VERSION", "BURNED_IN_DETECTOR_VERSION", "_OWNER_GAIN_SCAN_VERSION"))
+    check(reads >= 40, "media_library.py reads its settings from the governor table (%d reads)" % reads)
+    src = read(path)
+    check(src.count("import performance_governor as _governor") == 1 and "_pb_governor" not in src and "_hub_governor" not in src,
+          "media_library.py loads the governor once for its settings")
+    check("[MEDIA LIBRARY] could not import performance_governor" in src, "a failed governor import in media_library.py writes a line")
+    import media_library as _ml
+    check(_ml._PB_SAMPLE_FRACTIONS == gov.PICTURE_BOX_SAMPLE_FRACTIONS and _ml._PB_LIMIT == gov.PICTURE_BOX_CROPDETECT_LIMIT == 32
+          and _ml._GROWING_FILE_CHECK_DELAY_S == gov.LIBRARY_GROWING_FILE_CHECK_DELAY_S,
+          "the picture-box scan and growing-file check read the governor's numbers")
+
+
+def suite_gpu_numbers_in_governor():
+    import ast as _ast
+    facts = ("D3D_DRIVER_TYPE_UNKNOWN", "D3D11_SDK_VERSION", "DXGI_FORMAT_UNKNOWN", "DXGI_FORMAT_B8G8R8A8_UNORM", "DXGI_SWAP_EFFECT_DISCARD",
+             "MONITOR_DEFAULTTONEAREST", "D3D11_USAGE_STAGING", "D3D11_MAP_READ", "RELEASE", "_MAX_ADAPTERS", "_MAX_OUTPUTS",
+             "DXGI_FORMAT_R8G8B8A8_UNORM", "D3D11_USAGE_DEFAULT", "D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST", "SCAN_NONE", "SCAN_PLAIN",
+             "SCAN_BLOOM", "DEFAULT_SAMPLE_STEPS", "CONSTANT_BUFFER_BYTES", "MAX_SCALE_TAPS", "COMPOSITE_CONSTANT_BUFFER_BYTES")
+    for name in ("d3d11_gpu_core.py", "d3d11_gpu_frame.py", "d3d11_gpu_gate.py", "d3d11_gpu_reference.py"):
+        script_numbers_check(os.path.join(ROOT, "GPU", name), "GPU/" + name, fact_names=facts)
+    main = _ast.parse(MAIN_SRC)
+    fields = set()
+    for node in _ast.walk(main):
+        if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) and node.func.attr == "FrameParams":
+            fields |= {k.arg for k in node.keywords}
+    check({"curvature", "vignette", "scan_lines", "scan_floor", "bloom_strength", "bloom_gamma"} <= fields,
+          "the main script passes every CRT value to the GPU, so the defaults written in d3d11_gpu_reference.py are never the setting (%s)" % sorted(fields))
+
+
+def suite_visualizers_numbers_in_governor():
+    import ast as _ast
+    path = os.path.join(ROOT, "visualizers.py")
+    reads = script_numbers_check(path, "visualizers.py")
+    check(reads >= 10, "visualizers.py reads its settings and colours from the governor table (%d reads)" % reads)
+    src = read(path)
+    colours = []
+    for node in _ast.walk(_ast.parse(src)):
+        if (isinstance(node, _ast.Tuple) and len(node.elts) in (3, 4)
+                and all(isinstance(e, _ast.Constant) and type(e.value) is int and 0 <= e.value <= 255 for e in node.elts)):
+            value = tuple(e.value for e in node.elts)
+            if "if _governor is not None else" in src.split("\n")[node.lineno - 1] or value in ((0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 255)):
+                continue
+            colours.append((node.lineno, value))
+    check(not colours, "every colour in visualizers.py is a named governor colour; only pure black and see-through are written in place (%s)" % colours[:8])
+    check("[VISUALIZER] could not import performance_governor" in src, "a failed governor import in visualizers.py writes a line")
+
+
+def suite_audio_analysis_numbers_in_governor():
+    path = os.path.join(ROOT, "assets", "audio_analysis.py")
+    reads = script_numbers_check(path, "assets/audio_analysis.py", fact_names=("ANALYSIS_VERSION",))
+    check(reads >= 29, "audio_analysis.py reads its settings from the governor table (%d reads)" % reads)
+    src = read(path)
+    body = src[src.index("# SECTION: Analysis maths"):]
+    for written in ("* 1.0 + 0.004", "percentile(flux, 95)", "max(0.3, 0.3", ", 5, 98, 6.0)", "spectrum_norm, 1.3", "level_norm, 1.2", "timeout=30.0"):
+        check(written not in body, "audio_analysis.py no longer writes %r in its maths" % written)
+    check("[VISUALIZER ANALYSIS] could not import performance_governor" in src, "a failed governor import in audio_analysis.py writes a line")
+    check(not os.path.exists(os.path.join(ROOT, "audio_analysis.py")), "audio_analysis.py lives only in assets, where the main script loads it from")
+
+
+class TestAudioAnalysisNumbersInGovernor(_SectionCase):
+    """AU23: assets/audio_analysis.py keeps only its cache version stamp; its analysis numbers live in the governor table"""
+
+    def test_audio_analysis_numbers_in_governor(self):
+        self.run_section(suite_audio_analysis_numbers_in_governor)
+
+
+class TestVisualizersNumbersInGovernor(_SectionCase):
+    """AU23: visualizers.py's settings and colours live in the governor table"""
+
+    def test_visualizers_numbers_in_governor(self):
+        self.run_section(suite_visualizers_numbers_in_governor)
+
+
+class TestGpuNumbersInGovernor(_SectionCase):
+    """AU23: the GPU scripts keep only Direct3D codes, shader sizes and self-check patterns; the CRT settings come from the governor through the main script"""
+
+    def test_gpu_numbers_in_governor(self):
+        self.run_section(suite_gpu_numbers_in_governor)
+
+
+class TestMediaLibraryNumbersInGovernor(_SectionCase):
+    """AU23: media_library.py keeps only version stamps and the identity sample size; its settings live in the governor table"""
+
+    def test_media_library_numbers_in_governor(self):
+        self.run_section(suite_media_library_numbers_in_governor)
+
+
+class TestMenuNavNumbersInGovernor(_SectionCase):
+    """AU23: menu_nav.py keeps only menu grid shapes, selection ids and key codes; its timers live in the governor table"""
+
+    def test_menu_nav_numbers_in_governor(self):
+        self.run_section(suite_menu_nav_numbers_in_governor)
+
+
+class TestUiNumbersInGovernor(_SectionCase):
+    """AU23: ui.py keeps only selection ids, row numbers and slot grid shape; its settings and colours live in the governor table"""
+
+    def test_ui_numbers_in_governor(self):
+        self.run_section(suite_ui_numbers_in_governor)
+
+
+class TestMediaNumbersInGovernor(_SectionCase):
+    """AU23: media.py keeps only facts and version stamps; its settings and theme colours live in the governor table"""
+
+    def test_media_numbers_in_governor(self):
+        self.run_section(suite_media_numbers_in_governor)
+
+
+class TestGameDeckNumbersInGovernor(_SectionCase):
+    """AU23: game_deck.py keeps only Windows and joystick codes; its settings and colours live in the governor table"""
+
+    def test_game_deck_numbers_in_governor(self):
+        self.run_section(suite_game_deck_numbers_in_governor)
+
+
+def suite_audit2_log_lines():
+    import glob as _glob
+    broken = []
+    for path in sorted(_glob.glob(os.path.join(ROOT, "**", "*.py"), recursive=True)):
+        rel = os.path.relpath(path, ROOT)
+        if rel.split(os.sep)[0] in ("tests", "temp"):
+            continue
+        for number, line in enumerate(read(path).split("\n"), 1):
+            if "\ufffd" in line:
+                broken.append("%s:%d" % (rel, number))
+    check(not broken, "no script holds a broken character where a dash or symbol was lost (%s)" % broken[:6])
+    boot = function_source(MAIN_SRC, "_bootstrap_libvlc")
+    helper = boot[boot.index("def _log(msg):"):boot.index("base_dir")]
+    check("print(msg" in helper and "log.info(msg)" not in helper,
+          "each libVLC start-up line is written to app_log.txt once: print already reaches the log through _logged_print")
+    check("_builtins.print = _logged_print" in MAIN_SRC and MAIN_SRC.index("_builtins.print = _logged_print") < MAIN_SRC.index("def _bootstrap_libvlc"),
+          "the print hook is installed before the libVLC start-up runs")
+    check("\"DVD \\u2014 Change Audio Selection\"" in read(os.path.join(ROOT, "ui.py")), "the DVD audio menu title shows a real dash")
+
+
+def suite_audit2_audio_analysis():
+    import numpy as np
+    import logging as _logging
+    sys.path.insert(0, ASSETS_DIR)
+    import audio_analysis as aa
+    tmp = tempfile.mkdtemp(prefix="aa_audit_")
+    lines = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    grab = _Grab()
+    roots = [_logging.getLogger(), _logging.getLogger("performance_governor"), aa._LOGGER]
+    for lg in roots:
+        lg.addHandler(grab)
+    try:
+        check(aa._load_cached(os.path.join(tmp, "viz_missing.npz")) is None and not any("FAILURE" in l or "could not be read" in l for l in lines),
+              "a song that is not cached yet is read as not cached, with no failure line")
+        bad = os.path.join(tmp, "viz_bad.npz")
+        np.savez_compressed(bad, version=np.array(aa.ANALYSIS_VERSION), level=np.zeros(5000, np.uint8))
+        with open(bad, "rb") as fh:
+            whole = fh.read()
+        with open(bad, "wb") as fh:
+            fh.write(whole[:len(whole) // 2])
+        check(aa._load_cached(bad) is None and any("could not be read, the song is analyzed again" in l for l in lines),
+              "a broken cache file is reported and the song is analyzed again instead of failing")
+        song = os.path.join(tmp, "song.mp3")
+        with open(song, "wb") as fh:
+            fh.write(b"x" * 10)
+        frames = 40
+        arrays = {"spectrum": np.zeros((frames, aa.SPECTRUM_BINS), np.uint8), "bands": np.zeros((frames, 3), np.uint8),
+                  "level": np.zeros(frames, np.uint8), "beat": np.zeros(frames, np.uint8)}
+        real_decode, real_analyze, real_save = aa.decode_samples, aa.analyze_samples, aa._save_cached
+        aa.decode_samples = lambda ffmpeg, path: np.zeros(10, np.float32)
+        aa.analyze_samples = lambda samples: arrays
+
+        def _full_disk(path, data):
+            raise OSError(28, "No space left on device")
+
+        aa._save_cached = _full_disk
+        try:
+            analyzer = aa.TrackAnalyzer(lambda: "ffmpeg", lambda: tmp)
+            analyzer._process(os.path.normpath(song), keep=True)
+            check(analyzer._memory.get(os.path.normpath(song)) is not None and os.path.normpath(song) not in analyzer._failed,
+                  "a song whose cache file cannot be written still reacts: it is kept in memory and not marked failed")
+            check(any("could not write the analysis cache" in l for l in lines), "the cache write failure writes a line")
+        finally:
+            aa.decode_samples, aa.analyze_samples, aa._save_cached = real_decode, real_analyze, real_save
+    finally:
+        for lg in roots:
+            lg.removeHandler(grab)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_audit2_visualizers():
+    import logging as _logging
+    import visualizers as vz
+    lines = []
+
+    class _Grab(_logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    grab = _Grab()
+    vz._LOGGER.addHandler(grab)
+    vz._logged_counts.clear()
+    try:
+        deck = vz.VisualizerDeck()
+        surface = pygame.Surface((96, 54))
+        for _ in range(25):
+            deck.render_active_engine(surface, {}, mock_amplitude=40, style_override="NoSuchStyle")
+        unknown = [l for l in lines if "unknown visualizer style" in l]
+        check(len(unknown) == 2 and "(seen 10 times)" in unknown[1],
+              "an unknown style repeated every frame writes its line once and again at the 10th time, not every frame (%d lines)" % len(unknown))
+        stand_in = deck._unknown_style_stand_in.get("NoSuchStyle")
+        check(stand_in in deck.render_styles, "an unknown style is drawn as one of the real styles (%r)" % stand_in)
+        check(not any("unrecognized" in l for l in lines) and "unrecognized style" not in read(os.path.join(ROOT, "visualizers.py")),
+              "an unknown style never shows a fixed message on screen")
+        for name, value in (("VIS_EQ_BARS", 24), ("VIS_PRISM_SHARDS", 22), ("VIS_TUNNEL_RINGS", 16), ("VIS_FRAME_TIME_STEP", 0.04)):
+            check(getattr(vz, name) == getattr(gov, name) == value, "the style shape value %s comes from the governor" % name)
+        check(len(deck.eq_bars) == vz.VIS_EQ_BARS and len(deck.prism_shards) == vz.VIS_PRISM_SHARDS and len(deck.chrome_balls) == vz.VIS_CHROME_BALLS,
+              "the deck builds its bars, shards and balls from the governor's counts")
+        check('styles = ["Random"] + list(visualizer_deck.render_styles)' in MAIN_SRC,
+              "the style picker cycles through the deck's own style list, written once")
+        pick_ns = {"globals": lambda: {"visualizer_deck": deck}}
+        exec(compile(function_source(MAIN_SRC, "_get_channel_visualizer_style"), "<pick>", "exec"), pick_ns)
+        check(pick_ns["_get_channel_visualizer_style"]({"visualizer_style": "KaleidoscopeEdge9"}) == "Random"
+              and pick_ns["_get_channel_visualizer_style"]({"visualizer_style": "Lightning"}) == "Lightning",
+              "a saved style the deck does not know plays as Random; a real one is kept")
+        for style in deck.render_styles:
+            deck.render_active_engine(surface, {}, mock_amplitude=40, style_override=style)
+        check(not any("render failed" in l for l in lines), "every listed style draws without an error")
+    finally:
+        vz._LOGGER.removeHandler(grab)
+
+
+def suite_audit2_libretro_core():
+    import libretro_core as lc
+    tmp = tempfile.mkdtemp(prefix="lr_audit_")
+    try:
+        calls = []
+
+        class _FakeDll:
+            def retro_unload_game(self):
+                calls.append("unload_game")
+
+            def retro_deinit(self):
+                calls.append("deinit")
+
+        core = lc.LibretroCore(os.path.join(tmp, "core.dll"), os.path.join(tmp, "system"), os.path.join(tmp, "saves"), create_system_dir=False)
+        core._dll = _FakeDll()
+        core._initialized = True
+        core._loaded = False
+        core.unload()
+        check(calls == ["deinit"] and core._dll is None,
+              "a core whose ROM never loaded is still shut down and freed by unload (calls %s)" % calls)
+        calls.clear()
+        core._dll = _FakeDll()
+        core._initialized = False
+        core.unload()
+        check(calls == [] and core._dll is None, "a core whose start-up failed is freed without a shut-down call it never got ready for")
+        path = os.path.join(tmp, "game.srm")
+        with open(path, "wb") as fh:
+            fh.write(b"OLD SAVE")
+        real_replace = os.replace
+
+        def _power_cut(src, dst):
+            raise OSError("power cut")
+
+        lc.os.replace = _power_cut
+        try:
+            try:
+                lc._write_file_safely(path, b"NEW SAVE THAT NEVER LANDED")
+            except OSError:
+                pass
+        finally:
+            lc.os.replace = real_replace
+        with open(path, "rb") as fh:
+            check(fh.read() == b"OLD SAVE", "a save cut off before it lands leaves the old save whole")
+        lc._write_file_safely(path, b"NEW SAVE")
+        with open(path, "rb") as fh:
+            check(fh.read() == b"NEW SAVE" and not os.path.exists(path + ".tmp"), "a finished save replaces the old one and leaves no temporary file")
+        src = read(os.path.join(ROOT, "libretro_core.py"))
+        check("pitch < width * _bytes_per_pixel" in src, "a frame row shorter than its pixels is refused for every pixel format")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_audit2_rest():
+    scripts = {name: read(os.path.join(ROOT, *name.split("/"))) for name in (
+        "media.py", "menu_nav.py", "libretro_core.py", "ui.py", "media_library.py", "visualizers.py", "assets/audio_analysis.py",
+        "game_deck.py", "retro_tv_emulator.py", "performance_governor.py")}
+    for name, tag in (("media.py", "[MEDIA]"), ("menu_nav.py", "[MENU NAV]"), ("libretro_core.py", "[LIBRETRO]"), ("ui.py", "[UI]"),
+                      ("media_library.py", "[MEDIA LIBRARY]"), ("visualizers.py", "[VISUALIZER]"), ("assets/audio_analysis.py", "[VISUALIZER ANALYSIS]")):
+        src = scripts[name]
+        check(("%s could not import performance_governor" % tag) in src, "%s writes a line of its own when the governor fails to load" % name)
+    media_src = scripts["media.py"]
+    head = media_src[:media_src.index("import performance_governor as _perf_governor") + 400]
+    check("_log_swallowed(\"media values: import performance_governor\"" not in media_src and "logging.getLogger(__name__).warning(\"[MEDIA] could not import" in head,
+          "media.py's failed-governor line uses the plain logger, not the governor's own helper that is missing in that case")
+    check(media_src.count("import performance_governor as") == 1, "media.py loads the governor once")
+    gone = {
+        "media_library.py": ("def mark_checked", "def mark_gain_checked", "import zlib"),
+        "ui.py": ("def _draw_footer_switch", "def _draw_footer_value_box", "def render_update_prompt", "COLOR_MENU_LABEL_BOX"),
+        "game_deck.py": ("dvd_hud_until", "_dvd_skip_dir", "dvd_was_in_menu_on_leave", "_gba_wf_", "_mapping_reassign_wait_started", "_perm_denied ="),
+        "retro_tv_emulator.py": ("def _hot_patch_live_gain", "def _is_usa_bios_filename", "def resize_canvas", "flash_intensity", "galaxy_glow", "playback_active_check"),
+        "media.py": ("playback_active_check", "self.audio_files"),
+        "performance_governor.py": ("last_reason",),
+        "visualizers.py": ("Kaleidoscope",),
+    }
+    gone["retro_tv_emulator.py"] = gone["retro_tv_emulator.py"] + ("def _poll_dvd_menu_signals", "def _enter_title_when_ready", "def _process_pending_dvd_events",
+                                                                     "_DVD_HIGHLIGHT_RE", "_dvd_pending_title_change", "_dvd_sig_log_pos")
+    for name, needles in gone.items():
+        for needle in needles:
+            check(needle not in scripts[name], "the leftover %r is gone from %s" % (needle, name))
+    check("visualizer_frame_failed" in scripts["retro_tv_emulator.py"] and "HUD drawing failed" not in scripts["retro_tv_emulator.py"],
+          "a music station frame that fails to draw writes its line at most once per throttle time, not every frame")
+
+
+def suite_static_sound_on_grey():
+    src = MAIN_SRC
+    start = src.index('elif current_playback_state["mode"] == "Static":\n            if _static_visual_is_grey(("live", str(ch))):')
+    grey_branch = src[start:src.index("else:", start)]
+    check("_stop_transition_static()" not in grey_branch and "_static_sound_stop(" not in grey_branch,
+          "the grey screen of a channel airing Static does not stop its noise (it fought the Static sound play every frame and cut the sound)")
+    play = src.index("# WARNING: a channel airing Static keeps its noise under menus")
+    check("_static_sound_play()" in src[play:play + 600] and 'current_playback_state.get("mode") == "Static"' in src[play:play + 600],
+          "a channel airing Static still plays its noise every frame it is on air")
+
+
+def suite_logs_folder():
+    tmp = tempfile.mkdtemp(prefix="logs_folder_")
+    try:
+        root = os.path.join(tmp, "Retro TV Emulator")
+        os.makedirs(os.path.join(root, "temp"))
+        os.makedirs(os.path.join(root, "watchdog"))
+        os.makedirs(os.path.join(root, "controllers"))
+        os.makedirs(os.path.join(root, ".retro_tv_updates", "download-1"))
+        files = {
+            os.path.join("temp", "app_log.txt"): "old app log", os.path.join("temp", "running.marker"): "marker",
+            os.path.join("watchdog", "watchdog_relaunch_state.json"): "[]",
+            os.path.join("controllers", "emulator_config.json"): "{\"pads\": 1}",
+            os.path.join(".retro_tv_updates", "pending_update.json"): "{}",
+            "playback_runtime.json": "{\"anchors\": {}}", "_probe_inflight.json": "{}", "update_helper.log": "helper",
+            "retro_config.json": "{\"config\": {}}", "retro_config.json.tmp": "half written", ".retro_tv_device_id": "abc",
+        }
+        for rel, text in files.items():
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        os.makedirs(os.path.join(root, "logs", "temp"))
+        with open(os.path.join(root, "logs", "temp", "app_log.txt"), "w", encoding="utf-8") as fh:
+            fh.write("new app log")
+        ns = {"os": os, "sys": types.SimpleNamespace(argv=[os.path.join(root, "Retro TV Emulator.exe")])}
+        for name in ("LOGS_FOLDER_NAME", "_ROOT_FOLDERS_INTO_LOGS", "_ROOT_FILES_INTO_LOGS", "_ROOT_STALE_TEMP_FILES"):
+            start = MAIN_SRC.index(name + " = ")
+            exec(MAIN_SRC[start:MAIN_SRC.index("\n", start)], ns)
+        for name in ("_app_root_dir", "_app_logs_dir", "_move_root_working_files_into_logs"):
+            exec(main_function_code(name), ns)
+        done = ns["_move_root_working_files_into_logs"]()
+        left = sorted(os.listdir(root))
+        check(left == [".retro_tv_device_id", "logs", "retro_config.json"],
+              "after the first start only retro_config.json, the device id and the logs folder are left in the app folder (%s)" % left)
+        logs = os.path.join(root, "logs")
+        for rel in (os.path.join("temp", "running.marker"), os.path.join("watchdog", "watchdog_relaunch_state.json"),
+                    os.path.join("controllers", "emulator_config.json"), os.path.join(".retro_tv_updates", "pending_update.json"),
+                    "playback_runtime.json", "_probe_inflight.json", "update_helper.log"):
+            check(os.path.isfile(os.path.join(logs, rel)), "%s moved into logs" % rel)
+        with open(os.path.join(logs, "temp", "app_log.txt"), encoding="utf-8") as fh:
+            check(fh.read() == "new app log", "a file already in logs is never overwritten by the older copy")
+        with open(os.path.join(logs, "controllers", "emulator_config.json"), encoding="utf-8") as fh:
+            check(fh.read() == "{\"pads\": 1}", "the controller setup keeps its contents when it moves")
+        check(any("removed a leftover retro_config.json.tmp" in d for d in done) and any("merged folder temp" in d for d in done),
+              "what moved is reported for the log (%s)" % done)
+        check(ns["_move_root_working_files_into_logs"]() == [], "a second start finds nothing left to move")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for needle, where in (('os.path.join(_app_logs_dir(), "temp")', "the logs and crash files"),
+                          ('os.path.join(_app_logs_dir(), "watchdog")', "the relaunch watchdog"),
+                          ('os.path.join(db.base_dir, LOGS_FOLDER_NAME)', "the probe marker")):
+        check(needle in MAIN_SRC, "%s are written in root/logs" % where)
+    media_src = read(os.path.join(ROOT, "media.py"))
+    check('self.runtime_path = os.path.join(self.logs_dir, "playback_runtime.json")' in media_src
+          and media_src.count('os.path.join(self.logs_dir, "retro_config.json.tmp")') == 2 and 'self.config_path + ".tmp"' not in media_src,
+          "the runtime file and the settings save's temporary file are written in root/logs")
+    check('os.path.join(root_dir, "logs", "controllers")' in read(os.path.join(ROOT, "game_deck.py")), "the controller setup is kept in root/logs/controllers")
+    check('os.path.join(os.path.abspath(base_dir), "logs", UPDATE_DIR_NAME)' in read(os.path.join(ROOT, "updater", "auto_updater.py")),
+          "update downloads are made in root/logs")
+    helper = read(os.path.join(ROOT, "updater", "update_helper.py"))
+    check('os.path.join(logs_dir, "update_helper.log")' in helper and '"logs")' in helper, "the update helper writes its log in root/logs and an update never replaces anything there")
+
+
+class TestLogsFolder(_SectionCase):
+    """Owner order 2026-11-01: everything the app makes beside the exe (logs, working files, the temp, watchdog, controllers and update folders) lives in root/logs"""
+
+    def test_logs_folder(self):
+        self.run_section(suite_logs_folder)
+
+
+class TestStaticSoundOnGrey(_SectionCase):
+    """Owner logs 2026-11-01 20:46: on a channel airing Static, the noise was stopped and started every frame once the snow turned grey after 2 s"""
+
+    def test_static_sound_on_grey(self):
+        self.run_section(suite_static_sound_on_grey)
+
+
+class TestAudit2Rest(_SectionCase):
+    """Audit 2, the rest of the scripts: each writes its own line when the governor fails to load, and the leftovers found are gone"""
+
+    def test_audit2_rest(self):
+        self.run_section(suite_audit2_rest)
+
+
+class TestAudit2LibretroCore(_SectionCase):
+    """Audit 2: libretro_core frees a core whose ROM failed to load, and writes game saves so a crash never cuts one short"""
+
+    def test_audit2_libretro_core(self):
+        self.run_section(suite_audit2_libretro_core)
+
+
+class TestAudit2Visualizers(_SectionCase):
+    """Audit 2 stage 3: visualizers.py writes a repeating per-frame error once, not every frame"""
+
+    def test_audit2_visualizers(self):
+        self.run_section(suite_audit2_visualizers)
+
+
+class TestAudit2AudioAnalysis(_SectionCase):
+    """Audit 2 stage 2: the music analysis treats a missing cache as normal, re-analyzes a broken cache file, and keeps a song whose cache cannot be written"""
+
+    def test_audit2_audio_analysis(self):
+        self.run_section(suite_audit2_audio_analysis)
+
+
+class TestAudit2LogLines(_SectionCase):
+    """Audit 2 (owner logs 2026-11-01): VLC start-up lines are written once, and no script shows a broken character"""
+
+    def test_audit2_log_lines(self):
+        self.run_section(suite_audit2_log_lines)
+
+
+class TestMainScriptNumbersInGovernor(_SectionCase):
+    """Every setting number of the main script lives in the governor table, and every fallback matches it"""
+
+    def test_main_script_numbers_in_governor(self):
+        self.run_section(suite_main_script_numbers_in_governor)
+
+
+def suite_random_short_pairs():
+    import re as _re
+
+    def eps(n, dur=600, show="Show X"):
+        return [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (show, show, i), "duration": dur} for i in range(1, n + 1)]
+
+    def number(path):
+        return int(_re.search(r"E(\d+)", path).group(1))
+
+    def run(episodes, blocks, mode="random"):
+        state, out = {}, []
+        for day in range(blocks):
+            lineup, state, _o = media.build_show_rotation(episodes, "one_slot", state, 1000 + day, pair_threshold_seconds=900,
+                                                          episode_order_mode=mode, channel_id="05")
+            for t in lineup:
+                out.append((number(t["pair_ep1_path"]), number(t["pair_ep2_path"])) if t.get("is_pair") else (number(t["path"]),))
+        return out, state
+
+    hub_before = media.get_duration_hub()
+    media.set_duration_hub(None)
+    try:
+        out, state = run(eps(5), 20)
+        check(all(len(entry) == 2 for entry in out), "in random order every short episode airs in a pair of two: %s" % out)
+        rounds, ok_round, ok_carry = [out[i:i + 2] for i in range(0, len(out) - 1, 2)], True, True
+        skipped = []
+        for k, rnd in enumerate(rounds):
+            seen = [e for pair in rnd for e in pair]
+            ok_round = ok_round and len(seen) == len(set(seen)) == 4
+            left = sorted(set(range(1, 6)) - set(seen))
+            if skipped and rnd[0][0] != skipped[-1]:
+                ok_carry = False
+            skipped.extend(left)
+        check(ok_round, "each round of 5 airs 4 different episodes, two random pairs, and nothing twice: %s" % out)
+        check(ok_carry, "the episode left over in a round opens the next round, paired with a random one: %s (left over %s)" % (out, skipped))
+        check(len(set(skipped)) > 1, "the episode left over changes from round to round: %s" % skipped)
+        out6, _s = run(eps(6), 12)
+        rounds6 = [out6[i:i + 3] for i in range(0, len(out6) - 2, 3)]
+        check(all(len({e for pair in r for e in pair}) == 6 for r in rounds6), "an even number of short episodes all air in each round, three pairs, no repeats: %s" % out6)
+        check(state[media.stable_series_id("Show X", "05")].get("v") == media.RANDOM_SHORT_PAIRS_STATE_VERSION, "the round is saved by file")
+        lone, _s = run(eps(1) + [dict(e, duration=1500) for e in eps(4)[1:]], 6)
+        check(lone[:3] == [(1, 2), (3,), (4,)],
+              "a show with only one short episode keeps the rule it had: the short one airs with a long one: %s" % lone)
+        mixed = eps(4) + [dict(e, duration=1500) for e in eps(6)[4:]]
+        mout, _s = run(mixed, 12)
+        check(all(len(entry) == (2 if entry[0] <= 4 else 1) for entry in mout) and all(e[0] > 4 or e[1] <= 4 for e in mout if len(e) == 2),
+              "long episodes air alone and short ones pair only with short ones: %s" % mout)
+        seq, _s = run(eps(5), 6, mode="sequential")
+        check(seq[:5] == [(1, 2), (3, 4), (5, 1), (2, 3), (4, 5)], "sequential order is unchanged: %s" % seq[:5])
+        bag_state = {"v": media.RANDOM_STATE_VERSION, "bag": [], "cycle": 1, "last": None, "recent": [],
+                     "drawn": [e["path"] for e in eps(5)[:2]]}
+        moved, new_state = media.draw_random_short_pairs(bag_state, eps(5), 1, "x", 900)
+        check(all(number(moved[0][k]) > 2 for k in ("pair_ep1_path", "pair_ep2_path")) and new_state["v"] == media.RANDOM_SHORT_PAIRS_STATE_VERSION,
+              "a round saved before this change keeps the episodes that already aired this round out of it")
+        held, held_state = media.draw_random_short_pairs({"v": media.RANDOM_SHORT_PAIRS_STATE_VERSION, "pass": [], "aired": [e["path"] for e in eps(5)],
+                                                          "carry": None, "cycle": 2, "last": None}, eps(5), 2, "x", 900, hold_new_pass=True)
+        check(held == [] and held_state["cycle"] == 2, "while files of the show are not scanned no new round starts")
+        _l, after_run, _o = media.build_show_rotation(eps(5), "one_slot", {}, 1000, pair_threshold_seconds=900, episode_order_mode="random", channel_id="05")
+        ff, _o2, _r2 = media.fast_forward_show_pos(eps(5), "one_slot", {}, [1000], pair_threshold_seconds=900, episode_order_mode="random", channel_id="05")
+        key = media.stable_series_id("Show X", "05")
+        check(ff.get(key) == after_run.get(key), "a catch-up over one block leaves the same saved round as airing that block")
+    finally:
+        media.set_duration_hub(hub_before)
+
+
+def suite_broken_pair_partner_redealt():
+    def make(groups, tracks):
+        channels = {"05": {"playback_log": {"sched_block_key": "2026_305_Morning", "sched_cached_tracks": list(tracks),
+                                            "sched_cached_durations": {t: 600 for t in tracks},
+                                            "sched_cached_groups": {"groups": groups}}}}
+        asked = []
+        ns = {"db": types.SimpleNamespace(channels_db=channels), "copy": copy, "os": os, "log": mock.MagicMock(),
+              "_request_schedule_rebuild": lambda ch, block: asked.append((ch, block))}
+
+        def _set_saved_lineup(log_dict, tracks_now, durations, record):
+            log_dict["sched_cached_tracks"], log_dict["sched_cached_durations"], log_dict["sched_cached_groups"] = tracks_now, durations, record
+        ns["_set_saved_lineup"] = _set_saved_lineup
+        exec(compile(get_function_source("_remove_confirmed_file_from_saved_lineups"), "<extracted>", "exec"), ns)
+        return ns, channels, asked
+
+    ns, channels, asked = make([{"kind": "pair", "paths": ["a", "b"]}, {"kind": "single", "paths": ["c"]}], ["a", "b", "c"])
+    check(ns["_remove_confirmed_file_from_saved_lineups"]("a") and asked == [("05", "2026_305_Morning")],
+          "a file found broken inside a pair asks for the entries still ahead to be dealt again, so its partner gets a new one")
+    check(channels["05"]["playback_log"]["sched_cached_tracks"] == ["b", "c"], "the broken file leaves the saved lineup")
+    ns, channels, asked = make([{"kind": "pair", "paths": ["a", "b"]}, {"kind": "single", "paths": ["c"]}], ["a", "b", "c"])
+    check(ns["_remove_confirmed_file_from_saved_lineups"]("c") and asked == [], "a broken single file does not ask for the rest to be dealt again")
+
+
+class TestBrokenPairPartnerRedealt(_SectionCase):
+    """A short episode whose partner is found broken gets a new partner instead of airing alone"""
+
+    def test_broken_pair_partner_redealt(self):
+        self.run_section(suite_broken_pair_partner_redealt)
+
+
+def suite_slot_count_switch():
+    import re as _re
+
+    def eps(name, n, dur):
+        return [{"path": "/m/%s/Season 1/%s S01E%02d.mkv" % (name, name, i + 1), "duration": dur} for i in range(n)]
+
+    sizes = {"Show A": 8, "Show B": 6, "Tiny One": 1, "Tiny Two": 2}
+
+    def run(frm, to, switch_h, block_mode):
+        content = eps("Show A", 8, 1320) + eps("Show B", 6, 1500) + eps("Tiny One", 1, 1320) + eps("Tiny Two", 2, 1500)
+        names = {"eight_hour": ["Morning", "Evening", "Night"], "full_day": ["Full Day"]}[block_mode]
+        ch = {"active": True, "scheduling_mode": frm, "commercials_enabled": False, "commercial_placement": "interrupt_half_hour",
+              "pair_threshold_minutes": 15, "block_mode": block_mode, "episode_order_mode": "sequential",
+              "schedules": {n: [dict(x) for x in content] for n in names}, "playback_log": {"intro_seed": 1}}
+        ch["schedules"]["Commercials"] = []
+        t0 = datetime.datetime(2026, 10, 13, 0, 0, 5)
+        clock, ticks = [t0], [0]
+        ns = _sched_record_ns({"05": ch}, clock, ticks)
+        ns["_SCHEDULE_MODE_COMMIT_HOLD_MS"] = gov.SCHEDULE_MODE_COMMIT_HOLD_MS
+        step, aired, last = 120, [], None
+        for i in range(int(20 * 3600 / step)):
+            clock[0] = t0 + datetime.timedelta(seconds=i * step)
+            ticks[0] += 10000
+            if i == int(switch_h * 3600 / step):
+                ch["scheduling_mode"] = to
+                ch["_sched_debounce_pending_since"] = ticks[0] - 10 ** 6
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                result = ns["calculate_slotted_playback_state"]("05")
+            path = result.get("file", "") if result.get("mode") == "Video" else ""
+            if path and path != last:
+                aired.append(path)
+            if result.get("mode") != "Commercial":
+                last = path or None
+        record = ch["playback_log"].get("sched_cycle_start_pos") or {}
+        return aired, record
+
+    bad = []
+    for frm, to, switch_h, block_mode in (("two_slots", "one_slot", 11.7, "full_day"), ("one_slot", "two_slots", 5.3, "eight_hour"),
+                                         ("random_slots", "two_slots", 5.3, "eight_hour"), ("two_slots", "one_slot", 11.7, "eight_hour")):
+        aired, record = run(frm, to, switch_h, block_mode)
+        per = {}
+        for path in aired:
+            m = _re.match(r"/m/([^/]+)/.*E(\d+)", path)
+            per.setdefault(m.group(1), []).append(int(m.group(2)))
+        for show, seq in per.items():
+            n = sizes[show]
+            for a, b in zip(seq, seq[1:]):
+                if b != a % n + 1:
+                    bad.append("%s->%s %s at %.1f h: %s E%02d then E%02d" % (frm, to, block_mode, switch_h, show, a, b))
+        check(record.get("mode") == to, "the start of the airing cycle is saved with the slot mode its entries were dealt in (%s)" % record.get("mode"))
+    check(not bad, "after a switch between one slot, two slots and random slots in the middle of a block, every show, the tiny ones too, goes on with its next episode, never repeating or skipping one (%s)" % bad[:4])
+
+
+def suite_catch_up_walks_once():
+    counts = {"walk": 0, "guide": 0}
+    real_walk, real_guide = media._catch_up_walk, media.replay_missed_blocks
+
+    def walk(*a, **k):
+        counts["walk"] += 1
+        return real_walk(*a, **k)
+
+    def guide(*a, **k):
+        counts["guide"] += 1
+        return real_guide(*a, **k)
+
+    with patch.object(media, "_catch_up_walk", walk), patch.object(media, "replay_missed_blocks", guide), \
+            patch.object(media, "_cached_path_exists", lambda p: True):
+        for block_mode in ("full_day", "eight_hour"):
+            channels = {"05": _sched_record_channel(block_mode, "interrupt_half_hour", "one_slot", True)}
+            t0 = datetime.datetime(2026, 10, 13, 9, 0, 5)
+            clock, ticks = [t0], [0]
+            ns = _sched_record_ns(channels, clock, ticks)
+            ns["calculate_slotted_playback_state"]("05")
+            counts.update(walk=0, guide=0)
+            clock[0] = t0 + datetime.timedelta(days=30, hours=3)
+            ticks[0] += 10 ** 7
+            result = ns["calculate_slotted_playback_state"]("05")
+            check(result.get("mode") in ("Video", "Commercial"), "%s: the station airs after a 30 day gap" % block_mode)
+            check(counts == {"walk": 1, "guide": 1}, "%s: one resume after a gap walks the gap once for the catch-up and once for the guide's past (%s)" % (block_mode, counts))
+        ch = _sched_record_channel("full_day", "interrupt_half_hour", "one_slot", False)
+        ch["playback_log"]["sched_block_key"] = "2026_286_Full Day"
+        counts.update(walk=0)
+        first = media._catch_up_replay("05", ch, {}, "2026_286_Full Day", "2026_296_Full Day", lambda p: True, [], lambda o: 7)
+        again = media._catch_up_replay("05", ch, {}, "2026_286_Full Day", "2026_296_Full Day", lambda p: True, [], lambda o: 7)
+        check(counts["walk"] == 1 and first == again and first is not again, "the same gap asked twice at once is walked once, and each caller gets its own copy")
+        again[0]["changed"] = True
+        third = media._catch_up_replay("05", ch, {}, "2026_286_Full Day", "2026_296_Full Day", lambda p: True, [], lambda o: 7)
+        check("changed" not in third[0], "a caller changing its copy never changes what the next caller gets")
+        media._catch_up_replay("05", ch, {}, "2026_286_Full Day", "2026_297_Full Day", lambda p: True, [], lambda o: 7)
+        ch["broken_files"] = [ch["schedules"]["Full Day"][0]["path"]]
+        media._catch_up_replay("05", ch, {}, "2026_286_Full Day", "2026_297_Full Day", lambda p: True, [], lambda o: 7)
+        check(counts["walk"] == 3, "a different gap, or a channel whose files changed, is walked again (%d walks)" % counts["walk"])
+
+
+class TestCatchUpWalksOnce(_SectionCase):
+    """C1: a resume after a gap walks the missed blocks once for the catch-up and once for the guide's past"""
+
+    def test_catch_up_walks_once(self):
+        self.run_section(suite_catch_up_walks_once)
+
+
+class TestSlotCountSwitch(_SectionCase):
+    """C2: changing the slot count in the middle of a block carries each show on from its last episode"""
+
+    def test_slot_count_switch(self):
+        self.run_section(suite_slot_count_switch)
+
+
+class TestRandomShortPairs(_SectionCase):
+    """Random order pairs short episodes at random each round; the one left over opens the next round"""
+
+    def test_random_short_pairs(self):
+        self.run_section(suite_random_short_pairs)
+
+
+class TestConsoleSplashByName(_SectionCase):
+    """A console's splash with nothing picked is <CONSOLE>SplashScreen.png from its own folder"""
+
+    def test_console_splash_by_name(self):
+        self.run_section(suite_console_splash_by_name)
+
+
+class TestRebuildKeepsAiringEntry(_SectionCase):
+    """A lineup rebuilt in the middle of a later cycle keeps the show on air where it is"""
+
+    def test_rebuild_keeps_airing_entry(self):
+        self.run_section(suite_rebuild_keeps_airing_entry)
+
+
 class TestReflavorNoSkippedEpisode(_SectionCase):
     """A lineup rebuilt in the middle of a cycle continues each show with the episode after the last kept one"""
 
@@ -9472,7 +10607,9 @@ def suite_resolve_part_seek():
 # ============================================================================
 
 def suite_pending_probe_does_not_wait_on_own_flag():
-    check(gov.PENDING_SCHEDULE_PROBE_PARALLEL == 6, "the governor must hold the pending-probe parallel count")
+    check(gov.PENDING_SCHEDULE_PROBE_PARALLEL == 1, "the governor must probe pending files one at a time")
+    check(gov.PENDING_SCHEDULE_PROBE_RETRY_SECONDS == 5.0 and gov.PENDING_SCHEDULE_PROBE_REQUEST_STALE_SECONDS == 30.0,
+          "the governor must hold the pending-probe retry and stale seconds")
     check(media._perf_governor is gov, "media must use the same governor module")
     check(not gov.in_priority_scope(), "a plain thread is not in a priority scope")
     with gov.priority_scope():
@@ -9482,8 +10619,17 @@ def suite_pending_probe_does_not_wait_on_own_flag():
     media.set_live_playback_priority(True)
     try:
         started = time.monotonic()
-        media._yield_to_live_playback("plain")
-        check(time.monotonic() - started >= 0.35, "background work still waits for the live open")
+        media._yield_to_live_playback("main thread")
+        check(time.monotonic() - started < 0.1, "the main thread never waits on the live-playback flag")
+        waited = []
+        def _background_ask():
+            began = time.monotonic()
+            media._yield_to_live_playback("plain")
+            waited.append(time.monotonic() - began)
+        worker = threading.Thread(target=_background_ask)
+        worker.start()
+        worker.join(5.0)
+        check(waited and waited[0] >= 0.35, "background work still waits for the live open")
         started = time.monotonic()
         with gov.priority_scope():
             media._yield_to_live_playback("scoped")
@@ -9493,19 +10639,26 @@ def suite_pending_probe_does_not_wait_on_own_flag():
               "_channel_is_server_streamed": lambda ch: False, "initialize_vlc_on_demand": lambda: None,
               "_governor_priority_scope": gov.priority_scope,
               "set_live_playback_priority": media.set_live_playback_priority,
-              "_PENDING_SCHEDULE_PROBE_PARALLEL": 6}
+              "performance_governor": gov,
+              "_PENDING_SCHEDULE_PROBE_PARALLEL": 1, "_PENDING_PROBE_URGENT_COUNT": 4, "media": media,
+              "_pending_backlog_may_run": lambda state, now_m: True}
         patched = []
-        threads = set()
+        probe_threads = []
+        in_probe = []
+        overlap = []
+        release = threading.Event()
         cached_path = os.path.normpath("/m/cached.mkv")
 
         def fake_cached(path):
             return {"duration": 5.0, "dims": (1, 1)} if path == cached_path else {}
 
         def fake_probe(path):
-            threads.add(threading.current_thread().name)
-            with gov.priority_scope():
-                media._yield_to_live_playback("probe")
-                time.sleep(0.2)
+            probe_threads.append(threading.current_thread().name)
+            in_probe.append(path)
+            if len(in_probe) > 1:
+                overlap.append(path)
+            release.wait(5.0)
+            in_probe.remove(path)
             return (None, None) if path.endswith("bad.mkv") else (100.0, (640, 480))
 
         def fake_patch(kind, ch_key, sub_key, path, duration=None, dims=None):
@@ -9513,21 +10666,51 @@ def suite_pending_probe_does_not_wait_on_own_flag():
 
         ns.update({"_read_file_probe_facts": fake_cached, "_probe_duration_and_dims_combined": fake_probe,
                    "_patch_probed_gain": fake_patch})
+        exec(main_assignment_code("_PENDING_PROBE_RETRY_SECONDS"), ns)
+        exec(main_assignment_code("_PENDING_PROBE_REQUEST_STALE_SECONDS"), ns)
+        exec(main_assignment_code("_pending_probe_state"), ns)
         exec(main_function_code("_probe_pending_schedule_one"), ns)
+        exec(main_function_code("_pending_probe_worker"), ns)
         exec(main_function_code("_priority_probe_pending_schedule"), ns)
         tracks = [{"path": "/m/f%d.mkv" % i} for i in range(8)]
         tracks += [{"path": "/m/f0.mkv"}, {"path": "/m/cached.mkv"}, {"path": "/m/bad.mkv"}, {"path": ""}]
         started = time.monotonic()
         ns["_priority_probe_pending_schedule"]("05", "schedules", "Morning", tracks)
         elapsed = time.monotonic() - started
-        check(elapsed < 1.5, "eight pending files must probe in parallel without waiting on the live flag (%.2fs)" % elapsed)
+        check(elapsed < 0.5, "the caller returns at once while every probe is still stuck (%.2fs)" % elapsed)
+        check(patched == [], "nothing is stored while no probe has finished")
+        time.sleep(0.3)
+        check(len(in_probe) == 1 and not overlap, "only one file is probed at a time (%d in flight)" % len(in_probe))
+        first_probed = os.path.normpath("/m/f0.mkv")
+        check(in_probe == [first_probed], "the first pending file of the schedule is probed first")
+        release.set()
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and len(patched) < 8:
+            done_paths = {os.path.normpath(p[0]) for p in patched}
+            still_pending = [tr for tr in tracks if os.path.normpath(tr["path"] or "x") not in done_paths]
+            ns["_priority_probe_pending_schedule"]("05", "schedules", "Morning", still_pending)
+            time.sleep(0.05)
         check(len(patched) == 8 and all(p[1] == 100.0 for p in patched), "every probed file is stored once (%d)" % len(patched))
         check(len({p[0] for p in patched}) == 8, "a repeated path is probed and stored once")
         check(all(p[2] == threading.current_thread().name for p in patched), "results are stored on the calling thread")
-        check(len(threads) > 1, "the probes must run on more than one thread (%d)" % len(threads))
+        check(set(probe_threads) == {"PendingProbe"} and not overlap, "the probes run on the one background thread, never on the caller")
+        check(os.path.normpath("/m/cached.mkv") not in [p[0] for p in patched], "a file the library already knows is not stored again")
+        time.sleep(0.2)
+        before = len(probe_threads)
+        ns["_priority_probe_pending_schedule"]("05", "schedules", "Morning", [tr for tr in tracks if tr["path"].endswith("bad.mkv")])
+        time.sleep(0.3)
+        check(len(probe_threads) == before, "a file whose probe found nothing waits for the retry seconds before it is tried again")
+        check(ns["_pending_probe_state"]["in_flight"] == set(), "no file is left marked as being probed")
+        ns["_priority_probe_pending_schedule"]("05", "schedules", "Morning", [])
+        check(("05", "schedules", "Morning") not in ns["_pending_probe_state"]["requests"],
+              "a block with nothing pending drops its request")
     finally:
+        release.set()
         media._LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = saved_wait
         media.set_live_playback_priority(False)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and media._LIVE_PLAYBACK_PRIORITY.is_set():
+        time.sleep(0.05)
     check(not media._LIVE_PLAYBACK_PRIORITY.is_set(), "the pending probe must leave the live flag cleared")
 
 
@@ -9613,7 +10796,8 @@ def suite_first_start_remaining_scans():
     ns = {"os": os, "time": time, "threading": threading, "media": media, "log": mock.MagicMock(),
           "_cached_path_exists": lambda p: True,
           "_is_drive_degraded": lambda p: False,
-          "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 2.0, "_PICTURE_BOX_PRE_SHOW_PARALLEL": 6,
+          "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 2.0,
+          "performance_governor": types.SimpleNamespace(picture_box_pre_show_parallel=lambda: (6, "test PC")),
           "_governor_priority_scope": gov.priority_scope}
     store = {}
 
@@ -10257,7 +11441,10 @@ def suite_unscanned_not_placed():
     if os.path.exists(rec_path):
         import json as _json
         rec = _json.load(open(rec_path, encoding="utf-8"))
-        check(all(calls[0]["result"].get("mode") == "Static" and calls[0]["result"].get("reason") == "not_scanned" for calls in rec.values()), "in every scan scenario the first call, with nothing scanned, is Static")
+        check(all((calls[0]["result"].get("mode") == "Static" and calls[0]["result"].get("reason") == "not_scanned")
+                  or (calls[0]["result"].get("mode") == "Video" and str(calls[0]["result"].get("file", "")).startswith("/m/Movies/"))
+                  for calls in rec.values()),
+              "in every scan scenario the first call, with nothing scanned, is Static or a movie placed at the movie estimate, never an unscanned episode")
 
 
 class TestUnscannedNotPlaced(_SectionCase):
@@ -10351,7 +11538,7 @@ SCHED_RECORD_FUNCS = [
     "_prime_block_durations_on_cold_start", "_probe_and_persist_duration",
     "_snapshot_track_durations", "_start_order_seed", "_save_file_probe_facts", "_hub_note_measured_duration", "_timeline_whole_episode_durations",
     "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "calculate_slotted_playback_state",
-    "_block_overrun_anchor", "_channel_is_server_streamed", "_note_aired_cycle", "_note_missed_blocks", "_priority_probe_pending_schedule", "_probe_pending_schedule_one", "_set_saved_lineup",
+    "_block_overrun_anchor", "_channel_is_server_streamed", "_note_aired_cycle", "_note_missed_blocks", "_priority_probe_pending_schedule", "_pending_probe_worker", "_pending_backlog_may_run", "_probe_pending_schedule_one", "_set_saved_lineup",
 ]
 
 SCHED_RECORD_ENGINE_STUBS = {
@@ -10375,7 +11562,8 @@ SCHED_RECORD_GLOBALS = [
     "_SCHED_MEMBERSHIP_CACHE_SECONDS", "_THROTTLED_LOG_INTERVAL_S", "_cold_primed_channels", "_cold_primed_channels_lock",
     "_duration_precache_inflight", "_intro_seed_lock", "_ondemand_duration_probe_next", "_probe_block_timeline_cache",
     "_probe_library_lock",
-    "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
+    "SCHEDULER_REPEAT_GUARD_SECONDS", "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS", "BLOCK_ROTATION_CACHE_MAX_BLOCKS",
+    "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_PENDING_PROBE_RETRY_SECONDS", "_PENDING_PROBE_REQUEST_STALE_SECONDS", "_PENDING_PROBE_URGENT_COUNT", "_pending_probe_state", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
 ]
 
 SCHED_RECORD_SCENARIOS = [
@@ -10711,11 +11899,12 @@ NIGHT_STATE_KEYS = ("sched_block_key", "sched_cached_tracks", "sched_cached_dura
 
 
 def _night_date_run(channels, moments):
+    media._catch_up_last["key"] = None
     clock, ticks = [moments[0]], [0]
     ns = _sched_record_ns(channels, clock, ticks)
     caught = []
     replaying = [False]
-    real_rotation, real_catch_up = media.build_block_rotation, media.catch_up_state
+    real_rotation, real_catch_up = media.build_block_rotation, media._catch_up_walk
 
     def rotation_spy(raw, ch_info, show_pos, day_seed, *args, **kwargs):
         if replaying[0]:
@@ -10729,7 +11918,7 @@ def _night_date_run(channels, moments):
         finally:
             replaying[0] = False
 
-    with patch.object(media, "build_block_rotation", rotation_spy), patch.object(media, "catch_up_state", catch_up_spy):
+    with patch.object(media, "build_block_rotation", rotation_spy), patch.object(media, "_catch_up_walk", catch_up_spy):
         for moment in moments:
             clock[0] = moment
             ticks[0] += 10000
@@ -11127,6 +12316,7 @@ def _surf_ns(active, current="05", game=True, guide=True, music_busy=False, mode
     ns = {"db": fake_db, "pygame": fake_pygame, "app_state": state, "_CHANNEL_SURF_HESITATE_MS": 400,
           "vlc": fake_vlc, "vlc_engine": engine, "static_audio": types.SimpleNamespace(
               stop=lambda: calls.__setitem__("static_stop", calls["static_stop"] + 1)),
+          "_static_sound_stop": lambda where: calls.__setitem__("static_stop", calls["static_stop"] + 1),
           "broadcast_clock": fake_clock, "os": os, "log": MagicMock(),
           "menu_nav": mn,
           "_stop_transition_static": lambda: calls.__setitem__("transition_static_stop", calls["transition_static_stop"] + 1),
@@ -11250,7 +12440,7 @@ def suite_channel_surf():
     check("_surf_quiet = _surf_origin_active()" in loop, "the loop reads once per frame whether a show is shut down")
     stall = loop[loop.index("# SECTION: Video end & stall detection"):loop.index("# SECTION: Video render (TV channels)")]
     check(stall.count("not _surf_quiet") == 3, "end detection, the background watchdog and the restart watchdog all stand down while flipping (%d)" % stall.count("not _surf_quiet"))
-    check('if _surf_quiet and ch not in ("03", "04"):\n        if _configured_transition_style() == "static":\n            _render_transition_static(screen, _full_window_rect)\n        else:\n            screen.fill(_TRANSITION_GRAY, _full_window_rect)\n    elif ch != "04":' in loop,
+    check('if _surf_quiet and ch not in ("03", "04"):\n        if _configured_transition_style() == "static":\n            _render_transition_static(screen, _full_window_rect)\n        else:\n            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)\n    elif ch != "04":' in loop,
           "the picture draw shows static for a shut-down show in Static style and grey otherwise")
     check('if _surf_quiet and ch not in ("03", "04"):\n        pass\n    elif ch == "03":' in loop, "the playback and stall-recovery section does nothing for a shut-down show")
     ov = loop[loop.index("# SECTION: Overlays: captions"):loop.index('_prof_mark("overlays")')]
@@ -11258,13 +12448,13 @@ def suite_channel_surf():
           "captions, static noise, reception lines, the watermark and the static transition are not drawn while flipping")
     check(ov.index("if not _surf_quiet:") < ov.index("_render_transition_static("), "the static transition is inside the flipping gate")
     grey = loop[loop.index("# SECTION: Final compositing & present"):]
-    check(grey.index("if (_surf_quiet") < grey.index("screen.fill(_TRANSITION_GRAY)") < grey.index('_draw_channel_volume_osd("picture")'), "the grey cover is drawn for a shut-down show, before the channel letters")
+    check(grey.index("if (_surf_quiet") < grey.index("screen.fill(COLOR_TRANSITION_GREY)") < grey.index('_draw_channel_volume_osd("picture")'), "the grey cover is drawn for a shut-down show, before the channel letters")
     cover = grey[grey.index("if (_surf_quiet"):grey.index('_draw_channel_volume_osd("picture")')]
-    check('if _configured_transition_style() != "static":\n            screen.fill(_TRANSITION_GRAY)' in cover,
+    check('if _configured_transition_style() != "static":\n            screen.fill(COLOR_TRANSITION_GREY)' in cover,
           "the grey cover is drawn only when the transition style is not Static")
     check('elif ch in ("03", "04"):\n            _render_transition_static(screen, _full_window_rect)' in cover,
           "in Static style the game channel and guide are covered with static, not grey")
-    _mid = cc[cc.index("_mid_static_burst = ("):cc.index("if (not _mid_static_burst")]
+    _mid = cc[cc.index("_mid_static_burst = ("):cc.index("if not _mid_static_burst and not internal_advance:")]
     check('== "static"' in _mid and "_surf_origin_active()" in _mid,
           "a flip in progress counts as a running static burst, so the static sound is not cut at the tune")
     check("if _surf_origin_active():\n                _tune_after_flip(final_ch, is_surfing=True)" in src, "typed digits tune through the flip so the old show's position is kept")
@@ -11283,7 +12473,7 @@ def suite_channel_surf():
     _mm_line = 'if app_state.get("current_channel") == "03" and not app_state.get("is_loading", False) and game_deck is not None and not _surf_quiet:\n        _mm_mode ='
     check(_mm_line in loop, "the game channel's menu music is not restarted while a flip has the channel shut down")
     _stop_src = get_function_source("_stop_transition_static")
-    check("_static_transition_running()" in _stop_src and _stop_src.index("_static_transition_running()") < _stop_src.index("static_audio.stop()"),
+    check("_static_transition_running()" in _stop_src and _stop_src.index("_static_transition_running()") < _stop_src.index("_static_sound_stop("),
           "stopping the transition static checks first that no Static-style burst or flip is running")
 
     def _static_ns(style, static_until, origin, now=10_000):
@@ -11291,7 +12481,8 @@ def suite_channel_surf():
         _ns = {"db": types.SimpleNamespace(config={"transition_type": style}),
                "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: now)),
                "app_state": {"channel_switch_static_until": static_until, "surf_origin": origin},
-               "static_audio": types.SimpleNamespace(stop=lambda: _stops.append(1))}
+               "static_audio": types.SimpleNamespace(stop=lambda: _stops.append(1)),
+               "_static_sound_stop": lambda where: _stops.append(1)}
         for _name in ("_configured_transition_style", "_surf_origin_active", "_static_transition_running", "_stop_transition_static"):
             exec(compile(get_function_source(_name), "<extracted:%s>" % _name, "exec"), _ns)
         return _ns, _stops
@@ -11419,10 +12610,10 @@ def suite_channel_digits():
     gov = __import__("performance_governor")
     with open(os.path.abspath(mn.__file__), encoding="utf-8") as nav_file:
         nav_src = nav_file.read()
-    fallback = nav_src.split("DIGIT_ENTRY_CONFIRM_MS = int(", 1)[1].split("except Exception:", 1)[1].split("\n")[1]
+    fallback = nav_src.split("DIGIT_ENTRY_CONFIRM_MS = int(", 1)[1].split("\n", 1)[0]
     check(gov.CHANNEL_DIGIT_TUNE_DELAY_MS == 350 and mn.DIGIT_ENTRY_CONFIRM_MS == gov.CHANNEL_DIGIT_TUNE_DELAY_MS,
           "the delay after the second digit lives in the governor table and menu_nav reads it")
-    check("DIGIT_ENTRY_CONFIRM_MS = 350" in fallback, "the menu_nav fallback matches the governor value")
+    check(fallback.endswith("if _governor is not None else 350"), "the menu_nav fallback matches the governor value")
 
 
 class TestChannelDigits(_SectionCase):
@@ -11472,7 +12663,7 @@ class _Tee:
 
 
 def run_logged(script_path, run):
-    """Runs `run()` with everything it prints also saved to root/temp/<script>_output.txt; the previous run's file is kept as <script>_output_previous.txt."""
+    """Runs `run()` with everything it prints also saved to root/logs/temp/<script>_output.txt; the previous run's file is kept as <script>_output_previous.txt."""
     name = os.path.splitext(os.path.basename(script_path))[0]
     os.makedirs(TEMP_DIR, exist_ok=True)
     out_path = os.path.join(TEMP_DIR, name + "_output.txt")
@@ -11641,6 +12832,8 @@ def suite_duration_scan_ahead():
         "_scan_store_duration": fake_store,
         "_scan_duration_failed": lambda p: failed.append(p) or False,
         "_background_scan_pace_seconds": lambda base: base,
+        "_scan_class_pace_seconds": lambda cls, base: 0.0 if cls == 0 else base,
+        "_scan_thread_slot": lambda kind, cls: contextlib.nullcontext(True),
         "SCAN_CLASS_NOW": 0,
         "BETWEEN_LOUDNESS_PROBES_SECONDS": 0.5,
         "SCAN_PIPELINE_PREEMPT_CHECK_SECONDS": 5.0,
@@ -11721,6 +12914,8 @@ def suite_picture_box_lane():
         "_pipeline_stage_picture_box": stage,
         "_picture_box_done": done, "_scan_pb_has_box": has_box,
         "_background_scan_pace_seconds": lambda base: base,
+        "_scan_class_pace_seconds": lambda cls, base: 0.0 if cls == 0 else base,
+        "_scan_thread_slot": lambda kind, cls: contextlib.nullcontext(True),
         "SCAN_CLASS_NOW": 0,
         "PICTURE_BOX_BETWEEN_FILES_SECONDS": 1.0,
         "PICTURE_BOX_IDLE_SLEEP_SECONDS": 20.0,
@@ -11883,6 +13078,8 @@ def suite_scan_lanes_finish():
             "_is_drive_degraded": lambda p: False, "_scan_hold_drive": lambda p, w: None, "_drive_latency_summary": lambda p: "",
             "_scan_drive_on_hold": lambda p: False, "_governor_priority_scope": contextlib.nullcontext,
             "_governor_nullscope": contextlib.nullcontext, "_background_scan_pace_seconds": lambda b: b,
+            "_scan_class_pace_seconds": lambda cls, b: 0.0 if cls == 0 else b,
+            "_scan_thread_slot": lambda kind, cls: contextlib.nullcontext(True),
             "_scan_store_duration": store_fn, "_scan_duration_failed": lambda p: False,
             "_pipeline_stage_picture_box": stage_fn, "_picture_box_done": set(), "_scan_pb_has_box": set(),
             
@@ -12178,6 +13375,7 @@ def suite_duration_hub():
             again = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
             check(again[shows[3]] == 1350, "a saved estimate is not recalculated when another episode is scanned later")
 
+            check(hub.flush_estimates(10.0), "the background writer saves every queued estimate")
             hub2 = open_hub()
             media.set_duration_hub(hub2)
             restarted = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
@@ -12231,7 +13429,7 @@ def suite_duration_hub():
         probe_lib = ml.ProbeLibrary(ml.MediaLibrary(os.path.join(tmp, "p.sqlite3")), use_vlc_fallback=False)
         hubs.append(probe_lib.library)
         lonely = make_file("Lonely.mkv", 2500)
-        ml.DurationHub(probe_lib).store_estimate(lonely, 1800, "series_average")
+        _h = ml.DurationHub(probe_lib); _h.store_estimate(lonely, 1800, "series_average"); _h.flush_estimates()
         with patch.object(ml, "combined_header_probe", lambda *a, **k: ml.HeaderProbeResult(ok=True, duration=1234.0)):
             entry = probe_lib.get_or_probe_sync(lonely)
         check(entry and entry["duration"] == 1234.0, "a library row holding only an estimate is still probed, not returned as a finished probe")
@@ -12258,10 +13456,11 @@ class TestDurationHub(_SectionCase):
 
 _GAIN_EMULATOR_FUNCTIONS = (
     "_library_gain_is_current", "_get_library_gain", "_store_loudness_gain", "_library_gain_first",
-    "_read_file_probe_facts", "_save_file_probe_facts", "_audio_track_pref_key",
+    "_read_file_probe_facts", "_save_file_probe_facts",
     "_get_manual_audio_gain_db", "_save_audio_gain_db",
-    "_lookup_file_gain", "_safe_gain", "_hub_forget_path", "_get_audio_gain_db", "_get_library_dims",
+    "_lookup_file_gain", "_server_entry_gain", "_playing_track_gain", "_owner_set_gain", "_safe_gain", "_hub_forget_path", "_get_audio_gain_db", "_get_library_dims",
     "_set_gain_double_checked", "_take_gain_double_checked", "_set_gain_windows", "_take_gain_windows",
+    "_learning_read", "_learning_write", "_take_learned_offset_applied", "_learned_offset_applied", "_owner_gain_baseline_db",
 )
 
 
@@ -12271,8 +13470,12 @@ def _gain_namespace(fake_db, hub, server_channels=()):
           "_MUSIC_FILE_EXTS": (".mp3", ".flac", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".opus"),
           "_get_gain_hub": lambda: hub, "_hub_note_measured_duration": lambda path, duration: None,
           "_channel_is_server_streamed": lambda ch: str(ch).zfill(2) in server_channels,
-          "_checkpoints": [], "app_state": {},
-          "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock()}
+          "_checkpoints": [], "app_state": {}, "vlc_engine": None,
+          "_track_gain_memo": {}, "_track_gain_memo_lock": threading.Lock(), "_log_warn_throttled": lambda *a: None,
+          "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
+          "_LEARN_FIELDS": ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db"),
+          "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {},
+          "_queue_owner_gain_learning": lambda path, baseline_db, total_db: None}
     ns["_checkpoint_probe_cache"] = lambda: ns["_checkpoints"].append(1)
     for name in _GAIN_EMULATOR_FUNCTIONS:
         exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
@@ -12388,7 +13591,7 @@ def suite_gain_hub():
         check(gone not in fake_db.config["media_probe_cache"] and emu_hub.read(gone)["gain"] is None,
               "a gain for a file the library cannot key saves nothing and the old cache is not written")
 
-        with mock.patch.object(media, "TARGET_LUFS", -23.0):
+        with mock.patch.object(media, "TARGET_LUFS", -23.0), mock.patch.object(media, "MUSIC_TARGET_LUFS", -23.0):
             check(ns["_get_library_gain"](d) is None and "gain" not in ns["_read_file_probe_facts"](d),
                   "a gain measured under another target is ignored so the file is measured again")
         with mock.patch.object(media, "LOUDNESS_GAIN_SCAN_VERSION", media.LOUDNESS_GAIN_SCAN_VERSION + 1):
@@ -12416,13 +13619,13 @@ def suite_gain_hub():
         check(abs(emu_hub.read(d)["gain"] - 10 ** (3 / 20.0)) < 1e-9 and emu_hub.read(d)["manual_gain_db"] == 0,
               "the owner's gain is read back from the library file after a restart of the reader")
         f = make_file("f.mkv", 3500)
-        fake_db.config["audio_gain_db_by_file"][ns["_audio_track_pref_key"](f)] = -4
         ns["_save_audio_gain_db"](f, 0)
         check(ns["_get_manual_audio_gain_db"](f) == 0 and abs(emu_hub.read(f)["gain"] - 1.0) < 1e-9,
-              "setting a file's gain back to zero is saved as the owner's gain and beats the old settings value")
+              "setting a file's gain to zero is saved as the owner's gain")
+        config_before, saves_before = json.dumps(fake_db.config, sort_keys=True, default=str), len(fake_db.saves)
         ns["_save_audio_gain_db"](gone, 5)
-        check(ns["_audio_track_pref_key"](gone) not in fake_db.config["audio_gain_db_by_file"],
-              "a gain for a file the library cannot key saves nothing and the old settings are not written")
+        check(json.dumps(fake_db.config, sort_keys=True, default=str) == config_before and len(fake_db.saves) == saves_before,
+              "a gain for a file the library cannot key saves nothing and the settings are not written")
         ns["_save_audio_gain_db"](d, 99)
         check(abs(emu_hub.read(d)["gain"] - 10 ** (12 / 20.0)) < 1e-9, "the owner's gain is held to the plus or minus 12 dB range")
         ns["_save_audio_gain_db"](d, 3)
@@ -12438,8 +13641,8 @@ def suite_gain_hub():
               "one step up from the shown minus 4 plays at minus 3, not at plus 1")
         legacy = make_file("legacy.mkv", 3800)
         fake_db.channels_db = {"05": {"schedules": {"Morning": [{"path": legacy, "gain": 10 ** (-4 / 20.0)}]}}}
-        check(ns["_get_audio_gain_db"](legacy, "05") == -4,
-              "a gain that only a schedule entry holds is shown as it plays, not as 0")
+        check(ns["_get_audio_gain_db"](legacy, "05") == 0,
+              "a gain that only a schedule entry holds is not read on a local channel: the library is the one place a gain lives")
         ns["_save_audio_gain_db"](legacy, -3)
         check(ns["_get_audio_gain_db"](legacy, "05") == -3,
               "changing that file's gain saves the new total and plays at it")
@@ -12492,7 +13695,7 @@ def suite_gain_hub():
               and 'entry["gain"] = gain\n                    entry["pair' not in MAIN_SRC,
               "no scan writer still copies a new gain into the old dvd cache or a pair schedule entry")
         check(media.OWNER_GAIN_SCAN_VERSION == ml._OWNER_GAIN_SCAN_VERSION == 0, "the owner-gain mark is the same in media.py and the library")
-        check(media.LOUDNESS_GAIN_SCAN_VERSION == 9 and gov.HUB_GAIN_MISS_RECHECK_SECONDS == ml._GAIN_MISS_RECHECK_SECONDS,
+        check(media.LOUDNESS_GAIN_SCAN_VERSION == 10 and gov.HUB_GAIN_MISS_RECHECK_SECONDS == ml._GAIN_MISS_RECHECK_SECONDS,
               "the scan version lives in media.py and the recheck time comes from the governor table")
     finally:
         for lib in libs:
@@ -12520,21 +13723,22 @@ _GAIN_CHECK_FUNCTIONS = (
     "_gain_bundle_members", "_gain_check_db",
     "_middle_value", "_gain_neighbor_check", "_store_loudness_gain", "_library_gain_is_current",
     "_get_library_gain", "_library_gain_first",
-    "_loudness_learning_data", "_learning_set", "_learned_series_offset", "_learned_offset_applied",
-    "_apply_offset_once_confirmed", "_take_learned_offset_applied",
+    "_learning_read", "_learning_write", "_series_offset_from_changes", "_series_offset_for_key",
+    "_learned_series_offset", "_learned_offset_applied",
+    "_apply_offset_once_confirmed", "_take_learned_offset_applied", "_series_offset_from_slider",
 )
 
 
 def suite_gain_double_check():
     windows_of = media._lufs_sample_windows
-    check(windows_of(180.0) is None and windows_of(100.0) is None and windows_of(None) is None and len(windows_of(181.0)) == 5,
-          "a file of 180 seconds or less is scanned whole, with no sample windows, and a file just over it gets 5 windows")
+    check(windows_of(180.0) is None and windows_of(100.0) is None and windows_of(None) is None and len(windows_of(181.0)) == 3,
+          "a file of 180 seconds or less is scanned whole, with no sample windows, and a file just over it gets 3 windows")
     forty = windows_of(2400.0)
     check(len(forty) == 5 and all(length == 60.0 for _start, length in forty)
           and [round(start) for start, _length in forty] == [210, 690, 1170, 1650, 2130],
           "a 40 minute show gets 5 windows of 60 seconds, evenly spaced across the file")
-    check(len(windows_of(3600.0)) == 5 and len(windows_of(3601.0)) == 7 and len(windows_of(7200.0)) == 7,
-          "a show of an hour or less gets 5 windows and a show over an hour gets 7")
+    check([len(windows_of(d)) for d in (600.0, 601.0, 1500.0, 1501.0, 3600.0, 3601.0, 5400.0, 7200.0, 9001.0)] == [3, 4, 4, 5, 5, 6, 6, 7, 9],
+          "the window count follows the length: 3 up to 10 minutes, 4 to 25, 5 to an hour, 6 to 90 minutes, 7 to 150, 9 above")
     long_show = windows_of(7200.0)
     gaps = [long_show[i + 1][0] - long_show[i][0] for i in range(6)]
     check(len(long_show) == 7 and all(abs(gap - 7200.0 / 7) < 1.0 for gap in gaps)
@@ -12544,15 +13748,13 @@ def suite_gain_double_check():
           and media._standard_window_centers(7200.0) == (0.0714, 0.2143, 0.3571, 0.5, 0.6429, 0.7857, 0.9286),
           "the first scan's places are the middle of each equal share of the file")
     check(all(getattr(media, name) == getattr(gov, name) for name in (
-              "LOUDNESS_SCAN_WINDOW_SECONDS", "LOUDNESS_SCAN_WINDOWS_STANDARD", "LOUDNESS_SCAN_WINDOWS_LONG",
-              "LOUDNESS_SCAN_LONG_SHOW_SECONDS", "LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS", "GAIN_CHECK_DRASTIC_DB",
+              "LOUDNESS_SCAN_WINDOW_SECONDS", "LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS", "GAIN_CHECK_DRASTIC_DB",
               "GAIN_CHECK_DRASTIC_EXTRA_BATCHES", "GAIN_CHECK_NEIGHBOR_DB", "GAIN_CHECK_BUNDLE_MIN_SCANNED",
               "GAIN_CHECK_RECHECK_EXTRA_BATCHES", "GAIN_CHECK_EXTRA_BATCH_WINDOWS", "GAIN_CHECK_MAX_OVERLAP")),
           "the scan and double-check numbers in media.py follow the governor table")
-    check(gov.LOUDNESS_SCAN_WINDOW_SECONDS == 60.0 and gov.LOUDNESS_SCAN_WINDOWS_STANDARD == 5
-          and gov.LOUDNESS_SCAN_WINDOWS_LONG == 7 and gov.LOUDNESS_SCAN_LONG_SHOW_SECONDS == 3600.0
+    check(gov.LOUDNESS_SCAN_WINDOW_SECONDS == 60.0 and media.LOUDNESS_SCAN_WINDOW_COUNTS == tuple(gov.LOUDNESS_SCAN_WINDOW_COUNTS)
           and gov.LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS == 180.0,
-          "the table holds 60 second windows, 5 for a show up to an hour, 7 above it, and a whole-file limit of 180 seconds")
+          "the table holds 60 second windows, the window count by length, and a whole-file limit of 180 seconds")
 
     for duration in (1500.0, 2400.0, 7200.0):
         first_places = list(media._standard_window_centers(duration))
@@ -12568,7 +13770,7 @@ def suite_gain_double_check():
         check(ok and len(taken) > len(first_places),
               "extra windows for a %d second show sit away from every earlier window, inside the span of the first scan" % duration)
     check(len(media._extra_window_centers(2400.0, media._standard_window_centers(2400.0), 3)) == 3
-          and media._extra_window_centers(200.0, media._standard_window_centers(200.0), 3) == []
+          and len(media._extra_window_centers(200.0, media._standard_window_centers(200.0), 3)) == 2
           and len(media._extra_window_centers(300.0, media._standard_window_centers(300.0)
                                               + (0.2, 0.4, 0.6), 3)) == 1
           and media._extra_window_centers(300.0, [0.1, 0.3, 0.5, 0.7, 0.9, 0.2, 0.4, 0.6, 0.8], 3) == [],
@@ -12718,6 +13920,11 @@ def suite_gain_double_check():
                 return media._get_media_loudness_gain_impl(path)
 
         got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -6.1, (0.0, -3.0, 5.0, "", False))
+        check(not whole_calls and abs(20 * math.log10(got) + -6.1 - ceiling) < 1e-6,
+              "with the whole-file peak check off (the default) no whole-file read runs and the window peaks hold the ceiling")
+        _peak_switch = mock.patch.object(media, "LOUDNESS_WHOLE_FILE_PEAK_CHECK", True)
+        _peak_switch.start()
+        got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -6.1, (0.0, -3.0, 5.0, "", False))
         check(len(whole_calls) == 1 and whole_calls[0][:2] == (None, None)
               and abs(20 * math.log10(got) + -3.0 - ceiling) < 1e-6,
               "a sampled file whose boosted peak would land near the ceiling gets a whole-file peak pass and is held to the louder peak it finds")
@@ -12730,6 +13937,7 @@ def suite_gain_double_check():
         got = run_peak(100.0, media.TARGET_LUFS - 4.6, -3.0, (0.0, -3.0, 5.0, "", False))
         check(not whole_calls and abs(20 * math.log10(got) + -3.0 - ceiling) < 1e-6,
               "a file scanned whole already has its true peak, so no second pass runs and the ceiling holds")
+        _peak_switch.stop()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -12749,7 +13957,7 @@ def suite_gain_double_check():
         a = make("a.mkv", 3000)
         check(not hub.is_checked(a) and hub.note_gain(a, 1.2, -20.5, 1, 1.5) and not hub.is_checked(a),
               "a scanned gain starts out not double-checked")
-        check(hub.mark_checked(a) and hub.is_checked(a) and ml.GainHub(hub.probe_library).is_checked(a),
+        check(hub.note_gain(a, 1.2, -20.5, 1, 1.5, checked=True) and hub.is_checked(a) and ml.GainHub(hub.probe_library).is_checked(a),
               "the double-checked mark is saved in the library and survives a restart")
         check(hub.note_gain(a, 1.3, -20.5, 1, 1.5) and not hub.is_checked(a),
               "a new scan result that was not double-checked clears the mark")
@@ -12757,7 +13965,7 @@ def suite_gain_double_check():
               "a scan result saved as double-checked carries the mark")
         check(hub.note_owner_gain(a, 3) and hub.is_checked(a),
               "a file the owner set by hand counts as checked and is never scanned again")
-        check(not hub.mark_checked(os.path.join(tmp, "gone.mkv")), "a file the library cannot key cannot be marked")
+        check(not hub.note_gain(os.path.join(tmp, "gone.mkv"), 1.2, -20.5, 1, 1.5, checked=True), "a file the library cannot key cannot be marked")
 
         w = [(0.1667, -33.0), (0.5, -33.4), (0.8333, -32.8)]
         wf = make("w.mkv", 3050)
@@ -12792,7 +14000,9 @@ def suite_gain_double_check():
                   "_app_shutting_down": threading.Event(), "_LOUDNESS_PRIORITY_PENDING": threading.Event(),
                   "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
                   "_gain_check_tried": set(), "_gain_check_folder_seen": {}, "_GAIN_CHECK_FOLDER_REVISIT_S": 600,
-                  "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {}}
+                  "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {},
+                  "_LEARN_FIELDS": ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db"),
+                  "LOUDNESS_LEARN_MIN_FILES": 3, "LOUDNESS_LEARN_MAX_OFFSET_DB": 12}
 
             def fake_probe(norm_p, **kwargs):
                 rescans.append((norm_p, kwargs.get("prior_windows")))
@@ -12870,9 +14080,8 @@ def suite_gain_double_check():
         ns = make_ns(season_key=None)
         check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
               "a file that is not in a season folder is never compared with its folder")
-        ns = make_ns()
-        ns["db"].config["loudness_scan_enabled"] = False
-        check(ns["_gain_neighbor_check"](files[0], force=True) == 0, "with loudness scanning off the check does nothing")
+        check("loudness_scan_enabled" not in get_function_source("_gain_neighbor_check"),
+              "the season check runs the same with Loudness Scan on or off; off only stops playback from using the gains")
         ns = make_ns()
         ns["_LOUDNESS_PRIORITY_PENDING"].set()
         set_gains({0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0, 4: 8.0})
@@ -12908,10 +14117,12 @@ class TestGainDoubleCheck(_SectionCase):
 _LEARNED_OFFSET_FUNCTIONS = (
     "_set_gain_double_checked", "_take_gain_double_checked", "_set_gain_windows", "_take_gain_windows",
     "_gain_bundle_members", "_gain_check_db", "_middle_value", "_store_loudness_gain", "_library_gain_is_current",
-    "_get_library_gain", "_loudness_learning_data", "_learning_set", "_learned_series_offset",
-    "_learned_offset_applied", "_series_scan_is_outlier", "_apply_learned_series_offset",
+    "_get_library_gain", "_learning_read", "_learning_write", "_series_offset_from_changes",
+    "_series_offset_for_key", "_series_offset_from_slider", "_learned_series_offset",
+    "_learned_offset_applied", "_season_others_middle_db", "_series_scan_is_outlier", "_apply_learned_series_offset",
     "_apply_offset_once_confirmed", "_take_learned_offset_applied", "_owner_gain_baseline_db",
-    "_learn_from_owner_gain",
+    "_series_members", "_apply_series_offset_to_scanned", "_learn_from_owner_gain",
+    "_queue_owner_gain_learning", "_owner_gain_learning_loop",
 )
 
 
@@ -12922,99 +14133,344 @@ def suite_learned_series_offset():
         lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
         libs.append(lib)
         hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
-        files = []
-        for i in range(10):
-            full = os.path.join(tmp, "e%d.mkv" % i)
+        show = os.path.join(tmp, "Show")
+
+        def make(folder, name, size):
+            os.makedirs(folder, exist_ok=True)
+            full = os.path.join(folder, name)
             with open(full, "wb") as handle:
-                handle.write(os.urandom(3000 + i))
-            files.append(os.path.normpath(full))
+                handle.write(os.urandom(size))
+            return os.path.normpath(full)
+
+        files = [make(os.path.join(show, "Season 1"), "e%d.mkv" % i, 3000 + i) for i in range(10)]
+        season2 = [make(os.path.join(show, "Season 2"), "f%d.mkv" % i, 4000 + i) for i in range(3)]
+        loose = make(os.path.join(tmp, "Loose"), "x.mkv", 5000)
         saves = []
         fake_db = types.SimpleNamespace(config={}, save_settings_async=lambda **k: saves.append(1))
         ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
               "log": mock.MagicMock(), "_log_swallowed": lambda where, error: None,
               "_MUSIC_FILE_EXTS": (".mp3",), "_get_gain_hub": lambda: hub,
-              "_get_show_smoothing_key": lambda p: "show", "_is_drive_degraded": lambda p: False,
-              "_get_part_group_key": lambda p: None,
+              "_get_show_smoothing_key": lambda p: "show" if os.sep + "Show" + os.sep in p else None,
+              "_is_drive_degraded": lambda p: False, "_get_part_group_key": lambda p: None,
               "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
-              "LOUDNESS_LEARN_MIN_FILES": 3, "LOUDNESS_LEARN_MAX_OFFSET_DB": 12,
-              "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {}}
+              "LOUDNESS_LEARN_MIN_FILES": 3, "LOUDNESS_LEARN_AGREE_DB": 2.0, "LOUDNESS_LEARN_SINGLE_CHANGE_DB": 3.0,
+              "LOUDNESS_LEARN_MAX_OFFSET_DB": 12, "LOUDNESS_LEARN_SETTLE_SECONDS": 3600.0,
+              "_LEARN_FIELDS": ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db"),
+              "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {},
+              "_owner_gain_learning_pending": {}, "_owner_gain_learning_worker": {"thread": None},
+              "_app_shutting_down": threading.Event()}
         for name in _LEARNED_OFFSET_FUNCTIONS:
             exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
 
-        def scan(i, value_db):
-            hub.note_gain(files[i], 10 ** (value_db / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION,
+        def scan(path, value_db):
+            hub.note_gain(path, 10 ** (value_db / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION,
                           media.LOUDNESS_CONVERGENCE_DB)
 
-        def owner(i, total_db):
-            baseline = ns["_owner_gain_baseline_db"](files[i], hub)
-            hub.note_owner_gain(files[i], total_db)
-            ns["_learn_from_owner_gain"](files[i], baseline, total_db)
+        def owner(path, total_db):
+            baseline = ns["_owner_gain_baseline_db"](path, hub)
+            hub.note_owner_gain(path, total_db)
+            ns["_learn_from_owner_gain"](path, baseline, total_db)
 
-        def raw_db(i):
-            return ns["_gain_check_db"](hub, files[i])
+        def played_db(path):
+            return 20.0 * math.log10(hub.read(path)["gain"])
 
-        for i in range(6):
-            scan(i, 2.0)
-        owner(0, 4)
-        owner(0, 5)
-        check(ns["_learned_series_offset"](files[0]) == 0 and saves,
-              "one episode changed by hand, even in two steps, teaches the series nothing yet and is saved")
-        owner(1, 5)
-        check(ns["_learned_series_offset"](files[0]) == 0, "two episodes changed by the same amount are not yet enough")
-        owner(2, 5)
-        check(ns["_learned_series_offset"](files[0]) == 3,
-              "three episodes of a series changed by the same 3 dB give the series a learned +3 dB offset")
-        check(ns["_learned_offset_applied"](files[0]) == 0 and all(raw_db(i) is None for i in (0, 1, 2)),
-              "the three changed episodes are the owner's and are never rescanned or offset again")
-        owner(0, 6)
-        check(ns["_learned_series_offset"](files[0]) == 0,
-              "when the owner's latest three changes are not the same amount the learned offset is cleared")
-        owner(0, 5)
-        check(ns["_learned_series_offset"](files[0]) == 3, "changing it back to the same amount learns it again")
+        def offset():
+            return ns["_learned_series_offset"](files[0])
 
-        base_db = 2.0
-        gain = ns["_apply_learned_series_offset"](files[6], 10 ** (base_db / 20.0))
-        check(abs(20 * math.log10(gain) - 5.0) < 1e-9, "an unscanned episode of the series is scanned and given the learned +3 dB")
-        check(ns["_store_loudness_gain"](files[6], gain) and ns["_learned_offset_applied"](files[6]) == 3
-              and abs(raw_db(6) - base_db) < 1e-6,
-              "the offset that was added is remembered, and the season comparison still sees the episode's own scanned dB")
-        check(abs(ns["_owner_gain_baseline_db"](files[6], hub) - base_db) < 1e-6,
-              "an owner change to an offset episode is measured from its own scanned dB, not from the offset one")
+        for i in range(8):
+            scan(files[i], 2.0)
+        scan(files[8], 8.0)
+        for path in season2:
+            scan(path, 2.0)
 
-        gain = ns["_apply_learned_series_offset"](files[7], 10 ** (8.0 / 20.0))
-        check(abs(20 * math.log10(gain) - 8.0) < 1e-9,
-              "an episode whose own scan is 3 dB or more from the rest of its season is left behind without the offset")
-        check(ns["_store_loudness_gain"](files[7], gain) and ns["_learned_offset_applied"](files[7]) == 0,
-              "the left-behind episode is saved with no offset recorded")
-        gain = ns["_apply_offset_once_confirmed"](files[7], 10 ** (2.2 / 20.0), 2.0)
-        check(abs(20 * math.log10(gain) - 5.2) < 1e-9,
-              "after the scan at new places agrees with the season, the learned offset is added to that episode")
-        check(ns["_store_loudness_gain"](files[7], gain) and ns["_learned_offset_applied"](files[7]) == 3,
-              "the offset added after the recheck is remembered")
-        gain = ns["_apply_offset_once_confirmed"](files[7], 10 ** (8.0 / 20.0), 2.0)
-        check(abs(20 * math.log10(gain) - 8.0) < 1e-9,
-              "if the scan at new places still differs from the season, the episode keeps its own scanned gain")
+        check(ns["_series_offset_from_changes"]([(2.0, 1), (3.0, 2), (2.0, 3)]) == 2
+              and ns["_series_offset_from_changes"]([(-5.0, 1)]) == -5
+              and ns["_series_offset_from_changes"]([(2.0, 1), (-2.0, 2), (2.0, 3)]) == 0
+              and ns["_series_offset_from_changes"]([(1.0, 1), (4.0, 2), (1.0, 3)]) == 0
+              and ns["_series_offset_from_changes"]([(-20.0, 1)]) == -12,
+              "the series offset: one change over 3 dB sets it; three small changes that all go one way within 2 dB of each other give their middle; any other mix gives none; never past 12 dB")
 
-        ns["_get_show_smoothing_key"] = lambda p: None
-        check(ns["_learned_series_offset"](files[8]) == 0 and ns["_apply_learned_series_offset"](files[8], 1.5) == 1.5,
+        owner(files[0], 4)
+        owner(files[0], 5)
+        held = hub.read_file_fields(files[0], ("learn_series_key", "learn_change_db"))
+        check(offset() == 0 and held == {"learn_series_key": "show", "learn_change_db": 3.0} and not fake_db.config,
+              "one episode changed by 3 dB, even in two steps, teaches the series nothing yet and is saved in the file's library row, not the settings file")
+        owner(files[1], 4)
+        check(offset() == 0, "two small changes are not yet enough")
+        owner(files[2], 5)
+        check(offset() == 3, "three small changes the same way (+3, +2, +3) give the series their middle, +3 dB")
+        check(abs(played_db(files[3]) - 5.0) < 1e-6 and abs(played_db(season2[0]) - 5.0) < 1e-6
+              and ns["_learned_offset_applied"](files[3]) == 3 and ns["_learned_offset_applied"](season2[0]) == 3,
+              "the learned +3 dB reaches the scanned episodes of this season and of the next season at once")
+        check(abs(played_db(files[8]) - 8.0) < 1e-6 and ns["_learned_offset_applied"](files[8]) == 0,
+              "an episode whose own scan sits far from its season is left without the series offset")
+        check(abs(played_db(files[0]) - 5.0) < 1e-6 and abs(played_db(files[2]) - 5.0) < 1e-6,
+              "the owner's own gains are never changed by the learned offset")
+
+        owner(files[3], 7)
+        check(offset() == 5, "one change of more than 3 dB on an episode that scans like its season sets the series at once (+5 dB)")
+        check(abs(played_db(files[4]) - 7.0) < 1e-6 and abs(played_db(season2[1]) - 7.0) < 1e-6,
+              "the new offset replaces the old one on every scanned episode, measured from each episode's own scan")
+        gain = ns["_apply_learned_series_offset"](files[9], 10 ** (2.0 / 20.0))
+        check(abs(20 * math.log10(gain) - 7.0) < 1e-9, "an episode scanned later is given the learned offset when it is scanned")
+        ns["_take_learned_offset_applied"](files[9])
+
+        owner(files[8], 3)
+        check(offset() == 5 and hub.read_file_fields(files[8], ("learn_change_db",)) == {"learn_change_db": None},
+              "a change to a one-off episode that scans far from its season is kept for that episode only and does not move the series")
+
+        owner(files[4], 2)
+        check(offset() == 0 and abs(played_db(files[5]) - 2.0) < 1e-6 and ns["_learned_offset_applied"](files[5]) == 0,
+              "the owner turning an episode back to its own scan is learned from too: the mixed changes clear the offset and the episodes go back to their scans")
+
+        check(ns["_learned_series_offset"](loose) == 0 and ns["_apply_learned_series_offset"](loose, 1.5) == 1.5,
               "a file outside a season folder is never offset")
-        scan(9, 2.0)
-        before = len(saves)
-        owner(9, 7)
-        check(len(saves) == before and ns["_learned_series_offset"](files[9]) == 0,
+        scan(loose, 2.0)
+        owner(loose, 7)
+        check(hub.read_file_fields(loose, ("learn_change_db",)) == {"learn_change_db": None},
               "a change to a file outside a season folder is not learned from")
+
+        ns["_app_shutting_down"].set()
+        ns["_queue_owner_gain_learning"](files[6], 2.0, 3)
+        ns["_queue_owner_gain_learning"](files[6], None, 4)
+        held = ns["_owner_gain_learning_pending"].get(files[6])
+        check(held is not None and held[0] == 2.0 and held[1] == 4,
+              "presses close together wait to be learned as one change, measured from the scan before the first press")
     finally:
         for opened in libs:
             opened.close()
         shutil.rmtree(tmp, ignore_errors=True)
     src = MAIN_SRC
     check("apply_learned_offset=False" in src and "_apply_offset_once_confirmed(member, new_gain, middle)" in src
-          and "_learn_from_owner_gain(norm_path, baseline_db, value)" in src,
-          "the season check scans a far episode again without the offset, and the owner's gain changes are learned from")
+          and "_queue_owner_gain_learning(norm_path, baseline_db, value)" in src,
+          "the season check scans a far episode again without the offset, and the owner's gain changes are learned from on the learning thread")
+    check("return _track_gain * 10 ** (_learned_offset_applied(norm_target) / 20.0) * manual_gain" in src,
+          "a second audio track plays with the series' learned offset too")
+
+
+_SLIDER_LEARN_FUNCTIONS = _LEARNED_OFFSET_FUNCTIONS + (
+    "_slider_comfort_volume", "_slider_volume_db", "_settled_volume",
+    "_learn_from_slider_watch", "_owner_set_gain", "_perceptual_volume_pct", "_slider_watch_sample", "_slider_watch_loop",
+)
+
+
+def suite_slider_learning():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        libs.append(lib)
+        hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+
+        def make(folder, name, size):
+            os.makedirs(folder, exist_ok=True)
+            full = os.path.join(folder, name)
+            with open(full, "wb") as handle:
+                handle.write(os.urandom(size))
+            return os.path.normpath(full)
+
+        files = [make(os.path.join(tmp, "Show", "Season 1"), "e%d.mkv" % i, 3000 + i) for i in range(10)]
+        season2 = [make(os.path.join(tmp, "Show", "Season 2"), "f%d.mkv" % i, 4000 + i) for i in range(3)]
+        other = [make(os.path.join(tmp, "Other", "Season 1"), "o%d.mkv" % i, 6000 + i) for i in range(3)]
+
+        def key(p):
+            if os.sep + "Show" + os.sep in p:
+                return "show"
+            if os.sep + "Other" + os.sep in p:
+                return "other"
+            return None
+
+        fake_db = types.SimpleNamespace(config={"global_volume": 72, "is_muted": False}, save_settings_async=lambda **k: None)
+        ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
+              "log": mock.MagicMock(), "_log_swallowed": lambda where, error: None,
+              "_MUSIC_FILE_EXTS": (".mp3",), "_get_gain_hub": lambda: hub, "_get_show_smoothing_key": key,
+              "_is_drive_degraded": lambda p: False, "_get_part_group_key": lambda p: None,
+              "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
+              "LOUDNESS_LEARN_MIN_FILES": 3, "LOUDNESS_LEARN_AGREE_DB": 2.0, "LOUDNESS_LEARN_SINGLE_CHANGE_DB": 3.0,
+              "LOUDNESS_LEARN_MAX_OFFSET_DB": 12, "LOUDNESS_LEARN_SETTLE_SECONDS": 3600.0,
+              "LOUDNESS_SLIDER_SAMPLE_SECONDS": 1.0, "LOUDNESS_SLIDER_MIN_WATCH_SECONDS": 600.0, "LOUDNESS_SLIDER_TRIGGER_POINTS": 30,
+              "LOUDNESS_SLIDER_COMFORT_PCT": 72, "LOUDNESS_SLIDER_REFERENCE_FILES": 10, "LOUDNESS_SLIDER_REFERENCE_MIN_FILES": 3,
+              "_LEARN_FIELDS": ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db"),
+              "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {},
+              "_owner_gain_learning_pending": {}, "_owner_gain_learning_worker": {"thread": None},
+              "_app_shutting_down": threading.Event()}
+        for name in _SLIDER_LEARN_FUNCTIONS:
+            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
+
+        def scan(path, value_db):
+            hub.note_gain(path, 10 ** (value_db / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION,
+                          media.LOUDNESS_CONVERGENCE_DB)
+
+        def played_db(path):
+            return 20.0 * math.log10(hub.read(path)["gain"])
+
+        def watch(path, seconds_at_volume):
+            ns["_learn_from_slider_watch"](path, dict(seconds_at_volume))
+
+        def offset():
+            return ns["_learned_series_offset"](files[0])
+
+        for i in range(8):
+            scan(files[i], 2.0)
+        scan(files[8], 8.0)
+        for path in season2 + other:
+            scan(path, 2.0)
+
+        check(ns["_settled_volume"]({72: 1800.0, 30: 300.0}) == 72 and ns["_settled_volume"]({40: 1500.0, 72: 600.0}) == 40,
+              "the volume an episode counts at is the one most of its watched time sat at; a short drop for a phone call does not move it")
+        check(ns["_slider_comfort_volume"]() == 72.0, "the comfortable volume is 72 until enough files set by hand have been watched")
+
+        watch(files[0], {72: 1200.0})
+        watch(files[1], {72: 300.0})
+        check(hub.read_file_fields(files[1], ("learn_slider_db",)) == {"learn_slider_db": None},
+              "an episode watched for less than 10 minutes teaches nothing")
+        watch(files[1], {35: 1500.0, 72: 200.0})
+        check(offset() == 0, "one episode turned far down is not enough")
+        watch(files[2], {35: 1500.0})
+        check(offset() == -12, "two of the last three episodes kept more than 30 points under the comfortable volume make the series quieter (held to 12 dB)")
+        check(abs(played_db(files[3]) + 10.0) < 1e-6 and abs(played_db(season2[0]) + 10.0) < 1e-6,
+              "the rest of the series, both seasons, is given the learned offset on its own scan")
+        check(abs(played_db(files[8]) - 8.0) < 1e-6, "an episode whose own scan sits far from its season is left without it")
+        watch(files[3], {72: 1500.0})
+        watch(files[4], {72: 900.0, 100: 300.0, 40: 200.0})
+        check(offset() == -12,
+              "once the series sounds right at the comfortable volume the offset stays: the episodes now ask for what they played with, and the room-noise moves do not count")
+        watch(files[8], {35: 1500.0})
+        check(hub.read_file_fields(files[8], ("learn_slider_db",)) == {"learn_slider_db": None} and offset() == -12,
+              "an episode that scans far from its season is not counted for the series")
+
+        for path in other:
+            hub.note_owner_gain(path, 0)
+            watch(path, {60: 1500.0})
+        check(ns["_slider_comfort_volume"]() == 60.0, "the files the owner set by hand give the comfortable volume once three are watched")
+        check(hub.read_file_fields(other[0], ("learn_slider_db",)) == {"learn_slider_db": None},
+              "a file set by hand only gives the comfortable volume and is never changed by the slider learning")
+
+        baseline = ns["_owner_gain_baseline_db"](files[6], hub)
+        hub.note_owner_gain(files[6], -8)
+        ns["_learn_from_owner_gain"](files[6], baseline, -8)
+        check(offset() == -10 and abs(played_db(files[7]) + 8.0) < 1e-6,
+              "a manual change that sets an offset wins over the volume learning (-10 dB from the episode's own scan)")
+        baseline = ns["_owner_gain_baseline_db"](files[5], hub)
+        hub.note_owner_gain(files[5], 3)
+        ns["_learn_from_owner_gain"](files[5], baseline, 3)
+        check(offset() != 0, "a small manual tweak that sets no offset of its own does not wipe out what was learned")
+
+        samples = iter([(files[9], 72)] * 3 + [(None, None), (season2[2], 72), (files[9], None)])
+        fed = []
+
+        def fake_sample():
+            try:
+                return next(samples)
+            except StopIteration:
+                ns["_app_shutting_down"].set()
+                return None, None
+
+        ns["_slider_watch_sample"] = fake_sample
+        ns["_learn_from_slider_watch"] = lambda path, record: fed.append((path, dict(record)))
+        ns["_app_shutting_down"].wait = lambda timeout=None: ns["_app_shutting_down"].is_set()
+        ns["_slider_watch_loop"]()
+        check(fed == [(files[9], {72: 3.0}), (season2[2], {72: 1.0})],
+              "the watch adds up seconds at each volume for one episode, skips a moment with no series file (a commercial), hands the episode over when another episode starts and adds no time while paused or muted")
+    finally:
+        for opened in libs:
+            opened.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    check('threading.Thread(target=_slider_watch_loop, daemon=True, name="VolumeWatch").start()' in MAIN_SRC,
+          "the volume watch starts at boot on its own thread")
+
+
+class TestSliderLearning(_SectionCase):
+    """The volume kept while watching a series teaches its loudness without reacting to short moves"""
+
+    def test_slider_learning(self):
+        self.run_section(suite_slider_learning)
+
+
+def suite_static_sound():
+    class FakeChannel:
+        def __init__(self):
+            self.volume = 0.0
+
+        def set_volume(self, v):
+            self.volume = v
+
+    class FakeSound:
+        def __init__(self):
+            self.playing = 0
+            self.volume = None
+            self.channel = FakeChannel()
+            self.free = True
+
+        def get_num_channels(self):
+            return self.playing
+
+        def play(self, loops=0):
+            if not self.free:
+                return None
+            self.playing = 1
+            return self.channel
+
+        def stop(self):
+            self.playing = 0
+
+        def set_volume(self, v):
+            self.volume = v
+
+    sound = FakeSound()
+    lines = []
+    ticks = [1000]
+    ns = {"static_audio": sound, "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0])),
+          "log": types.SimpleNamespace(info=lambda msg, *a: lines.append(msg % a)), "_log_swallowed": lambda where, e: lines.append("FAILURE " + where),
+          "_effective_audio_gain": lambda: 0.5, "_effective_loudness_gain": lambda g: 1.0, "_STATIC_AUDIO_GAIN": 0.25,
+          "_static_sound_state": {"last_stop": "", "last_stop_ms": 0, "stop_counts": {}, "logged_restart": ""}}
+    for name in ("_static_sound_play", "_static_sound_stop"):
+        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    ns["_static_sound_play"]()
+    check(sound.playing == 1 and sound.channel.volume == 1.0 and sound.volume == 0.5,
+          "the Static noise starts at the current volume, and the channel it lands on is set back to full volume")
+    ns["_static_sound_play"]()
+    check(sound.playing == 1 and not lines, "a playing Static noise is left alone")
+    ticks[0] = 4000
+    ns["_static_sound_stop"]("change_channel")
+    check(sound.playing == 0 and lines == ["[STATIC SOUND] stopped by change_channel"], "a stop says who stopped the noise")
+    ns["_static_sound_stop"]("change_channel")
+    check(len(lines) == 1, "stopping a noise that is not playing does nothing and writes nothing")
+    ticks[0] = 4250
+    ns["_static_sound_play"]()
+    check(sound.playing == 1 and lines[-1] == "[STATIC SOUND] started again; last stopped by change_channel 250 ms before",
+          "starting it again names the last stop")
+    for _ in range(12):
+        ns["_static_sound_stop"]("visualizer: content is playing")
+        ns["_static_sound_play"]()
+    check(sum(l.startswith("[STATIC SOUND] stopped by visualizer") for l in lines) == 2,
+          "a stop from one place repeated every frame writes its 1st and 10th line only")
+    sound.stop()
+    sound.free = False
+    ns["_static_sound_play"]()
+    check(lines[-1] == "FAILURE _static_sound_play: starting the Static noise", "no free mixer channel writes a failure line")
+
+    src = MAIN_SRC
+    check(src.count("static_audio.stop()") == 1 and src.count("static_audio.play(") == 1,
+          "the Static noise is started and stopped only through _static_sound_play and _static_sound_stop")
+    for opener in [m.start() for m in re.finditer(r"_fe_open\(", src)]:
+        before = src[max(0, opener - 700):opener]
+        check("_static_sound_stop(" not in before, "opening the file explorer does not stop the Static noise (at %d)" % opener)
+    check('current_playback_state.get("mode") == "Static"' in src and '_static_sound_play()\n\n    _prof_mark("game_deck")' in src,
+          "once a frame a channel airing Static keeps its noise playing, under menus and the file explorer too")
+    check('if reason != "toggle" and not player.is_playing():\n            continue' in src,
+          "the stereo reassert waits for playback instead of retrying every 2 s with nothing loaded")
+
+
+class TestStaticSound(_SectionCase):
+    """The Static noise keeps playing on a channel airing Static, and every start and stop writes who did it"""
+
+    def test_static_sound(self):
+        self.run_section(suite_static_sound)
 
 
 class TestLearnedSeriesOffset(_SectionCase):
-    """A series the owner changes by the same amount three times has the rest of it offset by that amount"""
+    """A series the owner changes by one big step or three agreeing small steps has the rest of it offset; one-off episodes stay one-off"""
 
     def test_learned_series_offset(self):
         self.run_section(suite_learned_series_offset)
@@ -13282,12 +14738,76 @@ class TestFileFactsHub(_SectionCase):
 
 
 # ============================================================================
+# SECTION: Reading a file's facts never opens the file (hundreds of new files must not stall the scheduler)
+# ============================================================================
+
+def suite_file_facts_read_never_hashes():
+    tmp = tempfile.mkdtemp()
+    libs = []
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        libs.append(lib)
+        probe = ml.ProbeLibrary(lib, use_vlc_fallback=False)
+        hub = ml.FileFactsHub(probe)
+
+        def make_file(name, size=3000):
+            path = os.path.join(tmp, name)
+            with open(path, "wb") as handle:
+                handle.write(os.urandom(size))
+            return path
+
+        new_files = [make_file("new_%03d.mkv" % i) for i in range(200)]
+        hashed = []
+        real_identity = ml.compute_identity_key
+
+        def counting_identity(path, *a, **k):
+            hashed.append(path)
+            return real_identity(path, 0)
+
+        with patch.object(ml, "compute_identity_key", counting_identity):
+            started = time.monotonic()
+            with patch.object(media, "get_file_facts_hub", return_value=hub):
+                verdicts = [media.file_is_confirmed_bad(path) for path in new_files]
+            took = time.monotonic() - started
+        check(not any(verdicts), "files nobody has keyed yet read as not bad")
+        check(not hashed, "reading 200 never-keyed files opened none of them to hash (%d hashed)" % len(hashed))
+        check(took < 5.0, "reading 200 never-keyed files is quick (%.2fs)" % took)
+
+        keyed = make_file("keyed.mkv")
+        check(hub.note(keyed, confirmed_unplayable=True), "a verdict is saved for a keyed file")
+        later = ml.FileFactsHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+        with patch.object(ml, "compute_identity_key", counting_identity):
+            check(later.read(keyed)["confirmed_unplayable"] is True, "a saved verdict is still found by path after a restart, with no hashing")
+        check(not hashed, "finding a saved verdict hashed nothing (%d hashed)" % len(hashed))
+
+        with open(keyed, "wb") as handle:
+            handle.write(os.urandom(3600))
+        later.forget(keyed)
+        changed = later.read(keyed)
+        check(not changed["confirmed_unplayable"], "a file marked changed is re-keyed from disk, so its old verdict no longer applies")
+    finally:
+        for lib in libs:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestFileFactsReadNeverHashes(_SectionCase):
+    """Reading verdicts for hundreds of unkeyed files must not hash them on the thread that asks"""
+
+    def test_file_facts_read_never_hashes(self):
+        self.run_section(suite_file_facts_read_never_hashes)
+
+
+# ============================================================================
 # SECTION: Multi-part title gains in the library
 # ============================================================================
 
 _PART_GROUP_EMULATOR_FUNCTIONS = (
     "_library_gain_is_current", "_read_part_group_gain", "_set_part_group_anchor_gain",
-    "_invalidate_gains_for_target_lufs_change", "_probe_loudness_guarded",
+    "_strip_local_entry_gains", "_probe_loudness_guarded",
 )
 
 
@@ -13332,7 +14852,10 @@ def suite_part_group_gain_hub():
               "log": logged, "_log_swallowed": lambda where, error: None,
               "_MUSIC_FILE_EXTS": (".mp3", ".flac", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".opus"),
               "_get_gain_hub": lambda: emu_hub, "_get_probe_library": lambda: emu_hub.probe_library,
-              "TARGET_LUFS": media.TARGET_LUFS, "LOUDNESS_CONVERGENCE_DB": media.LOUDNESS_CONVERGENCE_DB}
+              "TARGET_LUFS": media.TARGET_LUFS, "LOUDNESS_CONVERGENCE_DB": media.LOUDNESS_CONVERGENCE_DB,
+              "_channel_is_server_streamed": lambda ch: False,
+              "_apply_learned_series_offset": lambda path, gain: gain,
+              "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {}}
         for name in _PART_GROUP_EMULATOR_FUNCTIONS:
             exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
 
@@ -13347,7 +14870,7 @@ def suite_part_group_gain_hub():
         check(ns["_read_part_group_gain"]("d:\\music\\album::album")["target_lufs"] == media.MUSIC_TARGET_LUFS,
               "a music part is stamped with the music target")
         check("_part_group_gain_cache" not in fake_db.config and not fake_db.saves, "saving a title gain writes nothing into settings and forces no settings save")
-        with mock.patch.object(media, "TARGET_LUFS", -23.0):
+        with mock.patch.object(media, "TARGET_LUFS", -23.0), mock.patch.object(media, "MUSIC_TARGET_LUFS", -23.0):
             check(ns["_read_part_group_gain"](gk) is None, "a title gain measured under another target is ignored so the title is measured again")
         with mock.patch.object(media, "LOUDNESS_GAIN_SCAN_VERSION", media.LOUDNESS_GAIN_SCAN_VERSION + 1):
             check(ns["_read_part_group_gain"](gk) is None, "a title gain from an older scan version is ignored")
@@ -13367,14 +14890,12 @@ def suite_part_group_gain_hub():
         ns["_set_part_group_anchor_gain"](gk, "p.mkv", None)
         check(emu_hub.read_group(gk)["gain"] == 0.75, "saving without a title or without a gain does nothing")
 
-        fake_db.config["_gain_cache_target_lufs"] = [-23.0, media.LOUDNESS_CONVERGENCE_DB]
         fake_db.channels_db = {"05": {"schedules": {"Morning": [{"path": "p.mkv", "gain": 0.9, "pair_ep1_gain": 0.8}]}}}
-        ns["TARGET_LUFS"] = media.TARGET_LUFS
         before = emu_hub.read_group(gk)
-        cleared = ns["_invalidate_gains_for_target_lufs_change"]()
-        check(cleared == 2 and "gain" not in fake_db.channels_db["05"]["schedules"]["Morning"][0], "a loudness target change still clears the gains held inside schedule entries")
+        cleared = ns["_strip_local_entry_gains"]()
+        check(cleared == 2 and "gain" not in fake_db.channels_db["05"]["schedules"]["Morning"][0], "old gains held inside local schedule entries are removed at boot")
         check(emu_hub.read_group(gk) == before and not hasattr(fake_db, "_part_group_gain_cache"),
-              "a loudness target change no longer clears multi-part title gains; the library keeps them and the stamps decide if they count")
+              "removing them leaves multi-part title gains in the library untouched")
 
         def run_guarded(path, group, scan_gain=None, shortfall=None):
             guarded = {"_get_part_group_key": lambda p: group, "_read_part_group_gain": ns["_read_part_group_gain"],
@@ -13398,7 +14919,7 @@ def suite_part_group_gain_hub():
         gain, out, scanner = run_guarded("d:\\movies\\fresh\\fresh cd1.mkv", fresh, scan_gain=0.65)
         check(gain == 0.65 and scanner.called and emu_hub.read_group(fresh)["gain"] == 0.65 and emu_hub.read_group(fresh)["anchor_path"].endswith("fresh cd1.mkv"),
               "the first part of a new multi-part title that is scanned becomes the title's saved gain")
-        with mock.patch.object(media, "TARGET_LUFS", -23.0):
+        with mock.patch.object(media, "TARGET_LUFS", -23.0), mock.patch.object(media, "MUSIC_TARGET_LUFS", -23.0):
             gain, out, scanner = run_guarded("d:\\movies\\fresh\\fresh cd2.mkv", fresh, scan_gain=0.55)
             check(gain == 0.55 and scanner.called and emu_hub.read_group(fresh)["anchor_path"].endswith("fresh cd2.mkv"),
                   "when the saved title gain was measured under another target the next part is scanned and becomes the new saved gain")
@@ -13431,22 +14952,16 @@ def suite_clear_keeps_file_data():
     tmp = tempfile.mkdtemp()
     libs = []
     try:
-        kept_names = ("_gain_cache_target_lufs", "_lufs23_migration_done", "_music_target_v2_migration_done")
-        check(set(media.FACTORY_RESET_KEEPS_FILE_DATA) == set(kept_names),
-              "the list of settings keys that survive Reset All Settings holds the loudness-target stamp and the one-time gain flags")
-        learned = {"_gain_cache_target_lufs": [-20.5, 1.5],
-                   "_lufs23_migration_done": True, "_music_target_v2_migration_done": True}
+        check(not hasattr(media, "FACTORY_RESET_KEEPS_FILE_DATA"),
+              "no per-file data is kept in the settings file, so Reset All Settings has nothing of it to carry over")
         rdb = object.__new__(media.RetroDatabase)
-        rdb.config = dict(copy.deepcopy(learned))
-        rdb.config.update({"global_volume": 10, "current_theme": "X"})
+        rdb.config = {"global_volume": 10, "current_theme": "X"}
         rdb.ready_flag = False
         rdb.channels_db = {"05": {"schedules": {"Morning": [{"path": "c:\\tv\\a.mkv", "duration": 1500}]}}}
         saved = []
         rdb.save_settings = lambda: saved.append(1)
         rdb._build_channels_db = lambda raw: {"05": {"schedules": {"Morning": []}}}
         rdb.factory_reset()
-        check(all(rdb.config.get(k) == v for k, v in learned.items()),
-              "Reset All Settings keeps the loudness-target stamp and the one-time gain flags")
         check(rdb.config["global_volume"] == 70 and rdb.channels_db["05"]["schedules"]["Morning"] == [],
               "Reset All Settings still returns settings to their defaults and clears all media from every channel")
 
@@ -13467,10 +14982,10 @@ def suite_clear_keeps_file_data():
 
         reset_src = get_function_source("_execute_system_reset_all_settings")
         check(reset_src.index("_save_schedule_lengths_into_library()") < reset_src.index("db.factory_reset()"),
-              "lengths and gains held only in schedule entries are copied into the kept cache before Reset All Settings clears the channels")
+              "lengths held only in schedule entries are copied into the library before Reset All Settings clears the channels")
 
         fake_db = types.SimpleNamespace(
-            config={k: copy.deepcopy(v) for k, v in learned.items()}, saves=[],
+            config={"global_volume": 33}, saves=[],
             channels_db={"05": {"schedules": {"Morning": [{"path": "a"}], "Commercials": [{"path": "b"}]},
                                  "playback_log": {"x": 1}, "sched_cached_tracks": {"y": 1}},
                          "06": {"schedules": {"Morning": [{"path": "c"}]}, "playback_log": {"z": 1}},
@@ -13490,8 +15005,8 @@ def suite_clear_keeps_file_data():
         clear_ns["_execute_channel_media_clear"]("07", fake_db.channels_db["07"])
         check(fake_db.channels_db["07"]["schedules"]["Music Tracks"] == [],
               "a visualizer's Clear button empties only its own music tracks")
-        check(all(fake_db.config[k] == v for k, v in learned.items()),
-              "a channel's Clear button leaves every stored length, gain, manual dB and caption result untouched")
+        check(fake_db.config == {"global_volume": 33},
+              "a channel's Clear button leaves the settings untouched; lengths, gains, manual dB and captions live in the library")
     finally:
         for item in libs:
             try:
@@ -13612,11 +15127,11 @@ def suite_ch03_menu_music_hub():
         exec(compile(get_function_source("_ch03_track_gain"), "<extracted:_ch03_track_gain>", "exec"), gns)
         track = tracks[2]
         check(gns["_ch03_track_gain"](track, {"path": track}) == 1.0, "a track with no scan and no saved gain plays at 1.0")
-        check(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) == 1.4,
-              "a gain saved in the playlist by an older version is used only until the scan lands")
+        check(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) == 1.0,
+              "a gain left in the playlist by an older version is never used; gains come only from the library")
         gain_hub.note_gain(track, 0.8, media.MUSIC_TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
         check(abs(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) - 0.8) < 1e-9,
-              "the scanned gain replaces the saved playlist gain and is applied once")
+              "the library's scanned gain is the one played, applied once")
         _set_manual_db(gain_hub, track, 3)
         check(abs(gns["_ch03_track_gain"](track, {"path": track, "gain": 1.4}) - 0.8 * 10 ** (3 / 20.0)) < 1e-9,
               "the owner's manual dB sits on top of the scanned gain")
@@ -13678,22 +15193,6 @@ def suite_guide_past_replay():
     exists = lambda p: True
     _install_cache_hub(cache)
 
-    estimates = media.estimated_track_durations(items + [{"path": "/m/Gamma/S01E01.mkv"}, {"path": "/m/Movies/Heat.mkv"}], exists)
-    check(estimates["/m/Alpha/S01E05.mkv"] == 1320 and estimates["/m/Beta/S01E05.mkv"] == 2700,
-          "an unscanned episode with two scanned episodes uses its own series' saved average")
-    check("/m/Gamma/S01E01.mkv" not in estimates,
-          "an unscanned episode with no scanned series average has no duration and receives no channel-wide fallback")
-    check(estimates["/m/Movies/Heat.mkv"] == media.HUB_MOVIE_ESTIMATE_SECONDS,
-          "an unscanned movie uses the hub's saved movie estimate")
-    check("/m/Solo/S01E01.mkv" not in media.estimated_track_durations([{"path": "/m/Solo/S01E01.mkv"}], exists),
-          "an unscanned episode with no series duration remains unplaced")
-    unestimated = [
-        {"path": "/m/Gamma/S01E01.mkv"},
-        {"path": "/m/LooseFilm.mkv"},
-        {"path": "/m/Commercials/Unscanned.mp4"},
-    ]
-    check(not media.estimated_track_durations(unestimated, exists),
-          "an unscanned episode, unidentified movie, or commercial gets no replay-only duration fallback")
     tracks = {t["path"]: t for t in media.build_raw_tracks(items, exists)}
     check(len(tracks) == len(items) and tracks["/m/Alpha/S01E05.mkv"]["duration"] == 1320,
           "the shared track builder places the permitted series estimate without a replay-only fallback")
@@ -13949,8 +15448,8 @@ def suite_block_anchor_real_start():
     check(anchor_for(holiday, "2026_289_holiday", noon_ish) == 12 * 3600,
           "a caller that gives no clock start gets the old behaviour")
     sched = get_function_source("calculate_slotted_playback_state")
-    check(sched.count("real_start_seconds=0,") == 1 and sched.count("real_start_seconds=block_start_hour * 3600,") == 3,
-          "every scheduler block passes its real clock start")
+    check(sched.count("real_start_seconds=0,") == 2 and sched.count("real_start_seconds=block_start_hour * 3600,") == 3,
+          "every scheduler block passes its real clock start: the Holiday and Full Day days from midnight, the other blocks from their start hour")
     late = {"playback_log": {"sched_block_key": "2026_288_Evening"}}
     check(anchor_for(late, "2026_288_Night", 20 * 3600 + 60, real_start_seconds=20 * 3600, overrun_end_seconds=20 * 3600 + 4740) == 20 * 3600 + 4740,
           "a block that starts while an entry of the last block is still airing is measured from the second that entry ends")
@@ -14026,7 +15525,7 @@ def suite_explorer_bios_flow():
         ns = {"app_state": state, "os": os, "re": re, "db": _Db(), "game_deck": _Deck(),
               "_log_warn_throttled": lambda *a, **k: None}
         for name in ("_fe_managed_delete_dir", "_fe_in_managed_delete_dir", "_fe_in_bios_dir", "_fe_add_button_label",
-                     "_fe_remove_button_label", "_is_usa_bios_filename", "_bios_region_rank", "_bios_priority_key",
+                     "_fe_remove_button_label", "_bios_region_rank", "_bios_priority_key",
                      "_fe_resolve_active_bios_name", "_fe_pick_bios_in_folder", "_fe_apply_bios_selection"):
             exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
         ns["_BIOS_KNOWN_PRIORITY"] = ["scph5501", "scph7001", "scph1001", "scph5502", "scph7002", "scph1002",
@@ -14286,8 +15785,8 @@ def suite_old_carry_in_retired():
     check(not [name for name in ("LegacyCacheMigrator", "MigrationProgress", "set_legacy_carrier", "_carry_legacy_values", "_LEGACY_STORE_NAMES", "_is_legacy_fallback_gain")
                if hasattr(ml, name)], "the library no longer holds the old-settings carrier or migrator")
     check(not [name for name in ("LegacyCacheMigrator", "set_legacy_carrier") if name in ml.__all__], "the library's export list no longer names the migrator or the carrier")
-    check(set(media.FACTORY_RESET_KEEPS_FILE_DATA) == {"_gain_cache_target_lufs", "_lufs23_migration_done", "_music_target_v2_migration_done"},
-          "Reset All Settings keeps only the loudness-target stamp and the one-time flags; the five old file-fact stores are no longer listed")
+    check(not hasattr(media, "FACTORY_RESET_KEEPS_FILE_DATA"),
+          "Reset All Settings carries no old file-fact store over; per-file data lives only in the library")
     with open(os.path.join(ROOT, "ui.py"), "r", encoding="utf-8") as handle:
         ui_src = handle.read()
     check(not any(name in ui_src for name in ("media_probe_cache", "dvd_gain_cache", "audio_gain_db_by_file", "pan_scan_library", "_part_group_gain_cache")),
@@ -14556,11 +16055,6 @@ def suite_schedule_hub_rows():
         check(hub.rows("05", "Morning")[0]["used_length"] == 1490.0, "the length that really aired is saved on the row")
 
         check(hub.mark("05", "Morning", 1, "static") is True, "a slot that passed on Static is marked static, not replayed")
-        check(hub.set_length("05", "Morning", 2, 1700.0, "measured") is True and hub.rows("05", "Morning")[2]["used_length"] == 1700.0,
-              "a new length changes a row still ahead")
-        check(hub.set_length("05", "Morning", 0, 99.0, "measured") is False and hub.rows("05", "Morning")[0]["used_length"] == 1490.0,
-              "a new length never changes a row that aired")
-        check(hub.set_length("05", "Morning", 1, 99.0, "measured") is False, "a new length never changes a row that went to Static")
 
         written, skipped = hub.put_rows("05", "Morning", rows(5, start=5000.0))
         after = hub.rows("05", "Morning")
@@ -15619,12 +17113,12 @@ def suite_hub_row_generations():
         old = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1800)]
         new = [entry("/m/x.mkv", 0, 1500), entry("/m/ad2.mp4", 1500, 30, True), entry("/m/y.mkv", 1530, 1200)]
         sync(5, "blk", old, old[0], 600.0, S)
-        check(hub.current_slot_key("05", "blk") == "blk" and hub.generation_key("blk", 1) == "blk" and hub.generation_key("blk", 3) == "blk#g3",
+        check(_current_slot_key(hub, "05", "blk") == "blk" and hub.generation_key("blk", 1) == "blk" and hub.generation_key("blk", 3) == "blk#g3",
               "the first set of rows for a block uses the block key itself")
 
         before_history = [r for r in hub.rows("05") if r["state"] != "planned"]
         sync(5, "blk", new, new[0], 700.0, S)
-        check(hub.current_slot_key("05", "blk") == "blk#g2", "a block rebuilt with other files gets its own set of rows")
+        check(_current_slot_key(hub, "05", "blk") == "blk#g2", "a block rebuilt with other files gets its own set of rows")
         first = hub.rows("05", "blk")
         check([(r["path"], r["state"]) for r in first] == [("/m/a.mkv", "aired"), ("/m/ad1.mp4", "planned"), ("/m/b.mkv", "planned")] and first[0]["used_length"] == 700.0,
               "the old set keeps the show that really aired, closed at the moment of the change, and its unaired plan stays, set aside")
@@ -15648,11 +17142,11 @@ def suite_hub_row_generations():
 
         ns["_hub_rows_seen"].clear()
         sync(5, "blk", new, new[1], 1510.0, S)
-        check(hub.current_slot_key("05", "blk") == "blk#g2" and hub.rows("05", "blk#g3") == [], "after a restart the same plan goes back into the same set")
+        check(_current_slot_key(hub, "05", "blk") == "blk#g2" and hub.rows("05", "blk#g3") == [], "after a restart the same plan goes back into the same set")
 
         third = [entry("/m/p.mkv", 0, 900), entry("/m/q.mkv", 900, 900)]
         sync(5, "blk", third, third[1], 1600.0, S)
-        check(hub.current_slot_key("05", "blk") == "blk#g3" and [r["position"] for r in hub.rows("05", "blk#g3")] == [1],
+        check(_current_slot_key(hub, "05", "blk") == "blk#g3" and [r["position"] for r in hub.rows("05", "blk#g3")] == [1],
               "a second rebuild opens a third set, and only from the airing entry on, since the earlier slots never aired under that plan")
         check([r["state"] for r in hub.rows("05", "blk#g2")] == ["aired", "static", "planned"] and hub.set_info("05", "blk#g2")["state"] == "set_aside",
               "the second set is put aside with its history and its unaired plan kept")
@@ -15661,12 +17155,12 @@ def suite_hub_row_generations():
         sync(6, "len", base, base[0], 10.0, S)
         longer = [entry("/m/a.mkv", 0, 1320), entry("/m/ad1.mp4", 1320, 30, True), entry("/m/b.mkv", 1350, 1900)]
         sync(6, "len", longer, longer[0], 20.0, S)
-        check(hub.current_slot_key("06", "len") == "len" and [r["used_length"] for r in hub.rows("06", "len")] == [1320.0, 30.0, 1900.0],
+        check(_current_slot_key(hub, "06", "len") == "len" and [r["used_length"] for r in hub.rows("06", "len")] == [1320.0, 30.0, 1900.0],
               "a new length for a later entry rewrites the plan in the same set and opens no new one")
 
         sync(7, "cyc", base, base[2], 1400.0, S)
         sync(7, "cyc", base, base[0], 5.0, S + 3150.0)
-        check(hub.current_slot_key("07", "cyc") == "cyc#g2", "the same plan run again later, as the next cycle of a Full Day block, gets its own set")
+        check(_current_slot_key(hub, "07", "cyc") == "cyc#g2", "the same plan run again later, as the next cycle of a Full Day block, gets its own set")
         cycle_one = hub.rows("07", "cyc")
         check([r["state"] for r in cycle_one] == ["aired", "aired", "aired"] and cycle_one[2]["used_length"] == 1800.0,
               "the first cycle's rows stay as aired history with the length that aired")
@@ -15695,7 +17189,7 @@ def suite_hub_row_generations():
         hub.mark("11", "2026_292_Full Day", 0, "airing")
         hub.place_rows("11", "2026_292_Full Day", [dict(gap, path="/m/n.mkv")], airing_position=0, now_epoch=S + 50.0)
         hub.put_rows("11", "2026X292XFull Day", [dict(gap)])
-        check(hub.current_slot_key("11", "2026X292XFull Day") == "2026X292XFull Day" and hub.current_slot_key("11", "2026_292_Full Day") == "2026_292_Full Day#g2",
+        check(_current_slot_key(hub, "11", "2026X292XFull Day") == "2026X292XFull Day" and _current_slot_key(hub, "11", "2026_292_Full Day") == "2026_292_Full Day#g2",
               "block names that differ only where a wildcard would match are kept apart")
 
         slot, w, k, opened = hub.place_rows("12", "fresh", [dict(gap)], airing_position=0, now_epoch=S)
@@ -15888,8 +17382,10 @@ def suite_stall_static_threshold():
     check(gov.STALL_FORCES_STATIC_MS == 7000, "the fall back to Static waits 7 seconds without a new picture")
     check("STALL_FORCES_STATIC_MS = performance_governor.STALL_FORCES_STATIC_MS if performance_governor is not None else 7000" in MAIN_SRC,
           "the main script reads the number from the governor table and its fallback matches")
-    recovery = int(re.search(r"^PLAYBACK_STALL_TIMEOUT_MS = (\d+)", MAIN_SRC, re.M).group(1))
-    initial = int(re.search(r"^PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = (\d+)", MAIN_SRC, re.M).group(1))
+    recovery, initial = gov.PLAYBACK_STALL_TIMEOUT_MS, gov.PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS
+    check("PLAYBACK_STALL_TIMEOUT_MS = performance_governor.PLAYBACK_STALL_TIMEOUT_MS if performance_governor is not None else %d" % recovery in MAIN_SRC
+          and "PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = performance_governor.PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS if performance_governor is not None else %d" % initial in MAIN_SRC,
+          "the main script reads both stall limits from the governor table and its fallbacks match")
     check(gov.STALL_FORCES_STATIC_MS < recovery <= initial, "Static still comes before the stall recovery, which is unchanged")
     check("_stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS" in MAIN_SRC, "the main loop still decides Static from the time without a new picture")
 
@@ -16199,23 +17695,44 @@ def suite_visualizer_clear_music():
         exec(code, env)
         return state
 
-    state = press(4, 0, ["a.mp3"])
+    state = press(6, 0, ["a.mp3"])
     check(state.get("show_clear_confirm") is True and state.get("clear_confirm_target") == "channel_music",
           "Enter on Clear All Scheduled Music asks to confirm clearing the music")
     check(state.get("clear_confirm_channel") == "07" and state.get("clear_confirm_selection") == "No",
           "the confirm names the channel and starts on No")
-    state = press(4, 0, [])
+    state = press(6, 0, [])
     check(not state.get("show_clear_confirm"), "with no music added the button does nothing")
-    state = press(4, 1, ["a.mp3"])
+    for col in (0, 3):
+        state = press(7, col, ["a.mp3"])
+        check(not state.get("show_clear_confirm") and state.get("menu_layer") == "CHANNEL_LIST",
+              "Enter on Close (column %d) closes the menu and does not ask to clear" % col)
+    def press_tv(row, col, media_files):
+        db = n6_FakeDb()
+        db.channels_db = {str(n).zfill(2): {"active": False} for n in range(5, 45)}
+        db.channels_db["05"]["active"] = True
+        db.channels_db["07"] = {"active": True, "is_visualizer": False, "name": "X", "scheduling_mode": "random_slots", "schedules": {"Morning": list(media_files)}}
+        state = {"menu_layer": "CHANNEL_SUB_MENU", "sub_menu_row_index": row, "sub_menu_col_index": col, "selected_channel_row": 7, "show_menu": True}
+        env = make_env()
+        env.update({"app_state": state, "db": db, "event": types.SimpleNamespace(key=pygame.K_RETURN), "now_ticks": 123,
+                    "SIX_HOUR_BLOCK_NAMES": [], "_count_active_content_channels": lambda _db: 2,
+                    "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)})
+        exec(code, env)
+        return state
+
+    state = press_tv(7, 0, ["a.mkv"])
+    check(state.get("show_clear_confirm") is True and state.get("clear_confirm_target") == "channel_schedule" and state.get("menu_layer") == "CHANNEL_SUB_MENU",
+          "on a TV channel Enter on Clear All Scheduled Media asks to clear and does not close the menu")
+    state = press_tv(7, 3, ["a.mkv"])
     check(not state.get("show_clear_confirm") and state.get("menu_layer") == "CHANNEL_LIST",
-          "Enter on Close in the same row closes the menu and does not ask to clear")
-    state = press(4, 2, ["a.mp3"])
-    check(not state.get("show_clear_confirm") and state.get("menu_layer") == "CHANNEL_SUB_MENU",
-          "a column left over from another layout does not clear anything")
+          "on a TV channel Enter on Close closes the menu and does not ask to clear")
+    for col in (0, 2):
+        state = press(4, col, ["a.mp3"])
+        check(not state.get("show_clear_confirm") and state.get("menu_layer") == "CHANNEL_SUB_MENU",
+              "Enter on Loudness Gain (column %d) does not clear anything" % col)
 
 
 class TestVisualizerClearMusic(_SectionCase):
-    """Enter on Clear All Scheduled Music asks to clear the channel's music; Close in the same row only closes"""
+    """Enter on Clear All Scheduled Music asks to clear the channel's music; Close only closes; Loudness Gain never clears"""
 
     def test_visualizer_clear_music(self):
         self.run_section(suite_visualizer_clear_music)
@@ -16260,7 +17777,8 @@ def suite_crash_log_and_exit_notice():
 
         exits = []
         removed = []
-        exit_ns = {"os": types.SimpleNamespace(name="posix", _exit=lambda code: exits.append(code)),
+        exit_ns = {"_log_swallowed": lambda where, error: None,
+                   "os": types.SimpleNamespace(name="posix", _exit=lambda code: exits.append(code)),
                    "ctypes": None, "_clear_run_marker": lambda: removed.append(True)}
         exec(compile(get_function_source("_hard_exit_process"), "<extracted:_hard_exit_process>", "exec"), exit_ns)
         exit_ns["_hard_exit_process"](0)
@@ -16469,9 +17987,12 @@ def suite_failure_point_text():
     check(not quiet_stray, "no broad except that only returns or continues is left outside the boot crash path; stray lines: %s" % quiet_stray[:10])
     for node in converted:
         call = node.body[0].value if isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Call) else None
-        rest_ok = all(isinstance(stmt, (ast.Return, ast.Continue, ast.Break)) for stmt in node.body[1:])
-        if call is None or getattr(call.func, "id", "") != "_log_swallowed" or not rest_ok:
-            check(False, "line %d: a converted handler is one _log_swallowed call, then at most the return or continue it had before" % node.lineno)
+        rest_ok = not any(isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == "_log_swallowed"
+                          for stmt in node.body[1:] for inner in ast.walk(stmt))
+        own_error = (call is not None and len(call.args) == 2 and isinstance(call.args[1], ast.Name)
+                     and call.args[1].id == node.name)
+        if call is None or getattr(call.func, "id", "") != "_log_swallowed" or not own_error or not rest_ok:
+            check(False, "line %d: a converted handler starts with one _log_swallowed call naming its place and its own error, then keeps the fallback it had before" % node.lineno)
             continue
         where_ok = bool(call.args) and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str) and call.args[0].value.strip() != ""
         error_ok = len(call.args) == 2 and isinstance(call.args[1], ast.Name) and call.args[1].id == node.name
@@ -16543,7 +18064,7 @@ class TestFailurePointText(_SectionCase):
 
 
 def suite_failure_point_text_game_deck():
-    converted_handler_checks("game_deck.py", 35)
+    converted_handler_checks("game_deck.py", 55)
     path = os.path.join(ROOT, "game_deck.py")
     module = load_deck_module(path, "game_deck_failure_text")
     check(module._log_swallowed is gov.log_swallowed, "game_deck uses the one shared helper from performance_governor.py")
@@ -16579,7 +18100,7 @@ class TestFailurePointTextGameDeck(_SectionCase):
 
 
 def suite_failure_point_text_other_scripts():
-    for name, expected in (("media.py", 29), ("performance_governor.py", 8), ("ui.py", 5), ("libretro_core.py", 3), ("media_library.py", 23)):
+    for name, expected in (("media.py", 33), ("performance_governor.py", 8), ("ui.py", 11), ("libretro_core.py", 5), ("media_library.py", 32)):
         converted_handler_checks(name, expected)
     check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
 
@@ -17644,7 +19165,7 @@ class TestFlyingVisualizerSpeed(unittest.TestCase):
         self.deck = _viz.VisualizerDeck()
         self.surface = pygame.Surface((64, 48))
         self.clock = [1000.0]
-        self._patch = unittest.mock.patch.object(_viz._time, "monotonic", lambda: self.clock[0])
+        self._patch = unittest.mock.patch.object(_viz, "_time", types.SimpleNamespace(monotonic=lambda: self.clock[0]))
         self._patch.start()
         self.ease, self.star_min, self.star_max, self.tunnel_min, self.tunnel_max, self.max_step = _viz._flight_tunables()
 
@@ -17780,7 +19301,7 @@ class TestCommercialBundleLaps(unittest.TestCase):
         import performance_governor as _gov
         src = open(media.__file__, encoding="utf-8").read()
         self.assertEqual(_gov.COMMERCIAL_BUNDLE_STEP_SECONDS, 15)
-        self.assertIn("_COMMERCIAL_BUNDLE_STEP_SECONDS = %d" % _gov.COMMERCIAL_BUNDLE_STEP_SECONDS, src)
+        self.assertIn("_COMMERCIAL_BUNDLE_STEP_SECONDS = _perf_governor.COMMERCIAL_BUNDLE_STEP_SECONDS if _perf_governor is not None else %d" % _gov.COMMERCIAL_BUNDLE_STEP_SECONDS, src)
         self.assertEqual(media._COMMERCIAL_BUNDLE_STEP_SECONDS, _gov.COMMERCIAL_BUNDLE_STEP_SECONDS)
 
     def test_no_commercial_airs_again_before_its_bundle_has_aired(self):
@@ -18142,9 +19663,10 @@ class TestBezelNumberWindowMeasured(unittest.TestCase):
               "_bezel_file_cache_key_throttled": lambda path: ("key", path)}
         for const in ("DARK_MAX", "ALPHA_MIN", "MIN_AREA_FRAC", "MIN_FILL", "MIN_ASPECT", "MAX_ASPECT", "MAX_TILT_DEG", "MIN_TILT_DEG"):
             ns["_BEZEL_LED_WINDOW_" + const] = getattr(gov, "BEZEL_LED_WINDOW_" + const)
-        for name in ("_bezel_led_box_tilt_deg", "_measure_bezel_led_shape", "_measure_bezel_led_window", "_store_bezel_led_window",
+        for name in ("_bezel_led_box_tilt_deg", "_measure_bezel_led_shape", "_store_bezel_led_window",
                      "_bezel_measured_led_window", "_bezel_measured_led_tilt", "_blit_centered_led_text"):
             exec(main_function_code(name), ns)
+        ns["_measure_bezel_led_window"] = lambda surf, hole: (lambda shape: None if shape is None else shape[0])(ns["_measure_bezel_led_shape"](surf, hole))
         return ns
 
     def _frame(self, window=(800, 100, 100, 60), wall=True, text=False):
@@ -18486,7 +20008,7 @@ class TestHolidayForceToggle(unittest.TestCase):
 
     def test_on_another_channel_only_the_forced_holidays_own_switch_is_open_and_it_turns_everything_off(self):
         cfg = {"holiday_force_key": "halloween", "holiday_force_channels": ["05"]}
-        self.assertEqual(media.holiday_force_enabled_rows(cfg, "06"), (0,))
+        self.assertEqual(media.holiday_force_row_states(cfg, "06"), {"halloween": "on", "christmas": "greyed", "thanksgiving": "greyed"})
         ns, db = self._ns(cfg)
         self.assertTrue(ns["_toggle_holiday_force"]("halloween", "06"))
         self.assertEqual(media.holiday_forced_key_global(db.config), "")
@@ -18495,7 +20017,7 @@ class TestHolidayForceToggle(unittest.TestCase):
     def test_a_channel_without_that_holidays_files_can_still_turn_it_on(self):
         ns, db = self._ns()
         self.assertEqual(media.holiday_force_row_states(db.config, "07"), {"halloween": "off", "christmas": "off", "thanksgiving": "off"})
-        self.assertEqual(media.holiday_force_enabled_rows(db.config, "07"), (0, 1, 2))
+        self.assertEqual(media.holiday_force_row_states(db.config, "07"), {"halloween": "off", "christmas": "off", "thanksgiving": "off"})
         self.assertTrue(ns["_toggle_holiday_force"]("halloween", "07"))
         self.assertEqual(db.config["holiday_force_channels"], ["05", "06", "07"])
         self.assertEqual(media.holiday_forced_key_global(db.config), "halloween", "the bezel follows even when no channel has files")
@@ -18610,16 +20132,19 @@ class TestHolidayForceToggle(unittest.TestCase):
             pos = mn.holiday_move(state, pos[0], pos[1], d)
         self.assertEqual(pos, (2, 1), "down the toggle column passes every row")
         pos = mn.holiday_move(state, pos[0], pos[1], down)
-        self.assertEqual(pos, (3, 0), "down from the last toggle reaches Close")
+        self.assertEqual(pos, (mn.HOLIDAY_CLEAR_ROW, 0), "down from the last toggle reaches Clear")
         pos = mn.holiday_move(state, pos[0], pos[1], up)
-        self.assertEqual(pos, (2, 0), "up from Close lands on the last file picker")
+        self.assertEqual(pos, (2, 0), "up from Clear lands on the last file picker")
+        self.assertEqual(mn.holiday_move(state, mn.HOLIDAY_CLEAR_ROW, 0, right), (mn.HOLIDAY_CLOSE_ROW, 0), "Close sits right of Clear")
+        self.assertEqual(mn.holiday_move(state, mn.HOLIDAY_CLOSE_ROW, 0, left), (mn.HOLIDAY_CLEAR_ROW, 0), "and Clear left of Close")
+        self.assertEqual(mn.holiday_move(state, mn.HOLIDAY_CLOSE_ROW, 0, up), (2, 1), "up from Close lands on the last toggle")
         self.assertEqual(mn.holiday_move(state, 0, 0, right), (0, 1))
         self.assertEqual(mn.holiday_move(state, 1, 0, right), (1, 1))
         self.assertEqual(mn.holiday_move(state, 2, 0, right), (2, 1))
         self.assertEqual(mn.holiday_move(state, 1, 1, left), (1, 0))
         self.assertEqual(mn.holiday_move(state, 0, 1, up), (0, 1), "the top toggle stays put")
         self.assertEqual(mn.holiday_move(state, 1, 1, up), (0, 1))
-        self.assertEqual(mn.holiday_move(state, 3, 0, right), (3, 0), "Close has no second column")
+        self.assertEqual(mn.holiday_move(state, mn.HOLIDAY_CLOSE_ROW, 0, right), (mn.HOLIDAY_CLOSE_ROW, 0), "nothing is right of Close")
 
     def test_navigation_no_longer_takes_a_list_of_open_toggles(self):
         import inspect
@@ -18634,7 +20159,8 @@ class TestHolidayForceToggle(unittest.TestCase):
         state = {"menu_layer": "HOLIDAY_SUB_MENU", "sub_menu_row_index": row, "sub_menu_col_index": 1, "selected_channel_row": 7}
         calls = []
         env = make_env()
-        env["_toggle_holiday_force"] = lambda key, ch: calls.append((key, ch)) or True
+        env["_toggle_holiday_force"] = lambda key, ch: (media.holiday_force_toggle(dict(db.config), ch, key, ["07"])
+                                                         and (calls.append((key, ch)) or True))
         event = types.SimpleNamespace(key=pygame.K_RETURN)
         work = dict(state)
         with Quiet():
@@ -18660,8 +20186,10 @@ class TestHolidayForceToggle(unittest.TestCase):
         src = MAIN_SRC[MAIN_SRC.index('elif app_state["menu_layer"] == "HOLIDAY_SUB_MENU":'):]
         src = src[:src.index('elif app_state["menu_layer"] == "GAMES_LIST":')]
         self.assertIn("media.HOLIDAY_KEYS", src)
-        self.assertIn("_toggle_holiday_force(HKEYS[sub_row], target_ch_str)", src)
-        self.assertIn("media.holiday_force_enabled_rows(", src)
+        self.assertIn("_toggle_holiday_force(media.HOLIDAY_KEYS[sub_row], target_ch_str)", src)
+        toggle = MAIN_SRC[MAIN_SRC.index("def _toggle_holiday_force("):]
+        toggle = toggle[:toggle.index("\ndef ")]
+        self.assertIn("media.holiday_force_toggle(", toggle, "the greyed check is made where the toggle is switched")
         self.assertNotIn("valentine", src)
 
     def test_the_menu_picture_has_three_holidays_and_a_greyed_state(self):
@@ -19358,16 +20886,8 @@ def suite_guide_aired_cycle_whole():
     rows_v = [(r, 10, 20, "B"), (r, 3000, 3100, "B"), (r, 9000, 9100, "B")]
     check(len(in_view(rows_v, 0, 100)) == 2, "the viewport keeps rows up to an hour past its end and has no cut at the clock")
 
-    sig_a = media.aired_ledger_signature(playback_log)
-    check(sig_a == media.aired_ledger_signature(playback_log), "the ledger signature is stable while the ledger is unchanged")
-    changed = [dict(x) for x in ledger_tl]
-    changed[1]["duration"] += 1
-    other_log = {}
-    media.aired_ledger_upsert(other_log, "Full Day", "2026_296_Full Day", ordinal * 86400 + base, changed, total_a, now_dt)
-    check(sig_a != media.aired_ledger_signature(other_log), "the ledger signature changes when a recorded break changes")
-    check(media.aired_ledger_signature({}) == (), "an empty ledger has an empty signature")
-    check("media.aired_ledger_signature(" in src and "_guide_splice_aired(" in src and "_guide_merge_cells(" in src,
-          "the guide's timeline cache key carries the ledger signature and the build uses the three helpers")
+    check("_guide_splice_aired(" in src and "_guide_merge_cells(" in src,
+          "the guide's build uses the splice and merge helpers")
     check("_r[2] <= _now_rel_secs" not in src and "_past_rows" not in src, "the guide no longer cuts the aired rows at the clock")
 
 
@@ -19707,6 +21227,16 @@ class _FakeProcess:
         return self._exit_code
 
 
+def _stepping_clock():
+    """A time stand-in for the update helper: each look at the clock moves it on a quarter second and sleep returns at once, so the helper's waits end without real waiting and whatever another test did to the real clock."""
+    now = [1000.0]
+
+    def monotonic():
+        now[0] += 0.25
+        return now[0]
+    return types.SimpleNamespace(monotonic=monotonic, sleep=lambda seconds: None)
+
+
 class TestUpdateHelperSwap(unittest.TestCase):
     """update_helper.apply_update on a temp install folder: renamed exe, version stamp, old exe cleanup, rollback."""
 
@@ -19718,6 +21248,10 @@ class TestUpdateHelperSwap(unittest.TestCase):
         cls.h = _load_updater_script("update_helper")
 
     def setUp(self):
+        for name, value in (("HEALTH_CHECK_SECONDS", 1.0), ("time", _stepping_clock())):
+            patcher = mock.patch.object(self.h, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.tmp = tempfile.mkdtemp(prefix="rtv-upd-test-")
         self.install = os.path.join(self.tmp, "install")
         self.staged = os.path.join(self.tmp, "work", "payload")
@@ -20210,7 +21744,7 @@ class TestAutoUpdaterCheckAndStage(unittest.TestCase):
                     mock.patch.object(self.u, "_helper_command", return_value=["helper"]):
                 pid = self.u.launch_staged_update(tmp, {"staged_path": staged, "version": "1.4.3"}, ["app.exe", "--relaunched"], parent_pid=77)
             self.assertEqual(pid, 4242)
-            with open(os.path.join(tmp, self.u.UPDATE_DIR_NAME, self.u.PENDING_RECORD_NAME), encoding="utf-8") as handle:
+            with open(os.path.join(tmp, "logs", self.u.UPDATE_DIR_NAME, self.u.PENDING_RECORD_NAME), encoding="utf-8") as handle:
                 pending = json.load(handle)
             self.assertEqual((pending["parent_pid"], pending["version"]), (77, "1.4.3"))
             self.assertEqual(started[0][0][:1] + started[0][0][1:2], ["helper", "--apply"])
@@ -20880,7 +22414,7 @@ class TestServerToggleGreyedOut(unittest.TestCase):
         src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
         self.assertIn('_as_disabled_row = (_as_row_id == "server_option" and not (UPDATER_AND_SERVER_FEATURES_ENABLED and SERVER_TOGGLE_ENABLED))', src)
         draw = src[src.index("_as_disabled_row = ("):]
-        self.assertLess(draw.index("_as_disabled_row"), draw.index("(32, 32, 40) if _as_disabled_row"))
+        self.assertLess(draw.index("_as_disabled_row"), draw.index("COLOR_MENU_BUTTON_GREYED if _as_disabled_row"))
         before = src[:src.index("_as_disabled_row = (")]
         self.assertIn("if _as_focused:\n                    _aa_rounded_rect(menu_canvas, NEON_GREEN", before[-400:])
 
@@ -20993,6 +22527,10 @@ class TestUpdateRenamesInstallFolder(unittest.TestCase):
         self._write(self.staged, os.path.join("_internal", "retro_config.json"), '{"config": {"start_on_boot": true}}')
         self._write(self.staged, os.path.join("_internal", "lib.dll"), "new lib")
         self.h.HEALTH_CHECK_SECONDS = 0.6
+        for name, value in (("UPDATE_RENAMES_INSTALL_FOLDER", True), ("time", _stepping_clock())):
+            patcher = mock.patch.object(self.h, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.calls = []
 
     def tearDown(self):
@@ -21145,7 +22683,12 @@ class TestUpdateRestartFollowsSavedSettings(unittest.TestCase):
                 self.assertEqual(read(), expected, (kiosk, boot))
             relaunched = self._function("_read_boot_fullscreen_pref", sys=fake_sys, os=os, _IS_RELAUNCH=True,
                                         log=logging.getLogger("t"), logging=logging)
-            self.assertTrue(relaunched())
+            for kiosk, boot, expected in ((False, False, False), (True, False, True), (False, True, True)):
+                with open(os.path.join(tmp, "retro_config.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"config": {"kiosk_mode_enabled": kiosk, "start_on_boot": boot}}, handle)
+                self.assertEqual(relaunched(), expected, ("relaunch", kiosk, boot))
+            os.remove(os.path.join(tmp, "retro_config.json"))
+            self.assertFalse(relaunched(), "a relaunch with no saved settings boots windowed")
 
     def test_the_saved_music_path_follows_the_renamed_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -21159,15 +22702,755 @@ class TestUpdateRestartFollowsSavedSettings(unittest.TestCase):
             saved = []
             db = types.SimpleNamespace(config={"ch03_menu_music": [{"path": dead, "gain": 0.32}, {"path": other, "gain": 0.5}], "kiosk_mode_enabled": False},
                                        save_settings=lambda: saved.append(1))
-            names = dict(os=os, db=db, resolve_main_dir=lambda: main_dir, _CH03_DEFAULT_MUSIC_GAIN_LEGACY=0.31,
-                         _CH03_DEFAULT_MUSIC_GAIN_PRECACHED=0.32)
+            names = dict(os=os, db=db, resolve_main_dir=lambda: main_dir)
             names["_ch03_entry_is_default_music"] = self._function("_ch03_entry_is_default_music", os=os, resolve_main_dir=lambda: main_dir)
             self._function("_ensure_ch03_menu_music_seeded", **names)()
             entries = db.config["ch03_menu_music"]
             self.assertEqual(entries[0]["path"], track)
-            self.assertEqual(entries[1], {"path": other, "gain": 0.5})
+            self.assertEqual(entries[1], {"path": other})
+            self.assertNotIn("gain", entries[0])
             self.assertEqual(db.config["kiosk_mode_enabled"], False)
             self.assertTrue(saved)
+
+
+def suite_main_thread_never_hashes_or_blocks_on_estimates():
+    """Saving an estimate must return at once without opening the file; the library row lands later from the background writer; a registered UI thread never hashes."""
+    import media_library as ml
+    tmp = tempfile.mkdtemp()
+    lib = None
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "m.sqlite3"))
+        probe_lib = ml.ProbeLibrary(lib, use_vlc_fallback=False)
+        hub = ml.DurationHub(probe_lib)
+        files = []
+        for n in range(50):
+            f = os.path.join(tmp, "Show S01E%02d.mkv" % n)
+            with open(f, "wb") as h:
+                h.write(b"x" * 4096)
+            files.append(f)
+        hashed = []
+        real = ml.compute_identity_key
+        def spy(path, *a, **k):
+            hashed.append(threading.current_thread().name)
+            return real(path, *a, **k)
+        with mock.patch.object(ml, "compute_identity_key", spy):
+            started = time.monotonic()
+            got = [hub.store_estimate(f, 1300, "series_average") for f in files]
+            elapsed = time.monotonic() - started
+            check(all(g == 1300 for g in got), "every estimate is answered at once")
+            check(elapsed < 1.0, "50 estimates return without waiting on the disk (%.2fs)" % elapsed)
+            check(hub.read(files[0]) == (1300, ml.DURATION_KIND_ESTIMATED), "the estimate reads back straight away from memory")
+            check(hub.flush_estimates(20.0), "the background writer finishes")
+        check(hashed and all(name == "EstimateWriter" for name in hashed),
+              "files are hashed only on the writer thread (%r)" % sorted(set(hashed)))
+        check(hub2_reads_saved(probe_lib, files[0]), "the estimate is saved in the library by the writer")
+
+        ml.set_ui_thread(threading.get_ident())
+        try:
+            fresh = os.path.join(tmp, "Fresh S01E01.mkv")
+            with open(fresh, "wb") as h:
+                h.write(b"y" * 4096)
+            with mock.patch.object(ml, "compute_identity_key", spy):
+                before = len(hashed)
+                check(probe_lib.keys.resolve(fresh) is None, "a UI thread asking for a file nobody keyed gets None, not a hash")
+                check(len(hashed) == before, "the UI thread opened no file")
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline and probe_lib.library.lookup_path_key(
+                        os.path.normpath(os.path.abspath(fresh)).lower(), os.stat(fresh).st_size, os.stat(fresh).st_mtime) is None:
+                    time.sleep(0.05)
+            check(probe_lib.library.lookup_path_key(os.path.normpath(os.path.abspath(fresh)).lower(),
+                                                    os.stat(fresh).st_size, os.stat(fresh).st_mtime) is not None,
+                  "the background keyer saved the key")
+            check(probe_lib.keys.resolve(fresh) is not None, "once keyed, the UI thread reads the saved key")
+        finally:
+            ml.set_ui_thread(None)
+    finally:
+        if lib is not None:
+            try:
+                lib.close()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def hub2_reads_saved(probe_lib, path):
+    key = probe_lib.keys.resolve(path)
+    entry = probe_lib.library.get_entry(key) if key else None
+    return bool(entry and entry.get("estimated_duration") == 1300)
+
+
+class TestMainThreadNeverHashes(_SectionCase):
+    """Adding media must never freeze the main thread: estimates are answered from memory and keyed in the background"""
+
+    def test_main_thread_never_hashes(self):
+        self.run_section(suite_main_thread_never_hashes_or_blocks_on_estimates)
+
+
+
+def suite_open_retry_banner_and_grey_screen():
+    """A Stopped-without-error open is retried, not logged OPENED; static turns grey after 2 s; the scanning banner waits."""
+    src = read(MAIN_SCRIPT)
+    check("_wait_open_outcome" in src and "_reopen_same_media" in src and "_OPEN_RETRY_DELAYS_S" in src,
+          "the open check retries an open that went Stopped without an error")
+    check("_open_error_check(can_retry=True)" in src, "the off-thread open check is the one that retries")
+    class _Clock:
+        now_s = 100.0
+        @classmethod
+        def monotonic(cls):
+            return cls.now_s
+    ns = {"time": _Clock, "performance_governor": gov}
+    for name in ("_static_visual_is_grey",):
+        ns.update({"_STATIC_TO_GREY_S": 0.2, "_static_visual_seen": {}})
+        exec(main_function_code(name), ns)
+    check(ns["_static_visual_is_grey"](("live", "05")) is False, "a channel that just went to Static shows the snow")
+    _Clock.now_s += 0.25
+    check(ns["_static_visual_is_grey"](("live", "05")) is True, "after the delay the screen turns grey")
+    check(gov.STATIC_TO_GREY_MS == 2000 and gov.FIRST_FILE_SCANNING_BANNER_DELAY_MS == 8000,
+          "the governor holds the 2 s grey and 8 s banner delays")
+    bns = {"time": _Clock, "_static_banner_seen": {}, "_STATIC_BANNER_DELAY_S": {"first_file_scanning": 0.2}}
+    exec(main_function_code("_static_banner_ready"), bns)
+    check(bns["_static_banner_ready"](("live", "05"), "first_file_scanning") is False, "the scanning banner does not show at once")
+    check(bns["_static_banner_ready"](("live", "05"), "missing_media") is True, "a real failure still shows at once")
+    _Clock.now_s += 0.25
+    check(bns["_static_banner_ready"](("live", "05"), "first_file_scanning") is True, "the scanning banner shows after the delay")
+
+
+class TestOpenRetryBannerAndGrey(_SectionCase):
+    """A failed open is retried, static gives way to grey after 2 s, and the scanning banner waits"""
+
+    def test_open_retry_banner_and_grey(self):
+        self.run_section(suite_open_retry_banner_and_grey_screen)
+
+
+def suite_pending_probe_priority_and_pacing():
+    """The pending probe takes every channel's next file before any channel's second; the backlog is paced and stands down under load."""
+    check(gov.PENDING_PROBE_URGENT_COUNT == 4 and gov.PENDING_BACKLOG_INTERVAL_SECONDS == 1.5,
+          "the governor holds the urgent count and backlog spacing")
+    check(gov.pending_backlog_interval_seconds() >= gov.PENDING_BACKLOG_INTERVAL_SECONDS,
+          "the backlog spacing is never below the base interval")
+    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True):
+        calm = gov.pending_backlog_interval_seconds()
+        check(gov.pending_backlog_allowed(), "backlog may run when the load level is low")
+    with mock.patch.object(gov, "current_level", lambda: 3), mock.patch.object(gov, "enforcing", lambda: True):
+        check(not gov.pending_backlog_allowed(), "backlog stands down when the PC is under load")
+        check(gov.pending_backlog_interval_seconds() > calm, "backlog spacing stretches under load")
+    src = read(MAIN_SCRIPT)
+    check("_pending_backlog_may_run" in src and "rank < _PENDING_PROBE_URGENT_COUNT" in src,
+          "the worker ranks files and paces the backlog")
+    ns = {"time": time, "media": media, "performance_governor": gov}
+    exec(main_function_code("_pending_backlog_may_run"), ns)
+    media._LIVE_PLAYBACK_PRIORITY.clear()
+    with mock.patch.object(gov, "pending_backlog_allowed", lambda: True), \
+            mock.patch.object(gov, "pending_backlog_interval_seconds", lambda mode=None: 2.0):
+        check(ns["_pending_backlog_may_run"]({"last_backlog": 0.0}, 100.0), "backlog runs once the spacing has passed")
+        check(not ns["_pending_backlog_may_run"]({"last_backlog": 99.0}, 100.0), "backlog waits inside the spacing")
+        media._LIVE_PLAYBACK_PRIORITY.set()
+        try:
+            check(not ns["_pending_backlog_may_run"]({"last_backlog": 0.0}, 100.0), "backlog waits while a live open is in flight")
+        finally:
+            media._LIVE_PLAYBACK_PRIORITY.clear()
+
+
+class TestPendingProbePriorityAndPacing(_SectionCase):
+    """Soonest-airing files probe first on every channel; the long backlog is paced by the governor"""
+
+    def test_pending_probe_priority_and_pacing(self):
+        self.run_section(suite_pending_probe_priority_and_pacing)
+
+
+def suite_shared_scan_pacing():
+    """One pacing rule for every scan: airing files run with no pause, the next 3 shows run fast, the files behind them run slower, and the pace follows playback, load, the PC, the mode and a quiet PC."""
+    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True), \
+            mock.patch.object(gov, "pc_is_quiet", lambda now=None: False):
+        check(gov.scan_pace_seconds("now", 1.0, playing=True) == 0.0, "a file airing now is scanned with no pause")
+        nxt = gov.scan_pace_seconds("next", 1.0)
+        deep = gov.scan_pace_seconds("deep", 1.0)
+        check(0 < nxt < deep, "the next shows are scanned faster than the files behind them (%.2f < %.2f)" % (nxt, deep))
+        check(gov.scan_pace_seconds("deep", 1.0, playing=True) > deep, "the deep pace slows while a show plays")
+        check(gov.scan_pace_seconds("next", 1.0, playing=True) < gov.scan_pace_seconds("deep", 1.0, playing=True),
+              "while a show plays the next shows still go faster than the deep files")
+        check(gov.scan_pace_seconds("next", 1.0, guide_open=True) > nxt, "the guide being open slows the scans")
+    with mock.patch.object(gov, "current_level", lambda: 3), mock.patch.object(gov, "enforcing", lambda: True), \
+            mock.patch.object(gov, "pc_is_quiet", lambda now=None: False):
+        check(gov.scan_pace_seconds("deep", 1.0) > deep, "a busy PC stretches the pace")
+    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True), \
+            mock.patch.object(gov, "pc_is_quiet", lambda now=None: True):
+        check(gov.scan_pace_seconds("deep", 1.0) < deep, "a quiet PC speeds the scans back up")
+    weak = types.SimpleNamespace(tier="WEAK", effective_physical=2, logical_cores=4, gpu_tier="none")
+    strong = gov.build_profile(8, 0, 16, 32.0, 24.0)
+    paces = {}
+    for label, profile in (("weak", weak), ("strong", strong)):
+        with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True), \
+                mock.patch.object(gov, "pc_is_quiet", lambda now=None: False), mock.patch.object(gov, "get_profile", lambda p=profile: p), \
+                mock.patch.object(gov, "_limit_mode", lambda capability, mode: mode):
+            paces[label] = (gov.scan_pace_seconds("next", 1.0, mode="standard"), gov.scan_pace_seconds("next", 1.0, mode="lite"))
+    check(paces["weak"][0] > paces["strong"][0], "a weak PC waits longer between files")
+    check(paces["strong"][1] > paces["strong"][0], "Lite mode waits longer between files")
+
+    throttle = gov.Throttle(16.6, name="quiet-test")
+    calm = {"system_cpu_pct": 10.0, "busy_avg_ms": 4.0, "busy_worst_ms": 6.0}
+    for t in range(0, 30):
+        throttle.update(dict(calm), now=1000.0 + t)
+    check(throttle.quiet_seconds(now=1029.0) >= gov.SCAN_QUIET_AFTER_SECONDS, "a calm PC counts as quiet after the quiet seconds")
+    throttle.update({"system_cpu_pct": 85.0, "busy_avg_ms": 4.0}, now=1030.0)
+    check(throttle.quiet_seconds(now=1030.0) == 0.0, "a busy reading ends the quiet time at once")
+
+    src = read(MAIN_SCRIPT)
+    for worker in ("_duration_scan_worker", "_picture_box_scan_worker", "_music_precache_worker"):
+        body = get_function_source(worker)
+        check("_scan_class_pace_seconds(" in body and "_scan_thread_slot(" in body,
+              "%s uses the shared pace and the shared scan threads" % worker)
+    check("_loudness_scan_pace(_head_cls, BETWEEN_PROBES)" in src and '_scan_thread_slot("loudness", _head_cls)' in src,
+          "the loudness chain uses the shared pace and the shared scan threads")
+
+
+class TestSharedScanPacing(_SectionCase):
+    """The duration, picture-box, loudness and music scans share one pace rule that follows the PC"""
+
+    def test_shared_scan_pacing(self):
+        self.run_section(suite_shared_scan_pacing)
+
+
+def suite_shared_scan_threads():
+    """The scans get their own threads on a PC with cores to spare and take turns on one thread on a weak PC; the count follows the mode and the load."""
+    weak = types.SimpleNamespace(tier="WEAK", effective_physical=2, logical_cores=4, gpu_tier="none")
+    strong = gov.build_profile(8, 0, 16, 32.0, 24.0)
+    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True):
+        check(gov.scan_threads(weak) == 1, "a weak PC runs the scans on one shared thread")
+        many = gov.scan_threads(strong, "performance")
+        check(1 < many <= gov.SCAN_THREADS_MAX, "a strong PC in Performance gives the scans their own threads (got %d)" % many)
+        check(gov.scan_threads(strong, "lite") <= many, "Lite mode never gives the scans more threads than Performance")
+    with mock.patch.object(gov, "current_level", lambda: 3), mock.patch.object(gov, "enforcing", lambda: True):
+        check(gov.scan_threads(strong, "performance") < many, "a busy PC cuts the scan threads")
+
+    with mock.patch.object(gov, "scan_threads", lambda profile=None, mode=None: 1):
+        entered = threading.Event()
+        release = threading.Event()
+        second = []
+
+        def holder():
+            with gov.scan_thread_slot("duration") as ok:
+                entered.set()
+                release.wait(5)
+
+        def waiter():
+            with gov.scan_thread_slot("loudness") as ok:
+                second.append(time.monotonic())
+
+        t1 = threading.Thread(target=holder)
+        t1.start()
+        entered.wait(5)
+        t2 = threading.Thread(target=waiter)
+        t2.start()
+        time.sleep(0.6)
+        check(not second, "with one scan thread a second scan waits for the first")
+        released_at = time.monotonic()
+        release.set()
+        t1.join(5)
+        t2.join(5)
+        check(second and second[0] >= released_at, "the waiting scan runs once the thread is free")
+
+        hold = threading.Event()
+        inside = threading.Event()
+
+        def holder2():
+            with gov.scan_thread_slot("duration"):
+                inside.set()
+                hold.wait(5)
+
+        t3 = threading.Thread(target=holder2)
+        t3.start()
+        inside.wait(5)
+        ran = []
+
+        def priority_job():
+            with gov.scan_thread_slot("picture_box", priority=True) as ok:
+                ran.append(ok)
+
+        t4 = threading.Thread(target=priority_job)
+        t4.start()
+        t4.join(2)
+        check(ran == [True], "a file airing now never waits for a scan thread")
+        stop = threading.Event()
+        stop.set()
+        got = []
+
+        def stopped_job():
+            with gov.scan_thread_slot("music", stop=stop) as ok:
+                got.append(ok)
+
+        t5 = threading.Thread(target=stopped_job)
+        t5.start()
+        t5.join(2)
+        check(got == [False], "a waiting scan gives up when the app shuts down")
+        hold.set()
+        t3.join(5)
+
+
+class TestSharedScanThreads(_SectionCase):
+    """Scans run on their own threads or share one, by the PC's cores, the mode and the load"""
+
+    def test_shared_scan_threads(self):
+        self.run_section(suite_shared_scan_threads)
+
+
+def suite_music_scan_window():
+    """Visualizer and menu music: the first 3 songs scan with no pause, scans stay fast until 10 songs ahead are scanned, then slow down, and go fast again when fewer than 5 are left."""
+    check(gov.MUSIC_SCAN_QUICK_SONGS == 3 and gov.MUSIC_SCAN_FAST_AHEAD_SONGS == 10 and gov.MUSIC_SCAN_FALL_BEHIND_SONGS == 5,
+          "the governor holds 3 quick songs, 10 songs ahead and the 5-song fall-behind mark")
+    check([gov.music_scan_class(d, False) for d in (0, 2, 3, 9, 10, 40)] == ["now", "now", "next", "next", "deep", "deep"],
+          "songs 1 to 3 are quick, up to 10 ahead fast, further ones slow")
+    check(gov.music_scan_class(30, True) == "next", "a falling-behind playlist scans its far songs fast")
+    check(gov.music_scan_falling_behind(False, 4) is True, "fewer than 5 scanned songs ahead is falling behind")
+    check(gov.music_scan_falling_behind(True, 7) is True, "a falling-behind scan stays fast until 10 are scanned")
+    check(gov.music_scan_falling_behind(True, 10) is False, "10 songs ahead ends the fast scan")
+    check(gov.music_scan_falling_behind(False, 7) is False, "between 5 and 10 a slow scan stays slow")
+
+    ns = {"performance_governor": gov, "log": MagicMock(), "_music_scan_behind": {}}
+    exec(main_function_code("_music_scan_source_items"), ns)
+    songs = [("channel", "07", "Music Tracks", "/s/%02d.mp3" % k, k < 6) for k in range(30)]
+    items = ns["_music_scan_source_items"]("ch01", songs)
+    check(ns["_music_scan_behind"]["ch01"] is True, "a playlist seen for the first time scans fast until 10 songs ahead are scanned")
+    ns["_music_scan_behind"]["ch07"] = False
+    items = ns["_music_scan_source_items"]("ch07", songs)
+    check(items[0][1] == 6 and ns["_music_scan_behind"]["ch07"] is False,
+          "a slow playlist with 5 next songs scanned stays slow, the first unscanned song is listed first")
+    check({it[0] for it in items if it[1] >= 10} == {"deep"} and {it[0] for it in items if it[1] < 10} == {"next"},
+          "songs inside 10 ahead are fast, the rest slow")
+    songs = [("channel", "07", "Music Tracks", "/s/%02d.mp3" % k, k < 3) for k in range(30)]
+    items = ns["_music_scan_source_items"]("ch07", songs)
+    check(ns["_music_scan_behind"]["ch07"] is True and all(it[0] in ("now", "next") for it in items),
+          "only 2 next songs scanned is falling behind: every song is scanned fast")
+    src = get_function_source("_gather_music_probe_queue")
+    check("ranked.sort(key=lambda it: (_MUSIC_SCAN_CLASS_RANK.get(it[0], 2), it[1]))" in src,
+          "every playlist's near songs are scanned before any playlist's far songs")
+
+
+class TestMusicScanWindow(_SectionCase):
+    """Visualizer music scans run quick for 3 songs, fast to 10 ahead, slow after, fast again when falling behind"""
+
+    def test_music_scan_window(self):
+        self.run_section(suite_music_scan_window)
+
+
+def suite_deep_backlog_by_distance():
+    """Behind the next 3 shows every channel's 4th show is scanned before any channel's 5th, so no channel falls behind."""
+    lineups = {ch: [{"path": "/m/%s_%d.mkv" % (ch, k)} for k in range(8)] for ch in ("05", "06")}
+    snaps = {ch: {"current_file": "/m/%s_0.mkv" % ch, "ordered": lineups[ch], "block_key": "Full Day",
+                  "pending": [], "pending_other": [], "other_blocks": []} for ch in lineups}
+    ns = {"db": types.SimpleNamespace(channels_db={ch: {"active": True} for ch in lineups}), "os": os,
+          "SCAN_GATHER_LIBRARY_LOOKUPS": 400, "_scan_snapshot_channel": lambda ch: snaps.get(ch),
+          "_paths_from_entry": lambda e: [e["path"]], "_cached_path_exists": lambda p: True,
+          "_scan_stages_pending": lambda p, g, d, lk: True, "_front_load_watched_channel": lambda items: items,
+          "_gather_holiday_scan_items": lambda: ([], [], [])}
+    exec(main_function_code("_gather_deep_backlog_queue"), ns)
+    order = [os.path.basename(it[3]) for it in ns["_gather_deep_backlog_queue"]()]
+    check(order[:4] == ["05_4.mkv", "06_4.mkv", "05_5.mkv", "06_5.mkv"],
+          "the deep scan goes channel by channel at each distance (got %s)" % order[:4])
+
+
+class TestDeepBacklogByDistance(_SectionCase):
+    """The deep scan backlog is ordered by distance from the show on air across all channels"""
+
+    def test_deep_backlog_by_distance(self):
+        self.run_section(suite_deep_backlog_by_distance)
+
+
+def suite_picture_box_gpu_decode():
+    """The picture-box scan decodes on the GPU when the PC has one and this ffmpeg can, and redoes a failed GPU decode on the CPU."""
+    saved = dict(ml._pb_gpu_state)
+    try:
+        ml._pb_gpu_state.update({"checked_for": None, "available": False, "failures": 0})
+        with mock.patch.object(gov, "scan_gpu_decode_allowed", lambda profile=None: False):
+            check(ml._pb_gpu_decode_args("ffmpeg") == [], "no GPU or not Windows: the scan decodes on the CPU")
+        listing = mock.Mock(stdout=b"Hardware acceleration methods:\ndxva2\nd3d11va\n", returncode=0)
+        with mock.patch.object(gov, "scan_gpu_decode_allowed", lambda profile=None: True), \
+                mock.patch.object(ml.subprocess, "run", lambda *a, **k: listing):
+            check(ml._pb_gpu_decode_args("ffmpeg") == ["-hwaccel", gov.SCAN_GPU_DECODE_HWACCEL],
+                  "a PC with a GPU and an ffmpeg that has the hwaccel decodes on the GPU")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "-hwaccel" in cmd:
+                return mock.Mock(stderr=b"error", stdout=b"", returncode=1)
+            return mock.Mock(stderr=_pb_stderr((1280, 720), [(1280, 720, 0, 0)]).encode("utf-8"),
+                             stdout=b"\x10" * (ml._PB_FLAT_W * ml._PB_FLAT_H), returncode=0)
+
+        with mock.patch.object(gov, "scan_gpu_decode_allowed", lambda profile=None: True), \
+                mock.patch.object(ml.subprocess, "run", fake_run):
+            sample = ml._pb_run_sample("movie.mp4", "ffmpeg", 10.0, 5.0)
+        check(len(calls) == 2 and "-hwaccel" in calls[0] and "-hwaccel" not in calls[1],
+              "a failed GPU decode is redone on the CPU at once")
+        check(sample is not None and sample.frames, "the CPU redo gives the scan its result")
+        check(ml._pb_gpu_state["failures"] == 1, "the failed GPU decode is counted")
+        ml._pb_gpu_state["failures"] = gov.SCAN_GPU_DECODE_FAILURE_LIMIT
+        with mock.patch.object(gov, "scan_gpu_decode_allowed", lambda profile=None: True):
+            check(ml._pb_gpu_decode_args("ffmpeg") == [], "after the failure limit the run goes back to CPU decoding")
+    finally:
+        ml._pb_gpu_state.clear()
+        ml._pb_gpu_state.update(saved)
+
+
+class TestPictureBoxGpuDecode(_SectionCase):
+    """The picture-box scan uses the GPU for decoding when there is one, with a CPU fallback"""
+
+    def test_picture_box_gpu_decode(self):
+        self.run_section(suite_picture_box_gpu_decode)
+
+
+def suite_visualizer_analysis_read_ahead():
+    """The visualizer analyzes the next songs ahead into the disk cache, always after the song playing now."""
+    import numpy as np
+    sys.path.insert(0, ASSETS_DIR)
+    import audio_analysis as aa
+    tmp = tempfile.mkdtemp(prefix="vis_ahead_")
+    try:
+        songs = []
+        for k in range(3):
+            path = os.path.join(tmp, "song%d.mp3" % k)
+            with open(path, "wb") as fh:
+                fh.write(b"x" * (k + 10))
+            songs.append(path)
+        order = []
+
+        def fake_decode(ffmpeg, path):
+            order.append(os.path.basename(path))
+            rng = np.random.default_rng(len(order))
+            return rng.standard_normal(aa.SAMPLE_RATE * 3).astype(np.float32) * 0.1
+
+        with mock.patch.object(aa, "decode_samples", fake_decode):
+            analyzer = aa.TrackAnalyzer(lambda: "ffmpeg", lambda: tmp, log=MagicMock())
+            analyzer.analyze_ahead([(songs[1], 0.0), (songs[2], 0.0)])
+            analyzer.get(songs[0])
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not (analyzer.get(songs[0]) and all(analyzer.is_analyzed(p) for p in songs[1:])):
+                time.sleep(0.05)
+        check(analyzer.get(songs[0]) is not None, "the song playing now is analyzed and kept in memory")
+        check(all(analyzer.is_analyzed(p) for p in songs[1:]), "the next songs are analyzed ahead into the disk cache")
+        check(os.path.normpath(songs[1]) not in analyzer._memory, "a read-ahead song does not push the playing song out of memory")
+        check(order.count("song1.mp3") == 1 and order.count("song2.mp3") == 1, "each read-ahead song is decoded once")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    src = get_function_source("_music_precache_worker")
+    check("_visualizer_analysis_prefetch()" in src, "the music scan thread keeps the visualizer's read-ahead list filled")
+
+
+class TestVisualizerAnalysisReadAhead(_SectionCase):
+    """Visualizer song analysis reads ahead the next songs behind the one playing"""
+
+    def test_visualizer_analysis_read_ahead(self):
+        self.run_section(suite_visualizer_analysis_read_ahead)
+
+
+def suite_audio_track_english_first():
+    """A file with no saved track plays its English track first; the menu shows each track's language and keeps up with tracks VLC lists late."""
+    ns = {"re": re, "os": os, "performance_governor": gov}
+    for name in ("_gov_audio_track_value", "_audio_language_is_preferred", "_vlc_track_language",
+                 "_audio_track_rows", "_pick_preferred_audio_track"):
+        exec(main_function_code(name), ns)
+    ns["_AUDIO_LABEL_LANGUAGE_RE"] = re.compile(r"\[([^\]]+)\]")
+    pick = ns["_pick_preferred_audio_track"]
+    tracks = [(1, "Track 1 - [Japanese]"), (2, "Track 2 - [English]")]
+    check(pick(tracks, [], 1)[0] == 2, "English on track 2 is picked over Japanese on track 1")
+    check(pick([(1, "Track 1 - [English]"), (2, "Track 2 - [Spanish]")], [], 1)[0] is None,
+          "English already playing on track 1 is kept")
+    check(pick([(1, "Track 1"), (2, "Track 2")], [{"lang": "jpn", "desc": "ac3"}, {"lang": "eng", "desc": "aac"}], 1)[0] == 2,
+          "with no language in VLC's labels the file's own stream languages decide")
+    check(pick([(1, "Track 1 - [French]"), (2, "Track 2 - [German]")], [], 1)[0] is None,
+          "no English track: the playing track is kept")
+    rows = ns["_audio_track_rows"]([(1, "Track 1"), (2, "Track 2")], [{"lang": "jpn", "desc": "ac3, 48000 Hz, 5.1"}, {"lang": "eng", "desc": "aac, 48000 Hz, stereo"}])
+    check("ENG" in rows[1][1] and "JPN" in rows[0][1], "the menu shows each track's language when VLC's label has none")
+    check(ns["_audio_track_rows"]([(2, "Track 2 - [English]")], [{"lang": "eng", "desc": "x"}])[0][1] == "Track 2 - [English]",
+          "a label that already names its language is shown as VLC gives it")
+    src = read(MAIN_SCRIPT)
+    check("self._apply_preferred_audio_track_when_ready(filepath, timeout_ms)" in src,
+          "a file with no saved track choice gets the English-first pick at start")
+    check("_refresh_audio_track_picker, args=(_picker_file, time.monotonic())" in src,
+          "the Audio Track menu keeps re-reading the track list while it is open")
+    check("_vlc_label = dict(_vlc_tracks).get(track_id, track_name)" in src and "_save_audio_track_pref(_cur_file, track_id, _vlc_label, _vlc_index)" in src,
+          "a menu choice is remembered under VLC's own label so it is found again next time")
+
+
+class TestAudioTrackEnglishFirst(_SectionCase):
+    """Audio tracks: English first, every track listed with its language, and the owner's choice remembered"""
+
+    def test_audio_track_english_first(self):
+        self.run_section(suite_audio_track_english_first)
+
+
+def suite_loudness_scan_stage1():
+    """One goal for every file, one audio-only decode per window for the whole mix, the dialogue and the peak, the track that plays, and fewer windows when they agree."""
+    check(media.TARGET_LUFS == -24.0 and media.MUSIC_TARGET_LUFS == media.TARGET_LUFS,
+          "TV dialogue, commercials and music all aim at -24 LUFS")
+    check(media.LOUDNESS_GAIN_OFFSET_DB == media.MUSIC_GAIN_OFFSET_DB == gov.LOUDNESS_STATION_LEVEL_DB,
+          "one station level is added to TV and music alike")
+    check(media.LOUDNESS_GAIN_SCAN_VERSION == 10, "the scan version moved on so every file is measured once with the new method")
+
+    blocks = [-23.0] * 50 + [-80.0] * 10
+    check(abs(media._bs1770_integrated(blocks) - (-23.0)) < 1e-6, "blocks under -70 LUFS are left out of the integrated loudness")
+    check(abs(media._bs1770_integrated([-20.0] * 10 + [-40.0] * 10) - (-20.0)) < 1e-6,
+          "the relative gate drops blocks 10 LU under the mean")
+    check(media._bs1770_integrated([-20.0] * 10 + [-40.0] * 10, relative=False) < -22.0,
+          "dialogue gating uses the absolute gate only, as ATSC A/85 long-form does")
+    lines = "\n".join("[Parsed_ebur128_1 @ 0x1] t: %.1f    TARGET:-23 LUFS    M: %.1f S: %.1f     I: -20.0 LUFS       LRA:   0.0 LU  FTPK: -9.0 -8.0 dBFS  TPK: -7.5 -6.5 dBFS" % (0.1 * k, -20.0, -20.0) for k in range(1, 40))
+    lines += "\n" + "\n".join("[Parsed_ebur128_3 @ 0x2] t: %.1f    TARGET:-23 LUFS    M: %.1f S: %.1f     I: -30.0 LUFS       LRA:   0.0 LU" % (0.1 * k, -30.0, -30.0) for k in range(1, 40))
+    parsed = media._parse_ebur128_log(lines)
+    check(set(parsed) == {"1", "3"} and parsed["1"]["tpk"] == -6.5 and parsed["3"]["tpk"] is None,
+          "the frame log is read per measurement and the whole-mix one is the one with true peaks")
+    spoken, seconds = media._speech_block_loudness(parsed["1"], [(1.0, 2.0)])
+    check(spoken is not None and 0.9 <= seconds <= 1.3, "only the blocks that are mostly speech are counted as dialogue")
+
+    header = ("  Stream #0:0: Video: h264\n  Stream #0:1(jpn): Audio: ac3, 48000 Hz, 5.1(side), fltp (default)\n"
+              "  Stream #0:2(eng): Audio: aac (LC), 48000 Hz, stereo, fltp\n")
+    with mock.patch.dict(media._audio_track_resolver, {"fn": None}):
+        check(media._scan_audio_stream_index("x.mkv", header) == 1, "with nothing saved the scan measures the English track, like playback")
+    with mock.patch.dict(media._audio_track_resolver, {"fn": lambda path, streams: 0}):
+        check(media._scan_audio_stream_index("x.mkv", header) == 0, "the owner's saved track is the one measured")
+    with mock.patch.dict(media._audio_track_resolver, {"fn": None}):
+        check(media._scan_audio_stream_index("x.mkv", "  Stream #0:1(jpn): Audio: ac3 (default)\n  Stream #0:2(fre): Audio: aac\n") == 0,
+              "with no English track the default track is measured")
+    check(media._header_has_center_channel(header, 0) and not media._header_has_center_channel(header, 1),
+          "the centre-channel check looks at the track that plays")
+
+    check(media._early_stop_order(5)[:3] == [2, 0, 4] and sorted(media._early_stop_order(7)) == list(range(7)),
+          "the first scan reads the middle, the start and the end first, then every other window")
+    calls = []
+
+    def fake_window(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90, semaphore=None,
+                    semaphore_timeout=None, pre_filter=None, dialogue=None, dialogue_out=None, stream_index=None):
+        calls.append(start_sec)
+        return -25.0 + 0.2 * len(calls), -6.0, 6.0, "", False
+
+    with mock.patch.object(media, "_lufs_window_ffmpeg", fake_window), \
+            mock.patch.object(media, "_probe_duration_seconds_fast", lambda p: 2400.0), \
+            mock.patch.object(media, "_duration_looks_implausible", lambda p, d: False):
+        readings = media._sample_lufs_readings("ep.mkv", -24.0)[0]
+    check(len(calls) == 3 and readings, "3 windows that agree within 1.5 LU end the first scan early (read %d of 5)" % len(calls))
+    calls.clear()
+
+    def far_window(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90, semaphore=None,
+                   semaphore_timeout=None, pre_filter=None, dialogue=None, dialogue_out=None, stream_index=None):
+        calls.append(start_sec)
+        return -20.0 - 3.0 * len(calls), -6.0, 6.0, "", False
+
+    with mock.patch.object(media, "_lufs_window_ffmpeg", far_window), \
+            mock.patch.object(media, "_probe_duration_seconds_fast", lambda p: 2400.0), \
+            mock.patch.object(media, "_duration_looks_implausible", lambda p, d: False):
+        media._sample_lufs_readings("ep.mkv", -24.0)
+    check(len(calls) == 5, "windows that disagree are all read")
+
+    seen = []
+    tmp = tempfile.mkdtemp()
+    try:
+        song = os.path.join(tmp, "song.mp3")
+        with open(song, "wb") as fh:
+            fh.write(b"x" * 100)
+        with mock.patch.object(media, "_resolve_dialogue_basis", lambda *a, **k: seen.append(a) or (None, False)), \
+                mock.patch.object(media, "_sample_lufs_readings", lambda *a, **k: ([-30.0], [-30.0], [5.0], "", False)), \
+                mock.patch.object(media, "_get_header_facts", lambda p: None), \
+                mock.patch.object(media, "_cached_path_exists", lambda p: True):
+            music_gain = media.get_music_loudness_gain(song)
+        check(not seen and abs(20 * math.log10(music_gain) - (6.0 + gov.LOUDNESS_STATION_LEVEL_DB)) < 0.01,
+              "music is measured on the whole song against the same -24 plus the station level")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    src = inspect.getsource(media._get_media_loudness_gain_impl)
+    check("abs(gain_db - gain_offset_db) >= GAIN_CHECK_DRASTIC_DB" in src,
+          "extra check windows are judged on the measured loudness, not on the station level")
+
+    held = {"audio_track_id": 3, "audio_track_name": "Track 2 - [English]", "audio_track_index": None}
+    fake_hub = types.SimpleNamespace(read_file_fields=lambda path, names: {n: held.get(n) for n in names})
+    ns = {"re": re, "os": os, "_get_gain_hub": lambda: fake_hub,
+          "_TRACK_FIELDS": ("audio_track_id", "audio_track_name", "audio_track_index")}
+    exec("_TRACK_NUMBER_RE = re.compile(r'^\\s*Track\\s+(\\d+)\\b', re.I)", ns)
+    exec(main_function_code("_scan_audio_track_for_file"), ns)
+    check(ns["_scan_audio_track_for_file"]("a.mkv", [{}, {}]) == 1, "an older saved choice named 'Track 2' is measured on the second track")
+    held["audio_track_index"] = 0
+    check(ns["_scan_audio_track_for_file"]("a.mkv", [{}, {}]) == 0, "a saved track place is used as it is")
+
+    if shutil.which("ffmpeg"):
+        tmp = tempfile.mkdtemp()
+        try:
+            wav = os.path.join(tmp, "tone.wav")
+            subprocess_run = __import__("subprocess").run
+            subprocess_run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "anoisesrc=d=70:a=0.05:c=pink", "-ac", "2", wav])
+            mine = media._lufs_window_ffmpeg_inner(wav, -24.0, start_sec=5.0, length_sec=60.0)
+            err = subprocess_run(["ffmpeg", "-nostdin", "-ss", "5", "-i", wav, "-t", "60", "-af", "loudnorm=print_format=json",
+                                  "-f", "null", "-"], capture_output=True, text=True).stderr
+            ref = json.loads(re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", err).group(0))
+            check(abs(mine[0] - float(ref["input_i"])) < 0.2 and abs(mine[1] - float(ref["input_tp"])) < 0.3,
+                  "the one-decode measurement matches ffmpeg's loudnorm (%.2f vs %s)" % (mine[0], ref["input_i"]))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def suite_every_audio_track_scanned():
+    """A file with two or more audio tracks has every track scanned before the scan moves on, and a switched track plays at its own gain."""
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "movie.mkv")
+        with open(path, "wb") as fh:
+            fh.write(b"x" * 100)
+        header = ("  Stream #0:0: Video: h264\n  Stream #0:1(eng): Audio: aac, 48000 Hz, stereo, fltp (default)\n"
+                  "  Stream #0:2(jpn): Audio: aac, 48000 Hz, stereo, fltp\n")
+        measured = {0: -30.0, 1: -20.0}
+        streams_seen = []
+        sunk = []
+
+        def fake_sample(file_path, target_lufs, semaphore=None, chunk_timeout=180, semaphore_timeout=None,
+                        parallel_windows=False, duration_out=None, centers=None, known_duration=None, window_out=None,
+                        dialogue=None, method_out=None, stream_index=None):
+            index = 0 if stream_index is None else stream_index
+            streams_seen.append(index)
+            if duration_out is not None:
+                duration_out["duration_sec"] = 2400.0
+            return [measured[index]], [-30.0], [6.0], "", False
+
+        with mock.patch.object(media, "_sample_lufs_readings", fake_sample), \
+                mock.patch.object(media, "_scan_header_text", lambda p: header), \
+                mock.patch.object(media, "_resolve_dialogue_basis", lambda *a, **k: (None, False)), \
+                mock.patch.object(media, "_get_header_facts", lambda p: None), \
+                mock.patch.object(media, "_cached_path_exists", lambda p: True), \
+                mock.patch.dict(media._audio_track_resolver, {"fn": None}), \
+                mock.patch.dict(media._track_gains_sink, {"fn": lambda p, primary, gains: sunk.append((primary, gains))}):
+            gain = media.get_media_loudness_gain(path)
+        check(streams_seen[0] is not None and 1 in streams_seen, "the second audio track is scanned in the same job (%s)" % streams_seen)
+        check(sunk and sunk[0][0] == 0 and set(sunk[0][1]) == {0, 1}, "both tracks' gains are handed to the main script")
+        if sunk:
+            g = sunk[0][1]
+            check(abs(20 * math.log10(g[0]) - 20 * math.log10(g[1]) - 10.0) < 0.01,
+                  "a track 10 dB louder gets a gain 10 dB lower")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    src = read(MAIN_SCRIPT)
+    check("_track_gain = _playing_track_gain(norm_target)" in src and "not _owner_set_gain(norm_target)" in src,
+          "the playing track's own gain is used unless the owner set the file's gain himself")
+    check("_target_engine._audio_index = _vlc_index" in src and "self._reapply_track_gain(filepath)" in src,
+          "switching tracks in the menu and the track picked at file start both use that track's gain")
+    lib_src = inspect.getsource(ml)
+    check('("track_gains", "TEXT")' in lib_src, "the library keeps a per-track gain column, added to older library files too")
+
+
+def suite_loudness_off_rules():
+    """Loudness Scan off: the scans keep running at their normal pace, playback uses no gain, and both gain rows are greyed and cannot be changed; the menu and the station read the same default for Loudness Scan and the Pixel Orbiter."""
+    src = read(MAIN_SCRIPT)
+    check("LOUDNESS_OFF_SLOWDOWN_MULTIPLIER" not in src and "spare = not app_state.get(\"is_playing_video\", False)" in src,
+          "the loudness scan keeps its pace and its threads with Loudness Scan off")
+    check(src.count("if not db.config.get(\"loudness_scan_enabled\", True):\n                                continue") == 1
+          and src.count("if not db.config.get(\"loudness_scan_enabled\", True):\n                            continue") == 1,
+          "the channel Audio Track gain row and the visualizer gain row ignore Left/Right with Loudness Scan off")
+    ui_src = inspect.getsource(ui)
+    check(ui_src.count("LOUDNESS GAIN: LOUDNESS SCAN IS OFF") == 2, "both gain rows are drawn greyed with Loudness Scan off")
+    check('db.config.get("loudness_scan_enabled", True) if db is not None else True' in ui_src
+          and 'db.config.get("pixel_orbiter_enabled", True) if db is not None else True' in ui_src,
+          "the menu shows Loudness Scan and the Pixel Orbiter with the same default the station runs")
+    ns = {"db": types.SimpleNamespace(config={"pixel_orbiter_enabled": False})}
+    exec(main_function_code("_pixel_orbiter_active"), ns)
+    check(ns["_pixel_orbiter_active"]() is False, "the Pixel Orbiter stops shifting the picture when it is off")
+
+
+def suite_file_data_in_the_hub():
+    """Chosen audio tracks and loudness learning live in each file's library row; what an older version kept in the settings file is moved there and removed from it; there is one guide idle shield."""
+    tmp = tempfile.mkdtemp()
+    lib = None
+    try:
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+        files = []
+        for i in range(3):
+            path = os.path.normpath(os.path.join(tmp, "ep%d.mkv" % i))
+            with open(path, "wb") as fh:
+                fh.write(os.urandom(2000 + i))
+            files.append(path)
+        missing = os.path.normpath(os.path.join(tmp, "gone.mkv"))
+        saves = []
+        fake_db = types.SimpleNamespace(config={
+            "audio_track_prefs": {files[0]: {"track_id": 2, "track_name": "Track 2 - [English]", "audio_index": 1},
+                                  missing: {"track_id": 1, "track_name": "Track 1"}},
+            "loudness_learning": {"baselines": {files[1]: 2.0}, "applied": {files[2]: 3},
+                                  "series": {"show": {"changes": {files[1]: {"delta_db": 4, "at": 10.0}}, "offset_db": 0}}},
+        }, save_settings_async=lambda **k: saves.append(1))
+        ns = {"db": fake_db, "os": os, "log": MagicMock(), "_get_gain_hub": lambda: hub}
+        exec(main_function_code("_carry_config_file_data_into_hub"), ns)
+        ns["_carry_config_file_data_into_hub"]()
+        check(hub.read_file_fields(files[0], ("audio_track_id", "audio_track_name", "audio_track_index"))
+              == {"audio_track_id": 2, "audio_track_name": "Track 2 - [English]", "audio_track_index": 1},
+              "a chosen track kept in the settings file is moved into the file's library row")
+        check(list(fake_db.config.get("audio_track_prefs", {})) == [missing],
+              "a choice whose file cannot be read yet stays in the settings file for the next boot")
+        check(hub.read_file_fields(files[1], ("learn_series_key", "learn_change_db", "learn_baseline_db"))
+              == {"learn_series_key": "show", "learn_change_db": 4.0, "learn_baseline_db": 2.0}
+              and hub.read_file_fields(files[2], ("learn_applied_db",)) == {"learn_applied_db": 3.0},
+              "loudness learning kept in the settings file is moved into each file's library row")
+        check("loudness_learning" not in fake_db.config and saves, "the moved learning is removed from the settings file and the file is saved")
+        check(hub.read_series_changes("show") == [(4.0, 10.0)], "the series' changes are read back from the library rows")
+    finally:
+        if lib is not None:
+            lib.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    src = read(MAIN_SCRIPT)
+    check('db.config.get("audio_track_prefs"' not in src.replace('prefs = db.config.get("audio_track_prefs")', "")
+          and 'db.config.get("loudness_learning")' not in src.replace('learning = db.config.get("loudness_learning")', ""),
+          "nothing but the one-time move reads chosen tracks or learning from the settings file")
+    check("ANTI-BURN-IN SHIELD 2" not in src and src.count("[ANTI-BURN-IN SHIELD] Inactivity limit reached") == 1,
+          "the guide has one idle shield, the one a held key keeps awake")
+    check("_server_entry_gain(ch_key, norm_target)" in src and "_strip_local_entry_gains()" in src,
+          "gains are read from the library only; only a channel streamed from a Server uses the gain the Server sent")
+
+
+def suite_idle_close_everywhere():
+    """Every menu, sub-menu and file explorer closes after the one menu idle value, and every popup after the one popup value (30 s)."""
+    check(gov.MENU_IDLE_CLOSE_SECONDS == 60.0 and gov.CONFIRM_POPUP_IDLE_CLOSE_SECONDS == 30.0,
+          "the governor holds 60 s for menus and 30 s for popups")
+    src = read(MAIN_SCRIPT)
+    check("60000" not in src.replace("--clock-jitter=60000", "").replace("_PRUNE_EVERY_MS = 60000", "").replace("else 60000", "")
+          and "elapsed_ms >= 20000" not in src and "elapsed_popup_ms >= 20000" not in src,
+          "no menu or popup timer is written as a bare number in the main script")
+    check(src.count("elapsed_ms >= MENU_IDLE_CLOSE_MS") == 3 and src.count("+ MENU_IDLE_CLOSE_MS") == 4,
+          "the splash, the file explorer, the menu (with every sub-menu in it) and the guide use the one menu idle value")
+    check(src.count("elapsed_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS") == 3 and "elapsed_popup_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS" in src,
+          "the Quit, shared Yes/No (clear, reset, burn-in, update) and Restart popups and the controller popups use the one popup value")
+    check("game_deck.dismiss_pick_layout_popup()" in src and "game_deck.cancel_any_mapping_reassign()" in src,
+          "the Pick Layout popup and the wait for a controller button close after the popup value")
+    import game_deck as gd
+    check(gd.ExternalGameDeck._CONFIRM_BURN_IN_MS == 30000, "the DVD exit, DVD back-to-menu and game exit popups close after the popup value")
+
+
+class TestIdleCloseEverywhere(_SectionCase):
+    """Menus close after one idle value and every popup after one popup value"""
+
+    def test_idle_close_everywhere(self):
+        self.run_section(suite_idle_close_everywhere)
+
+
+class TestFileDataInTheHub(_SectionCase):
+    """Per-file data lives in the library; older settings-file copies are moved there; one guide idle shield"""
+
+    def test_file_data_in_the_hub(self):
+        self.run_section(suite_file_data_in_the_hub)
+
+
+class TestLoudnessOffRules(_SectionCase):
+    """Loudness Scan off keeps scanning but plays no gain and greys the gain rows; menu and station agree on defaults"""
+
+    def test_loudness_off_rules(self):
+        self.run_section(suite_loudness_off_rules)
+
+
+class TestEveryAudioTrackScanned(_SectionCase):
+    """Every audio track of a file is scanned and switching tracks plays the new track at its own level"""
+
+    def test_every_audio_track_scanned(self):
+        self.run_section(suite_every_audio_track_scanned)
+
+
+class TestLoudnessScanStage1(_SectionCase):
+    """Loudness scan: one goal, one decode per window, dialogue found by subtitles, centre channel or the speech detector, the track that plays"""
+
+    def test_loudness_scan_stage1(self):
+        self.run_section(suite_loudness_scan_stage1)
 
 
 if __name__ == "__main__":

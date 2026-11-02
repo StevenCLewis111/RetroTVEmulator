@@ -93,7 +93,8 @@ class UpdateError(RuntimeError):
 
 
 def _update_dir(base_dir):
-    return os.path.join(os.path.abspath(base_dir), UPDATE_DIR_NAME)
+    """The update work folder, root/logs/.retro_tv_updates, so a download never shows beside the exe."""
+    return os.path.join(os.path.abspath(base_dir), "logs", UPDATE_DIR_NAME)
 
 
 def _atomic_json_write(path, payload):
@@ -127,6 +128,89 @@ def _read_json(path, default=None):
 
 
 # ============================================================================
+# SECTION: Build info & version stamp
+# ============================================================================
+
+try:
+    import build_info as _build_info
+except ImportError:
+    _build_info = None
+
+BUILD_TYPES = ("Alpha", "Beta", "Release")
+VERSION_STAMP_NAME = "version.json"
+# VALUES CHANGE HERE: True offers only zips of the installed build type (an Alpha build sees only Alpha zips, a Beta build only Beta zips; a zip name with neither word is Release); False offers the highest number of any type.
+UPDATE_MATCHES_BUILD_TYPE = True
+_BUILD_TYPE_RE = re.compile(r"(?<![A-Za-z])(alpha|beta)(?![A-Za-z])", re.IGNORECASE)
+
+
+def build_type_from_name(name):
+    """Returns Alpha, Beta or Release from the words in a file name; Release when it holds neither Alpha nor Beta."""
+    match = _BUILD_TYPE_RE.search(str(name or ""))
+    return match.group(1).capitalize() if match else "Release"
+
+
+def _baked(attribute):
+    return str(getattr(_build_info, attribute, "") or "").strip()
+
+
+def current_build_type(base_dir):
+    """Returns the installed build type: the one built into the exe, then the one in version.json, then the Alpha or Beta word in the exe's name; empty when none is known."""
+    baked = _baked("BUILD_TYPE").capitalize()
+    if baked in BUILD_TYPES:
+        return baked
+    stamp = _read_json(os.path.join(base_dir, VERSION_STAMP_NAME), {})
+    if isinstance(stamp, dict):
+        stamped = str(stamp.get("build", "") or "").strip().capitalize()
+        if stamped in BUILD_TYPES:
+            return stamped
+    for name in (sys.executable, sys.argv[0] if sys.argv else ""):
+        match = _BUILD_TYPE_RE.search(os.path.basename(str(name or "")))
+        if match:
+            return match.group(1).capitalize()
+    return ""
+
+
+def _set_stamp_attributes(path, protected):
+    """Marks version.json hidden, system and read-only (protected) or plain; does nothing off Windows."""
+    if os.name != "nt":
+        return
+    import ctypes
+    ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x1 | 0x2 | 0x4 if protected else 0x80)
+
+
+def write_version_stamp(base_dir, version, build=""):
+    """Writes version.json with the version and build type and protects it from accidental deletion; returns True when written."""
+    path = os.path.join(base_dir, VERSION_STAMP_NAME)
+    payload = {"version": str(version)}
+    if build:
+        payload["build"] = build
+    try:
+        _set_stamp_attributes(path, False)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return True
+    except OSError as exc:
+        log.warning("[FAILURE] write_version_stamp: could not write %s: %s", path, exc)
+        return False
+    finally:
+        _set_stamp_attributes(path, True)
+
+
+def _heal_version_stamp(base_dir):
+    """Rewrites version.json from the version and build type built into this exe when the file is missing or differs."""
+    baked_version = _baked("BUILD_VERSION")
+    if not VERSION_RE.fullmatch(baked_version):
+        return
+    baked_build = _baked("BUILD_TYPE").capitalize()
+    baked_build = baked_build if baked_build in BUILD_TYPES else ""
+    stamp = _read_json(os.path.join(base_dir, VERSION_STAMP_NAME), {})
+    stamp = stamp if isinstance(stamp, dict) else {}
+    if str(stamp.get("version", "") or "").strip() == baked_version and (not baked_build or stamp.get("build") == baked_build):
+        return
+    write_version_stamp(base_dir, baked_version, baked_build)
+
+
+# ============================================================================
 # SECTION: Version handling & configuration
 # ============================================================================
 
@@ -145,12 +229,16 @@ def version_is_newer(candidate, current):
 
 
 def current_version(base_dir, config=None):
-    """Read the installed version without requiring pygame or the media DB: the RETRO_TV_VERSION override, then version.json (written by update_helper.py), then the V1.2.3 number in the running exe's own name; 0.0.0 when none is found."""
+    """Read the installed version without requiring pygame or the media DB: the RETRO_TV_VERSION override, then the version built into the exe, then version.json (written by update_helper.py), then the V1.2.3 number in the running exe's own name; 0.0.0 when none is found."""
     env_version = os.environ.get("RETRO_TV_VERSION")
     if env_version:
         return str(env_version).strip()
 
-    value = _read_json(os.path.join(base_dir, "version.json"), {})
+    baked_version = _baked("BUILD_VERSION")
+    if VERSION_RE.fullmatch(baked_version):
+        return baked_version
+
+    value = _read_json(os.path.join(base_dir, VERSION_STAMP_NAME), {})
     if isinstance(value, dict):
         value = str(value.get("version", "") or "").strip()
         if VERSION_RE.fullmatch(value):
@@ -263,7 +351,7 @@ def validate_manifest(raw):
     }
 
 
-def check_github_for_update(installed, repo, api_base=GITHUB_API_BASE, timeout=DEFAULT_TIMEOUT_SECONDS):
+def check_github_for_update(installed, repo, api_base=GITHUB_API_BASE, timeout=DEFAULT_TIMEOUT_SECONDS, build_type=""):
     """Lists the repository's releases (pre-releases included), picks the zip with the highest V1.2.3 number in its name and reports whether it is newer than the installed build; the download is checked against the SHA-256 GitHub reports for that file."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
         raise UpdateError("The GitHub repository is not valid; it must look like owner/name")
@@ -281,6 +369,8 @@ def check_github_for_update(installed, repo, api_base=GITHUB_API_BASE, timeout=D
                 continue
             version = version_from_zip_name(asset.get("name", ""))
             if version is None:
+                continue
+            if UPDATE_MATCHES_BUILD_TYPE and build_type and build_type_from_name(asset.get("name", "")) != build_type:
                 continue
             zips_seen += 1
             rank = (parse_version(version), str(release.get("published_at", "") or ""))
@@ -325,6 +415,10 @@ def check_github_for_update(installed, repo, api_base=GITHUB_API_BASE, timeout=D
 def check_for_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
     """Looks for a newer release on GitHub, returning a UI-friendly result."""
     installed = current_version(base_dir, config)
+    try:
+        _heal_version_stamp(base_dir)
+    except Exception as heal_exc:
+        log.warning("[FAILURE] check_for_update: could not refresh %s: %s", VERSION_STAMP_NAME, heal_exc)
     repo, github_base = github_settings(config)
     if not repo:
         return {
@@ -333,7 +427,7 @@ def check_for_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
             "current_version": installed,
             "message": "Update source is not configured.",
         }
-    return check_github_for_update(installed, repo, github_base, timeout=timeout)
+    return check_github_for_update(installed, repo, github_base, timeout=timeout, build_type=current_build_type(base_dir))
 
 
 # ============================================================================

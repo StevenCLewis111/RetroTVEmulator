@@ -16,6 +16,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+try:
+    import performance_governor as _governor
+except Exception:
+    _governor = None
+
 # ============================================================================
 # SECTION: Directions and the table
 # ============================================================================
@@ -140,9 +145,9 @@ def is_back(key):
 # WARNING: layers where a held key must never repeat: their handlers treat every key as input to capture or map.
 NO_REPEAT_LAYERS = ("GAMES_CTRL_MAP", "DVD_BTN_MAP", "REMOTE_REMAP_CAPTURE", "NUMBER_REMAP_CAPTURE")
 
-# VALUES CHANGE HERE (milliseconds: a second press of one key with no release between counts as the same press inside the first window; the same press arriving by a different key code counts as one inside the second)
-NAV_DUP_HELD_MS = 250
-NAV_DUP_PATH_MS = 50
+# WARNING: the fallback numbers below must match NAV_DUP_HELD_MS, NAV_DUP_PATH_MS in performance_governor.py; they are used only when that module fails to import.
+NAV_DUP_HELD_MS = _governor.NAV_DUP_HELD_MS if _governor is not None else 250
+NAV_DUP_PATH_MS = _governor.NAV_DUP_PATH_MS if _governor is not None else 50
 
 
 def repeat_allowed(layer, key, suppressed=False):
@@ -576,17 +581,18 @@ THEME_LETTERBOX = "letterbox"
 THEME_RIGHT_CELLS = {0: THEME_STATIC, 1: THEME_LETTERBOX}
 THEME_SLIDERS = ("opacity", "bg_hue", "ui_hue")
 
-# VALUES CHANGE HERE: each slider is (config key, value when unset, lowest, highest); one left or right press moves SLIDER_STEP.
-SLIDER_STEP = 5
-SLIDER_SPECS = {
+# WARNING: the fallback numbers below must match SLIDER_STEP, SLIDER_SPECS in performance_governor.py; they are used only when that module fails to import.
+SLIDER_STEP = _governor.SLIDER_STEP if _governor is not None else 5
+SLIDER_SPECS = _governor.SLIDER_SPECS if _governor is not None else {
     "brightness": ("brightness", 50, 0, 100), "contrast": ("contrast", 50, 0, 100), "color": ("color", 50, 0, 100),
     "sharpness": ("sharpness", 50, 0, 100), "tint": ("tint", 50, 0, 100),
     "opacity": ("menu_opacity", 50, 0, 100), "bg_hue": ("theme_bg_hue", 220, 0, 360), "ui_hue": ("theme_ui_hue", 140, 0, 360),
 }
 
 
-# VALUES CHANGE HERE: the Reactive Strength slider on a music channel's editor (config key on the channel, value when unset, lowest, highest). It is not in SLIDER_SPECS because it lives on the channel, not in db.config, and is not a Video or Theme cell; it moves by the same SLIDER_STEP through the same rule.
-REACTIVE_STRENGTH_SPEC = ("reactive_visualizer_strength", 50, 0, 100)
+# WARNING: the Reactive Strength slider is not in SLIDER_SPECS because it lives on the channel, not in db.config, and is not a Video or Theme cell; it moves by the same SLIDER_STEP through the same rule.
+# WARNING: the fallback number below must match REACTIVE_STRENGTH_SPEC in performance_governor.py; it is used only when that module fails to import.
+REACTIVE_STRENGTH_SPEC = _governor.REACTIVE_STRENGTH_SPEC if _governor is not None else ("reactive_visualizer_strength", 50, 0, 100)
 
 
 def _slider_move(store, spec, direction):
@@ -612,8 +618,9 @@ def reactive_strength_adjust(ch_info, direction):
     return _slider_move(ch_info, REACTIVE_STRENGTH_SPEC, direction)
 
 
-# VALUES CHANGE HERE (milliseconds): the fastest a value control (slider, volume) may step, however fast the key is pressed or held. Keep it below the held-key repeat intervals in HOLD_RULES so a hold is never dropped.
-VALUE_STEP_MIN_MS = 100
+# WARNING: VALUE_STEP_MIN_MS must stay below the held-key repeat intervals in HOLD_RULES, or a hold is dropped.
+# WARNING: the fallback number below must match VALUE_STEP_MIN_MS in performance_governor.py; it is used only when that module fails to import.
+VALUE_STEP_MIN_MS = _governor.VALUE_STEP_MIN_MS if _governor is not None else 100
 
 
 def step_ready(gate, name, now, min_ms=VALUE_STEP_MIN_MS):
@@ -1497,11 +1504,9 @@ def channel_sub_layout(ch_info, active_count):
 
 def channel_sub_close_row(layout):
     """Returns the row number of the Close row for a layout."""
-    on, music, marathon = layout[0], layout[1], layout[2]
+    on, marathon = layout[0], layout[2]
     if not on:
         return 1
-    if music:
-        return 7
     return 6 if marathon else 7
 
 
@@ -1544,21 +1549,17 @@ def _channel_sub_target(layout, close, row, col, direction):
         if row == 0:
             return None
         if row == close:
-            if (not music) and on and col == 1:
-                return row, 0
             return close - 1, 0
         return row - 1, (only_off_at_row0 if row - 1 == 0 else 0)
     if direction == DOWN:
         if row == close - 1:
             return close, 0
         if row == close:
-            if (not music) and on and col == 0:
-                return row, 1
             return None
         return row + 1, 0
     if direction == RIGHT:
         if row == close:
-            if not on:
+            if not on or music:
                 return None
             return (row, 3) if col == 0 else None
         elif row == 0:
@@ -1577,7 +1578,7 @@ def _channel_sub_target(layout, close, row, col, direction):
             limit = None
         return None if limit is None else (row, min(limit, col + 1))
     if row == close:
-        if not on:
+        if not on or music:
             return None
         return (row, 0) if col == 3 else None
     elif row == 0:
@@ -1759,18 +1760,16 @@ class HoldRule:
     inclusive: bool = False
 
 
-# VALUES CHANGE HERE
-HOLD_RULES = {
-    "vertical": HoldRule(None, 100),
-    "horizontal": HoldRule(None, 110),
-    "rom_list": HoldRule(380, 70, True),
-    "gamepad": HoldRule(400, 180, True),
-    "volume": HoldRule(100, 160),
-}
-# VALUES CHANGE HERE
-HOLD_STUCK_MS = {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}
-# VALUES CHANGE HERE: percent one volume press or one repeat moves.
-VOLUME_STEP = 5
+# WARNING: the fallback numbers below must match HOLD_RULES, HOLD_STUCK_MS, VOLUME_STEP in performance_governor.py; they are used only when that module fails to import.
+HOLD_RULES = {_name: HoldRule(*_rule) for _name, _rule in (_governor.HOLD_RULES if _governor is not None else {
+    "vertical": (None, 100),
+    "horizontal": (None, 110),
+    "rom_list": (380, 70, True),
+    "gamepad": (400, 180, True),
+    "volume": (100, 160),
+}).items()}
+HOLD_STUCK_MS = _governor.HOLD_STUCK_MS if _governor is not None else {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}
+VOLUME_STEP = _governor.VOLUME_STEP if _governor is not None else 5
 
 
 @dataclass
@@ -1875,16 +1874,16 @@ def hold_conflict(first_pressed, second_pressed, first_down=0, second_down=0, bo
 # SECTION: File explorer
 # ============================================================================
 
-# VALUES CHANGE HERE
-EXPLORER_WHEEL_ROWS = 3
-EXPLORER_DOUBLE_CLICK_MS = 500
-EXPLORER_DRAG_START_PX = 4
-EXPLORER_DRAG_EDGE_ZONE_PX = 50
-EXPLORER_DRAG_SCROLL_SLOW_MS = 120
-EXPLORER_DRAG_SCROLL_FAST_MS = 60
-EXPLORER_THUMB_MIN_H = 20
-EXPLORER_SB_WIDTH = 8
-EXPLORER_SB_PAD = 4
+# WARNING: the fallback numbers below must match EXPLORER_WHEEL_ROWS, EXPLORER_DOUBLE_CLICK_MS, EXPLORER_DRAG_START_PX, EXPLORER_DRAG_EDGE_ZONE_PX, EXPLORER_DRAG_SCROLL_SLOW_MS, EXPLORER_DRAG_SCROLL_FAST_MS, EXPLORER_THUMB_MIN_H, EXPLORER_SB_WIDTH, EXPLORER_SB_PAD in performance_governor.py; they are used only when that module fails to import.
+EXPLORER_WHEEL_ROWS = _governor.EXPLORER_WHEEL_ROWS if _governor is not None else 3
+EXPLORER_DOUBLE_CLICK_MS = _governor.EXPLORER_DOUBLE_CLICK_MS if _governor is not None else 500
+EXPLORER_DRAG_START_PX = _governor.EXPLORER_DRAG_START_PX if _governor is not None else 4
+EXPLORER_DRAG_EDGE_ZONE_PX = _governor.EXPLORER_DRAG_EDGE_ZONE_PX if _governor is not None else 50
+EXPLORER_DRAG_SCROLL_SLOW_MS = _governor.EXPLORER_DRAG_SCROLL_SLOW_MS if _governor is not None else 120
+EXPLORER_DRAG_SCROLL_FAST_MS = _governor.EXPLORER_DRAG_SCROLL_FAST_MS if _governor is not None else 60
+EXPLORER_THUMB_MIN_H = _governor.EXPLORER_THUMB_MIN_H if _governor is not None else 20
+EXPLORER_SB_WIDTH = _governor.EXPLORER_SB_WIDTH if _governor is not None else 8
+EXPLORER_SB_PAD = _governor.EXPLORER_SB_PAD if _governor is not None else 4
 
 
 def explorer_hit(rect, x, y):
@@ -2058,17 +2057,12 @@ def explorer_button_at(buttons, x, y):
 # ============================================================================
 
 
-# WARNING: the fallback number must match STICK_MENU_AXIS_THRESHOLD in performance_governor.py; it is used only when that module fails to import.
-try:
-    import performance_governor as _governor
-    JOY_AXIS_THRESHOLD = float(_governor.STICK_MENU_AXIS_THRESHOLD)
-except Exception:
-    JOY_AXIS_THRESHOLD = 0.6
-# VALUES CHANGE HERE
-JOY_VERTICAL_AXIS = 1
-JOY_HORIZONTAL_AXIS = 0
-JOY_ACCEPT_BUTTONS = (0, 7)
-JOY_BACK_BUTTONS = (1, 6)
+# WARNING: the fallback numbers below must match STICK_MENU_AXIS_THRESHOLD, JOY_VERTICAL_AXIS, JOY_HORIZONTAL_AXIS, JOY_ACCEPT_BUTTONS, JOY_BACK_BUTTONS in performance_governor.py; they are used only when that module fails to import.
+JOY_AXIS_THRESHOLD = float(_governor.STICK_MENU_AXIS_THRESHOLD) if _governor is not None else 0.6
+JOY_VERTICAL_AXIS = _governor.JOY_VERTICAL_AXIS if _governor is not None else 1
+JOY_HORIZONTAL_AXIS = _governor.JOY_HORIZONTAL_AXIS if _governor is not None else 0
+JOY_ACCEPT_BUTTONS = _governor.JOY_ACCEPT_BUTTONS if _governor is not None else (0, 7)
+JOY_BACK_BUTTONS = _governor.JOY_BACK_BUTTONS if _governor is not None else (1, 6)
 
 
 def joystick_action(event):
@@ -2129,15 +2123,11 @@ def bridge_vk_to_key(vk):
 # ============================================================================
 
 
-# WARNING: the fallback number must match CHANNEL_DIGIT_TUNE_DELAY_MS in performance_governor.py; it is used only when that module fails to import.
-try:
-    import performance_governor as _digit_governor
-    DIGIT_ENTRY_CONFIRM_MS = int(_digit_governor.CHANNEL_DIGIT_TUNE_DELAY_MS)
-except Exception:
-    DIGIT_ENTRY_CONFIRM_MS = 350
-# VALUES CHANGE HERE
+# WARNING: the fallback numbers below must match CHANNEL_DIGIT_TUNE_DELAY_MS, DIGIT_ENTRY_SINGLE_MS in performance_governor.py; they are used only when that module fails to import.
+DIGIT_ENTRY_CONFIRM_MS = int(_governor.CHANNEL_DIGIT_TUNE_DELAY_MS) if _governor is not None else 350
+DIGIT_ENTRY_SINGLE_MS = _governor.DIGIT_ENTRY_SINGLE_MS if _governor is not None else 2500
+# WARNING: channel numbers are two digits (01 to 99); this is not a setting.
 DIGIT_ENTRY_MAX = 2
-DIGIT_ENTRY_SINGLE_MS = 2500
 
 
 def key_to_digit(key):
@@ -2178,9 +2168,9 @@ NAME_SAVE = "save"
 NAME_CANCEL = "cancel"
 NAME_EDIT = "edit"
 
-# VALUES CHANGE HERE
-NAME_ENTRY_CHANNEL_MAX_DEFAULT = 18
-NAME_ENTRY_SLOT_MAX = 24
+# WARNING: the fallback numbers below must match NAME_ENTRY_CHANNEL_MAX_DEFAULT, NAME_ENTRY_SLOT_MAX in performance_governor.py; they are used only when that module fails to import.
+NAME_ENTRY_CHANNEL_MAX_DEFAULT = _governor.NAME_ENTRY_CHANNEL_MAX_DEFAULT if _governor is not None else 18
+NAME_ENTRY_SLOT_MAX = _governor.NAME_ENTRY_SLOT_MAX if _governor is not None else 24
 
 
 def name_entry_step(key, char, text, all_selected, max_len, cancel_on_back=False):
@@ -2223,16 +2213,16 @@ DVD_CANON_REWIND = -9002
 DVD_CANON_FAST_FORWARD = -9003
 
 # WARNING: a skip never lands within DVD_SKIP_END_GUARD_MS of the real end, or playback runs past the length libVLC knows.
-# VALUES CHANGE HERE
 _SDLK_SCANCODE_MASK = 0x40000000
 DVD_REMOTE_PLAY_PAUSE = _SDLK_SCANCODE_MASK | 261
 DVD_REMOTE_REWIND = _SDLK_SCANCODE_MASK | 285
 DVD_REMOTE_FAST_FORWARD = _SDLK_SCANCODE_MASK | 286
-DVD_SKIP_TAP_MS = 30000
-DVD_SKIP_HOLD_MS = 5000
-DVD_SKIP_END_GUARD_MS = 10000
-DVD_SKIP_COOLDOWN_MS = 400
-DVD_SKIP_HOLD_START_MS = 500
+# WARNING: the fallback numbers below must match DVD_SKIP_TAP_MS, DVD_SKIP_HOLD_MS, DVD_SKIP_END_GUARD_MS, DVD_SKIP_COOLDOWN_MS, DVD_SKIP_HOLD_START_MS in performance_governor.py; they are used only when that module fails to import.
+DVD_SKIP_TAP_MS = _governor.DVD_SKIP_TAP_MS if _governor is not None else 30000
+DVD_SKIP_HOLD_MS = _governor.DVD_SKIP_HOLD_MS if _governor is not None else 5000
+DVD_SKIP_END_GUARD_MS = _governor.DVD_SKIP_END_GUARD_MS if _governor is not None else 10000
+DVD_SKIP_COOLDOWN_MS = _governor.DVD_SKIP_COOLDOWN_MS if _governor is not None else 400
+DVD_SKIP_HOLD_START_MS = _governor.DVD_SKIP_HOLD_START_MS if _governor is not None else 500
 
 
 def dvd_canonical(action):

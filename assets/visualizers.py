@@ -17,8 +17,9 @@ import time as _time
 
 try:
     import performance_governor as _governor
-except Exception:
+except Exception as _governor_import_error:
     _governor = None
+    logging.getLogger(__name__).warning("[VISUALIZER] could not import performance_governor, using the fallback values written in visualizers.py: %s", _governor_import_error)
 
 
 # ============================================================================
@@ -26,6 +27,15 @@ except Exception:
 # ============================================================================
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
+_logged_counts = {}
+
+
+def _log_error_once(key, message, *args):
+    """Writes an error line the first time key is seen and again at the 10th, 100th, 1000th ... time, so a problem repeating every frame does not flood the log."""
+    count = _logged_counts.get(key, 0) + 1
+    _logged_counts[key] = count
+    if count == 10 ** (len(str(count)) - 1):
+        _LOGGER.error(message + ("" if count == 1 else " (seen %d times)" % count), *args)
 
 
 # ============================================================================
@@ -64,10 +74,44 @@ def _flight_speed(current, level, dt, ease_seconds, slowest, fastest):
     return max(slowest, _eq_ease(current, target, dt, ease_seconds))
 
 
-# VALUES CHANGE HERE (real-music visualizers: seconds a level takes to rise toward a louder reading, and to fall toward a quieter one; beat glow fade seconds)
-_REACT_ATTACK_SECONDS = 0.035
-_REACT_RELEASE_SECONDS = 0.16
-_REACT_BEAT_FADE_SECONDS = 0.18
+# WARNING: the fallback numbers below must match VIS_REACT_ATTACK_SECONDS, VIS_REACT_RELEASE_SECONDS, VIS_REACT_BEAT_FADE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_REACT_ATTACK_SECONDS = _governor.VIS_REACT_ATTACK_SECONDS if _governor is not None else 0.035
+_REACT_RELEASE_SECONDS = _governor.VIS_REACT_RELEASE_SECONDS if _governor is not None else 0.16
+_REACT_BEAT_FADE_SECONDS = _governor.VIS_REACT_BEAT_FADE_SECONDS if _governor is not None else 0.18
+
+# WARNING: the fallback numbers and colours below must match the same names in performance_governor.py; they are used only when that module fails to import.
+VIS_EQ_TOP_MARGIN_PX = _governor.VIS_EQ_TOP_MARGIN_PX if _governor is not None else 10
+VIS_FRAME_TIME_STEP = _governor.VIS_FRAME_TIME_STEP if _governor is not None else 0.04
+VIS_LITE_LEVEL_SMOOTH = _governor.VIS_LITE_LEVEL_SMOOTH if _governor is not None else 0.15
+VIS_PARTICLE_COUNT = _governor.VIS_PARTICLE_COUNT if _governor is not None else 200
+VIS_STAR_COUNT = _governor.VIS_STAR_COUNT if _governor is not None else 200
+VIS_PRISM_SLICES = _governor.VIS_PRISM_SLICES if _governor is not None else 8
+VIS_PRISM_SHARDS = _governor.VIS_PRISM_SHARDS if _governor is not None else 22
+VIS_PRISM_TURN_SPEED = _governor.VIS_PRISM_TURN_SPEED if _governor is not None else 0.15
+VIS_CHROME_BALLS = _governor.VIS_CHROME_BALLS if _governor is not None else 7
+VIS_CHROME_GRID_COLUMNS = _governor.VIS_CHROME_GRID_COLUMNS if _governor is not None else 108
+VIS_CHROME_BALL_SPEED = _governor.VIS_CHROME_BALL_SPEED if _governor is not None else 1.6
+VIS_PULSE_LITE_SLOWEST_FRAMES = _governor.VIS_PULSE_LITE_SLOWEST_FRAMES if _governor is not None else 16
+VIS_PULSE_REACTIVE_IDLE_FRAMES = _governor.VIS_PULSE_REACTIVE_IDLE_FRAMES if _governor is not None else 90
+VIS_PULSE_RING_SPEED = _governor.VIS_PULSE_RING_SPEED if _governor is not None else 4.0
+VIS_PULSE_RING_WIDTH = _governor.VIS_PULSE_RING_WIDTH if _governor is not None else 10
+VIS_TUNNEL_SIDES = _governor.VIS_TUNNEL_SIDES if _governor is not None else 6
+VIS_TUNNEL_RINGS = _governor.VIS_TUNNEL_RINGS if _governor is not None else 16
+VIS_BRAID_POINTS = _governor.VIS_BRAID_POINTS if _governor is not None else 220
+VIS_BRAID_STRANDS = _governor.VIS_BRAID_STRANDS if _governor is not None else 3
+VIS_BRAID_STRANDS_FULL = _governor.VIS_BRAID_STRANDS_FULL if _governor is not None else 6
+VIS_BRAID_GLOW_WIDTH = _governor.VIS_BRAID_GLOW_WIDTH if _governor is not None else 5
+VIS_BRAID_LINE_WIDTH = _governor.VIS_BRAID_LINE_WIDTH if _governor is not None else 2
+VIS_EQ_BARS = _governor.VIS_EQ_BARS if _governor is not None else 24
+VIS_EQ_DOT_GAP_PX = _governor.VIS_EQ_DOT_GAP_PX if _governor is not None else 3
+VIS_LIGHTNING_FADE_PER_FRAME = _governor.VIS_LIGHTNING_FADE_PER_FRAME if _governor is not None else 0.06
+VIS_LIGHTNING_FLASH_FADE_PER_FRAME = _governor.VIS_LIGHTNING_FLASH_FADE_PER_FRAME if _governor is not None else 0.08
+COLOR_SCREEN_BLACK = _governor.COLOR_SCREEN_BLACK if _governor is not None else (1, 1, 1)
+COLOR_VIS_EQ_BOTTOM = _governor.COLOR_VIS_EQ_BOTTOM if _governor is not None else (255, 60, 170)
+COLOR_VIS_EQ_MID = _governor.COLOR_VIS_EQ_MID if _governor is not None else (0, 210, 220)
+COLOR_VIS_EQ_TOP = _governor.COLOR_VIS_EQ_TOP if _governor is not None else (210, 230, 60)
+COLOR_VIS_EQ_PEAK = _governor.COLOR_VIS_EQ_PEAK if _governor is not None else (255, 240, 80)
+COLOR_VIS_GLOW_BRAID_FADE = _governor.COLOR_VIS_GLOW_BRAID_FADE if _governor is not None else (0, 0, 0, 16)
 
 
 def _react_at(react, p):
@@ -120,14 +164,14 @@ class VisualizerDeck:
         self.last_random_style = None
         self.style_by_channel = {}
 
-        self.particles = [{"x": random.uniform(0, 1024), "y": random.uniform(0, 768), "size": random.uniform(1, 5), "speed": random.uniform(1, 4), "color": random.uniform(0, 1), "angle": random.uniform(0, math.pi*2), "angleSpeed": random.uniform(-0.02, 0.02)} for _ in range(200)]
-        self.stars = [{"x": random.uniform(-1, 1), "y": random.uniform(-1, 1), "z": random.uniform(0.1, 1.0), "color": random.uniform(0, 1)} for _ in range(200)]
+        self.particles = [{"x": random.uniform(0, 1024), "y": random.uniform(0, 768), "size": random.uniform(1, 5), "speed": random.uniform(1, 4), "color": random.uniform(0, 1), "angle": random.uniform(0, math.pi*2), "angleSpeed": random.uniform(-0.02, 0.02)} for _ in range(VIS_PARTICLE_COUNT)]
+        self.stars = [{"x": random.uniform(-1, 1), "y": random.uniform(-1, 1), "z": random.uniform(0.1, 1.0), "color": random.uniform(0, 1)} for _ in range(VIS_STAR_COUNT)]
 
-        self.eq_bars    = [0.0] * 24
-        self.eq_targets = [random.uniform(0.05, 0.3) for _ in range(24)]
-        self.eq_peaks   = [0.0] * 24
-        self.eq_bar_phase = [random.uniform(0, math.pi * 2) for _ in range(24)]
-        self.eq_bar_mult  = [random.uniform(0.75, 1.25) for _ in range(24)]
+        self.eq_bars    = [0.0] * VIS_EQ_BARS
+        self.eq_targets = [random.uniform(0.05, 0.3) for _ in range(VIS_EQ_BARS)]
+        self.eq_peaks   = [0.0] * VIS_EQ_BARS
+        self.eq_bar_phase = [random.uniform(0, math.pi * 2) for _ in range(VIS_EQ_BARS)]
+        self.eq_bar_mult  = [random.uniform(0.75, 1.25) for _ in range(VIS_EQ_BARS)]
         self._eq_last_time = None
 
         _flight = _flight_tunables()
@@ -140,10 +184,10 @@ class VisualizerDeck:
         self._glow_braid_fade = None
         self.lissa_phase = 0.0
 
-        self.prism_slices = 8
+        self.prism_slices = VIS_PRISM_SLICES
         self.prism_half = math.pi / self.prism_slices
         self.prism_shards = []
-        for _ in range(22):
+        for _ in range(VIS_PRISM_SHARDS):
             a_frac = random.uniform(0.05, 0.95)
             r_frac = random.uniform(0.10, 1.0)
             size = random.uniform(0.05, 0.16) * (0.5 + r_frac * 0.5)
@@ -161,10 +205,10 @@ class VisualizerDeck:
 
         self.chrome_balls = []
         self._chrome_small = None
-        for _ in range(7):
+        for _ in range(VIS_CHROME_BALLS):
             self.chrome_balls.append({
                 "x": random.uniform(100, 924), "y": random.uniform(100, 668),
-                "vx": random.uniform(-1.6, 1.6), "vy": random.uniform(-1.6, 1.6),
+                "vx": random.uniform(-VIS_CHROME_BALL_SPEED, VIS_CHROME_BALL_SPEED), "vy": random.uniform(-VIS_CHROME_BALL_SPEED, VIS_CHROME_BALL_SPEED),
                 "base_r": random.uniform(55, 110), "hue": random.uniform(0, 1),
             })
 
@@ -175,6 +219,7 @@ class VisualizerDeck:
         self.lightning_bolts = []
         self.lightning_last_amp = 50.0
         self.lightning_flash = 0.0
+        self._unknown_style_stand_in = {}
 
     # ========================================================================
     # SECTION: Style selection
@@ -292,12 +337,13 @@ class VisualizerDeck:
                 surface, theme, mock_amplitude, style_override, reactive
             )
         except Exception as error:
-            _LOGGER.error("Visualizer render failed for style %r: %s", style_override, error)
+            _log_error_once(("render", style_override, type(error).__name__),
+                            "[VISUALIZER] render failed for style %r: %s: %s", style_override, type(error).__name__, error)
             raise
 
     def _render_active_engine(self, surface, theme, mock_amplitude=None, style_override=None, reactive=None):
         w, h = surface.get_size()
-        self.time_delta += 0.04
+        self.time_delta += VIS_FRAME_TIME_STEP
         _flight_ease, _star_min, _star_max, _tunnel_min, _tunnel_max, _flight_max_step = _flight_tunables()
         _flight_now = _time.monotonic()
         flight_dt = (1.0 / 60.0) if self._flight_last_time is None else min(_flight_max_step, max(0.0, _flight_now - self._flight_last_time))
@@ -306,7 +352,7 @@ class VisualizerDeck:
         react = self._prepare_reactive(reactive, flight_dt)
         if react is None:
             target_amp = mock_amplitude if mock_amplitude is not None else 50
-            self.smooth_amp += (target_amp - self.smooth_amp) * 0.15
+            self.smooth_amp += (target_amp - self.smooth_amp) * VIS_LITE_LEVEL_SMOOTH
         else:
             self.smooth_amp = 8.0 + react["level"] * 92.0
         amp = self.smooth_amp
@@ -315,12 +361,18 @@ class VisualizerDeck:
             style = style_override
         else:
             style = self.current_running_style if self.active_mode == "Random" else self.active_mode
+        if style not in self.render_styles:
+            # WARNING: a name the deck does not know (a style removed in an older version) is drawn as one real style, picked once like Random picks, so the screen never shows a fixed message.
+            _log_error_once(("unknown", style), "[VISUALIZER] unknown visualizer style %r, drawing a real style in its place", style)
+            if style not in self._unknown_style_stand_in:
+                self._unknown_style_stand_in[style] = self.get_next_random_style()
+            style = self._unknown_style_stand_in[style]
 
         # WARNING: Pulsate is the shared beat-driven expansion/glow layer, so styles that do not use that effect keep only normal level and spectrum reactivity.
-        react_pulse = 0.0 if style in {"GlowBraid", "Kaleidoscope", "Lightning"} else (react["pulse"] if react is not None else 0.0)
+        react_pulse = 0.0 if style in {"GlowBraid", "Lightning"} else (react["pulse"] if react is not None else 0.0)
 
         # WARNING: (1, 1, 1), not pure black: (0, 0, 0) is the game-overlay transparency key.
-        surface.fill((1, 1, 1))
+        surface.fill(COLOR_SCREEN_BLACK)
         t = self.time_delta
         amp_norm = amp / 256.0
 
@@ -336,7 +388,7 @@ class VisualizerDeck:
             slices = self.prism_slices
             half = self.prism_half
             slice_angle = half * 2.0
-            global_rot = t * 0.15
+            global_rot = t * VIS_PRISM_TURN_SPEED
 
             for shard in self.prism_shards:
                 local_angle = shard["a_frac"] * half
@@ -374,7 +426,7 @@ class VisualizerDeck:
 
 
         elif style == "LiquidChrome":
-            cols = 108
+            cols = VIS_CHROME_GRID_COLUMNS
             rows = max(1, int(cols * h / float(w)))
             cell_w = w / float(cols)
             cell_h = h / float(rows)
@@ -427,7 +479,7 @@ class VisualizerDeck:
                         cr, cg, cb = colorsys.hsv_to_rgb(hue, 0.95, edge)
                         small.set_at((gx, gy), (int(cr * 255), int(cg * 255), int(cb * 255)))
                     else:
-                        small.set_at((gx, gy), (1, 1, 1))
+                        small.set_at((gx, gy), COLOR_SCREEN_BLACK)
 
             scaled = pygame.transform.smoothscale(small, (w, h))
             surface.blit(scaled, (0, 0))
@@ -436,11 +488,11 @@ class VisualizerDeck:
         elif style == "PulseRings":
             self.pulse_spawn_timer += 1
             if react is None:
-                spawn_interval = max(5, int(16 - amp_norm * 12))
+                spawn_interval = max(5, int(VIS_PULSE_LITE_SLOWEST_FRAMES - amp_norm * 12))
                 onset = (amp - self.pulse_last_amp) > 8
                 spawn_now = self.pulse_spawn_timer >= spawn_interval or onset
             else:
-                spawn_now = react["beat"] > 0.0 or self.pulse_spawn_timer >= 90
+                spawn_now = react["beat"] > 0.0 or self.pulse_spawn_timer >= VIS_PULSE_REACTIVE_IDLE_FRAMES
             self.pulse_last_amp = amp
 
             if spawn_now:
@@ -449,13 +501,13 @@ class VisualizerDeck:
                     self.pulse_active.append({
                         "r": 0.0,
                         "hue": (t * 0.1) % 1.0,
-                        "speed": 4.0 + amp_norm * 9.0,
+                        "speed": VIS_PULSE_RING_SPEED + amp_norm * 9.0,
                     })
                 else:
                     self.pulse_active.append({
                         "r": 0.0,
                         "hue": (0.95 - 0.6 * react["centroid"]) % 1.0,
-                        "speed": 4.0 + react["level"] * 9.0 + react["beat"] * 6.0,
+                        "speed": VIS_PULSE_RING_SPEED + react["level"] * 9.0 + react["beat"] * 6.0,
                         "shape": ([_react_at(react, abs(k / 24.0 - 1.0)) for k in range(48)] if react["full"] else None),
                     })
 
@@ -470,7 +522,7 @@ class VisualizerDeck:
             for ring in self.pulse_active:
                 frac = ring["r"] / edge_r
                 fade = max(0.0, 1.0 - frac)
-                thickness = max(2, int(10 * (1.0 - frac * 0.6)))
+                thickness = max(2, int(VIS_PULSE_RING_WIDTH * (1.0 - frac * 0.6)))
                 cr, cg, cb = colorsys.hsv_to_rgb(ring["hue"], 1.0, 0.45 + 0.55 * fade)
                 color = (int(cr * 255), int(cg * 255), int(cb * 255))
                 shape = ring.get("shape")
@@ -488,8 +540,8 @@ class VisualizerDeck:
 
 
         elif style == "WarpTunnel":
-            sides = 6
-            num_rings = 16
+            sides = VIS_TUNNEL_SIDES
+            num_rings = VIS_TUNNEL_RINGS
             self.tunnel_speed = _flight_speed(self.tunnel_speed, amp_norm if react is None else react["level"], flight_dt, _flight_ease, _tunnel_min, _tunnel_max)
             self.tunnel_depth = (self.tunnel_depth + self.tunnel_speed * flight_dt) % 1.0
 
@@ -532,7 +584,7 @@ class VisualizerDeck:
 
             if self._glow_braid_fade is None or self._glow_braid_fade.get_size() != (w, h):
                 self._glow_braid_fade = pygame.Surface((w, h), pygame.SRCALPHA)
-                self._glow_braid_fade.fill((0, 0, 0, 16))
+                self._glow_braid_fade.fill(COLOR_VIS_GLOW_BRAID_FADE)
             self.trail_surface.blit(self._glow_braid_fade, (0, 0), special_flags=pygame.BLEND_RGBA_SUB)
 
             self.lissa_phase += 0.015 + (amp_norm if react is None else react["level"] * 0.4) * 0.05
@@ -542,8 +594,8 @@ class VisualizerDeck:
             freq_a = 3.0 + math.sin(t * 0.07) * 1.4 + (amp_norm * 0.8 if react is None else react["centroid"] * 1.2)
             freq_b = 2.0 + math.cos(t * 0.05) * 1.1
 
-            strands = 6 if (react is not None and react["full"]) else 3
-            samples = 220
+            strands = VIS_BRAID_STRANDS_FULL if (react is not None and react["full"]) else VIS_BRAID_STRANDS
+            samples = VIS_BRAID_POINTS
             for s_i in range(strands):
                 if react is not None:
                     braid_amp = 0.70 + _react_at(react, s_i / float(max(1, strands - 1))) * 0.55 + react_pulse * 0.10
@@ -564,21 +616,21 @@ class VisualizerDeck:
                     pts.append((x, y))
 
                 if len(pts) >= 2:
-                    pygame.draw.lines(self.trail_surface, glow_color, True, pts, 5)
-                    pygame.draw.lines(self.trail_surface, bright_color, True, pts, 2)
+                    pygame.draw.lines(self.trail_surface, glow_color, True, pts, VIS_BRAID_GLOW_WIDTH)
+                    pygame.draw.lines(self.trail_surface, bright_color, True, pts, VIS_BRAID_LINE_WIDTH)
 
             surface.blit(self.trail_surface, (0, 0))
 
 
         elif style == "EqualizerGrid":
             t = self.time_delta
-            num_bars = 24
+            num_bars = VIS_EQ_BARS
             bar_w = w // num_bars
             dot_h = max(4, bar_w - 4)
             dot_w = max(4, bar_w - 6)
-            gap = 3
+            gap = VIS_EQ_DOT_GAP_PX
             cell_h = dot_h + gap
-            _EQ_TOP_MARGIN = 10
+            _EQ_TOP_MARGIN = VIS_EQ_TOP_MARGIN_PX
             max_dots = (h - _EQ_TOP_MARGIN) // cell_h
 
             _eq_smooth, _eq_peak_fall, _eq_max_step = _eq_tunables()
@@ -604,9 +656,9 @@ class VisualizerDeck:
                 else:
                     self.eq_peaks[i] = max(0.0, self.eq_peaks[i] - _eq_peak_fall * _eq_dt)
 
-            _EQ_BOTTOM = (255, 60, 170)
-            _EQ_MID    = (0, 210, 220)
-            _EQ_TOP    = (210, 230, 60)
+            _EQ_BOTTOM = COLOR_VIS_EQ_BOTTOM
+            _EQ_MID    = COLOR_VIS_EQ_MID
+            _EQ_TOP    = COLOR_VIS_EQ_TOP
 
             def _eq_row_color(frac):
                 frac = max(0.0, min(1.0, frac))
@@ -641,7 +693,7 @@ class VisualizerDeck:
                 peak_di = int(self.eq_peaks[bi] * max_dots)
                 peak_y = h - dot_h - peak_di * cell_h
                 if peak_y > 0 and peak_di > 2:
-                    pygame.draw.rect(surface, (255, 240, 80), (bar_x, peak_y, dot_w, dot_h))
+                    pygame.draw.rect(surface, COLOR_VIS_EQ_PEAK, (bar_x, peak_y, dot_w, dot_h))
 
         elif style == "ParticleFlow":
             for p in self.particles:
@@ -707,7 +759,7 @@ class VisualizerDeck:
                 self.lightning_flash = min(1.0, self.lightning_flash + hit * 0.6 + 0.2)
 
 
-            decay = 0.06 + amp_norm * 0.10
+            decay = VIS_LIGHTNING_FADE_PER_FRAME + amp_norm * 0.10
             alive = []
             for bolt in self.lightning_bolts:
                 bolt["life"] -= decay
@@ -715,7 +767,7 @@ class VisualizerDeck:
                     alive.append(bolt)
             self.lightning_bolts = alive
 
-            self.lightning_flash = max(0.0, self.lightning_flash - 0.08)
+            self.lightning_flash = max(0.0, self.lightning_flash - VIS_LIGHTNING_FLASH_FADE_PER_FRAME)
             if self.lightning_flash > 0.01:
                 fv = int(28 * self.lightning_flash)
                 surface.fill((fv, fv, min(255, fv + 12)))
@@ -737,13 +789,6 @@ class VisualizerDeck:
                 for (p1, p2, depth) in bolt["segments"]:
                     cw = max(1, base_w - depth)
                     pygame.draw.line(surface, core_c, p1, p2, cw)
-
-
-        else:
-            _LOGGER.error("Unknown visualizer style: %r", style)
-            font = pygame.font.SysFont(None, 28)
-            msg = font.render(f"[visualizer] unrecognized style: {style!r}", True, (255, 60, 60))
-            surface.blit(msg, (20, 20))
 
 
 # ============================================================================

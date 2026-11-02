@@ -19,6 +19,7 @@ import types
 import zlib
 import logging
 import math
+import random
 import subprocess
 import numpy as np
 import pygame
@@ -46,8 +47,15 @@ except Exception:
         """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
         return None
 
+try:
+    import performance_governor as _perf_governor
+except Exception as _governor_import_error:
+    logging.getLogger(__name__).warning("[MEDIA] could not import performance_governor, using the fallback values written in media.py: %s", _governor_import_error)
+    _perf_governor = None
 
-SELECTION_BORDER_WIDTH = 3
+
+# WARNING: the fallback number below must match SELECTION_BORDER_WIDTH in performance_governor.py; it is used only when that module fails to import.
+SELECTION_BORDER_WIDTH = _perf_governor.SELECTION_BORDER_WIDTH if _perf_governor is not None else 3
 
 def _media_warning(_key, message, *args):
     """Write one inexpensive line for a recoverable media failure."""
@@ -66,7 +74,8 @@ def is_shortcut_path(path):
     try:
         if os.path.islink(path):
             return True
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("is_shortcut_path: if os.path.islink(path):", _swallowed_error)
         pass
     return os.path.splitext(str(path))[1].lower() in SHORTCUT_EXTENSIONS
 
@@ -76,7 +85,8 @@ def _read_lnk_target(path):
     try:
         with open(path, "rb") as f:
             data = f.read()
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_read_lnk_target: with open(path, 'rb') as f:", _swallowed_error)
         return None
 
     if len(data) < 0x4C or data[:4] != b"\x4C\x00\x00\x00":
@@ -128,7 +138,8 @@ def resolve_shortcut_target(path):
             if not os.path.isabs(target):
                 target = os.path.join(os.path.dirname(path), target)
             return os.path.normpath(target)
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("resolve_shortcut_target: if os.path.islink(path):", _swallowed_error)
         pass
 
     ext = os.path.splitext(str(path))[1].lower()
@@ -148,7 +159,8 @@ def resolve_shortcut_target(path):
                             local = unquote(raw[8:]).replace("/", os.sep)
                             return os.path.normpath(local)
                         return None
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("resolve_shortcut_target: with open(path, 'r', errors='replace') as f:", _swallowed_error)
             return None
 
     return None
@@ -195,7 +207,8 @@ def resolve_dir_entry(entry_path, entry_name):
             return "dir", os.path.normpath(target), display_name
         if os.path.isfile(target):
             return "file", os.path.normpath(target), display_name
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("resolve_dir_entry: if os.path.isdir(target):", _swallowed_error)
         pass
     return None, None, None
 
@@ -211,14 +224,16 @@ def iter_files_resolving_shortcuts(root, ignored_dir_names=None, valid_exts=None
             return
         try:
             real = os.path.realpath(dir_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("iter_files_resolving_shortcuts._walk: real = os.path.realpath(dir_path)", _swallowed_error)
             real = dir_path
         if real in seen_dirs:
             return
         seen_dirs.add(real)
         try:
             entries = list(os.scandir(dir_path))
-        except (PermissionError, OSError):
+        except (PermissionError, OSError) as _swallowed_error:
+            _log_swallowed("iter_files_resolving_shortcuts._walk: entries = list(os.scandir(dir_path))", _swallowed_error)
             return
 
         subdirs = []
@@ -226,7 +241,8 @@ def iter_files_resolving_shortcuts(root, ignored_dir_names=None, valid_exts=None
         for entry in entries:
             try:
                 kind, real_path, _disp = resolve_dir_entry(entry.path, entry.name)
-            except OSError:
+            except OSError as _swallowed_error:
+                _log_swallowed("iter_files_resolving_shortcuts._walk: kind, real_path, _disp = resolve_dir_entry(entry.path, entry.name)", _swallowed_error)
                 continue
             if kind == "dir":
                 if entry.name.lower() not in ignored_dir_names:
@@ -681,38 +697,45 @@ def _now_ms():
 _path_exists_cache = {}
 _path_exists_cache_lock = threading.Lock()
 
-_PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS = 60000
-_PATH_EXISTS_CACHE_MAX_ENTRIES = 20000
+# WARNING: the fallback numbers below must match PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS, PATH_EXISTS_CACHE_MAX_ENTRIES in performance_governor.py; they are used only when that module fails to import.
+_PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS = _perf_governor.PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS if _perf_governor is not None else 60000
+_PATH_EXISTS_CACHE_MAX_ENTRIES = _perf_governor.PATH_EXISTS_CACHE_MAX_ENTRIES if _perf_governor is not None else 20000
 _last_path_exists_cache_sweep_ms = 0.0
 
-_PATH_NOT_FOUND_TTL_MS = 5000
-_PATH_FOUND_TTL_MS = 30000
-_PATH_UNKNOWN_TTL_MS = 1500
+# WARNING: the fallback numbers below must match PATH_NOT_FOUND_TTL_MS, PATH_FOUND_TTL_MS, PATH_UNKNOWN_TTL_MS in performance_governor.py; they are used only when that module fails to import.
+_PATH_NOT_FOUND_TTL_MS = _perf_governor.PATH_NOT_FOUND_TTL_MS if _perf_governor is not None else 5000
+_PATH_FOUND_TTL_MS = _perf_governor.PATH_FOUND_TTL_MS if _perf_governor is not None else 30000
+_PATH_UNKNOWN_TTL_MS = _perf_governor.PATH_UNKNOWN_TTL_MS if _perf_governor is not None else 1500
 
 # WARNING: treat PATH_UNKNOWN like PRESENT for eligibility; never drop a file because its drive had a rough moment.
 PATH_PRESENT = "present"
 PATH_MISSING = "missing"
 PATH_UNKNOWN = "unknown"
 
-FAST_DISK_IO_MAX_CONCURRENT = 3
+# WARNING: the fallback number below must match FAST_DISK_IO_MAX_CONCURRENT in performance_governor.py; it is used only when that module fails to import.
+FAST_DISK_IO_MAX_CONCURRENT = _perf_governor.FAST_DISK_IO_MAX_CONCURRENT if _perf_governor is not None else 3
 _FAST_DISK_IO_SEMAPHORE = threading.BoundedSemaphore(FAST_DISK_IO_MAX_CONCURRENT)
 
-LOUDNESS_PROBE_MAX_CONCURRENT = 2
+# WARNING: the fallback number below must match LOUDNESS_PROBE_MAX_CONCURRENT in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_PROBE_MAX_CONCURRENT = _perf_governor.LOUDNESS_PROBE_MAX_CONCURRENT if _perf_governor is not None else 2
 _LOUDNESS_PROBE_SEMAPHORE = threading.BoundedSemaphore(LOUDNESS_PROBE_MAX_CONCURRENT)
 
-# VALUES CHANGE HERE (fallback only; the governor's FIRST_START_PRIORITY_DISK_SLOTS sets it when the governor loads)
-_FAST_DISK_IO_PRIORITY_SLOTS = 3
+# WARNING: the fallback number below must match FIRST_START_PRIORITY_DISK_SLOTS in performance_governor.py; it is used only when that module fails to import.
+_FAST_DISK_IO_PRIORITY_SLOTS = _perf_governor.FIRST_START_PRIORITY_DISK_SLOTS if _perf_governor is not None else 3
 _FAST_DISK_IO_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(_FAST_DISK_IO_PRIORITY_SLOTS)
 
 _LOUDNESS_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(1)
-_LOUDNESS_PARALLEL_SEMAPHORE = threading.BoundedSemaphore(8)
+# WARNING: the fallback number below must match LOUDNESS_PARALLEL_MAX_CONCURRENT in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_PARALLEL_MAX_CONCURRENT = _perf_governor.LOUDNESS_PARALLEL_MAX_CONCURRENT if _perf_governor is not None else 8
+_LOUDNESS_PARALLEL_SEMAPHORE = threading.BoundedSemaphore(LOUDNESS_PARALLEL_MAX_CONCURRENT)
 
-# VALUES CHANGE HERE
-MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT = 1
+# WARNING: the fallback number below must match MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT in performance_governor.py; it is used only when that module fails to import.
+MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT = _perf_governor.MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT if _perf_governor is not None else 1
 _MUSIC_LOUDNESS_PROBE_SEMAPHORE = threading.BoundedSemaphore(MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT)
 
 _LIVE_PLAYBACK_PRIORITY = threading.Event()
-_LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = 2.5
+# WARNING: the fallback number below must match LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S in performance_governor.py; it is used only when that module fails to import.
+_LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = _perf_governor.LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S if _perf_governor is not None else 2.5
 
 
 def set_live_playback_priority(active):
@@ -730,6 +753,9 @@ def _yield_to_live_playback(label=""):
         return
     # WARNING: first-scan work in a priority scope is the live open itself and must never wait on the flag it is clearing.
     if _perf_governor is not None and _perf_governor.in_priority_scope():
+        return
+    # WARNING: the main thread is the live playback itself (and the menus); it must never sleep waiting on a flag it owns. Only background threads yield.
+    if threading.current_thread() is threading.main_thread():
         return
     _wait_start = _now_ms()
     _deadline_ms = _wait_start + (_LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S * 1000)
@@ -811,7 +837,8 @@ def _maybe_sweep_path_exists_cache(now_ms):
 
 
 # WARNING: must match _DRIVE_CHECK_TIMEOUT_MS below.
-_PATH_EXISTS_PROBE_TIMEOUT_MS = 2500
+# WARNING: the fallback number below must match PATH_EXISTS_PROBE_TIMEOUT_MS in performance_governor.py; it is used only when that module fails to import.
+_PATH_EXISTS_PROBE_TIMEOUT_MS = _perf_governor.PATH_EXISTS_PROBE_TIMEOUT_MS if _perf_governor is not None else 2500
 
 
 def _bounded_os_path_exists(p, timeout_ms=_PATH_EXISTS_PROBE_TIMEOUT_MS):
@@ -822,7 +849,8 @@ def _bounded_os_path_exists(p, timeout_ms=_PATH_EXISTS_PROBE_TIMEOUT_MS):
     def _worker():
         try:
             _box.append(os.path.exists(p))
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_bounded_os_path_exists._worker: _box.append(os.path.exists(p))", _swallowed_error)
             _box.append(False)
         finally:
             _done.set()
@@ -899,16 +927,12 @@ def request_media_shutdown():
 
 
 # WARNING: the fallback number must match DRIVE_FAILED_AFTER_MS in performance_governor.py; it is used only when that module fails to import.
-try:
-    from performance_governor import DRIVE_FAILED_AFTER_MS as _DRIVE_FAILED_AFTER_MS
-except Exception as _swallowed_error:
-    _log_swallowed("media drive failed-after tunable: import performance_governor", _swallowed_error)
-    _DRIVE_FAILED_AFTER_MS = 7000
+_DRIVE_FAILED_AFTER_MS = _perf_governor.DRIVE_FAILED_AFTER_MS if _perf_governor is not None else 7000
 
-_DRIVE_CHECK_TIMEOUT_MS         = 2500
-# VALUES CHANGE HERE
-_DRIVE_RECHECK_INTERVAL_MS      = 4000
-_DRIVE_UNRESPONSIVE_RECHECK_MS  = 3000
+# WARNING: the fallback numbers below must match DRIVE_CHECK_TIMEOUT_MS, DRIVE_RECHECK_INTERVAL_MS, DRIVE_UNRESPONSIVE_RECHECK_MS in performance_governor.py; they are used only when that module fails to import.
+_DRIVE_CHECK_TIMEOUT_MS = _perf_governor.DRIVE_CHECK_TIMEOUT_MS if _perf_governor is not None else 2500
+_DRIVE_RECHECK_INTERVAL_MS = _perf_governor.DRIVE_RECHECK_INTERVAL_MS if _perf_governor is not None else 4000
+_DRIVE_UNRESPONSIVE_RECHECK_MS = _perf_governor.DRIVE_UNRESPONSIVE_RECHECK_MS if _perf_governor is not None else 3000
 
 
 def _drive_root_of(path):
@@ -939,7 +963,8 @@ def _purge_stale_negative_cache_for_root(root):
 def _drive_probe_worker(root):
     try:
         ok = os.path.exists(root)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_drive_probe_worker: ok = os.path.exists(root)", _swallowed_error)
         ok = False
     now_ms = _now_ms()
     with _drive_health_lock:
@@ -1027,11 +1052,7 @@ def _failed_drive_roots():
 # SECTION: Folder listing cache, read-ahead and drive hold (ROM/DVD lists and the file explorer)
 # ============================================================================
 
-try:
-    import performance_governor as _listing_gov
-except Exception as _swallowed_error:
-    _log_swallowed("media listing cache tunables: import performance_governor", _swallowed_error)
-    _listing_gov = None
+_listing_gov = _perf_governor
 
 
 def _listing_value(name, fallback):
@@ -1240,14 +1261,12 @@ import collections
 
 _drive_op_latency = {}
 _drive_op_latency_lock = threading.Lock()
-# VALUES CHANGE HERE
-_DRIVE_LATENCY_SAMPLE_WINDOW = 6
-_DRIVE_LATENCY_FIXED_OVERHEAD_MS = 2000
-# VALUES CHANGE HERE
-# VALUES CHANGE HERE (background loudness work backs off only when sustained ffmpeg read cost exceeds this; one slow read is not enough)
-_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = 150.0
-_DRIVE_LATENCY_MIN_SAMPLES = 3
-_DRIVE_LATENCY_SAMPLE_MAX_AGE_MS = 120_000
+# WARNING: the fallback numbers below must match DRIVE_LATENCY_SAMPLE_WINDOW, DRIVE_LATENCY_FIXED_OVERHEAD_MS, DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC, DRIVE_LATENCY_MIN_SAMPLES, DRIVE_LATENCY_SAMPLE_MAX_AGE_MS in performance_governor.py; they are used only when that module fails to import.
+_DRIVE_LATENCY_SAMPLE_WINDOW = _perf_governor.DRIVE_LATENCY_SAMPLE_WINDOW if _perf_governor is not None else 6
+_DRIVE_LATENCY_FIXED_OVERHEAD_MS = _perf_governor.DRIVE_LATENCY_FIXED_OVERHEAD_MS if _perf_governor is not None else 2000
+_DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = _perf_governor.DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC if _perf_governor is not None else 150.0
+_DRIVE_LATENCY_MIN_SAMPLES = _perf_governor.DRIVE_LATENCY_MIN_SAMPLES if _perf_governor is not None else 3
+_DRIVE_LATENCY_SAMPLE_MAX_AGE_MS = _perf_governor.DRIVE_LATENCY_SAMPLE_MAX_AGE_MS if _perf_governor is not None else 120_000
 
 
 def _record_drive_op_latency(path, elapsed_ms, audio_sec=None):
@@ -1257,7 +1276,8 @@ def _record_drive_op_latency(path, elapsed_ms, audio_sec=None):
         return
     try:
         audio_sec = float(audio_sec) if audio_sec is not None else 0.0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("_record_drive_op_latency: audio_sec = float(audio_sec) if audio_sec is not None else 0.0", _swallowed_error)
         audio_sec = 0.0
     if audio_sec <= 0.0:
         return
@@ -1318,10 +1338,10 @@ def _drive_latency_summary(path):
 
 _file_probe_state = {}
 _file_probe_lock = threading.Lock()
-# VALUES CHANGE HERE
-_FILE_PROBE_RECHECK_MS   = 5000
-_FILE_PROBE_TIMEOUT_MS   = 3000
-_FILE_PROBE_READ_BYTES   = 65536
+# WARNING: the fallback numbers below must match FILE_PROBE_RECHECK_MS, FILE_PROBE_TIMEOUT_MS, FILE_PROBE_READ_BYTES in performance_governor.py; they are used only when that module fails to import.
+_FILE_PROBE_RECHECK_MS = _perf_governor.FILE_PROBE_RECHECK_MS if _perf_governor is not None else 5000
+_FILE_PROBE_TIMEOUT_MS = _perf_governor.FILE_PROBE_TIMEOUT_MS if _perf_governor is not None else 3000
+_FILE_PROBE_READ_BYTES = _perf_governor.FILE_PROBE_READ_BYTES if _perf_governor is not None else 65536
 
 
 def _file_probe_worker(root, path):
@@ -1330,7 +1350,8 @@ def _file_probe_worker(root, path):
         with open(path, "rb") as f:
             f.read(_FILE_PROBE_READ_BYTES)
         ok = True
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_file_probe_worker: with open(path, 'rb') as f:", _swallowed_error)
         ok = False
     now_ms = _now_ms()
     with _file_probe_lock:
@@ -1393,7 +1414,8 @@ DRIVE_CDROM = 5
 
 _disc_info_cache = {}
 _disc_info_lock  = threading.Lock()
-_DISC_INFO_RECHECK_MS = 4000
+# WARNING: the fallback number below must match DISC_INFO_RECHECK_MS in performance_governor.py; it is used only when that module fails to import.
+_DISC_INFO_RECHECK_MS = _perf_governor.DISC_INFO_RECHECK_MS if _perf_governor is not None else 4000
 
 
 def _win_drive_type_raw(drive_root):
@@ -1525,7 +1547,8 @@ _dims_inflight = _InFlightGuard()
 
 try:
     _cpu_n = os.cpu_count() or 4
-except Exception:
+except Exception as _swallowed_error:
+    _log_swallowed("module: _cpu_n = os.cpu_count() or 4", _swallowed_error)
     _cpu_n = 4
 _DURATION_POOL_SIZE = max(2, min(6, _cpu_n - 1))
 _duration_pool = []
@@ -1701,6 +1724,17 @@ def _flex_series_and_season(track):
     return title, season_number, marker[1] if marker else None
 
 
+def _flex_episode_sort_key(item):
+    """Sort key for one grouped episode: season first, then episode order."""
+    # WARNING: every key must have the same shape at every position, or a show with an S01E00 file next to S01E01 raises TypeError when it is sorted.
+    nk = _natural_ep_key(item)
+    if item["_episode_number"] == 0:
+        return (item["_season_number"], nk)
+    path = item.get("path", item.get("file", ""))
+    name = os.path.splitext(os.path.basename(str(path)))[0].lower()
+    return (item["_season_number"], (0, item["_episode_number"], 0, name))
+
+
 def group_shows_flexible(raw_tracks):
     """Resolve arbitrary layouts into stable series/season/episode groups."""
     import collections as _col
@@ -1748,10 +1782,7 @@ def group_shows_flexible(raw_tracks):
                 if old_marked and not new_marked:
                     best[identity] = item
         clean = [best[k] for k in order]
-        clean.sort(key=lambda x: (
-            x["_season_number"],
-            _natural_ep_key(x) if x["_episode_number"] == 0 else (0, x["_episode_number"], 0, _natural_ep_key(x)),
-        ))
+        clean.sort(key=_flex_episode_sort_key)
         result[display_names[key]] = clean
 
     show_names = sorted(result)
@@ -1813,7 +1844,8 @@ def _season_folder_base(show_name):
 # ============================================================================
 
 
-MOVIE_LENGTH_THRESHOLD_SECONDS = 4800
+# WARNING: the fallback number below must match MOVIE_LENGTH_THRESHOLD_SECONDS in performance_governor.py; it is used only when that module fails to import.
+MOVIE_LENGTH_THRESHOLD_SECONDS = _perf_governor.MOVIE_LENGTH_THRESHOLD_SECONDS if _perf_governor is not None else 4800
 
 
 SIX_HOUR_BLOCKS = [
@@ -1831,13 +1863,8 @@ SIX_HOUR_BLOCK_NAMES = [b[0] for b in SIX_HOUR_BLOCKS]
 # SECTION: Duration reader (schedule hub)
 # ============================================================================
 # WARNING: the fallback numbers must match HUB_* in performance_governor.py; they are used only when that module fails to import.
-try:
-    import performance_governor as _hub_governor
-    HUB_SERIES_ESTIMATE_MIN_SCANNED = int(_hub_governor.HUB_SERIES_ESTIMATE_MIN_SCANNED)
-    HUB_MOVIE_ESTIMATE_SECONDS = int(_hub_governor.HUB_MOVIE_ESTIMATE_SECONDS)
-except Exception:
-    HUB_SERIES_ESTIMATE_MIN_SCANNED = 2
-    HUB_MOVIE_ESTIMATE_SECONDS = 5400
+HUB_SERIES_ESTIMATE_MIN_SCANNED = _perf_governor.HUB_SERIES_ESTIMATE_MIN_SCANNED if _perf_governor is not None else 2
+HUB_MOVIE_ESTIMATE_SECONDS = _perf_governor.HUB_MOVIE_ESTIMATE_SECONDS if _perf_governor is not None else 5400
 
 # WARNING: these two words are also what media_library.DurationHub returns; changing one without the other makes every saved length read as unknown.
 DURATION_MEASURED = "measured"
@@ -2029,14 +2056,6 @@ def aired_ledger_entries(playback_log, today_ordinal):
     return out
 
 
-def aired_ledger_signature(playback_log):
-    """A small value that changes whenever any timeline recorded in the ledger changes."""
-    sig = []
-    for rec_id, rec in sorted((playback_log.get(GUIDE_AIRED_LEDGER_KEY) or {}).items()):
-        tl = rec.get("timeline") or []
-        sig.append((rec_id, rec.get("total", 0), len(tl),
-                    hash(tuple((e.get("start_time", 0), e.get("duration", 0), e.get("path", "")) for e in tl))))
-    return tuple(sig)
 
 
 def aired_entry_at(playback_log, today_ordinal, now_seconds, block_name=None):
@@ -2047,18 +2066,6 @@ def aired_entry_at(playback_log, today_ordinal, now_seconds, block_name=None):
     return None
 
 
-def block_overrun_end(playback_log, today_ordinal, boundary_seconds):
-    """The whole second of today at which the entry the ledger says is airing across a block boundary ends, with its parts and commercials; None when no ledger entry runs across the boundary."""
-    run_end = None
-    for _entry, start, end, _name in aired_ledger_entries(playback_log, today_ordinal):
-        if run_end is None:
-            if start < boundary_seconds and end > boundary_seconds + 0.5:
-                run_end = end
-        elif start <= run_end + 0.5:
-            run_end = max(run_end, end)
-        else:
-            break
-    return None if run_end is None else int(math.ceil(run_end - 1e-6))
 
 
 BLOCK_OVERRUN_KEY = "block_overrun_ends"
@@ -2079,31 +2086,25 @@ def note_block_overrun(playback_log, block_key, cycle_start_abs, kept_total, cut
 # SECTION: Guide past rebuild (missed blocks)
 # ============================================================================
 # WARNING: the fallback numbers must match GUIDE_REPLAY_* and CATCH_UP_* in performance_governor.py; they are used only when that module fails to import.
-try:
-    import performance_governor as _guide_governor
-    GUIDE_REPLAY_MAX_BLOCKS = int(_guide_governor.GUIDE_REPLAY_MAX_BLOCKS)
-    CATCH_UP_MAX_BLOCKS = int(_guide_governor.CATCH_UP_MAX_BLOCKS)
-    CATCH_UP_MAX_CYCLES_PER_BLOCK = int(_guide_governor.CATCH_UP_MAX_CYCLES_PER_BLOCK)
-except Exception:
-    GUIDE_REPLAY_MAX_BLOCKS = 60
-    CATCH_UP_MAX_BLOCKS = 3000
-    CATCH_UP_MAX_CYCLES_PER_BLOCK = 1000
+GUIDE_REPLAY_MAX_BLOCKS = _perf_governor.GUIDE_REPLAY_MAX_BLOCKS if _perf_governor is not None else 60
+CATCH_UP_MAX_BLOCKS = _perf_governor.CATCH_UP_MAX_BLOCKS if _perf_governor is not None else 3000
+CATCH_UP_MAX_CYCLES_PER_BLOCK = _perf_governor.CATCH_UP_MAX_CYCLES_PER_BLOCK if _perf_governor is not None else 1000
 
 _GUIDE_EIGHT_HOUR_BLOCKS = (("Morning", 4, 12), ("Evening", 12, 20), ("Night", 20, 28))
 
 
-def estimated_track_durations(items, path_exists):
-    """Returns the saved or hub-supported estimate for each scheduled file that has one."""
-    return _series_duration_guesses(items, path_exists)
 
 
 def _parse_block_key(block_key):
-    """(date ordinal, block name) from a saved block key, or None when it cannot be read."""
+    """(date ordinal, block name) from a saved block key, or None when there is none or it cannot be read."""
+    if not block_key:
+        return None
     try:
         year, yday, name = str(block_key).split("_", 2)
         started = datetime.date(int(year), 1, 1) + datetime.timedelta(days=int(yday) - 1)
         return started.toordinal(), name
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError) as _swallowed_error:
+        _log_swallowed("_parse_block_key: year, yday, name = str(block_key).split('_', 2)", _swallowed_error)
         return None
 
 
@@ -2182,8 +2183,46 @@ def catch_up_overrun_end(channel_key, ch_info, show_pos, prev_block_key, block_k
     return carry_end if carry_end is not None and carry_end > cur_start + 0.5 else None
 
 
+# WARNING: the fallback number below must match CATCH_UP_REUSE_SECONDS in performance_governor.py; it is used only when that module fails to import.
+_CATCH_UP_REUSE_SECONDS = _perf_governor.CATCH_UP_REUSE_SECONDS if _perf_governor is not None else 2.0
+_catch_up_last = {"key": None, "at": 0.0, "result": None}
+_catch_up_last_lock = threading.Lock()
+
+
+def _catch_up_inputs_key(channel_key, ch_info, show_pos, prev_block_key, block_key, commercial_tracks):
+    """Everything a walk across missed blocks reads, as one text; two walks with the same text give the same answer."""
+    playback_log = ch_info.get("playback_log", {}) or {}
+    saved = {k: playback_log.get(k) for k in ("sched_cycle_boundary", "sched_cycle_total", "commercial_next_pos", "commercial_pos", "show_order")}
+    saved["anchor"] = (playback_log.get("block_anchors") or {}).get(prev_block_key)
+    saved["overrun"] = (playback_log.get(BLOCK_OVERRUN_KEY) or {}).get(prev_block_key)
+    settings = {k: v for k, v in ch_info.items() if k != "playback_log"}
+    ads = [(c.get("path"), c.get("duration")) if isinstance(c, dict) else c for c in (commercial_tracks or [])]
+    return json.dumps([channel_key, prev_block_key, block_key, show_pos, saved, settings, ads], sort_keys=True, default=str)
+
+
 def _catch_up_replay(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
                      commercial_tracks, order_seed_for, is_holiday_date=None):
+    """Simulates schedule advancement across missed blocks and returns the last scheduled entry end; a walk asked again with the same inputs within _CATCH_UP_REUSE_SECONDS gives a copy of the answer it just gave."""
+    # WARNING: the same gap is asked about by the block-start overrun check and by the catch-up in one scheduler pass; walking it twice doubled the start-up wait after a long gap.
+    try:
+        key = _catch_up_inputs_key(channel_key, ch_info, show_pos, prev_block_key, block_key, commercial_tracks)
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("_catch_up_replay: the walk's inputs could not be written as text, so it is not reused", _swallowed_error)
+        key = None
+    now = time.monotonic()
+    with _catch_up_last_lock:
+        if key is not None and _catch_up_last["key"] == key and now - _catch_up_last["at"] <= _CATCH_UP_REUSE_SECONDS:
+            return copy.deepcopy(_catch_up_last["result"])
+    result = _catch_up_walk(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
+                            commercial_tracks, order_seed_for, is_holiday_date)
+    if key is not None:
+        with _catch_up_last_lock:
+            _catch_up_last.update(key=key, at=time.monotonic(), result=copy.deepcopy(result))
+    return result
+
+
+def _catch_up_walk(channel_key, ch_info, show_pos, prev_block_key, block_key, path_exists,
+                   commercial_tracks, order_seed_for, is_holiday_date=None):
     """Simulates schedule advancement across missed blocks and returns the last scheduled entry end."""
     # WARNING: show_pos and the commercial state are deep-copied and nothing in ch_info is changed here; build_block_rotation edits nested entries such as __FAIRNESS__ in place.
     # WARNING: catch-up and guide history must use build_raw_tracks so files without a measured or saved estimate cannot shift the clock.
@@ -2290,7 +2329,6 @@ def replay_missed_blocks(channel_key, ch_info, show_pos, prev_block_key, block_k
     show_orders = copy.deepcopy(playback_log.get("show_order", {}))
     broken = set(ch_info.get("broken_files", []))
     floor_abs = (now.toordinal() - 1) * 86400
-    pair_thresh_sec = max(0, ch_info.get("pair_threshold_minutes", 15)) * 60
 
     def _admitted(track):
         return track["path"] not in broken and not file_is_confirmed_bad(track["path"])
@@ -3128,7 +3166,8 @@ def _read_sequential_state_full(episodes, stored, threshold_seconds):
         raw_owed = list(stored.get("owed") or [])
         try:
             raw_done = max(0, int(stored.get("done", 0) or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _swallowed_error:
+            _log_swallowed("_read_sequential_state_full: raw_done = max(0, int(stored.get('done', 0) or 0))", _swallowed_error)
             raw_done = 0
         aired_at_end = set(raw_owed[:raw_done])
         owed = [p for p in raw_owed if p in paths]
@@ -3309,9 +3348,11 @@ def _owed_episodes(episodes, owed):
     return [by_path[p] for p in owed if p in by_path]
 
 
-MOVIE_HEAVY_RATIO = 2
+# WARNING: the fallback number below must match MOVIE_HEAVY_RATIO in performance_governor.py; it is used only when that module fails to import.
+MOVIE_HEAVY_RATIO = _perf_governor.MOVIE_HEAVY_RATIO if _perf_governor is not None else 2
 
-MOVIES_PER_BLOCK = 2
+# WARNING: the fallback number below must match MOVIES_PER_BLOCK in performance_governor.py; it is used only when that module fails to import.
+MOVIES_PER_BLOCK = _perf_governor.MOVIES_PER_BLOCK if _perf_governor is not None else 2
 
 MOVIE_ROTATION_KEY = "__MOVIES__"
 
@@ -3343,8 +3384,8 @@ def _fit_movies_to_runtime(candidates, target_seconds, max_movies):
     return list(candidates[:max_movies])
 
 
-# VALUES CHANGE HERE
-RANDOM_REPEAT_HOLD_BACK = 10
+# WARNING: the fallback number below must match RANDOM_REPEAT_HOLD_BACK in performance_governor.py; it is used only when that module fails to import.
+RANDOM_REPEAT_HOLD_BACK = _perf_governor.RANDOM_REPEAT_HOLD_BACK if _perf_governor is not None else 10
 
 
 def _draw_from_shuffle_bag(state, n, count, seed_prefix, hold_back=RANDOM_REPEAT_HOLD_BACK):
@@ -3536,6 +3577,84 @@ def draw_from_shuffle_bag_by_file(state, entries, count, seed_prefix, hold_back=
                  "last": keys[current["last"]] if current["last"] is not None else None,
                  "recent": [keys[i] for i in current["recent"]], "drawn": drawn}
     return picked, new_state
+
+
+RANDOM_SHORT_PAIRS_STATE_VERSION = "short-pairs-1"
+
+
+def _short_pairs_state(state, paths, seed_prefix):
+    """The saved round of a random show that pairs its short episodes, cleaned of files that left; a round saved by the shuffle bag is carried over with the files it already aired."""
+    path_set = set(paths)
+    if isinstance(state, dict) and state.get("v") == RANDOM_SHORT_PAIRS_STATE_VERSION:
+        round_left = [p for p in state.get("pass", []) if p in path_set]
+        aired = [p for p in state.get("aired", []) if p in path_set]
+        carry = state.get("carry") if state.get("carry") in path_set else None
+        cycle = int(state.get("cycle", 0) or 0)
+        last = state.get("last") if state.get("last") in path_set else None
+        if cycle > 0:
+            round_left += [p for p in paths if p not in round_left and p not in aired and p != carry]
+        return {"pass": round_left, "aired": aired, "carry": carry, "cycle": cycle, "last": last}
+    drawn = [f for f in (state.get("drawn") or []) if f in path_set] if isinstance(state, dict) and state.get("v") == RANDOM_STATE_VERSION else []
+    cycle = int(state.get("cycle", 0) or 0) if isinstance(state, dict) else 0
+    if cycle > 0 and drawn:
+        round_left = [p for p in paths if p not in drawn]
+        random.Random("%s:carried-round" % seed_prefix).shuffle(round_left)
+        return {"pass": round_left, "aired": drawn, "carry": None, "cycle": cycle, "last": drawn[-1]}
+    return {"pass": [], "aired": [], "carry": None, "cycle": 0, "last": None}
+
+
+def draw_random_short_pairs(state, episodes, count, seed_prefix, threshold_seconds, hold_new_pass=False):
+    """Draws `count` entries of a random show whose short episodes air two at a time: each round is a shuffle of the show's files; a short one is paired with a random short one still unaired this round; the short one left with no partner is skipped, counts as aired for this round and opens the next round with a random partner; returns (entries, the new saved round)."""
+    # WARNING: a short episode never airs alone while the show has another short one; with hold_new_pass set (files not scanned yet) no new round starts.
+    by_path = {}
+    for ep in episodes or []:
+        by_path.setdefault(_episode_path(ep), ep)
+    paths = list(by_path)
+    if not paths:
+        return [], state
+    short = {p for p in paths if _episode_duration(by_path[p]) < threshold_seconds}
+    st = _short_pairs_state(state, paths, seed_prefix)
+
+    def _new_round():
+        st["cycle"] += 1
+        order = list(paths)
+        random.Random("%s:%d" % (seed_prefix, st["cycle"])).shuffle(order)
+        if len(order) > 1 and order[0] == st["last"]:
+            order.append(order.pop(0))
+        st["pass"], st["aired"] = order, []
+
+    picked = []
+    guard = 0
+    while len(picked) < count and guard < 4 * (len(paths) + count) + 8:
+        guard += 1
+        if not st["pass"]:
+            if hold_new_pass and st["cycle"] > 0:
+                break
+            _new_round()
+            if st["carry"]:
+                first = st["carry"]
+                st["carry"] = None
+                if first in st["pass"]:
+                    st["pass"].remove(first)
+            else:
+                first = st["pass"].pop(0)
+        else:
+            first = st["pass"].pop(0)
+        if first not in short or len(short) < 2:
+            picked.append(by_path[first])
+            st["aired"].append(first)
+            st["last"] = first
+            continue
+        partner = next((p for p in st["pass"] if p in short), None)
+        if partner is None:
+            st["carry"] = first
+            continue
+        st["pass"].remove(partner)
+        picked.append(_build_pair_track(by_path[first], by_path[partner]))
+        st["aired"].extend([first, partner])
+        st["last"] = partner
+    return picked, {"v": RANDOM_SHORT_PAIRS_STATE_VERSION, "pass": st["pass"], "aired": st["aired"],
+                    "carry": st["carry"], "cycle": st["cycle"], "last": st["last"]}
 
 
 def random_bag_entry_indices(show_pos, show_name, entries, channel_id=None):
@@ -3755,6 +3874,12 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
     def _take_random(show_name, count, eps):
         state_key = stable_series_id(show_name, channel_id)
         state = show_pos.get(state_key, show_pos.get(show_name))
+        raw = show_raw_episodes.get(show_name) or []
+        if pair_threshold_seconds > 0 and sum(1 for ep in raw if _episode_duration(ep) < pair_threshold_seconds) >= 2:
+            picked, show_pos[state_key] = draw_random_short_pairs(
+                state, raw, count, f"{day_seed}:{show_name}", pair_threshold_seconds,
+                hold_new_pass=bool(pending_by_show.get(show_name)))
+            return picked
         picked, show_pos[state_key] = draw_from_shuffle_bag_by_file(
             state, eps, count, f"{day_seed}:{show_name}", hold_new_pass=bool(pending_by_show.get(show_name)))
         return picked
@@ -4039,11 +4164,7 @@ HOLIDAY_EPISODE_ORDER = "random"
 HOLIDAY_DAY_SECONDS = 86400
 HOLIDAY_KEYS = ("halloween", "christmas", "thanksgiving")
 # WARNING: the fallback number must match HOLIDAY_WINDOW_DAYS in performance_governor.py; it is used only when that module fails to import.
-try:
-    from performance_governor import HOLIDAY_WINDOW_DAYS as _HOLIDAY_WINDOW_DAYS
-except Exception as _swallowed_error:
-    _log_swallowed("media holiday window: import performance_governor", _swallowed_error)
-    _HOLIDAY_WINDOW_DAYS = 3
+_HOLIDAY_WINDOW_DAYS = _perf_governor.HOLIDAY_WINDOW_DAYS if _perf_governor is not None else 3
 
 
 def holiday_date(holiday_key, year):
@@ -4131,12 +4252,6 @@ def holiday_force_row_states(config, channel_key):
         else:
             states[key] = "off"
     return states
-
-
-def holiday_force_enabled_rows(config, channel_key):
-    """The Holiday menu rows (0 to 2) whose force toggle can be selected on this channel."""
-    states = holiday_force_row_states(config, channel_key)
-    return tuple(row for row, key in enumerate(HOLIDAY_KEYS) if states[key] != "greyed")
 
 
 def holiday_force_toggle(config, channel_key, holiday_key, all_channels=None, today=None):
@@ -4404,8 +4519,8 @@ def block_start_date(now, block_name):
     return (now - datetime.timedelta(days=1)) if (block_name == "Night" and now.hour < 4) else now
 
 
-# VALUES CHANGE HERE
-BLOCK_LENGTH_SECONDS = {"Marathon": 86400, "Full Day": 86400, "Morning": 8 * 3600, "Evening": 8 * 3600, "Night": 8 * 3600}
+# WARNING: the fallback number below must match BLOCK_LENGTH_SECONDS in performance_governor.py; it is used only when that module fails to import.
+BLOCK_LENGTH_SECONDS = dict(_perf_governor.BLOCK_LENGTH_SECONDS) if _perf_governor is not None else {"Marathon": 86400, "Full Day": 86400, "Morning": 8 * 3600, "Evening": 8 * 3600, "Night": 8 * 3600}
 for _length_name, _length_start, _length_end in SIX_HOUR_BLOCKS:
     BLOCK_LENGTH_SECONDS[_length_name] = (_length_end - _length_start) * 3600
 
@@ -4502,13 +4617,10 @@ def read_holiday_lineup(ch_key, ch_info, holiday_key, now, path_exists,
 # ============================================================================
 # SECTION: Commercial bundles & block timeline
 # ============================================================================
-COMMERCIAL_MAX_SECONDS = 5 * 60
+# WARNING: the fallback number below must match COMMERCIAL_MAX_SECONDS in performance_governor.py; it is used only when that module fails to import.
+COMMERCIAL_MAX_SECONDS = _perf_governor.COMMERCIAL_MAX_SECONDS if _perf_governor is not None else 300
 # WARNING: the fallback number must match COMMERCIAL_BUNDLE_STEP_SECONDS in performance_governor.py; it is used only when that module fails to import.
-try:
-    from performance_governor import COMMERCIAL_BUNDLE_STEP_SECONDS as _COMMERCIAL_BUNDLE_STEP_SECONDS
-except Exception as _swallowed_error:
-    _log_swallowed("media commercial bundle step: import performance_governor", _swallowed_error)
-    _COMMERCIAL_BUNDLE_STEP_SECONDS = 15
+_COMMERCIAL_BUNDLE_STEP_SECONDS = _perf_governor.COMMERCIAL_BUNDLE_STEP_SECONDS if _perf_governor is not None else 15
 COMMERCIAL_BUNDLE_CEILINGS = tuple(range(_COMMERCIAL_BUNDLE_STEP_SECONDS, COMMERCIAL_MAX_SECONDS + 1, _COMMERCIAL_BUNDLE_STEP_SECONDS))
 
 
@@ -4537,6 +4649,12 @@ def build_commercial_tracks(items, path_exists, max_seconds=COMMERCIAL_MAX_SECON
     return tracks
 
 
+# WARNING: the fallback numbers below must match BREAK_MAX_CATCHUP_SECONDS, BREAK_MIN_GAP_SECONDS, BREAK_MIN_SECONDS in performance_governor.py; they are used only when that module fails to import.
+BREAK_MAX_CATCHUP_SECONDS = _perf_governor.BREAK_MAX_CATCHUP_SECONDS if _perf_governor is not None else 180
+BREAK_MIN_GAP_SECONDS = _perf_governor.BREAK_MIN_GAP_SECONDS if _perf_governor is not None else 300
+BREAK_MIN_SECONDS = _perf_governor.BREAK_MIN_SECONDS if _perf_governor is not None else 120
+
+
 def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, day_seed,
                           interrupt_floor_seconds=900,
                           max_interrupt_break_seconds=360,
@@ -4547,10 +4665,6 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     import random as _random
 
     HALF_HOUR         = 1800
-    # VALUES CHANGE HERE
-    MAX_CATCHUP       = 180
-    MIN_BREAK_GAP     = 300
-    MIN_BREAK_SECONDS = 120
 
     def _dur_is_estimated(show):
         try:
@@ -4627,10 +4741,10 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
 
     # WARNING: modified by the closures below via nonlocal.
     _deferred_fill  = 0
-    _last_break_end = -MIN_BREAK_GAP
+    _last_break_end = -BREAK_MIN_GAP_SECONDS
     _last_played_path = (commercial_state or {}).get("last")
 
-    MAX_BREAKS_PER_HALF_HOUR = 2
+    MAX_BREAKS_PER_HALF_HOUR = _perf_governor.BREAK_MAX_PER_HALF_HOUR if _perf_governor is not None else 2
     _half_hour_bucket        = 0
     _breaks_this_half_hour   = 0
 
@@ -4790,7 +4904,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         capped_per = min(per_break, max_interrupt_break_seconds) if max_interrupt_break_seconds else per_break
         if per_break > capped_per:
             _deferred_fill += (per_break - capped_per) * (num_breaks - 1)
-        capped_per = max(capped_per, MIN_BREAK_SECONDS)
+        capped_per = max(capped_per, BREAK_MIN_SECONDS)
 
         base_seg    = int(show_dur) // num_breaks
         seek_offset = 0
@@ -4803,7 +4917,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             seek_offset     += seg
             if is_last:
                 end_budget = next_mark - t_block_content
-                if 0 < end_budget < MIN_BREAK_SECONDS:
+                if 0 < end_budget < BREAK_MIN_SECONDS:
                     _deferred_fill += end_budget
                 else:
                     t_block_content = _pack_and_round(
@@ -4824,12 +4938,12 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         nonlocal _deferred_fill
         if _deferred_fill <= 0 or not commercial_pool:
             return t
-        if t - _last_break_end < MIN_BREAK_GAP:
+        if t - _last_break_end < BREAK_MIN_GAP_SECONDS:
             return t
         if _half_hour_capped(t):
             return t
-        insert_amt = min(MAX_CATCHUP, _deferred_fill)
-        if insert_amt < MIN_BREAK_SECONDS:
+        insert_amt = min(BREAK_MAX_CATCHUP_SECONDS, _deferred_fill)
+        if insert_amt < BREAK_MIN_SECONDS:
             return t
         picked, used = _pack_break(insert_amt)
         if picked:
@@ -4842,9 +4956,9 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         if t % HALF_HOUR == 0:
             return t
         snap_budget = HALF_HOUR - (t % HALF_HOUR)
-        if snap_budget < MIN_BREAK_SECONDS:
+        if snap_budget < BREAK_MIN_SECONDS:
             snap_budget += HALF_HOUR
-        if t - _last_break_end < MIN_BREAK_GAP:
+        if t - _last_break_end < BREAK_MIN_GAP_SECONDS:
             _deferred_fill += snap_budget
             return t
         if _half_hour_capped(t):
@@ -4902,12 +5016,12 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
-            if 0 < gap < MIN_BREAK_SECONDS:
+            if 0 < gap < BREAK_MIN_SECONDS:
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
             if gap <= 0:
-                _fallback_break_len = max_interrupt_break_seconds if max_interrupt_break_seconds else MIN_BREAK_SECONDS
+                _fallback_break_len = max_interrupt_break_seconds if max_interrupt_break_seconds else BREAK_MIN_SECONDS
 
                 if show_dur < interrupt_floor_seconds:
                     timeline.append(_show_entry(show, show_dur, total_block_content, 0))
@@ -4971,7 +5085,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                         max_seconds=max_interrupt_break_seconds)
 
             elif show_dur < HALF_HOUR:
-                if gap < 2 * MIN_BREAK_SECONDS:
+                if gap < 2 * BREAK_MIN_SECONDS:
                     timeline.append(_show_entry(show, show_dur, total_block_content, 0))
                     total_block_content += show_dur
                     end_budget = next_mark - total_block_content
@@ -5012,7 +5126,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                         show, show_dur, gap, num_breaks, total_block_content, next_mark)
                 else:
                     capped_per = min(baseline_per_break, max_interrupt_break_seconds) if max_interrupt_break_seconds else baseline_per_break
-                    capped_per = max(capped_per, MIN_BREAK_SECONDS)
+                    capped_per = max(capped_per, BREAK_MIN_SECONDS)
 
                     seek_offset    = 0
                     remaining_show = show_dur
@@ -5033,7 +5147,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                         total_block_content += remaining_show
 
                     end_budget = next_mark - total_block_content
-                    if 0 < end_budget < MIN_BREAK_SECONDS:
+                    if 0 < end_budget < BREAK_MIN_SECONDS:
                         _deferred_fill += end_budget
                     else:
                         total_block_content = _pack_and_round(
@@ -5056,7 +5170,7 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             next_mark  = (((total_block_content // HALF_HOUR)
                            + (1 if total_block_content % HALF_HOUR != 0 else 0)) * HALF_HOUR)
             end_budget = next_mark - total_block_content
-            if 0 < end_budget < MIN_BREAK_SECONDS:
+            if 0 < end_budget < BREAK_MIN_SECONDS:
                 next_mark += HALF_HOUR
                 end_budget = next_mark - total_block_content
             total_block_content = _pack_and_round(
@@ -5119,8 +5233,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     return timeline, total_block_content, new_commercial_state
 
 
-# VALUES CHANGE HERE
-COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES = 15
+# WARNING: the fallback number below must match COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES in performance_governor.py; it is used only when that module fails to import.
+COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES = _perf_governor.COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES if _perf_governor is not None else 15
 
 
 def commercial_interrupt_floor_seconds(ch_info):
@@ -5314,8 +5428,8 @@ def schedule_rows_from_lineup(lineup, bundles=None):
 # ============================================================================
 
 
-# VALUES CHANGE HERE
-_DURATION_SANITY_MAX_PLAUSIBLE_MBPS = 60
+# WARNING: the fallback number below must match DURATION_SANITY_MAX_PLAUSIBLE_MBPS in performance_governor.py; it is used only when that module fails to import.
+_DURATION_SANITY_MAX_PLAUSIBLE_MBPS = _perf_governor.DURATION_SANITY_MAX_PLAUSIBLE_MBPS if _perf_governor is not None else 60
 
 
 def _duration_looks_implausible(file_path, duration_sec):
@@ -5395,7 +5509,8 @@ def get_media_duration(file_path):
                         (n for n in dir(vlc.MediaParsedStatus)
                          if not n.startswith("_") and getattr(vlc.MediaParsedStatus, n) == _final_status),
                         str(_final_status))
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("get_media_duration: _final_status = media.get_parsed_status()", _swallowed_error)
                     _status_name = "unknown"
                 _media_warning(
                     "duration_parse",
@@ -5607,10 +5722,31 @@ def resolve_main_dir():
 CRT_WARP_ACTIVE = False
 
 _bezel_style_files_cache = {"key": None, "files": [], "checked_at": 0.0}
-_BEZEL_STYLE_DISCOVERY_TTL_SEC = 2.0
+# WARNING: the fallback number below must match BEZEL_STYLE_DISCOVERY_TTL_SEC in performance_governor.py; it is used only when that module fails to import.
+_BEZEL_STYLE_DISCOVERY_TTL_SEC = _perf_governor.BEZEL_STYLE_DISCOVERY_TTL_SEC if _perf_governor is not None else 2.0
 
 _bezel_dir_cache = {"dir": None, "checked_at": 0.0}
 _BEZEL_DIR_RECHECK_TTL_SEC = _BEZEL_STYLE_DISCOVERY_TTL_SEC
+
+
+def resolve_splash_images_dir():
+    """Returns the folder that holds each console's splash images, the game menu background (MENU) and the watermarks (WATERMARK)."""
+    return os.path.join(resolve_main_dir(), "images", "splash screen images")
+
+
+# WARNING: these folders share the splash images folder but hold no console load screen, so they never get a splash file found by name.
+_SPLASH_NOT_A_CONSOLE = ("MENU", "WATERMARK")
+
+
+def console_splash_file(console_key, picked_path=""):
+    """Returns the splash file a console's load screen shows: the file the owner picked when it is on disk, else <CONSOLE>SplashScreen.png in that console's splash images folder when it is there, else ''."""
+    if picked_path and os.path.isfile(picked_path):
+        return picked_path
+    key = str(console_key or "")
+    if not key or key in _SPLASH_NOT_A_CONSOLE:
+        return ""
+    found = os.path.join(resolve_splash_images_dir(), key, key + "SplashScreen.png")
+    return found if os.path.isfile(found) else ""
 
 
 def resolve_bezel_dir():
@@ -5639,7 +5775,8 @@ def discover_bezel_style_files():
 
     try:
         _dir_fingerprint = (os.path.getmtime(b_dir), len(os.listdir(b_dir))) if os.path.isdir(b_dir) else None
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("discover_bezel_style_files: _dir_fingerprint = (os.path.getmtime(b_dir), len(os.listdir(b_dir))...", _swallowed_error)
         _dir_fingerprint = None
     _cache_key = (b_dir, _dir_fingerprint)
     cached["checked_at"] = now
@@ -5790,15 +5927,14 @@ def resolve_captions_dir():
 CAPTION_SIDECAR_EXTS = (".srt", ".vtt", ".ass", ".ssa", ".sub", ".smi")
 
 _TEXT_SUBTITLE_CODECS = ("subrip", "ass", "ssa", "webvtt", "mov_text", "text")
-_BITMAP_SUBTITLE_CODECS = ("dvd_subtitle", "hdmv_pgs_subtitle", "xsub", "dvb_subtitle")
 
 
 # ============================================================================
 # SECTION: Caption start-up helpers
 # ============================================================================
-# VALUES CHANGE HERE
-_HEADER_PROBE_SHARE_SECONDS = 120.0
-_HEADER_PROBE_SHARE_MAX_ENTRIES = 64
+# WARNING: the fallback numbers below must match HEADER_PROBE_SHARE_SECONDS, HEADER_PROBE_SHARE_MAX_ENTRIES in performance_governor.py; they are used only when that module fails to import.
+_HEADER_PROBE_SHARE_SECONDS = _perf_governor.HEADER_PROBE_SHARE_SECONDS if _perf_governor is not None else 120.0
+_HEADER_PROBE_SHARE_MAX_ENTRIES = _perf_governor.HEADER_PROBE_SHARE_MAX_ENTRIES if _perf_governor is not None else 64
 _header_probe_share = {}
 _header_probe_share_lock = threading.Lock()
 
@@ -5816,7 +5952,8 @@ def _shared_header_probe(file_path, timeout):
     try:
         st = os.stat(file_path)
         key = (os.path.normpath(file_path).lower(), st.st_mtime, st.st_size)
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_shared_header_probe: st = os.stat(file_path)", _swallowed_error)
         return _ml.combined_header_probe(file_path, timeout=timeout)
     now = time.monotonic()
     with _header_probe_share_lock:
@@ -5902,7 +6039,8 @@ def _find_sidecar_caption_file(file_path):
             return candidate
     try:
         names = os.listdir(folder or ".")
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_find_sidecar_caption_file: names = os.listdir(folder or '.')", _swallowed_error)
         return None
     best = None
     for entry in names:
@@ -6020,7 +6158,8 @@ def resolve_caption_source(file_path):
     try:
         st = os.stat(file_path)
         result["mtime"], result["size"] = st.st_mtime, st.st_size
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("resolve_caption_source: st = os.stat(file_path)", _swallowed_error)
         return result
 
     if filename_says_captions_baked_in(file_path):
@@ -6159,7 +6298,8 @@ def _whisper_dir_has_model(path):
                 return True
             if os.path.isfile(os.path.join(path, entry, "model.bin")):
                 return True
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_whisper_dir_has_model: if not os.path.isdir(path):", _swallowed_error)
         pass
     return False
 
@@ -6203,16 +6343,11 @@ _ASR_SEMAPHORE = threading.BoundedSemaphore(1)
 
 _ASR_MODEL_SIZE = "small.en"
 _ASR_LANGUAGE = "en"
-_ASR_BEAM_SIZE = 5
-_ASR_VAD_PARAMETERS = {"min_silence_duration_ms": 500}
-# VALUES CHANGE HERE (fallback only; used when performance_governor is missing or fails)
+# WARNING: the fallback numbers below must match ASR_BEAM_SIZE, ASR_VAD_PARAMETERS in performance_governor.py; they are used only when that module fails to import.
+_ASR_BEAM_SIZE = _perf_governor.ASR_BEAM_SIZE if _perf_governor is not None else 5
+_ASR_VAD_PARAMETERS = _perf_governor.ASR_VAD_PARAMETERS if _perf_governor is not None else {"min_silence_duration_ms": 500}
+# WARNING: used only when performance_governor.py fails to import; whisper_threads there sets the live thread count.
 _ASR_CPU_THREADS = max(4, min(8, (os.cpu_count() or 8) // 2))
-try:
-    import performance_governor as _perf_governor
-    _FAST_DISK_IO_PRIORITY_SLOTS = int(_perf_governor.FIRST_START_PRIORITY_DISK_SLOTS)
-    _FAST_DISK_IO_PRIORITY_SEMAPHORE = threading.BoundedSemaphore(_FAST_DISK_IO_PRIORITY_SLOTS)
-except Exception:
-    _perf_governor = None
 _whisper_model = None
 _whisper_model_load_failed = False
 _whisper_model_lock = threading.Lock()
@@ -6323,7 +6458,8 @@ def _get_whisper_model():
                     download_root=resolve_whisper_model_dir(),
                     local_files_only=True,
                 )
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_get_whisper_model: _whisper_model = WhisperModel(_ASR_MODEL_SIZE, device='cpu', comput...", _swallowed_error)
                 _whisper_model = WhisperModel(
                     _ASR_MODEL_SIZE, device="cpu", compute_type="int8",
                     cpu_threads=_threads,
@@ -6399,78 +6535,77 @@ def release_whisper_model(reason):
 # WARNING: shared by the DVD player's disk-cached captions and the TV overlay's live captions; a change here affects both.
 _asr_vad_utils_load_failed = False
 
-_ASR_VAD_THRESHOLD = 0.25
-# VALUES CHANGE HERE
-_ASR_VAD_MIN_SPEECH_MS = 150
-# VALUES CHANGE HERE
-_ASR_MERGE_GAP_SEC = 1.5
-_ASR_LIVE_AUDIO_FILTER = "dynaudnorm=f=150:g=15:p=0.9:m=20"
-_ASR_MAX_CLIP_SEC = 25.0
+# WARNING: the fallback numbers below must match ASR_VAD_THRESHOLD, ASR_VAD_MIN_SPEECH_MS, ASR_MERGE_GAP_SEC, ASR_LIVE_AUDIO_FILTER, ASR_MAX_CLIP_SEC in performance_governor.py; they are used only when that module fails to import.
+_ASR_VAD_THRESHOLD = _perf_governor.ASR_VAD_THRESHOLD if _perf_governor is not None else 0.25
+_ASR_VAD_MIN_SPEECH_MS = _perf_governor.ASR_VAD_MIN_SPEECH_MS if _perf_governor is not None else 150
+_ASR_MERGE_GAP_SEC = _perf_governor.ASR_MERGE_GAP_SEC if _perf_governor is not None else 1.5
+_ASR_LIVE_AUDIO_FILTER = _perf_governor.ASR_LIVE_AUDIO_FILTER if _perf_governor is not None else "dynaudnorm=f=150:g=15:p=0.9:m=20"
+_ASR_MAX_CLIP_SEC = _perf_governor.ASR_MAX_CLIP_SEC if _perf_governor is not None else 25.0
 
-_ASR_CUE_MAX_SEC = 5.0
-# VALUES CHANGE HERE
-_ASR_CUE_MAX_CHARS = 84
-_ASR_CUE_GAP_BREAK_SEC = 0.8
-_ASR_CUE_MIN_SHOW_SEC = 1.2
-_ASR_CUE_TRAIL_HOLD_SEC = 0.3
+# WARNING: the fallback numbers below must match ASR_CUE_MAX_SEC, ASR_CUE_MAX_CHARS, ASR_CUE_GAP_BREAK_SEC, ASR_CUE_MIN_SHOW_SEC, ASR_CUE_TRAIL_HOLD_SEC in performance_governor.py; they are used only when that module fails to import.
+_ASR_CUE_MAX_SEC = _perf_governor.ASR_CUE_MAX_SEC if _perf_governor is not None else 5.0
+_ASR_CUE_MAX_CHARS = _perf_governor.ASR_CUE_MAX_CHARS if _perf_governor is not None else 84
+_ASR_CUE_GAP_BREAK_SEC = _perf_governor.ASR_CUE_GAP_BREAK_SEC if _perf_governor is not None else 0.8
+_ASR_CUE_MIN_SHOW_SEC = _perf_governor.ASR_CUE_MIN_SHOW_SEC if _perf_governor is not None else 1.2
+_ASR_CUE_TRAIL_HOLD_SEC = _perf_governor.ASR_CUE_TRAIL_HOLD_SEC if _perf_governor is not None else 0.3
 _ASR_SENTENCE_END = (".", "?", "!", "\u2026")
 
-# VALUES CHANGE HERE (hallucination guard)
-_ASR_NO_SPEECH_PROB_MAX = 0.75
-_ASR_AVG_LOGPROB_MIN = -1.5
+# WARNING: the fallback numbers below must match ASR_NO_SPEECH_PROB_MAX, ASR_AVG_LOGPROB_MIN in performance_governor.py; they are used only when that module fails to import.
+_ASR_NO_SPEECH_PROB_MAX = _perf_governor.ASR_NO_SPEECH_PROB_MAX if _perf_governor is not None else 0.75
+_ASR_AVG_LOGPROB_MIN = _perf_governor.ASR_AVG_LOGPROB_MIN if _perf_governor is not None else -1.5
 
-# VALUES CHANGE HERE (prompt-echo guard)
-_ASR_ECHO_MAX_WORD_PROB = 0.5
-_ASR_ECHO_REPEAT_MIN = 3
-_ASR_ECHO_REPEAT_MAX_WORD_PROB = 0.75
+# WARNING: the fallback numbers below must match ASR_ECHO_MAX_WORD_PROB, ASR_ECHO_REPEAT_MIN, ASR_ECHO_REPEAT_MAX_WORD_PROB in performance_governor.py; they are used only when that module fails to import.
+_ASR_ECHO_MAX_WORD_PROB = _perf_governor.ASR_ECHO_MAX_WORD_PROB if _perf_governor is not None else 0.5
+_ASR_ECHO_REPEAT_MIN = _perf_governor.ASR_ECHO_REPEAT_MIN if _perf_governor is not None else 3
+_ASR_ECHO_REPEAT_MAX_WORD_PROB = _perf_governor.ASR_ECHO_REPEAT_MAX_WORD_PROB if _perf_governor is not None else 0.75
 _ASR_STOCK_PHRASE_RE = re.compile(
     r"^(thanks for watching|thank you for watching|please subscribe( to (my|the) channel)?|"
     r"subtitles by .*|captions by .*|amara\.org.*|www\..*)[.! ]*$", re.I)
 
-# VALUES CHANGE HERE (gap recovery)
-_ASR_RECOVER_ENABLED = True
-_ASR_RECOVER_MIN_GAP_SEC = 0.9
-_ASR_RECOVER_PAD_SEC = 0.3
-_ASR_RECOVER_MAX_WINDOWS = 2
-_ASR_RECOVER_JOIN_SEC = 3.0
-_ASR_RECOVER_MAX_WINDOW_SEC = 14.0
-_ASR_RECOVER_BEAM = 3
-_ASR_RECOVER_MAX_SEC = 6.0
-_ASR_RECOVER_MAX_FRAC_OF_CHUNK = 0.5
-_ASR_RECOVER_KEEP_LEAD_SEC = 8.0
-_ASR_RECOVER_MIN_WORD_PROB = 0.55
-_ASR_RECOVER_MIN_AVG_LOGPROB = -0.95
-_ASR_RECOVER_MAX_NO_SPEECH = 0.5
-_ASR_RECOVER_MAX_WORDS_PER_SEC = 5.0
-_ASR_RECOVER_MAX_OVERLAP_FRAC = 0.3
-_ASR_RUNAWAY_CHAR_RUN = 12
-_ASR_RUNAWAY_WORD_RUN = 6
+# WARNING: the fallback numbers below must match ASR_RECOVER_ENABLED, ASR_RECOVER_MIN_GAP_SEC, ASR_RECOVER_PAD_SEC, ASR_RECOVER_MAX_WINDOWS, ASR_RECOVER_JOIN_SEC, ASR_RECOVER_MAX_WINDOW_SEC, ASR_RECOVER_BEAM, ASR_RECOVER_MAX_SEC, ASR_RECOVER_MAX_FRAC_OF_CHUNK, ASR_RECOVER_KEEP_LEAD_SEC, ASR_RECOVER_MIN_WORD_PROB, ASR_RECOVER_MIN_AVG_LOGPROB, ASR_RECOVER_MAX_NO_SPEECH, ASR_RECOVER_MAX_WORDS_PER_SEC, ASR_RECOVER_MAX_OVERLAP_FRAC, ASR_RUNAWAY_CHAR_RUN, ASR_RUNAWAY_WORD_RUN in performance_governor.py; they are used only when that module fails to import.
+_ASR_RECOVER_ENABLED = _perf_governor.ASR_RECOVER_ENABLED if _perf_governor is not None else True
+_ASR_RECOVER_MIN_GAP_SEC = _perf_governor.ASR_RECOVER_MIN_GAP_SEC if _perf_governor is not None else 0.9
+_ASR_RECOVER_PAD_SEC = _perf_governor.ASR_RECOVER_PAD_SEC if _perf_governor is not None else 0.3
+_ASR_RECOVER_MAX_WINDOWS = _perf_governor.ASR_RECOVER_MAX_WINDOWS if _perf_governor is not None else 2
+_ASR_RECOVER_JOIN_SEC = _perf_governor.ASR_RECOVER_JOIN_SEC if _perf_governor is not None else 3.0
+_ASR_RECOVER_MAX_WINDOW_SEC = _perf_governor.ASR_RECOVER_MAX_WINDOW_SEC if _perf_governor is not None else 14.0
+_ASR_RECOVER_BEAM = _perf_governor.ASR_RECOVER_BEAM if _perf_governor is not None else 3
+_ASR_RECOVER_MAX_SEC = _perf_governor.ASR_RECOVER_MAX_SEC if _perf_governor is not None else 6.0
+_ASR_RECOVER_MAX_FRAC_OF_CHUNK = _perf_governor.ASR_RECOVER_MAX_FRAC_OF_CHUNK if _perf_governor is not None else 0.5
+_ASR_RECOVER_KEEP_LEAD_SEC = _perf_governor.ASR_RECOVER_KEEP_LEAD_SEC if _perf_governor is not None else 8.0
+_ASR_RECOVER_MIN_WORD_PROB = _perf_governor.ASR_RECOVER_MIN_WORD_PROB if _perf_governor is not None else 0.55
+_ASR_RECOVER_MIN_AVG_LOGPROB = _perf_governor.ASR_RECOVER_MIN_AVG_LOGPROB if _perf_governor is not None else -0.95
+_ASR_RECOVER_MAX_NO_SPEECH = _perf_governor.ASR_RECOVER_MAX_NO_SPEECH if _perf_governor is not None else 0.5
+_ASR_RECOVER_MAX_WORDS_PER_SEC = _perf_governor.ASR_RECOVER_MAX_WORDS_PER_SEC if _perf_governor is not None else 5.0
+_ASR_RECOVER_MAX_OVERLAP_FRAC = _perf_governor.ASR_RECOVER_MAX_OVERLAP_FRAC if _perf_governor is not None else 0.3
+_ASR_RUNAWAY_CHAR_RUN = _perf_governor.ASR_RUNAWAY_CHAR_RUN if _perf_governor is not None else 12
+_ASR_RUNAWAY_WORD_RUN = _perf_governor.ASR_RUNAWAY_WORD_RUN if _perf_governor is not None else 6
 
-# VALUES CHANGE HERE (repetition-loop guard)
-_ASR_LOOP_MIN_CHARS = 24
-_ASR_LOOP_COMPRESSION_MAX = 2.4
+# WARNING: the fallback numbers below must match ASR_LOOP_MIN_CHARS, ASR_LOOP_COMPRESSION_MAX in performance_governor.py; they are used only when that module fails to import.
+_ASR_LOOP_MIN_CHARS = _perf_governor.ASR_LOOP_MIN_CHARS if _perf_governor is not None else 24
+_ASR_LOOP_COMPRESSION_MAX = _perf_governor.ASR_LOOP_COMPRESSION_MAX if _perf_governor is not None else 2.4
 
-# VALUES CHANGE HERE (music marking)
 _ASR_MUSIC_CAPTION_TEXT = "\u266a"
-_ASR_MUSIC_MIN_SEC = 2.0
-_ASR_MUSIC_BRIDGE_SEC = 1.0
-_ASR_MUSIC_PIECE_SEC = 6.0
-_ASR_MUSIC_MIN_RMS_DB = -38.0
-_ASR_MUSIC_PEAK_PERSIST_MIN = 0.60
-_ASR_MUSIC_ENVELOPE_CV_MAX = 0.35
-_ASR_MUSIC_REPLACE_FRAC = 0.7
-_ASR_MUSIC_REPLACE_MAX_WORD_PROB = 0.5
+# WARNING: the fallback numbers below must match ASR_MUSIC_MIN_SEC, ASR_MUSIC_BRIDGE_SEC, ASR_MUSIC_PIECE_SEC, ASR_MUSIC_MIN_RMS_DB, ASR_MUSIC_PEAK_PERSIST_MIN, ASR_MUSIC_ENVELOPE_CV_MAX, ASR_MUSIC_REPLACE_FRAC, ASR_MUSIC_REPLACE_MAX_WORD_PROB in performance_governor.py; they are used only when that module fails to import.
+_ASR_MUSIC_MIN_SEC = _perf_governor.ASR_MUSIC_MIN_SEC if _perf_governor is not None else 2.0
+_ASR_MUSIC_BRIDGE_SEC = _perf_governor.ASR_MUSIC_BRIDGE_SEC if _perf_governor is not None else 1.0
+_ASR_MUSIC_PIECE_SEC = _perf_governor.ASR_MUSIC_PIECE_SEC if _perf_governor is not None else 6.0
+_ASR_MUSIC_MIN_RMS_DB = _perf_governor.ASR_MUSIC_MIN_RMS_DB if _perf_governor is not None else -38.0
+_ASR_MUSIC_PEAK_PERSIST_MIN = _perf_governor.ASR_MUSIC_PEAK_PERSIST_MIN if _perf_governor is not None else 0.60
+_ASR_MUSIC_ENVELOPE_CV_MAX = _perf_governor.ASR_MUSIC_ENVELOPE_CV_MAX if _perf_governor is not None else 0.35
+_ASR_MUSIC_REPLACE_FRAC = _perf_governor.ASR_MUSIC_REPLACE_FRAC if _perf_governor is not None else 0.7
+_ASR_MUSIC_REPLACE_MAX_WORD_PROB = _perf_governor.ASR_MUSIC_REPLACE_MAX_WORD_PROB if _perf_governor is not None else 0.5
 
-# VALUES CHANGE HERE (name hint)
-_ASR_NAME_MIN_WORD_PROB = 0.85
-_ASR_NAME_MIN_CUES = 2
-_ASR_NAME_MIN_LEN = 3
-_ASR_NAME_MAX_LEARNED = 6
-_ASR_NAME_SIMILAR_MIN = 0.75
+# WARNING: the fallback numbers below must match ASR_NAME_MIN_WORD_PROB, ASR_NAME_MIN_CUES, ASR_NAME_MIN_LEN, ASR_NAME_MAX_LEARNED, ASR_NAME_SIMILAR_MIN in performance_governor.py; they are used only when that module fails to import.
+_ASR_NAME_MIN_WORD_PROB = _perf_governor.ASR_NAME_MIN_WORD_PROB if _perf_governor is not None else 0.85
+_ASR_NAME_MIN_CUES = _perf_governor.ASR_NAME_MIN_CUES if _perf_governor is not None else 2
+_ASR_NAME_MIN_LEN = _perf_governor.ASR_NAME_MIN_LEN if _perf_governor is not None else 3
+_ASR_NAME_MAX_LEARNED = _perf_governor.ASR_NAME_MAX_LEARNED if _perf_governor is not None else 6
+_ASR_NAME_SIMILAR_MIN = _perf_governor.ASR_NAME_SIMILAR_MIN if _perf_governor is not None else 0.75
 
-# VALUES CHANGE HERE (chunk-boundary carry-over)
-_ASR_CARRY_COVER_FRAC = 0.4
-_ASR_CARRY_NEAR_SEC = 1.5
+# WARNING: the fallback numbers below must match ASR_CARRY_COVER_FRAC, ASR_CARRY_NEAR_SEC in performance_governor.py; they are used only when that module fails to import.
+_ASR_CARRY_COVER_FRAC = _perf_governor.ASR_CARRY_COVER_FRAC if _perf_governor is not None else 0.4
+_ASR_CARRY_NEAR_SEC = _perf_governor.ASR_CARRY_NEAR_SEC if _perf_governor is not None else 1.5
 
 
 def _asr_words(text):
@@ -6766,7 +6901,6 @@ def _asr_recover_gaps(model, audio, sampling_rate, raw_spans, out, own_len, lang
                                     break
                     if reason:
                         continue
-                    c.recovered = True
                     out.append(c)
                     cue_iv.append((float(c.start), float(c.end)))
                     out.recover_ok += 1
@@ -6775,17 +6909,19 @@ def _asr_recover_gaps(model, audio, sampling_rate, raw_spans, out, own_len, lang
     out.recover_sec = time.monotonic() - t_start
 
 
+def _asked_to_stop(should_stop):
+    """True when the caller's should_stop callback says the caption work must stop; a callback that fails is logged and counts as not stopping."""
+    try:
+        return bool(should_stop and should_stop())
+    except Exception as _swallowed_error:
+        _log_swallowed("_asked_to_stop: asking the caller whether to stop", _swallowed_error)
+        return False
+
+
 def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=None,
                           temperature=None, should_stop=None, own_len=None, recover_budget_sec=0.0):
     """Transcribe one extracted chunk WAV; when `own_len` and a positive `recover_budget_sec` are given, re-read missed speech afterwards."""
     global _asr_vad_utils_load_failed
-
-    def _stopped():
-        try:
-            return bool(should_stop and should_stop())
-        except Exception as _swallowed_error:
-            _log_swallowed("_stopped: return bool(should_stop and should_stop())", _swallowed_error)
-            return False
 
     temp_kw = {} if temperature is None else {"temperature": temperature}
     if not _asr_vad_utils_load_failed:
@@ -6805,7 +6941,7 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
         )
         out = _SegList()
         for seg in segments_iter:
-            if _stopped():
+            if _asked_to_stop(should_stop):
                 break
             out.extend(_asr_split_segment(seg, 0.0))
         _asr_finalize_cue_timing(out)
@@ -6827,7 +6963,7 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
     out.audio_secs = len(audio) / float(sampling_rate)
     out.music_secs = _asr_music_seconds(audio, sampling_rate)
     for span in _merged_spans:
-        if _stopped():
+        if _asked_to_stop(should_stop):
             break
         clip = audio[span["start"]:span["end"]]
         if clip.size == 0:
@@ -6841,18 +6977,18 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
         )
         _n_raw = 0
         for seg in segments_iter:
-            if _stopped():
+            if _asked_to_stop(should_stop):
                 break
             _n_raw += 1
             out.extend(_asr_split_segment(seg, span_start_sec))
         t_clip = time.monotonic() - t_clip
-        if _n_raw == 0 and not _stopped():
+        if _n_raw == 0 and not _asked_to_stop(should_stop):
             log.warning("[ASR] speech was detected in %.1fs of audio starting %.1fs into the chunk, "
                         "but Whisper returned nothing for it", clip.size / float(sampling_rate), span_start_sec)
         if t_clip > 8.0:
             log.warning("[ASR SLOW] %.1fs of speech took %.1fs to transcribe (beam=%s)",
                         clip.size / float(sampling_rate), t_clip, beam_size)
-    if (_ASR_RECOVER_ENABLED and own_len is not None and recover_budget_sec > 0.0 and not _stopped()):
+    if (_ASR_RECOVER_ENABLED and own_len is not None and recover_budget_sec > 0.0 and not _asked_to_stop(should_stop)):
         _asr_recover_gaps(model, audio, sampling_rate, raw_spans, out, float(own_len), language,
                           initial_prompt, float(recover_budget_sec), should_stop)
     _asr_finalize_cue_timing(out)
@@ -7090,11 +7226,11 @@ ASR_REASON_EXTRACT_FAILED = "extract_failed"
 ASR_REASON_TRANSCRIBE_FAILED = "transcribe_failed"
 ASR_REASON_INTERRUPTED = "interrupted"
 
-_ASR_FIRST_CHUNK_SEC = 60.0
-_ASR_CHUNK_SEC = 300.0
-_ASR_CHUNK_OVERLAP_SEC = 8.0
-# VALUES CHANGE HERE
-_ASR_MIN_TAIL_SEC = 15.0
+# WARNING: the fallback numbers below must match ASR_FIRST_CHUNK_SEC, ASR_CHUNK_SEC, ASR_CHUNK_OVERLAP_SEC, ASR_MIN_TAIL_SEC in performance_governor.py; they are used only when that module fails to import.
+_ASR_FIRST_CHUNK_SEC = _perf_governor.ASR_FIRST_CHUNK_SEC if _perf_governor is not None else 60.0
+_ASR_CHUNK_SEC = _perf_governor.ASR_CHUNK_SEC if _perf_governor is not None else 300.0
+_ASR_CHUNK_OVERLAP_SEC = _perf_governor.ASR_CHUNK_OVERLAP_SEC if _perf_governor is not None else 8.0
+_ASR_MIN_TAIL_SEC = _perf_governor.ASR_MIN_TAIL_SEC if _perf_governor is not None else 15.0
 _ASR_META_VERSION = 1
 
 
@@ -7128,7 +7264,8 @@ def _atomic_write_text(path, text):
     log.warning("[ASR] could not replace %s: %s", path, last_err)
     try:
         os.remove(tmp_path)
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_atomic_write_text: os.remove(tmp_path)", _swallowed_error)
         pass
     return False
 
@@ -7173,7 +7310,8 @@ def _asr_discard_state(file_path):
         try:
             if os.path.isfile(p):
                 os.remove(p)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("_asr_discard_state: if os.path.isfile(p):", _swallowed_error)
             pass
 
 
@@ -7229,10 +7367,12 @@ def _asr_plan_chunks(duration, start_sec, done):
     return out
 
 
-_ASR_DUP_TEXT_SIMILARITY_MIN = 0.6
+# WARNING: the fallback number below must match ASR_DUP_TEXT_SIMILARITY_MIN in performance_governor.py; it is used only when that module fails to import.
+_ASR_DUP_TEXT_SIMILARITY_MIN = _perf_governor.ASR_DUP_TEXT_SIMILARITY_MIN if _perf_governor is not None else 0.6
 
-_ASR_SHORT_TEXT_CHARS = 6
-_ASR_SHORT_TEXT_OVERLAP_MIN = 0.85
+# WARNING: the fallback numbers below must match ASR_SHORT_TEXT_CHARS, ASR_SHORT_TEXT_OVERLAP_MIN in performance_governor.py; they are used only when that module fails to import.
+_ASR_SHORT_TEXT_CHARS = _perf_governor.ASR_SHORT_TEXT_CHARS if _perf_governor is not None else 6
+_ASR_SHORT_TEXT_OVERLAP_MIN = _perf_governor.ASR_SHORT_TEXT_OVERLAP_MIN if _perf_governor is not None else 0.85
 
 
 def _asr_cues_are_same_speech(new_text, old_text, overlap_frac=None):
@@ -7304,7 +7444,8 @@ def _asr_probe_media(file_path):
     return {"duration": facts["duration"], "has_audio": facts["has_audio"]}
 
 
-_ASR_ACCURATE_SEEK_MARGIN_SEC = 15.0
+# WARNING: the fallback number below must match ASR_ACCURATE_SEEK_MARGIN_SEC in performance_governor.py; it is used only when that module fails to import.
+_ASR_ACCURATE_SEEK_MARGIN_SEC = _perf_governor.ASR_ACCURATE_SEEK_MARGIN_SEC if _perf_governor is not None else 15.0
 
 
 def _asr_extract_chunk(file_path, start_sec, length_sec, out_wav_path, timeout=120,
@@ -7333,14 +7474,16 @@ def _asr_extract_chunk(file_path, start_sec, length_sec, out_wav_path, timeout=1
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs
             )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as _swallowed_error:
+        _log_swallowed("_asr_extract_chunk: popen_kwargs = {}", _swallowed_error)
         return "failed"
     except Exception as e:
         log.warning("[ASR] chunk extract error for %s: %s", os.path.basename(file_path), e)
         return "failed"
     try:
         size = os.path.getsize(out_wav_path) if os.path.isfile(out_wav_path) else 0
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_asr_extract_chunk: size = os.path.getsize(out_wav_path) if os.path.isfile(out_wav_path...", _swallowed_error)
         size = 0
     if size > 44:
         return "ok"
@@ -7357,27 +7500,23 @@ def _asr_cleanup_orphan_wavs(out_dir, max_age_sec=3600):
                 try:
                     if now - os.path.getmtime(p) > max_age_sec:
                         os.remove(p)
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("_asr_cleanup_orphan_wavs: if now - os.path.getmtime(p) > max_age_sec:", _swallowed_error)
                     pass
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_asr_cleanup_orphan_wavs: now = time.time()", _swallowed_error)
         pass
 
 
 def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
                                       should_stop=None, timeout_extract=120):
     """Transcribes a video or audio file in chunks with local faster-whisper and returns (srt_path, reason); an unchanged file resumes where it stopped."""
-    def _stopped():
-        try:
-            return bool(should_stop and should_stop())
-        except Exception as _swallowed_error:
-            _log_swallowed("_stopped: return bool(should_stop and should_stop())", _swallowed_error)
-            return False
-
     if not file_path or not _cached_path_exists(file_path):
         return None, ASR_REASON_EXTRACT_FAILED
     try:
         st = os.stat(file_path)
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("generate_captions_via_asr_chunked: st = os.stat(file_path)", _swallowed_error)
         return None, ASR_REASON_EXTRACT_FAILED
     srt_path, meta_path = _asr_paths(file_path)
     base_name = os.path.basename(file_path)
@@ -7432,7 +7571,7 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     import tempfile
     _prev_chunk_end = None
     for idx, (a, b) in enumerate(plan, 1):
-        if _stopped():
+        if _asked_to_stop(should_stop):
             return None, ASR_REASON_INTERRUPTED
         _yield_to_live_playback(f"asr_chunk({base_name})")
 
@@ -7464,8 +7603,8 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
                     _disk_prompt = _asr_prompt_for(file_path)
                     segments = _asr_transcribe_chunk(model, wav_path, lang, _ASR_BEAM_SIZE,
                                                      initial_prompt=_disk_prompt,
-                                                     should_stop=_stopped)
-                    if _stopped():
+                                                     should_stop=should_stop)
+                    if _asked_to_stop(should_stop):
                         return None, ASR_REASON_INTERRUPTED
                     new_cues, _drops = _asr_filter_cues(segments, a, b, at_file_end, prompt=_disk_prompt)
                 except Exception as e:
@@ -7475,7 +7614,8 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
             try:
                 if os.path.isfile(wav_path):
                     os.remove(wav_path)
-            except OSError:
+            except OSError as _swallowed_error:
+                _log_swallowed("generate_captions_via_asr_chunked: if os.path.isfile(wav_path):", _swallowed_error)
                 pass
 
         _asr_merge_cues(cues, new_cues)
@@ -7501,21 +7641,21 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
 # SECTION: Live captions
 # ============================================================================
 
-# VALUES CHANGE HERE
-LIVE_CAPTION_LEAD_SEC = 5.0
-LIVE_CAPTION_READY_DEADLINE_SEC = 10.0
-LIVE_CAPTION_CHUNK_SEC = 30.0
-# VALUES CHANGE HERE (fallback only; used when performance_governor is missing or fails; the live values are CAPTION_CADENCE in performance_governor.py)
-_LIVE_CAPTION_STARTUP_CHUNK_SEC = 10.0
-_LIVE_CAPTION_FIRST_CHUNK_SEC = 5.0
-_LIVE_CAPTION_FIRST_CHUNK_OVERLAP_SEC = 3.0
-_LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC = 5.0
-_LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC = 3.0
-_LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC = 15.0
-_LIVE_CAPTION_PREFETCH_CHUNK_SEC = 10.0
-_LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC = 120.0
-# VALUES CHANGE HERE (next-file prefetch cap)
-_LIVE_CAPTION_PREFETCH_CAP_SEC = 60.0
+# WARNING: the fallback numbers below must match LIVE_CAPTION_LEAD_SEC, LIVE_CAPTION_READY_DEADLINE_SEC, LIVE_CAPTION_CHUNK_SEC in performance_governor.py; they are used only when that module fails to import.
+LIVE_CAPTION_LEAD_SEC = _perf_governor.LIVE_CAPTION_LEAD_SEC if _perf_governor is not None else 5.0
+LIVE_CAPTION_READY_DEADLINE_SEC = _perf_governor.LIVE_CAPTION_READY_DEADLINE_SEC if _perf_governor is not None else 10.0
+LIVE_CAPTION_CHUNK_SEC = _perf_governor.LIVE_CAPTION_CHUNK_SEC if _perf_governor is not None else 30.0
+# WARNING: the fallback numbers below must match the standard row of CAPTION_CADENCE in performance_governor.py; they are used only when that module fails to import.
+_LIVE_CAPTION_STARTUP_CHUNK_SEC = _perf_governor.CAPTION_CADENCE["standard"]["startup_chunk_sec"] if _perf_governor is not None else 10.0
+_LIVE_CAPTION_FIRST_CHUNK_SEC = _perf_governor.CAPTION_CADENCE["standard"]["first_chunk_sec"] if _perf_governor is not None else 5.0
+_LIVE_CAPTION_FIRST_CHUNK_OVERLAP_SEC = _perf_governor.CAPTION_CADENCE["standard"]["first_overlap_sec"] if _perf_governor is not None else 3.0
+# WARNING: the fallback numbers below must match LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC, LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC, LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC, LIVE_CAPTION_PREFETCH_CHUNK_SEC, LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC, LIVE_CAPTION_PREFETCH_CAP_SEC in performance_governor.py; they are used only when that module fails to import.
+_LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC = _perf_governor.LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC if _perf_governor is not None else 5.0
+_LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC = _perf_governor.LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC if _perf_governor is not None else 3.0
+_LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC = _perf_governor.LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC if _perf_governor is not None else 15.0
+_LIVE_CAPTION_PREFETCH_CHUNK_SEC = _perf_governor.LIVE_CAPTION_PREFETCH_CHUNK_SEC if _perf_governor is not None else 10.0
+_LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC = _perf_governor.LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC if _perf_governor is not None else 120.0
+_LIVE_CAPTION_PREFETCH_CAP_SEC = _perf_governor.LIVE_CAPTION_PREFETCH_CAP_SEC if _perf_governor is not None else 60.0
 _LIVE_ATTACHED_SESSIONS = set()
 _LIVE_RUNNING_SESSIONS = set()
 
@@ -7541,24 +7681,21 @@ def _prefetch_may_run():
         if sess._busy or sess._last_lead < _LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC:
             return False
     return True
-_LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC = 3.0
-_LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC = 15.0
-# VALUES CHANGE HERE (lead cap)
-LIVE_CAPTION_MAX_LEAD_SEC = 60.0
-# VALUES CHANGE HERE (jump-back detection)
-_LIVE_CAPTION_JUMP_BACK_LEAD_SEC = 120.0
-_LIVE_CAPTION_PACE_POLL_SEC = 1.0
-_LIVE_CAPTION_SKIP_BEHIND_SEC = 15.0
-_LIVE_CAPTION_RESUME_AHEAD_SEC = 2.0
-# VALUES CHANGE HERE
-_LIVE_CAPTION_KEEP_PAST_SEC = 20.0
-_LIVE_CAPTION_MAX_CUES = 500
-# VALUES CHANGE HERE
-_LIVE_CAPTION_MAX_FAILURES = 3
-_ASR_LIVE_BEAM_SIZE = 3
-_ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC = 4.0
-_LIVE_CAPTION_CLOCK_MIN_DT = 0.75
-_LIVE_CAPTION_CLOCK_TOLERANCE = 0.4
+# WARNING: the fallback numbers below must match LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC, LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC, LIVE_CAPTION_MAX_LEAD_SEC, LIVE_CAPTION_JUMP_BACK_LEAD_SEC, LIVE_CAPTION_PACE_POLL_SEC, LIVE_CAPTION_SKIP_BEHIND_SEC, LIVE_CAPTION_RESUME_AHEAD_SEC, LIVE_CAPTION_KEEP_PAST_SEC, LIVE_CAPTION_MAX_CUES, LIVE_CAPTION_MAX_FAILURES, ASR_LIVE_BEAM_SIZE, ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC, LIVE_CAPTION_CLOCK_MIN_DT, LIVE_CAPTION_CLOCK_TOLERANCE in performance_governor.py; they are used only when that module fails to import.
+_LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC = _perf_governor.LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC if _perf_governor is not None else 3.0
+_LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC = _perf_governor.LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC if _perf_governor is not None else 15.0
+LIVE_CAPTION_MAX_LEAD_SEC = _perf_governor.LIVE_CAPTION_MAX_LEAD_SEC if _perf_governor is not None else 60.0
+_LIVE_CAPTION_JUMP_BACK_LEAD_SEC = _perf_governor.LIVE_CAPTION_JUMP_BACK_LEAD_SEC if _perf_governor is not None else 120.0
+_LIVE_CAPTION_PACE_POLL_SEC = _perf_governor.LIVE_CAPTION_PACE_POLL_SEC if _perf_governor is not None else 1.0
+_LIVE_CAPTION_SKIP_BEHIND_SEC = _perf_governor.LIVE_CAPTION_SKIP_BEHIND_SEC if _perf_governor is not None else 15.0
+_LIVE_CAPTION_RESUME_AHEAD_SEC = _perf_governor.LIVE_CAPTION_RESUME_AHEAD_SEC if _perf_governor is not None else 2.0
+_LIVE_CAPTION_KEEP_PAST_SEC = _perf_governor.LIVE_CAPTION_KEEP_PAST_SEC if _perf_governor is not None else 20.0
+_LIVE_CAPTION_MAX_CUES = _perf_governor.LIVE_CAPTION_MAX_CUES if _perf_governor is not None else 500
+_LIVE_CAPTION_MAX_FAILURES = _perf_governor.LIVE_CAPTION_MAX_FAILURES if _perf_governor is not None else 3
+_ASR_LIVE_BEAM_SIZE = _perf_governor.ASR_LIVE_BEAM_SIZE if _perf_governor is not None else 3
+_ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC = _perf_governor.ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC if _perf_governor is not None else 4.0
+_LIVE_CAPTION_CLOCK_MIN_DT = _perf_governor.LIVE_CAPTION_CLOCK_MIN_DT if _perf_governor is not None else 0.75
+_LIVE_CAPTION_CLOCK_TOLERANCE = _perf_governor.LIVE_CAPTION_CLOCK_TOLERANCE if _perf_governor is not None else 0.4
 
 
 class LiveCaptionSession:
@@ -7633,7 +7770,8 @@ class LiveCaptionSession:
             return est
         try:
             p = fn()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("LiveCaptionSession._playback_sec: p = fn()", _swallowed_error)
             p = None
         if p is None or p < 0:
             return est
@@ -7932,7 +8070,8 @@ class LiveCaptionSession:
                 try:
                     if os.path.isfile(wav_path):
                         os.remove(wav_path)
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("LiveCaptionSession._run_locked: if os.path.isfile(wav_path):", _swallowed_error)
                     pass
 
             if took is not None and chunks_done > 0 and length > 0:
@@ -8037,11 +8176,14 @@ def check_media_truly_ended(
 # ============================================================================
 
 
-LOUDNESS_GAIN_CEILING = 10.0
+# WARNING: the fallback number below must match LOUDNESS_GAIN_CEILING in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_GAIN_CEILING = _perf_governor.LOUDNESS_GAIN_CEILING if _perf_governor is not None else 10.0
 # WARNING: this is the loudness safety ceiling; LOUDNESS_GAIN_FLOOR_STANDARD never loosens it.
-LOUDNESS_GAIN_FLOOR = 0.1
+# WARNING: the fallback number below must match LOUDNESS_GAIN_FLOOR in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_GAIN_FLOOR = _perf_governor.LOUDNESS_GAIN_FLOOR if _perf_governor is not None else 0.1
 # WARNING: true-peak safety is a separate clamp; this floor never lets a file exceed TRUE_PEAK_CEILING_DBTP.
-LOUDNESS_GAIN_FLOOR_STANDARD = 0.5
+# WARNING: the fallback number below must match LOUDNESS_GAIN_FLOOR_STANDARD in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_GAIN_FLOOR_STANDARD = _perf_governor.LOUDNESS_GAIN_FLOOR_STANDARD if _perf_governor is not None else 0.5
 
 MUSIC_GAIN_FLOOR = LOUDNESS_GAIN_FLOOR
 
@@ -8049,22 +8191,19 @@ MUSIC_GAIN_FLOOR = LOUDNESS_GAIN_FLOOR
 LOUDNESS_CONVERGENCE_DB = 0.0
 
 # WARNING: raise this number whenever the loudness scan's method or TV target changes; scanned gains stored under an older number are ignored and measured again.
-LOUDNESS_GAIN_SCAN_VERSION = 9
+LOUDNESS_GAIN_SCAN_VERSION = 10
 # WARNING: must match _OWNER_GAIN_SCAN_VERSION in media_library.py; a gain row stamped with this scan version is the owner's own gain and is never rescanned.
 OWNER_GAIN_SCAN_VERSION = 0
 
-# WARNING: every settings key that records the loudness target stored gains were measured under, or a one-time gain-reset flag, must be listed here; Reset All Settings keeps these so the next start does not clear every gain again. The library itself is never reset.
-FACTORY_RESET_KEEPS_FILE_DATA = (
-    "_gain_cache_target_lufs",
-    "_lufs23_migration_done", "_music_target_v2_migration_done",
-)
+# WARNING: per-file data (gains, chosen tracks, loudness learning, picture boxes, durations) lives only in the library, which Reset All Settings never touches.
 
 
-TRUE_PEAK_CEILING_DBTP = -2.0
+# WARNING: the fallback number below must match TRUE_PEAK_CEILING_DBTP in performance_governor.py; it is used only when that module fails to import.
+TRUE_PEAK_CEILING_DBTP = _perf_governor.TRUE_PEAK_CEILING_DBTP if _perf_governor is not None else -2.0
 
-# VALUES CHANGE HERE (a file scanned by sample windows gets one whole-file true-peak pass when its gained peak would land within this many dB of the ceiling, because the windows may have missed its loudest moment)
-TRUE_PEAK_CONFIRM_MARGIN_DB = 3.0
-TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS = 600.0
+# WARNING: the fallback numbers below must match TRUE_PEAK_CONFIRM_MARGIN_DB, TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS in performance_governor.py; they are used only when that module fails to import.
+TRUE_PEAK_CONFIRM_MARGIN_DB = _perf_governor.TRUE_PEAK_CONFIRM_MARGIN_DB if _perf_governor is not None else 3.0
+TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS = _perf_governor.TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS if _perf_governor is not None else 600.0
 
 
 def _true_peak_limited_gain(gain, clamped_gain, combined_tp):
@@ -8077,25 +8216,25 @@ def _true_peak_limited_gain(gain, clamped_gain, combined_tp):
     _peak_floor = 1.0 if gain > 1.0 else LOUDNESS_GAIN_FLOOR
     return max(_peak_floor, _peak_gain_cap), True
 
-# WARNING: -24 is the ATSC A/85 TV baseline (FFmpeg loudnorm reports LKFS as LUFS); it is measured on dialogue when subtitles or a centre channel exist, while true peak and loudness range always come from the whole mix.
-TARGET_LUFS = -24.0
+# WARNING: -24 is the ATSC A/85 TV baseline (LKFS and LUFS are the same unit); shows and movies are measured on dialogue (subtitles or centre channel), commercials, short files and music on the whole mix, all against the same number; true peak and loudness range always come from the whole mix.
+TARGET_LUFS = _perf_governor.LOUDNESS_TARGET_LUFS if _perf_governor is not None else -24.0
+_STATION_LEVEL_DB = _perf_governor.LOUDNESS_STATION_LEVEL_DB if _perf_governor is not None else 7.0
 
-MUSIC_TARGET_LUFS = -18.5
+# WARNING: music shares the TV target; code tells music apart by the music flag of the scan, never by comparing targets.
+MUSIC_TARGET_LUFS = TARGET_LUFS
 
-# VALUES CHANGE HERE (calibration offsets applied after the measured LUFS target)
 # WARNING: a negative offset makes every scan under-level on purpose, so keep these at 0 unless the owner asks.
-# VALUES CHANGE HERE (playback calibration: add this many dB to newly scanned TV gains; owner/manual gains are never changed)
-# WARNING: 7.0 (was 3.0) because the owner raised Aladdin and Bob's Burgers by +4 dB each from the 3.0 scan, landing both near -17 LUFS. Files already scanned keep their saved gain until they are scanned again.
-LOUDNESS_GAIN_OFFSET_DB = 7.0
-MUSIC_GAIN_OFFSET_DB = 0.0
+# WARNING: the station level (performance_governor.LOUDNESS_STATION_LEVEL_DB, 7 dB because the owner found -24 too quiet on his speakers) is added to every scanned gain alike, TV and music; owner/manual gains are never changed.
+LOUDNESS_GAIN_OFFSET_DB = _STATION_LEVEL_DB
+MUSIC_GAIN_OFFSET_DB = _STATION_LEVEL_DB
 
-COMPRESSOR_ATTACK_MS = 25.0
-COMPRESSOR_RELEASE_MS = 800.0
-# VALUES CHANGE HERE
-COMPRESSOR_THRESHOLD_DB = -18.0
-COMPRESSOR_RATIO = 2.0
-COMPRESSOR_KNEE_DB = 6.0
-COMPRESSOR_MAKEUP_DB = 4.0
+# WARNING: the fallback numbers below must match COMPRESSOR_ATTACK_MS, COMPRESSOR_RELEASE_MS, COMPRESSOR_THRESHOLD_DB, COMPRESSOR_RATIO, COMPRESSOR_KNEE_DB, COMPRESSOR_MAKEUP_DB in performance_governor.py; they are used only when that module fails to import.
+COMPRESSOR_ATTACK_MS = _perf_governor.COMPRESSOR_ATTACK_MS if _perf_governor is not None else 25.0
+COMPRESSOR_RELEASE_MS = _perf_governor.COMPRESSOR_RELEASE_MS if _perf_governor is not None else 800.0
+COMPRESSOR_THRESHOLD_DB = _perf_governor.COMPRESSOR_THRESHOLD_DB if _perf_governor is not None else -18.0
+COMPRESSOR_RATIO = _perf_governor.COMPRESSOR_RATIO if _perf_governor is not None else 2.0
+COMPRESSOR_KNEE_DB = _perf_governor.COMPRESSOR_KNEE_DB if _perf_governor is not None else 6.0
+COMPRESSOR_MAKEUP_DB = _perf_governor.COMPRESSOR_MAKEUP_DB if _perf_governor is not None else 4.0
 
 COMPRESSOR_BAKE_VERSION = 1
 
@@ -8158,9 +8297,165 @@ def _probe_duration_seconds_fast(file_path):
         return None
 
 
+# ============================================================================
+# SECTION: Loudness scan audio track
+# ============================================================================
+
+_SCAN_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+(?:\[[^\]]*\])?(?:\(([^)]*)\))?[^\n]*?: Audio: ([^\n]*)")
+_scan_header_cache = {}
+_scan_header_cache_lock = threading.Lock()
+_audio_track_resolver = {"fn": None}
+
+
+def set_audio_track_resolver(fn):
+    """Lets the main script say which audio stream (0 = first) the player uses for a file: fn(file_path, streams) returns that number or None, streams being the file's audio streams as dicts (lang, desc, default)."""
+    _audio_track_resolver["fn"] = fn
+
+
+def _scan_header_text(file_path):
+    """ffmpeg's stream listing for the file, cached by size and time; "" when it cannot be read."""
+    try:
+        _st = os.stat(file_path)
+        key = (os.path.normpath(file_path), _st.st_size, _st.st_mtime_ns)
+    except OSError as e:
+        _media_warning("loudness_header_stat", "[LOUDNESS PROBE] could not read %s to list its audio tracks: %s",
+                       os.path.basename(str(file_path)), e)
+        return ""
+    with _scan_header_cache_lock:
+        hit = _scan_header_cache.get(key)
+    if hit is not None:
+        return hit
+    text, timed_out = _dialogue_header_text(file_path)
+    if timed_out:
+        return ""
+    with _scan_header_cache_lock:
+        if len(_scan_header_cache) >= 256:
+            _scan_header_cache.clear()
+        _scan_header_cache[key] = text
+    return text
+
+
+def _scan_audio_streams(header_text):
+    """The file's audio streams in order as dicts (lang, desc, default) from ffmpeg's stream listing."""
+    out = []
+    for match in _SCAN_AUDIO_STREAM_RE.finditer(header_text or ""):
+        desc = match.group(2)
+        out.append({"lang": (match.group(1) or "").strip().lower(), "desc": desc.strip(),
+                    "default": "(default)" in desc})
+    return out
+
+
+def _scan_audio_stream_index(file_path, header_text=None):
+    """Which audio stream (0 = first) the loudness scan measures: the one the player uses, as the main script says, else the first English stream, else the default stream, else the first."""
+    streams = _scan_audio_streams(_scan_header_text(file_path) if header_text is None else header_text)
+    fn = _audio_track_resolver["fn"]
+    if fn is not None:
+        try:
+            index = fn(file_path, streams)
+            if index is not None and (not streams or 0 <= int(index) < len(streams)):
+                return int(index)
+        except Exception as _swallowed_error:
+            _log_swallowed("_scan_audio_stream_index: asking the main script which audio track plays", _swallowed_error)
+    for i, st in enumerate(streams):
+        if st["lang"] in ("eng", "en", "english"):
+            return i
+    for i, st in enumerate(streams):
+        if st["default"]:
+            return i
+    return 0
+
+
+# ============================================================================
+# SECTION: BS.1770 gating from ffmpeg's ebur128 frame log
+# ============================================================================
+
+_EBUR_LINE_RE = re.compile(r"^\[Parsed_ebur128_(\d+) @ [^\]]*\]\s*t:\s*([0-9.]+)\s+TARGET:\S+\s+LUFS\s+M:\s*(-?[0-9.]+|-?inf|nan)\s+S:\s*(-?[0-9.]+|-?inf|nan)(.*)$", re.M)
+_EBUR_TPK_RE = re.compile(r"\bTPK:\s*([^d]*)dBFS")
+
+
+def _bs1770_mean(values):
+    import math
+    if not values:
+        return None
+    energy = sum(10 ** ((v + 0.691) / 10.0) for v in values) / len(values)
+    return -0.691 + 10.0 * math.log10(energy) if energy > 0 else None
+
+
+def _bs1770_integrated(blocks, relative=True):
+    """Integrated loudness from 400 ms block loudness values: absolute gate -70 LUFS and, when relative is True, the relative gate 10 LU under the absolute-gated mean; None when nothing passes."""
+    gated = [v for v in blocks if v > -70.0]
+    if not gated:
+        return None
+    if not relative:
+        return _bs1770_mean(gated)
+    threshold = _bs1770_mean(gated) - 10.0
+    gated = [v for v in gated if v > threshold]
+    return _bs1770_mean(gated)
+
+
+def _loudness_range(short_terms):
+    """EBU Tech 3342 loudness range from 3 s short-term values: absolute gate -70, relative gate 20 LU under their mean, 95th minus 10th percentile."""
+    gated = [v for v in short_terms if v > -70.0]
+    if len(gated) < 2:
+        return 0.0 if gated else None
+    threshold = _bs1770_mean(gated) - 20.0
+    gated = sorted(v for v in gated if v > threshold)
+    if len(gated) < 2:
+        return 0.0
+    def _pct(p):
+        return gated[min(len(gated) - 1, max(0, int(round(p * (len(gated) - 1)))))]
+    return _pct(0.95) - _pct(0.10)
+
+
+def _parse_ebur128_log(stderr_text):
+    """{instance: {"t": [...], "m": [...], "s": [...], "tpk": last running true peak or None}} from ffmpeg's ebur128 frame log."""
+    out = {}
+    for match in _EBUR_LINE_RE.finditer(stderr_text or ""):
+        inst = out.setdefault(match.group(1), {"t": [], "m": [], "s": [], "tpk": None})
+        try:
+            t = float(match.group(2))
+            m = float(match.group(3))
+            st = float(match.group(4))
+        except ValueError as _swallowed_error:
+            _log_swallowed("_parse_ebur128_log: t = float(match.group(2))", _swallowed_error)
+            continue
+        inst["t"].append(t)
+        inst["m"].append(m)
+        inst["s"].append(st)
+        tpk = _EBUR_TPK_RE.search(match.group(5) or "")
+        if tpk:
+            peaks = []
+            for part in tpk.group(1).split():
+                try:
+                    value = float(part)
+                except ValueError as _swallowed_error:
+                    _log_swallowed("_parse_ebur128_log: value = float(part)", _swallowed_error)
+                    continue
+                if value == value and value != float("inf"):
+                    peaks.append(value)
+            if peaks:
+                inst["tpk"] = max(peaks)
+    return out
+
+
+def _speech_block_loudness(inst, spans, offset=0.0):
+    """(loudness of the 400 ms blocks that are at least half speech, gated as ATSC A/85 long-form dialogue: absolute gate only; seconds of speech blocks) with spans in window time after subtracting offset."""
+    shifted = [(a - offset, b - offset) for a, b in spans]
+    picked = []
+    for t, m in zip(inst["t"], inst["m"]):
+        if t < 0.4 - 1e-6:
+            continue
+        begin, end = t - 0.4, t
+        covered = sum(max(0.0, min(b, end) - max(a, begin)) for a, b in shifted)
+        if covered >= 0.2:
+            picked.append(m)
+    return _bs1770_integrated(picked, relative=False), len(picked) * 0.1
+
+
 def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
-                         semaphore=None, semaphore_timeout=None, pre_filter=None):
-    """Run one loudness window after the governor admits it; the work is in _lufs_window_ffmpeg_inner; pre_filter is an ffmpeg audio filter run before the loudness measurement (used to measure only speech or only the centre channel)."""
+                         semaphore=None, semaphore_timeout=None, pre_filter=None, dialogue=None, dialogue_out=None,
+                         stream_index=None):
+    """Run one loudness window after the governor admits it; the work is in _lufs_window_ffmpeg_inner; pre_filter is an ffmpeg audio filter run before the loudness measurement; dialogue (from _resolve_dialogue_basis) also measures the window's dialogue in the same decode and dialogue_out receives it as "i" with its speech seconds as "speech_seconds"."""
     _lane = "music_loudness" if semaphore is _MUSIC_LOUDNESS_PROBE_SEMAPHORE else "loudness_and_bake"
     _prio = semaphore is _LOUDNESS_PRIORITY_SEMAPHORE or semaphore is _LOUDNESS_PARALLEL_SEMAPHORE
     _win_t0 = time.time()
@@ -8171,7 +8466,8 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
         _gate_wait = time.time() - _win_t0
         _result = _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=start_sec, length_sec=length_sec,
                                              timeout=timeout, semaphore=semaphore,
-                                             semaphore_timeout=semaphore_timeout, pre_filter=pre_filter)
+                                             semaphore_timeout=semaphore_timeout, pre_filter=pre_filter,
+                                             dialogue=dialogue, dialogue_out=dialogue_out, stream_index=stream_index)
         _total = time.time() - _win_t0
         if _prio or _total >= LOUDNESS_WINDOW_LOG_MIN_SECONDS:
             log.info("[LOUDNESS WINDOW TIMING] %s start=%s len=%s gate_wait=%.1fs total=%.1fs reading=%s%s",
@@ -8185,23 +8481,38 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
 
 
 def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec=None, timeout=90,
-                               semaphore=None, semaphore_timeout=None, pre_filter=None):
-    """Measure one standards-gated TV loudness pass and its peak/range data."""
-    import subprocess, re, json
+                               semaphore=None, semaphore_timeout=None, pre_filter=None, dialogue=None, dialogue_out=None,
+                               stream_index=None):
+    """Measure one window in one audio-only decode with ffmpeg's ebur128 frame log: the whole mix's integrated loudness, true peak and range, and with dialogue the dialogue loudness of the same window (speech times from subtitles, or the centre channel)."""
+    import subprocess
     popen_kwargs = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = (
             subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
         )
-    cmd = [_resolve_ffmpeg_path(), "-nostdin"]
+    _method = dialogue.get("method") if dialogue else None
+    _want_center = _method == "center"
+    _stream = _scan_audio_stream_index(file_path) if stream_index is None else int(stream_index)
+    cmd = [_resolve_ffmpeg_path(), "-nostdin", "-nostats"]
     if start_sec is not None:
         cmd += ["-ss", f"{max(0.0, start_sec):.2f}"]
-    cmd += ["-i", file_path, "-vn"]
     if length_sec is not None:
         cmd += ["-t", f"{length_sec:.2f}"]
-    _loudnorm = f"loudnorm=I={target_lufs}:TP={TRUE_PEAK_CEILING_DBTP}:LRA=11:print_format=json"
-    cmd += ["-af", f"{pre_filter},{_loudnorm}" if pre_filter else _loudnorm,
-            "-f", "null", "-"]
+    cmd += ["-i", file_path]
+    branches = ["full"] + (["center"] if _want_center else [])
+    source = f"[0:a:{_stream}]"
+    graph = []
+    if len(branches) == 1:
+        heads = {"full": source}
+    else:
+        graph.append(source + f"asplit={len(branches)}" + "".join(f"[b{k}]" for k in range(len(branches))))
+        heads = {name: f"[b{k}]" for k, name in enumerate(branches)}
+    graph.append(f"{heads['full']}{pre_filter + ',' if pre_filter else ''}ebur128=framelog=info:peak=true[full]")
+    if _want_center:
+        graph.append(f"{heads['center']}pan=mono|c0=FC,ebur128=framelog=info[center]")
+    cmd += ["-filter_complex", ";".join(graph), "-map", "[full]", "-f", "null", "-"]
+    if _want_center:
+        cmd += ["-map", "[center]", "-f", "null", "-"]
     _probe_t0 = time.time()
     _sem = semaphore or _LOUDNESS_PROBE_SEMAPHORE
     if semaphore_timeout is not None:
@@ -8221,7 +8532,7 @@ def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec
         _probe_t0 = time.time()
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cmd, capture_output=True,
                 timeout=timeout, stdin=subprocess.DEVNULL,
                 **popen_kwargs
             )
@@ -8238,23 +8549,41 @@ def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec
         _record_drive_op_latency(file_path, _elapsed * 1000.0, audio_sec=length_sec)
         return None, None, None, "", True
     _record_drive_op_latency(file_path, (time.time() - _probe_t0) * 1000.0, audio_sec=length_sec)
-    match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", result.stderr)
-    if not match:
-        return None, None, None, result.stderr, False
+    stderr = result.stderr or ""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
     try:
-        stats = json.loads(match.group(0))
-        _measured_i = float(stats.get("input_i", 0))
-        try:
-            _measured_tp = float(stats.get("input_tp"))
-        except (TypeError, ValueError):
-            _measured_tp = None
-        try:
-            _measured_lra = float(stats.get("input_lra"))
-        except (TypeError, ValueError):
-            _measured_lra = None
-        return _measured_i, _measured_tp, _measured_lra, result.stderr, False
-    except Exception:
-        return None, None, None, result.stderr, False
+        instances = _parse_ebur128_log(stderr)
+        full = next((inst for inst in instances.values() if inst["tpk"] is not None), None)
+        if full is None and len(instances) == 1:
+            full = next(iter(instances.values()))
+        if full is None:
+            return None, None, None, stderr, False
+        blocks = [m for t, m in zip(full["t"], full["m"]) if t >= 0.4 - 1e-6]
+        measured_i = _bs1770_integrated(blocks)
+        if measured_i is None:
+            measured_i = -70.0
+        shorts = [v for t, v in zip(full["t"], full["s"]) if t >= 3.0 - 1e-6]
+        measured_lra = _loudness_range(shorts)
+        measured_tp = full["tpk"]
+        if dialogue_out is not None and dialogue is not None:
+            spoken, speech_seconds = None, 0.0
+            if _method == "center":
+                center = next((inst for inst in instances.values() if inst is not full), None)
+                if center is not None:
+                    spoken = _bs1770_integrated([m for t, m in zip(center["t"], center["m"]) if t >= 0.4 - 1e-6])
+                    speech_seconds = float(length_sec or (center["t"][-1] if center["t"] else 0.0))
+            elif _method == "subtitle":
+                spoken, speech_seconds = _speech_block_loudness(full, dialogue.get("spans") or [],
+                                                                 offset=float(start_sec or 0.0))
+            if spoken is not None and speech_seconds >= DIALOGUE_MIN_WINDOW_SECONDS and spoken > -70.0:
+                dialogue_out["i"] = spoken
+                dialogue_out["speech_seconds"] = speech_seconds
+        return measured_i, measured_tp, measured_lra, stderr, False
+    except Exception as e:
+        _media_warning("loudness_parse_failed", "[LOUDNESS PROBE WINDOW] reading the loudness log of %s failed: %s",
+                       os.path.basename(file_path), e)
+        return None, None, None, stderr, False
 
 
 def _combine_lufs_readings(readings):
@@ -8277,42 +8606,53 @@ def _combine_true_peak_readings(tp_readings):
 # ============================================================================
 
 
-# VALUES CHANGE HERE (sample windows that disagree by more than this many LU use the quieter reading)
-LOUDNESS_WINDOW_DISAGREE_LU = 3.0
+# WARNING: the fallback number below must match LOUDNESS_WINDOW_DISAGREE_LU in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_WINDOW_DISAGREE_LU = _perf_governor.LOUDNESS_WINDOW_DISAGREE_LU if _perf_governor is not None else 3.0
 
-# VALUES CHANGE HERE (a loudness window is logged when it took at least this long, or when it belongs to the playing file's first scan)
-LOUDNESS_WINDOW_LOG_MIN_SECONDS = 5.0
+# WARNING: the fallback number below must match LOUDNESS_WINDOW_LOG_MIN_SECONDS in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_WINDOW_LOG_MIN_SECONDS = _perf_governor.LOUDNESS_WINDOW_LOG_MIN_SECONDS if _perf_governor is not None else 5.0
 
-LOUDNESS_WIDE_LRA_FLAG_LU = 15.0
+# WARNING: the fallback number below must match LOUDNESS_WIDE_LRA_FLAG_LU in performance_governor.py; it is used only when that module fails to import.
+LOUDNESS_WIDE_LRA_FLAG_LU = _perf_governor.LOUDNESS_WIDE_LRA_FLAG_LU if _perf_governor is not None else 15.0
 
 # WARNING: the fallback numbers must match LOUDNESS_SCAN_* and GAIN_CHECK_* in performance_governor.py; they are used only when that module fails to import.
-try:
-    import performance_governor as _gain_check_governor
-    LOUDNESS_SCAN_WINDOW_SECONDS = float(_gain_check_governor.LOUDNESS_SCAN_WINDOW_SECONDS)
-    LOUDNESS_SCAN_WINDOWS_STANDARD = int(_gain_check_governor.LOUDNESS_SCAN_WINDOWS_STANDARD)
-    LOUDNESS_SCAN_WINDOWS_LONG = int(_gain_check_governor.LOUDNESS_SCAN_WINDOWS_LONG)
-    LOUDNESS_SCAN_LONG_SHOW_SECONDS = float(_gain_check_governor.LOUDNESS_SCAN_LONG_SHOW_SECONDS)
-    LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = float(_gain_check_governor.LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS)
-    GAIN_CHECK_DRASTIC_DB = float(_gain_check_governor.GAIN_CHECK_DRASTIC_DB)
-    GAIN_CHECK_DRASTIC_EXTRA_BATCHES = int(_gain_check_governor.GAIN_CHECK_DRASTIC_EXTRA_BATCHES)
-    GAIN_CHECK_NEIGHBOR_DB = float(_gain_check_governor.GAIN_CHECK_NEIGHBOR_DB)
-    GAIN_CHECK_BUNDLE_MIN_SCANNED = int(_gain_check_governor.GAIN_CHECK_BUNDLE_MIN_SCANNED)
-    GAIN_CHECK_RECHECK_EXTRA_BATCHES = int(_gain_check_governor.GAIN_CHECK_RECHECK_EXTRA_BATCHES)
-    GAIN_CHECK_EXTRA_BATCH_WINDOWS = int(_gain_check_governor.GAIN_CHECK_EXTRA_BATCH_WINDOWS)
-    GAIN_CHECK_MAX_OVERLAP = float(_gain_check_governor.GAIN_CHECK_MAX_OVERLAP)
-except Exception:
-    LOUDNESS_SCAN_WINDOW_SECONDS = 60.0
-    LOUDNESS_SCAN_WINDOWS_STANDARD = 5
-    LOUDNESS_SCAN_WINDOWS_LONG = 7
-    LOUDNESS_SCAN_LONG_SHOW_SECONDS = 3600.0
-    LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = 180.0
-    GAIN_CHECK_DRASTIC_DB = 4.0
-    GAIN_CHECK_DRASTIC_EXTRA_BATCHES = 2
-    GAIN_CHECK_NEIGHBOR_DB = 3.0
-    GAIN_CHECK_BUNDLE_MIN_SCANNED = 4
-    GAIN_CHECK_RECHECK_EXTRA_BATCHES = 2
-    GAIN_CHECK_EXTRA_BATCH_WINDOWS = 3
-    GAIN_CHECK_MAX_OVERLAP = 0.5
+LOUDNESS_SCAN_WINDOW_SECONDS = _perf_governor.LOUDNESS_SCAN_WINDOW_SECONDS if _perf_governor is not None else 60.0
+LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = _perf_governor.LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS if _perf_governor is not None else 180.0
+GAIN_CHECK_DRASTIC_DB = _perf_governor.GAIN_CHECK_DRASTIC_DB if _perf_governor is not None else 4.0
+GAIN_CHECK_DRASTIC_EXTRA_BATCHES = _perf_governor.GAIN_CHECK_DRASTIC_EXTRA_BATCHES if _perf_governor is not None else 2
+GAIN_CHECK_NEIGHBOR_DB = _perf_governor.GAIN_CHECK_NEIGHBOR_DB if _perf_governor is not None else 3.0
+GAIN_CHECK_BUNDLE_MIN_SCANNED = _perf_governor.GAIN_CHECK_BUNDLE_MIN_SCANNED if _perf_governor is not None else 4
+GAIN_CHECK_RECHECK_EXTRA_BATCHES = _perf_governor.GAIN_CHECK_RECHECK_EXTRA_BATCHES if _perf_governor is not None else 2
+GAIN_CHECK_EXTRA_BATCH_WINDOWS = _perf_governor.GAIN_CHECK_EXTRA_BATCH_WINDOWS if _perf_governor is not None else 3
+GAIN_CHECK_MAX_OVERLAP = _perf_governor.GAIN_CHECK_MAX_OVERLAP if _perf_governor is not None else 0.5
+LOUDNESS_SCAN_WINDOW_COUNTS = _perf_governor.LOUDNESS_SCAN_WINDOW_COUNTS if _perf_governor is not None else ((600.0, 3), (1500.0, 4), (3600.0, 5), (5400.0, 6), (9000.0, 7), (None, 9))
+LOUDNESS_SCAN_EARLY_STOP_WINDOWS = _perf_governor.LOUDNESS_SCAN_EARLY_STOP_WINDOWS if _perf_governor is not None else 3
+LOUDNESS_SCAN_EARLY_STOP_LU = _perf_governor.LOUDNESS_SCAN_EARLY_STOP_LU if _perf_governor is not None else 1.5
+LOUDNESS_WHOLE_FILE_PEAK_CHECK = _perf_governor.LOUDNESS_WHOLE_FILE_PEAK_CHECK if _perf_governor is not None else False
+
+
+def _scan_window_count(duration_sec):
+    """How many sample windows a file of this length gets from LOUDNESS_SCAN_WINDOW_COUNTS."""
+    for longest, count in LOUDNESS_SCAN_WINDOW_COUNTS:
+        if longest is None or duration_sec <= longest:
+            return int(count)
+    return int(LOUDNESS_SCAN_WINDOW_COUNTS[-1][1])
+
+
+def _early_stop_order(count):
+    """The order a first scan reads its windows in so it can stop early: the middle, the start and the end first, then the rest each as far from the ones read as possible."""
+    if count <= 0:
+        return []
+    order = []
+    for index in (count // 2, 0, count - 1):
+        if index not in order:
+            order.append(index)
+    rest = [i for i in range(count) if i not in order]
+    while rest:
+        best = max(rest, key=lambda i: (min(abs(i - j) for j in order), -abs(i - count // 2)))
+        order.append(best)
+        rest.remove(best)
+    return order
 
 
 def _lufs_scan_window(duration_sec):
@@ -8339,8 +8679,8 @@ def _reconcile_lufs_readings(pass_readings):
 
 
 def _standard_window_centers(duration_sec):
-    """The places, as fractions of the file, of a first scan's windows: evenly spaced, each in the middle of its own equal share of the file, with the standard count up to the long-show length and the long count above it."""
-    count = LOUDNESS_SCAN_WINDOWS_LONG if duration_sec > LOUDNESS_SCAN_LONG_SHOW_SECONDS else LOUDNESS_SCAN_WINDOWS_STANDARD
+    """The places, as fractions of the file, of a first scan's windows: evenly spaced, each in the middle of its own equal share of the file, as many as LOUDNESS_SCAN_WINDOW_COUNTS gives for its length."""
+    count = _scan_window_count(duration_sec)
     return tuple(round((i + 0.5) / count, 4) for i in range(count))
 
 
@@ -8379,18 +8719,15 @@ def _extra_window_centers(duration_sec, existing_centers, count, place_ok=None):
 # SECTION: Dialogue loudness basis
 # ============================================================================
 
-# VALUES CHANGE HERE (a sample window needs at least this many seconds of subtitled speech, and a file at least DIALOGUE_MIN_WINDOWS such windows, before its loudness is measured on dialogue)
-DIALOGUE_MIN_WINDOW_SECONDS = 8.0
-DIALOGUE_MIN_WINDOWS = 2
-# VALUES CHANGE HERE (subtitle lines closer together than this are joined into one stretch of speech)
-DIALOGUE_MERGE_GAP_SECONDS = 0.5
-# WARNING: a window's speech filter is part of one ffmpeg command line; a window with more stretches of speech than this is measured on the whole mix instead so the command never outgrows the operating system's limit.
-DIALOGUE_MAX_SPEECH_STRETCHES = 400
-DIALOGUE_HEADER_TIMEOUT_SECONDS = 30.0
-DIALOGUE_EXTRACT_TIMEOUT_SECONDS = 180.0
-DIALOGUE_SUBTITLE_MAX_BYTES = 8 * 1024 * 1024
-DIALOGUE_CACHE_SECONDS = 600.0
-DIALOGUE_CACHE_MAX_ENTRIES = 64
+# WARNING: the fallback numbers below must match DIALOGUE_MIN_WINDOW_SECONDS, DIALOGUE_MIN_WINDOWS, DIALOGUE_MERGE_GAP_SECONDS, DIALOGUE_HEADER_TIMEOUT_SECONDS, DIALOGUE_EXTRACT_TIMEOUT_SECONDS, DIALOGUE_SUBTITLE_MAX_BYTES, DIALOGUE_CACHE_SECONDS, DIALOGUE_CACHE_MAX_ENTRIES in performance_governor.py; they are used only when that module fails to import.
+DIALOGUE_MIN_WINDOW_SECONDS = _perf_governor.DIALOGUE_MIN_WINDOW_SECONDS if _perf_governor is not None else 8.0
+DIALOGUE_MIN_WINDOWS = _perf_governor.DIALOGUE_MIN_WINDOWS if _perf_governor is not None else 2
+DIALOGUE_MERGE_GAP_SECONDS = _perf_governor.DIALOGUE_MERGE_GAP_SECONDS if _perf_governor is not None else 0.5
+DIALOGUE_HEADER_TIMEOUT_SECONDS = _perf_governor.DIALOGUE_HEADER_TIMEOUT_SECONDS if _perf_governor is not None else 30.0
+DIALOGUE_EXTRACT_TIMEOUT_SECONDS = _perf_governor.DIALOGUE_EXTRACT_TIMEOUT_SECONDS if _perf_governor is not None else 180.0
+DIALOGUE_SUBTITLE_MAX_BYTES = _perf_governor.DIALOGUE_SUBTITLE_MAX_BYTES if _perf_governor is not None else 8 * 1024 * 1024
+DIALOGUE_CACHE_SECONDS = _perf_governor.DIALOGUE_CACHE_SECONDS if _perf_governor is not None else 600.0
+DIALOGUE_CACHE_MAX_ENTRIES = _perf_governor.DIALOGUE_CACHE_MAX_ENTRIES if _perf_governor is not None else 64
 DIALOGUE_SUBTITLE_EXTENSIONS = (".srt", ".ass", ".ssa", ".vtt")
 DIALOGUE_TEXT_SUBTITLE_CODECS = ("subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text")
 
@@ -8458,7 +8795,8 @@ def _parse_subtitle_spans(text):
             if len(fields) == 10:
                 try:
                     start, end = _subtitle_time_seconds(fields[1]), _subtitle_time_seconds(fields[2])
-                except ValueError:
+                except ValueError as _swallowed_error:
+                    _log_swallowed("_parse_subtitle_spans: start, end = (_subtitle_time_seconds(fields[1]), _subtitle_time_sec...", _swallowed_error)
                     start = end = 0.0
                 if end > start and _subtitle_cue_is_speech(fields[9]):
                     spans.append((start, end))
@@ -8475,7 +8813,7 @@ def _dialogue_window_centers(duration_sec, spans):
     """The places, as fractions of the file, of the sample windows for a subtitled file: the same count as the standard windows, each placed where its own equal share of the file has the most speech; a share with less than DIALOGUE_MIN_WINDOW_SECONDS of speech gets no window."""
     if not duration_sec or duration_sec <= 0:
         return []
-    count = LOUDNESS_SCAN_WINDOWS_LONG if duration_sec > LOUDNESS_SCAN_LONG_SHOW_SECONDS else LOUDNESS_SCAN_WINDOWS_STANDARD
+    count = _scan_window_count(duration_sec)
     length = min(LOUDNESS_SCAN_WINDOW_SECONDS, duration_sec)
     max_start = max(0.0, duration_sec - length)
     share = duration_sec / count
@@ -8520,40 +8858,6 @@ def _dialogue_place_ok(dialogue, duration_sec):
     return _ok
 
 
-def _dialogue_pre_filter(dialogue, start_sec, length_sec):
-    """The ffmpeg audio filter that keeps only the dialogue of the window starting at start_sec and lasting length_sec (the whole file when both are None), or None when the window has too little speech to measure."""
-    if dialogue is None:
-        return None
-    if dialogue.get("method") == "center":
-        return "pan=mono|c0=FC"
-    begin = 0.0 if start_sec is None else float(start_sec)
-    finish = float("inf") if length_sec is None else begin + float(length_sec)
-    pieces = []
-    total = 0.0
-    for start, end in dialogue["spans"]:
-        first, last = max(start, begin), min(end, finish)
-        if last - first >= 0.05:
-            pieces.append((first - begin, last - begin))
-            total += last - first
-    if total < DIALOGUE_MIN_WINDOW_SECONDS or len(pieces) > DIALOGUE_MAX_SPEECH_STRETCHES:
-        return None
-    expression = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in pieces)
-    return f"aselect='{expression}',asetpts=N/SR/TB"
-
-
-def _dialogue_reading(file_path, target_lufs, dialogue, start_sec, length_sec, timeout, semaphore, semaphore_timeout):
-    """One window's loudness measured on dialogue only, or None when the window has too little speech, the measurement failed, or nothing audible was left."""
-    pre_filter = _dialogue_pre_filter(dialogue, start_sec, length_sec)
-    if pre_filter is None:
-        return None
-    value = _lufs_window_ffmpeg(
-        file_path, target_lufs, start_sec=start_sec, length_sec=length_sec, timeout=timeout,
-        semaphore=semaphore, semaphore_timeout=semaphore_timeout, pre_filter=pre_filter)[0]
-    if value is None or not math.isfinite(value) or value <= -70.0:
-        return None
-    return value
-
-
 def _file_lufs_basis(values, dialogue):
     """One file-level loudness from window readings: dialogue readings are all power-averaged (every window already holds only speech), whole-mix readings are reconciled so a stray window is outvoted."""
     if not values:
@@ -8577,7 +8881,8 @@ def _paired_subtitle_paths(file_path):
     stem = os.path.splitext(name)[0].lower()
     try:
         entries = os.listdir(folder or ".")
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_paired_subtitle_paths: entries = os.listdir(folder or '.')", _swallowed_error)
         return []
     found = []
     for entry in entries:
@@ -8600,7 +8905,8 @@ def _read_subtitle_text(path):
             return ""
         with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
             return handle.read()
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_read_subtitle_text: if os.path.getsize(path) > DIALOGUE_SUBTITLE_MAX_BYTES:", _swallowed_error)
         return ""
 
 
@@ -8620,10 +8926,13 @@ def _embedded_text_subtitle_stream(header_text):
     return None if best is None else best[1]
 
 
-def _header_has_center_channel(header_text):
-    """True when the file's first audio stream has a front-centre channel (a 3.0, 4.0, 5.1, 7.1 or similar layout)."""
-    match = _AUDIO_STREAM_RE.search(header_text or "")
-    return bool(match and _CENTER_LAYOUT_RE.search(match.group(1)))
+def _header_has_center_channel(header_text, stream_position=0):
+    """True when the file's audio stream at stream_position (0 = first) has a front-centre channel (a 3.0, 4.0, 5.1, 7.1 or similar layout)."""
+    matches = list(_AUDIO_STREAM_RE.finditer(header_text or ""))
+    if not matches:
+        return False
+    match = matches[stream_position] if 0 <= stream_position < len(matches) else matches[0]
+    return bool(_CENTER_LAYOUT_RE.search(match.group(1)))
 
 
 def _dialogue_popen_kwargs():
@@ -8641,7 +8950,8 @@ def _dialogue_header_text(file_path):
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=DIALOGUE_HEADER_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
                 **_dialogue_popen_kwargs())
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as _swallowed_error:
+        _log_swallowed("_dialogue_header_text: with _fast_disk_io_slot(f'dialogue_probe({os.path.basename(file_pat...", _swallowed_error)
         return "", True
     return result.stderr or "", False
 
@@ -8672,7 +8982,7 @@ def _extract_embedded_subtitle_text(file_path, stream_index, semaphore=None, sem
 
 
 def _resolve_dialogue_basis(file_path, duration_sec=None, semaphore=None, semaphore_timeout=None):
-    """(dialogue, timed_out): how to measure this file's dialogue loudness, tried in this order: the speech timing of a paired subtitle file, of a text subtitle stream inside the file, then the front-centre channel; dialogue is None when none is usable and the whole mix is measured. Never uses the player's subtitle setup. A timed-out read gives timed_out True so the scan is not saved under the wrong method."""
+    """(dialogue, timed_out): how to measure this file's dialogue loudness, tried in this order: the speech timing of a paired subtitle file, of a text subtitle stream inside the file, then the front-centre channel of the audio track that plays; dialogue is None when none is usable and the whole mix is measured. Never uses the player's subtitle setup. A timed-out read gives timed_out True so the scan is not saved under the wrong method."""
     if not file_path:
         return None, False
     try:
@@ -8683,7 +8993,8 @@ def _resolve_dialogue_basis(file_path, duration_sec=None, semaphore=None, semaph
         try:
             _stat = os.stat(file_path)
             _key = (os.path.normpath(os.path.abspath(file_path)), _stat.st_mtime_ns, _stat.st_size)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("_resolve_dialogue_basis: _stat = os.stat(file_path)", _swallowed_error)
             _key = None
         if _key is not None:
             with _dialogue_basis_cache_lock:
@@ -8710,7 +9021,7 @@ def _resolve_dialogue_basis(file_path, duration_sec=None, semaphore=None, semaph
             if _dialogue_spans_usable(spans, duration_sec):
                 dialogue = {"method": "subtitle", "spans": spans, "label": label}
                 break
-        if dialogue is None and _header_has_center_channel(header):
+        if dialogue is None and _header_has_center_channel(header, _scan_audio_stream_index(file_path, header)):
             dialogue = {"method": "center", "label": "center channel"}
         if _key is not None:
             with _dialogue_basis_cache_lock:
@@ -8735,7 +9046,7 @@ def _lufs_sample_windows(duration_sec, centers=None):
 
 def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=180, semaphore_timeout=None,
                           parallel_windows=False, duration_out=None, centers=None, known_duration=None,
-                          window_out=None, dialogue=None, method_out=None):
+                          window_out=None, dialogue=None, method_out=None, stream_index=None):
     """Measure a file and return one file-level loudness basis; parallel_windows runs all sample windows at once, duration_out receives the length measured for the scan as "duration_sec", centers puts the sample windows at other places in the file, known_duration skips measuring the length again, and window_out receives one (place in the file as a fraction, LUFS) pair per window that returned a reading. dialogue (from _resolve_dialogue_basis) measures each window on dialogue only while true peak and range still come from the whole mix; method_out receives "method" as "dialogue" or "full" for what the readings are. When centers is given with dialogue, a window with no dialogue reading is left out rather than replaced by a whole-mix reading."""
     duration_sec = known_duration if known_duration else _probe_duration_seconds_fast(file_path)
     if (duration_out is not None and duration_sec and duration_sec > 0
@@ -8760,15 +9071,14 @@ def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=
         else:
             start, length = None, None
         _whole_length = None if length is None else max(1.0, length)
+        _whole_dialogue = {}
         m_i, m_tp, m_lra, stderr_for_stream_checks, timed_out = _lufs_window_ffmpeg(
             file_path, target_lufs, start_sec=start,
             length_sec=_whole_length, timeout=chunk_timeout,
-            semaphore=semaphore, semaphore_timeout=semaphore_timeout)
+            semaphore=semaphore, semaphore_timeout=semaphore_timeout,
+            dialogue=dialogue, dialogue_out=_whole_dialogue, stream_index=stream_index)
         any_timeout = timed_out
-        _spoken_i = None
-        if dialogue is not None and m_i is not None:
-            _spoken_i = _dialogue_reading(file_path, target_lufs, dialogue, start, _whole_length,
-                                          chunk_timeout, semaphore, semaphore_timeout)
+        _spoken_i = _whole_dialogue.get("i") if (dialogue is not None and m_i is not None) else None
         if method_out is not None:
             method_out["method"] = "dialogue" if _spoken_i is not None else "full"
         if _spoken_i is not None:
@@ -8786,28 +9096,42 @@ def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=
 
     def _one(window):
         _window_semaphore = _LOUDNESS_PARALLEL_SEMAPHORE if parallel_windows else semaphore
+        _spoken_out = {}
         _full = _lufs_window_ffmpeg(
             file_path, target_lufs, start_sec=float(window[0]), length_sec=max(1.0, window[1]),
-            timeout=chunk_timeout, semaphore=_window_semaphore, semaphore_timeout=semaphore_timeout)
-        _spoken = None
-        if dialogue is not None:
-            _spoken = _dialogue_reading(file_path, target_lufs, dialogue, float(window[0]), max(1.0, window[1]),
-                                        chunk_timeout, _window_semaphore, semaphore_timeout)
-        return _full, _spoken
+            timeout=chunk_timeout, semaphore=_window_semaphore, semaphore_timeout=semaphore_timeout,
+            dialogue=dialogue, dialogue_out=_spoken_out, stream_index=stream_index)
+        return _full, (_spoken_out.get("i") if dialogue is not None else None)
 
     if parallel_windows:
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(windows), thread_name_prefix="loud-win") as pool:
-            results = list(pool.map(_one, windows))
+            results = list(enumerate(pool.map(_one, windows)))
+    elif centers is None and len(windows) > LOUDNESS_SCAN_EARLY_STOP_WINDOWS:
+        results = []
+        _agree = []
+        for _index in _early_stop_order(len(windows)):
+            _res = _one(windows[_index])
+            results.append((_index, _res))
+            _value = _res[1] if (dialogue is not None and _res[1] is not None) else (_res[0][0] if dialogue is None else None)
+            if _value is not None:
+                _agree.append(_value)
+            if (len(_agree) >= LOUDNESS_SCAN_EARLY_STOP_WINDOWS
+                    and max(_agree) - min(_agree) <= LOUDNESS_SCAN_EARLY_STOP_LU):
+                if len(results) < len(windows):
+                    log.info("[LOUDNESS PROBE] %s: %d of %d windows agree within %.1f LU, the rest are skipped",
+                             os.path.basename(file_path), len(_agree), len(windows), LOUDNESS_SCAN_EARLY_STOP_LU)
+                break
+        results.sort(key=lambda it: it[0])
     else:
-        results = [_one(w) for w in windows]
+        results = [(i, _one(w)) for i, w in enumerate(windows)]
 
     pass_readings = []
     full_places = []
     spoken_readings = []
     spoken_places = []
     timeouts = []
-    for index, ((m_i, m_tp, m_lra, chunk_stderr, timed_out), spoken_i) in enumerate(results):
+    for index, ((m_i, m_tp, m_lra, chunk_stderr, timed_out), spoken_i) in results:
         if not stderr_for_stream_checks and chunk_stderr:
             stderr_for_stream_checks = chunk_stderr
         timeouts.append(timed_out)
@@ -8860,6 +9184,63 @@ def _extra_scan_windows(file_path, target_lufs, duration_sec, windows, batches, 
     return tp_all, lra_all, done, placed
 
 
+_track_gains_sink = {"fn": None}
+
+
+def set_track_gains_sink(fn):
+    """Lets the main script keep the gain of every audio track of a file: fn(norm_path, primary_track, {track: gain}) is called once a file's other tracks are scanned."""
+    _track_gains_sink["fn"] = fn
+
+
+def _dialogue_for_stream(file_path, base, header, stream, duration_sec, music):
+    """How to measure the dialogue of one audio track: subtitle timing is shared by every track; the centre channel is decided for this track."""
+    if music:
+        return None
+    if base is not None and base.get("method") == "subtitle":
+        return base
+    if _header_has_center_channel(header, stream):
+        return {"method": "center", "label": "center channel"}
+    return None
+
+
+def _scan_other_audio_tracks(file_path, target_lufs, primary, primary_gain, base_dialogue, duration_sec, music,
+                             gain_offset_db, attenuation_floor, ceiling, semaphore=None, chunk_timeout=180,
+                             semaphore_timeout=None):
+    """Scans every audio track of a file other than the one its gain was measured on, the same way, and hands {track: gain} to the main script so a switched track already has its gain; a file with one track does nothing."""
+    try:
+        header = _scan_header_text(file_path)
+        streams = _scan_audio_streams(header)
+        if len(streams) < 2:
+            return
+        gains = {int(primary): float(primary_gain)}
+        for stream in range(len(streams)):
+            if stream == primary:
+                continue
+            dialogue = _dialogue_for_stream(file_path, base_dialogue, header, stream, duration_sec, music)
+            readings, tp_readings, _lra, _stderr, timed_out = _sample_lufs_readings(
+                file_path, target_lufs, semaphore=semaphore, chunk_timeout=chunk_timeout,
+                semaphore_timeout=semaphore_timeout, known_duration=duration_sec, dialogue=dialogue,
+                stream_index=stream)
+            measured = _combine_lufs_readings(readings)
+            if measured is None or measured <= -70.0 or measured > 0.0:
+                log.info("[LOUDNESS PROBE] %s: audio track %d gave no usable reading%s", os.path.basename(file_path),
+                         stream + 1, " (timed out)" if timed_out else "")
+                continue
+            wanted = 10 ** ((target_lufs - measured + gain_offset_db) / 20.0)
+            base = max(attenuation_floor, min(wanted, ceiling))
+            gain, _capped = _true_peak_limited_gain(wanted, base, _combine_true_peak_readings(tp_readings))
+            gains[stream] = gain
+            log.info("[LOUDNESS PROBE] %s: audio track %d (%s) measured %.1f LUFS on %s, gain %+.1f dB",
+                     os.path.basename(file_path), stream + 1, streams[stream].get("lang") or "?", measured,
+                     _dialogue_basis_label(dialogue), 20 * math.log10(gain))
+        sink = _track_gains_sink["fn"]
+        if sink is not None and len(gains) > 1:
+            sink(os.path.normpath(os.path.abspath(file_path)), int(primary), gains)
+    except Exception as e:
+        _media_warning("loudness_other_tracks_failed", "[LOUDNESS PROBE] scanning the other audio tracks of %s failed: %s",
+                       os.path.basename(file_path), e)
+
+
 def get_media_loudness_gain(file_path, target_lufs=TARGET_LUFS, *args, **kwargs):
     """Wrapper for the loudness scan: a scan on the priority semaphore is the playing file's first scan and runs in a priority scope, never held back by the throttle."""
     if kwargs.get("semaphore") is _LOUDNESS_PRIORITY_SEMAPHORE and _perf_governor is not None:
@@ -8881,7 +9262,8 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                              attenuation_floor=None,
                              parallel_windows=False,
                              duration_out=None,
-                             prior_windows=None):
+                             prior_windows=None,
+                             music=False):
     _fallback = None if treat_fallback_as_unknown else 1.0
     _ceiling = LOUDNESS_GAIN_CEILING
     _atten_floor = LOUDNESS_GAIN_FLOOR_STANDARD if attenuation_floor is None else attenuation_floor
@@ -8907,7 +9289,7 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                 raise NoAudioStreamError(file_path)
             return _fallback
         _dialogue = None
-        if target_lufs != MUSIC_TARGET_LUFS:
+        if not music:
             _dialogue, _dialogue_timed_out = _resolve_dialogue_basis(
                 file_path, semaphore=semaphore, semaphore_timeout=semaphore_timeout)
             if _dialogue_timed_out:
@@ -9005,13 +9387,14 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
             )
             return _fallback
         gain_db = target_lufs - measured_i
-        gain_offset_db = MUSIC_GAIN_OFFSET_DB if target_lufs == MUSIC_TARGET_LUFS else LOUDNESS_GAIN_OFFSET_DB
+        gain_offset_db = MUSIC_GAIN_OFFSET_DB if music else LOUDNESS_GAIN_OFFSET_DB
         gain_db += gain_offset_db
         # WARNING: safety windows are added only when the first result is far from the target or the file is a bundle outlier; the caller must exclude owner/manual records from prior_windows.
         _double_checked = False
         _first_gain_db = gain_db
         _check_batches = GAIN_CHECK_RECHECK_EXTRA_BATCHES if _recheck else 0
-        if not _recheck and abs(gain_db) >= GAIN_CHECK_DRASTIC_DB:
+        # WARNING: the drastic check compares the measured loudness with the target; counting the station level would send nearly every file to extra windows.
+        if not _recheck and abs(gain_db - gain_offset_db) >= GAIN_CHECK_DRASTIC_DB:
             _check_batches = GAIN_CHECK_DRASTIC_EXTRA_BATCHES
         _check_duration = _dur_info.get("duration_sec")
         if _check_batches and _windows and _lufs_sample_windows(_check_duration) is not None:
@@ -9045,7 +9428,8 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
         _base_gain = max(_atten_floor, min(gain, _ceiling))
         combined_tp = _combine_true_peak_readings(tp_readings)
         _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _base_gain, combined_tp)
-        if (combined_tp is not None and _lufs_sample_windows(_dur_info.get("duration_sec")) is not None
+        if (LOUDNESS_WHOLE_FILE_PEAK_CHECK and combined_tp is not None
+                and _lufs_sample_windows(_dur_info.get("duration_sec")) is not None
                 and combined_tp + 20 * math.log10(_clamped_gain) > TRUE_PEAK_CEILING_DBTP - TRUE_PEAK_CONFIRM_MARGIN_DB):
             _whole_tp = _lufs_window_ffmpeg(
                 file_path, target_lufs, timeout=TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS,
@@ -9067,9 +9451,9 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                 "loudness_wide_lra",
                 "[LOUDNESS PROBE] %s: wide loudness range (%.1f LU) on the "
                 "scanned window(s) -- integrated/true-peak targets are met, "
-                "but this is a signal (not a measurement) that a short-term "
-                "moment could still land well above -20 LUFS/3s",
-                os.path.basename(file_path), _max_lra,
+                "but this is a signal (not a measurement) that a 3-second "
+                "moment could still land well above the %.1f LUFS the file now plays at",
+                os.path.basename(file_path), _max_lra, measured_i + (20 * math.log10(_clamped_gain)),
             )
         if shortfall_out is not None:
             shortfall_out.update({
@@ -9111,6 +9495,18 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                     "needed_gain": gain,
                     "clamped_gain": _clamped_gain,
                 })
+        if not _recheck:
+            # WARNING: the live first scan must hand back the playing track's gain at once, so its other tracks are scanned on a thread; a background scan does them before it moves on.
+            _other_args = (file_path, target_lufs, _scan_audio_stream_index(file_path), _clamped_gain, _dialogue,
+                           _dur_info.get("duration_sec"), music, gain_offset_db, _atten_floor, _ceiling)
+            _other_kwargs = {"semaphore": semaphore, "chunk_timeout": chunk_timeout, "semaphore_timeout": semaphore_timeout}
+            if parallel_windows:
+                # WARNING: the thread uses the ordinary probe slot and gate, never the live scan's priority slot.
+                _other_kwargs = {"semaphore": None, "chunk_timeout": chunk_timeout, "semaphore_timeout": None}
+                threading.Thread(target=_scan_other_audio_tracks, args=_other_args, kwargs=_other_kwargs,
+                                 daemon=True, name="loudness-other-tracks").start()
+            else:
+                _scan_other_audio_tracks(*_other_args, **_other_kwargs)
         return _clamped_gain
     except (NoAudioStreamError, UnplayableMediaError, LoudnessProbeTimeoutError):
         raise
@@ -9158,6 +9554,7 @@ def get_music_loudness_gain(file_path, raise_on_no_audio=False,
         db=db,
         semaphore=_MUSIC_LOUDNESS_PROBE_SEMAPHORE,
         attenuation_floor=MUSIC_GAIN_FLOOR,
+        music=True,
     )
 
 
@@ -9187,13 +9584,11 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
         stderr_for_stream_checks = ""
         any_timeout = False
         for _fp in (path1, path2):
-            _pair_dialogue = None
-            if target_lufs != MUSIC_TARGET_LUFS:
-                _pair_dialogue, _pair_dialogue_timed_out = _resolve_dialogue_basis(
-                    _fp, semaphore=_LOUDNESS_PROBE_SEMAPHORE)
-                if _pair_dialogue_timed_out:
-                    any_timeout = True
-                    continue
+            _pair_dialogue, _pair_dialogue_timed_out = _resolve_dialogue_basis(
+                _fp, semaphore=_LOUDNESS_PROBE_SEMAPHORE)
+            if _pair_dialogue_timed_out:
+                any_timeout = True
+                continue
             _r, _tp_r, _lra_r, _stderr, _timed_out = _sample_lufs_readings(
                 _fp, target_lufs, semaphore=_LOUDNESS_PROBE_SEMAPHORE, dialogue=_pair_dialogue)
             readings.extend(_r)
@@ -9397,7 +9792,8 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except OSError:
+            except OSError as _swallowed_error:
+                _log_swallowed("bake_compressor_pass: os.remove(tmp_path)", _swallowed_error)
                 pass
         _threshold_lin = 10 ** (COMPRESSOR_THRESHOLD_DB / 20.0)
         _makeup_lin = 10 ** (COMPRESSOR_MAKEUP_DB / 20.0)
@@ -9419,7 +9815,8 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("bake_compressor_pass: os.remove(tmp_path)", _swallowed_error)
                     pass
             return None
         if (result.returncode != 0 or not os.path.exists(tmp_path)
@@ -9434,7 +9831,8 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
-                except OSError:
+                except OSError as _swallowed_error:
+                    _log_swallowed("bake_compressor_pass: os.remove(tmp_path)", _swallowed_error)
                     pass
             return None
         os.replace(tmp_path, out_path)
@@ -9466,16 +9864,11 @@ class RetroDatabase:
         self.config_path = os.path.join(self.base_dir, "retro_config.json")
         self._detected_aspect_ratio = detected_aspect_ratio
 
-        self.playback_active_check = None
-        
-        self.themes = {
-            "DefaultBlueGreen": {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)},
-            "Classic Amber": {"ui": (255, 170, 0), "bg": (15, 10, 0), "text": (240, 220, 180)}
-        }
+        # WARNING: the fallback colours below must match COLOR_THEMES in performance_governor.py; they are used only when that module fails to import.
+        self.themes = {k: dict(v) for k, v in _perf_governor.COLOR_THEMES.items()} if _perf_governor is not None else {"DefaultBlueGreen": {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)}, "Classic Amber": {"ui": (255, 170, 0), "bg": (15, 10, 0), "text": (240, 220, 180)}}
         
         self.config = {}
         self.channels_db = {}
-        self.audio_files = [] 
         self.ready_flag = False
         self._save_lock = threading.Lock()
         self._save_request_lock = threading.Lock()
@@ -9487,7 +9880,9 @@ class RetroDatabase:
         self._channels_save_generation = 0
 
         # WARNING: the config and channels writers must never target the same physical file.
-        self.runtime_path = os.path.join(self.base_dir, "playback_runtime.json")
+        # WARNING: the runtime file and the settings save's temporary file live in root/logs (LOGS_FOLDER_NAME in retro_tv_emulator.py), so nothing pops up beside the exe while the app saves.
+        self.logs_dir = os.path.join(self.base_dir, "logs")
+        self.runtime_path = os.path.join(self.logs_dir, "playback_runtime.json")
         self._runtime_lock = threading.Lock()
         self._runtime_save_generation = 0
 
@@ -9523,9 +9918,8 @@ class RetroDatabase:
             config["_static_color_migrated"] = True
         # WARNING: the Aspect Ratio settings have no controls. The picture box follows each video's own shape, a screen that is not 16:9 gets the 16:9 picture boxed inside it, and Bezel mode sets 4:3 itself at boot, so the saved value is forced back to 16:9 here (this also clears a 4:3 the old setting saved), and the old DVD and Games Aspect Ratio keys are dropped from the config.
         config["aspect_ratio"] = "16:9"
-        for _gone_key in ("dvd_aspect_ratio", "game_aspect_ratio", "_aspect_ratio_before_bezel", "_dvd_aspect_ratio_before_bezel", "_game_aspect_ratio_before_bezel"):
+        for _gone_key in ("dvd_aspect_ratio", "game_aspect_ratio", "_aspect_ratio_before_bezel", "_dvd_aspect_ratio_before_bezel", "_game_aspect_ratio_before_bezel", "_aspect_screen_forcing_migrated"):
             config.pop(_gone_key, None)
-        config["_aspect_screen_forcing_migrated"] = True
         return config
 
     def _build_channels_db(self, raw_channels):
@@ -9706,7 +10100,8 @@ class RetroDatabase:
         for key, value in channels.items():
             try:
                 channel_num = int(str(key))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as _swallowed_error:
+                _log_swallowed("RetroDatabase.apply_remote_schedule: channel_num = int(str(key))", _swallowed_error)
                 continue
             if 5 <= channel_num <= 44 and isinstance(value, dict):
                 normalized[str(channel_num).zfill(2)] = value
@@ -9952,7 +10347,6 @@ class RetroDatabase:
             "_static_color_migrated": True,
             "volume_bar_style": "1",
             "aspect_ratio": "16:9",
-            "_aspect_screen_forcing_migrated": True,
             "fake_43_border_enabled": False,
             "bezel_style": 1,
             "fake_43_scanlines_enabled": False,
@@ -10142,6 +10536,7 @@ class RetroDatabase:
     @staticmethod
     def _atomic_write_json(tmp_path, final_path, data):
         """Write `data` to `tmp_path` as JSON, fsync, then atomically rename onto `final_path`."""
+        os.makedirs(os.path.dirname(tmp_path) or ".", exist_ok=True)
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=4)
             f.flush()
@@ -10155,7 +10550,7 @@ class RetroDatabase:
                 with self._save_request_lock:
                     if generation != self._save_generation:
                         return
-                tmp_path = self.config_path + ".tmp"
+                tmp_path = os.path.join(self.logs_dir, "retro_config.json.tmp")
                 self._atomic_write_json(
                     tmp_path, self.config_path,
                     {"config": config_snapshot, "channels": self._main_channels_cache},
@@ -10173,7 +10568,7 @@ class RetroDatabase:
                 if path == self.config_path:
                     self._main_channels_cache = channels_snapshot
                     with self._save_lock:
-                        tmp_path = self.config_path + ".tmp"
+                        tmp_path = os.path.join(self.logs_dir, "retro_config.json.tmp")
                         self._atomic_write_json(
                             tmp_path, self.config_path,
                             {"config": copy.deepcopy(self.config), "channels": channels_snapshot},
@@ -10252,7 +10647,6 @@ class RetroDatabase:
 
     def factory_reset(self):
 
-        kept_file_data = {key: self.config[key] for key in FACTORY_RESET_KEEPS_FILE_DATA if key in self.config}
         game_ch_flag   = self.config.get("game_channel_enabled", True)
         guide_ch_flag  = self.config.get("tv_guide_enabled", True)
         theme_name     = self.config.get("current_theme", "DefaultBlueGreen")
@@ -10300,7 +10694,6 @@ class RetroDatabase:
             "menu_opacity": menu_opacity,
             "transition_type": transition_type,
             "aspect_ratio": "16:9",
-            "_aspect_screen_forcing_migrated": True,
             "fake_43_border_enabled": False,
             "bezel_style": 1,
             "fake_43_scanlines_enabled": False,
@@ -10333,7 +10726,6 @@ class RetroDatabase:
             "dvd_splash_enabled": dvd_splash_enabled,
             "dvd_splash_path": dvd_splash_path,
         }
-        self.config.update(kept_file_data)
 
         self.channels_db = self._build_channels_db({})
 
@@ -10353,7 +10745,7 @@ __all__ = [
     "FAST_DISK_IO_MAX_CONCURRENT", "LEFTOVERS_TITLE", "LIVE_CAPTION_CHUNK_SEC",
     "LIVE_CAPTION_LEAD_SEC", "LIVE_CAPTION_MAX_LEAD_SEC", "LIVE_CAPTION_READY_DEADLINE_SEC",
     "LOUDNESS_CONVERGENCE_DB", "LOUDNESS_WINDOW_DISAGREE_LU",
-    "FACTORY_RESET_KEEPS_FILE_DATA", "LOUDNESS_GAIN_CEILING", "LOUDNESS_GAIN_SCAN_VERSION", "OWNER_GAIN_SCAN_VERSION", "LOUDNESS_GAIN_FLOOR", "LOUDNESS_GAIN_FLOOR_STANDARD",
+"LOUDNESS_GAIN_CEILING", "LOUDNESS_GAIN_SCAN_VERSION", "OWNER_GAIN_SCAN_VERSION", "LOUDNESS_GAIN_FLOOR", "LOUDNESS_GAIN_FLOOR_STANDARD",
     "LOUDNESS_PROBE_MAX_CONCURRENT", "LOUDNESS_WIDE_LRA_FLAG_LU",
     "LiveCaptionSession",
     "LoudnessProbeTimeoutError", "MOVIES_PER_BLOCK", "MOVIE_HEAVY_RATIO",
@@ -10368,14 +10760,14 @@ __all__ = [
     "build_block_timeline", "build_ordered_tracks", "build_show_rotation",
     "check_media_truly_ended", "clean_display_title_for_ext", "clean_music_display_title",
     "clean_video_display_title", "commercial_bundle_ceiling", "dedupe_duplicate_episode_files",
-    "dedupe_same_name_different_extension", "discover_bezel_style_files", "discover_holiday_bezel_files", "holiday_bezel_path_for", "holiday_key_for_date", "holiday_date", "HOLIDAY_KEYS", "holiday_days_until_open", "holiday_force_channels", "holiday_forced_key_global", "holiday_forced_key_for_channel", "holiday_force_row_states", "holiday_force_enabled_rows", "holiday_force_toggle", "holiday_force_started_today", "dvd_disc_mrl",
+    "dedupe_same_name_different_extension", "discover_bezel_style_files", "discover_holiday_bezel_files", "holiday_bezel_path_for", "holiday_key_for_date", "holiday_date", "HOLIDAY_KEYS", "holiday_days_until_open", "holiday_force_channels", "holiday_forced_key_global", "holiday_forced_key_for_channel", "holiday_force_row_states", "holiday_force_toggle", "holiday_force_started_today", "dvd_disc_mrl",
     "fast_forward_show_pos", "schedule_rows_from_timeline", "schedule_rows_from_lineup", "bundles_of_tracks", "sequential_state_after_path", "sequential_state_shifted", "take_sequential_entries", "generate_captions_via_asr_chunked", "get_cached_compressor_bake",
     "get_disc_info", "get_media_duration", "get_media_loudness_gain",
     "get_media_video_dimensions", "get_music_loudness_gain", "get_pair_loudness_gain",
     "group_shows_flexible", "is_dvd_disc_source", "is_movie_track", "is_optical_drive_root",
     "is_shortcut_path", "iter_files_resolving_shortcuts", "migrate_show_positions",
-    "note_random_episode_played", "draw_from_shuffle_bag_by_file", "random_bag_entry_indices", "random_last_entry", "lineup_groups", "pair_movie_parts", "track_duration_is_known", "pair_short_episodes", "guide_pair_title",
-    "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_caption_source", "get_file_facts_hub", "file_facts", "file_is_confirmed_bad", "note_caption_source",
+    "note_random_episode_played", "draw_from_shuffle_bag_by_file", "draw_random_short_pairs", "random_bag_entry_indices", "random_last_entry", "lineup_groups", "pair_movie_parts", "track_duration_is_known", "pair_short_episodes", "guide_pair_title",
+    "parse_caption_cues", "filename_says_captions_baked_in", "probe_file_level_recovery", "request_media_shutdown", "resolve_bezel_dir", "resolve_splash_images_dir", "console_splash_file", "resolve_caption_source", "get_file_facts_hub", "file_facts", "file_is_confirmed_bad", "note_caption_source",
     "resolve_captions_dir", "resolve_dir_entry", "resolve_loudness_dir", "resolve_main_dir",
     "build_pending_tracks", "group_pending_tracks", "resolve_shortcut_chain", "resolve_shortcut_target", "resolve_track_duration",
     "resolve_whisper_model_dir", "set_caption_memory_refusal_handler", "set_live_playback_priority", "split_movies_and_series",

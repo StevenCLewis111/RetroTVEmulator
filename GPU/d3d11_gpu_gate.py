@@ -245,12 +245,13 @@ class GPUGate:
         self._frame_failures = 0
         self._lost_count = 0
         self._retry_at = 0.0
-        self._disabled_reason = None
         self._prepared = None
         self._prep_thread = None
         self._prep_error = None
 
-    # -- state ----------------------------------------------------------------
+    # ========================================================================
+    # SECTION: State
+    # ========================================================================
     @property
     def state(self) -> str:
         return self._state
@@ -263,11 +264,9 @@ class GPUGate:
     def pipeline(self):
         return self._pipeline
 
-    @property
-    def disabled_reason(self):
-        return self._disabled_reason
-
-    # -- opening ---------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Opening
+    # ========================================================================
     def acquire(self, hwnd: int, width: int, height: int, effects: FrameParams, template=None):
         """Returns the frame pipeline when the GPU path may draw this frame, opening it (with the self-check) when needed; None means draw on the CPU."""
         if self._state == STATE_READY:
@@ -366,7 +365,9 @@ class GPUGate:
                  (finished - started) * 1000.0, (device_done - started) * 1000.0, (shaders_done - device_done) * 1000.0,
                  (finished - shaders_done) * 1000.0, prepared.build_ms, prepared.shader_ms)
 
-    # -- running -----------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Running
+    # ========================================================================
     def report_success(self) -> None:
         """Tells the gate the last GPU frame was drawn and presented, which clears the failed-frames-in-a-row count."""
         self._frame_failures = 0
@@ -407,7 +408,9 @@ class GPUGate:
             return False
         return True
 
-    # -- failure policy ---------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Failure policy
+    # ========================================================================
     def _note_open_failure(self, exc):
         self._open_failures += 1
         if self._open_failures >= self._settings.failure_limit:
@@ -430,10 +433,11 @@ class GPUGate:
     def _disable(self, reason):
         self._close_resources()
         self._state = STATE_DISABLED
-        self._disabled_reason = reason
         log.warning("[GPU GATE] switched off for this run, drawing on the CPU: %s", reason)
 
-    # -- teardown ----------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Teardown
+    # ========================================================================
     @staticmethod
     def _teardown(core, pipeline) -> None:
         for name, obj in (("pipeline", pipeline), ("core", core)):
@@ -473,4 +477,3 @@ class GPUGate:
         self._frame_failures = 0
         self._lost_count = 0
         self._retry_at = 0.0
-        self._disabled_reason = None

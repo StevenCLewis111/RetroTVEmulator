@@ -38,6 +38,12 @@ except Exception:
         """Fallback used only when performance_governor cannot be imported: the failure line is lost, nothing else changes."""
         return None
 
+try:
+    import performance_governor as _governor
+except Exception as _governor_import_error:
+    _governor = None
+    logging.getLogger(__name__).warning("[MEDIA LIBRARY] could not import performance_governor, using the fallback values written in media_library.py: %s", _governor_import_error)
+
 # ============================================================================
 # SECTION: Storage location & database
 # ============================================================================
@@ -99,6 +105,19 @@ CREATE TABLE IF NOT EXISTS library (
     manual_gain_db      REAL,       -- the owner's own dB correction for this file; 0 means the owner set it back to zero
     gain_checked        INTEGER,    -- 1 once the scanned gain was double-checked with extra scans; a new scan result sets it back to 0
     gain_windows        TEXT,       -- JSON [[place in the file as a fraction, measured LUFS], ...]: every sample window behind the saved scanned gain
+    audio_track_id      INTEGER,    -- the owner's chosen audio track: VLC's track id
+    audio_track_name    TEXT,       -- the owner's chosen audio track: VLC's label
+    audio_track_index   INTEGER,    -- the owner's chosen audio track: its place among the file's audio tracks, 0 = first
+    learn_series_key    TEXT,       -- loudness learning: the series this file belongs to
+    learn_change_db     REAL,       -- loudness learning: how many dB the owner moved this file from its own scan
+    learn_change_at     REAL,       -- loudness learning: when that change was made (seconds since 1970)
+    learn_baseline_db   REAL,       -- loudness learning: the file's own scanned dB when the owner first changed it
+    learn_applied_db    REAL,       -- loudness learning: the series offset added to the file's saved scanned gain
+    learn_slider_db     REAL,       -- loudness learning: the offset in dB the volume kept while watching this episode asked for
+    learn_slider_at     REAL,       -- loudness learning: when that episode was watched (seconds since 1970)
+    learn_watch_volume  REAL,       -- loudness learning: the volume slider setting kept for most of the last watch of this file
+    learn_watch_at      REAL,       -- loudness learning: when that watch ended (seconds since 1970)
+    track_gains         TEXT,       -- JSON {"primary": audio track the saved gain was measured on, "version": scan version, "gains": {"track number": gain}}: the scanned gain of every audio track
 
     captions_blob       BLOB,       -- zlib-compressed cue text
     captions_source     TEXT,       -- "embedded" | "sidecar" | "asr"
@@ -206,6 +225,19 @@ _LIBRARY_ADDED_COLUMNS = (
     ("manual_gain_db", "REAL"),
     ("gain_checked", "INTEGER"),
     ("gain_windows", "TEXT"),
+    ("track_gains", "TEXT"),
+    ("audio_track_id", "INTEGER"),
+    ("audio_track_name", "TEXT"),
+    ("audio_track_index", "INTEGER"),
+    ("learn_series_key", "TEXT"),
+    ("learn_change_db", "REAL"),
+    ("learn_change_at", "REAL"),
+    ("learn_baseline_db", "REAL"),
+    ("learn_applied_db", "REAL"),
+    ("learn_slider_db", "REAL"),
+    ("learn_slider_at", "REAL"),
+    ("learn_watch_volume", "REAL"),
+    ("learn_watch_at", "REAL"),
     ("caption_kind", "TEXT"),
     ("caption_srt_path", "TEXT"),
     ("unplayable_strikes", "INTEGER"),
@@ -248,6 +280,31 @@ class MediaLibrary:
         for name, sql_type in _LIBRARY_ADDED_COLUMNS:
             if name not in have:
                 self._conn.execute(f"ALTER TABLE library ADD COLUMN {name} {sql_type}")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_library_learn_series ON library(learn_series_key)")
+
+    def series_learning_rows(self, series_key: str):
+        """(change dB, change time) of every file of one series that holds an owner loudness change, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT learn_change_db, learn_change_at FROM library WHERE learn_series_key=? AND learn_change_db IS NOT NULL "
+                "ORDER BY learn_change_at", (series_key,)).fetchall()
+        return [(float(r[0]), float(r[1] or 0.0)) for r in rows]
+
+    def series_slider_rows(self, series_key: str):
+        """(wanted offset dB, watch time) of every file of one series the volume kept while watching was learned from, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT learn_slider_db, learn_slider_at FROM library WHERE learn_series_key=? AND learn_slider_db IS NOT NULL "
+                "ORDER BY learn_slider_at", (series_key,)).fetchall()
+        return [(float(r[0]), float(r[1] or 0.0)) for r in rows]
+
+    def comfort_watch_volumes(self, limit: int):
+        """The volume kept on the most recently watched files whose gain the owner set by hand, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT learn_watch_volume FROM library WHERE gain_scan_version=? AND learn_watch_volume IS NOT NULL "
+                "ORDER BY learn_watch_at DESC LIMIT ?", (_OWNER_GAIN_SCAN_VERSION, int(limit))).fetchall()
+        return [float(r[0]) for r in rows]
 
     def _ensure_schedule_row_columns(self):
         """Adds the bundle, row_files and guide_entry columns to a hub_schedule_row table an older database file lacks, keeping every row."""
@@ -272,6 +329,15 @@ class MediaLibrary:
             return self._conn.execute(
                 "SELECT l.gain, l.gain_target_lufs, l.gain_scan_version, l.gain_convergence_db, l.manual_gain_db, l.width, l.height "
                 "FROM path_keys p JOIN library l ON l.content_key = p.content_key WHERE p.norm_path = ?",
+                (norm_path,),
+            ).fetchone()
+
+    def path_facts_row(self, norm_path: str):
+        """The stored caption-source, playability and loudness-retry fields for one keyed path, in FILE_FACT_COLUMNS order, or None when the path was never keyed; nothing is read from the file itself."""
+        columns = ", ".join("l." + name for name in FILE_FACT_COLUMNS)
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT {columns} FROM path_keys p JOIN library l ON l.content_key = p.content_key WHERE p.norm_path = ?",
                 (norm_path,),
             ).fetchone()
 
@@ -356,7 +422,8 @@ class MediaLibrary:
             if d.get(json_field):
                 try:
                     d[json_field] = json.loads(d[json_field])
-                except (TypeError, ValueError):
+                except (TypeError, ValueError) as _swallowed_error:
+                    _log_swallowed("MediaLibrary.get_entry: d[json_field] = json.loads(d[json_field])", _swallowed_error)
                     d[json_field] = None
         return d
 
@@ -402,7 +469,8 @@ class MediaLibrary:
 # ============================================================================
 
 _SAMPLE_SIZE = 64 * 1024
-_GROWING_FILE_CHECK_DELAY_S = 0.05
+# WARNING: the fallback number below must match LIBRARY_GROWING_FILE_CHECK_DELAY_S in performance_governor.py; it is used only when that module fails to import.
+_GROWING_FILE_CHECK_DELAY_S = _governor.LIBRARY_GROWING_FILE_CHECK_DELAY_S if _governor is not None else 0.05
 
 
 def _sample_offsets(size: int):
@@ -419,13 +487,15 @@ def compute_identity_key(file_path: str, growing_check_delay: float = _GROWING_F
     """File size plus a SHA-1 of up to three 64 KB samples (start, middle, end)."""
     try:
         size_before = os.path.getsize(file_path)
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("compute_identity_key: size_before = os.path.getsize(file_path)", _swallowed_error)
         return None
     if growing_check_delay > 0:
         time.sleep(growing_check_delay)
         try:
             size_after = os.path.getsize(file_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("compute_identity_key: size_after = os.path.getsize(file_path)", _swallowed_error)
             return None
         if size_after != size_before:
             return None
@@ -443,9 +513,20 @@ def compute_identity_key(file_path: str, growing_check_delay: float = _GROWING_F
                 for offset in _sample_offsets(size):
                     f.seek(offset)
                     h.update(f.read(_SAMPLE_SIZE))
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("compute_identity_key: import media as _media", _swallowed_error)
         return None
     return f"{size:x}-{h.hexdigest()}"
+
+
+# WARNING: the app registers its main (UI) thread here at startup. That thread must never open a file to hash it: a path with no saved key is queued for the background keyer and reads as "not keyed yet" until the key lands. Tests and tools never register one, so they hash inline as before.
+_UI_THREAD_IDENT = None
+
+
+def set_ui_thread(ident):
+    """Registers the thread id that must never hash a file; None switches the guard off."""
+    global _UI_THREAD_IDENT
+    _UI_THREAD_IDENT = ident
 
 
 class PathKeyResolver:
@@ -453,25 +534,64 @@ class PathKeyResolver:
 
     def __init__(self, library: MediaLibrary):
         self.library = library
+        self._key_lock = threading.Lock()
+        self._key_queue = {}
+        self._key_wake = threading.Event()
+        self._key_thread = None
 
     def resolve(self, file_path: str) -> Optional[str]:
         norm_path = os.path.normpath(os.path.abspath(file_path)).lower()
         try:
             st = os.stat(file_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("PathKeyResolver.resolve: st = os.stat(file_path)", _swallowed_error)
             return None
         cached = self.library.lookup_path_key(norm_path, st.st_size, st.st_mtime)
         if cached is not None:
             return cached
+        if _UI_THREAD_IDENT is not None and threading.get_ident() == _UI_THREAD_IDENT:
+            self._queue_background_key(norm_path, file_path)
+            return None
         content_key = compute_identity_key(file_path)
         if content_key is None:
             return None
         try:
             st = os.stat(file_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("PathKeyResolver.resolve: st = os.stat(file_path)", _swallowed_error)
             return None
         self.library.store_path_key(norm_path, st.st_size, st.st_mtime, content_key)
         return content_key
+
+    def _queue_background_key(self, norm_path, file_path):
+        """Hands a path to the one background keyer thread; never blocks."""
+        with self._key_lock:
+            self._key_queue.setdefault(norm_path, file_path)
+            if self._key_thread is None or not self._key_thread.is_alive():
+                self._key_thread = threading.Thread(target=self._key_worker, name="PathKeyer", daemon=True)
+                self._key_thread.start()
+        self._key_wake.set()
+
+    def _key_worker(self):
+        while True:
+            with self._key_lock:
+                item = None
+                if self._key_queue:
+                    norm_path = next(iter(self._key_queue))
+                    item = (norm_path, self._key_queue.pop(norm_path))
+            if item is None:
+                self._key_wake.clear()
+                if not self._key_wake.wait(timeout=30.0):
+                    with self._key_lock:
+                        if not self._key_queue:
+                            self._key_thread = None
+                            return
+                continue
+            try:
+                self.resolve(item[1])
+            except Exception as _swallowed_error:
+                _log_swallowed("PathKeyResolver._key_worker: keying a queued file", _swallowed_error)
+            time.sleep(0.01)
 
 
 # ============================================================================
@@ -594,32 +714,20 @@ PICTURE_BOX_DETECTOR_VERSION = 3
 
 _CROPDETECT_RE = _re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 
-_PB_SAMPLE_FRACTIONS = (0.10, 0.25, 0.40, 0.55, 0.70, 0.85)
-_PB_FALLBACK_OFFSETS_S = (30.0, 120.0, 300.0)
-_PB_SAMPLE_SECONDS = 2.0
-_PB_SAMPLE_TIMEOUT_S = 25.0
-_PB_MIN_GOOD_SAMPLES = 3
-_PB_LIMIT = 32
-_PB_MIN_BAR_FRACTION = 0.015
-_PB_MIN_BAR_PX = 4
-_PB_SYMMETRY_TOLERANCE = 0.25
-
-# WARNING: the fallback numbers must match PICTURE_BOX_FLAT_* in performance_governor.py; they are used only when that module fails to import.
-try:
-    import performance_governor as _pb_governor
-
-    _PB_FLAT_W = int(_pb_governor.PICTURE_BOX_FLAT_WIDTH)
-    _PB_FLAT_H = int(_pb_governor.PICTURE_BOX_FLAT_HEIGHT)
-    _PB_FLAT_TOLERANCE = int(_pb_governor.PICTURE_BOX_FLAT_TOLERANCE)
-    _PB_FLAT_FRAMES = int(_pb_governor.PICTURE_BOX_FLAT_FRAMES)
-    _PB_FLAT_MIN_PICTURE_FRACTION = float(_pb_governor.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION)
-except Exception as _swallowed_error:
-    _log_swallowed("media_library picture box flat tunables: import performance_governor as _pb_governor", _swallowed_error)
-    _PB_FLAT_W = 640
-    _PB_FLAT_H = 480
-    _PB_FLAT_TOLERANCE = 12
-    _PB_FLAT_FRAMES = 2
-    _PB_FLAT_MIN_PICTURE_FRACTION = 0.125
+# WARNING: the fallback numbers below must match PICTURE_BOX_SAMPLE_FRACTIONS, PICTURE_BOX_FALLBACK_OFFSETS_S, PICTURE_BOX_SAMPLE_SECONDS, PICTURE_BOX_SAMPLE_TIMEOUT_S, PICTURE_BOX_MIN_GOOD_SAMPLES, PICTURE_BOX_CROPDETECT_LIMIT, PICTURE_BOX_MIN_BAR_FRACTION, PICTURE_BOX_MIN_BAR_PX and PICTURE_BOX_FLAT_* in performance_governor.py; they are used only when that module fails to import.
+_PB_SAMPLE_FRACTIONS = _governor.PICTURE_BOX_SAMPLE_FRACTIONS if _governor is not None else (0.10, 0.25, 0.40, 0.55, 0.70, 0.85)
+_PB_FALLBACK_OFFSETS_S = _governor.PICTURE_BOX_FALLBACK_OFFSETS_S if _governor is not None else (30.0, 120.0, 300.0)
+_PB_SAMPLE_SECONDS = _governor.PICTURE_BOX_SAMPLE_SECONDS if _governor is not None else 2.0
+_PB_SAMPLE_TIMEOUT_S = _governor.PICTURE_BOX_SAMPLE_TIMEOUT_S if _governor is not None else 25.0
+_PB_MIN_GOOD_SAMPLES = _governor.PICTURE_BOX_MIN_GOOD_SAMPLES if _governor is not None else 3
+_PB_LIMIT = _governor.PICTURE_BOX_CROPDETECT_LIMIT if _governor is not None else 32
+_PB_MIN_BAR_FRACTION = _governor.PICTURE_BOX_MIN_BAR_FRACTION if _governor is not None else 0.015
+_PB_MIN_BAR_PX = _governor.PICTURE_BOX_MIN_BAR_PX if _governor is not None else 4
+_PB_FLAT_W = _governor.PICTURE_BOX_FLAT_WIDTH if _governor is not None else 640
+_PB_FLAT_H = _governor.PICTURE_BOX_FLAT_HEIGHT if _governor is not None else 480
+_PB_FLAT_TOLERANCE = _governor.PICTURE_BOX_FLAT_TOLERANCE if _governor is not None else 12
+_PB_FLAT_FRAMES = _governor.PICTURE_BOX_FLAT_FRAMES if _governor is not None else 2
+_PB_FLAT_MIN_PICTURE_FRACTION = _governor.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION if _governor is not None else 0.125
 
 
 def _pb_axis(start: int, length: int, frame: int):
@@ -721,6 +829,64 @@ def _pb_cropdetect_threads() -> int:
         return 2
 
 
+_pb_gpu_state = {"checked_for": None, "available": False, "failures": 0, "off_logged": False, "on_logged": False}
+_pb_gpu_lock = threading.Lock()
+
+
+def _pb_gpu_decode_args(ffmpeg: str) -> list:
+    """The ffmpeg arguments that move the picture-box decode onto the GPU, or [] when this PC, this ffmpeg or this run may not use it; the ffmpeg check runs once per ffmpeg path."""
+    try:
+        import performance_governor as _pg
+        if not _pg.scan_gpu_decode_allowed():
+            return []
+        hwaccel = str(_pg.SCAN_GPU_DECODE_HWACCEL)
+        check_timeout = float(_pg.SCAN_GPU_DECODE_CHECK_TIMEOUT_SECONDS)
+        failure_limit = int(_pg.SCAN_GPU_DECODE_FAILURE_LIMIT)
+    except Exception as _swallowed_error:
+        _log_swallowed("_pb_gpu_decode_args: reading the governor's GPU scan values", _swallowed_error)
+        return []
+    with _pb_gpu_lock:
+        if _pb_gpu_state["failures"] >= failure_limit:
+            return []
+        if _pb_gpu_state["checked_for"] != ffmpeg:
+            _pb_gpu_state["checked_for"] = ffmpeg
+            _pb_gpu_state["available"] = False
+            try:
+                popen_kwargs = {}
+                if os.name == "nt":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                listed = subprocess.run([ffmpeg, "-hide_banner", "-hwaccels"], capture_output=True,
+                                        timeout=check_timeout, stdin=subprocess.DEVNULL, **popen_kwargs)
+                out = listed.stdout or b""
+                if isinstance(out, bytes):
+                    out = out.decode("utf-8", errors="replace")
+                _pb_gpu_state["available"] = hwaccel in [w.strip() for w in out.splitlines()]
+            except Exception as e:
+                log.warning("[PICTURE BOX] GPU decode check failed at 'ffmpeg -hwaccels' (scans decode on the CPU): %s", e)
+            log.info("[PICTURE BOX] GPU decode %s: hwaccel %s %s in this ffmpeg", "ON" if _pb_gpu_state["available"] else "off",
+                     hwaccel, "found" if _pb_gpu_state["available"] else "not found")
+        if not _pb_gpu_state["available"]:
+            return []
+    return ["-hwaccel", hwaccel]
+
+
+def _pb_gpu_decode_failed(file_path: str, returncode) -> None:
+    """Counts one failed GPU decode; once the governor's limit is reached the picture-box scan decodes on the CPU for the rest of the run."""
+    try:
+        import performance_governor as _pg
+        failure_limit = int(_pg.SCAN_GPU_DECODE_FAILURE_LIMIT)
+    except Exception as _swallowed_error:
+        _log_swallowed("_pb_gpu_decode_failed: reading the governor's GPU failure limit", _swallowed_error)
+        failure_limit = 1
+    with _pb_gpu_lock:
+        _pb_gpu_state["failures"] += 1
+        count = _pb_gpu_state["failures"]
+    log.warning("[PICTURE BOX] GPU decode of %s failed (exit %s), sample redone on the CPU (%d of %d)",
+                os.path.basename(file_path), returncode, count, failure_limit)
+    if count >= failure_limit:
+        log.warning("[PICTURE BOX] GPU decode switched off for this run after %d failures; scans decode on the CPU", count)
+
+
 class _PbSampleText(str):
     """The ffmpeg stderr of one sample; its frames attribute holds the gray frames read in the same decode."""
     frames: list = []
@@ -733,22 +899,40 @@ def _pb_run_sample(file_path: str, ffmpeg: str, t: float, timeout: float):
         popen_kwargs["creationflags"] = (
             subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
         )
-    cmd = [
-        ffmpeg, "-nostdin", "-hide_banner", "-threads", str(_pb_cropdetect_threads()),
-        "-ss", f"{t:.3f}", "-i", file_path, "-t", f"{_PB_SAMPLE_SECONDS:g}",
-        "-map", "0:v:0", "-vf", f"cropdetect=limit={_PB_LIMIT}:round=2:reset=0",
-        "-an", "-sn", "-dn", "-f", "null", "-",
-        "-map", "0:v:0", "-vf", f"fps=1,scale={_PB_FLAT_W}:{_PB_FLAT_H}:flags=area,format=gray",
-        "-frames:v", str(_PB_FLAT_FRAMES), "-an", "-sn", "-dn", "-f", "rawvideo", "pipe:1",
-    ]
+    gpu_args = _pb_gpu_decode_args(ffmpeg)
+
+    def _command(hw):
+        return [
+            ffmpeg, "-nostdin", "-hide_banner", "-threads", str(_pb_cropdetect_threads()),
+        ] + list(hw) + [
+            "-ss", f"{t:.3f}", "-i", file_path, "-t", f"{_PB_SAMPLE_SECONDS:g}",
+            "-map", "0:v:0", "-vf", f"cropdetect=limit={_PB_LIMIT}:round=2:reset=0",
+            "-an", "-sn", "-dn", "-f", "null", "-",
+            "-map", "0:v:0", "-vf", f"fps=1,scale={_PB_FLAT_W}:{_PB_FLAT_H}:flags=area,format=gray",
+            "-frames:v", str(_PB_FLAT_FRAMES), "-an", "-sn", "-dn", "-f", "rawvideo", "pipe:1",
+        ]
+
     try:
         import media as _media
         with _media._fast_disk_io_slot(f"picture_box({os.path.basename(file_path)})"):
-            result = subprocess.run(
-                cmd, capture_output=True,
-                timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
-            )
-    except subprocess.TimeoutExpired:
+            try:
+                result = subprocess.run(
+                    _command(gpu_args), capture_output=True,
+                    timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
+                )
+            except subprocess.TimeoutExpired:
+                if not gpu_args:
+                    raise
+                result = None
+            # WARNING: a GPU decode that fails must be redone on the CPU in the same slot, or a file the GPU cannot decode would be reported as unreadable and could be removed as broken.
+            if gpu_args and (result is None or getattr(result, "returncode", 0) != 0 or not result.stdout):
+                _pb_gpu_decode_failed(file_path, "timeout" if result is None else getattr(result, "returncode", None))
+                result = subprocess.run(
+                    _command([]), capture_output=True,
+                    timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs,
+                )
+    except subprocess.TimeoutExpired as _swallowed_error:
+        _log_swallowed("_pb_run_sample: import media as _media", _swallowed_error)
         return None
     except Exception as _swallowed_error:
         _log_swallowed("_pb_run_sample: import media as _media", _swallowed_error)
@@ -889,30 +1073,30 @@ BURNED_IN_DETECTOR_VERSION = 1
 _BI_SOURCE_BAKED = "baked"
 _BI_SOURCE_CLEAN = "clean"
 
-# VALUES CHANGE HERE
-_BI_FRAME_W = 480
-_BI_FRAME_H = 270
-_BI_SAMPLE_FRACTIONS = (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
-_BI_FALLBACK_OFFSETS_S = (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
-_BI_FRAME_TIMEOUT_S = 20.0
-_BI_REGION_TOP_FRAC = 0.55
-_BI_BRIGHT_MIN = 205
-_BI_DARK_MAX = 75
-_BI_OUTLINE_REACH_PX = 2
-_BI_ROW_MIN_TEXT_FRAC = 0.025
-_BI_ROW_MIN_TRANSITIONS = 10
-_BI_BAND_MIN_H_FRAC = 0.018
-_BI_BAND_MAX_H_FRAC = 0.10
-_BI_BAND_MIN_WIDTH_FRAC = 0.12
-_BI_BAND_CENTER_RANGE = (0.25, 0.75)
-_BI_BAND_MIN_GLYPH_CLUSTERS = 6
-_BI_BAND_MAX_FILL = 0.50
-_BI_BAND_CONTRAST_RATIO = 4.0
-_BI_POSITION_TOLERANCE_FRAC = 0.05
-_BI_MIN_POSITIVE_FRAMES = 3
-_BI_MAX_BANDS_PER_FRAME = 3
-_BI_EARLY_STOP_FRAMES = 4
-_BI_MIN_AGREEING_SHARE = 0.6
+# WARNING: the fallback numbers below must match BURNED_IN_FRAME_W, BURNED_IN_FRAME_H, BURNED_IN_SAMPLE_FRACTIONS, BURNED_IN_FALLBACK_OFFSETS_S, BURNED_IN_FRAME_TIMEOUT_S, BURNED_IN_REGION_TOP_FRAC, BURNED_IN_BRIGHT_MIN, BURNED_IN_DARK_MAX, BURNED_IN_OUTLINE_REACH_PX, BURNED_IN_ROW_MIN_TEXT_FRAC, BURNED_IN_ROW_MIN_TRANSITIONS, BURNED_IN_BAND_MIN_H_FRAC, BURNED_IN_BAND_MAX_H_FRAC, BURNED_IN_BAND_MIN_WIDTH_FRAC, BURNED_IN_BAND_CENTER_RANGE, BURNED_IN_BAND_MIN_GLYPH_CLUSTERS, BURNED_IN_BAND_MAX_FILL, BURNED_IN_BAND_CONTRAST_RATIO, BURNED_IN_POSITION_TOLERANCE_FRAC, BURNED_IN_MIN_POSITIVE_FRAMES, BURNED_IN_MAX_BANDS_PER_FRAME, BURNED_IN_EARLY_STOP_FRAMES, BURNED_IN_MIN_AGREEING_SHARE in performance_governor.py; they are used only when that module fails to import.
+_BI_FRAME_W = _governor.BURNED_IN_FRAME_W if _governor is not None else 480
+_BI_FRAME_H = _governor.BURNED_IN_FRAME_H if _governor is not None else 270
+_BI_SAMPLE_FRACTIONS = _governor.BURNED_IN_SAMPLE_FRACTIONS if _governor is not None else (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
+_BI_FALLBACK_OFFSETS_S = _governor.BURNED_IN_FALLBACK_OFFSETS_S if _governor is not None else (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+_BI_FRAME_TIMEOUT_S = _governor.BURNED_IN_FRAME_TIMEOUT_S if _governor is not None else 20.0
+_BI_REGION_TOP_FRAC = _governor.BURNED_IN_REGION_TOP_FRAC if _governor is not None else 0.55
+_BI_BRIGHT_MIN = _governor.BURNED_IN_BRIGHT_MIN if _governor is not None else 205
+_BI_DARK_MAX = _governor.BURNED_IN_DARK_MAX if _governor is not None else 75
+_BI_OUTLINE_REACH_PX = _governor.BURNED_IN_OUTLINE_REACH_PX if _governor is not None else 2
+_BI_ROW_MIN_TEXT_FRAC = _governor.BURNED_IN_ROW_MIN_TEXT_FRAC if _governor is not None else 0.025
+_BI_ROW_MIN_TRANSITIONS = _governor.BURNED_IN_ROW_MIN_TRANSITIONS if _governor is not None else 10
+_BI_BAND_MIN_H_FRAC = _governor.BURNED_IN_BAND_MIN_H_FRAC if _governor is not None else 0.018
+_BI_BAND_MAX_H_FRAC = _governor.BURNED_IN_BAND_MAX_H_FRAC if _governor is not None else 0.10
+_BI_BAND_MIN_WIDTH_FRAC = _governor.BURNED_IN_BAND_MIN_WIDTH_FRAC if _governor is not None else 0.12
+_BI_BAND_CENTER_RANGE = _governor.BURNED_IN_BAND_CENTER_RANGE if _governor is not None else (0.25, 0.75)
+_BI_BAND_MIN_GLYPH_CLUSTERS = _governor.BURNED_IN_BAND_MIN_GLYPH_CLUSTERS if _governor is not None else 6
+_BI_BAND_MAX_FILL = _governor.BURNED_IN_BAND_MAX_FILL if _governor is not None else 0.50
+_BI_BAND_CONTRAST_RATIO = _governor.BURNED_IN_BAND_CONTRAST_RATIO if _governor is not None else 4.0
+_BI_POSITION_TOLERANCE_FRAC = _governor.BURNED_IN_POSITION_TOLERANCE_FRAC if _governor is not None else 0.05
+_BI_MIN_POSITIVE_FRAMES = _governor.BURNED_IN_MIN_POSITIVE_FRAMES if _governor is not None else 3
+_BI_MAX_BANDS_PER_FRAME = _governor.BURNED_IN_MAX_BANDS_PER_FRAME if _governor is not None else 3
+_BI_EARLY_STOP_FRAMES = _governor.BURNED_IN_EARLY_STOP_FRAMES if _governor is not None else 4
+_BI_MIN_AGREEING_SHARE = _governor.BURNED_IN_MIN_AGREEING_SHARE if _governor is not None else 0.6
 
 
 def _bi_dilate(mask, reach):
@@ -1016,7 +1200,8 @@ def _bi_grab_frame(file_path, ffmpeg, t, timeout):
         with _media._fast_disk_io_slot(f"burned_in({os.path.basename(file_path)})"):
             result = subprocess.run(cmd, capture_output=True, timeout=timeout,
                                     stdin=subprocess.DEVNULL, **popen_kwargs)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as _swallowed_error:
+        _log_swallowed("_bi_grab_frame: import media as _media", _swallowed_error)
         return "timeout"
     except Exception as _swallowed_error:
         _log_swallowed("_bi_grab_frame: import media as _media", _swallowed_error)
@@ -1054,7 +1239,8 @@ def detect_burned_in_captions(file_path, duration=None, ffmpeg_path=None,
     """Returns True when subtitle text is part of the picture, False when it is not, None when it could not tell."""
     try:
         import numpy
-    except ImportError:
+    except ImportError as _swallowed_error:
+        _log_swallowed("detect_burned_in_captions: import numpy", _swallowed_error)
         if diag is not None:
             diag["reason"] = "numpy_unavailable"
         return None
@@ -1196,7 +1382,8 @@ class ProbeLibrary:
             return
         try:
             size = os.path.getsize(file_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("ProbeLibrary._probe_header_into: size = os.path.getsize(file_path)", _swallowed_error)
             size = None
         if self.use_vlc_fallback:
             duration, source = probe_duration_with_fallback(file_path, result)
@@ -1259,15 +1446,6 @@ class ProbeLibrary:
         return box
 
 
-    def store_picture_box(self, file_path: str, rect, detector_version: int):
-        content_key = self.keys.resolve(file_path)
-        if content_key is None:
-            return False
-        self.library.upsert_fields(
-            content_key, picture_box={"rect": list(rect)},
-            picture_box_detector_version=detector_version,
-        )
-        return True
 
     def store_gain(self, file_path: str, gain: float, target_lufs: Optional[float] = None,
                    scan_version: Optional[int] = None, convergence_db: Optional[float] = None,
@@ -1286,6 +1464,49 @@ class ProbeLibrary:
         self.library.upsert_fields(content_key, **fields)
         return True
 
+    def store_file_fields(self, file_path: str, **fields):
+        """Writes per-file fields (audio track choice, loudness learning) into the file's row; a field given as None is cleared. False when the file cannot be keyed yet."""
+        content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return False
+        self.library.upsert_fields(content_key, **fields)
+        return True
+
+    def file_fields(self, file_path: str, names):
+        """{name: value} of the named per-file fields, None for a field with nothing on record; None when the file cannot be keyed yet."""
+        content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return None
+        held = self.library.get_entry(content_key) or {}
+        return {name: held.get(name) for name in names}
+
+    def store_track_gains(self, file_path: str, primary: int, gains: dict, scan_version: Optional[int] = None):
+        """Stores the scanned gain of every audio track of a file ({track number: gain}, 0 = first track) and which track the file's saved gain was measured on; False when the file cannot be keyed."""
+        content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return False
+        payload = {"primary": int(primary), "version": scan_version,
+                   "gains": {str(int(k)): float(v) for k, v in gains.items() if v and float(v) > 0}}
+        self.library.upsert_fields(content_key, track_gains=json.dumps(payload))
+        return True
+
+    def track_gains(self, file_path: str):
+        """{"primary", "version", "gains"} as stored by store_track_gains, or None when nothing is on record."""
+        content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return None
+        held = self.library.get_entry(content_key)
+        raw = held.get("track_gains") if held else None
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            return {"primary": int(data.get("primary", 0)), "version": data.get("version"),
+                    "gains": {int(k): float(v) for k, v in (data.get("gains") or {}).items()}}
+        except (ValueError, TypeError, AttributeError) as _swallowed_error:
+            _log_swallowed("ProbeLibrary.track_gains: data = json.loads(raw) if isinstance(raw, str) else raw", _swallowed_error)
+            return None
+
     def gain_windows(self, file_path: str):
         """The sample windows behind the file's saved gain as (place in the file as a fraction, LUFS) pairs; empty when none are on record."""
         content_key = self.keys.resolve(file_path)
@@ -1298,7 +1519,8 @@ class ProbeLibrary:
         try:
             data = json.loads(raw) if isinstance(raw, str) else raw
             return [(float(c), float(v)) for c, v in data]
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as _swallowed_error:
+            _log_swallowed("ProbeLibrary.gain_windows: data = json.loads(raw) if isinstance(raw, str) else raw", _swallowed_error)
             return []
 
     def gain_is_checked(self, file_path: str) -> bool:
@@ -1340,32 +1562,12 @@ class ProbeLibrary:
         """True when the library keyed this path before and the file's size or modified time no longer match what was recorded."""
         try:
             st = os.stat(file_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("ProbeLibrary.file_changed_on_disk: st = os.stat(file_path)", _swallowed_error)
             return False
         stamp = self.library.path_key_stamp(os.path.normpath(os.path.abspath(file_path)).lower())
         return stamp is not None and (stamp[0] != st.st_size or stamp[1] != st.st_mtime)
 
-    def store_captions(self, file_path: str, text: str, source: str, reason: Optional[str] = None):
-        content_key = self.keys.resolve(file_path)
-        if content_key is None:
-            return False
-        blob = zlib.compress(text.encode("utf-8")) if text else None
-        self.library.upsert_fields(
-            content_key, captions_blob=blob, captions_source=source,
-            captions_reason=reason,
-        )
-        return True
-
-    def get_captions_text(self, file_path: str) -> Optional[str]:
-        entry = self.get_cached(file_path)
-        if not entry or not entry.get("captions_blob"):
-            return None
-        try:
-            return zlib.decompress(entry["captions_blob"]).decode("utf-8")
-        except (zlib.error, UnicodeDecodeError) as e:
-            log.warning("[MEDIA LIBRARY] stored captions for %s failed to decompress "
-                        "(%s) -- treating as no captions on file", os.path.basename(file_path), e)
-            return None
 
     def get_burned_in_verdict(self, file_path: str) -> Optional[bool]:
         """Read-only: the stored burned-in verdict for this file's current content (True / False), or None when it has never been scanned by the current detector."""
@@ -1440,12 +1642,6 @@ class ProbeLibrary:
             self.library.upsert_fields(content_key, pan_scan_memory=memory)
         return True
 
-    def store_pan_scan_memory(self, file_path: str, memory: dict):
-        content_key = self.keys.resolve(file_path)
-        if content_key is None:
-            return False
-        self.library.upsert_fields(content_key, pan_scan_memory=memory)
-        return True
 
     def store_file_facts(self, file_path: str, **facts):
         """Saves caption-source, playability and loudness-retry fields for a file; False when the library cannot key the file or a field is not one of FILE_FACT_COLUMNS."""
@@ -1500,15 +1696,11 @@ def _hub_key(path) -> str:
 
 
 # WARNING: the fallback must match HUB_UNMEASURED_RECHECK_SECONDS in performance_governor.py; it is used only when that module fails to import.
-try:
-    import performance_governor as _hub_governor
-    _UNMEASURED_RECHECK_SECONDS = float(_hub_governor.HUB_UNMEASURED_RECHECK_SECONDS)
-except Exception:
-    _UNMEASURED_RECHECK_SECONDS = 30.0
+_UNMEASURED_RECHECK_SECONDS = _governor.HUB_UNMEASURED_RECHECK_SECONDS if _governor is not None else 30.0
 
 
-class DurationHub:
-    """Answers one file at a time: looks the file up in the library when it is asked about and remembers the answer; nothing is read in advance. The one place the scheduler, guide and catch-up read a file's length from."""
+class _PathMemoHub:
+    """What every per-file hub shares: the library it reads, its lock, what it remembers per path, the paths it was asked about, and the paths that must be keyed again from disk."""
 
     def __init__(self, probe_library: "ProbeLibrary"):
         self.probe_library = probe_library
@@ -1516,6 +1708,30 @@ class DurationHub:
         self._memo = {}
         self._paths = {}
         self._must_resolve = set()
+
+    def forget(self, path):
+        """Drops what the hub remembers about a path because the file changed on disk; the next look-up re-keys the file from disk and finds that file's own record. The library rows stay."""
+        key = _hub_key(path)
+        with self._lock:
+            self._memo.pop(key, None)
+            self._must_resolve.add(key)
+
+    def known_paths(self):
+        """The paths this hub has been asked about, as the caller gave them."""
+        with self._lock:
+            return list(self._paths.values())
+
+
+class DurationHub(_PathMemoHub):
+    """Answers one file at a time: looks the file up in the library when it is asked about and remembers the answer; nothing is read in advance. The one place the scheduler, guide and catch-up read a file's length from."""
+
+    def __init__(self, probe_library: "ProbeLibrary"):
+        super().__init__(probe_library)
+        self._pending_estimates = {}
+        self._estimate_wake = threading.Event()
+        self._estimate_idle = threading.Event()
+        self._estimate_idle.set()
+        self._estimate_thread = None
 
     def _read_row(self, key, path, force):
         """The file's (measured, estimate) from the library; a forgotten file is re-keyed from disk first."""
@@ -1586,7 +1802,8 @@ class DurationHub:
         return saved
 
     def store_estimate(self, path, seconds, basis):
-        """Saves an estimate for a file with no measured length; a file that already has an estimate keeps it. Returns the estimate on record, or None for a measured file or a length that is not positive."""
+        """Saves an estimate for a file with no measured length; a file that already has an estimate keeps it. Returns the estimate on record, or None for a measured file or a length that is not positive. The answer is held in memory at once and the library row is written by one background thread, so nothing on the asking thread ever opens a file."""
+        # WARNING: this is called while the schedule is built, on the main thread too; keying a new file here (a disk read behind the governor gate) froze the app for a minute when hundreds of files were added.
         if not seconds or seconds <= 0:
             return None
         key = _hub_key(path)
@@ -1596,37 +1813,61 @@ class DurationHub:
         if existing:
             return int(existing)
         saved = float(int(round(seconds)))
-        try:
-            content_key = self.probe_library.keys.resolve(path)
-            if content_key is not None:
-                entry = self.probe_library.library.get_entry(content_key) or {}
-                if entry.get("duration") and entry["duration"] > 0:
-                    with self._lock:
-                        self._memo[key] = [float(entry["duration"]), entry.get("estimated_duration"), time.monotonic()]
-                    return None
-                if entry.get("estimated_duration") and entry["estimated_duration"] > 0:
-                    saved = float(entry["estimated_duration"])
-                else:
-                    self.probe_library.library.upsert_fields(
-                        content_key, estimated_duration=saved, estimated_at=time.time(), estimate_basis=basis)
-        except Exception as _swallowed_error:
-            _log_swallowed("DurationHub.store_estimate: saving the estimate to the library", _swallowed_error)
         with self._lock:
             held = self._memo.get(key)
             self._memo[key] = [held[0] if held else None, saved, time.monotonic()]
+            self._pending_estimates[key] = (str(path), saved, basis)
+            self._estimate_idle.clear()
+            if self._estimate_thread is None or not self._estimate_thread.is_alive():
+                self._estimate_thread = threading.Thread(target=self._estimate_writer, name="EstimateWriter", daemon=True)
+                self._estimate_thread.start()
+        self._estimate_wake.set()
         return int(saved)
 
-    def forget(self, path):
-        """Drops what the hub remembers about a path because the file changed on disk; the next look-up re-keys the file from disk. The library rows stay."""
-        key = _hub_key(path)
-        with self._lock:
-            self._memo.pop(key, None)
-            self._must_resolve.add(key)
+    def flush_estimates(self, timeout=10.0):
+        """Waits until every queued estimate is written to the library; True when the queue is empty. For restarts and tests, never the main loop."""
+        return self._estimate_idle.wait(timeout)
 
-    def known_paths(self):
-        """The paths this hub has been asked about, as the caller gave them."""
-        with self._lock:
-            return list(self._paths.values())
+    def _estimate_writer(self):
+        while True:
+            with self._lock:
+                item = None
+                if self._pending_estimates:
+                    key = next(iter(self._pending_estimates))
+                    item = (key,) + self._pending_estimates.pop(key)
+            if item is None:
+                with self._lock:
+                    if not self._pending_estimates:
+                        self._estimate_idle.set()
+                self._estimate_wake.clear()
+                if not self._estimate_wake.wait(timeout=30.0):
+                    with self._lock:
+                        if not self._pending_estimates:
+                            self._estimate_thread = None
+                            return
+                continue
+            try:
+                self._write_estimate(*item)
+            except Exception as _swallowed_error:
+                _log_swallowed("DurationHub._estimate_writer: saving a queued estimate", _swallowed_error)
+
+    def _write_estimate(self, key, path, saved, basis):
+        """Background thread: keys the file and saves its estimate in the library, unless the library already holds a length or an older estimate for that content."""
+        content_key = self.probe_library.keys.resolve(path)
+        if content_key is None:
+            return
+        entry = self.probe_library.library.get_entry(content_key) or {}
+        if entry.get("duration") and entry["duration"] > 0:
+            with self._lock:
+                self._memo[key] = [float(entry["duration"]), entry.get("estimated_duration"), time.monotonic()]
+            return
+        if entry.get("estimated_duration") and entry["estimated_duration"] > 0:
+            with self._lock:
+                held = self._memo.get(key)
+                self._memo[key] = [held[0] if held else None, float(entry["estimated_duration"]), time.monotonic()]
+            return
+        self.probe_library.library.upsert_fields(
+            content_key, estimated_duration=saved, estimated_at=time.time(), estimate_basis=basis)
 
 
 _shared_duration_hub = None
@@ -1652,21 +1893,11 @@ def shared_duration_hub() -> "DurationHub":
 _OWNER_GAIN_SCAN_VERSION = 0
 
 # WARNING: the fallback must match HUB_GAIN_MISS_RECHECK_SECONDS in performance_governor.py; it is used only when that module fails to import.
-try:
-    _GAIN_MISS_RECHECK_SECONDS = float(_hub_governor.HUB_GAIN_MISS_RECHECK_SECONDS)
-except Exception:
-    _GAIN_MISS_RECHECK_SECONDS = 900.0
+_GAIN_MISS_RECHECK_SECONDS = _governor.HUB_GAIN_MISS_RECHECK_SECONDS if _governor is not None else 900.0
 
 
-class GainHub:
+class GainHub(_PathMemoHub):
     """Answers one file at a time: looks the file's scanned gain, the settings it was scanned under and the owner's manual dB up in the library when asked, and remembers the answer; nothing is read in advance."""
-
-    def __init__(self, probe_library: "ProbeLibrary"):
-        self.probe_library = probe_library
-        self._lock = threading.RLock()
-        self._memo = {}
-        self._paths = {}
-        self._must_resolve = set()
 
     def _lookup(self, key, path):
         """Returns the remembered record for a path, asking the library once; a path with no scanned gain on record is asked again after the recheck time, and a path the library has no gain or picture size for gets its old settings values carried in first."""
@@ -1769,6 +2000,79 @@ class GainHub:
                                           "width": held.get("width"), "height": held.get("height"), "at": time.monotonic()}
         return True
 
+    def note_learned_gain(self, path, gain, applied_db):
+        """Replaces a scanned file's saved gain with its own scan plus the series' learned offset, keeping every other scan fact; False when the gain is the owner's or the library cannot hold it."""
+        if not gain or gain <= 0 or self.read(path)["scan_version"] == _OWNER_GAIN_SCAN_VERSION:
+            return False
+        try:
+            if not self.probe_library.store_file_fields(path, gain=float(gain), learn_applied_db=float(applied_db) if applied_db else None):
+                return False
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.note_learned_gain: saving the offset gain to the library", _swallowed_error)
+            return False
+        key = _hub_key(path)
+        with self._lock:
+            held = self._memo.get(key)
+            if held:
+                self._memo[key] = dict(held, gain=float(gain))
+        return True
+
+    def note_file_fields(self, path, **fields):
+        """Saves per-file fields (audio track choice, loudness learning) in the file's library row; False when the library cannot hold them yet."""
+        try:
+            return bool(self.probe_library.store_file_fields(path, **fields))
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.note_file_fields: saving per-file fields to the library", _swallowed_error)
+            return False
+
+    def read_file_fields(self, path, names):
+        """The named per-file fields of a file, or None when the library cannot read them yet."""
+        try:
+            return self.probe_library.file_fields(path, names)
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.read_file_fields: reading per-file fields from the library", _swallowed_error)
+            return None
+
+    def read_series_changes(self, series_key):
+        """(change dB, change time) of every owner loudness change saved in one series, oldest first; [] when none or unreadable."""
+        try:
+            return self.probe_library.library.series_learning_rows(series_key)
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.read_series_changes: reading the series' loudness changes from the library", _swallowed_error)
+            return []
+
+    def read_series_slider(self, series_key):
+        """(wanted offset dB, watch time) of every watched episode of one series the volume slider was learned from, oldest first; [] when none or unreadable."""
+        try:
+            return self.probe_library.library.series_slider_rows(series_key)
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.read_series_slider: reading the series' watched volumes from the library", _swallowed_error)
+            return []
+
+    def read_comfort_volumes(self, limit):
+        """The volume kept on the most recently watched owner-set files, newest first; [] when none or unreadable."""
+        try:
+            return self.probe_library.library.comfort_watch_volumes(limit)
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.read_comfort_volumes: reading the owner's comfortable volumes from the library", _swallowed_error)
+            return []
+
+    def note_track_gains(self, path, primary, gains, scan_version=None):
+        """Saves the scanned gain of every audio track of a file; False when the library cannot hold it."""
+        try:
+            return bool(self.probe_library.store_track_gains(path, primary, gains, scan_version))
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.note_track_gains: saving the per-track gains to the library", _swallowed_error)
+            return False
+
+    def read_track_gains(self, path):
+        """The per-track gains of a file as stored by note_track_gains, or None."""
+        try:
+            return self.probe_library.track_gains(path)
+        except Exception as _swallowed_error:
+            _log_swallowed("GainHub.read_track_gains: reading the per-track gains from the library", _swallowed_error)
+            return None
+
     def read_windows(self, path):
         """The sample windows behind the file's scanned gain as (place in the file as a fraction, LUFS) pairs; empty when none are on record, as for a gain scanned before windows were kept."""
         try:
@@ -1816,18 +2120,6 @@ class GainHub:
             _log_swallowed("GainHub.note_group: saving a multi-part title's gain to the library", _swallowed_error)
             return False
 
-    def forget(self, path):
-        """Drops what the hub remembers about a path because the file changed on disk; the next look-up re-keys the file from disk. The library rows stay."""
-        key = _hub_key(path)
-        with self._lock:
-            self._memo.pop(key, None)
-            self._must_resolve.add(key)
-
-    def known_paths(self):
-        """The paths this hub has been asked about, as the caller gave them."""
-        with self._lock:
-            return list(self._paths.values())
-
 
 _shared_gain_hub = None
 _shared_gain_hub_lock = threading.Lock()
@@ -1848,14 +2140,8 @@ def shared_gain_hub() -> "GainHub":
 # ============================================================================
 
 
-class FileFactsHub:
+class FileFactsHub(_PathMemoHub):
     """Answers one file at a time: looks the file's caption source, playability verdicts and loudness retry timers up in the library when asked, and remembers the answer; nothing is read in advance."""
-
-    def __init__(self, probe_library: "ProbeLibrary"):
-        self.probe_library = probe_library
-        self._lock = threading.RLock()
-        self._memo = {}
-        self._paths = {}
 
     @staticmethod
     def _blank():
@@ -1864,23 +2150,30 @@ class FileFactsHub:
         return record
 
     def _lookup(self, key, path):
-        """Returns the remembered record for a path, asking the library once; the file is re-keyed from disk first, so a file that changed since it was last seen has no record; a path with nothing on record is asked again after the recheck time."""
+        """Returns the remembered record for a path, asking the library once; a path with nothing on record is asked again after the recheck time. Only a file the hub was told changed (forget) is re-keyed from disk; every other read goes by the saved path row and never opens the file."""
+        # WARNING: this is called for every pending file by the scheduler, the guide and the preloader, on the main thread too; hashing a file here made 500 new files stall the whole app for a minute. A path nobody has keyed yet has no facts on record, so it reads as blank.
         with self._lock:
             held = self._memo.get(key)
+            force = key in self._must_resolve
         now = time.monotonic()
-        if held is not None:
+        if held is not None and not force:
             if any(held[name] is not None for name in FILE_FACT_COLUMNS) or now - held["at"] < _GAIN_MISS_RECHECK_SECONDS:
                 return held
         record = self._blank()
         try:
-            content_key = self.probe_library.keys.resolve(path)
-            entry = self.probe_library.library.get_entry(content_key) if content_key is not None else None
-            if entry:
-                for name in FILE_FACT_COLUMNS:
-                    record[name] = entry.get(name)
+            if force:
+                content_key = self.probe_library.keys.resolve(path)
+                entry = self.probe_library.library.get_entry(content_key) if content_key is not None else None
+                row = None if not entry else tuple(entry.get(name) for name in FILE_FACT_COLUMNS)
+            else:
+                row = self.probe_library.library.path_facts_row(key)
+            if row:
+                for name, value in zip(FILE_FACT_COLUMNS, row):
+                    record[name] = value
         except Exception as _swallowed_error:
             _log_swallowed("FileFactsHub._lookup: reading the file's facts row from the library", _swallowed_error)
         with self._lock:
+            self._must_resolve.discard(key)
             self._paths[key] = str(path)
             self._memo[key] = record
         return record
@@ -1950,17 +2243,6 @@ class FileFactsHub:
                 self._memo[key] = held
             held.update(update)
             held["at"] = time.monotonic()
-
-    def forget(self, path):
-        """Drops what the hub remembers about a path because the file changed on disk; the next look-up re-keys the file from disk and finds that file's own record. The library rows stay."""
-        key = _hub_key(path)
-        with self._lock:
-            self._memo.pop(key, None)
-
-    def known_paths(self):
-        """The paths this hub has been asked about, as the caller gave them."""
-        with self._lock:
-            return list(self._paths.values())
 
 
 _shared_file_facts_hub = None
@@ -2097,10 +2379,7 @@ def shared_play_order_hub() -> "PlayOrderHub":
 # ============================================================================
 
 # WARNING: the fallback must match HUB_ROW_GENERATION_START_TOLERANCE_SECONDS in performance_governor.py; it is used only when that module fails to import.
-try:
-    _ROW_GENERATION_START_TOLERANCE_SECONDS = float(_hub_governor.HUB_ROW_GENERATION_START_TOLERANCE_SECONDS)
-except Exception:
-    _ROW_GENERATION_START_TOLERANCE_SECONDS = 60.0
+_ROW_GENERATION_START_TOLERANCE_SECONDS = _governor.HUB_ROW_GENERATION_START_TOLERANCE_SECONDS if _governor is not None else 60.0
 
 _GENERATION_MARK = "#g"
 
@@ -2214,11 +2493,6 @@ class ScheduleHub:
                 found[int(slot[len(prefix):])] = slot
         return found
 
-    def current_slot_key(self, channel, block_key):
-        """The slot key of the newest generation of the block that has rows, or the block key itself when it has none."""
-        with self.library._lock:
-            found = self._generations(self.library._conn, channel, block_key)
-        return found[max(found)] if found else str(block_key)
 
     def set_info(self, channel, slot_key):
         """The label of one set of rows (mode, active or set aside, and where it was put aside), or None when it has no label."""
@@ -2450,16 +2724,6 @@ class ScheduleHub:
                     (state, used_length, length_source, time.time(), channel, slot_key, position))
             return True
 
-    def set_length(self, channel, slot_key, position, used_length, length_source):
-        """Changes the length of a row that is still ahead; an airing, aired or static row never changes. Returns whether it changed."""
-        with self.library._lock:
-            conn = self.library._conn
-            with conn:
-                cur = conn.execute(
-                    "UPDATE hub_schedule_row SET used_length = ?, length_source = ?, updated_at = ? "
-                    "WHERE channel = ? AND slot_key = ? AND position = ? AND state = 'planned'",
-                    (used_length, length_source, time.time(), channel, slot_key, position))
-            return cur.rowcount > 0
 
     def mark_airing_static(self, channel, path):
         """Marks the channel's newest airing row for this file as static, the slot that went to Static because the file would not play. Returns how many rows changed."""

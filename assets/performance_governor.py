@@ -106,10 +106,8 @@ CEILINGS = {
 # VALUES CHANGE HERE (extra lane slots added in Performance on a STRONG PC, on top of the CEILINGS row)
 PERFORMANCE_STRONG_LANE_BONUS = {"probe_and_duration": 2, "loudness_and_bake": 1, "cropdetect_threads": 1}
 
-# VALUES CHANGE HERE (duration probe batches: the pool is the probe lane's slots; a video playing divides it; chunk = pool size x factor)
+# VALUES CHANGE HERE (duration probe threads: the pool is the probe lane's slots; a video playing divides it)
 DURATION_WORKERS_WHILE_PLAYING_DIVISOR = 3
-DURATION_CHUNK_FACTOR_FIRST_PASS = 4
-DURATION_CHUNK_FACTOR_BACKLOG = 2
 
 # VALUES CHANGE HERE (loudness scan dispatch: threads per round normally, and when nothing is playing or waiting; both capped by the loudness lane)
 LOUDNESS_DISPATCH_WORKERS_BASE = 1
@@ -212,6 +210,10 @@ FEED_INTERVAL_SECONDS = 1.0
 LOSS_WINDOW_SECONDS = 5.0
 MEDIA_START_GRACE_SECONDS = 3.0
 
+# VALUES CHANGE HERE (burn-in idle close: seconds with no input before the controls splash, the settings menu with every sub-menu in it, the file explorer and the TV guide close (the guide goes to the channel it was previewing); seconds before every popup closes by itself as if No or Cancel was picked: Quit, the shared Yes/No popup (clear media, reset, burn-in warnings, update), Restart, DVD exit, DVD back to menu, game exit, the controller Pick Layout popup and the wait for a controller button)
+MENU_IDLE_CLOSE_SECONDS = 60.0
+CONFIRM_POPUP_IDLE_CLOSE_SECONDS = 30.0
+
 # VALUES CHANGE HERE (held W/A/S/D key: milliseconds before a hold in a menu or the guide starts repeating)
 MENU_NAV_REPEAT_DELAY_MS = 400
 
@@ -293,12 +295,6 @@ GAME_PAD_WARMUP_MAX_WAIT_SECONDS = 3.0
 GAME_PAD_POLL_IDLE_STOP_SECONDS = 2.0
 ACTIVITY_LOOKBACK_SECONDS = 3.0
 ATTRIBUTION_LOG_INTERVAL_SECONDS = 30.0
-GATE_LANE_UNIT = {
-    "probe_and_duration": "header_probe",
-    "loudness_and_bake": "loudness",
-    "music_loudness": "loudness",
-    "cropdetect_threads": "cropdetect",
-}
 
 
 # VALUES CHANGE HERE (boot hardware scan)
@@ -341,11 +337,14 @@ HUB_MOVIE_ESTIMATE_SECONDS = 5400
 # VALUES CHANGE HERE (schedule hub: seconds before the hub asks the library again about a file that has no measured length yet)
 HUB_UNMEASURED_RECHECK_SECONDS = 30.0
 
+# VALUES CHANGE HERE (milliseconds a channel must stay on Static for the file-scanning reason before the "SCANNING FILES" / "SCANNING MUSIC" banner shows; the banner is for a scan that is taking too long, not for every normal tune-in)
+FIRST_FILE_SCANNING_BANNER_DELAY_MS = 8000
+
+# VALUES CHANGE HERE (milliseconds a channel stays on the static snow while it cannot play yet before the screen turns to the grey background; the grey then holds, so a channel that needs a little longer never flashes snow again)
+STATIC_TO_GREY_MS = 2000
+
 # VALUES CHANGE HERE (schedule hub loudness: seconds before the hub asks the library again about a file that has no scanned gain on record)
 HUB_GAIN_MISS_RECHECK_SECONDS = 900.0
-
-# VALUES CHANGE HERE (seconds before a loudness scan skipped because its drive is slow may be retried; this keeps playback ahead of background rescans)
-LOUDNESS_DEGRADED_RETRY_SECONDS = 1800.0
 
 # VALUES CHANGE HERE (schedule hub clock check: seconds either side of a slot edge in which the hub's answer for "what is on air now" may differ from the scheduler's without being reported)
 HUB_CLOCK_COMPARE_GRACE_SECONDS = 1.0
@@ -386,14 +385,21 @@ HUB_MODE_SWITCH_SETTLE_SECONDS = 0.5
 # VALUES CHANGE HERE (fall back to Static: milliseconds a playing channel may go without a new picture before the screen shows Static; it must stay below the stall recovery time in retro_tv_emulator.py, PLAYBACK_STALL_TIMEOUT_MS)
 STALL_FORCES_STATIC_MS = 7000
 
-# VALUES CHANGE HERE (loudness scan sampling: each sample window is this many seconds of audio; a show up to the long-show length gets the first number of windows and a longer show gets the second, evenly spaced across the file; a file up to the whole-file length is scanned whole)
+# VALUES CHANGE HERE (loudness scan sampling: each sample window is this many seconds of audio (how many windows a file gets is LOUDNESS_SCAN_WINDOW_COUNTS below); a file up to the whole-file length is scanned whole)
 LOUDNESS_SCAN_WINDOW_SECONDS = 60.0
-LOUDNESS_SCAN_WINDOWS_STANDARD = 5
-LOUDNESS_SCAN_WINDOWS_LONG = 7
-LOUDNESS_SCAN_LONG_SHOW_SECONDS = 3600.0
 LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = 180.0
 
-# VALUES CHANGE HERE (gain double-check, right away: a scan whose gain lands more than this many dB from 0 dB scans this many more batches of windows, each batch the size given below; the gain is then worked out from every window together)
+# VALUES CHANGE HERE (loudness scan window count by length: each pair is (longest file in seconds, windows), the last pair (None, windows) is for anything longer; windows are evenly spaced; a background first scan stops early once this many windows agree within the LU given, read from the middle, the start and the end of the file first)
+LOUDNESS_SCAN_WINDOW_COUNTS = ((600.0, 3), (1500.0, 4), (3600.0, 5), (5400.0, 6), (9000.0, 7), (None, 9))
+LOUDNESS_SCAN_EARLY_STOP_WINDOWS = 3
+LOUDNESS_SCAN_EARLY_STOP_LU = 1.5
+
+# VALUES CHANGE HERE (one loudness goal for every file: TV dialogue, commercials and music all aim at the target LUFS (ATSC A/85, -24); the station level in dB is then added to every file alike; False for the whole-file peak check skips an extra whole-file read of the true peak when a boosted peak lands near the ceiling)
+LOUDNESS_TARGET_LUFS = -24.0
+LOUDNESS_STATION_LEVEL_DB = 7.0
+LOUDNESS_WHOLE_FILE_PEAK_CHECK = False
+
+# VALUES CHANGE HERE (gain double-check, right away: a scan whose measured loudness lands more than this many dB from the target (the station level not counted) scans this many more batches of windows, each batch the size given below; the gain is then worked out from every window together)
 GAIN_CHECK_DRASTIC_DB = 4.0
 GAIN_CHECK_DRASTIC_EXTRA_BATCHES = 2
 
@@ -410,6 +416,790 @@ GAIN_CHECK_MAX_OVERLAP = 0.5
 CATCH_UP_MAX_BLOCKS = 3000
 CATCH_UP_MAX_CYCLES_PER_BLOCK = 1000
 
+
+# ============================================================================
+# SECTION: Main script values (read by retro_tv_emulator.py)
+# ============================================================================
+
+# VALUES CHANGE HERE
+BETWEEN_LOUDNESS_PROBES_SECONDS = 0.5
+
+# VALUES CHANGE HERE
+PROBE_IDLE_SLEEP_SECONDS = 20.0
+
+# VALUES CHANGE HERE (pipeline pacing)
+SCAN_PIPELINE_PREEMPT_CHECK_SECONDS = 5.0
+SCAN_GATHER_LIBRARY_LOOKUPS = 400
+
+# VALUES CHANGE HERE
+PICTURE_BOX_PAUSE_RECHECK_SECONDS = 5.0
+
+# VALUES CHANGE HERE
+DURATION_PRECACHE_PAUSE_RECHECK_SECONDS = 5.0
+DURATION_PRECACHE_IDLE_SLEEP_SECONDS = 20.0
+
+# VALUES CHANGE HERE (used only when a bezel image has no transparent screen hole to measure, and before the boot preloader has measured it)
+TV_BORDER_KNOWN_CUTOUTS = {
+    "bezel":  (0.2943, 0.2434, 0.3523, 0.4591),
+    "bezel1": (0.2053, 0.1344, 0.5060, 0.6595),
+    "bezel2": (0.0774, 0.1402, 0.5646, 0.7181),
+}
+
+# VALUES CHANGE HERE
+TV_BORDER_OSD_OFFSET = (48, 64)
+
+# VALUES CHANGE HERE
+PIXEL_ORBITER_MARGIN_PX = 3
+PIXEL_ORBITER_INITIAL_DELAY_MS = 2 * 60 * 1000
+
+# VALUES CHANGE HERE
+PIXEL_ORBITER_PERIOD_MS = 60 * 1000
+
+# VALUES CHANGE HERE
+PICTURE_BOX_FIT_RETRY_SECONDS = 2.0
+
+# VALUES CHANGE HERE
+PAN_SCAN_ANALYZE_EVERY_N = 2
+PAN_SCAN_SMOOTHING = 0.08
+PAN_SCAN_DEAD_ZONE = 0.04
+
+# VALUES CHANGE HERE
+PAN_SCAN_SHOT_SIG_LEN = 10
+PAN_SCAN_SHOT_MEMORY_MAX = 40
+PAN_SCAN_REMEMBER_GRACE_MS = 400
+PAN_SCAN_SHOT_MATCH_THRESHOLD = 0.025
+
+# VALUES CHANGE HERE
+CRT_SHADER_CURVATURE_DEFAULT = 0.20
+
+# VALUES CHANGE HERE
+CRT_SHADER_CURVATURE = {
+    "bezel":  0.08,
+    "bezel1": 0.08,
+    "bezel2": 0.08,
+}
+
+# VALUES CHANGE HERE
+CRT_SHADER_VIGNETTE = 0.35
+
+# VALUES CHANGE HERE
+CRT_SCANLINE_MIN_LINES = 180
+
+# VALUES CHANGE HERE
+CRT_SCANLINE_MAX_LINES = 320
+CRT_SCANLINE_DARKEN_FLOOR = 0.70
+CRT_SCANLINE_BLOOM_GAMMA = 1.6
+CRT_SCANLINE_BLOOM_STRENGTH = 0.95
+
+# VALUES CHANGE HERE
+MENU_NAV_TRACE = True
+
+# VALUES CHANGE HERE
+PERF_LOG_INTERVAL_S = 5.0
+PERF_LOG_MAX_SAMPLES = 900
+
+# VALUES CHANGE HERE
+STATIC_NOISE_REFRESH_MS = 110
+
+# VALUES CHANGE HERE
+STATIC_NOISE_AMBIENT_REFRESH_MS = 80
+
+# VALUES CHANGE HERE
+STATIC_WEAK = 0.16
+STATIC_MEDIUM = 0.30
+STATIC_HEAVY = 0.46
+
+# VALUES CHANGE HERE
+STATIC_WEAK_HOLD_MS = 10000
+STATIC_MEDIUM_HOLD_MS = 6500
+STATIC_HEAVY_HOLD_MS = 7000
+STATIC_RAMP_MS = 1200
+STATIC_SUDDEN_RAMP_MS = 220
+
+# VALUES CHANGE HERE
+WATERMARK_JUMP_TOLERANCE_PX = 2
+WATERMARK_REPOSITION_HIDE_MS = 450
+WATERMARK_ALPHA = 150
+WATERMARK_WIDTH_FRAC = 0.091
+WATERMARK_MARGIN_FRAC = 0.12
+
+# VALUES CHANGE HERE
+GAME_CORE_FPS_FALLBACK = 60.0
+GAME_CORE_FPS_GUARD = (40.0, 120.0)
+UI_COMPOSITOR_FPS = 60.0
+
+# VALUES CHANGE HERE
+STATUS_BANNER_DURATION_MS = 30000
+CAPTION_MEMORY_BANNER_LABEL = "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
+
+# VALUES CHANGE HERE
+DRIVE_BANNER_REARM_MS = 5 * 60 * 1000
+
+# VALUES CHANGE HERE
+MISSING_MEDIA_BANNER_REARM_MS = 5 * 60 * 1000
+
+# VALUES CHANGE HERE
+CAPTION_MIN_FIRST_SHOW_MS = 600
+
+# VALUES CHANGE HERE
+NATIVE_SUB_WATCH_MS = 20000
+NATIVE_SUB_POLL_MS = 400
+
+# VALUES CHANGE HERE
+WATCHDOG_SPURIOUS_RESUME_BAIL_AFTER = 3
+WATCHDOG_SPURIOUS_RESUME_WINDOW_MS = 20000
+
+# VALUES CHANGE HERE
+START_TIME_CONFIRM_MS = 800
+
+# VALUES CHANGE HERE
+START_TIME_POLL_MS = 150
+
+# VALUES CHANGE HERE
+LOAD_BAR_TEXT_GAP = 3
+
+# VALUES CHANGE HERE
+FE_FOOTER_H = 108
+FE_LEFT_W = 215
+FE_LEFT_ROW_H = 40
+FE_LEFT_REMOVE_W = 24
+FE_COL_H = 34
+FE_ROW_H = 34
+FE_BTN_H = 42
+
+# VALUES CHANGE HERE
+FE_BTN_W = 210
+FE_BTN_W_SM = 85
+FE_ADDLOC_HDR_H = 40
+FE_ADDLOC_W = 150
+
+# VALUES CHANGE HERE
+FE_ICON_W = 14
+FE_ICON_H = 11
+FE_ICON_GAP = 6
+
+# VALUES CHANGE HERE
+CHANGED_FILE_SWEEP_INTERVAL_S = 1800
+
+# VALUES CHANGE HERE (series loudness learning: how many of the owner's most recent small changes in one series must agree before the rest of the series is offset by their middle; how many dB apart agreeing changes may be (all up or all down); a change bigger than this many dB on an episode that scans like its season sets the series at once; the most dB an offset may be; seconds after the owner's last press before the change is learned from)
+LOUDNESS_LEARN_MIN_FILES = 3
+LOUDNESS_LEARN_AGREE_DB = 2.0
+LOUDNESS_LEARN_SINGLE_CHANGE_DB = 3.0
+LOUDNESS_LEARN_MAX_OFFSET_DB = 12
+LOUDNESS_LEARN_SETTLE_SECONDS = 5.0
+
+# VALUES CHANGE HERE (series loudness learning from the volume slider: seconds between looks at the volume; seconds of an episode that must be watched before the volume kept on it counts; how many slider points (0 to 100) from the comfortable volume the kept volume must be before the episode counts as too loud or too quiet; the comfortable volume until enough owner-set files are watched (70 to 75 is comfortable, 100 the loudest); how many owner-set files' kept volumes give the comfortable volume, and how few are enough)
+LOUDNESS_SLIDER_SAMPLE_SECONDS = 1.0
+LOUDNESS_SLIDER_MIN_WATCH_SECONDS = 600.0
+LOUDNESS_SLIDER_TRIGGER_POINTS = 30
+LOUDNESS_SLIDER_COMFORT_PCT = 72
+LOUDNESS_SLIDER_REFERENCE_FILES = 10
+LOUDNESS_SLIDER_REFERENCE_MIN_FILES = 3
+
+# VALUES CHANGE HERE
+GAIN_CHECK_FOLDER_REVISIT_S = 600
+
+# VALUES CHANGE HERE
+SCHED_MEMBERSHIP_CACHE_SECONDS = 5.0
+
+# VALUES CHANGE HERE
+ORDERED_CONTENT_CACHE_PRUNE_EVERY_MS = 60000
+ORDERED_CONTENT_CACHE_LAST_PRUNE_MS = 0.0
+
+# VALUES CHANGE HERE
+MIXER_SEEK_TEST_ENCODERS = {
+    ".mp3": "libmp3lame", ".ogg": "libvorbis", ".opus": "libopus", ".flac": "flac",
+    ".wav": "pcm_s16le", ".aif": "pcm_s16be", ".aiff": "pcm_s16be",
+    ".m4a": "aac", ".aac": "aac", ".wma": "wmav2",
+}
+MIXER_SEEK_TEST_SECONDS = 4
+MIXER_SEEK_TEST_POSITION = 1.0
+
+# VALUES CHANGE HERE
+PRIME_DURATIONS_NEAR_TERM_N = 8
+
+# VALUES CHANGE HERE
+SCAN_SNAPSHOT_INTERVAL_S = 5.0
+SCAN_SNAPSHOT_STALE_S = 15.0
+SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD = 200
+
+# VALUES CHANGE HERE
+MUSIC_PRECACHE_IDLE_SLEEP_SECONDS = 20.0
+MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS = 0.5
+MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS = 10.0
+
+# VALUES CHANGE HERE
+GPU_DEDICATED_VRAM_FLOOR_BYTES = 512 * 1024 * 1024
+
+# VALUES CHANGE HERE
+SCAN_RETRY_LIMIT = 3
+SCAN_DEAD_BURST_LIMIT = 5
+SCAN_DEAD_BURST_WINDOW_S = 300.0
+
+# VALUES CHANGE HERE
+MAX_COMFORTABLE_VOLUME = 135
+
+# VALUES CHANGE HERE
+SS_SPEED_FRAC_PER_S = 0.07
+SS_VISIBLE_MIN_ALPHA = 24
+SS_MAX_DT_S = 0.1
+
+
+# VALUES CHANGE HERE (main script, values used inside its functions: bezel screen hole grow per bezel image, width and height multipliers, and the multiplier for a bezel not listed)
+TV_BORDER_SCREEN_EXPAND = {
+    "bezel":  (1.00, 1.00),
+    "bezel1": (1.00, 1.00),
+    "bezel2": (1.00, 1.00),
+}
+TV_BORDER_SCREEN_EXPAND_DEFAULT = (1.00, 1.00)
+
+# VALUES CHANGE HERE (reception line noise band: pixel block size; share of blocks drawn; share drawn bright; alpha range of bright and of dark blocks)
+RECEPTION_NOISE_BLOCK_PX = 3
+RECEPTION_NOISE_VISIBLE_SHARE = 0.55
+RECEPTION_NOISE_BRIGHT_SHARE = 0.30
+RECEPTION_NOISE_BRIGHT_ALPHA = (180, 255)
+RECEPTION_NOISE_DARK_ALPHA = (110, 210)
+
+# VALUES CHANGE HERE (reception lines: height of a big and of a small rolling line as a share of the screen height, and the roll speed in pixels per millisecond)
+RECEPTION_LINE_BIG_FRAC_RANGE = (0.035, 0.09)
+RECEPTION_LINE_SMALL_FRAC_RANGE = (0.012, 0.03)
+RECEPTION_LINE_SPEED_PX_MS = 0.85
+
+# VALUES CHANGE HERE (file explorer: milliseconds a folder may take to open before it is given up)
+FILE_EXPLORER_EXPAND_TIMEOUT_MS = 6000
+
+# VALUES CHANGE HERE (playback seek: milliseconds between retries while a seek is checked to have landed)
+SEEK_RETRY_INTERVAL_MS = 1500
+
+# VALUES CHANGE HERE (frame copy timing: frames counted before one [FRAME COPY] log line)
+FRAME_COPY_LOG_EVERY_FRAMES = 600
+
+# VALUES CHANGE HERE (guide preload: seconds to wait for the window size before the preload worker gives up for that pass)
+GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS = 30.0
+
+# VALUES CHANGE HERE (caption pre-cache: seconds between the cheap checks of the caption worker)
+CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS = 0.3
+
+# VALUES CHANGE HERE (scheduler repeat guard: seconds after a show ends in which the same show may not start again in the next slot, and seconds the just-ended record is kept)
+SCHEDULER_REPEAT_GUARD_SECONDS = 60
+SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS = 900
+
+# VALUES CHANGE HERE (block rotation caches: most blocks kept in the scheduler's rotation cache and in the saved rotation record)
+BLOCK_ROTATION_CACHE_MAX_BLOCKS = 12
+
+
+# ============================================================================
+# SECTION: Media script values (read by media.py)
+# ============================================================================
+
+# VALUES CHANGE HERE (media.py, path checks: how often the path-exists cache is swept and its most entries; how long a not-found, found and unknown answer is kept in milliseconds; how long one exists check may take)
+PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS = 60000
+PATH_EXISTS_CACHE_MAX_ENTRIES = 20000
+PATH_NOT_FOUND_TTL_MS = 5000
+PATH_FOUND_TTL_MS = 30000
+PATH_UNKNOWN_TTL_MS = 1500
+PATH_EXISTS_PROBE_TIMEOUT_MS = 2500
+
+# VALUES CHANGE HERE (media.py, disk and scan slots: fast-disk reads at once, loudness scans at once, loudness sample windows read side by side, music loudness scans at once; seconds background work waits for the playing file's reads before going on)
+FAST_DISK_IO_MAX_CONCURRENT = 3
+LOUDNESS_PROBE_MAX_CONCURRENT = 2
+LOUDNESS_PARALLEL_MAX_CONCURRENT = 8
+MUSIC_LOUDNESS_PROBE_MAX_CONCURRENT = 1
+LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S = 2.5
+
+# VALUES CHANGE HERE (media.py, drive health: how long one drive check may take, how often a drive is checked again, and how soon an unresponsive drive is checked again, in milliseconds)
+DRIVE_CHECK_TIMEOUT_MS = 2500
+DRIVE_RECHECK_INTERVAL_MS = 4000
+DRIVE_UNRESPONSIVE_RECHECK_MS = 3000
+
+# VALUES CHANGE HERE (media.py, drive read cost: reads kept per drive, the fixed start cost of one ffmpeg read in milliseconds; background loudness work backs off only when sustained ffmpeg read cost exceeds the milliseconds per second of audio, one slow read is not enough; the fewest reads and the oldest read in milliseconds that count)
+DRIVE_LATENCY_SAMPLE_WINDOW = 6
+DRIVE_LATENCY_FIXED_OVERHEAD_MS = 2000
+DRIVE_LATENCY_DEGRADED_MS_PER_AUDIO_SEC = 150.0
+DRIVE_LATENCY_MIN_SAMPLES = 3
+DRIVE_LATENCY_SAMPLE_MAX_AGE_MS = 120_000
+
+# VALUES CHANGE HERE (media.py, file and disc checks: how often a file is test-read again, how long the test read may take in milliseconds and how many bytes it reads; how often disc information is read again in milliseconds)
+FILE_PROBE_RECHECK_MS = 5000
+FILE_PROBE_TIMEOUT_MS = 3000
+FILE_PROBE_READ_BYTES = 65536
+DISC_INFO_RECHECK_MS = 4000
+
+# VALUES CHANGE HERE (media.py, scheduling: seconds from which a file counts as a movie; the movie-heavy ratio and movies per block; recent picks held back from random play; block lengths in seconds by block name (the six-hour blocks are added from their hours); the default commercial interrupt floor in minutes)
+MOVIE_LENGTH_THRESHOLD_SECONDS = 4800
+MOVIE_HEAVY_RATIO = 2
+MOVIES_PER_BLOCK = 2
+RANDOM_REPEAT_HOLD_BACK = 10
+BLOCK_LENGTH_SECONDS = {"Marathon": 86400, "Full Day": 86400, "Morning": 8 * 3600, "Evening": 8 * 3600, "Night": 8 * 3600}
+COMMERCIAL_INTERRUPT_FLOOR_DEFAULT_MINUTES = 15
+
+# VALUES CHANGE HERE (media.py, commercial breaks in a block's timeline: most seconds of deferred fill one break may catch up, fewest seconds between two breaks, shortest break in seconds)
+BREAK_MAX_CATCHUP_SECONDS = 180
+BREAK_MIN_GAP_SECONDS = 300
+BREAK_MIN_SECONDS = 120
+
+# VALUES CHANGE HERE (media.py, file facts: the highest bit rate in Mbps a believable length may give; seconds a bezel style folder listing is reused; seconds and most entries a shared header read is kept; the selection border width in pixels)
+DURATION_SANITY_MAX_PLAUSIBLE_MBPS = 60
+BEZEL_STYLE_DISCOVERY_TTL_SEC = 2.0
+HEADER_PROBE_SHARE_SECONDS = 120.0
+HEADER_PROBE_SHARE_MAX_ENTRIES = 64
+SELECTION_BORDER_WIDTH = 3
+
+# VALUES CHANGE HERE (media.py, generated captions, speech finding and cues: beam size, speech-finder settings, threshold and shortest speech in ms; join gap and longest clip in seconds; live audio filter; longest cue in seconds and characters, gap that breaks a cue, shortest time a cue shows, hold after the last word)
+ASR_BEAM_SIZE = 5
+ASR_VAD_PARAMETERS = {"min_silence_duration_ms": 500}
+ASR_VAD_THRESHOLD = 0.25
+ASR_VAD_MIN_SPEECH_MS = 150
+ASR_MERGE_GAP_SEC = 1.5
+ASR_LIVE_AUDIO_FILTER = "dynaudnorm=f=150:g=15:p=0.9:m=20"
+ASR_MAX_CLIP_SEC = 25.0
+ASR_CUE_MAX_SEC = 5.0
+ASR_CUE_MAX_CHARS = 84
+ASR_CUE_GAP_BREAK_SEC = 0.8
+ASR_CUE_MIN_SHOW_SEC = 1.2
+ASR_CUE_TRAIL_HOLD_SEC = 0.3
+
+# VALUES CHANGE HERE (media.py, generated captions, guards: hallucination guard (highest no-speech chance, lowest average log chance); prompt-echo guard (word chance, repeats); gap recovery (on or off, gap, padding, windows, join, window length, beam, most seconds, share of a chunk, lead kept, word chance, log chance, no-speech chance, words per second, overlap share); runaway character and word runs; repetition-loop guard (fewest characters, highest compression))
+ASR_NO_SPEECH_PROB_MAX = 0.75
+ASR_AVG_LOGPROB_MIN = -1.5
+ASR_ECHO_MAX_WORD_PROB = 0.5
+ASR_ECHO_REPEAT_MIN = 3
+ASR_ECHO_REPEAT_MAX_WORD_PROB = 0.75
+ASR_RECOVER_ENABLED = True
+ASR_RECOVER_MIN_GAP_SEC = 0.9
+ASR_RECOVER_PAD_SEC = 0.3
+ASR_RECOVER_MAX_WINDOWS = 2
+ASR_RECOVER_JOIN_SEC = 3.0
+ASR_RECOVER_MAX_WINDOW_SEC = 14.0
+ASR_RECOVER_BEAM = 3
+ASR_RECOVER_MAX_SEC = 6.0
+ASR_RECOVER_MAX_FRAC_OF_CHUNK = 0.5
+ASR_RECOVER_KEEP_LEAD_SEC = 8.0
+ASR_RECOVER_MIN_WORD_PROB = 0.55
+ASR_RECOVER_MIN_AVG_LOGPROB = -0.95
+ASR_RECOVER_MAX_NO_SPEECH = 0.5
+ASR_RECOVER_MAX_WORDS_PER_SEC = 5.0
+ASR_RECOVER_MAX_OVERLAP_FRAC = 0.3
+ASR_RUNAWAY_CHAR_RUN = 12
+ASR_RUNAWAY_WORD_RUN = 6
+ASR_LOOP_MIN_CHARS = 24
+ASR_LOOP_COMPRESSION_MAX = 2.4
+
+# VALUES CHANGE HERE (media.py, generated captions, music, names and chunks: music marking (shortest music, bridge, piece length, quietest level in dB, peak persistence, envelope steadiness, share replaced, word chance); name hint (word chance, fewest cues, shortest name, most names learned, likeness); chunk-boundary carry-over (share covered, nearness); first chunk, chunk and overlap in seconds; shortest tail; duplicate text likeness, short text length and its overlap; accurate seek margin)
+ASR_MUSIC_MIN_SEC = 2.0
+ASR_MUSIC_BRIDGE_SEC = 1.0
+ASR_MUSIC_PIECE_SEC = 6.0
+ASR_MUSIC_MIN_RMS_DB = -38.0
+ASR_MUSIC_PEAK_PERSIST_MIN = 0.60
+ASR_MUSIC_ENVELOPE_CV_MAX = 0.35
+ASR_MUSIC_REPLACE_FRAC = 0.7
+ASR_MUSIC_REPLACE_MAX_WORD_PROB = 0.5
+ASR_NAME_MIN_WORD_PROB = 0.85
+ASR_NAME_MIN_CUES = 2
+ASR_NAME_MIN_LEN = 3
+ASR_NAME_MAX_LEARNED = 6
+ASR_NAME_SIMILAR_MIN = 0.75
+ASR_CARRY_COVER_FRAC = 0.4
+ASR_CARRY_NEAR_SEC = 1.5
+ASR_FIRST_CHUNK_SEC = 60.0
+ASR_CHUNK_SEC = 300.0
+ASR_CHUNK_OVERLAP_SEC = 8.0
+ASR_MIN_TAIL_SEC = 15.0
+ASR_DUP_TEXT_SIMILARITY_MIN = 0.6
+ASR_SHORT_TEXT_CHARS = 6
+ASR_SHORT_TEXT_OVERLAP_MIN = 0.85
+ASR_ACCURATE_SEEK_MARGIN_SEC = 15.0
+
+# VALUES CHANGE HERE (media.py, live captions: lead, ready deadline and chunk in seconds; startup overlap and first-chunk head start; next-file prefetch (fewest seconds of lead, chunk, longest wait, cap); big-chunk safety margin and default estimate; lead cap; jump-back detection (lead, pace poll, skip behind, resume ahead); cues kept (seconds of past, most cues); most failures in a row; live beam size and accurate seek margin; clock check (shortest step, tolerance))
+LIVE_CAPTION_LEAD_SEC = 5.0
+LIVE_CAPTION_READY_DEADLINE_SEC = 10.0
+LIVE_CAPTION_CHUNK_SEC = 30.0
+LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC = 5.0
+LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC = 3.0
+LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC = 15.0
+LIVE_CAPTION_PREFETCH_CHUNK_SEC = 10.0
+LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC = 120.0
+LIVE_CAPTION_PREFETCH_CAP_SEC = 60.0
+LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC = 3.0
+LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC = 15.0
+LIVE_CAPTION_MAX_LEAD_SEC = 60.0
+LIVE_CAPTION_JUMP_BACK_LEAD_SEC = 120.0
+LIVE_CAPTION_PACE_POLL_SEC = 1.0
+LIVE_CAPTION_SKIP_BEHIND_SEC = 15.0
+LIVE_CAPTION_RESUME_AHEAD_SEC = 2.0
+LIVE_CAPTION_KEEP_PAST_SEC = 20.0
+LIVE_CAPTION_MAX_CUES = 500
+LIVE_CAPTION_MAX_FAILURES = 3
+ASR_LIVE_BEAM_SIZE = 3
+ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC = 4.0
+LIVE_CAPTION_CLOCK_MIN_DT = 0.75
+LIVE_CAPTION_CLOCK_TOLERANCE = 0.4
+
+# VALUES CHANGE HERE (media.py, loudness limits: highest and lowest gain multiplier, lowest gain for the standard floor; true-peak ceiling in dBTP; a file scanned by sample windows gets one whole-file true-peak pass when its gained peak would land within the margin in dB of the ceiling (only while LOUDNESS_WHOLE_FILE_PEAK_CHECK is True), and that pass's time limit in seconds)
+LOUDNESS_GAIN_CEILING = 10.0
+LOUDNESS_GAIN_FLOOR = 0.1
+LOUDNESS_GAIN_FLOOR_STANDARD = 0.5
+TRUE_PEAK_CEILING_DBTP = -2.0
+TRUE_PEAK_CONFIRM_MARGIN_DB = 3.0
+TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS = 600.0
+
+# VALUES CHANGE HERE (media.py, loudness compressor and windows: compressor attack and release in ms, threshold in dB, ratio, knee and makeup in dB; sample windows that disagree by more than this many LU use the quieter reading; a window is logged when it took at least this many seconds, or when it belongs to the playing file's first scan; loudness range in LU that flags a wide file)
+COMPRESSOR_ATTACK_MS = 25.0
+COMPRESSOR_RELEASE_MS = 800.0
+COMPRESSOR_THRESHOLD_DB = -18.0
+COMPRESSOR_RATIO = 2.0
+COMPRESSOR_KNEE_DB = 6.0
+COMPRESSOR_MAKEUP_DB = 4.0
+LOUDNESS_WINDOW_DISAGREE_LU = 3.0
+LOUDNESS_WINDOW_LOG_MIN_SECONDS = 5.0
+LOUDNESS_WIDE_LRA_FLAG_LU = 15.0
+
+# VALUES CHANGE HERE (media.py, dialogue loudness: a sample window needs at least this many seconds of subtitled speech, and a file at least this many such windows, before its loudness is measured on dialogue; subtitle lines closer together than the gap in seconds are joined; time limits for the header read and the subtitle extract in seconds; largest subtitle text read in bytes; seconds and most entries the dialogue choice is kept)
+DIALOGUE_MIN_WINDOW_SECONDS = 8.0
+DIALOGUE_MIN_WINDOWS = 2
+DIALOGUE_MERGE_GAP_SECONDS = 0.5
+DIALOGUE_HEADER_TIMEOUT_SECONDS = 30.0
+DIALOGUE_EXTRACT_TIMEOUT_SECONDS = 180.0
+DIALOGUE_SUBTITLE_MAX_BYTES = 8 * 1024 * 1024
+DIALOGUE_CACHE_SECONDS = 600.0
+DIALOGUE_CACHE_MAX_ENTRIES = 64
+
+# VALUES CHANGE HERE (media.py, schedule: seconds within which the same catch-up walk asked again is answered from the last walk, the longest a file may be and still count as a commercial in seconds, and the most commercial breaks in one half hour)
+CATCH_UP_REUSE_SECONDS = 2.0
+COMMERCIAL_MAX_SECONDS = 5 * 60
+BREAK_MAX_PER_HALF_HOUR = 2
+
+# ============================================================================
+# SECTION: Menu and guide drawing values (read by ui.py)
+# ============================================================================
+
+# VALUES CHANGE HERE (ui.py, channel scan bar: height and moving head in pixels, halo mix)
+CHANNEL_SCAN_BAR_HEIGHT_PX = 3
+CHANNEL_SCAN_BAR_HEAD_PX = 6
+CHANNEL_SCAN_BAR_HALO_MIX = 0.35
+
+# VALUES CHANGE HERE (ui.py, menus: shrink of every menu while bezel style 1 or 2 is on; the menu canvas width and height in pixels)
+MENU_FIT_SHRINK_FACTOR = 0.94
+MENU_CANVAS_W = 1036
+MENU_CANVAS_H = 680
+
+# VALUES CHANGE HERE (ui.py, TV guide: half hours the guide spans (336 = 7 days) and half hours before now it may scroll back; side padding of a channel name cell; seconds a drawn channel row stays valid and most rows kept)
+GUIDE_TOTAL_HALF_HOURS = 336
+GUIDE_PAST_HALF_HOURS = 48
+NAME_CELL_SIDE_PAD = 10
+GUIDE_ROW_CACHE_TTL_S = 20.0
+GUIDE_ROW_CACHE_MAX = 24
+
+# VALUES CHANGE HERE (ui.py, Server Mode toggle: False greys it out in Advanced Settings (the row can still be reached with the keys and controller but cannot be turned on or off); True lets it be switched again)
+SERVER_TOGGLE_ENABLED = False
+
+# VALUES CHANGE HERE (ui.py, controls splash: gap between a row's keys, between key columns and between columns, and the extra height of a section title, in pixels)
+CONTROLS_ROW_KEY_GAP_PX = 48
+CONTROLS_COL_KEY_GAP_PX = 40
+CONTROLS_COL_GAP_PX = 90
+CONTROLS_SECTION_EXTRA_PX = 22
+
+# VALUES CHANGE HERE (ui.py, TV guide and controls splash: channel rows shown in 16:9 and in 4:3, time columns in 16:9 and in 4:3, the guide header, clock and smallest font sizes, the controls splash body font size, width of an icon key, and the gaps under the title, between a section title and its body and between sub rows, in pixels)
+GUIDE_VISIBLE_ROWS_16_9 = 8
+GUIDE_VISIBLE_ROWS_4_3 = 5
+GUIDE_NUM_COLS_16_9 = 5
+GUIDE_NUM_COLS_4_3 = 4
+GUIDE_HDR_FONT_PX = 17
+GUIDE_CLOCK_FONT_PX = 17
+GUIDE_MIN_FONT_PX = 17
+CONTROLS_BODY_FONT_PX = 22
+CONTROLS_ICON_KEY_W_PX = 64
+CONTROLS_TITLE_SECTION_GAP_PX = 60
+CONTROLS_SECTION_BODY_GAP_PX = 24
+CONTROLS_SUB_BODY_GAP_PX = 20
+
+# VALUES CHANGE HERE (ui.py, settings menu: how far the left and right toggle columns of the options page sit from their column start, the server picker's visible rows, and how far the channel grid moves left and its left column moves back right, in pixels)
+OPTIONS_LEFT_TOGGLE_OFFSET_PX = 370
+OPTIONS_RIGHT_TOGGLE_OFFSET_PX = 260
+SERVER_PICKER_VISIBLE_ROWS = 6
+CHANNEL_GRID_GROUP_SHIFT_LEFT_PX = 40
+CHANNEL_GRID_LEFT_COL_SHIFT_PX = 50
+
+# VALUES CHANGE HERE (ui.py, TV guide in 4:3 (used by the guide drawing and by the channel name length limit, which must agree): clock cell padding, header cell padding, gap between the two clocks in pixels, and the header-to-clock font size ratio)
+GUIDE_43_CLOCK_CELL_PAD_PX = 10
+GUIDE_43_HDR_CELL_PAD_PX = 12
+GUIDE_43_CLOCK_PAIR_GAP_PX = 8
+GUIDE_43_HDR_TO_CLOCK_RATIO = 22.0 / 17.0
+
+# VALUES CHANGE HERE (ui.py, settings menu layout in pixels: options toggle box width; remote remap label column, key box width and height, gap between the two columns; channel settings header gap, bottom space and smallest top; Holiday rows spread evenly between the title and the Close button (top and bottom space, smallest and largest row height, row padding, toggle width, gap, side space); Video tab slider row space, largest and smallest slider spacing; Theme tab last block space, largest and smallest block spacing, smallest first gap and its trim)
+OPTIONS_TOGGLE_BOX_W_PX = 18 + 24
+REMOTE_REMAP_LABEL_COL_W_PX = 195
+REMOTE_REMAP_KEY_BOX_W_PX = 110
+REMOTE_REMAP_KEY_BOX_H_PX = 30
+REMOTE_REMAP_COL_GAP_PX = 30
+CHANNEL_SETTINGS_HEADER_GAP_PX = 40
+CHANNEL_SETTINGS_BOTTOM_RESERVED_PX = 70
+CHANNEL_SETTINGS_MIN_TOP_PX = 20
+HOLIDAY_ROWS_TOP_PX = 60
+HOLIDAY_ROWS_BOTTOM_PX = 62
+HOLIDAY_ROW_MIN_H_PX = 34
+HOLIDAY_ROW_MAX_H_PX = 56
+HOLIDAY_ROW_SLOT_PAD_PX = 8
+HOLIDAY_TOGGLE_W_PX = 190
+HOLIDAY_TOGGLE_GAP_PX = 12
+HOLIDAY_ROW_SIDE_SPACE_PX = 70
+VIDEO_SLIDER_ROW_RESERVE_PX = 40
+VIDEO_SLIDER_SPACING_MAX_PX = 70
+VIDEO_SLIDER_SPACING_MIN_PX = 40
+THEME_SLIDER_LAST_BLOCK_RESERVE_PX = 50
+THEME_SLIDER_SPACING_MAX_PX = 88
+THEME_SLIDER_SPACING_MIN_PX = 50
+THEME_SLIDER_FIRST_GAP_MIN_PX = 38
+THEME_SLIDER_FIRST_GAP_TRIM_PX = 18
+
+# ============================================================================
+# SECTION: Menu navigation values (read by menu_nav.py)
+# ============================================================================
+
+# VALUES CHANGE HERE (menu_nav.py, double presses in milliseconds: a second press of one key with no release between counts as the same press inside the first window; the same press arriving by a different key code counts as one inside the second)
+NAV_DUP_HELD_MS = 250
+NAV_DUP_PATH_MS = 50
+
+# VALUES CHANGE HERE (menu_nav.py, sliders: one left or right press moves SLIDER_STEP; each slider is (config key, value when unset, lowest, highest); the Reactive Strength slider on a music channel's editor the same way; the fastest a value control (slider, volume) may step in milliseconds, however fast the key is pressed or held, kept below the held-key repeat intervals in HOLD_RULES so a hold is never dropped)
+SLIDER_STEP = 5
+SLIDER_SPECS = {
+    "brightness": ("brightness", 50, 0, 100), "contrast": ("contrast", 50, 0, 100), "color": ("color", 50, 0, 100),
+    "sharpness": ("sharpness", 50, 0, 100), "tint": ("tint", 50, 0, 100),
+    "opacity": ("menu_opacity", 50, 0, 100), "bg_hue": ("theme_bg_hue", 220, 0, 360), "ui_hue": ("theme_ui_hue", 140, 0, 360),
+}
+REACTIVE_STRENGTH_SPEC = ("reactive_visualizer_strength", 50, 0, 100)
+VALUE_STEP_MIN_MS = 100
+
+# VALUES CHANGE HERE (menu_nav.py, held keys: each rule is (milliseconds before the first repeat, None for the menu's own delay; milliseconds between repeats; True when a hold of exactly that delay already counts); milliseconds after which a hold with no key-up is treated as stuck; percent one volume press or one repeat moves)
+HOLD_RULES = {
+    "vertical": (None, 100),
+    "horizontal": (None, 110),
+    "rom_list": (380, 70, True),
+    "gamepad": (400, 180, True),
+    "volume": (100, 160),
+}
+HOLD_STUCK_MS = {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}
+VOLUME_STEP = 5
+
+# VALUES CHANGE HERE (menu_nav.py, file explorer mouse: rows one wheel step scrolls, double-click time in ms, pixels before a drag starts, edge zone in pixels where a drag scrolls, slow and fast drag scroll steps in ms, smallest scrollbar thumb, scrollbar width and padding in pixels)
+EXPLORER_WHEEL_ROWS = 3
+EXPLORER_DOUBLE_CLICK_MS = 500
+EXPLORER_DRAG_START_PX = 4
+EXPLORER_DRAG_EDGE_ZONE_PX = 50
+EXPLORER_DRAG_SCROLL_SLOW_MS = 120
+EXPLORER_DRAG_SCROLL_FAST_MS = 60
+EXPLORER_THUMB_MIN_H = 20
+EXPLORER_SB_WIDTH = 8
+EXPLORER_SB_PAD = 4
+
+# VALUES CHANGE HERE (menu_nav.py, controller in menus: the stick axis that moves up and down and the one that moves left and right; the buttons that accept and the buttons that go back)
+JOY_VERTICAL_AXIS = 1
+JOY_HORIZONTAL_AXIS = 0
+JOY_ACCEPT_BUTTONS = (0, 7)
+JOY_BACK_BUTTONS = (1, 6)
+
+# VALUES CHANGE HERE (menu_nav.py, channel number entry: milliseconds a single typed digit waits for a second one)
+DIGIT_ENTRY_SINGLE_MS = 2500
+
+# VALUES CHANGE HERE (menu_nav.py, name entry: most characters of a channel name when the guide gives no limit, and of a save slot name)
+NAME_ENTRY_CHANNEL_MAX_DEFAULT = 18
+NAME_ENTRY_SLOT_MAX = 24
+
+# VALUES CHANGE HERE (menu_nav.py, DVD skip in milliseconds: one tap's jump, each step while held, how close to the real end a skip may land, the pause between skips, and how long a press must be held before it repeats)
+DVD_SKIP_TAP_MS = 30000
+DVD_SKIP_HOLD_MS = 5000
+DVD_SKIP_END_GUARD_MS = 10000
+DVD_SKIP_COOLDOWN_MS = 400
+DVD_SKIP_HOLD_START_MS = 500
+
+# ============================================================================
+# SECTION: Game screen values (read by game_deck.py)
+# ============================================================================
+
+# VALUES CHANGE HERE (game_deck.py, controller mapping screen: where the left button column ends and the right one starts, as a share of the panel width; gap between the options, space above them under the wireframe, the NES lift as a share of the height, and the drop for every console but N64, in pixels)
+GAME_MAP_LEFT_COLUMN_EDGE_FRAC = 0.22
+GAME_MAP_RIGHT_COLUMN_EDGE_FRAC = 0.78
+GAME_MAP_OPTION_GAP_PX = 40
+GAME_MAP_OPTIONS_TOP_GAP_PX = 14
+GAME_MAP_NES_OPTIONS_LIFT_FRAC = 0.04
+GAME_MAP_OPTIONS_DROP_PX = 20
+
+# VALUES CHANGE HERE (game_deck.py, key legend at the bottom of the game screens: row height and bottom padding in pixels, and how much darker the key names are than the titles (0 to 255))
+GAME_LEGEND_ROW_H_PX = 20
+GAME_LEGEND_BOTTOM_PAD_PX = 8
+GAME_LEGEND_KEY_DARKEN = 60
+
+# VALUES CHANGE HERE (game_deck.py, console picker and ROM list in pixels: size of the console switch arrows, their space beside the logo, how far past the Back column the ROM list arrows sit, the space under the ROM list and the gap of its arrows from the middle; the ROM list logo box width and height (on the menu canvas, scaled with it), how much taller it is, and its top space)
+GAME_NAV_ARROW_SIZE_PX = 15
+GAME_CONSOLE_ARROW_PAD_PX = 46
+GAME_ROMLIST_ARROW_PAST_BACK_PX = 140
+GAME_ROMLIST_BOTTOM_SPACE_PX = 90
+GAME_ROMLIST_ARROW_GAP_PX = 46
+GAME_ROMLIST_LOGO_BOX_W_PX = 226
+GAME_ROMLIST_LOGO_BOX_H_PX = 72
+GAME_ROMLIST_LOGO_HEADER_TALLER = 1.35
+GAME_ROMLIST_LOGO_TOP_PX = 20
+
+# VALUES CHANGE HERE (game_deck.py, ROM archives: most entries read from one archive, largest single file taken out of it in bytes, highest compression ratio allowed (safety caps against broken or hostile archives))
+GAME_ARCHIVE_MAX_ENTRIES = 20000
+GAME_ARCHIVE_MAX_ENTRY_BYTES = 8 * 1024 ** 3
+GAME_ARCHIVE_MAX_COMPRESSION_RATIO = 300
+
+# VALUES CHANGE HERE (game_deck.py, a game core that finishes loading after its loading screen gave up: seconds it is waited for so it can be unloaded, and seconds between checks)
+GAME_LATE_CORE_LOAD_WAIT_SECONDS = 600
+GAME_LATE_CORE_LOAD_POLL_SECONDS = 1.0
+
+# VALUES CHANGE HERE (game_deck.py, game loading screen: how fast the bar fills toward 100 % in ms (bigger is slower) for a listed console and for every other one, ms it holds at 100 % before the game shows, and ms a core gets to draw its first picture before the load is given up, for a listed console and for every other one)
+GAME_LOAD_BAR_TAU_MS = {"PSX": 9000}
+GAME_LOAD_BAR_TAU_MS_DEFAULT = 1200
+GAME_LOAD_HOLD_AT_100_MS = 350
+GAME_FIRST_FRAME_GIVEUP_MS = {"PSX": 75000}
+GAME_FIRST_FRAME_GIVEUP_MS_DEFAULT = 20000
+
+# VALUES CHANGE HERE (game_deck.py, game picture and timing: share of the bezel screen a handheld picture fills, and most game frames run in one pass to catch up after a slow frame)
+GAME_HANDHELD_BEZEL_FIT_MARGIN = 0.90
+GAME_MAX_CATCHUP_FRAMES = 4
+
+# VALUES CHANGE HERE (game_deck.py, game menus: most archives whose contents are remembered, ms between live rescans of the ROM folders, ms a console switch arrow flashes, ms the controller exit buttons are held to leave a game, seconds after one remap capture before the next is taken, and ms a message takes to fade out)
+GAME_ARCHIVE_CACHE_MAX_ENTRIES = 5000
+GAME_LIVE_RESCAN_INTERVAL_MS = 1500
+GAME_CONSOLE_ARROW_FLASH_MS = 220
+GAME_CONTROLLER_EXIT_HOLD_MS = 600
+GAME_REMAP_CAPTURE_COOLDOWN_SECONDS = 0.30
+GAME_MESSAGE_FADE_MS = 500
+
+# VALUES CHANGE HERE (game_deck.py, controller mapping screen value boxes in pixels: width, extra height over the text, and gap from the button name)
+GAME_MAP_VALUE_BOX_W_PX = 56
+GAME_MAP_VALUE_BOX_PAD_PX = 6
+GAME_MAP_VALUE_BOX_GAP_PX = 6
+
+# VALUES CHANGE HERE (game_deck.py, DVD player in ms: how long the loading screen shows, how long a custom splash picture shows, longest a splash video plays, how long a disc image gets to open, the wait after a failed open before it is called failed, the wait before a menu change is believed, and how long an end state lasts before the player goes back to the list)
+DVD_LOAD_SCREEN_MS = 1600
+DVD_CUSTOM_SPLASH_MS = 3000
+DVD_SPLASH_VIDEO_MAX_MS = 60000
+DVD_ISO_OPEN_TIMEOUT_MS = 9000
+DVD_ISO_OPEN_FAIL_GRACE_MS = 700
+DVD_MENU_FLIP_DEBOUNCE_MS = 400
+DVD_END_STATE_GRACE_MS = 2500
+
+# ============================================================================
+# SECTION: Values read by the smaller scripts (visualizers.py, libretro_core.py, media_library.py, audio_analysis.py)
+# ============================================================================
+
+# VALUES CHANGE HERE (visualizers.py, real-music visualizers: seconds a level takes to rise toward a louder reading, and to fall toward a quieter one; beat glow fade seconds)
+VIS_REACT_ATTACK_SECONDS = 0.035
+VIS_REACT_RELEASE_SECONDS = 0.16
+VIS_REACT_BEAT_FADE_SECONDS = 0.18
+
+# VALUES CHANGE HERE (visualizers.py, the space left above the Equalizer Grid's tallest bar, in pixels)
+VIS_EQ_TOP_MARGIN_PX = 10
+
+# VALUES CHANGE HERE (visualizers.py, every style: how far the animation clock moves each frame, how fast the Lite (no real music) level follows the music, and how many particles (Particle Flow) and stars (Neon Starfield) there are)
+VIS_FRAME_TIME_STEP = 0.04
+VIS_LITE_LEVEL_SMOOTH = 0.15
+VIS_PARTICLE_COUNT = 200
+VIS_STAR_COUNT = 200
+
+# VALUES CHANGE HERE (visualizers.py, Prism Shards: mirror slices, shards and turning speed; Liquid Chrome: balls, grid columns across the screen (more is sharper and slower to draw) and the balls' fastest drift per frame)
+VIS_PRISM_SLICES = 8
+VIS_PRISM_SHARDS = 22
+VIS_PRISM_TURN_SPEED = 0.15
+VIS_CHROME_BALLS = 7
+VIS_CHROME_GRID_COLUMNS = 108
+VIS_CHROME_BALL_SPEED = 1.6
+
+# VALUES CHANGE HERE (visualizers.py, Pulse Rings: the most frames between rings in Lite, frames before a ring is sent anyway when real music has no beat, how fast a ring grows per frame and its widest line; Warp Tunnel: sides of each ring and rings in the tunnel)
+VIS_PULSE_LITE_SLOWEST_FRAMES = 16
+VIS_PULSE_REACTIVE_IDLE_FRAMES = 90
+VIS_PULSE_RING_SPEED = 4.0
+VIS_PULSE_RING_WIDTH = 10
+VIS_TUNNEL_SIDES = 6
+VIS_TUNNEL_RINGS = 16
+
+# VALUES CHANGE HERE (visualizers.py, Glow Braid: points along each strand, strands in Lite and Standard and with the full spectrum in Performance, glow and bright line widths; Equalizer Grid: bars and the gap between dots in pixels; Lightning: how much a bolt and the sky flash fade per frame)
+VIS_BRAID_POINTS = 220
+VIS_BRAID_STRANDS = 3
+VIS_BRAID_STRANDS_FULL = 6
+VIS_BRAID_GLOW_WIDTH = 5
+VIS_BRAID_LINE_WIDTH = 2
+VIS_EQ_BARS = 24
+VIS_EQ_DOT_GAP_PX = 3
+VIS_LIGHTNING_FADE_PER_FRAME = 0.06
+VIS_LIGHTNING_FLASH_FADE_PER_FRAME = 0.08
+
+# VALUES CHANGE HERE (libretro_core.py, game audio in sample frames: frames sent to the mixer at a time, the queue it aims for, the most it may hold, the frames gathered before playback starts; the largest speed nudge that keeps the queue level (0.004 = 0.4 %); the game volume multiplier)
+LIBRETRO_AUDIO_OUT_CHUNK = 1024
+LIBRETRO_AUDIO_TARGET_OUT = 4096
+LIBRETRO_AUDIO_MAX_OUT = 12288
+LIBRETRO_AUDIO_PREBUFFER = 3072
+LIBRETRO_AUDIO_DRC_RANGE = 0.004
+LIBRETRO_AUDIO_LOUDNESS_GAIN = 0.45
+
+# VALUES CHANGE HERE (libretro_core.py, game core: seconds between repeats of one throttled warning; the most audio frames one core call may hand over before it is refused as broken; the widest and tallest picture a core may send, in pixels; the default enlargement of the pixel-art scaler)
+LIBRETRO_WARN_THROTTLE_SECONDS = 5.0
+LIBRETRO_AUDIO_MAX_BATCH_FRAMES = 500_000
+LIBRETRO_MAX_FRAME_DIM = 4096
+LIBRETRO_PIXEL_ART_SCALE_FACTOR = 2
+
+# VALUES CHANGE HERE (media_library.py, burned-in subtitle check: frame size read; where in the file the frames are taken (shares of the length) and the seconds used when the length is unknown; time limit per frame; the lower share of the picture searched; brightest and darkest levels that count as text and outline, outline reach in pixels; a text row's least text share and colour changes; a text band's least and most height, least width, centre range, least letter clusters, most fill and contrast; how far bands may move between frames; least frames with text, most bands per frame, frames that end the check early, and the share of frames that must agree)
+BURNED_IN_FRAME_W = 480
+BURNED_IN_FRAME_H = 270
+BURNED_IN_SAMPLE_FRACTIONS = (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
+BURNED_IN_FALLBACK_OFFSETS_S = (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+BURNED_IN_FRAME_TIMEOUT_S = 20.0
+BURNED_IN_REGION_TOP_FRAC = 0.55
+BURNED_IN_BRIGHT_MIN = 205
+BURNED_IN_DARK_MAX = 75
+BURNED_IN_OUTLINE_REACH_PX = 2
+BURNED_IN_ROW_MIN_TEXT_FRAC = 0.025
+BURNED_IN_ROW_MIN_TRANSITIONS = 10
+BURNED_IN_BAND_MIN_H_FRAC = 0.018
+BURNED_IN_BAND_MAX_H_FRAC = 0.10
+BURNED_IN_BAND_MIN_WIDTH_FRAC = 0.12
+BURNED_IN_BAND_CENTER_RANGE = (0.25, 0.75)
+BURNED_IN_BAND_MIN_GLYPH_CLUSTERS = 6
+BURNED_IN_BAND_MAX_FILL = 0.50
+BURNED_IN_BAND_CONTRAST_RATIO = 4.0
+BURNED_IN_POSITION_TOLERANCE_FRAC = 0.05
+BURNED_IN_MIN_POSITIVE_FRAMES = 3
+BURNED_IN_MAX_BANDS_PER_FRAME = 3
+BURNED_IN_EARLY_STOP_FRAMES = 4
+BURNED_IN_MIN_AGREEING_SHARE = 0.6
+
+# VALUES CHANGE HERE (audio_analysis.py, music analysis (raise ANALYSIS_VERSION in audio_analysis.py after changing any number here so cached tracks are rebuilt): sample rate, frames per second, FFT size, spectrum bands and their lowest and highest Hz, top of the low and mid bands in Hz, most seconds analysed, frames per chunk, beat flux bands, frames between beats, beat peak radius in frames)
+AUDIO_ANALYSIS_SAMPLE_RATE = 22050
+AUDIO_ANALYSIS_FPS = 25
+AUDIO_ANALYSIS_FFT_SIZE = 2048
+AUDIO_ANALYSIS_SPECTRUM_BINS = 24
+AUDIO_ANALYSIS_SPECTRUM_LOW_HZ = 40.0
+AUDIO_ANALYSIS_SPECTRUM_HIGH_HZ = 10000.0
+AUDIO_ANALYSIS_BAND_LOW_TOP_HZ = 250.0
+AUDIO_ANALYSIS_BAND_MID_TOP_HZ = 2500.0
+AUDIO_ANALYSIS_MAX_ANALYZED_SECONDS = 1500
+AUDIO_ANALYSIS_CHUNK_FRAMES = 1000
+AUDIO_ANALYSIS_BEAT_FLUX_BANDS = 16
+AUDIO_ANALYSIS_BEAT_REFRACTORY_FRAMES = 5
+AUDIO_ANALYSIS_BEAT_PEAK_RADIUS_FRAMES = 2
+
+# VALUES CHANGE HERE (audio_analysis.py, how the music numbers are scaled and beats are picked (raise ANALYSIS_VERSION in audio_analysis.py after changing any number here so cached tracks are rebuilt): the quiet and loud percentiles each band is stretched between and the smallest span in dB; the curve on the spectrum and the 3 bands and on the overall level; a beat must rise this many spreads plus this floor above the local average, its strength is scaled by this share of the given percentile of all rises, and a beat is never weaker than the minimum strength)
+AUDIO_ANALYSIS_NORMALISE_FLOOR_PERCENTILE = 5
+AUDIO_ANALYSIS_NORMALISE_CEILING_PERCENTILE = 98
+AUDIO_ANALYSIS_NORMALISE_MIN_SPAN_DB = 6.0
+AUDIO_ANALYSIS_SPECTRUM_GAMMA = 1.3
+AUDIO_ANALYSIS_LEVEL_GAMMA = 1.2
+AUDIO_ANALYSIS_BEAT_THRESHOLD_SPREAD = 1.0
+AUDIO_ANALYSIS_BEAT_THRESHOLD_FLOOR = 0.004
+AUDIO_ANALYSIS_BEAT_SCALE_PERCENTILE = 95
+AUDIO_ANALYSIS_BEAT_SCALE_SHARE = 0.5
+AUDIO_ANALYSIS_BEAT_MIN_STRENGTH = 0.3
+
+# VALUES CHANGE HERE (audio_analysis.py, analysis housekeeping: decode time limit and seconds before a failed track is tried again; tracks kept in memory, tracks waiting at most, most cache files, seconds an idle analysis thread waits for work before it stops)
+AUDIO_ANALYSIS_DECODE_TIMEOUT_SECONDS = 240
+AUDIO_ANALYSIS_FAILED_RETRY_SECONDS = 600
+AUDIO_ANALYSIS_MEMORY_TRACKS = 4
+AUDIO_ANALYSIS_MAX_QUEUED_TRACKS = 3
+AUDIO_ANALYSIS_MAX_CACHE_FILES = 400
+AUDIO_ANALYSIS_WORKER_IDLE_SECONDS = 30.0
 
 # ============================================================================
 # SECTION: Mode table
@@ -792,6 +1582,126 @@ def loudness_dispatch_workers(spare=False, cap=None, mode=None):
     return max(1, value)
 
 
+def pending_backlog_allowed(mode=None):
+    """True when a backlog (not-needed-soon) pending file may be probed now: the governor's load level is within PENDING_BACKLOG_MAX_LEVEL."""
+    level = current_level() if enforcing() else 0
+    return level <= PENDING_BACKLOG_MAX_LEVEL
+
+
+def pending_backlog_interval_seconds(mode=None):
+    """Seconds between two backlog probes: the base interval stretched by this PC's tier (a weak PC waits longer), the performance mode (lite waits longer) and the current load level."""
+    profile = get_profile()
+    level = current_level() if enforcing() else 0
+    value = PENDING_BACKLOG_INTERVAL_SECONDS * (1.0 + PENDING_BACKLOG_PER_LEVEL_MULTIPLIER * level)
+    if profile.tier == "WEAK":
+        value *= PENDING_BACKLOG_WEAK_PC_MULTIPLIER
+    if _limit_mode("scan", _resolve_mode(mode)) == "lite":
+        value *= PENDING_BACKLOG_LITE_MODE_MULTIPLIER
+    return value
+
+
+def scan_pace_seconds(scan_class, base_seconds, playing=False, guide_open=False, mode=None):
+    """Seconds a scan waits after one file: 0 for a file airing now ("now"), otherwise the base pause stretched by the class ("next" or "deep"), the playback state, the load level, the PC's tier and the mode, and shortened while the PC is quiet."""
+    if scan_class == "now":
+        return 0.0
+    cls = "deep" if scan_class == "deep" else "next"
+    pace = float(base_seconds) * SCAN_PACE_CLASS_MULTIPLIER[cls]
+    if playing:
+        pace *= SCAN_PACE_WHILE_PLAYING_MULTIPLIER[cls]
+    elif guide_open:
+        pace *= SCAN_PACE_GUIDE_MULTIPLIER
+    level = current_level() if enforcing() else 0
+    pace /= max(PACE_FACTOR_FLOOR, LEVEL_FACTOR[max(0, min(MAX_LEVEL, int(level)))])
+    if get_profile().tier == "WEAK":
+        pace *= SCAN_PACE_WEAK_PC_MULTIPLIER
+    if _limit_mode("scan", _resolve_mode(mode)) == "lite":
+        pace *= SCAN_PACE_LITE_MODE_MULTIPLIER
+    if pc_is_quiet():
+        pace *= SCAN_QUIET_PACE_MULTIPLIER
+    return pace
+
+
+def quiet_seconds(now=None):
+    """Seconds the PC has been quiet (load level 0, low CPU use, light frames), 0 when it is busy or the governor is not enforcing."""
+    throttle = _gate_state["throttle"]
+    if throttle is None or not enforcing():
+        return 0.0
+    return throttle.quiet_seconds(now)
+
+
+def pc_is_quiet(now=None):
+    """True when the PC has been quiet for SCAN_QUIET_AFTER_SECONDS, so the scans may speed up."""
+    return quiet_seconds(now) >= SCAN_QUIET_AFTER_SECONDS
+
+
+def scan_threads(profile=None, mode=None):
+    """How many of the scans (duration, picture box, loudness, visualizer music) may work on a not-airing-now file at the same time on this PC, in this mode, at this load level; 1 means they share one thread."""
+    profile = profile or get_profile()
+    if profile.tier == "WEAK":
+        return 1
+    count = int(core_budget(profile, mode) // max(0.1, SCAN_THREADS_CORES_PER_THREAD))
+    count = min(count, affordable_threads(profile, mode), SCAN_THREADS_MAX)
+    level = current_level() if enforcing() else 0
+    count = int(count * effective_factor(level, profile, mode))
+    return max(1, count)
+
+
+@contextlib.contextmanager
+def scan_thread_slot(kind, priority=False, stop=None):
+    """Holds one of the shared scan threads around one file of non-airing scan work; yields True when admitted, False when stop was set while waiting. Airing-now work, priority scopes and the UI thread never wait."""
+    if priority or _is_priority_context():
+        yield True
+        return
+    start = time.monotonic()
+    admitted = True
+    while not _activity.try_begin(SCAN_THREADS_LANE, scan_threads()):
+        if stop is not None and stop.is_set():
+            admitted = False
+            break
+        if time.monotonic() - start >= GATE_MAX_WAIT_SECONDS:
+            _activity.begin(SCAN_THREADS_LANE)
+            log.info("[GOVERNOR] scan thread wait cap %.0fs reached, running anyway: kind=%s threads=%d",
+                     GATE_MAX_WAIT_SECONDS, kind, scan_threads())
+            break
+        if stop is not None:
+            stop.wait(GATE_POLL_SECONDS)
+        else:
+            time.sleep(GATE_POLL_SECONDS)
+    if not admitted:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _activity.end(SCAN_THREADS_LANE)
+
+
+def scan_gpu_decode_allowed(profile=None):
+    """True when the picture-box scan may decode on the GPU: the switch is on, this is Windows and the PC has a real GPU of a listed tier."""
+    if not SCAN_GPU_DECODE_ENABLED or os.name != "nt":
+        return False
+    profile = profile or get_profile()
+    return str(getattr(profile, "gpu_tier", "none")) in SCAN_GPU_DECODE_TIERS
+
+
+def music_scan_class(distance, falling_behind):
+    """The pace class of a visualizer song distance songs ahead of the one playing (0 = playing): "now" for the quick songs, "next" while inside the fast window or while the scan is falling behind, "deep" after that."""
+    if distance < MUSIC_SCAN_QUICK_SONGS:
+        return "now"
+    if falling_behind or distance < MUSIC_SCAN_FAST_AHEAD_SONGS:
+        return "next"
+    return "deep"
+
+
+def music_scan_falling_behind(previous, scanned_ahead):
+    """True while the visualizer music scan must go fast: it starts when fewer than MUSIC_SCAN_FALL_BEHIND_SONGS of the next songs are scanned and ends once MUSIC_SCAN_FAST_AHEAD_SONGS are."""
+    if scanned_ahead < MUSIC_SCAN_FALL_BEHIND_SONGS:
+        return True
+    if scanned_ahead >= MUSIC_SCAN_FAST_AHEAD_SONGS:
+        return False
+    return bool(previous)
+
+
 def level_allows(level, kind):
     if level <= 2:
         return True
@@ -981,11 +1891,438 @@ VIDEO_DECODE_CANVAS_SD = (854, 480)
 VIDEO_DECODE_CANVAS_HD = (1280, 720)
 
 
+
+# ============================================================================
+# SECTION: Main script timers, limits and drawing numbers (read by retro_tv_emulator.py)
+# ============================================================================
+
+# VALUES CHANGE HERE (main script, logs and watchdogs: seconds between repeats of one throttled warning; seconds between re-installs of the Windows key hook; errors in a row before the playback watchdog gives up on a file; ms the main loop may go without a heartbeat before the watchdog logs it; ms VLC's position may stand still before the log says so; ms a file may be missing before the VLC log watchdog warns; seconds the guide preload may stand still before it is reported, and seconds before it may be reported again; app relaunches allowed inside the relaunch window, and that window in seconds)
+THROTTLED_LOG_INTERVAL_S = 30.0
+KEY_HOOK_REINSTALL_SECONDS = 45
+WATCHDOG_ERROR_BAIL_AFTER = 2
+HEARTBEAT_WATCHDOG_TIMEOUT_MS = 45000
+VLC_LOG_STALL_WARN_MS = 30000
+VLC_LOG_MISSING_FILE_GRACE_MS = 15000
+GUIDE_PRELOAD_STALL_SECONDS = 2.0
+GUIDE_PRELOAD_REPORT_COOLDOWN_SECONDS = 10.0
+RELAUNCH_MAX_ATTEMPTS = 4
+RELAUNCH_WINDOW_SECONDS = 600
+
+# VALUES CHANGE HERE (main script, background scan pacing: how many times slower scans go while a file plays; seconds the caption scan sleeps when it has nothing to do; seconds between the picture-box scans of two files, and its sleep when it has nothing to do; seconds before a skipped sweep is tried again; seconds a now-playing probe answer is trusted; seconds before one file's on-demand length probe may run again; how many times slower scans go while the guide is open; seconds before the upcoming-media sweep may run again; seconds between saves of its progress; seconds the guide preload waits between checks; ms a channel's ordered file list is kept; seconds a file whose loudness scan timed out waits before its next try, for the 1st, 2nd, 3rd and later timeouts)
+SCAN_BACKOFF_WHILE_PLAYING_MULTIPLIER = 6.0
+CAPTION_IDLE_SLEEP_SECONDS = 20.0
+PICTURE_BOX_BETWEEN_FILES_SECONDS = 1.0
+PICTURE_BOX_IDLE_SLEEP_SECONDS = 20.0
+SWEEP_SKIP_BACKOFF_SECONDS = 1.0
+PROBE_NOW_STATE_TTL_SECONDS = 3.0
+ONDEMAND_DURATION_PROBE_COOLDOWN_SECONDS = 30.0
+GUIDE_BACKOFF_MULTIPLIER = 2.0
+UPCOMING_PROBE_RESWEEP_COOLDOWN_SECONDS = 30.0
+UPCOMING_PROBE_SAVE_THROTTLE_SECONDS = 10.0
+GUIDE_PRELOAD_POLL_SECONDS = 0.5
+ORDERED_CONTENT_CACHE_TTL_MS = 8000
+LOUDNESS_TIMEOUT_BACKOFF_SECONDS = (600, 1800, 7200, 21600)
+
+# VALUES CHANGE HERE (main script, playback: ms of Static between channels; ms of black while a guide preview settles; ms a guide preview may take to load; ms a playing file may stall before it is called stalled, and the longer limit for its first buffering; ms the sound is held after a seek; ms from the end that counts as ending; seconds a stuck stop may take; seconds of the short wait for a quick stop; seconds the picture-size probe may hold up an open; ms of grace for the first frame after a seek; seconds from the end a seek is kept away from; seconds an open is checked for an error, the longer window when it may be retried, seconds Stopped must last to count as a failed open, and the seconds before each retry; failed plays on one drive before that drive is held; seconds the sound is muted while stereo or mono is switched; failures before a file is set aside as unplayable; ms a channel's failure message stays; ms between sweeps for dead drives; seconds a DVD's audio track count is kept)
+STATIC_TRANSITION_MS = 1500
+GUIDE_PREVIEW_SETTLE_MS = 500
+GUIDE_PREVIEW_LOAD_TIMEOUT_MS = 2500
+PLAYBACK_STALL_TIMEOUT_MS = 10000
+PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = 20000
+AUDIO_SYNC_HOLD_MS = 500
+END_PROXIMITY_MS = 2000
+WEDGED_STOP_TIMEOUT_SECONDS = 5
+PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS = 0.05
+PRE_OPEN_DIMS_PROBE_BOUND_SECONDS = 0.35
+SEEK_FRAME_READY_GRACE_MS = 600
+SEEK_GUARD_TAIL_MARGIN_SECONDS = 5.0
+PLAY_OPEN_ERROR_CHECK_SECONDS = 0.25
+PLAY_OPEN_CONFIRM_WINDOW_SECONDS = 1.5
+PLAY_OPEN_STOPPED_DEBOUNCE_SECONDS = 0.15
+PLAY_OPEN_RETRY_DELAYS_SECONDS = (0.5, 1.0)
+PLAY_RETRY_DRIVE_BAIL_AFTER = 2
+STEREO_TOGGLE_MUTE_SECONDS = 0.2
+UNPLAYABLE_STRIKE_THRESHOLD = 3
+CHANNEL_FAILURE_MESSAGE_MS = 30000
+DEAD_DRIVE_SWEEP_INTERVAL_MS = 2000
+DVD_AUDIO_TRACK_COUNT_TTL_SECONDS = 1.0
+
+# VALUES CHANGE HERE (main script, sound levels: the music volume multiplier; the quietest dB the stacked volume curve reaches, and the VLC volume curve; the Static sound level; dB a smoothed gain may sit above the show's floor)
+MUSIC_GAIN = 1.0
+STACKED_GAIN_MIN_DB = -48.0
+VLC_GAIN_MIN_DB = -18.0
+STATIC_AUDIO_GAIN_PRECACHED = 0.25
+SHOW_SMOOTH_TOLERANCE_DB = 0.3
+
+# VALUES CHANGE HERE (main script, captions: seconds before a TV caption lookup is tried again; ms one caption may stay on screen)
+TV_CAPTION_RETRY_SECONDS = 8.0
+CAPTION_MAX_HOLD_MS = 7000
+
+# VALUES CHANGE HERE (main script, picture and bezel drawing: seconds between checks of a bezel file for changes; pixels the channel number is nudged at the top; the menu's shrink inside each bezel and by default, and its extra shrink when warp is off; each bezel's channel LED box, gap, upward nudge, tilt, cover-up stretches and trims, cover-up nudge, text nudges, number scale, text scale and text gap, each with its default for a bezel not listed; the watermark's extra offset inside each bezel; how much of the frame an overlay border may fill and how much of the bezel's screen the picture may fill; CRT power-on: ms the picture grows, ms it settles, and its peak brightness; scan lines drawn on the screen)
+TV_BORDER_MTIME_RECHECK_TTL_SECONDS = 2.0
+CH_NUM_TOP_ALIGN_NUDGE_PX = -20
+MENU_BEZEL_SHRINK = {
+    "bezel":  (0.95, 0.95),
+    "bezel1": (0.95, 0.95),
+    "bezel2": (0.95, 0.95),
+}
+MENU_BEZEL_SHRINK_DEFAULT = (1.0, 1.0)
+MENU_WARP_OFF_EXTRA_SHRINK = 0.97
+BEZEL_CHANNEL_LED_FRAC = {
+    "bezel":  (0.7010, 0.2402, 0.0676, 0.0776),
+    "bezel1": (0.7801, 0.1191, 0.1263, 0.1282),
+}
+BEZEL_CHANNEL_LED_GAP_FRAC = {
+    "bezel":  0.28,
+    "bezel1": 0.28,
+}
+BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT = 0.28
+BEZEL_CHANNEL_LED_Y_NUDGE_FRAC = {
+    "bezel":  0.0,
+    "bezel1": 0.10,
+}
+BEZEL_CHANNEL_LED_Y_NUDGE_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_TILT_DEG = {
+    "bezel":  -2.0,
+    "bezel1": -2.0,
+}
+BEZEL_CHANNEL_LED_TILT_DEG_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC = {
+    "bezel":  0.65,
+    "bezel1": 0.0,
+}
+BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC = {
+    "bezel":  0.22,
+    "bezel1": 0.0,
+}
+BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC = {
+    "bezel":  0.65,
+    "bezel1": 0.0,
+}
+BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC = {
+    "bezel":  0.061,
+}
+BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC = {
+    "bezel":  0.061,
+}
+BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC = {
+    "bezel":  0.061,
+    "bezel1": 0.241,
+}
+BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC_DEFAULT = 0.0
+BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX = {
+    "bezel1": (1, 1),
+}
+BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX_DEFAULT = (0, 0)
+BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX = {
+    "bezel":  2,
+    "bezel1": -6,
+}
+BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX_DEFAULT = 0
+BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX = {
+    "bezel":  0,
+    "bezel1": -3,
+}
+BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX_DEFAULT = 0
+BEZEL_SONG_CARD_LED_Y_NUDGE_PX = {
+    "bezel":  4,
+    "bezel1": 4,
+}
+BEZEL_SONG_CARD_LED_Y_NUDGE_PX_DEFAULT = 0
+BEZEL_CHANNEL_LED_NUM_SCALE_FRAC = {
+    "bezel":  1.0,
+    "bezel1": 0.78,
+}
+BEZEL_CHANNEL_LED_NUM_SCALE_FRAC_DEFAULT = 1.0
+BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC = {
+    "bezel1": 0.9,
+}
+BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC_DEFAULT = 1.0
+BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX = {
+    "bezel1": -2,
+}
+BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX_DEFAULT = 0
+WATERMARK_BEZEL_EXTRA_OFFSET = {
+    "bezel":  (10, 10),
+    "bezel1": (10, 10),
+    "bezel2": (10, 10),
+}
+OVERLAY_BORDER_FIT_MARGIN = 0.85
+BEZEL_PICTURE_FIT_MARGIN = 1.00
+CRT_POWERON_EXPAND_MS = 680
+CRT_POWERON_SETTLE_MS = 1000
+CRT_POWERON_PEAK_ALPHA = 235
+CRT_SCANLINE_TARGET_LINES = 240
+
+# VALUES CHANGE HERE (main script, pan and scan: the motion grid's width and height; the least motion that counts; the frame difference that counts as a scene cut; ms between saves of a file's pan-and-scan memory to the library)
+PAN_SCAN_GRID_W = 32
+PAN_SCAN_GRID_H = 18
+PAN_SCAN_MOTION_FLOOR = 0.006
+PAN_SCAN_CUT_THRESHOLD = 0.09
+PAN_SCAN_LIBRARY_SAVE_INTERVAL_MS = 8000
+
+# VALUES CHANGE HERE (main script, start-up, file explorer, guide and key capture: the loading bar's centre, width and height on the loading art, and its font size; the boot progress weight of the steps that are not files; seconds the boot screen holds at 100 %; seconds between subsystem starts at boot; boot prewarm workers and seconds it waits for the settings; seconds probes get to finish at shutdown; the file explorer's title and toolbar heights; ms its left list is kept; half-hour steps the guide searches for the next show start; ms within which a second delivery of the same key press is ignored while a key is captured, and ms within which the same key from a second input path is ignored)
+LOAD_BAR_CENTER_X = 1196
+LOAD_BAR_CENTER_Y = 988
+LOAD_BAR_WIDTH = 260
+LOAD_BAR_HEIGHT = 12
+LOAD_BAR_FONT_SIZE = 34
+BOOT_READY_UNIT_WEIGHT = 15
+BOOT_HOLD_AT_100_SECONDS = 0.5
+BOOT_SUBSYSTEM_YIELD_SECONDS = 0.05
+BOOT_PREWARM_WORKERS = 8
+BOOT_PREWARM_SETTINGS_WAIT_SECONDS = 15.0
+SHUTDOWN_PROBE_GRACE_SECONDS = 0.4
+FILE_EXPLORER_TITLE_H = 44
+FILE_EXPLORER_TOOLBAR_H = 40
+FILE_EXPLORER_LEFT_ITEMS_TTL_MS = 2000
+GUIDE_TIME_STEP_MAX_SHIFTS = 8
+KEY_CAPTURE_SAME_PRESS_MS = 250
+KEY_CAPTURE_SECOND_PATH_MS = 600
+
+
+# ============================================================================
+# SECTION: Colours (read by retro_tv_emulator.py; ui.py and game_deck.py share the names that mean the same colour)
+# ============================================================================
+
+# VALUES CHANGE HERE (screen fills: the near-black every picture area is filled with (never pure black, which is the game overlay's see-through colour), the grey shown while a channel changes or buffers, and the guide preview's fill when it cannot draw)
+COLOR_SCREEN_BLACK = (1, 1, 1)
+COLOR_TRANSITION_GREY = (15, 15, 15)
+COLOR_GUIDE_PREVIEW_ERROR_FILL = (40, 40, 40)
+
+# VALUES CHANGE HERE (loading screen: the fill when there is no loading art, the loading bar's track and its green bar and percentage)
+COLOR_LOADING_EMPTY_BG = (5, 5, 5)
+COLOR_LOADING_BAR_TRACK = (20, 30, 20)
+COLOR_LOADING_GREEN = (0, 255, 128)
+
+# VALUES CHANGE HERE (text shared by the menus and popups: white, the gold of a warning headline and the red of a warning line)
+COLOR_TEXT_WHITE = (255, 255, 255)
+COLOR_ARCADE_GOLD = (255, 220, 0)
+COLOR_ACTION_RED = (255, 60, 60)
+
+# VALUES CHANGE HERE (banners and overlays: the text, fill and edge of the red status banner, the caption colour when a caption names none, the volume bar's track, and the screensaver's stand-in picture)
+COLOR_BANNER_TEXT = (255, 255, 255)
+COLOR_BANNER_FILL = (120, 20, 20, 210)
+COLOR_BANNER_EDGE = (255, 90, 90, 255)
+COLOR_CAPTION_DEFAULT = (255, 255, 255)
+COLOR_VOLUME_OSD_TRACK = (80, 80, 80)
+COLOR_SCREENSAVER_FALLBACK = (255, 255, 255, 200)
+
+# VALUES CHANGE HERE (file explorer: grey and locked-file text, the toolbar and footer, the Up button, the path box and its edge, dividers and lines, section headers and their text, item text, the scroll track, the tint on every other row, selected-row text, the Add buttons and their hover, the remove-location sign, its hover and hover tint, the Cancel, Remove, Done buttons and hovers, the warning banner and the busy dim)
+COLOR_FE_TEXT_GREY = (150, 150, 150)
+COLOR_FE_LOCKED = (255, 170, 60)
+COLOR_FE_BAR_BG = (10, 10, 10)
+COLOR_FE_UP_BUTTON = (40, 40, 40)
+COLOR_FE_PATH_BG = (18, 18, 18)
+COLOR_FE_PATH_EDGE = (60, 60, 60)
+COLOR_FE_DIVIDER = (50, 50, 50)
+COLOR_FE_COLUMN_HEADER_BG = (15, 15, 15)
+COLOR_FE_LINE = (45, 45, 45)
+COLOR_FE_SECTION_HEADER_BG = (8, 8, 8)
+COLOR_FE_SECTION_HEADER_TEXT = (100, 100, 100)
+COLOR_FE_ITEM_TEXT = (200, 200, 200)
+COLOR_FE_SCROLL_TRACK = (28, 28, 28)
+COLOR_FE_ALT_ROW_TINT = (255, 255, 255, 8)
+COLOR_FE_SELECTED_TEXT = (200, 225, 255)
+COLOR_FE_ADD_BUTTON_HOVER = (40, 80, 150)
+COLOR_FE_ADD_BUTTON = (25, 50, 95)
+COLOR_FE_REMOVE_LOCATION_HOVER = (255, 120, 120)
+COLOR_FE_REMOVE_LOCATION = (130, 70, 70)
+COLOR_FE_REMOVE_LOCATION_HOVER_TINT = (180, 40, 40, 90)
+COLOR_FE_CANCEL_HOVER = (210, 50, 50)
+COLOR_FE_CANCEL = (80, 20, 20)
+COLOR_FE_REMOVE_BUTTON_HOVER = (200, 100, 30)
+COLOR_FE_REMOVE_BUTTON = (100, 50, 10)
+COLOR_FE_DONE = (20, 70, 20)
+COLOR_FE_BANNER_BG = (150, 30, 30)
+COLOR_FE_BUSY_DIM = (0, 0, 0, 90)
+
+# VALUES CHANGE HERE (game_deck.py, the colours a list or caption text can be set to in the menu, by name)
+GAME_LIST_TEXT_COLORS = {
+    "white":  (255, 255, 255),
+    "black":  (0, 0, 0),
+    "red":    (220, 60, 60),
+    "orange": (230, 140, 40),
+    "yellow": (230, 210, 60),
+    "green":  (80, 220, 120),
+    "blue":   (80, 140, 230),
+    "purple": (170, 90, 220),
+}
+
+# VALUES CHANGE HERE (game_deck.py, stick deadzone screen: the stick ring's fill and edge, the deadzone ring, the threshold lines, the raw stick dot and text, and the grey of a label that is not highlighted)
+COLOR_GAME_STICK_RING_FILL = (25, 38, 62)
+COLOR_GAME_STICK_RING_EDGE = (90, 90, 110)
+COLOR_GAME_STICK_DEADZONE_RING = (200, 160, 40)
+COLOR_GAME_STICK_THRESHOLD_LINE = (70, 110, 160)
+COLOR_GAME_STICK_RAW = (150, 150, 165)
+COLOR_GAME_LABEL_GREY = (180, 180, 180)
+
+# VALUES CHANGE HERE (game_deck.py, switches, sliders and buttons on the game screens: a switch or slider that is on and off, the help line, the off red, the plain button blue and the confirm blue)
+COLOR_GAME_SWITCH_ON = (40, 167, 69)
+COLOR_GAME_SWITCH_OFF = (45, 65, 100)
+COLOR_GAME_HINT_TEXT = (120, 120, 140)
+COLOR_GAME_OFF_RED = (220, 53, 69)
+COLOR_GAME_NEUTRAL_BUTTON = (45, 80, 130)
+COLOR_GAME_CONFIRM_BLUE = (45, 110, 200)
+
+# VALUES CHANGE HERE (game_deck.py, player number boxes: a connected and an empty player, one waiting for a new controller, the number on a lit box, on a connected one and on an empty one)
+COLOR_GAME_PLAYER_BOX_CONNECTED = (70, 70, 95)
+COLOR_GAME_PLAYER_BOX_EMPTY = (35, 35, 45)
+COLOR_GAME_PLAYER_BOX_ARMED = (200, 160, 30)
+COLOR_GAME_PLAYER_TEXT_LIT = (20, 20, 20)
+COLOR_GAME_PLAYER_TEXT_CONNECTED = (200, 200, 210)
+COLOR_GAME_PLAYER_TEXT_OFF = (90, 90, 95)
+
+# VALUES CHANGE HERE (game_deck.py, controller mapping screen: the missing-wireframe box fill, edge, headline and hint, a value box while it waits for a press and normally, a value box edge, the line and dot to the button on the picture, the controller pick button, and the remap help line)
+COLOR_GAME_WIREFRAME_MISSING_FILL = (40, 50, 40)
+COLOR_GAME_WIREFRAME_MISSING_EDGE = (60, 80, 60)
+COLOR_GAME_WIREFRAME_MISSING_TEXT = (100, 120, 100)
+COLOR_GAME_WIREFRAME_MISSING_HINT = (60, 80, 60)
+COLOR_GAME_VALUE_BOX_ACTIVE = (90, 30, 30)
+COLOR_GAME_VALUE_BOX = (60, 60, 80)
+COLOR_GAME_VALUE_BOX_EDGE = (120, 120, 140)
+COLOR_GAME_HOTSPOT_LINE = (60, 200, 90)
+COLOR_GAME_HOTSPOT_DOT = (90, 255, 130)
+COLOR_GAME_PICK_BUTTON = (45, 45, 55)
+COLOR_GAME_REMAP_HINT = (120, 120, 60)
+
+# VALUES CHANGE HERE (game_deck.py, ROM list and loading screens: warning text, the loading message, bar track and percentage, a console arrow that cannot switch, the no-files line, a missing ROM selected and not selected, the busy dim, the popup help line, the in-game message text and the controller-disconnected banner fill)
+COLOR_GAME_WARNING_TEXT = (255, 90, 90)
+COLOR_GAME_LOADING_TEXT = (150, 150, 150)
+COLOR_GAME_LOADING_BAR_TRACK = (22, 22, 22)
+COLOR_GAME_LOADING_PERCENT = (80, 80, 80)
+COLOR_GAME_ARROW_DISABLED = (90, 90, 90)
+COLOR_GAME_NO_FILES_TEXT = (200, 80, 80)
+COLOR_GAME_MISSING_ROM_SELECTED = (255, 150, 90)
+COLOR_GAME_MISSING_ROM = (200, 100, 60)
+COLOR_GAME_BUSY_DIM = (0, 0, 0, 90)
+COLOR_GAME_POPUP_HINT = (160, 160, 160)
+COLOR_GAME_OSD_TEXT = (255, 255, 180)
+COLOR_GAME_DISCONNECT_FILL = (120, 20, 20, 225)
+
+# VALUES CHANGE HERE (ui.py, menu buttons and rows: a plain button, a greyed one and its text, a blue button and its dimmed form while another capture runs, the button blue that is on and its edge, a button that is off, the off red and on green of a switch, a switch that is off and greyed, the switch track when off, and a row that is off)
+COLOR_MENU_BUTTON = (25, 45, 80)
+COLOR_MENU_BUTTON_GREYED = (32, 32, 40)
+COLOR_MENU_TEXT_GREYED = (105, 105, 115)
+COLOR_MENU_BUTTON_BLUE = (45, 80, 130)
+COLOR_MENU_BUTTON_BLUE_DIM = (35, 60, 95)
+COLOR_MENU_ON_BLUE = (40, 100, 180)
+COLOR_MENU_ON_BLUE_EDGE = (60, 140, 220)
+COLOR_MENU_OFF_BUTTON = (35, 45, 60)
+COLOR_MENU_OFF_RED = (220, 53, 69)
+COLOR_MENU_ON_GREEN = (40, 167, 69)
+COLOR_MENU_SWITCH_OFF = (45, 65, 100)
+COLOR_MENU_SWITCH_GREYED = (35, 35, 45)
+COLOR_MENU_TRACK_OFF = (55, 55, 60)
+COLOR_MENU_ROW_OFF = (35, 35, 35)
+
+# VALUES CHANGE HERE (ui.py, menu text: a value in mint, grey for a disabled label, a lighter disabled grey, the off-label grey, dim text, help lines, the warning red, the flash message red, the last-item grey, text on a lit box, the section label, and greyed text and its focused form)
+COLOR_MENU_VALUE_MINT = (200, 255, 200)
+COLOR_MENU_DISABLED_GREY = (100, 100, 100)
+COLOR_MENU_TEXT_DISABLED_LIGHT = (140, 140, 140)
+COLOR_MENU_OFF_LABEL_GREY = (110, 110, 110)
+COLOR_MENU_DIM_TEXT = (150, 160, 180)
+COLOR_MENU_HINT_TEXT = (120, 120, 140)
+COLOR_MENU_WARNING_RED = (255, 80, 80)
+COLOR_MENU_FLASH_TEXT = (255, 90, 90)
+COLOR_MENU_LAST_ITEM_TEXT = (90, 90, 90)
+COLOR_MENU_TEXT_ON_LIT = (20, 20, 20)
+COLOR_MENU_SECTION_LABEL = (120, 120, 120)
+COLOR_MENU_TEXT_GREYED_LILAC = (130, 130, 150)
+COLOR_MENU_TEXT_GREYED_FOCUS = (160, 160, 175)
+
+# VALUES CHANGE HERE (ui.py, menu boxes and edges: the value box, a swatch edge, a greyed edge, the dim grey box, the padlock, a locked switch's on colour and knob, a greyed knob, a greyed toggle and its edge, and the holiday row)
+COLOR_MENU_VALUE_BOX = (10, 10, 10)
+COLOR_MENU_SWATCH_EDGE = (90, 90, 100)
+COLOR_MENU_EDGE_GREYED = (45, 45, 55)
+COLOR_MENU_DIM_GREY = (60, 60, 80)
+COLOR_MENU_PADLOCK = (80, 80, 80)
+COLOR_MENU_LOCKED_SWITCH_ON = (55, 90, 55)
+COLOR_MENU_LOCKED_SWITCH_KNOB = (130, 130, 130)
+COLOR_MENU_KNOB_GREYED = (80, 80, 90)
+COLOR_MENU_TOGGLE_GREYED = (22, 22, 30)
+COLOR_MENU_TOGGLE_GREYED_EDGE = (150, 150, 170)
+COLOR_MENU_HOLIDAY_ROW = (30, 50, 90)
+
+# VALUES CHANGE HERE (ui.py, clear buttons and key capture: the clear button, its text and dimmed form, a key box that clashes with another key and its text, and a key box waiting for a press)
+COLOR_MENU_CLEAR_BUTTON = (80, 30, 30)
+COLOR_MENU_CLEAR_TEXT = (255, 150, 150)
+COLOR_MENU_CLEAR_BUTTON_DIM = (45, 20, 25)
+COLOR_MENU_KEY_CONFLICT_FILL = (120, 20, 20)
+COLOR_MENU_KEY_CONFLICT_TEXT = (255, 100, 100)
+COLOR_MENU_KEY_CAPTURE_FILL = (90, 30, 30)
+
+# VALUES CHANGE HERE (ui.py, cards, radio buttons and the server picker: a card, its edge, a greyed card and edge, card text and greyed card text, an unnamed slot, a pending delete, the radio fill, edge and selected edge, the server-not-found line, a locked cell, its text and edge, the SERVER label, the lock dim and lock text)
+COLOR_MENU_CARD = (35, 45, 65)
+COLOR_MENU_CARD_EDGE = (90, 90, 110)
+COLOR_MENU_CARD_GREYED = (24, 27, 34)
+COLOR_MENU_CARD_EDGE_GREYED = (60, 62, 70)
+COLOR_MENU_CARD_TEXT = (210, 210, 220)
+COLOR_MENU_CARD_TEXT_GREYED = (95, 97, 105)
+COLOR_MENU_UNNAMED_TEXT = (110, 112, 120)
+COLOR_MENU_DELETE_ARMED = (60, 25, 25)
+COLOR_MENU_RADIO_FILL = (15, 15, 20)
+COLOR_MENU_RADIO_EDGE = (140, 140, 160)
+COLOR_MENU_RADIO_SELECTED_EDGE = (90, 160, 230)
+COLOR_MENU_NO_SERVER_TEXT = (200, 160, 60)
+COLOR_MENU_LOCKED_CELL = (48, 48, 55)
+COLOR_MENU_LOCKED_TEXT = (150, 150, 160)
+COLOR_MENU_EDGE_LOCKED = (145, 145, 155)
+COLOR_MENU_SERVER_LABEL = (175, 175, 185)
+COLOR_MENU_LOCK_DIM = (0, 0, 0, 145)
+COLOR_MENU_LOCK_TEXT = (190, 190, 200)
+
+# VALUES CHANGE HERE (ui.py, game, DVD and save profile rows: the player square, the player row, the disc edge and greyed disc, disc text that is off, the profile box focused and not and its edge, a step focused and its edge, the splash file name when splash is off, the dot ring and edge)
+COLOR_MENU_PLAYER_SQUARE = (80, 220, 120)
+COLOR_MENU_PLAYER_ROW = (25, 35, 55)
+COLOR_MENU_DISC_EDGE = (40, 60, 90)
+COLOR_MENU_DISC_GREYED = (20, 20, 28)
+COLOR_MENU_DISC_TEXT_OFF = (120, 120, 130)
+COLOR_MENU_PROFILE_FOCUS = (30, 50, 30)
+COLOR_MENU_PROFILE = (20, 30, 50)
+COLOR_MENU_PROFILE_EDGE = (50, 70, 100)
+COLOR_MENU_STEP_FOCUS = (34, 34, 46)
+COLOR_MENU_STEP_FOCUS_EDGE = (110, 110, 125)
+COLOR_MENU_SPLASH_FILE_OFF = (75, 75, 82)
+COLOR_MENU_DOT_RING = (170, 255, 195)
+COLOR_MENU_DOT_EDGE = (90, 150, 220)
+
+# VALUES CHANGE HERE (ui.py, popups and the DVD button-mapping popup: the hint line, the sub line and its dimmer form, the check box, and the mapping popup's off red, panel and key box)
+COLOR_MENU_POPUP_HINT = (160, 160, 160)
+COLOR_MENU_POPUP_SUBTEXT = (200, 200, 210)
+COLOR_MENU_POPUP_SUBTEXT_DIM = (140, 140, 150)
+COLOR_MENU_CHECKBOX = (200, 200, 200)
+COLOR_MENU_DVD_MAP_OFF_RED = (150, 45, 45)
+COLOR_MENU_DVD_MAP_PANEL = (16, 22, 40)
+COLOR_MENU_DVD_MAP_KEY = (12, 16, 30)
+
+# VALUES CHANGE HERE (visualizers.py: the Equalizer Grid's bottom, middle and top colours and its falling peak dot, and how much of the Glow Braid trail fades each frame (the last number, 0 to 255; bigger fades faster))
+COLOR_VIS_EQ_BOTTOM = (255, 60, 170)
+COLOR_VIS_EQ_MID = (0, 210, 220)
+COLOR_VIS_EQ_TOP = (210, 230, 60)
+COLOR_VIS_EQ_PEAK = (255, 240, 80)
+COLOR_VIS_GLOW_BRAID_FADE = (0, 0, 0, 16)
+
+# VALUES CHANGE HERE (the theme used when the saved theme cannot be read: menu colour, background and text)
+DEFAULT_THEME = {'ui': (0, 255, 128), 'bg': (10, 15, 30), 'text': (255, 255, 255)}
+
+# VALUES CHANGE HERE (media.py, the menu themes by name: menu colour, background and text; DefaultBlueGreen is the theme above)
+COLOR_THEMES = {
+    "DefaultBlueGreen": dict(DEFAULT_THEME),
+    "Classic Amber": {"ui": (255, 170, 0), "bg": (15, 10, 0), "text": (240, 220, 180)},
+}
+
 # ============================================================================
 # SECTION: Picture shapes
 # ============================================================================
-# VALUES CHANGE HERE
-PICTURE_STANDARD_ASPECTS = (16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0)
+# VALUES CHANGE HERE (the picture shapes Normal (Fit to Screen) lays a picture out as, widest first: 2.39 scope film, 2:1, 16:9, 3:2, 4:3, 1:1 square, 4:5 portrait, 9:16 phone; a picture takes the nearest one, so the most any common picture is stretched or squeezed is about 9 %)
+# WARNING: a shape wider than halfway between 4:3 and 16:9 is drawn on the whole Bezel screen with Bezel on, a narrower one in the true 4:3 box (_bezel_video_wants_tube_fit); a new shape goes with the group of the one it sits nearest.
+PICTURE_STANDARD_ASPECTS = (2.39, 2.0, 16.0 / 9.0, 3.0 / 2.0, 4.0 / 3.0, 1.0, 4.0 / 5.0, 9.0 / 16.0)
 
 
 # ============================================================================
@@ -1013,12 +2350,73 @@ PICTURE_BOX_FLAT_TOLERANCE = 12
 PICTURE_BOX_FLAT_FRAMES = 2
 PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION = 0.125
 
+# VALUES CHANGE HERE (media_library.py, picture-box scan: where in the file the samples are taken as shares of its length, the seconds into the file used when its length is unknown, seconds decoded per sample and the most seconds one sample may take, the fewest good samples for an answer, ffmpeg cropdetect's black level, and the smallest bar as a share of the frame and in pixels)
+# WARNING: raise PICTURE_BOX_DETECTOR_VERSION in media_library.py when one of these changes, so stored picture boxes are scanned again under the new numbers.
+PICTURE_BOX_SAMPLE_FRACTIONS = (0.10, 0.25, 0.40, 0.55, 0.70, 0.85)
+PICTURE_BOX_FALLBACK_OFFSETS_S = (30.0, 120.0, 300.0)
+PICTURE_BOX_SAMPLE_SECONDS = 2.0
+PICTURE_BOX_SAMPLE_TIMEOUT_S = 25.0
+PICTURE_BOX_MIN_GOOD_SAMPLES = 3
+PICTURE_BOX_CROPDETECT_LIMIT = 32
+PICTURE_BOX_MIN_BAR_FRACTION = 0.015
+PICTURE_BOX_MIN_BAR_PX = 4
+
+# VALUES CHANGE HERE (media_library.py, seconds between the two size reads that tell whether a file is still being copied in)
+LIBRARY_GROWING_FILE_CHECK_DELAY_S = 0.05
+
 
 # ============================================================================
 # SECTION: First-start probe of pending scheduled files
 # ============================================================================
-# VALUES CHANGE HERE
-PENDING_SCHEDULE_PROBE_PARALLEL = 6
+# VALUES CHANGE HERE (pending scheduled files are probed in the background, this many at a time; a file whose probe found nothing is tried again after the retry seconds; a channel's request is dropped when its schedule has not asked again for the stale seconds)
+PENDING_SCHEDULE_PROBE_PARALLEL = 1
+PENDING_SCHEDULE_PROBE_RETRY_SECONDS = 5.0
+PENDING_SCHEDULE_PROBE_REQUEST_STALE_SECONDS = 30.0
+
+# VALUES CHANGE HERE (pending-file probe priority: the first this-many files of a channel's request are needed soon and probe at priority, every channel's next file before any channel's second; every file after them is backlog, probed one per interval, only while the load level is at or below the max level; the interval is stretched by the load level and by the weak-PC and lite-mode multipliers)
+PENDING_PROBE_URGENT_COUNT = 4
+PENDING_BACKLOG_INTERVAL_SECONDS = 1.5
+PENDING_BACKLOG_MAX_LEVEL = 1
+PENDING_BACKLOG_WEAK_PC_MULTIPLIER = 2.0
+PENDING_BACKLOG_LITE_MODE_MULTIPLIER = 1.5
+PENDING_BACKLOG_PER_LEVEL_MULTIPLIER = 1.0
+
+# VALUES CHANGE HERE (scan pacing shared by the duration, picture-box, loudness and visualizer music scans: files airing now run with no pause; the next 3 shows per channel are "next" and the files behind them are "deep"; the pause after one file = the scan's base pause x the class multiplier x the while-playing multiplier (or the guide multiplier while the guide is open) / the load-level factor, then x the weak-PC and lite-mode multipliers)
+SCAN_PACE_CLASS_MULTIPLIER = {"next": 1.0, "deep": 2.0}
+SCAN_PACE_WHILE_PLAYING_MULTIPLIER = {"next": 2.0, "deep": 6.0}
+SCAN_PACE_GUIDE_MULTIPLIER = 2.0
+SCAN_PACE_WEAK_PC_MULTIPLIER = 2.0
+SCAN_PACE_LITE_MODE_MULTIPLIER = 1.5
+
+# VALUES CHANGE HERE (quiet PC: when the load level is 0, the whole PC's CPU use is at or below the percent and the app's frame time is at or below the share of its frame budget for the seconds given, the scans speed back up; their pause is multiplied by the quiet multiplier until the PC is busy again)
+SCAN_QUIET_MAX_SYSTEM_CPU_PCT = 40.0
+SCAN_QUIET_MAX_BUSY_RATIO = 0.6
+SCAN_QUIET_AFTER_SECONDS = 20.0
+SCAN_QUIET_PACE_MULTIPLIER = 0.5
+
+# VALUES CHANGE HERE (scan threads: the duration, picture-box, loudness and visualizer music scans each have their own thread, but only this many of them may work on a not-airing-now file at the same time: the scan cores of this PC and mode divided by the cores per thread, never above the PC's affordable threads or the maximum, cut by the load-level factor, never below 1; 1 means the scans take turns on one shared thread; a scan never waits longer than the gate wait cap)
+SCAN_THREADS_CORES_PER_THREAD = 1.0
+SCAN_THREADS_MAX = 4
+SCAN_THREADS_LANE = "scan_threads"
+
+# VALUES CHANGE HERE (GPU help for scans: when the PC has a real GPU of a listed tier, the picture-box scan decodes its video on the GPU with this ffmpeg hwaccel, which takes the decode work off the CPU; seconds allowed for the one-time check that this ffmpeg has the hwaccel; GPU decodes that may fail in a run before the scan goes back to CPU decoding for the rest of the run; the loudness, duration and music scans read audio or file headers only and have nothing for the GPU to do)
+SCAN_GPU_DECODE_ENABLED = True
+SCAN_GPU_DECODE_TIERS = ("dedicated", "onboard")
+SCAN_GPU_DECODE_HWACCEL = "d3d11va"
+SCAN_GPU_DECODE_CHECK_TIMEOUT_SECONDS = 5.0
+SCAN_GPU_DECODE_FAILURE_LIMIT = 3
+
+# VALUES CHANGE HERE (visualizer music scans: the first this-many songs ahead are scanned with no pause because songs are short; scans stay fast until this many songs ahead are scanned, then slow to the deep pace; when fewer than the fall-behind count of the next songs are scanned the scan is falling behind and goes fast again; the visualizer analysis keeps the fast count of songs ahead analyzed and refills when fewer than the fall-behind count are left)
+MUSIC_SCAN_QUICK_SONGS = 3
+MUSIC_SCAN_FAST_AHEAD_SONGS = 10
+MUSIC_SCAN_FALL_BEHIND_SONGS = 5
+
+# VALUES CHANGE HERE (audio tracks: languages picked first, in order, when a file has no saved track choice (matched against the track's language name or code); milliseconds the track list must stay unchanged after a file starts before the pick is made, and the most milliseconds to wait for that; seconds the Audio Track menu keeps re-reading the track list while it is open, and how often)
+AUDIO_TRACK_PREFERRED_LANGUAGES = ("english", "eng", "en")
+AUDIO_TRACK_SETTLE_MS = 600
+AUDIO_TRACK_SETTLE_MAX_MS = 2500
+AUDIO_TRACK_PICKER_REFRESH_SECONDS = 15.0
+AUDIO_TRACK_PICKER_REFRESH_INTERVAL_SECONDS = 0.5
 
 # VALUES CHANGE HERE (the first-start scans of the playing file, picture box and loudness, start together only when the PC can spare this many scan cores and threads and its load level is no higher than the limit; otherwise the picture box runs first and loudness follows; the priority disk slots are what those together-scans may hold at once)
 FIRST_START_CONCURRENT_MIN_CORES = 3.0
@@ -1061,10 +2459,11 @@ class Throttle:
         self._event_kind = ""
         self._event_logged = True
         self._last_status_log = 0.0
-        self.last_reason = "start"
         self._unattributed_target = 0
         self._unattributed_reason = ""
         self._last_unattributed_log = 0.0
+        self._quiet_since = None
+        self._quiet_announced = False
         self._lock = threading.Lock()
 
     def note_event(self, kind, now=None):
@@ -1140,6 +2539,7 @@ class Throttle:
         now = time.monotonic() if now is None else now
         with self._lock:
             target, reason, immediate = self._target(signals)
+            self._note_quiet(signals, target, now)
             if self._unattributed_target > self.level and now - self._last_unattributed_log >= ATTRIBUTION_LOG_INTERVAL_SECONDS:
                 self._last_unattributed_log = now
                 log.info("[GOVERNOR] pressure NOT attributable to background work (none running): would_level=%d (%s)",
@@ -1168,13 +2568,39 @@ class Throttle:
                     self._set_level(self.level - 1, "relax: calm for %.0fs" % (now - self._last_hold), now)
             return self.level
 
+    def _note_quiet(self, signals, target, now):
+        """Starts or ends the quiet-PC timer from this tick's signals and logs when the scans speed up or slow back down."""
+        cpu = signals.get("system_cpu_pct")
+        avg = signals.get("busy_avg_ms")
+        light = avg is None or self.frame_budget_ms <= 0 or avg / self.frame_budget_ms <= SCAN_QUIET_MAX_BUSY_RATIO
+        quiet = (target == 0 and self.level == 0 and cpu is not None
+                 and cpu <= SCAN_QUIET_MAX_SYSTEM_CPU_PCT and light)
+        if quiet:
+            if self._quiet_since is None:
+                self._quiet_since = now
+            if not self._quiet_announced and now - self._quiet_since >= SCAN_QUIET_AFTER_SECONDS:
+                self._quiet_announced = True
+                log.info("[GOVERNOR] PC quiet for %.0fs (system_cpu=%.0f%%): scans speed up x%.2f",
+                         now - self._quiet_since, cpu, 1.0 / max(0.01, SCAN_QUIET_PACE_MULTIPLIER))
+        else:
+            if self._quiet_announced:
+                log.info("[GOVERNOR] PC busy again (system_cpu=%s, level=%d): scans back to their normal pace",
+                         "%.0f%%" % cpu if cpu is not None else "unknown", self.level)
+            self._quiet_since = None
+            self._quiet_announced = False
+
+    def quiet_seconds(self, now=None):
+        """Seconds this throttle has seen the PC quiet, 0 when it is not."""
+        now = time.monotonic() if now is None else now
+        since = self._quiet_since
+        return 0.0 if since is None else max(0.0, now - since)
+
     def _set_level(self, new_level, reason, now):
         old = self.level
         self.level = max(0, min(MAX_LEVEL, new_level))
         self._last_change = now
         if self.level > old:
             self._last_hold = now
-        self.last_reason = reason
         if self.level != old:
             log.info("[GOVERNOR] level %d->%d reason=%s%s", old, self.level, reason,
                      " (shadow)" if SHADOW_MODE else "")
@@ -1342,9 +2768,6 @@ class ActivityTracker:
             self._inflight[lane] = max(0, self._inflight[lane] - 1)
             self._last_end[lane] = now
 
-    def inflight(self, lane):
-        with self._lock:
-            return self._inflight[lane]
 
     def try_begin(self, lane, limit):
         """Atomic check-and-start so two jobs cannot both take the last slot."""
@@ -1426,6 +2849,12 @@ def first_start_scan_plan(profile=None, mode=None):
 def first_start_scans_concurrent(profile=None, mode=None):
     """True when the playing file's first-start scans may run at the same time on this PC right now."""
     return first_start_scan_plan(profile, mode)[0]
+
+
+def picture_box_pre_show_parallel(profile=None, mode=None):
+    """(sample points decoded at once, reason) for the picture-box scan made before a file's first frame: PICTURE_BOX_PRE_SHOW_PARALLEL where first-start scans may run together, 1 where they must run in sequence."""
+    together, why = first_start_scan_plan(profile, mode)
+    return (max(1, int(PICTURE_BOX_PRE_SHOW_PARALLEL)) if together else 1), why
 
 
 def in_priority_scope():
@@ -1901,11 +3330,13 @@ def start(gpu_tier="none", gpu_names=(), vlc_version="", app_version="", pygame_
             pygame_version or "unknown", sdl_version or "unknown", _state["fingerprint"])
         log.info(
             "[GOVERNOR] ceilings mode=%s probe+duration=%s loudness+bake=%s music=%s whisper_slots=%s "
-            "whisper_threads=%d cropdetect_threads=%s vlc_avcodec_threads=%d affordable_threads=%d caption_cadence=%s",
+            "whisper_threads=%d cropdetect_threads=%s vlc_avcodec_threads=%d affordable_threads=%d caption_cadence=%s "
+            "scan_threads=%d scan_gpu_decode=%s",
             mode_now, lane_ceiling("probe_and_duration"), lane_ceiling("loudness_and_bake"),
             lane_ceiling("music_loudness"), lane_ceiling("whisper_slots"),
             whisper_threads(profile), lane_ceiling("cropdetect_threads"), vlc_decoder_threads(profile),
-            affordable_threads(profile), caption_cadence())
+            affordable_threads(profile), caption_cadence(), scan_threads(profile),
+            SCAN_GPU_DECODE_HWACCEL if scan_gpu_decode_allowed(profile) else "off")
     return profile
 
 
@@ -1927,4 +3358,6 @@ __all__ = [
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
     "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode",
+    "scan_pace_seconds", "quiet_seconds", "pc_is_quiet", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
+    "music_scan_class", "music_scan_falling_behind",
 ]

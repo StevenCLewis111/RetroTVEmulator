@@ -491,7 +491,9 @@ class GPUFramePipeline:
             self.close()
             raise
 
-    # -- setup ---------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Setup
+    # ========================================================================
     def _create_pipeline(self):
         codes = precompile_shaders()
         vs_code, ps1_code, ps2_code = codes["vs"], codes["ps1"], codes["ps2"]
@@ -515,7 +517,9 @@ class GPUFramePipeline:
                      ctypes.byref(desc), ctypes.byref(init), ctypes.byref(out))
         return out
 
-    # -- sized resources -------------------------------------------------------
+    # ========================================================================
+    # SECTION: Sized resources
+    # ========================================================================
     def _release_sized(self):
         for obj in (self._mid_rtv, self._mid_srv, self._mid_tex, self._src_srv, self._src_tex):
             release(obj)
@@ -560,7 +564,9 @@ class GPUFramePipeline:
         self._size = (width, height)
         self._src_format = src_format
 
-    # -- overlays (bezel image, LED readout) ----------------------------------------
+    # ========================================================================
+    # SECTION: Overlays (bezel image, LED readout)
+    # ========================================================================
     @staticmethod
     def _alpha_format_for(surface) -> int:
         if surface.get_bytesize() != 4:
@@ -619,7 +625,9 @@ class GPUFramePipeline:
         """Stops drawing the LED readout and frees its texture."""
         self._release_overlay(self._led)
 
-    # -- per frame -----------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Per frame
+    # ========================================================================
     @staticmethod
     def _format_for(surface) -> int:
         if surface.get_bytesize() != 4:
@@ -715,7 +723,9 @@ class GPUFramePipeline:
         self._run_pass2(composite, source_srv)
         self._unbind_inputs()
 
-    # -- teardown ------------------------------------------------------------------------
+    # ========================================================================
+    # SECTION: Teardown
+    # ========================================================================
     def close(self) -> None:
         """Releases everything; safe to call twice and after a failed constructor."""
         if self._closed:

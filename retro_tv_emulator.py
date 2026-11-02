@@ -29,11 +29,93 @@ import logging.handlers
 import traceback
 
 
+# ============================================================================
+# SECTION: The logs folder (every log, working file and folder the app makes beside the exe)
+# ============================================================================
+# WARNING: only retro_config.json, the exe and the folders the build ships stay in the app folder; everything the app makes while it runs (temp, watchdog, controllers, the update work folder, playback_runtime.json, the probe marker, the settings save's temporary file) lives in root/logs.
+LOGS_FOLDER_NAME = "logs"
+_ROOT_FOLDERS_INTO_LOGS = ("temp", "watchdog", "controllers", ".retro_tv_updates")
+_ROOT_FILES_INTO_LOGS = ("playback_runtime.json", "_probe_inflight.json", "update_helper.log", "update_helper.log.1")
+_ROOT_STALE_TEMP_FILES = ("retro_config.json.tmp", "playback_runtime.json.tmp")
+
+
+def _app_root_dir():
+    """The app folder: the folder that holds the exe (or the main script when run from source)."""
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def _app_logs_dir():
+    """root/logs, made when missing."""
+    _dir = os.path.join(_app_root_dir(), LOGS_FOLDER_NAME)
+    os.makedirs(_dir, exist_ok=True)
+    return _dir
+
+
+def _move_root_working_files_into_logs():
+    """Moves what older versions left in the app folder (the temp, watchdog, controllers and update work folders, the runtime file, the probe marker and the update helper's log) into root/logs, never over a file already there, and removes a leftover settings-save temporary file; returns what it did as lines for the log."""
+    done = []
+    try:
+        root = _app_root_dir()
+        logs = _app_logs_dir()
+    except Exception as _logs_error:
+        return ["could not make the logs folder: %s" % _logs_error]
+    for _name in _ROOT_FOLDERS_INTO_LOGS:
+        _old = os.path.join(root, _name)
+        if not os.path.isdir(_old):
+            continue
+        _new = os.path.join(logs, _name)
+        try:
+            if not os.path.exists(_new):
+                os.replace(_old, _new)
+                done.append("moved folder %s into logs" % _name)
+                continue
+            for _dirpath, _dirnames, _filenames in os.walk(_old, topdown=False):
+                _target_dir = os.path.join(_new, os.path.relpath(_dirpath, _old))
+                os.makedirs(_target_dir, exist_ok=True)
+                for _file in _filenames:
+                    _src = os.path.join(_dirpath, _file)
+                    _dst = os.path.join(_target_dir, _file)
+                    if os.path.exists(_dst):
+                        os.remove(_src)
+                    else:
+                        os.replace(_src, _dst)
+                os.rmdir(_dirpath)
+            done.append("merged folder %s into logs\\%s" % (_name, _name))
+        except Exception as _move_error:
+            done.append("could not move folder %s into logs: %s" % (_name, _move_error))
+    for _name in _ROOT_FILES_INTO_LOGS:
+        _old = os.path.join(root, _name)
+        if not os.path.isfile(_old):
+            continue
+        try:
+            _new = os.path.join(logs, _name)
+            if os.path.exists(_new):
+                os.remove(_old)
+                done.append("removed the older %s (logs already has one)" % _name)
+            else:
+                os.replace(_old, _new)
+                done.append("moved %s into logs" % _name)
+        except Exception as _move_error:
+            done.append("could not move %s into logs: %s" % (_name, _move_error))
+    for _name in _ROOT_STALE_TEMP_FILES:
+        _old = os.path.join(root, _name)
+        if os.path.isfile(_old):
+            try:
+                os.remove(_old)
+                done.append("removed a leftover %s" % _name)
+            except Exception as _remove_error:
+                done.append("could not remove a leftover %s: %s" % (_name, _remove_error))
+    return done
+
+
+_ROOT_MOVED_INTO_LOGS = _move_root_working_files_into_logs()
+
+
 def _early_crash_path():
     try:
-        base = os.path.dirname(os.path.abspath(sys.argv[0]))
-        os.makedirs(os.path.join(base, "temp"), exist_ok=True)
-        return os.path.join(base, "temp", "crash_log.txt")
+        _dir = os.path.join(_app_logs_dir(), "temp")
+        os.makedirs(_dir, exist_ok=True)
+        return os.path.join(_dir, "crash_log.txt")
     except Exception:
         return None
 
@@ -85,7 +167,7 @@ def _server_breadcrumb(_logger, _level, _key, message, *args, **_kwargs):
 
 
 def _log_output_dir():
-    _dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "temp")
+    _dir = os.path.join(_app_logs_dir(), "temp")
     os.makedirs(_dir, exist_ok=True)
     return _dir
 
@@ -151,11 +233,17 @@ import media
 import broadcast_clock
 import menu_nav
 try:
+    import media_library as _ml_ui_guard
+    _ml_ui_guard.set_ui_thread(threading.get_ident())
+except Exception as _ui_guard_err:
+    print(f"[BOOT] media_library UI-thread guard not set: {_ui_guard_err}")
+try:
     import performance_governor
     _PERFORMANCE_GOVERNOR_IMPORT_ERROR = None
 except Exception as _governor_import_err:
     performance_governor = None
     _PERFORMANCE_GOVERNOR_IMPORT_ERROR = _governor_import_err
+
 # WARNING: shell mode (--as-shell, Windows shell replaced) must be set before the governor starts, because the thread and core limits are read from it.
 if performance_governor is not None:
     performance_governor.set_shell_mode("--as-shell" in sys.argv)
@@ -270,6 +358,58 @@ except Exception as _log_setup_e:
 
 log = logging.getLogger(__name__)
 log.info("=== App start %s ===", broadcast_clock.now().replace(tzinfo=None).isoformat())
+for _moved_line in _ROOT_MOVED_INTO_LOGS:
+    log.info("[LOGS FOLDER] %s", _moved_line)
+
+
+
+# ============================================================================
+# SECTION: Colours
+# ============================================================================
+# WARNING: the fallback colours below must match the COLOR_ values and DEFAULT_THEME in performance_governor.py; they are used only when that module fails to import.
+COLOR_SCREEN_BLACK = performance_governor.COLOR_SCREEN_BLACK if performance_governor is not None else (1, 1, 1)
+COLOR_TRANSITION_GREY = performance_governor.COLOR_TRANSITION_GREY if performance_governor is not None else (15, 15, 15)
+COLOR_GUIDE_PREVIEW_ERROR_FILL = performance_governor.COLOR_GUIDE_PREVIEW_ERROR_FILL if performance_governor is not None else (40, 40, 40)
+COLOR_LOADING_EMPTY_BG = performance_governor.COLOR_LOADING_EMPTY_BG if performance_governor is not None else (5, 5, 5)
+COLOR_LOADING_BAR_TRACK = performance_governor.COLOR_LOADING_BAR_TRACK if performance_governor is not None else (20, 30, 20)
+COLOR_LOADING_GREEN = performance_governor.COLOR_LOADING_GREEN if performance_governor is not None else (0, 255, 128)
+COLOR_TEXT_WHITE = performance_governor.COLOR_TEXT_WHITE if performance_governor is not None else (255, 255, 255)
+COLOR_ARCADE_GOLD = performance_governor.COLOR_ARCADE_GOLD if performance_governor is not None else (255, 220, 0)
+COLOR_ACTION_RED = performance_governor.COLOR_ACTION_RED if performance_governor is not None else (255, 60, 60)
+COLOR_BANNER_TEXT = performance_governor.COLOR_BANNER_TEXT if performance_governor is not None else (255, 255, 255)
+COLOR_BANNER_FILL = performance_governor.COLOR_BANNER_FILL if performance_governor is not None else (120, 20, 20, 210)
+COLOR_BANNER_EDGE = performance_governor.COLOR_BANNER_EDGE if performance_governor is not None else (255, 90, 90, 255)
+COLOR_CAPTION_DEFAULT = performance_governor.COLOR_CAPTION_DEFAULT if performance_governor is not None else (255, 255, 255)
+COLOR_VOLUME_OSD_TRACK = performance_governor.COLOR_VOLUME_OSD_TRACK if performance_governor is not None else (80, 80, 80)
+COLOR_SCREENSAVER_FALLBACK = performance_governor.COLOR_SCREENSAVER_FALLBACK if performance_governor is not None else (255, 255, 255, 200)
+COLOR_FE_TEXT_GREY = performance_governor.COLOR_FE_TEXT_GREY if performance_governor is not None else (150, 150, 150)
+COLOR_FE_LOCKED = performance_governor.COLOR_FE_LOCKED if performance_governor is not None else (255, 170, 60)
+COLOR_FE_BAR_BG = performance_governor.COLOR_FE_BAR_BG if performance_governor is not None else (10, 10, 10)
+COLOR_FE_UP_BUTTON = performance_governor.COLOR_FE_UP_BUTTON if performance_governor is not None else (40, 40, 40)
+COLOR_FE_PATH_BG = performance_governor.COLOR_FE_PATH_BG if performance_governor is not None else (18, 18, 18)
+COLOR_FE_PATH_EDGE = performance_governor.COLOR_FE_PATH_EDGE if performance_governor is not None else (60, 60, 60)
+COLOR_FE_DIVIDER = performance_governor.COLOR_FE_DIVIDER if performance_governor is not None else (50, 50, 50)
+COLOR_FE_COLUMN_HEADER_BG = performance_governor.COLOR_FE_COLUMN_HEADER_BG if performance_governor is not None else (15, 15, 15)
+COLOR_FE_LINE = performance_governor.COLOR_FE_LINE if performance_governor is not None else (45, 45, 45)
+COLOR_FE_SECTION_HEADER_BG = performance_governor.COLOR_FE_SECTION_HEADER_BG if performance_governor is not None else (8, 8, 8)
+COLOR_FE_SECTION_HEADER_TEXT = performance_governor.COLOR_FE_SECTION_HEADER_TEXT if performance_governor is not None else (100, 100, 100)
+COLOR_FE_ITEM_TEXT = performance_governor.COLOR_FE_ITEM_TEXT if performance_governor is not None else (200, 200, 200)
+COLOR_FE_SCROLL_TRACK = performance_governor.COLOR_FE_SCROLL_TRACK if performance_governor is not None else (28, 28, 28)
+COLOR_FE_ALT_ROW_TINT = performance_governor.COLOR_FE_ALT_ROW_TINT if performance_governor is not None else (255, 255, 255, 8)
+COLOR_FE_SELECTED_TEXT = performance_governor.COLOR_FE_SELECTED_TEXT if performance_governor is not None else (200, 225, 255)
+COLOR_FE_ADD_BUTTON_HOVER = performance_governor.COLOR_FE_ADD_BUTTON_HOVER if performance_governor is not None else (40, 80, 150)
+COLOR_FE_ADD_BUTTON = performance_governor.COLOR_FE_ADD_BUTTON if performance_governor is not None else (25, 50, 95)
+COLOR_FE_REMOVE_LOCATION_HOVER = performance_governor.COLOR_FE_REMOVE_LOCATION_HOVER if performance_governor is not None else (255, 120, 120)
+COLOR_FE_REMOVE_LOCATION = performance_governor.COLOR_FE_REMOVE_LOCATION if performance_governor is not None else (130, 70, 70)
+COLOR_FE_REMOVE_LOCATION_HOVER_TINT = performance_governor.COLOR_FE_REMOVE_LOCATION_HOVER_TINT if performance_governor is not None else (180, 40, 40, 90)
+COLOR_FE_CANCEL_HOVER = performance_governor.COLOR_FE_CANCEL_HOVER if performance_governor is not None else (210, 50, 50)
+COLOR_FE_CANCEL = performance_governor.COLOR_FE_CANCEL if performance_governor is not None else (80, 20, 20)
+COLOR_FE_REMOVE_BUTTON_HOVER = performance_governor.COLOR_FE_REMOVE_BUTTON_HOVER if performance_governor is not None else (200, 100, 30)
+COLOR_FE_REMOVE_BUTTON = performance_governor.COLOR_FE_REMOVE_BUTTON if performance_governor is not None else (100, 50, 10)
+COLOR_FE_DONE = performance_governor.COLOR_FE_DONE if performance_governor is not None else (20, 70, 20)
+COLOR_FE_BANNER_BG = performance_governor.COLOR_FE_BANNER_BG if performance_governor is not None else (150, 30, 30)
+COLOR_FE_BUSY_DIM = performance_governor.COLOR_FE_BUSY_DIM if performance_governor is not None else (0, 0, 0, 90)
+DEFAULT_THEME = performance_governor.DEFAULT_THEME if performance_governor is not None else {'ui': (0, 255, 128), 'bg': (10, 15, 30), 'text': (255, 255, 255)}
 
 
 # ============================================================================
@@ -391,7 +531,8 @@ def _check_previous_run_exit():
             try:
                 with open(_path, "r", encoding="utf-8") as _f:
                     _started = _f.read().strip() or "unknown"
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_check_previous_run_exit: with open(_path, 'r', encoding='utf-8') as _f:", _swallowed_error)
                 _started = "unknown"
             log.warning("[BOOT] The previous run (started %s) did not exit cleanly: it ended by a crash, a task kill, a power loss or a forced exit, not by a quit. "
                         "Look in %s: crash_log.txt (kept when the app relaunched itself) or crash_log_previous.txt (moved there when the app was started by hand), "
@@ -441,7 +582,8 @@ def _write_tester_report(reason):
         _script = os.path.abspath(sys.argv[0])
         try:
             _built = datetime.datetime.fromtimestamp(os.path.getmtime(_script)).replace(microsecond=0).isoformat()
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("_write_tester_report: _built = datetime.datetime.fromtimestamp(os.path.getmtime(_script))...", _swallowed_error)
             _built = "unknown"
         _out = [
             "RETRO TV TESTER REPORT",
@@ -577,17 +719,20 @@ def _hard_exit_process(code):
         _clear_run_marker()
     try:
         _flush_app_log()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_hard_exit_process: _flush_app_log()", _swallowed_error)
         pass
     try:
         _write_tester_report("exit code %s" % code)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_hard_exit_process: _write_tester_report('exit code %s' % code)", _swallowed_error)
         pass
     try:
         if os.name == "nt":
             _k32 = ctypes.windll.kernel32
             _k32.TerminateProcess(_k32.GetCurrentProcess(), code)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_hard_exit_process: if os.name == 'nt':", _swallowed_error)
         pass
     os._exit(code)
 
@@ -607,18 +752,21 @@ _original_print = _builtins.print
 def _logged_print(*args, **kwargs):
     try:
         _original_print(*args, **kwargs)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_logged_print: _original_print(*args, **kwargs)", _swallowed_error)
         pass
     try:
         _msg = " ".join(str(a) for a in args)
         log.info(_msg)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_logged_print: _msg = ' '.join((str(a) for a in args))", _swallowed_error)
         pass
 
 _builtins.print = _logged_print
 
 _throttled_log_last_ts = {}
-_THROTTLED_LOG_INTERVAL_S = 30.0
+# WARNING: the fallback numbers below must match THROTTLED_LOG_INTERVAL_S in performance_governor.py; they are used only when that module fails to import.
+_THROTTLED_LOG_INTERVAL_S = performance_governor.THROTTLED_LOG_INTERVAL_S if performance_governor is not None else 30.0
 
 def _log_warn_throttled(_key, msg, *args, **_kwargs):
     _now = time.monotonic()
@@ -680,7 +828,6 @@ import pygame
 def _bootstrap_libvlc():
     def _log(msg):
         print(msg, flush=True)
-        log.info(msg)
 
     base_dir = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
     bundled_dir = os.path.join(base_dir, "vlc")
@@ -738,6 +885,13 @@ def _bootstrap_libvlc():
                      "a full VLC install instead of the trimmed bundled copy.")
 
         if os.path.isdir(plugins_dir):
+            _plugins_cache = os.path.join(plugins_dir, "plugins.dat")
+            if os.path.isfile(_plugins_cache):
+                _log(f"[BOOT] VLC plugin cache found: {_plugins_cache}")
+            else:
+                _log(f"[BOOT WARNING] VLC plugin cache missing ({_plugins_cache}): VLC reads every plugin file "
+                     "each time an engine starts, which can take several seconds; the cache is made by running "
+                     "vlc-cache-gen.exe on the plugins folder.")
             _found_directsound_plugin = False
             for _root, _dirs, _files in os.walk(plugins_dir):
                 for _f in _files:
@@ -824,8 +978,6 @@ try:
 except Exception as tk_err:
     log.warning(f"Tkinter preloader skipped: {tk_err}")
 
-
-_BOOT_WALL_START_TIME = time.time()
 
 pygame.display.init()
 pygame.font.init()
@@ -1017,7 +1169,8 @@ if os.name == "nt":
     ).start()
     print("[BOOT] OS interrupt-key suppression active (F1-F12, volume, media, mail, browser).", flush=True)
 
-    _HOOK_REINSTALL_SEC = 45
+    # WARNING: the fallback numbers below must match KEY_HOOK_REINSTALL_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    _HOOK_REINSTALL_SEC = performance_governor.KEY_HOOK_REINSTALL_SECONDS if performance_governor is not None else 45
 
     # WARNING: a low-level hook is only called while its installing thread reads messages; reinstalling from this sleeping thread left a hook that never answered, so Windows handled the volume and mute keys itself. The pump thread does the install.
     def _kbd_hook_watchdog():
@@ -1124,34 +1277,37 @@ log.info(
 # ============================================================================
 
 _last_frame_gap_ms = None
+# WARNING: the fallback numbers below must match MENU_IDLE_CLOSE_SECONDS, CONFIRM_POPUP_IDLE_CLOSE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+MENU_IDLE_CLOSE_MS = int(performance_governor.MENU_IDLE_CLOSE_SECONDS * 1000) if performance_governor is not None else 60000
+CONFIRM_POPUP_IDLE_CLOSE_MS = int(performance_governor.CONFIRM_POPUP_IDLE_CLOSE_SECONDS * 1000) if performance_governor is not None else 30000
 
-BETWEEN_DURATION_CHUNKS_SECONDS = 0.1
+# WARNING: the fallback numbers below must match BETWEEN_LOUDNESS_PROBES_SECONDS in performance_governor.py; they are used only when that module fails to import.
+BETWEEN_LOUDNESS_PROBES_SECONDS = performance_governor.BETWEEN_LOUDNESS_PROBES_SECONDS if performance_governor is not None else 0.5
 
-# VALUES CHANGE HERE
-BETWEEN_LOUDNESS_PROBES_SECONDS = 0.5
+# WARNING: the fallback numbers below must match SCAN_BACKOFF_WHILE_PLAYING_MULTIPLIER in performance_governor.py; they are used only when that module fails to import.
+SCAN_BACKOFF_WHILE_PLAYING_MULTIPLIER = performance_governor.SCAN_BACKOFF_WHILE_PLAYING_MULTIPLIER if performance_governor is not None else 6.0
 
-SCAN_BACKOFF_WHILE_PLAYING_MULTIPLIER = 6.0
 
-LOUDNESS_OFF_SLOWDOWN_MULTIPLIER = 3.0
+# WARNING: the fallback numbers below must match PROBE_IDLE_SLEEP_SECONDS in performance_governor.py; they are used only when that module fails to import.
+PROBE_IDLE_SLEEP_SECONDS = performance_governor.PROBE_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
 
-# VALUES CHANGE HERE
-PROBE_IDLE_SLEEP_SECONDS = 20.0
+# WARNING: the fallback numbers below must match SCAN_PIPELINE_PREEMPT_CHECK_SECONDS, SCAN_GATHER_LIBRARY_LOOKUPS in performance_governor.py; they are used only when that module fails to import.
+SCAN_PIPELINE_PREEMPT_CHECK_SECONDS = performance_governor.SCAN_PIPELINE_PREEMPT_CHECK_SECONDS if performance_governor is not None else 5.0
+SCAN_GATHER_LIBRARY_LOOKUPS = performance_governor.SCAN_GATHER_LIBRARY_LOOKUPS if performance_governor is not None else 400
 
-# VALUES CHANGE HERE (pipeline pacing)
-SCAN_DEEP_SLOWDOWN_MULTIPLIER = 2.0
-SCAN_PIPELINE_PREEMPT_CHECK_SECONDS = 5.0
-SCAN_GATHER_LIBRARY_LOOKUPS = 400
+# WARNING: the fallback numbers below must match CAPTION_IDLE_SLEEP_SECONDS in performance_governor.py; they are used only when that module fails to import.
+CAPTION_IDLE_SLEEP_SECONDS = performance_governor.CAPTION_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
 
-CAPTION_IDLE_SLEEP_SECONDS = 20.0
+# WARNING: the fallback numbers below must match PICTURE_BOX_BETWEEN_FILES_SECONDS in performance_governor.py; they are used only when that module fails to import.
+PICTURE_BOX_BETWEEN_FILES_SECONDS = performance_governor.PICTURE_BOX_BETWEEN_FILES_SECONDS if performance_governor is not None else 1.0
+# WARNING: the fallback numbers below must match PICTURE_BOX_IDLE_SLEEP_SECONDS in performance_governor.py; they are used only when that module fails to import.
+PICTURE_BOX_IDLE_SLEEP_SECONDS = performance_governor.PICTURE_BOX_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
+# WARNING: the fallback numbers below must match PICTURE_BOX_PAUSE_RECHECK_SECONDS in performance_governor.py; they are used only when that module fails to import.
+PICTURE_BOX_PAUSE_RECHECK_SECONDS = performance_governor.PICTURE_BOX_PAUSE_RECHECK_SECONDS if performance_governor is not None else 5.0
 
-PICTURE_BOX_BETWEEN_FILES_SECONDS = 1.0
-PICTURE_BOX_IDLE_SLEEP_SECONDS = 20.0
-# VALUES CHANGE HERE
-PICTURE_BOX_PAUSE_RECHECK_SECONDS = 5.0
-
-# VALUES CHANGE HERE
-DURATION_PRECACHE_PAUSE_RECHECK_SECONDS = 5.0
-DURATION_PRECACHE_IDLE_SLEEP_SECONDS = 20.0
+# WARNING: the fallback numbers below must match DURATION_PRECACHE_PAUSE_RECHECK_SECONDS, DURATION_PRECACHE_IDLE_SLEEP_SECONDS in performance_governor.py; they are used only when that module fails to import.
+DURATION_PRECACHE_PAUSE_RECHECK_SECONDS = performance_governor.DURATION_PRECACHE_PAUSE_RECHECK_SECONDS if performance_governor is not None else 5.0
+DURATION_PRECACHE_IDLE_SLEEP_SECONDS = performance_governor.DURATION_PRECACHE_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
 
 
 
@@ -1161,8 +1317,12 @@ DURATION_PRECACHE_IDLE_SLEEP_SECONDS = 20.0
 
 
 def _get_channel_visualizer_style(ch_conf):
-    """Return a channel's effective visualizer style from its saved config."""
-    return (ch_conf or {}).get("visualizer_style", "Random")
+    """Return a channel's effective visualizer style from its saved config; a saved name that is not one of the deck's styles (for example a style removed in an older version) counts as Random."""
+    style = (ch_conf or {}).get("visualizer_style", "Random")
+    deck = globals().get("visualizer_deck")
+    if style != "Random" and deck is not None and style not in deck.render_styles:
+        return "Random"
+    return style
 
 
 # ============================================================================
@@ -1218,7 +1378,8 @@ def _started_by_update_helper():
             try:
                 import psutil as _psutil
                 return any(os.path.basename(str(_a)).lower() == "update_helper.py" for _a in _psutil.Process(os.getpid()).parent().cmdline())
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_started_by_update_helper: import psutil as _psutil", _swallowed_error)
                 return False
     except Exception as _parent_err:
         log.warning(f"[FAILURE] _started_by_update_helper: could not read the parent process: {_parent_err}")
@@ -1229,9 +1390,7 @@ _STARTED_BY_UPDATE_HELPER = _started_by_update_helper()
 
 
 def _read_boot_fullscreen_pref():
-    # WARNING: an auto-relaunch (crash, heartbeat stall) boots fullscreen, but a start by the update helper never does, so an update from any older build still follows the saved kiosk, shell and start-on-boot settings.
-    if _IS_RELAUNCH and not _STARTED_BY_UPDATE_HELPER:
-        return True
+    # WARNING: every start, including a crash or heartbeat relaunch, follows the saved kiosk, shell and start-on-boot settings; forcing fullscreen here leaves a stuck app with no window X to close it.
     try:
         _cfg_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "retro_config.json")
         if os.path.exists(_cfg_path):
@@ -1392,7 +1551,8 @@ def _get_window_client_size():
             _log_warn_throttled("window_client_size", "[WINDOW] Could not read maximized client size: %s", _client_err)
     try:
         return tuple(int(v) for v in pygame.display.get_window_size())
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_get_window_client_size: return tuple((int(v) for v in pygame.display.get_window_size()))", _swallowed_error)
         return int(WINDOW_WIDTH), int(WINDOW_HEIGHT)
 
 
@@ -1554,21 +1714,24 @@ def _finalize_window_mode(screen, *, windowed, client_w, client_h, pos_x, pos_y)
                     dpi = 96
                     try:
                         dpi = ctypes.windll.user32.GetDpiForWindow(win_hwnd) or 96
-                    except Exception:
+                    except Exception as _swallowed_error:
+                        _log_swallowed("_finalize_window_mode: dpi = ctypes.windll.user32.GetDpiForWindow(win_hwnd) or 96", _swallowed_error)
                         dpi = 96
                     _ok = False
                     try:
                         _ok = bool(ctypes.windll.user32.AdjustWindowRectExForDpi(
                             ctypes.byref(rect), ctypes.c_ulong(style), False,
                             ctypes.c_ulong(exstyle), ctypes.c_uint(dpi)))
-                    except Exception:
+                    except Exception as _swallowed_error:
+                        _log_swallowed("_finalize_window_mode: _ok = bool(ctypes.windll.user32.AdjustWindowRectExForDpi(ctypes.byr...", _swallowed_error)
                         _ok = False
                     if not _ok:
                         try:
                             _ok = bool(ctypes.windll.user32.AdjustWindowRectEx(
                                 ctypes.byref(rect), ctypes.c_ulong(style), False,
                                 ctypes.c_ulong(exstyle)))
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("_finalize_window_mode: _ok = bool(ctypes.windll.user32.AdjustWindowRectEx(ctypes.byref(rec...", _swallowed_error)
                             _ok = False
                     if _ok:
                         out_w = rect.right - rect.left
@@ -1765,7 +1928,8 @@ def _apply_mixer_channels_setting():
     desired = 1 if (db is not None and not db.config.get("audio_stereo", True)) else 2
     try:
         _current = pygame.mixer.get_init()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_apply_mixer_channels_setting: _current = pygame.mixer.get_init()", _swallowed_error)
         _current = None
     if _current is not None and _current[2] == desired:
         return
@@ -1802,7 +1966,8 @@ def resource_path(rel_path):
 
 
 _tv_border_cache = {}
-_TV_BORDER_MTIME_RECHECK_TTL_SEC = 2.0
+# WARNING: the fallback numbers below must match TV_BORDER_MTIME_RECHECK_TTL_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_TV_BORDER_MTIME_RECHECK_TTL_SEC = performance_governor.TV_BORDER_MTIME_RECHECK_TTL_SECONDS if performance_governor is not None else 2.0
 _tv_border_mtime_recheck_state = {}
 _tv_border_current_path = {"path": None}
 _tv_border_raw_preload = {}
@@ -1820,7 +1985,8 @@ def _bezel_file_cache_key(path):
         return None
     try:
         return (os.path.normcase(os.path.abspath(path)), os.path.getmtime(path))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_bezel_file_cache_key: return (os.path.normcase(os.path.abspath(path)), os.path.getmtime(p...", _swallowed_error)
         return (os.path.normcase(os.path.abspath(path)), 0)
 
 
@@ -1891,7 +2057,8 @@ def _resolve_current_bezel_path(win_w=None, win_h=None):
         style_idx = db.config.get("bezel_style", 1) if db is not None else 1
         try:
             style_idx = int(style_idx)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _swallowed_error:
+            _log_swallowed("_resolve_current_bezel_path: style_idx = int(style_idx)", _swallowed_error)
             style_idx = 1
         style_idx = max(1, min(style_idx, len(eligible)))
         return _holiday_bezel_override(eligible[style_idx - 1]) or eligible[style_idx - 1]
@@ -1922,7 +2089,8 @@ def _load_bezel_surface_from_path(path):
         return cached[1]
     try:
         mtime = os.path.getmtime(path)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_load_bezel_surface_from_path: mtime = os.path.getmtime(path)", _swallowed_error)
         mtime = 0
     _tv_border_mtime_recheck_state[path] = now + _TV_BORDER_MTIME_RECHECK_TTL_SEC
     cache_key = (path, mtime)
@@ -2022,26 +2190,35 @@ _BEZEL_LED_WINDOW_MAX_ASPECT = performance_governor.BEZEL_LED_WINDOW_MAX_ASPECT 
 _BEZEL_LED_WINDOW_MAX_TILT_DEG = performance_governor.BEZEL_LED_WINDOW_MAX_TILT_DEG if performance_governor is not None else 15.0
 _BEZEL_LED_WINDOW_MIN_TILT_DEG = performance_governor.BEZEL_LED_WINDOW_MIN_TILT_DEG if performance_governor is not None else 0.3
 
-# VALUES CHANGE HERE (used only when a bezel image has no transparent screen hole to measure, and before the boot preloader has measured it)
-_TV_BORDER_KNOWN_CUTOUTS = {
-    "bezel":  (0.2943, 0.2434, 0.3523, 0.4591),
-    "bezel1": (0.2053, 0.1344, 0.5060, 0.6595),
-    "bezel2": (0.0774, 0.1402, 0.5646, 0.7181),
-}
+# WARNING: the fallback numbers below must match TV_BORDER_KNOWN_CUTOUTS in performance_governor.py; they are used only when that module fails to import.
+_TV_BORDER_KNOWN_CUTOUTS = performance_governor.TV_BORDER_KNOWN_CUTOUTS if performance_governor is not None else { "bezel":  (0.2943, 0.2434, 0.3523, 0.4591), "bezel1": (0.2053, 0.1344, 0.5060, 0.6595), "bezel2": (0.0774, 0.1402, 0.5646, 0.7181), }
 
-# VALUES CHANGE HERE
-_TV_BORDER_OSD_OFFSET = (48, 64)
+# WARNING: the fallback numbers below must match TV_BORDER_OSD_OFFSET in performance_governor.py; they are used only when that module fails to import.
+_TV_BORDER_OSD_OFFSET = performance_governor.TV_BORDER_OSD_OFFSET if performance_governor is not None else (48, 64)
 
 
-_CH_NUM_TOP_ALIGN_NUDGE_PX = -20
+# WARNING: the fallback numbers below must match CH_NUM_TOP_ALIGN_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
+_CH_NUM_TOP_ALIGN_NUDGE_PX = performance_governor.CH_NUM_TOP_ALIGN_NUDGE_PX if performance_governor is not None else -20
 
-_TV_BORDER_SCREEN_EXPAND = {
-    # VALUES CHANGE HERE
-    "bezel":  (1.00, 1.00),
-    "bezel1": (1.00, 1.00),
-  "bezel2": (1.00, 1.00),
-}
-_TV_BORDER_SCREEN_EXPAND_DEFAULT = (1.00, 1.00)
+# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, FRAME_COPY_LOG_EVERY_FRAMES, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
+_TV_BORDER_SCREEN_EXPAND = performance_governor.TV_BORDER_SCREEN_EXPAND if performance_governor is not None else {"bezel": (1.00, 1.00), "bezel1": (1.00, 1.00), "bezel2": (1.00, 1.00)}
+_TV_BORDER_SCREEN_EXPAND_DEFAULT = performance_governor.TV_BORDER_SCREEN_EXPAND_DEFAULT if performance_governor is not None else (1.00, 1.00)
+RECEPTION_NOISE_BLOCK_PX = performance_governor.RECEPTION_NOISE_BLOCK_PX if performance_governor is not None else 3
+RECEPTION_NOISE_VISIBLE_SHARE = performance_governor.RECEPTION_NOISE_VISIBLE_SHARE if performance_governor is not None else 0.55
+RECEPTION_NOISE_BRIGHT_SHARE = performance_governor.RECEPTION_NOISE_BRIGHT_SHARE if performance_governor is not None else 0.30
+RECEPTION_NOISE_BRIGHT_ALPHA = performance_governor.RECEPTION_NOISE_BRIGHT_ALPHA if performance_governor is not None else (180, 255)
+RECEPTION_NOISE_DARK_ALPHA = performance_governor.RECEPTION_NOISE_DARK_ALPHA if performance_governor is not None else (110, 210)
+RECEPTION_LINE_BIG_FRAC_RANGE = performance_governor.RECEPTION_LINE_BIG_FRAC_RANGE if performance_governor is not None else (0.035, 0.09)
+RECEPTION_LINE_SMALL_FRAC_RANGE = performance_governor.RECEPTION_LINE_SMALL_FRAC_RANGE if performance_governor is not None else (0.012, 0.03)
+RECEPTION_LINE_SPEED_PX_MS = performance_governor.RECEPTION_LINE_SPEED_PX_MS if performance_governor is not None else 0.85
+FILE_EXPLORER_EXPAND_TIMEOUT_MS = performance_governor.FILE_EXPLORER_EXPAND_TIMEOUT_MS if performance_governor is not None else 6000
+SEEK_RETRY_INTERVAL_MS = performance_governor.SEEK_RETRY_INTERVAL_MS if performance_governor is not None else 1500
+FRAME_COPY_LOG_EVERY_FRAMES = performance_governor.FRAME_COPY_LOG_EVERY_FRAMES if performance_governor is not None else 600
+GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS = performance_governor.GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS if performance_governor is not None else 30.0
+CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS = performance_governor.CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS if performance_governor is not None else 0.3
+SCHEDULER_REPEAT_GUARD_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_SECONDS if performance_governor is not None else 60
+SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS if performance_governor is not None else 900
+BLOCK_ROTATION_CACHE_MAX_BLOCKS = performance_governor.BLOCK_ROTATION_CACHE_MAX_BLOCKS if performance_governor is not None else 12
 
 
 def _active_tv_border_screen_expand():
@@ -2054,14 +2231,13 @@ def _active_tv_border_screen_expand():
     return _TV_BORDER_SCREEN_EXPAND_DEFAULT
 
 
-_MENU_BEZEL_SHRINK = {
-    "bezel":  (0.95, 0.95),
-    "bezel1": (0.95, 0.95),
-    "bezel2": (0.95, 0.95),
-}
-_MENU_BEZEL_SHRINK_DEFAULT = (1.0, 1.0)
+# WARNING: the fallback numbers below must match MENU_BEZEL_SHRINK in performance_governor.py; they are used only when that module fails to import.
+_MENU_BEZEL_SHRINK = performance_governor.MENU_BEZEL_SHRINK if performance_governor is not None else { "bezel": (0.95, 0.95), "bezel1": (0.95, 0.95), "bezel2": (0.95, 0.95), }
+# WARNING: the fallback numbers below must match MENU_BEZEL_SHRINK_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_MENU_BEZEL_SHRINK_DEFAULT = performance_governor.MENU_BEZEL_SHRINK_DEFAULT if performance_governor is not None else (1.0, 1.0)
 
-_MENU_WARP_OFF_EXTRA_SHRINK = 0.97
+# WARNING: the fallback numbers below must match MENU_WARP_OFF_EXTRA_SHRINK in performance_governor.py; they are used only when that module fails to import.
+_MENU_WARP_OFF_EXTRA_SHRINK = performance_governor.MENU_WARP_OFF_EXTRA_SHRINK if performance_governor is not None else 0.97
 
 
 def _active_menu_bezel_shrink():
@@ -2080,102 +2256,89 @@ def _active_menu_bezel_shrink():
     return _MENU_BEZEL_SHRINK_DEFAULT
 
 
-_BEZEL_CHANNEL_LED_FRAC = {
-    "bezel":  (0.7010, 0.2402, 0.0676, 0.0776),
-    "bezel1": (0.7801, 0.1191, 0.1263, 0.1282),
-}
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_FRAC = performance_governor.BEZEL_CHANNEL_LED_FRAC if performance_governor is not None else { "bezel": (0.7010, 0.2402, 0.0676, 0.0776), "bezel1": (0.7801, 0.1191, 0.1263, 0.1282), }
 
 
-_BEZEL_CHANNEL_LED_GAP_FRAC = {
-    "bezel":  0.28,
-    "bezel1": 0.28,
-}
-_BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT = 0.28
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_GAP_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_GAP_FRAC = performance_governor.BEZEL_CHANNEL_LED_GAP_FRAC if performance_governor is not None else { "bezel": 0.28, "bezel1": 0.28, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT if performance_governor is not None else 0.28
 
-_BEZEL_CHANNEL_LED_Y_NUDGE_FRAC = {
-    "bezel":  0.0,
-    "bezel1": 0.10,
-}
-_BEZEL_CHANNEL_LED_Y_NUDGE_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_Y_NUDGE_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_Y_NUDGE_FRAC = performance_governor.BEZEL_CHANNEL_LED_Y_NUDGE_FRAC if performance_governor is not None else { "bezel": 0.0, "bezel1": 0.10, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_Y_NUDGE_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_Y_NUDGE_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_Y_NUDGE_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_TILT_DEG = {
-    "bezel":  -2.0,
-    "bezel1": -2.0,
-}
-_BEZEL_CHANNEL_LED_TILT_DEG_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TILT_DEG in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TILT_DEG = performance_governor.BEZEL_CHANNEL_LED_TILT_DEG if performance_governor is not None else { "bezel": -2.0, "bezel1": -2.0, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TILT_DEG_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TILT_DEG_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_TILT_DEG_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC = {
-    "bezel":  0.65,
-    "bezel1": 0.0,
-}
-_BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC = performance_governor.BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC if performance_governor is not None else { "bezel": 0.65, "bezel1": 0.0, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_RIGHT_EXTEND_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC = {
-    "bezel":  0.22,
-    "bezel1": 0.0,
-}
-_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC = performance_governor.BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC if performance_governor is not None else { "bezel": 0.22, "bezel1": 0.0, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_LEFT_EXTEND_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC = {
-    "bezel":  0.65,
-    "bezel1": 0.0,
-}
-_BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC = performance_governor.BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC if performance_governor is not None else { "bezel": 0.65, "bezel1": 0.0, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_DOWN_EXTEND_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC = {
-    "bezel":  0.061,
-}
-_BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC = performance_governor.BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC if performance_governor is not None else { "bezel": 0.061, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_BOTTOM_TRIM_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC = {
-    "bezel":  0.061,
-}
-_BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC = performance_governor.BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC if performance_governor is not None else { "bezel": 0.061, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_RIGHT_TRIM_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC = {
-    "bezel":  0.061,
-    "bezel1": 0.241,
-}
-_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC_DEFAULT = 0.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC = performance_governor.BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC if performance_governor is not None else { "bezel": 0.061, "bezel1": 0.241, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_LEFT_EXTRA_FRAC_DEFAULT if performance_governor is not None else 0.0
 
-_BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX = {
-    "bezel1": (1, 1),
-}
-_BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX_DEFAULT = (0, 0)
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX = performance_governor.BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX if performance_governor is not None else { "bezel1": (1, 1), }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_HIDE_XY_NUDGE_PX_DEFAULT if performance_governor is not None else (0, 0)
 
-_BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX = {
-    "bezel":  2,
-    "bezel1": -6,
-}
-_BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX_DEFAULT = 0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX = performance_governor.BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX if performance_governor is not None else { "bezel": 2, "bezel1": -6, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_TEXT_Y_NUDGE_PX_DEFAULT if performance_governor is not None else 0
 
-_BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX = {
-    "bezel":  0,
-    "bezel1": -3,
-}
-_BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX_DEFAULT = 0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX = performance_governor.BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX if performance_governor is not None else { "bezel": 0, "bezel1": -3, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_TEXT_X_NUDGE_PX_DEFAULT if performance_governor is not None else 0
 
-_BEZEL_SONG_CARD_LED_Y_NUDGE_PX = {
-    "bezel":  4,
-    "bezel1": 4,
-}
-_BEZEL_SONG_CARD_LED_Y_NUDGE_PX_DEFAULT = 0
+# WARNING: the fallback numbers below must match BEZEL_SONG_CARD_LED_Y_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_SONG_CARD_LED_Y_NUDGE_PX = performance_governor.BEZEL_SONG_CARD_LED_Y_NUDGE_PX if performance_governor is not None else { "bezel": 4, "bezel1": 4, }
+# WARNING: the fallback numbers below must match BEZEL_SONG_CARD_LED_Y_NUDGE_PX_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_SONG_CARD_LED_Y_NUDGE_PX_DEFAULT = performance_governor.BEZEL_SONG_CARD_LED_Y_NUDGE_PX_DEFAULT if performance_governor is not None else 0
 
-_BEZEL_CHANNEL_LED_NUM_SCALE_FRAC = {
-    "bezel":  1.0,
-    "bezel1": 0.78,
-}
-_BEZEL_CHANNEL_LED_NUM_SCALE_FRAC_DEFAULT = 1.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_NUM_SCALE_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_NUM_SCALE_FRAC = performance_governor.BEZEL_CHANNEL_LED_NUM_SCALE_FRAC if performance_governor is not None else { "bezel": 1.0, "bezel1": 0.78, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_NUM_SCALE_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_NUM_SCALE_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_NUM_SCALE_FRAC_DEFAULT if performance_governor is not None else 1.0
 
-_BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC = {
-    "bezel1": 0.9,
-}
-_BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC_DEFAULT = 1.0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC = performance_governor.BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC if performance_governor is not None else { "bezel1": 0.9, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_TEXT_DISPLAY_SCALE_FRAC_DEFAULT if performance_governor is not None else 1.0
 
-_BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX = {
-    "bezel1": -2,
-}
-_BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX_DEFAULT = 0
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX = performance_governor.BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX if performance_governor is not None else { "bezel1": -2, }
+# WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_TEXT_GAP_ADJUST_PX_DEFAULT if performance_governor is not None else 0
 
 
 def _bezel_channel_led_rect(win_w, win_h):
@@ -2489,10 +2652,6 @@ def _measure_bezel_led_shape(border_surf, hole_frac):
     return ((x / w, y / h, bw / w, bh / h), tilt)
 
 
-def _measure_bezel_led_window(border_surf, hole_frac):
-    """Returns the black number window of a bezel image, to the right of its screen, as fractions (x, y, width, height), or None when the image has none."""
-    shape = _measure_bezel_led_shape(border_surf, hole_frac)
-    return None if shape is None else shape[0]
 
 
 def _store_bezel_led_window(border_surf, key, stem, hole_frac):
@@ -2636,11 +2795,11 @@ def _full_tv_border_geometry_impl(win_w, win_h):
     return outer, border_rect, inner
 
 
-# VALUES CHANGE HERE
-_PIXEL_ORBITER_MARGIN_PX = 3
-_PIXEL_ORBITER_INITIAL_DELAY_MS = 2 * 60 * 1000
-# VALUES CHANGE HERE
-_PIXEL_ORBITER_PERIOD_MS = 60 * 1000
+# WARNING: the fallback numbers below must match PIXEL_ORBITER_MARGIN_PX, PIXEL_ORBITER_INITIAL_DELAY_MS in performance_governor.py; they are used only when that module fails to import.
+_PIXEL_ORBITER_MARGIN_PX = performance_governor.PIXEL_ORBITER_MARGIN_PX if performance_governor is not None else 3
+_PIXEL_ORBITER_INITIAL_DELAY_MS = performance_governor.PIXEL_ORBITER_INITIAL_DELAY_MS if performance_governor is not None else 2 * 60 * 1000
+# WARNING: the fallback numbers below must match PIXEL_ORBITER_PERIOD_MS in performance_governor.py; they are used only when that module fails to import.
+_PIXEL_ORBITER_PERIOD_MS = performance_governor.PIXEL_ORBITER_PERIOD_MS if performance_governor is not None else 60 * 1000
 
 _PIXEL_ORBITER_OFFSETS = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)]
 
@@ -2769,7 +2928,8 @@ def _screen_mode_boxed_last_frame_rect(content_rect, win_w, win_h):
         r = _video_screen_mode_rect(content_rect, win_w, win_h,
                                     source_aspect=_last_fullscreen_frame_aspect())
         return r.x, r.y, r.width, r.height
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_screen_mode_boxed_last_frame_rect: r = _video_screen_mode_rect(content_rect, win_w, win_h, source_aspe...", _swallowed_error)
         return content_rect.x, content_rect.y, content_rect.width, content_rect.height
 
 
@@ -3009,7 +3169,8 @@ def _pan_scan_content_key(path):
     try:
         st = os.stat(path)
         return f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_pan_scan_content_key: st = os.stat(path)", _swallowed_error)
         return None
 
 
@@ -3021,18 +3182,18 @@ def _pan_scan_set_content(path):
 
 _picture_box_fit_state = {"content_key": None, "norm_rect": None, "picture_aspect": None, "retry_at": 0.0}
 
-# VALUES CHANGE HERE
-PICTURE_BOX_FIT_RETRY_SECONDS = 2.0
+# WARNING: the fallback numbers below must match PICTURE_BOX_FIT_RETRY_SECONDS in performance_governor.py; they are used only when that module fails to import.
+PICTURE_BOX_FIT_RETRY_SECONDS = performance_governor.PICTURE_BOX_FIT_RETRY_SECONDS if performance_governor is not None else 2.0
 
 _PICTURE_BOX_FIT_REASONS = {"letterbox", "pillarbox", "windowbox"}
 
 # WARNING: the fallback shapes must match PICTURE_STANDARD_ASPECTS in performance_governor.py; they are used only when that module fails to import.
 _PICTURE_STANDARD_ASPECTS = (tuple(performance_governor.PICTURE_STANDARD_ASPECTS) if performance_governor is not None
-                             else (16.0 / 9.0, 4.0 / 3.0, 9.0 / 16.0))
+                             else (2.39, 2.0, 16.0 / 9.0, 3.0 / 2.0, 4.0 / 3.0, 1.0, 4.0 / 5.0, 9.0 / 16.0))
 
 
 def _snap_standard_aspect(aspect):
-    """The one of 16:9, 4:3 or 9:16 nearest to the picture's shape, which is the shape Normal (Fit to Screen) lays it out as."""
+    """The shape in PICTURE_STANDARD_ASPECTS nearest to the picture's shape, which is the shape Normal (Fit to Screen) lays it out as."""
     # WARNING: every shape snaps, with no pass-through; DVD and all three picture draw sites rely on one box size per standard shape.
     if not aspect or aspect <= 0:
         return aspect
@@ -3103,7 +3264,7 @@ _guide_preview_box_hold_state = {"content_key": None, "started": 0.0, "gave_up":
 def _guide_preview_box_hold(path):
     """True while the guide preview must stay black because the highlighted file's picture box has not been read yet; ends when the box is read, the file cannot be scanned, or the hold time is used up."""
     # WARNING: must read the box through _picture_box_set_content first, or a picture drawn before the box lands shows the full frame and then shrinks.
-    global _picture_box_fit_state, _guide_preview_box_hold_state
+    global _guide_preview_box_hold_state
     _picture_box_set_content(path)
     key = _picture_box_fit_state["content_key"]
     if _picture_box_fit_state["retry_at"] == 0.0 or key is None:
@@ -3130,21 +3291,25 @@ def _guide_preview_box_hold(path):
     return True
 
 
-_PAN_SCAN_GRID_W = 32
-_PAN_SCAN_GRID_H = 18
-# VALUES CHANGE HERE
-_PAN_SCAN_ANALYZE_EVERY_N = 2
-_PAN_SCAN_SMOOTHING = 0.08
-_PAN_SCAN_DEAD_ZONE = 0.04
+# WARNING: the fallback numbers below must match PAN_SCAN_GRID_W in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_GRID_W = performance_governor.PAN_SCAN_GRID_W if performance_governor is not None else 32
+# WARNING: the fallback numbers below must match PAN_SCAN_GRID_H in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_GRID_H = performance_governor.PAN_SCAN_GRID_H if performance_governor is not None else 18
+# WARNING: the fallback numbers below must match PAN_SCAN_ANALYZE_EVERY_N, PAN_SCAN_SMOOTHING, PAN_SCAN_DEAD_ZONE in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_ANALYZE_EVERY_N = performance_governor.PAN_SCAN_ANALYZE_EVERY_N if performance_governor is not None else 2
+_PAN_SCAN_SMOOTHING = performance_governor.PAN_SCAN_SMOOTHING if performance_governor is not None else 0.08
+_PAN_SCAN_DEAD_ZONE = performance_governor.PAN_SCAN_DEAD_ZONE if performance_governor is not None else 0.04
 
-_PAN_SCAN_MOTION_FLOOR = 0.006
-_PAN_SCAN_CUT_THRESHOLD = 0.09
+# WARNING: the fallback numbers below must match PAN_SCAN_MOTION_FLOOR in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_MOTION_FLOOR = performance_governor.PAN_SCAN_MOTION_FLOOR if performance_governor is not None else 0.006
+# WARNING: the fallback numbers below must match PAN_SCAN_CUT_THRESHOLD in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_CUT_THRESHOLD = performance_governor.PAN_SCAN_CUT_THRESHOLD if performance_governor is not None else 0.09
 
-# VALUES CHANGE HERE
-_PAN_SCAN_SHOT_SIG_LEN = 10
-_PAN_SCAN_SHOT_MEMORY_MAX = 40
-_PAN_SCAN_REMEMBER_GRACE_MS = 400
-_PAN_SCAN_SHOT_MATCH_THRESHOLD = 0.025
+# WARNING: the fallback numbers below must match PAN_SCAN_SHOT_SIG_LEN, PAN_SCAN_SHOT_MEMORY_MAX, PAN_SCAN_REMEMBER_GRACE_MS, PAN_SCAN_SHOT_MATCH_THRESHOLD in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_SHOT_SIG_LEN = performance_governor.PAN_SCAN_SHOT_SIG_LEN if performance_governor is not None else 10
+_PAN_SCAN_SHOT_MEMORY_MAX = performance_governor.PAN_SCAN_SHOT_MEMORY_MAX if performance_governor is not None else 40
+_PAN_SCAN_REMEMBER_GRACE_MS = performance_governor.PAN_SCAN_REMEMBER_GRACE_MS if performance_governor is not None else 400
+_PAN_SCAN_SHOT_MATCH_THRESHOLD = performance_governor.PAN_SCAN_SHOT_MATCH_THRESHOLD if performance_governor is not None else 0.025
 
 def _pan_scan_shot_signature(gray, axis):
     """Fingerprint a frame for shot-memory matching along the pan axis: local contrast at each position, pooled to _PAN_SCAN_SHOT_SIG_LEN buckets and normalized to sum to 1."""
@@ -3186,7 +3351,8 @@ def _pan_scan_shot_remember(sig, offset, memory):
     memory.append({"sig": sig, "offset": offset})
 
 
-_PAN_SCAN_LIBRARY_SAVE_INTERVAL_MS = 8000
+# WARNING: the fallback numbers below must match PAN_SCAN_LIBRARY_SAVE_INTERVAL_MS in performance_governor.py; they are used only when that module fails to import.
+_PAN_SCAN_LIBRARY_SAVE_INTERVAL_MS = performance_governor.PAN_SCAN_LIBRARY_SAVE_INTERVAL_MS if performance_governor is not None else 8000
 
 
 def _pan_scan_shots_from_rows(raw):
@@ -3302,11 +3468,9 @@ def _pan_scan_update(analysis_surf, axis):
     return st["current"]
 
 
-_TRANSITION_GRAY = (15, 15, 15)
 
 
 # WARNING: not pure black: (0, 0, 0) is the game-overlay transparency key.
-_LETTERBOX_BLACK = (1, 1, 1)
 
 
 # ============================================================================
@@ -3317,8 +3481,8 @@ _LETTERBOX_BLACK = (1, 1, 1)
 def _video_bar_color():
     """Return the fill color for real letterbox/pillarbox bars beside playing content: TV video, launched games and DVD."""
     if db is not None and db.config.get("letterbox_color", "black") == "grey":
-        return _TRANSITION_GRAY
-    return _LETTERBOX_BLACK
+        return COLOR_TRANSITION_GREY
+    return COLOR_SCREEN_BLACK
 
 
 def _bezel_video_pixel_aspect(win_w, win_h):
@@ -3460,8 +3624,10 @@ def _watermark_bounds_rect_preview(fallback_rect):
     return fallback_rect
 
 
-_OVERLAY_BORDER_FIT_MARGIN = 0.85
-_BEZEL_PICTURE_FIT_MARGIN = 1.00
+# WARNING: the fallback numbers below must match OVERLAY_BORDER_FIT_MARGIN in performance_governor.py; they are used only when that module fails to import.
+_OVERLAY_BORDER_FIT_MARGIN = performance_governor.OVERLAY_BORDER_FIT_MARGIN if performance_governor is not None else 0.85
+# WARNING: the fallback numbers below must match BEZEL_PICTURE_FIT_MARGIN in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_PICTURE_FIT_MARGIN = performance_governor.BEZEL_PICTURE_FIT_MARGIN if performance_governor is not None else 1.00
 
 
 # ============================================================================
@@ -3693,10 +3859,13 @@ def _real_to_virtual_pos(real_pos, screen=None):
     return vx, vy
 
 
-CRT_POWERON_EXPAND_MS = 680
-CRT_POWERON_SETTLE_MS = 1000
+# WARNING: the fallback numbers below must match CRT_POWERON_EXPAND_MS in performance_governor.py; they are used only when that module fails to import.
+CRT_POWERON_EXPAND_MS = performance_governor.CRT_POWERON_EXPAND_MS if performance_governor is not None else 680
+# WARNING: the fallback numbers below must match CRT_POWERON_SETTLE_MS in performance_governor.py; they are used only when that module fails to import.
+CRT_POWERON_SETTLE_MS = performance_governor.CRT_POWERON_SETTLE_MS if performance_governor is not None else 1000
 CRT_POWERON_TOTAL_MS = CRT_POWERON_EXPAND_MS + CRT_POWERON_SETTLE_MS
-CRT_POWERON_PEAK_ALPHA = 235
+# WARNING: the fallback numbers below must match CRT_POWERON_PEAK_ALPHA in performance_governor.py; they are used only when that module fails to import.
+CRT_POWERON_PEAK_ALPHA = performance_governor.CRT_POWERON_PEAK_ALPHA if performance_governor is not None else 235
 
 
 def _crt_power_on_elapsed_ms(screen_rect):
@@ -4031,25 +4200,22 @@ _CRT_SHADER_CACHE = {
     "x0": None, "y0": None, "x1": None, "y1": None,
     "fx": None, "fy": None, "mult3": None,
 }
-# VALUES CHANGE HERE
-_CRT_SHADER_CURVATURE_DEFAULT = 0.20
-# VALUES CHANGE HERE
-_CRT_SHADER_CURVATURE = {
-    "bezel":  0.08,
-    "bezel1": 0.08,
-    "bezel2": 0.08,
-}
-# VALUES CHANGE HERE
-_CRT_SHADER_VIGNETTE = 0.35
+# WARNING: the fallback numbers below must match CRT_SHADER_CURVATURE_DEFAULT in performance_governor.py; they are used only when that module fails to import.
+_CRT_SHADER_CURVATURE_DEFAULT = performance_governor.CRT_SHADER_CURVATURE_DEFAULT if performance_governor is not None else 0.20
+# WARNING: the fallback numbers below must match CRT_SHADER_CURVATURE in performance_governor.py; they are used only when that module fails to import.
+_CRT_SHADER_CURVATURE = performance_governor.CRT_SHADER_CURVATURE if performance_governor is not None else { "bezel":  0.08, "bezel1": 0.08, "bezel2": 0.08, }
+# WARNING: the fallback numbers below must match CRT_SHADER_VIGNETTE in performance_governor.py; they are used only when that module fails to import.
+_CRT_SHADER_VIGNETTE = performance_governor.CRT_SHADER_VIGNETTE if performance_governor is not None else 0.35
 
-_CRT_SCANLINE_TARGET_LINES = 240
-# VALUES CHANGE HERE
-_CRT_SCANLINE_MIN_LINES     = 180
-# VALUES CHANGE HERE
-_CRT_SCANLINE_MAX_LINES     = 320
-_CRT_SCANLINE_DARKEN_FLOOR  = 0.70
-_CRT_SCANLINE_BLOOM_GAMMA   = 1.6
-_CRT_SCANLINE_BLOOM_STRENGTH = 0.95
+# WARNING: the fallback numbers below must match CRT_SCANLINE_TARGET_LINES in performance_governor.py; they are used only when that module fails to import.
+_CRT_SCANLINE_TARGET_LINES = performance_governor.CRT_SCANLINE_TARGET_LINES if performance_governor is not None else 240
+# WARNING: the fallback numbers below must match CRT_SCANLINE_MIN_LINES in performance_governor.py; they are used only when that module fails to import.
+_CRT_SCANLINE_MIN_LINES = performance_governor.CRT_SCANLINE_MIN_LINES if performance_governor is not None else 180
+# WARNING: the fallback numbers below must match CRT_SCANLINE_MAX_LINES, CRT_SCANLINE_DARKEN_FLOOR, CRT_SCANLINE_BLOOM_GAMMA, CRT_SCANLINE_BLOOM_STRENGTH in performance_governor.py; they are used only when that module fails to import.
+_CRT_SCANLINE_MAX_LINES = performance_governor.CRT_SCANLINE_MAX_LINES if performance_governor is not None else 320
+_CRT_SCANLINE_DARKEN_FLOOR = performance_governor.CRT_SCANLINE_DARKEN_FLOOR if performance_governor is not None else 0.70
+_CRT_SCANLINE_BLOOM_GAMMA = performance_governor.CRT_SCANLINE_BLOOM_GAMMA if performance_governor is not None else 1.6
+_CRT_SCANLINE_BLOOM_STRENGTH = performance_governor.CRT_SCANLINE_BLOOM_STRENGTH if performance_governor is not None else 0.95
 
 
 def _active_bezel_stem():
@@ -4063,8 +4229,8 @@ def _active_bezel_stem():
 # ============================================================================
 # SECTION: Menu navigation trace
 # ============================================================================
-# VALUES CHANGE HERE
-_MENU_NAV_TRACE = True
+# WARNING: the fallback numbers below must match MENU_NAV_TRACE in performance_governor.py; they are used only when that module fails to import.
+_MENU_NAV_TRACE = performance_governor.MENU_NAV_TRACE if performance_governor is not None else True
 _MENU_NAV_TRACE_KEYS = (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d)
 _NAV_DUP_KEYS = (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d)
 
@@ -4136,7 +4302,8 @@ def _menu_nav_frame_end(begin, frame_events):
              len(_names), " ".join(_names), globals().get("_last_frame_gap_ms"), begin[1], begin[2], _after)
     try:
         _burst = int(performance_governor.MENU_NAV_BURST_WARN_EVENTS)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_menu_nav_frame_end: _burst = int(performance_governor.MENU_NAV_BURST_WARN_EVENTS)", _swallowed_error)
         _burst = 0
     if _burst and len(_names) >= _burst:
         log.warning("[MENU NAV BURST] %d nav key events (%d down, %d up) handled in one frame: %s",
@@ -4389,9 +4556,9 @@ def _crt_shader_src_scratch_buffer(w, h):
 # ============================================================================
 # SECTION: Frame and shader timing log
 # ============================================================================
-# VALUES CHANGE HERE
-_PERF_LOG_INTERVAL_S = 5.0
-_PERF_LOG_MAX_SAMPLES = 900
+# WARNING: the fallback numbers below must match PERF_LOG_INTERVAL_S, PERF_LOG_MAX_SAMPLES in performance_governor.py; they are used only when that module fails to import.
+_PERF_LOG_INTERVAL_S = performance_governor.PERF_LOG_INTERVAL_S if performance_governor is not None else 5.0
+_PERF_LOG_MAX_SAMPLES = performance_governor.PERF_LOG_MAX_SAMPLES if performance_governor is not None else 900
 
 _frame_time_state = {"samples": [], "last_log": 0.0}
 _crt_timing_state = {"samples": [], "last_log": 0.0}
@@ -4479,7 +4646,8 @@ def _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, curvature):
     try:
         import numpy as np
         import cv2
-    except ImportError:
+    except ImportError as _swallowed_error:
+        _log_swallowed("_crt_shader_raw_pass: import numpy as np", _swallowed_error)
         return None
     raw4 = None
     try:
@@ -4647,11 +4815,10 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
         log.warning("_apply_crt_shader: draw failed, skipping this frame: %s", e)
 
 
-# VALUES CHANGE HERE
-_STATIC_NOISE_SEVERITY = 0.30
-_STATIC_NOISE_REFRESH_MS = 110
-# VALUES CHANGE HERE
-_STATIC_NOISE_AMBIENT_REFRESH_MS = 80
+# WARNING: the fallback numbers below must match STATIC_NOISE_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
+_STATIC_NOISE_REFRESH_MS = performance_governor.STATIC_NOISE_REFRESH_MS if performance_governor is not None else 110
+# WARNING: the fallback numbers below must match STATIC_NOISE_AMBIENT_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
+_STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REFRESH_MS if performance_governor is not None else 80
 _static_noise_overlay_cache = {"key": None, "surface": None, "built_at": 0}
 _static_noise_cycle_started = None
 
@@ -4659,7 +4826,8 @@ _last_screen_mode_picture_rect = None
 
 _last_guide_preview_picture_rect = None
 
-_DVD_AUDIO_TRACK_COUNT_TTL_SEC = 1.0
+# WARNING: the fallback numbers below must match DVD_AUDIO_TRACK_COUNT_TTL_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_DVD_AUDIO_TRACK_COUNT_TTL_SEC = performance_governor.DVD_AUDIO_TRACK_COUNT_TTL_SECONDS if performance_governor is not None else 1.0
 _dvd_audio_track_count_cache = {"engine_id": None, "count": 0, "ts": 0.0}
 
 
@@ -4686,7 +4854,8 @@ def _get_dvd_audio_track_count(dvd_engine):
 
     try:
         count = len(dvd_engine.get_audio_tracks())
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_get_dvd_audio_track_count: count = len(dvd_engine.get_audio_tracks())", _swallowed_error)
         count = 0
 
     cache["engine_id"] = engine_id
@@ -4695,17 +4864,17 @@ def _get_dvd_audio_track_count(dvd_engine):
     return count
 
 # WARNING: _STATIC_WEAK is the floor; the cycle must never dip below it or the picture reads as clean.
-# VALUES CHANGE HERE
-_STATIC_WEAK = 0.16
-_STATIC_MEDIUM = 0.30
-_STATIC_HEAVY = 0.46
+# WARNING: the fallback numbers below must match STATIC_WEAK, STATIC_MEDIUM, STATIC_HEAVY in performance_governor.py; they are used only when that module fails to import.
+_STATIC_WEAK = performance_governor.STATIC_WEAK if performance_governor is not None else 0.16
+_STATIC_MEDIUM = performance_governor.STATIC_MEDIUM if performance_governor is not None else 0.30
+_STATIC_HEAVY = performance_governor.STATIC_HEAVY if performance_governor is not None else 0.46
 
-# VALUES CHANGE HERE
-_STATIC_WEAK_HOLD_MS = 10000
-_STATIC_MEDIUM_HOLD_MS = 6500
-_STATIC_HEAVY_HOLD_MS = 7000
-_STATIC_RAMP_MS = 1200
-_STATIC_SUDDEN_RAMP_MS = 220
+# WARNING: the fallback numbers below must match STATIC_WEAK_HOLD_MS, STATIC_MEDIUM_HOLD_MS, STATIC_HEAVY_HOLD_MS, STATIC_RAMP_MS, STATIC_SUDDEN_RAMP_MS in performance_governor.py; they are used only when that module fails to import.
+_STATIC_WEAK_HOLD_MS = performance_governor.STATIC_WEAK_HOLD_MS if performance_governor is not None else 10000
+_STATIC_MEDIUM_HOLD_MS = performance_governor.STATIC_MEDIUM_HOLD_MS if performance_governor is not None else 6500
+_STATIC_HEAVY_HOLD_MS = performance_governor.STATIC_HEAVY_HOLD_MS if performance_governor is not None else 7000
+_STATIC_RAMP_MS = performance_governor.STATIC_RAMP_MS if performance_governor is not None else 1200
+_STATIC_SUDDEN_RAMP_MS = performance_governor.STATIC_SUDDEN_RAMP_MS if performance_governor is not None else 220
 
 
 # ============================================================================
@@ -4835,19 +5004,18 @@ def _build_tracking_noise_surface(w, band_h, seed_step, tint_style="white", line
     if cache["key"] == key and cache["surface"] is not None:
         return cache["surface"]
 
-    # VALUES CHANGE HERE
-    block = 3
+    block = RECEPTION_NOISE_BLOCK_PX
     bw = max(1, w // block)
     bh = max(1, band_h // block)
     roll = np.random.random((bw, bh))
-    visible = roll < 0.55
-    bright = visible & (roll < 0.30)
+    visible = roll < RECEPTION_NOISE_VISIBLE_SHARE
+    bright = visible & (roll < RECEPTION_NOISE_BRIGHT_SHARE)
     dark = visible & ~bright
     rgb = np.zeros((bw, bh, 3), dtype=np.uint8)
     rgb[bright] = _tinted_bright_rgb(int(bright.sum()), tint_style)
     alpha = np.zeros((bw, bh), dtype=np.uint8)
-    alpha[bright] = np.random.randint(180, 255, size=int(bright.sum()))
-    alpha[dark] = np.random.randint(110, 210, size=int(dark.sum()))
+    alpha[bright] = np.random.randint(RECEPTION_NOISE_BRIGHT_ALPHA[0], RECEPTION_NOISE_BRIGHT_ALPHA[1], size=int(bright.sum()))
+    alpha[dark] = np.random.randint(RECEPTION_NOISE_DARK_ALPHA[0], RECEPTION_NOISE_DARK_ALPHA[1], size=int(dark.sum()))
 
     small = pygame.Surface((bw, bh), pygame.SRCALPHA)
     px = pygame.surfarray.pixels3d(small)
@@ -4864,10 +5032,9 @@ def _build_tracking_noise_surface(w, band_h, seed_step, tint_style="white", line
 
 def _spawn_tracking_line_batch(h, now):
     """Build one batch of rolling tracking-line entries for a spawn event."""
-    # VALUES CHANGE HERE
-    BIG_FRAC_RANGE = (0.035, 0.09)
-    SMALL_FRAC_RANGE = (0.012, 0.03)
-    SPEED_PX_MS = 0.85
+    BIG_FRAC_RANGE = RECEPTION_LINE_BIG_FRAC_RANGE
+    SMALL_FRAC_RANGE = RECEPTION_LINE_SMALL_FRAC_RANGE
+    SPEED_PX_MS = RECEPTION_LINE_SPEED_PX_MS
 
     def make_line(frac_range, y_start_frac, delay_ms=0, speed_mult=1.0):
         band_h = max(4, int(h * random.uniform(*frac_range)))
@@ -4959,18 +5126,15 @@ def _apply_reception_lines_effect(screen, rect):
 _watermark_cache = {"path": None, "raw": None, "target_w": None, "surface": None}
 
 _watermark_transition_state = {}
-# VALUES CHANGE HERE
-_WATERMARK_JUMP_TOLERANCE_PX = 2
-_WATERMARK_REPOSITION_HIDE_MS = 450
-_WATERMARK_ALPHA = 150
-_WATERMARK_WIDTH_FRAC = 0.091
-_WATERMARK_MARGIN_FRAC = 0.12
+# WARNING: the fallback numbers below must match WATERMARK_JUMP_TOLERANCE_PX, WATERMARK_REPOSITION_HIDE_MS, WATERMARK_ALPHA, WATERMARK_WIDTH_FRAC, WATERMARK_MARGIN_FRAC in performance_governor.py; they are used only when that module fails to import.
+_WATERMARK_JUMP_TOLERANCE_PX = performance_governor.WATERMARK_JUMP_TOLERANCE_PX if performance_governor is not None else 2
+_WATERMARK_REPOSITION_HIDE_MS = performance_governor.WATERMARK_REPOSITION_HIDE_MS if performance_governor is not None else 450
+_WATERMARK_ALPHA = performance_governor.WATERMARK_ALPHA if performance_governor is not None else 150
+_WATERMARK_WIDTH_FRAC = performance_governor.WATERMARK_WIDTH_FRAC if performance_governor is not None else 0.091
+_WATERMARK_MARGIN_FRAC = performance_governor.WATERMARK_MARGIN_FRAC if performance_governor is not None else 0.12
 
-_WATERMARK_BEZEL_EXTRA_OFFSET = {
-    "bezel":  (10, 10),
-    "bezel1": (10, 10),
-    "bezel2": (10, 10),
-}
+# WARNING: the fallback numbers below must match WATERMARK_BEZEL_EXTRA_OFFSET in performance_governor.py; they are used only when that module fails to import.
+_WATERMARK_BEZEL_EXTRA_OFFSET = performance_governor.WATERMARK_BEZEL_EXTRA_OFFSET if performance_governor is not None else { "bezel": (10, 10), "bezel1": (10, 10), "bezel2": (10, 10), }
 
 
 def _is_live_tv_broadcast_channel(ch):
@@ -4978,7 +5142,8 @@ def _is_live_tv_broadcast_channel(ch):
     # WARNING: static noise, reception lines and the watermark all share this one test; keep it that way so they never disagree on what counts as live TV.
     try:
         return ch not in ("03", "04") and 5 <= int(ch) <= 44
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("_is_live_tv_broadcast_channel: return ch not in ('03', '04') and 5 <= int(ch) <= 44", _swallowed_error)
         return False
 
 
@@ -4994,7 +5159,8 @@ def _channel_watermark_path(channel):
                 candidate = os.path.join(folder, "watermark.png")
                 if os.path.isfile(candidate):
                     return candidate
-    except OSError:
+    except OSError as _swallowed_error:
+        _log_swallowed("_channel_watermark_path: for entry in os.listdir(WATERMARK_BASE_DIR):", _swallowed_error)
         pass
     return ""
 
@@ -5222,10 +5388,10 @@ except Exception as icon_err:
 
 clock = pygame.time.Clock()
 
-# VALUES CHANGE HERE
-_GAME_CORE_FPS_FALLBACK = 60.0
-_GAME_CORE_FPS_GUARD = (40.0, 120.0)
-_UI_COMPOSITOR_FPS = 60.0
+# WARNING: the fallback numbers below must match GAME_CORE_FPS_FALLBACK, GAME_CORE_FPS_GUARD, UI_COMPOSITOR_FPS in performance_governor.py; they are used only when that module fails to import.
+_GAME_CORE_FPS_FALLBACK = performance_governor.GAME_CORE_FPS_FALLBACK if performance_governor is not None else 60.0
+_GAME_CORE_FPS_GUARD = performance_governor.GAME_CORE_FPS_GUARD if performance_governor is not None else (40.0, 120.0)
+_UI_COMPOSITOR_FPS = performance_governor.UI_COMPOSITOR_FPS if performance_governor is not None else 60.0
 
 
 def _feature_locked(config_key):
@@ -5290,24 +5456,24 @@ def _cached_sys_font(name, size, bold=False):
     return _rt_font_cache[k]
 
 
-# VALUES CHANGE HERE
-STATUS_BANNER_DURATION_MS = 30000
+# WARNING: the fallback numbers below must match STATUS_BANNER_DURATION_MS, CAPTION_MEMORY_BANNER_LABEL in performance_governor.py; they are used only when that module fails to import.
+STATUS_BANNER_DURATION_MS = performance_governor.STATUS_BANNER_DURATION_MS if performance_governor is not None else 30000
 # WARNING: the 5000 fallback must match CAPTION_MEMORY_BANNER_SECONDS in performance_governor.py; it is used only when that module fails to import.
 CAPTION_MEMORY_BANNER_MS = int(performance_governor.CAPTION_MEMORY_BANNER_SECONDS * 1000) if performance_governor is not None else 5000
-CAPTION_MEMORY_BANNER_LABEL = "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
+CAPTION_MEMORY_BANNER_LABEL = performance_governor.CAPTION_MEMORY_BANNER_LABEL if performance_governor is not None else "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
 
 _drive_streak_signature = None
 _drive_streak_consumed  = False
 _drive_streak_consumed_at = None
 
-# VALUES CHANGE HERE
-_DRIVE_BANNER_REARM_MS = 5 * 60 * 1000
+# WARNING: the fallback numbers below must match DRIVE_BANNER_REARM_MS in performance_governor.py; they are used only when that module fails to import.
+_DRIVE_BANNER_REARM_MS = performance_governor.DRIVE_BANNER_REARM_MS if performance_governor is not None else 5 * 60 * 1000
 
 _gamepad_streak_signature = None
 _gamepad_streak_consumed  = False
 
-# VALUES CHANGE HERE
-_MISSING_MEDIA_BANNER_REARM_MS = 5 * 60 * 1000
+# WARNING: the fallback numbers below must match MISSING_MEDIA_BANNER_REARM_MS in performance_governor.py; they are used only when that module fails to import.
+_MISSING_MEDIA_BANNER_REARM_MS = performance_governor.MISSING_MEDIA_BANNER_REARM_MS if performance_governor is not None else 5 * 60 * 1000
 
 _missing_media_streak_signature = None
 _missing_media_streak_consumed  = False
@@ -5461,7 +5627,8 @@ def _advance_status_banner_streaks():
                 ch_key for ch_key in _channel_playback_failures
                 if db.channels_db.get(ch_key, {}).get("server_locked", False)
             ))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_advance_status_banner_streaks: if db is not None:", _swallowed_error)
         _locked_failures = ()
     if _remote is not None and (_remote_status == "offline" or _locked_failures):
         _server_sig = (
@@ -5507,7 +5674,8 @@ def _advance_status_banner_streaks():
     try:
         import game_deck
         path = game_deck.gamepad_permission_denied_path()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_advance_status_banner_streaks: import game_deck", _swallowed_error)
         path = None
     if not path:
         _gamepad_streak_signature = None
@@ -5600,13 +5768,13 @@ def _draw_status_banner_bar(screen, label):
     border_w = 2
 
     font = _cached_sys_font("Arial", font_size, bold=True)
-    text_surf = font.render(label, True, (255, 255, 255))
+    text_surf = font.render(label, True, COLOR_BANNER_TEXT)
     bar_w = text_surf.get_width() + pad_x * 2
     bar_h = text_surf.get_height() + pad_y * 2
     bar_w = min(bar_w, picture_rect.width)
     bar_surf = pygame.Surface((bar_w, bar_h), pygame.SRCALPHA)
-    bar_surf.fill((120, 20, 20, 210))
-    pygame.draw.rect(bar_surf, (255, 90, 90, 255), bar_surf.get_rect(), width=border_w)
+    bar_surf.fill(COLOR_BANNER_FILL)
+    pygame.draw.rect(bar_surf, COLOR_BANNER_EDGE, bar_surf.get_rect(), width=border_w)
     bar_surf.blit(text_surf, (pad_x, pad_y))
     if _active_bezel_stem_if_on() == "bezel2":
         bar_surf = _osd_anisotropic_correct(
@@ -5661,17 +5829,14 @@ _tv_caption_cache = {"path": None, "cues": [], "pending_path": None, "resolved_a
 
 _tv_caption_prefetch = {"path": None, "session": None, "channel": None}
 
-_TV_CAPTION_RETRY_SECONDS = 8.0
+# WARNING: the fallback numbers below must match TV_CAPTION_RETRY_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_TV_CAPTION_RETRY_SECONDS = performance_governor.TV_CAPTION_RETRY_SECONDS if performance_governor is not None else 8.0
 
-_TV_CAPTION_COLOR_NAMES = {
-    "white":  (255, 255, 255),
-    "yellow": (255, 220, 60),
-    "green":  (90, 230, 110),
-}
 
-_CAPTION_MAX_HOLD_MS = 7000
-# VALUES CHANGE HERE
-_CAPTION_MIN_FIRST_SHOW_MS = 600
+# WARNING: the fallback numbers below must match CAPTION_MAX_HOLD_MS in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_MAX_HOLD_MS = performance_governor.CAPTION_MAX_HOLD_MS if performance_governor is not None else 7000
+# WARNING: the fallback numbers below must match CAPTION_MIN_FIRST_SHOW_MS in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_MIN_FIRST_SHOW_MS = performance_governor.CAPTION_MIN_FIRST_SHOW_MS if performance_governor is not None else 600
 _caption_first_sight = {"key": None, "skip": False}
 _caption_last_path = {"path": None}
 
@@ -5680,7 +5845,7 @@ def _tv_caption_color_rgb():
     """Resolve the persisted tv_captions_color config value to an RGB triple."""
     from game_deck import LIST_TEXT_COLOR_RGB
     name = db.config.get("tv_captions_color", "white") if db is not None else "white"
-    return LIST_TEXT_COLOR_RGB.get(name, (255, 255, 255))
+    return LIST_TEXT_COLOR_RGB.get(name, COLOR_CAPTION_DEFAULT)
 
 
 def _stop_tv_live_caption_session():
@@ -5724,7 +5889,7 @@ def _maybe_unload_caption_model_after_show(reason):
 
 # WARNING: stop() is permanent; the cache must be reset with it, or turning captions back on reuses the dead session.
 def _release_tv_caption_state_when_off(reason="captions off"):
-    global _tv_caption_cache, _tv_caption_prefetch
+    global _tv_caption_cache
     _caption_last_path["path"] = None
     live = _tv_caption_cache.get("live_session")
     prefetch_session = _tv_caption_prefetch.get("session")
@@ -6072,9 +6237,9 @@ def _wrap_caption_to_two_lines(font, text, max_w):
 
 
 _native_sub_state = {"path": None, "until_ms": 0, "next_ms": 0}
-# VALUES CHANGE HERE
-_NATIVE_SUB_WATCH_MS = 20000
-_NATIVE_SUB_POLL_MS = 400
+# WARNING: the fallback numbers below must match NATIVE_SUB_WATCH_MS, NATIVE_SUB_POLL_MS in performance_governor.py; they are used only when that module fails to import.
+_NATIVE_SUB_WATCH_MS = performance_governor.NATIVE_SUB_WATCH_MS if performance_governor is not None else 20000
+_NATIVE_SUB_POLL_MS = performance_governor.NATIVE_SUB_POLL_MS if performance_governor is not None else 400
 
 
 def _suppress_native_subtitles(path, kind):
@@ -6263,12 +6428,13 @@ _visualizer_confirmed_dead_drive = {}
 _station_confirmed_dead_drive = {}
 
 _watchdog_consecutive_errors = {}
-_WATCHDOG_ERROR_BAIL_AFTER = 2
+# WARNING: the fallback numbers below must match WATCHDOG_ERROR_BAIL_AFTER in performance_governor.py; they are used only when that module fails to import.
+_WATCHDOG_ERROR_BAIL_AFTER = performance_governor.WATCHDOG_ERROR_BAIL_AFTER if performance_governor is not None else 2
 
 _watchdog_consecutive_spurious_resumes = {}
-# VALUES CHANGE HERE
-_WATCHDOG_SPURIOUS_RESUME_BAIL_AFTER = 3
-_WATCHDOG_SPURIOUS_RESUME_WINDOW_MS = 20000
+# WARNING: the fallback numbers below must match WATCHDOG_SPURIOUS_RESUME_BAIL_AFTER, WATCHDOG_SPURIOUS_RESUME_WINDOW_MS in performance_governor.py; they are used only when that module fails to import.
+_WATCHDOG_SPURIOUS_RESUME_BAIL_AFTER = performance_governor.WATCHDOG_SPURIOUS_RESUME_BAIL_AFTER if performance_governor is not None else 3
+_WATCHDOG_SPURIOUS_RESUME_WINDOW_MS = performance_governor.WATCHDOG_SPURIOUS_RESUME_WINDOW_MS if performance_governor is not None else 20000
 
 _drive_ever_confirmed_unresponsive = set()
 
@@ -6308,7 +6474,8 @@ def _drive_confirmed_recovered(root):
 
 
 _last_dead_drive_sweep_ticks = 0
-_DEAD_DRIVE_SWEEP_INTERVAL_MS = 2000
+# WARNING: the fallback numbers below must match DEAD_DRIVE_SWEEP_INTERVAL_MS in performance_governor.py; they are used only when that module fails to import.
+_DEAD_DRIVE_SWEEP_INTERVAL_MS = performance_governor.DEAD_DRIVE_SWEEP_INTERVAL_MS if performance_governor is not None else 2000
 
 
 def _sweep_all_recovered_dead_drives():
@@ -6345,7 +6512,8 @@ def _sweep_all_recovered_dead_drives():
             log.warning("[DRIVE HEALTH] _sweep_all_recovered_dead_drives: game launch failure check failed: %s", _e)
 
 
-CHANNEL_FAILURE_MESSAGE_MS = 30000
+# WARNING: the fallback numbers below must match CHANNEL_FAILURE_MESSAGE_MS in performance_governor.py; they are used only when that module fails to import.
+CHANNEL_FAILURE_MESSAGE_MS = performance_governor.CHANNEL_FAILURE_MESSAGE_MS if performance_governor is not None else 30000
 
 _last_vlc_play_exception = {}
 
@@ -6357,10 +6525,46 @@ STATIC_FALLBACK_BANNER_PREFIX = {
     "schedule_exhausted":   "SCHEDULE ERROR",
     "no_show_selected":     "NO CONTENT MATCHED",
     "visualizer_scanning":  "SCANNING MUSIC",
+    "first_file_scanning":  "SCANNING FILES",
     "visualizer_no_admitted_media": "NO PLAYABLE MUSIC",
 }
 
 SILENT_STATIC_REASONS = {"no_media_scheduled", "channel_inactive"}
+
+# WARNING: the fallback must match FIRST_FILE_SCANNING_BANNER_DELAY_MS in performance_governor.py; used only when that module fails to import.
+_SCANNING_BANNER_DELAY_S = performance_governor.FIRST_FILE_SCANNING_BANNER_DELAY_MS / 1000.0 if performance_governor is not None else 8.0
+_STATIC_BANNER_DELAY_S = {"first_file_scanning": _SCANNING_BANNER_DELAY_S,
+                          "visualizer_scanning": _SCANNING_BANNER_DELAY_S}
+_static_banner_seen = {}
+
+# WARNING: the fallback must match STATIC_TO_GREY_MS in performance_governor.py; used only when that module fails to import.
+_STATIC_TO_GREY_S = performance_governor.STATIC_TO_GREY_MS / 1000.0 if performance_governor is not None else 2.0
+_static_visual_seen = {}
+
+
+def _static_visual_is_grey(key):
+    """True once a channel has stayed on Static for _STATIC_TO_GREY_S: the snow gives way to the grey screen, which holds while the channel still cannot play. A gap of over 1.5 s between calls restarts the clock."""
+    now = time.monotonic()
+    record = _static_visual_seen.get(key)
+    if record is None or now - record[1] > 1.5:
+        record = [now, now]
+        _static_visual_seen[key] = record
+    record[1] = now
+    return now - record[0] >= _STATIC_TO_GREY_S
+
+
+def _static_banner_ready(key, reason):
+    """True once a Static reason has been on screen continuously for its delay; reasons with no delay show at once. A gap of over 1.5 s between calls restarts the wait."""
+    delay = _STATIC_BANNER_DELAY_S.get(reason, 0.0)
+    if delay <= 0.0:
+        return True
+    now = time.monotonic()
+    record = _static_banner_seen.get((key, reason))
+    if record is None or now - record[1] > 1.5:
+        record = [now, now]
+        _static_banner_seen[(key, reason)] = record
+    record[1] = now
+    return now - record[0] >= delay
 
 
 def _classify_playback_failure_reason(file_path):
@@ -6412,7 +6616,8 @@ def _register_channel_playback_failure(ch_key, file_path, duration=None, block=N
     if _known_duration is None and _norm_fail_path is not None:
         try:
             _known_duration = _read_file_probe_facts(_norm_fail_path).get("duration")
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_register_channel_playback_failure: _known_duration = _read_file_probe_facts(_norm_fail_path).get('dura...", _swallowed_error)
             _known_duration = None
     _exists = _cached_path_exists(file_path) if file_path else False
 
@@ -6545,7 +6750,7 @@ def _draw_reason_banner_bar(screen, content_rect, label, scale=1.0):
     try:
         font_size = max(9, round(18 * scale))
         font = _cached_sys_font("Arial", font_size, bold=True)
-        text_surf = font.render(label, True, (255, 255, 255))
+        text_surf = font.render(label, True, COLOR_BANNER_TEXT)
         pad_x, pad_y = max(4, round(14 * scale)), max(2, round(8 * scale))
         bar_w = text_surf.get_width() + pad_x * 2
         bar_h = text_surf.get_height() + pad_y * 2
@@ -6553,8 +6758,8 @@ def _draw_reason_banner_bar(screen, content_rect, label, scale=1.0):
         bar_x = content_rect.x + (content_rect.width - bar_w) // 2
         bar_y = content_rect.bottom - bar_h - max(3, round(12 * scale))
         bar_surf = pygame.Surface((bar_w, bar_h), pygame.SRCALPHA)
-        bar_surf.fill((120, 20, 20, 210))
-        pygame.draw.rect(bar_surf, (255, 90, 90, 255), bar_surf.get_rect(), width=max(1, round(2 * scale)))
+        bar_surf.fill(COLOR_BANNER_FILL)
+        pygame.draw.rect(bar_surf, COLOR_BANNER_EDGE, bar_surf.get_rect(), width=max(1, round(2 * scale)))
         screen.blit(bar_surf, (bar_x, bar_y))
         screen.blit(text_surf, (bar_x + pad_x, bar_y + pad_y))
     except Exception as e:
@@ -6583,6 +6788,8 @@ def _draw_channel_failure_message(screen, content_rect, ch_key, scale=1.0):
 def _draw_static_reason_banner(screen, content_rect, reason, reason_detail, scale=1.0):
     """Guide-preview counterpart to _draw_channel_failure_message, for a channel whose schedule resolved straight to Static."""
     if not reason or reason in SILENT_STATIC_REASONS:
+        return
+    if not _static_banner_ready(("guide", reason_detail), reason):
         return
     _detail = reason_detail or "playback unavailable for this channel"
     _prefix = STATIC_FALLBACK_BANNER_PREFIX.get(reason, "PLAYBACK FAILED")
@@ -6625,7 +6832,8 @@ def _blit_last_video_frame(screen, x, y, w, h, apply_screen_mode=True, context="
                 try:
                     _pa = _video_pixel_aspect(screen.get_width(), screen.get_height(),
                                               _fit_a or frame.get_width() / frame.get_height())
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("_blit_last_video_frame: _pa = _video_pixel_aspect(screen.get_width(), screen.get_height(), ...", _swallowed_error)
                     _pa = 1.0
             _mode = _bezel_video_fit_mode() if context == "fullscreen" else None
             _rect = pygame.Rect(x, y, w, h)
@@ -6666,7 +6874,8 @@ def _seed_last_video_frame(dst_context, src_context):
     except Exception as e:
         log.warning("_seed_last_video_frame: %s -> %s failed: %s", src_context, dst_context, e)
 
-STATIC_TRANSITION_MS = 1500
+# WARNING: the fallback numbers below must match STATIC_TRANSITION_MS in performance_governor.py; they are used only when that module fails to import.
+STATIC_TRANSITION_MS = performance_governor.STATIC_TRANSITION_MS if performance_governor is not None else 1500
 
 
 def _configured_transition_style():
@@ -6680,47 +6889,60 @@ def _configured_transition_style():
 
 _guide_dirty_event = threading.Event()
 
-GUIDE_PREVIEW_SETTLE_MS = 500
+# WARNING: the fallback numbers below must match GUIDE_PREVIEW_SETTLE_MS in performance_governor.py; they are used only when that module fails to import.
+GUIDE_PREVIEW_SETTLE_MS = performance_governor.GUIDE_PREVIEW_SETTLE_MS if performance_governor is not None else 500
 
-GUIDE_PREVIEW_LOAD_TIMEOUT_MS = 2500
+# WARNING: the fallback numbers below must match GUIDE_PREVIEW_LOAD_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
+GUIDE_PREVIEW_LOAD_TIMEOUT_MS = performance_governor.GUIDE_PREVIEW_LOAD_TIMEOUT_MS if performance_governor is not None else 2500
 
-PLAYBACK_STALL_TIMEOUT_MS = 10000
+# WARNING: the fallback numbers below must match PLAYBACK_STALL_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
+PLAYBACK_STALL_TIMEOUT_MS = performance_governor.PLAYBACK_STALL_TIMEOUT_MS if performance_governor is not None else 10000
 
-PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = 20000
+# WARNING: the fallback numbers below must match PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
+PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = performance_governor.PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS if performance_governor is not None else 20000
 
 # WARNING: the 7000 fallback must match STALL_FORCES_STATIC_MS in performance_governor.py; it is used only when that module fails to import.
 STALL_FORCES_STATIC_MS = performance_governor.STALL_FORCES_STATIC_MS if performance_governor is not None else 7000
 
-AUDIO_SYNC_HOLD_MS = 500
+# WARNING: the fallback numbers below must match AUDIO_SYNC_HOLD_MS in performance_governor.py; they are used only when that module fails to import.
+AUDIO_SYNC_HOLD_MS = performance_governor.AUDIO_SYNC_HOLD_MS if performance_governor is not None else 500
 
-_END_PROXIMITY_MS = 2000
+# WARNING: the fallback numbers below must match END_PROXIMITY_MS in performance_governor.py; they are used only when that module fails to import.
+_END_PROXIMITY_MS = performance_governor.END_PROXIMITY_MS if performance_governor is not None else 2000
 
-WEDGED_STOP_TIMEOUT_S = 5
+# WARNING: the fallback numbers below must match WEDGED_STOP_TIMEOUT_SECONDS in performance_governor.py; they are used only when that module fails to import.
+WEDGED_STOP_TIMEOUT_S = performance_governor.WEDGED_STOP_TIMEOUT_SECONDS if performance_governor is not None else 5
 
 
-_PLAY_SEGMENTED_STOP_FAST_WAIT_S = 0.05
+# WARNING: the fallback numbers below must match PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_PLAY_SEGMENTED_STOP_FAST_WAIT_S = performance_governor.PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS if performance_governor is not None else 0.05
 
-PRE_OPEN_DIMS_PROBE_BOUND_S = 0.35
+# WARNING: the fallback numbers below must match PRE_OPEN_DIMS_PROBE_BOUND_SECONDS in performance_governor.py; they are used only when that module fails to import.
+PRE_OPEN_DIMS_PROBE_BOUND_S = performance_governor.PRE_OPEN_DIMS_PROBE_BOUND_SECONDS if performance_governor is not None else 0.35
 
-_SEEK_FRAME_READY_GRACE_MS = 600
+# WARNING: the fallback numbers below must match SEEK_FRAME_READY_GRACE_MS in performance_governor.py; they are used only when that module fails to import.
+_SEEK_FRAME_READY_GRACE_MS = performance_governor.SEEK_FRAME_READY_GRACE_MS if performance_governor is not None else 600
 
-# VALUES CHANGE HERE
-_START_TIME_CONFIRM_MS = 800
-# VALUES CHANGE HERE
-_START_TIME_POLL_MS = 150
+# WARNING: the fallback numbers below must match START_TIME_CONFIRM_MS in performance_governor.py; they are used only when that module fails to import.
+_START_TIME_CONFIRM_MS = performance_governor.START_TIME_CONFIRM_MS if performance_governor is not None else 800
+# WARNING: the fallback numbers below must match START_TIME_POLL_MS in performance_governor.py; they are used only when that module fails to import.
+_START_TIME_POLL_MS = performance_governor.START_TIME_POLL_MS if performance_governor is not None else 150
 
 SEEK_AT_OPEN = True
 
-_SEEK_GUARD_TAIL_MARGIN_S = 5.0
+# WARNING: the fallback numbers below must match SEEK_GUARD_TAIL_MARGIN_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SEEK_GUARD_TAIL_MARGIN_S = performance_governor.SEEK_GUARD_TAIL_MARGIN_SECONDS if performance_governor is not None else 5.0
 
 
-HEARTBEAT_WATCHDOG_TIMEOUT_MS = 45000
+# WARNING: the fallback numbers below must match HEARTBEAT_WATCHDOG_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
+HEARTBEAT_WATCHDOG_TIMEOUT_MS = performance_governor.HEARTBEAT_WATCHDOG_TIMEOUT_MS if performance_governor is not None else 45000
 
 VLC_DEBUG_LOG_PATH = None
 
 _vlc_log_queue = queue.Queue(maxsize=5000)
 
-VLC_LOG_STALL_WARN_MS = 30000
+# WARNING: the fallback numbers below must match VLC_LOG_STALL_WARN_MS in performance_governor.py; they are used only when that module fails to import.
+VLC_LOG_STALL_WARN_MS = performance_governor.VLC_LOG_STALL_WARN_MS if performance_governor is not None else 30000
 
 
 # ============================================================================
@@ -6749,13 +6971,9 @@ def _start_guide_preview_load(hl_ch, hl_state):
         _log_swallowed("_start_guide_preview_load: vlc_engine.player.audio_set_mute(True)", _swallowed_error)
     app_state["_video_pending_unmute"] = True
     vlc_engine.stop()
-    # WARNING: do not add a fixed startup pad; buffering time varies, so it would make every guide preview seek inaccurate.
-    _VLC_STARTUP_LATENCY_S = 0.0
-
-    _gp_state = dict(hl_state)
-    _gp_state["seek"] = _gp_state.get("seek", 0) + _VLC_STARTUP_LATENCY_S
+    # WARNING: do not add a fixed startup pad to the seek; buffering time varies, so it would make every guide preview seek inaccurate (the real VLC position is read when the start is confirmed).
     _gp_on_confirmed = _make_live_playback_start_callback(
-        hl_ch, _gp_state, "guide_preview_open_failed"
+        hl_ch, hl_state, "guide_preview_open_failed"
     )
 
     app_state["last_video_play_started_at"] = pygame.time.get_ticks()
@@ -6818,10 +7036,6 @@ def _arm_guide_preview_transition():
     _governor_note_event("guide_row_switch")
     _mute_guard_log("ARM (guide row switch)", ch=app_state.get("highlighted_guide_channel"))
 
-_GUIDE_HL_STATE_REFRESH_MS = 1000
-
-_GUIDE_HL_STATE_HOLD_MS = 8000
-
 
 def _capture_guide_preview_position(ch_key):
     """Save the exact position of the preview before surfing to another row."""
@@ -6864,11 +7078,75 @@ def _get_guide_hl_playback_state(ch_key, slot="hl"):
 
 
 _visualizer_track_analyzer = None
+_visualizer_track_analyzer_lock = threading.Lock()
+
+
+def _get_visualizer_track_analyzer():
+    """The one shared visualizer song analyzer, created on first use."""
+    global _visualizer_track_analyzer
+    if _visualizer_track_analyzer is None:
+        from assets import audio_analysis
+        with _visualizer_track_analyzer_lock:
+            if _visualizer_track_analyzer is None:
+                _visualizer_track_analyzer = audio_analysis.TrackAnalyzer(
+                    media._resolve_ffmpeg_path, resolve_main_dir, log=log)
+    return _visualizer_track_analyzer
+
+
+def _visualizer_analysis_prefetch():
+    """Keeps the next songs of every reactive visualizer channel analyzed ahead in Standard and Performance: the first 3 with no pause, the rest up to 10 songs ahead at the fast scan pace, refilled once fewer than 5 of the next songs are analyzed."""
+    if db is None or performance_governor is None:
+        return
+    if performance_governor.get_mode() not in ("standard", "performance"):
+        return
+    analyzer = None
+    items = []
+    window = int(performance_governor.MUSIC_SCAN_FAST_AHEAD_SONGS)
+    for i in range(5, 45):
+        ch_str = str(i).zfill(2)
+        ch_info = db.channels_db.get(ch_str, {})
+        if (not ch_info or not ch_info.get("active", True) or not ch_info.get("is_visualizer", False)
+                or ch_info.get("server_locked", False) or not ch_info.get("reactive_visualizer_enabled", True)):
+            continue
+        _snap_rec = _scan_snapshot_channel(ch_str)
+        if _snap_rec is None or not _snap_rec["ordered"]:
+            continue
+        songs = []
+        for entry in _next_n_from_ordered(_snap_rec["ordered"], _snap_rec["current_file"], n=window + 1)[1:]:
+            for p in _paths_from_entry(entry):
+                if p and _cached_path_exists(p):
+                    songs.append(os.path.normpath(p))
+        if not songs:
+            continue
+        if analyzer is None:
+            analyzer = _get_visualizer_track_analyzer()
+        ahead = 0
+        for p in songs:
+            if not analyzer.is_analyzed(p):
+                break
+            ahead += 1
+        _key = "analysis ch" + ch_str
+        behind = performance_governor.music_scan_falling_behind(_music_scan_behind.get(_key, True), ahead)
+        if behind != _music_scan_behind.get(_key):
+            log.info("[VISUALIZER ANALYSIS] ch%s: %d next songs analyzed, %s", ch_str, ahead,
+                     "analyzing ahead" if behind else "far enough ahead")
+            _music_scan_behind[_key] = behind
+        if not behind:
+            continue
+        for distance, p in enumerate(songs, start=1):
+            if analyzer.is_analyzed(p):
+                continue
+            items.append((distance, p))
+    if analyzer is None:
+        return
+    items.sort(key=lambda it: it[0])
+    analyzer.analyze_ahead([
+        (p, _scan_class_pace_seconds(performance_governor.music_scan_class(distance, True), MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS))
+        for distance, p in items])
 
 
 def _visualizer_reactive_frame(track_file):
     """Returns the real-music numbers for the song the mixer is playing right now, or None to keep the Lite fake motion (Lite mode, song not analyzed yet, or no usable position)."""
-    global _visualizer_track_analyzer
     try:
         mode = performance_governor.get_mode() if performance_governor is not None else "lite"
         if mode not in ("standard", "performance") or not track_file or db is None:
@@ -6878,12 +7156,8 @@ def _visualizer_reactive_frame(track_file):
         mixer_ms = pygame.mixer.music.get_pos()
         if mixer_ms < 0 or not pygame.mixer.music.get_busy():
             return None
-        if _visualizer_track_analyzer is None:
-            from assets import audio_analysis
-            _visualizer_track_analyzer = audio_analysis.TrackAnalyzer(
-                media._resolve_ffmpeg_path, resolve_main_dir, log=log)
         from assets import audio_analysis
-        analysis = _visualizer_track_analyzer.get(app_state["_vis_react_track"])
+        analysis = _get_visualizer_track_analyzer().get(app_state["_vis_react_track"])
         position = app_state.get("_vis_react_seek", 0.0) + mixer_ms / 1000.0
         reactive = audio_analysis.reactive_frame(
             analysis, position, app_state.setdefault("_vis_react_state", {}), mode == "performance")
@@ -6913,12 +7187,6 @@ def _render_visualizer_frame(surface, theme, amplitude, style_override=None, rea
         style_override=style_override,
         reactive=reactive,
     )
-    if hasattr(visualizer_deck, "flash_intensity"):
-        visualizer_deck.flash_intensity = 0.0
-    if hasattr(visualizer_deck, "bg_flash"):
-        visualizer_deck.bg_flash = 0
-    if hasattr(visualizer_deck, "galaxy_glow"):
-        visualizer_deck.galaxy_glow = 0
 
 
 pygame_hwnd = pygame.display.get_wm_info().get("window")
@@ -6940,7 +7208,6 @@ SWP_NOMOVE      = 0x0002
 SWP_NOSIZE      = 0x0001
 SWP_SHOWWINDOW  = 0x0040
 SW_RESTORE      = 9
-SW_SHOWMAXIMIZED = 3
 _WINDOW_COMMAND_EVENT = pygame.USEREVENT + 17
 
 
@@ -6965,7 +7232,8 @@ def _win32_force_foreground(hwnd):
         if fg_thread_id and fg_thread_id != cur_thread_id:
             try:
                 attached = bool(u32.AttachThreadInput(cur_thread_id, fg_thread_id, True))
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_win32_force_foreground: attached = bool(u32.AttachThreadInput(cur_thread_id, fg_thread_id, ...", _swallowed_error)
                 attached = False
 
         try:
@@ -7080,20 +7348,25 @@ if sys.platform == "win32" and pygame_hwnd:
         if _orig_wndproc_ptr:
             print("[BOOT] WM_APPCOMMAND diagnostic subclass installed.", flush=True)
         else:
-            print("[APPCOMMAND] SetWindowLongPtrW returned NULL ������� subclass inactive.", flush=True)
+            print("[APPCOMMAND] SetWindowLongPtrW returned NULL -- subclass inactive.", flush=True)
     except Exception as _subclass_err:
         log.warning(f"[APPCOMMAND] subclass install failed: {_subclass_err}")
 
 
 pygame.mouse.set_visible(False)
 
-_LOAD_BAR_CENTER_X = 1196
-_LOAD_BAR_CENTER_Y = 988
-_LOAD_BAR_WIDTH = 260
-_LOAD_BAR_HEIGHT = 12
-_LOAD_BAR_FONT_SIZE = 34
-# VALUES CHANGE HERE
-_LOAD_BAR_TEXT_GAP = 3
+# WARNING: the fallback numbers below must match LOAD_BAR_CENTER_X in performance_governor.py; they are used only when that module fails to import.
+_LOAD_BAR_CENTER_X = performance_governor.LOAD_BAR_CENTER_X if performance_governor is not None else 1196
+# WARNING: the fallback numbers below must match LOAD_BAR_CENTER_Y in performance_governor.py; they are used only when that module fails to import.
+_LOAD_BAR_CENTER_Y = performance_governor.LOAD_BAR_CENTER_Y if performance_governor is not None else 988
+# WARNING: the fallback numbers below must match LOAD_BAR_WIDTH in performance_governor.py; they are used only when that module fails to import.
+_LOAD_BAR_WIDTH = performance_governor.LOAD_BAR_WIDTH if performance_governor is not None else 260
+# WARNING: the fallback numbers below must match LOAD_BAR_HEIGHT in performance_governor.py; they are used only when that module fails to import.
+_LOAD_BAR_HEIGHT = performance_governor.LOAD_BAR_HEIGHT if performance_governor is not None else 12
+# WARNING: the fallback numbers below must match LOAD_BAR_FONT_SIZE in performance_governor.py; they are used only when that module fails to import.
+_LOAD_BAR_FONT_SIZE = performance_governor.LOAD_BAR_FONT_SIZE if performance_governor is not None else 34
+# WARNING: the fallback numbers below must match LOAD_BAR_TEXT_GAP in performance_governor.py; they are used only when that module fails to import.
+_LOAD_BAR_TEXT_GAP = performance_governor.LOAD_BAR_TEXT_GAP if performance_governor is not None else 3
 
 base_dir = os.path.dirname(resolve_main_dir())
 img_path = _boot_loading_image_path(os.path.join(base_dir, "main", "images", "loading"))
@@ -7104,7 +7377,7 @@ if os.path.exists(img_path):
     _lbg_dest_w, _lbg_dest_h, _lbg_dest_x, _lbg_dest_y = _letterbox_fit(
         _lbg_w, _lbg_h, WINDOW_WIDTH, WINDOW_HEIGHT)
     # WARNING: bar colour must not be pure black; black is the transparency key elsewhere.
-    screen.fill((1, 1, 1))
+    screen.fill(COLOR_SCREEN_BLACK)
     screen.blit(pygame.transform.scale(loading_bg_surface, (_lbg_dest_w, _lbg_dest_h)),
                 (_lbg_dest_x, _lbg_dest_y))
 
@@ -7115,14 +7388,14 @@ if os.path.exists(img_path):
     init_x = _lbg_dest_x + int(_LOAD_BAR_CENTER_X * _init_art_scale) - init_w // 2
     init_y = _lbg_dest_y + int(_LOAD_BAR_CENTER_Y * _init_art_scale) - init_h // 2
     
-    pygame.draw.rect(screen, (20, 30, 20), (init_x, init_y, init_w, init_h), border_radius=3)
+    pygame.draw.rect(screen, COLOR_LOADING_BAR_TRACK, (init_x, init_y, init_w, init_h), border_radius=3)
     
     if DETECTED_ASPECT_RATIO != "4:3":
         try:
             _init_font_size = max(9, int(_LOAD_BAR_FONT_SIZE * _init_art_scale))
             _init_text_gap = max(2, int(_LOAD_BAR_TEXT_GAP * _init_art_scale))
             f_init_load = pygame.font.SysFont("Courier New", _init_font_size, bold=True)
-            lbl_init_txt = f_init_load.render("0%", True, (0, 255, 128))
+            lbl_init_txt = f_init_load.render("0%", True, COLOR_LOADING_GREEN)
             
             init_txt_x = _lbg_dest_x + int(_LOAD_BAR_CENTER_X * _init_art_scale) - lbl_init_txt.get_width() // 2
             init_txt_y = init_y - lbl_init_txt.get_height() - _init_text_gap
@@ -7134,7 +7407,7 @@ if os.path.exists(img_path):
     print("Loading image displayed immediately. at", time.time(), flush=True)
 else:
     loading_bg_surface = None
-    screen.fill((5, 5, 5))
+    screen.fill(COLOR_LOADING_EMPTY_BG)
     _present_cpu_window()
     print("No loading image - using fallback black screen.")
 
@@ -7294,8 +7567,7 @@ app_state = {
     "file_explorer_expand_result":     None,
     "file_explorer_expand_pending":    0,
     "file_explorer_expand_started_ms": 0,
-    # VALUES CHANGE HERE
-    "file_explorer_expand_timeout_ms": 6000,
+    "file_explorer_expand_timeout_ms": FILE_EXPLORER_EXPAND_TIMEOUT_MS,
     "file_explorer_context":        {},
     "file_explorer_left_sel":       -1,
     "file_explorer_left_scroll_pc": 0,
@@ -7394,9 +7666,8 @@ print("Basic app state created.")
 
 print("Starting minimal imports...")
 
-from media import read_block_lineup, build_raw_tracks, build_pending_tracks, build_commercial_tracks, block_seed_offset, block_day_seed, block_start_date, block_key_for, block_length_seconds, build_block_rotation, build_channel_timeline, reconcile_cached_lineup, apply_cached_durations, saved_block_lineup, lineup_paths, lineup_groups, RetroDatabase, get_media_duration, get_media_video_dimensions, get_media_loudness_gain, get_pair_loudness_gain, build_show_rotation, fast_forward_show_pos, pair_short_episodes, build_ordered_tracks, build_block_timeline, split_movies_and_series, note_random_episode_played, resolve_track_duration, track_duration_is_estimated, SIX_HOUR_BLOCKS, SIX_HOUR_BLOCK_NAMES, NoAudioStreamError, UnplayableMediaError, LoudnessProbeTimeoutError, LOUDNESS_GAIN_CEILING, LOUDNESS_CONVERGENCE_DB, _movie_part_info, _probe_duration_seconds_fast, SHORT_EPISODE_PAIRING_VERSION, check_media_truly_ended
+from media import read_block_lineup, build_raw_tracks, build_pending_tracks, build_commercial_tracks, block_seed_offset, block_day_seed, block_start_date, block_key_for, block_length_seconds, build_block_rotation, build_channel_timeline, reconcile_cached_lineup, apply_cached_durations, saved_block_lineup, lineup_paths, lineup_groups, RetroDatabase, get_media_duration, get_media_video_dimensions, get_media_loudness_gain, get_pair_loudness_gain, fast_forward_show_pos, build_ordered_tracks, split_movies_and_series, resolve_track_duration, SIX_HOUR_BLOCKS, SIX_HOUR_BLOCK_NAMES, NoAudioStreamError, UnplayableMediaError, LoudnessProbeTimeoutError, LOUDNESS_GAIN_CEILING, _movie_part_info, _probe_duration_seconds_fast, SHORT_EPISODE_PAIRING_VERSION, check_media_truly_ended
 from media import (
-    TARGET_LUFS,
     _season_folder_base,
     _bare_season_number,
     _normalize_show_key,
@@ -7411,37 +7682,40 @@ from media import (
     bake_compressor_pass,
 )
 import ui
-from ui import render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_update_prompt, render_clear_confirm_popup, fit_design_canvas, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
+from ui import render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, fit_design_canvas, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
     get_server_picker_entries, get_server_picker_selectable_count, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
-    UPDATER_AND_SERVER_FEATURES_ENABLED, SERVER_TOGGLE_ENABLED, GPU_RENDER_MODE_ENABLED
+    UPDATER_AND_SERVER_FEATURES_ENABLED, SERVER_TOGGLE_ENABLED, GPU_RENDER_MODE_ENABLED, NUM_CONTROL_PAGES
 from visualizers import VisualizerDeck
 
 explorer_queue = queue.Queue()
 
 
-_FE_TITLE_H    = 44
-_FE_TOOLBAR_H  = 40
-# VALUES CHANGE HERE
-_FE_FOOTER_H   = 108
-_FE_LEFT_W     = 215
-_FE_LEFT_ROW_H = 40
-_FE_LEFT_REMOVE_W = 24
-_FE_COL_H      = 34
-_FE_ROW_H      = 34
-_FE_BTN_H      = 42
-# VALUES CHANGE HERE
-_FE_BTN_W      = 210
-_FE_BTN_W_SM   = 85
+# WARNING: the fallback numbers below must match FILE_EXPLORER_TITLE_H in performance_governor.py; they are used only when that module fails to import.
+_FE_TITLE_H = performance_governor.FILE_EXPLORER_TITLE_H if performance_governor is not None else 44
+# WARNING: the fallback numbers below must match FILE_EXPLORER_TOOLBAR_H in performance_governor.py; they are used only when that module fails to import.
+_FE_TOOLBAR_H = performance_governor.FILE_EXPLORER_TOOLBAR_H if performance_governor is not None else 40
+# WARNING: the fallback numbers below must match FE_FOOTER_H, FE_LEFT_W, FE_LEFT_ROW_H, FE_LEFT_REMOVE_W, FE_COL_H, FE_ROW_H, FE_BTN_H in performance_governor.py; they are used only when that module fails to import.
+_FE_FOOTER_H = performance_governor.FE_FOOTER_H if performance_governor is not None else 108
+_FE_LEFT_W = performance_governor.FE_LEFT_W if performance_governor is not None else 215
+_FE_LEFT_ROW_H = performance_governor.FE_LEFT_ROW_H if performance_governor is not None else 40
+_FE_LEFT_REMOVE_W = performance_governor.FE_LEFT_REMOVE_W if performance_governor is not None else 24
+_FE_COL_H = performance_governor.FE_COL_H if performance_governor is not None else 34
+_FE_ROW_H = performance_governor.FE_ROW_H if performance_governor is not None else 34
+_FE_BTN_H = performance_governor.FE_BTN_H if performance_governor is not None else 42
+# WARNING: the fallback numbers below must match FE_BTN_W, FE_BTN_W_SM, FE_ADDLOC_HDR_H, FE_ADDLOC_W in performance_governor.py; they are used only when that module fails to import.
+_FE_BTN_W = performance_governor.FE_BTN_W if performance_governor is not None else 210
+_FE_BTN_W_SM = performance_governor.FE_BTN_W_SM if performance_governor is not None else 85
 _FE_HEADER_H   = _FE_TITLE_H + _FE_TOOLBAR_H
 _FE_ADDLOC_PANEL_W = _FE_LEFT_W
-_FE_ADDLOC_HDR_H   = 40
-_FE_ADDLOC_W       = 150
+_FE_ADDLOC_HDR_H = performance_governor.FE_ADDLOC_HDR_H if performance_governor is not None else 40
+_FE_ADDLOC_W = performance_governor.FE_ADDLOC_W if performance_governor is not None else 150
 
 # WARNING: _fe_add_selected_to_queue() must replace, not append, when one of these is the active context.
 _FE_SINGLE_PICK_MODES = {"libretro_core", "console_splash", "menu_bg", "watermark_select"}
 
 
-_FE_LEFT_ITEMS_TTL_MS = 2000
+# WARNING: the fallback numbers below must match FILE_EXPLORER_LEFT_ITEMS_TTL_MS in performance_governor.py; they are used only when that module fails to import.
+_FE_LEFT_ITEMS_TTL_MS = performance_governor.FILE_EXPLORER_LEFT_ITEMS_TTL_MS if performance_governor is not None else 2000
 _fe_left_items_cache = {"pc": None, "qa": None, "ts": -1_000_000}
 
 
@@ -7463,7 +7737,8 @@ def _fe_compute_this_pc_items():
                     if media.is_drive_held(drive):
                         continue
                     items.append({"label": drive, "path": drive, "indent": 1, "is_header": False})
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_fe_compute_this_pc_items: import ctypes as _cfe", _swallowed_error)
             for letter in "CDEF":
                 drive = f"{letter}:\\"
                 if os.path.exists(drive):
@@ -7617,8 +7892,9 @@ def _fe_list_dir(path, valid_exts):
             for entry in it:
                 try:
                     kind, real_path, disp_name = media.resolve_dir_entry(entry.path, entry.name)
-                except OSError:
+                except OSError as _swallowed_error:
                     # WARNING: one unreadable entry must not abort the whole listing.
+                    _log_swallowed("_fe_list_dir: kind, real_path, disp_name = media.resolve_dir_entry(entry.path, en...", _swallowed_error)
                     continue
                 if kind == "dir":
                     folders.append((disp_name, real_path))
@@ -7683,10 +7959,10 @@ def _fe_cached_label(font, text, color):
     return surf
 
 
-# VALUES CHANGE HERE
-_FE_ICON_W = 14
-_FE_ICON_H = 11
-_FE_ICON_GAP = 6
+# WARNING: the fallback numbers below must match FE_ICON_W, FE_ICON_H, FE_ICON_GAP in performance_governor.py; they are used only when that module fails to import.
+_FE_ICON_W = performance_governor.FE_ICON_W if performance_governor is not None else 14
+_FE_ICON_H = performance_governor.FE_ICON_H if performance_governor is not None else 11
+_FE_ICON_GAP = performance_governor.FE_ICON_GAP if performance_governor is not None else 6
 
 
 def _fe_draw_folder_icon(screen, x, y, color):
@@ -8090,9 +8366,11 @@ def _apply_loudness_setting_live():
 
 ALL_REMOTE_ACTION_IDS = [a for a, _ in REMOTE_REMAP_ACTIONS] + [a for a, _ in NUMBER_REMAP_ACTIONS]
 
-_REMAP_CAPTURE_DEDUP_MS = 600
+# WARNING: the fallback numbers below must match KEY_CAPTURE_SECOND_PATH_MS in performance_governor.py; they are used only when that module fails to import.
+_REMAP_CAPTURE_DEDUP_MS = performance_governor.KEY_CAPTURE_SECOND_PATH_MS if performance_governor is not None else 600
 
-MUSIC_GAIN = 1.0
+# WARNING: the fallback numbers below must match MUSIC_GAIN in performance_governor.py; they are used only when that module fails to import.
+MUSIC_GAIN = performance_governor.MUSIC_GAIN if performance_governor is not None else 1.0
 
 
 def check_remap_conflict(db_inst, app_state, action_id, key_code):
@@ -8151,11 +8429,6 @@ def set_dvd_binding(db_inst, action, key_code):
     print(f"[DVD REMAP] '{action}' bound to {remote_key_label(key_code)}")
 
 
-# VALUES CHANGE HERE
-_CH03_DEFAULT_MUSIC_GAIN_PRECACHED = 0.32
-_CH03_DEFAULT_MUSIC_GAIN_LEGACY = 0.31
-
-
 def _ch03_entry_is_default_music(entry):
     """True when a ch03 menu-music playlist entry is the shipped default track."""
     path = entry.get("path", entry.get("file", "")) if isinstance(entry, dict) else str(entry or "")
@@ -8166,12 +8439,12 @@ def _ch03_entry_is_default_music(entry):
 
 
 def _ensure_ch03_menu_music_seeded():
-    """Seed the ch03 menu-music playlist with the shipped default track if the playlist is still empty."""
+    """Seed the ch03 menu-music playlist with the shipped default track if the playlist is still empty; a track's gain is kept only in the library, never in the playlist."""
     if db is None:
         return
     _existing_music = db.config.get("ch03_menu_music", [])
     if _existing_music:
-        _gain_fixed = False
+        _changed = False
         _default_track = os.path.join(resolve_main_dir(), "audio", "Game Music", "gamemusic.mp3")
         for _entry in _existing_music:
             # WARNING: an update renames the install folder, which leaves the saved path of the shipped track pointing at the old folder; only that one dead entry is pointed at this install's copy, every other setting is left as saved.
@@ -8179,20 +8452,17 @@ def _ensure_ch03_menu_music_seeded():
             if (_saved_path and not os.path.isfile(_saved_path) and os.path.isfile(_default_track)
                     and _saved_path.replace("/", "\\").lower().endswith("\\main\\audio\\game music\\gamemusic.mp3")):
                 _entry["path"] = _default_track
-                _gain_fixed = True
-            if (isinstance(_entry, dict) and _ch03_entry_is_default_music(_entry)
-                    and abs(float(_entry.get("gain", 0) or 0) - _CH03_DEFAULT_MUSIC_GAIN_LEGACY) < 1e-9):
-                _entry["gain"] = _CH03_DEFAULT_MUSIC_GAIN_PRECACHED
-                _gain_fixed = True
-        if _gain_fixed:
+                _changed = True
+            if isinstance(_entry, dict) and "gain" in _entry:
+                del _entry["gain"]
+                _changed = True
+        if _changed:
             db.save_settings()
-            print(f"[CH03 MUSIC] Default track gain {_CH03_DEFAULT_MUSIC_GAIN_LEGACY} -> {_CH03_DEFAULT_MUSIC_GAIN_PRECACHED}")
+            print("[CH03 MUSIC] Playlist brought up to date: the shipped track's path, gains kept only in the library")
         return
     _default = os.path.join(resolve_main_dir(), "audio", "Game Music", "gamemusic.mp3")
     if os.path.isfile(_default):
-        db.config["ch03_menu_music"] = [
-            {"path": _default, "gain": _CH03_DEFAULT_MUSIC_GAIN_PRECACHED}
-        ]
+        db.config["ch03_menu_music"] = [{"path": _default}]
         db.save_settings()
         print(f"[CH03 MUSIC] Seeded default track: {os.path.basename(_default)}")
 
@@ -8250,11 +8520,9 @@ def _ch03_next_playlist_entry(playlist):
 
 
 def _ch03_track_gain(path, entry):
-    """The gain a menu-music track plays with: the library's scanned gain (a playlist gain saved by an older version until the scan lands, else 1.0) times the owner's manual dB, so the scan is applied once."""
+    """The gain a menu-music track plays with: the library's scanned gain (1.0 until the scan lands) times the owner's manual dB."""
     norm = os.path.normpath(path)
     base = _read_file_probe_facts(norm).get("gain")
-    if base is None and isinstance(entry, dict):
-        base = entry.get("gain")
     if not base:
         base = 1.0
     return float(base) * 10 ** (_get_manual_audio_gain_db(path) / 20.0)
@@ -8764,7 +9032,7 @@ def _store_loudness_gain(norm_path, gain):
             except Exception as _swallowed_error:
                 _log_swallowed("_store_loudness_gain: reading the saved row", _swallowed_error)
             if not owner_row:
-                _learning_set("applied", os.path.normpath(norm_path), learned_offset or None)
+                _learning_write(os.path.normpath(norm_path), learn_applied_db=float(learned_offset) if learned_offset else None)
     return stored
 
 
@@ -8828,8 +9096,8 @@ def _save_file_probe_facts(norm_path, duration=None, gain=None, dims=None):
 # SECTION: Changed-file sweep
 # ============================================================================
 
-# VALUES CHANGE HERE
-_CHANGED_FILE_SWEEP_INTERVAL_S = 1800
+# WARNING: the fallback numbers below must match CHANGED_FILE_SWEEP_INTERVAL_S in performance_governor.py; they are used only when that module fails to import.
+_CHANGED_FILE_SWEEP_INTERVAL_S = performance_governor.CHANGED_FILE_SWEEP_INTERVAL_S if performance_governor is not None else 1800
 
 
 def _forget_changed_files():
@@ -8889,7 +9157,8 @@ def _purge_removed_scan_data():
         log.warning(f"[CONFIG PURGE] save after purge failed: {e}")
 
 
-_LOUDNESS_TIMEOUT_BACKOFF_S = (600, 1800, 7200, 21600)
+# WARNING: the fallback numbers below must match LOUDNESS_TIMEOUT_BACKOFF_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_LOUDNESS_TIMEOUT_BACKOFF_S = performance_governor.LOUDNESS_TIMEOUT_BACKOFF_SECONDS if performance_governor is not None else (600, 1800, 7200, 21600)
 
 
 # ============================================================================
@@ -8956,7 +9225,9 @@ def _probe_marker_path():
     """Path to the tiny standalone "currently probing this" marker file."""
     if db is None:
         return None
-    return os.path.join(db.base_dir, "_probe_inflight.json")
+    _dir = os.path.join(db.base_dir, LOGS_FOLDER_NAME)
+    os.makedirs(_dir, exist_ok=True)
+    return os.path.join(_dir, "_probe_inflight.json")
 
 
 def _write_probe_marker(norm_p, field):
@@ -9130,7 +9401,7 @@ def _probe_duration_and_dims_combined_impl(norm_p):
 
 
 _PENDING_SCHEDULE_PROBE_PARALLEL = (performance_governor.PENDING_SCHEDULE_PROBE_PARALLEL
-                                    if performance_governor is not None else 6)
+                                    if performance_governor is not None else 1)
 
 
 def _probe_pending_schedule_one(norm_path):
@@ -9149,50 +9420,153 @@ def _probe_pending_schedule_one(norm_path):
     return None
 
 
+# ============================================================================
+# SECTION: Pending-file probe, one file at a time in the background
+# ============================================================================
+_PENDING_PROBE_RETRY_SECONDS = (performance_governor.PENDING_SCHEDULE_PROBE_RETRY_SECONDS
+                                if performance_governor is not None else 5.0)
+_PENDING_PROBE_REQUEST_STALE_SECONDS = (performance_governor.PENDING_SCHEDULE_PROBE_REQUEST_STALE_SECONDS
+                                        if performance_governor is not None else 30.0)
+# WARNING: the fallback must match PENDING_PROBE_URGENT_COUNT in performance_governor.py; used only when that module fails to import.
+_PENDING_PROBE_URGENT_COUNT = (performance_governor.PENDING_PROBE_URGENT_COUNT
+                               if performance_governor is not None else 4)
+# WARNING: this dict is the only state of the pending probe; the worker threads never touch the database, only the calling thread stores results.
+_pending_probe_state = {"lock": threading.Lock(), "wake": threading.Event(), "requests": {},
+                        "results": [], "in_flight": set(), "retry_at": {}, "threads": [], "active": 0,
+                        "urgent_active": 0, "last_backlog": 0.0}
+
+
+def _pending_probe_worker():
+    """Probes the requested pending files one at a time. What airs soonest on every channel goes first (every channel's next file before any channel's second), at priority; the long backlog behind it is paced by the governor and only runs while the PC is calm."""
+    # WARNING: the old worker ran every pending file of a block back to back inside a priority scope that the governor never throttles, so adding hundreds of files hammered the disk while a channel was opening. Only the first PENDING_PROBE_URGENT_COUNT files of a request are urgent now.
+    state = _pending_probe_state
+    while True:
+        item = None
+        urgent = True
+        with state["lock"]:
+            now_m = time.monotonic()
+            best = None
+            for key, request in list(state["requests"].items()):
+                if now_m - request["seen"] > _PENDING_PROBE_REQUEST_STALE_SECONDS:
+                    del state["requests"][key]
+                    continue
+                for rank, path in enumerate(request["paths"]):
+                    if path in state["in_flight"] or state["retry_at"].get(path, 0.0) > now_m:
+                        continue
+                    if best is None or rank < best[0]:
+                        best = (rank, key, path)
+                    break
+            if best is not None:
+                _rank, _key, _path = best
+                urgent = _rank < _PENDING_PROBE_URGENT_COUNT
+                if urgent or _pending_backlog_may_run(state, now_m):
+                    item = (_key, _path)
+                    state["in_flight"].add(_path)
+                    state["active"] += 1
+                    if urgent:
+                        state["urgent_active"] = state.get("urgent_active", 0) + 1
+                        if state["urgent_active"] == 1:
+                            set_live_playback_priority(True)
+                    else:
+                        state["last_backlog"] = now_m
+        if item is None:
+            state["wake"].wait(1.0)
+            state["wake"].clear()
+            continue
+        key, path = item
+        started = time.monotonic()
+        result = None
+        try:
+            if urgent:
+                with _governor_priority_scope():
+                    result = _probe_pending_schedule_one(path)
+            else:
+                result = _probe_pending_schedule_one(path)
+        except Exception as exc:
+            log.warning("[SCHEDULER] background probe of %s failed: %s", os.path.basename(path), exc)
+        finally:
+            with state["lock"]:
+                state["in_flight"].discard(path)
+                state["active"] -= 1
+                if state["active"] <= 0:
+                    state["active"] = 0
+                if urgent:
+                    state["urgent_active"] = max(0, state.get("urgent_active", 1) - 1)
+                    if state["urgent_active"] == 0:
+                        set_live_playback_priority(False)
+                state["retry_at"][path] = time.monotonic() + _PENDING_PROBE_RETRY_SECONDS
+                if result is not None:
+                    state["results"].append((key, result, time.monotonic() - started))
+
+
+def _pending_backlog_may_run(state, now_m):
+    """True when a backlog (not-needed-soon) file may be probed now: the PC's load level is low, no live open is in flight, and the governor's spacing since the last backlog probe has passed. Called with the state lock held."""
+    if media._LIVE_PLAYBACK_PRIORITY.is_set():
+        return False
+    if performance_governor is None:
+        return now_m - state.get("last_backlog", 0.0) >= 1.5
+    try:
+        if not performance_governor.pending_backlog_allowed():
+            return False
+        return now_m - state.get("last_backlog", 0.0) >= performance_governor.pending_backlog_interval_seconds()
+    except Exception as _swallowed_error:
+        _log_swallowed("_pending_backlog_may_run: if not performance_governor.pending_backlog_allowed():", _swallowed_error)
+        return now_m - state.get("last_backlog", 0.0) >= 1.5
+
+
 def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tracks):
-    """Resolve newly discovered scheduled files before playback may fall back to Static."""
-    if db is None or not pending_tracks or _channel_is_server_streamed(ch_key):
+    """Hands a channel's pending files to the one-at-a-time background probe and stores every result that has finished; it never waits for a probe."""
+    if db is None or _channel_is_server_streamed(ch_key):
         return
-    initialize_vlc_on_demand()
+    state = _pending_probe_state
+    key = (ch_key, container_key, sub_key)
     norm_paths = []
-    for track in pending_tracks:
+    for track in pending_tracks or []:
         path = track.get("path") if isinstance(track, dict) else None
         if path:
             norm_path = os.path.normpath(path)
             if norm_path not in norm_paths:
                 norm_paths.append(norm_path)
-    if not norm_paths:
-        return
-    from concurrent.futures import ThreadPoolExecutor
-    _started = time.monotonic()
-    _workers = max(1, min(_PENDING_SCHEDULE_PROBE_PARALLEL, len(norm_paths)))
-    results = []
-    with _governor_priority_scope():
-        set_live_playback_priority(True)
-        try:
-            if _workers == 1:
-                results = [_probe_pending_schedule_one(norm_paths[0])]
+    with state["lock"]:
+        if norm_paths:
+            request = state["requests"].get(key)
+            if request is None:
+                state["requests"][key] = {"paths": norm_paths, "seen": time.monotonic()}
             else:
-                with ThreadPoolExecutor(max_workers=_workers, thread_name_prefix="pending-probe") as _pool:
-                    results = list(_pool.map(_probe_pending_schedule_one, norm_paths))
-        finally:
-            set_live_playback_priority(False)
-    for item in results:
-        if item is None:
-            continue
+                request["paths"] = norm_paths
+                request["seen"] = time.monotonic()
+        else:
+            state["requests"].pop(key, None)
+        finished = state["results"]
+        state["results"] = []
+        waiting = len(norm_paths)
+        state["threads"] = [t for t in state["threads"] if t.is_alive()]
+        missing_workers = (max(1, _PENDING_SCHEDULE_PROBE_PARALLEL) - len(state["threads"])) if norm_paths else 0
+    if missing_workers > 0:
+        initialize_vlc_on_demand()
+        for _ in range(missing_workers):
+            worker = threading.Thread(target=_pending_probe_worker, name="PendingProbe", daemon=True)
+            worker.start()
+            with state["lock"]:
+                state["threads"].append(worker)
+    if norm_paths:
+        state["wake"].set()
+    for result_key, item, took in finished:
         norm_path, duration, dimensions = item
-        _patch_probed_gain("channel", ch_key, sub_key, norm_path,
+        _patch_probed_gain("channel", result_key[0], result_key[2], norm_path,
                            duration=duration,
                            dims=dimensions)
-    log.info("[SCHEDULER] ch%s %s: immediate probe of %d pending file(s) took %.2fs (%d worker(s)).",
-             ch_key, sub_key, len(norm_paths), time.monotonic() - _started, _workers)
-    try:
-        db.save_settings_async(force=True)
-    except Exception as exc:
-        log.warning("[SCHEDULER] could not persist immediate duration probes: %s", exc)
+        log.info("[SCHEDULER] ch%s %s: background probe stored %s (%.0fs long) in %.2fs; %d pending file(s) of this block still waiting.",
+                 result_key[0], result_key[2], os.path.basename(norm_path), duration, took, max(0, waiting - 1))
+    if finished:
+        try:
+            db.save_settings_async(force=True)
+        except Exception as exc:
+            log.warning("[SCHEDULER] could not persist background duration probes: %s", exc)
 
 
-SHOW_SMOOTH_TOLERANCE_DB = 0.3
+# WARNING: the fallback numbers below must match SHOW_SMOOTH_TOLERANCE_DB in performance_governor.py; they are used only when that module fails to import.
+SHOW_SMOOTH_TOLERANCE_DB = performance_governor.SHOW_SMOOTH_TOLERANCE_DB if performance_governor is not None else 0.3
 _show_loudness_floor = {}
 _show_loudness_floor_lock = threading.Lock()
 
@@ -9240,71 +9614,94 @@ def _apply_show_loudness_smoothing(norm_p, gain, shortfall_info):
 # SECTION: Learned series loudness offset (F3)
 # ============================================================================
 
-# VALUES CHANGE HERE (how many of the owner's most recent changes in one series must be the same dB before the rest of the series is offset by it, and the most dB an offset may be)
-LOUDNESS_LEARN_MIN_FILES = 3
-LOUDNESS_LEARN_MAX_OFFSET_DB = 12
+# WARNING: the fallback numbers below must match LOUDNESS_LEARN_MIN_FILES, LOUDNESS_LEARN_AGREE_DB, LOUDNESS_LEARN_SINGLE_CHANGE_DB, LOUDNESS_LEARN_MAX_OFFSET_DB, LOUDNESS_LEARN_SETTLE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+LOUDNESS_LEARN_MIN_FILES = performance_governor.LOUDNESS_LEARN_MIN_FILES if performance_governor is not None else 3
+LOUDNESS_LEARN_AGREE_DB = performance_governor.LOUDNESS_LEARN_AGREE_DB if performance_governor is not None else 2.0
+LOUDNESS_LEARN_SINGLE_CHANGE_DB = performance_governor.LOUDNESS_LEARN_SINGLE_CHANGE_DB if performance_governor is not None else 3.0
+LOUDNESS_LEARN_MAX_OFFSET_DB = performance_governor.LOUDNESS_LEARN_MAX_OFFSET_DB if performance_governor is not None else 12
+LOUDNESS_LEARN_SETTLE_SECONDS = performance_governor.LOUDNESS_LEARN_SETTLE_SECONDS if performance_governor is not None else 5.0
+# WARNING: the fallback numbers below must match LOUDNESS_SLIDER_SAMPLE_SECONDS, LOUDNESS_SLIDER_MIN_WATCH_SECONDS, LOUDNESS_SLIDER_TRIGGER_POINTS, LOUDNESS_SLIDER_COMFORT_PCT, LOUDNESS_SLIDER_REFERENCE_FILES, LOUDNESS_SLIDER_REFERENCE_MIN_FILES in performance_governor.py; they are used only when that module fails to import.
+LOUDNESS_SLIDER_SAMPLE_SECONDS = performance_governor.LOUDNESS_SLIDER_SAMPLE_SECONDS if performance_governor is not None else 1.0
+LOUDNESS_SLIDER_MIN_WATCH_SECONDS = performance_governor.LOUDNESS_SLIDER_MIN_WATCH_SECONDS if performance_governor is not None else 600.0
+LOUDNESS_SLIDER_TRIGGER_POINTS = performance_governor.LOUDNESS_SLIDER_TRIGGER_POINTS if performance_governor is not None else 30
+LOUDNESS_SLIDER_COMFORT_PCT = performance_governor.LOUDNESS_SLIDER_COMFORT_PCT if performance_governor is not None else 72
+LOUDNESS_SLIDER_REFERENCE_FILES = performance_governor.LOUDNESS_SLIDER_REFERENCE_FILES if performance_governor is not None else 10
+LOUDNESS_SLIDER_REFERENCE_MIN_FILES = performance_governor.LOUDNESS_SLIDER_REFERENCE_MIN_FILES if performance_governor is not None else 3
 
 _loudness_learning_lock = threading.RLock()
 _learned_offset_pending = {}
+_owner_gain_learning_pending = {}
+_owner_gain_learning_worker = {"thread": None}
 
 
-def _loudness_learning_data():
-    """The saved learning record with its three parts: baselines (a changed file's own scanned dB), applied (the offset added to a scanned file's gain) and series (the owner's changes and the offset learned from them)."""
-    data = db.config.get("loudness_learning")
-    if not isinstance(data, dict):
-        data = {}
-        db.config["loudness_learning"] = data
-    for name in ("baselines", "applied", "series"):
-        if not isinstance(data.get(name), dict):
-            data[name] = {}
-    return data
+_LEARN_FIELDS = ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db")
 
 
-def _learning_set(section, key, value):
-    """Sets or, for None, removes one entry of the learning record by swapping in a copy, so a settings save running at the same moment never sees the dict change size."""
-    with _loudness_learning_lock:
-        data = _loudness_learning_data()
-        if value is None and key not in data[section]:
-            return
-        updated = dict(data[section])
-        if value is None:
-            updated.pop(key, None)
-        else:
-            updated[key] = value
-        data[section] = updated
+def _learning_read(norm_path):
+    """The file's loudness-learning fields from its library row ({} when the library cannot read them yet)."""
+    hub = _get_gain_hub()
+    if hub is None or not norm_path:
+        return {}
+    return hub.read_file_fields(norm_path, _LEARN_FIELDS) or {}
+
+
+def _learning_write(norm_path, **fields):
+    """Writes loudness-learning fields into the file's library row; one line in the log when the library cannot hold them yet."""
+    hub = _get_gain_hub()
+    if hub is None or not hub.note_file_fields(norm_path, **fields):
+        log.warning("[LOUDNESS LEARN] %s: the library could not save the learned loudness (%s), it is not kept",
+                    os.path.basename(str(norm_path)), ", ".join(sorted(fields)))
+        return False
+    return True
+
+
+def _series_offset_from_changes(changes):
+    """The series offset in whole dB from the owner's counted changes, oldest first, held to LOUDNESS_LEARN_MAX_OFFSET_DB: the newest change when it is bigger than LOUDNESS_LEARN_SINGLE_CHANGE_DB; otherwise the middle of the last LOUDNESS_LEARN_MIN_FILES changes when they all go the same way and sit within LOUDNESS_LEARN_AGREE_DB of each other; 0 otherwise."""
+    values = [float(change) for change, _at in changes]
+    if not values:
+        return 0
+    if abs(values[-1]) > LOUDNESS_LEARN_SINGLE_CHANGE_DB:
+        offset = values[-1]
+    else:
+        recent = values[-LOUDNESS_LEARN_MIN_FILES:]
+        if (len(recent) < LOUDNESS_LEARN_MIN_FILES or not (all(v > 0 for v in recent) or all(v < 0 for v in recent))
+                or max(recent) - min(recent) > LOUDNESS_LEARN_AGREE_DB):
+            return 0
+        offset = _middle_value(recent)
+    return int(max(-LOUDNESS_LEARN_MAX_OFFSET_DB, min(LOUDNESS_LEARN_MAX_OFFSET_DB, round(offset))))
+
+
+def _series_offset_for_key(show_key):
+    """The whole dB offset learned for one series from its files' library rows: the offset the owner's own gain changes give wins whenever they give one; otherwise the offset from the volume he kept while watching."""
+    hub = _get_gain_hub()
+    if hub is None or show_key is None:
+        return 0
+    manual = _series_offset_from_changes(hub.read_series_changes(show_key))
+    if manual:
+        return manual
+    return _series_offset_from_slider(hub.read_series_slider(show_key))
 
 
 def _learned_series_offset(norm_path):
     """The whole dB offset learned for the file's series, or 0 when the series has none."""
     if db is None:
         return 0
-    show_key = _get_show_smoothing_key(norm_path)
-    if show_key is None:
-        return 0
-    with _loudness_learning_lock:
-        entry = _loudness_learning_data()["series"].get(show_key) or {}
-        try:
-            return int(entry.get("offset_db", 0))
-        except (TypeError, ValueError):
-            return 0
+    return _series_offset_for_key(_get_show_smoothing_key(norm_path))
 
 
 def _learned_offset_applied(norm_path):
     """The dB offset that was added to this file's saved scanned gain, or 0 when none was."""
     if db is None:
         return 0
-    with _loudness_learning_lock:
-        try:
-            return int(_loudness_learning_data()["applied"].get(norm_path, 0))
-        except (TypeError, ValueError):
-            return 0
+    value = _learning_read(norm_path).get("learn_applied_db")
+    return int(round(float(value))) if value else 0
 
 
-def _series_scan_is_outlier(norm_path, raw_db):
-    """True when enough of the season is already scanned and this file's own scanned dB is GAIN_CHECK_NEIGHBOR_DB or more from the middle of the others, the same test the season check uses."""
+def _season_others_middle_db(norm_path):
+    """The middle scanned dB of the other episodes in the file's season folder, without learned offsets, or None until enough of them are scanned."""
     hub = _get_gain_hub()
     if hub is None:
-        return False
+        return None
     others = []
     for member in _gain_bundle_members(norm_path):
         if member == norm_path:
@@ -9313,8 +9710,14 @@ def _series_scan_is_outlier(norm_path, raw_db):
         if member_db is not None:
             others.append(member_db)
     if len(others) < media.GAIN_CHECK_BUNDLE_MIN_SCANNED - 1:
-        return False
-    return round(abs(raw_db - _middle_value(others)), 2) >= media.GAIN_CHECK_NEIGHBOR_DB
+        return None
+    return _middle_value(others)
+
+
+def _series_scan_is_outlier(norm_path, raw_db):
+    """True when enough of the season is already scanned and this file's own scanned dB is GAIN_CHECK_NEIGHBOR_DB or more from the middle of the others, the same test the season check uses."""
+    middle = _season_others_middle_db(norm_path)
+    return middle is not None and round(abs(raw_db - middle), 2) >= media.GAIN_CHECK_NEIGHBOR_DB
 
 
 def _apply_learned_series_offset(norm_path, gain):
@@ -9357,12 +9760,12 @@ def _take_learned_offset_applied(norm_path):
 
 def _owner_gain_baseline_db(norm_path, hub):
     """The file's own scanned dB, without any learned offset, kept from the owner's first change to it; None when the file has no current scan to compare the change with."""
-    with _loudness_learning_lock:
-        held = _loudness_learning_data()["baselines"].get(norm_path)
+    held = _learning_read(norm_path).get("learn_baseline_db")
     if held is not None:
         try:
             return float(held)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _swallowed_error:
+            _log_swallowed("_owner_gain_baseline_db: return float(held)", _swallowed_error)
             return None
     try:
         if hub.read(norm_path)["scan_version"] == media.OWNER_GAIN_SCAN_VERSION:
@@ -9376,40 +9779,227 @@ def _owner_gain_baseline_db(norm_path, hub):
     return 20.0 * math.log10(gain) - _learned_offset_applied(norm_path)
 
 
+def _series_members(norm_path):
+    """The video files of the file's whole series: every season folder beside its own that belongs to the same show; empty when the file is not in a season folder or the drive is slow."""
+    show_key = _get_show_smoothing_key(norm_path)
+    if show_key is None:
+        return []
+    show_folder = os.path.dirname(os.path.dirname(norm_path))
+    if _is_drive_degraded(show_folder):
+        return []
+    try:
+        with os.scandir(show_folder) as seasons:
+            season_dirs = sorted(e.path for e in seasons if e.is_dir())
+    except OSError as e:
+        log.warning("[LOUDNESS LEARN] could not list the show folder %s: %s", show_folder, e)
+        return []
+    members = []
+    for season_dir in season_dirs:
+        if _get_show_smoothing_key(os.path.join(season_dir, "_")) == show_key:
+            members.extend(_gain_bundle_members(os.path.join(season_dir, "_")))
+    return members
+
+
+def _apply_series_offset_to_scanned(norm_path, offset):
+    """Gives every scanned episode of the file's series its own scan plus the series' learned offset; the owner's own gains, joined multi-part titles, episodes not scanned under the current settings and episodes whose scan sits far from their season are left as they are. Returns how many files changed."""
+    hub = _get_gain_hub()
+    if hub is None:
+        return 0
+    changed = 0
+    for member in _series_members(norm_path):
+        raw_db = _gain_check_db(hub, member)
+        if raw_db is None:
+            continue
+        applied = 0 if _series_scan_is_outlier(member, raw_db) else int(offset)
+        if applied == _learned_offset_applied(member):
+            continue
+        if hub.note_learned_gain(member, 10 ** ((raw_db + applied) / 20.0), applied):
+            changed += 1
+        else:
+            log.warning("[LOUDNESS LEARN] %s: the library could not save the series' learned %+d dB", os.path.basename(member), applied)
+    return changed
+
+
 def _learn_from_owner_gain(norm_path, baseline_db, total_db):
-    """Records how far the owner moved this file from its own scan. When the owner's LOUDNESS_LEARN_MIN_FILES most recent changes in the series are the same whole dB, that dB becomes the series' offset; any other mix of changes clears it."""
+    """Records in the file's library row how far the owner moved this file from its own scan and works out the series' offset from the owner's counted changes (_series_offset_from_changes). A change to an episode whose own scan sits GAIN_CHECK_NEIGHBOR_DB or more from its season is kept for that episode only and not counted. When the offset changes, every scanned episode of the series is given it."""
     if baseline_db is None or db is None:
         return
     show_key = _get_show_smoothing_key(norm_path)
     if show_key is None:
         return
     delta = int(round(total_db - baseline_db))
+    middle = _season_others_middle_db(norm_path)
+    one_off = middle is not None and round(abs(baseline_db - middle), 2) >= media.GAIN_CHECK_NEIGHBOR_DB
+    old_offset = _series_offset_for_key(show_key)
     with _loudness_learning_lock:
-        data = _loudness_learning_data()
-        series = dict(data["series"].get(show_key) or {})
-        changes = dict(series.get("changes") or {})
-        if delta == 0:
-            changes.pop(norm_path, None)
-        else:
-            changes[norm_path] = {"delta_db": delta, "at": time.time()}
-        recent = sorted(changes.values(), key=lambda c: c.get("at", 0))[-LOUDNESS_LEARN_MIN_FILES:]
-        same = {c.get("delta_db") for c in recent}
-        new_offset = 0
-        if len(recent) == LOUDNESS_LEARN_MIN_FILES and len(same) == 1:
-            new_offset = max(-LOUDNESS_LEARN_MAX_OFFSET_DB, min(LOUDNESS_LEARN_MAX_OFFSET_DB, int(same.pop())))
-        old_offset = int(series.get("offset_db", 0) or 0)
-        series["changes"] = changes
-        series["offset_db"] = new_offset
-        data["series"] = {**data["series"], show_key: series}
-    _learning_set("baselines", norm_path, baseline_db)
-    _learning_set("applied", norm_path, None)
+        _learning_write(norm_path, learn_series_key=show_key,
+                        learn_change_db=None if one_off else float(delta),
+                        learn_change_at=None if one_off else time.time(),
+                        learn_baseline_db=float(baseline_db), learn_applied_db=None)
+    if one_off:
+        log.info("[LOUDNESS LEARN] %s scans %+.1f dB from the rest of its season, so the owner's %+d dB is kept for this episode only (it now sits %+.1f dB from the others)",
+                 os.path.basename(norm_path), baseline_db - middle, delta, total_db - middle)
+        return
+    new_offset = _series_offset_for_key(show_key)
     if new_offset != old_offset:
-        log.info("[LOUDNESS LEARN] series '%s': learned offset changed from %+d dB to %+d dB after the owner changed %s by %+d dB",
-                 show_key, old_offset, new_offset, os.path.basename(norm_path), delta)
-    try:
-        db.save_settings_async()
-    except Exception as _swallowed_error:
-        _log_swallowed("_learn_from_owner_gain: saving the learned loudness", _swallowed_error)
+        changed = _apply_series_offset_to_scanned(norm_path, new_offset)
+        log.info("[LOUDNESS LEARN] series '%s': learned offset changed from %+d dB to %+d dB after the owner changed %s by %+d dB; %d scanned episodes updated",
+                 show_key, old_offset, new_offset, os.path.basename(norm_path), delta, changed)
+
+
+def _queue_owner_gain_learning(norm_path, baseline_db, total_db):
+    """Hands the owner's gain change to the learning thread, which learns from it once the owner has stopped pressing for LOUDNESS_LEARN_SETTLE_SECONDS; the baseline from the first press is kept."""
+    with _loudness_learning_lock:
+        held = _owner_gain_learning_pending.get(norm_path)
+        _owner_gain_learning_pending[norm_path] = (held[0] if held else baseline_db, total_db, time.monotonic())
+        worker = _owner_gain_learning_worker["thread"]
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(target=_owner_gain_learning_loop, name="LoudnessLearn", daemon=True)
+            _owner_gain_learning_worker["thread"] = worker
+            worker.start()
+
+
+def _owner_gain_learning_loop():
+    """Learns from each owner gain change once it has settled; stops when nothing is waiting."""
+    while not _app_shutting_down.is_set():
+        due = None
+        with _loudness_learning_lock:
+            if not _owner_gain_learning_pending:
+                _owner_gain_learning_worker["thread"] = None
+                return
+            now = time.monotonic()
+            for path, (baseline_db, total_db, at) in _owner_gain_learning_pending.items():
+                if now - at >= LOUDNESS_LEARN_SETTLE_SECONDS:
+                    due = (path, baseline_db, total_db)
+                    break
+            if due is not None:
+                del _owner_gain_learning_pending[due[0]]
+        if due is None:
+            _app_shutting_down.wait(0.5)
+            continue
+        try:
+            _learn_from_owner_gain(*due)
+        except Exception as e:
+            log.warning("[LOUDNESS LEARN] learning from the owner's change to %s failed: %s", os.path.basename(due[0]), e)
+
+
+def _series_offset_from_slider(values):
+    """The series offset in whole dB from the volume the owner kept while watching, oldest first: the middle of the last LOUDNESS_LEARN_MIN_FILES watched episodes' wanted offsets, so one odd episode never moves it; 0 until that many are watched; held to LOUDNESS_LEARN_MAX_OFFSET_DB."""
+    recent = [float(value) for value, _at in values][-LOUDNESS_LEARN_MIN_FILES:]
+    if len(recent) < LOUDNESS_LEARN_MIN_FILES:
+        return 0
+    return int(max(-LOUDNESS_LEARN_MAX_OFFSET_DB, min(LOUDNESS_LEARN_MAX_OFFSET_DB, round(_middle_value(recent)))))
+
+
+def _slider_comfort_volume():
+    """The volume the owner listens at when a file is right: the middle volume he kept on the files he set by hand, once LOUDNESS_SLIDER_REFERENCE_MIN_FILES of them are watched; LOUDNESS_SLIDER_COMFORT_PCT until then."""
+    hub = _get_gain_hub()
+    volumes = hub.read_comfort_volumes(LOUDNESS_SLIDER_REFERENCE_FILES) if hub is not None else []
+    if len(volumes) >= LOUDNESS_SLIDER_REFERENCE_MIN_FILES:
+        return float(_middle_value(volumes))
+    return float(LOUDNESS_SLIDER_COMFORT_PCT)
+
+
+def _slider_volume_db(volume_pct):
+    """The level in dB the volume slider gives at a setting (0 dB at 100), on the same curve playback uses."""
+    level = _perceptual_volume_pct(volume_pct) / 100.0
+    return 20.0 * math.log10(level) if level > 0 else None
+
+
+def _settled_volume(seconds_at_volume):
+    """The volume the episode spent the middle of its watched time at: short moves for a loud room, talk or a phone call do not shift it."""
+    total = sum(seconds_at_volume.values())
+    passed = 0.0
+    for volume in sorted(seconds_at_volume):
+        passed += seconds_at_volume[volume]
+        if passed >= total / 2.0:
+            return volume
+    return None
+
+
+def _learn_from_slider_watch(norm_path, seconds_at_volume):
+    """Learns from the volume the owner kept through one watched episode of a series: when it sat more than LOUDNESS_SLIDER_TRIGGER_POINTS from his comfortable volume, the episode wanted that difference in dB on top of what it played with; otherwise it wanted what it played with. Files he set by hand only give the comfortable volume; an episode that scans far from its season is not counted. When the series' offset changes, every scanned episode of the series is given it; nothing changes on the episode that just played until it plays again."""
+    watched = sum(seconds_at_volume.values())
+    show_key = _get_show_smoothing_key(norm_path)
+    if db is None or watched < LOUDNESS_SLIDER_MIN_WATCH_SECONDS or show_key is None:
+        return
+    settled = _settled_volume(seconds_at_volume)
+    if settled is None or settled <= 0:
+        return
+    now = time.time()
+    if _owner_set_gain(norm_path):
+        _learning_write(norm_path, learn_watch_volume=float(settled), learn_watch_at=now)
+        log.info("[LOUDNESS LEARN] %s (gain set by the owner) watched %d min mostly at volume %d; kept as a comfortable volume",
+                 os.path.basename(norm_path), int(watched // 60), settled)
+        return
+    hub = _get_gain_hub()
+    raw_db = _gain_check_db(hub, norm_path) if hub is not None else None
+    comfort = _slider_comfort_volume()
+    applied = _learned_offset_applied(norm_path)
+    points = settled - comfort
+    wanted = float(applied)
+    if abs(points) > LOUDNESS_SLIDER_TRIGGER_POINTS:
+        settled_db, comfort_db = _slider_volume_db(settled), _slider_volume_db(comfort)
+        if settled_db is not None and comfort_db is not None:
+            wanted = applied + (settled_db - comfort_db)
+    one_off = raw_db is not None and _series_scan_is_outlier(norm_path, raw_db)
+    old_offset = _series_offset_for_key(show_key)
+    with _loudness_learning_lock:
+        _learning_write(norm_path, learn_series_key=show_key,
+                        learn_slider_db=None if one_off else wanted, learn_slider_at=None if one_off else now,
+                        learn_watch_volume=float(settled), learn_watch_at=now)
+    log.info("[LOUDNESS LEARN] %s watched %d min mostly at volume %d (comfortable %d): %s",
+             os.path.basename(norm_path), int(watched // 60), settled, int(round(comfort)),
+             "scans far from its season, not counted for the series" if one_off
+             else "wanted %+.1f dB (played with %+d dB learned)" % (wanted, applied))
+    if one_off:
+        return
+    new_offset = _series_offset_for_key(show_key)
+    if new_offset != old_offset:
+        changed = _apply_series_offset_to_scanned(norm_path, new_offset)
+        log.info("[LOUDNESS LEARN] series '%s': learned offset changed from %+d dB to %+d dB from the volume kept while watching; %d scanned episodes updated",
+                 show_key, old_offset, new_offset, changed)
+
+
+def _slider_watch_sample():
+    """(the TV player's file, the volume while it plays unmuted, else None), read once a second by the watch thread."""
+    engine = globals().get("vlc_engine")
+    if engine is None or db is None:
+        return None, None
+    path = getattr(engine, "current_filepath", "") or ""
+    if not path:
+        return None, None
+    playing = engine.player is not None and bool(engine.player.is_playing())
+    if not playing or db.config.get("is_muted", False):
+        return os.path.normpath(path), None
+    return os.path.normpath(path), int(db.config.get("global_volume", 70))
+
+
+def _slider_watch_loop():
+    """Adds up how long the playing TV episode spends at each volume; commercials, movies and other files outside a series neither add to it nor end it; when another episode of a series starts, or the app quits, the finished episode goes to the learning."""
+    held_path, seconds_at_volume = None, {}
+
+    def _finish():
+        if held_path is not None and seconds_at_volume:
+            try:
+                _learn_from_slider_watch(held_path, seconds_at_volume)
+            except Exception as e:
+                log.warning("[LOUDNESS LEARN] learning from the volume kept on %s failed: %s", os.path.basename(held_path), e)
+
+    while not _app_shutting_down.wait(LOUDNESS_SLIDER_SAMPLE_SECONDS):
+        try:
+            path, volume = _slider_watch_sample()
+        except Exception as _swallowed_error:
+            _log_swallowed("_slider_watch_loop: reading the playing episode and the volume", _swallowed_error)
+            continue
+        if path is None or _get_show_smoothing_key(path) is None:
+            continue
+        if path != held_path:
+            _finish()
+            held_path, seconds_at_volume = path, {}
+        if volume is not None:
+            seconds_at_volume[volume] = seconds_at_volume.get(volume, 0.0) + LOUDNESS_SLIDER_SAMPLE_SECONDS
+    _finish()
 
 
 def _probe_loudness_guarded(norm_p, out_shortfall=None, apply_learned_offset=True, **kwargs):
@@ -9469,8 +10059,8 @@ _gain_check_lock = threading.Lock()
 _gain_check_tried = set()
 _gain_check_folder_seen = {}
 
-# VALUES CHANGE HERE
-_GAIN_CHECK_FOLDER_REVISIT_S = 600
+# WARNING: the fallback numbers below must match GAIN_CHECK_FOLDER_REVISIT_S in performance_governor.py; they are used only when that module fails to import.
+_GAIN_CHECK_FOLDER_REVISIT_S = performance_governor.GAIN_CHECK_FOLDER_REVISIT_S if performance_governor is not None else 600
 
 
 def _set_gain_double_checked(norm_path, checked):
@@ -9545,7 +10135,7 @@ def _middle_value(values):
 def _gain_neighbor_check(norm_path, force=False):
     """After-the-fact gain check for the season folder of one file: once enough of the season is scanned, a file whose gain is GAIN_CHECK_NEIGHBOR_DB or more from the middle gain of the rest is scanned again once with more windows at new places, its gain is worked out from every window together, and the new gain replaces the old one. Returns how many files were scanned again."""
     hub = _get_gain_hub()
-    if hub is None or db is None or not db.config.get("loudness_scan_enabled", True):
+    if hub is None or db is None:
         return 0
     folder = os.path.dirname(norm_path)
     now = time.monotonic()
@@ -9613,7 +10203,8 @@ def _probe_music_loudness_guarded(norm_p, out_shortfall=None, **kwargs):
         _release_probe(norm_p, "gain")
 
 
-UNPLAYABLE_STRIKE_THRESHOLD = 3
+# WARNING: the fallback numbers below must match UNPLAYABLE_STRIKE_THRESHOLD in performance_governor.py; they are used only when that module fails to import.
+UNPLAYABLE_STRIKE_THRESHOLD = performance_governor.UNPLAYABLE_STRIKE_THRESHOLD if performance_governor is not None else 3
 
 
 # ============================================================================
@@ -9646,13 +10237,12 @@ def _mark_confirmed_no_audio(norm_path, reason):
 
 
 def _save_schedule_lengths_into_library():
-    """Copies the lengths and gains held only in channel schedule entries into the library, for any file it does not already have them for; returns how many lengths were saved."""
+    """Copies the lengths held only in channel schedule entries into the library, for any file it does not already have one for; returns how many lengths were saved."""
     if db is None:
         return 0
     channels = getattr(db, "channels_db", None)
     if not isinstance(channels, dict):
         return 0
-    gain_hub = _get_gain_hub()
     saved = 0
     for _ch_id, ch_info in list(channels.items()):
         if not isinstance(ch_info, dict):
@@ -9667,18 +10257,12 @@ def _save_schedule_lengths_into_library():
                 if not isinstance(entry, dict) or not entry.get("path"):
                     continue
                 dur = entry.get("duration")
-                gain = entry.get("gain")
-                has_real_dur = isinstance(dur, (int, float)) and not isinstance(dur, bool) and dur > 0
-                has_gain = isinstance(gain, (int, float)) and not isinstance(gain, bool) and gain > 0
-                if not (has_real_dur or has_gain):
+                if not (isinstance(dur, (int, float)) and not isinstance(dur, bool) and dur > 0):
                     continue
                 norm = os.path.normpath(str(entry["path"]))
-                if has_real_dur:
-                    _hub = media.get_duration_hub()
-                    if _hub is not None and _hub.read(norm)[1] != media.DURATION_MEASURED and _hub_note_measured_duration(norm, dur):
-                        saved += 1
-                if has_gain and gain_hub is not None and gain_hub.read(norm)["gain"] is None:
-                    gain_hub.note_gain(norm, gain)
+                _hub = media.get_duration_hub()
+                if _hub is not None and _hub.read(norm)[1] != media.DURATION_MEASURED and _hub_note_measured_duration(norm, dur):
+                    saved += 1
     return saved
 
 
@@ -9822,174 +10406,32 @@ def _resume_interrupted_probe_batches():
 # ============================================================================
 
 
-def _invalidate_gains_for_target_lufs_change():
+def _strip_local_entry_gains():
+    """Removes every gain an older version kept inside local channel schedule entries (gain, pair_ep1_gain, pair_ep2_gain); gains live only in the library. A channel streamed from a connected Server keeps the gains the Server sent. Returns how many were removed."""
     if db is None:
         return 0
-    _gain_cache_key = [float(TARGET_LUFS), float(LOUDNESS_CONVERGENCE_DB)]
-    _last_target = db.config.get("_gain_cache_target_lufs")
-    db.config["_gain_cache_target_lufs"] = _gain_cache_key
-    if _last_target is not None:
-        try:
-            _last_norm = [float(_v) for _v in _last_target]
-        except (TypeError, ValueError):
-            _last_norm = None
-        if (_last_norm is not None
-                and len(_last_norm) == len(_gain_cache_key)
-                and all(abs(_a - _b) < 1e-9 for _a, _b in zip(_last_norm, _gain_cache_key))):
-            return 0
-    _cleared = 0
-    for _ch_info in db.channels_db.values():
-        if not isinstance(_ch_info, dict):
-            continue
-        for _container_key in ("schedules", "holiday_schedules"):
-            _pools = _ch_info.get(_container_key, {})
-            if not isinstance(_pools, dict):
-                continue
-            for _pool in _pools.values():
-                if not isinstance(_pool, list):
-                    continue
-                for _asset in _pool:
-                    if not isinstance(_asset, dict):
-                        continue
-                    for _gkey in ("gain", "pair_ep1_gain", "pair_ep2_gain"):
-                        if _gkey in _asset:
-                            del _asset[_gkey]
-                            _cleared += 1
-    return _cleared
-
-
-def _invalidate_stale_fallback_gains():
-    if db is None:
-        return 0
-    _cleared = 0
-    for _ch_info in db.channels_db.values():
-        if not isinstance(_ch_info, dict):
-            continue
-        for _container_key in ("schedules", "holiday_schedules"):
-            _pools = _ch_info.get(_container_key, {})
-            if not isinstance(_pools, dict):
-                continue
-            for _pool in _pools.values():
-                if not isinstance(_pool, list):
-                    continue
-                for _asset in _pool:
-                    if not isinstance(_asset, dict):
-                        continue
-                    for _gkey in ("gain", "pair_ep1_gain", "pair_ep2_gain"):
-                        _g = _asset.get(_gkey)
-                        if isinstance(_g, (int, float)) and not isinstance(_g, bool) and _g == 1.0:
-                            del _asset[_gkey]
-                            _cleared += 1
-    return _cleared
-
-
-def _reconcile_mismatched_pair_gains():
-    if db is None:
-        return 0
-    channels = getattr(db, "channels_db", None)
-    if not isinstance(channels, dict):
-        return 0
-    reset = 0
-    for ch_info in channels.values():
-        if not isinstance(ch_info, dict):
+    removed = 0
+    for ch_key, ch_info in list(db.channels_db.items()):
+        if not isinstance(ch_info, dict) or _channel_is_server_streamed(ch_key):
             continue
         for container_key in ("schedules", "holiday_schedules"):
-            for pool in ch_info.get(container_key, {}).values():
+            pools = ch_info.get(container_key, {})
+            if not isinstance(pools, dict):
+                continue
+            for pool in pools.values():
                 if not isinstance(pool, list):
                     continue
-                for entry in pool:
-                    if not isinstance(entry, dict) or not entry.get("is_pair"):
+                for asset in pool:
+                    if not isinstance(asset, dict):
                         continue
-                    g1 = entry.get("pair_ep1_gain")
-                    g2 = entry.get("pair_ep2_gain")
-                    if g1 is None or g2 is None:
-                        continue
-                    if abs(float(g1) - float(g2)) < 1e-6:
-                        continue
-                    entry.pop("gain", None)
-                    entry.pop("pair_ep1_gain", None)
-                    entry.pop("pair_ep2_gain", None)
-                    reset += 1
-    return reset
+                    for gkey in ("gain", "pair_ep1_gain", "pair_ep2_gain"):
+                        if gkey in asset:
+                            del asset[gkey]
+                            removed += 1
+    return removed
 
 
-def _clear_all_cached_loudness_gains():
-    """Strips the per-episode gain fields in channel schedules; the library's own gains carry the settings they were scanned under and are not touched."""
-    if db is None:
-        return 0
-    cleared = 0
-    channels = getattr(db, "channels_db", None)
-    if isinstance(channels, dict):
-        for ch_info in channels.values():
-            if not isinstance(ch_info, dict):
-                continue
-            for container_key in ("schedules", "holiday_schedules"):
-                pools = ch_info.get(container_key, {})
-                if not isinstance(pools, dict):
-                    continue
-                for pool in pools.values():
-                    if not isinstance(pool, list):
-                        continue
-                    for asset in pool:
-                        if not isinstance(asset, dict):
-                            continue
-                        for gkey in ("gain", "pair_ep1_gain", "pair_ep2_gain"):
-                            if gkey in asset:
-                                del asset[gkey]
-                                cleared += 1
-    return cleared
-
-
-def _reset_all_loudness_gains_for_target_change():
-    if db is None:
-        return 0
-    if db.config.get("_lufs23_migration_done"):
-        return 0
-    cleared = _clear_all_cached_loudness_gains()
-    db.config["_lufs23_migration_done"] = True
-    return cleared
-
-
-_MUSIC_TARGET_MIGRATION_KEY = "_music_target_v2_migration_done"
 _MUSIC_FILE_EXTS = (".mp3", ".flac", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".opus")
-
-
-def _reset_music_gains_for_new_target():
-    """One-time: clears cached MUSIC gains so they re-probe under MUSIC_TARGET_LUFS / MUSIC_GAIN_FLOOR."""
-    if db is None or db.config.get(_MUSIC_TARGET_MIGRATION_KEY):
-        return 0
-
-    def _is_pinned_default(g):
-        try:
-            return (abs(float(g) - _CH03_DEFAULT_MUSIC_GAIN_PRECACHED) < 1e-9
-                    or abs(float(g) - _CH03_DEFAULT_MUSIC_GAIN_LEGACY) < 1e-9)
-        except (TypeError, ValueError):
-            return False
-
-    cleared = 0
-    channels = getattr(db, "channels_db", None)
-    if isinstance(channels, dict):
-        for ch_info in channels.values():
-            if not isinstance(ch_info, dict):
-                continue
-            for container_key in ("schedules", "holiday_schedules"):
-                pools = ch_info.get(container_key, {})
-                if not isinstance(pools, dict):
-                    continue
-                for pool in pools.values():
-                    if not isinstance(pool, list):
-                        continue
-                    for asset in pool:
-                        if not isinstance(asset, dict):
-                            continue
-                        _ap = str(asset.get("path", asset.get("file", "")))
-                        if (_ap.lower().endswith(_MUSIC_FILE_EXTS)
-                                and "gain" in asset
-                                and not _is_pinned_default(asset["gain"])):
-                            del asset["gain"]
-                            cleared += 1
-    db.config[_MUSIC_TARGET_MIGRATION_KEY] = True
-    return cleared
 
 
 def _is_commercial_file_for_channel(ch_key, path):
@@ -10019,8 +10461,8 @@ def _is_commercial_file_for_channel(ch_key, path):
 # SECTION: Channel schedule membership
 # ============================================================================
 
-# VALUES CHANGE HERE
-_SCHED_MEMBERSHIP_CACHE_SECONDS = 5.0
+# WARNING: the fallback numbers below must match SCHED_MEMBERSHIP_CACHE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SCHED_MEMBERSHIP_CACHE_SECONDS = performance_governor.SCHED_MEMBERSHIP_CACHE_SECONDS if performance_governor is not None else 5.0
 
 
 def _channel_schedule_path_set(ch_key):
@@ -10208,18 +10650,6 @@ def _fe_delete_selected_files():
     _fe_navigate(app_state.get("file_explorer_cwd"))
 
 
-def _is_usa_bios_filename(fname):
-    """Whether a BIOS dump's filename indicates a USA/NTSC-U region dump."""
-    lower = fname.lower()
-    if "usa" in lower or "ntsc-u" in lower or "(u)" in lower:
-        return True
-    base = re.sub(r"[^a-z0-9]", "", os.path.splitext(lower)[0])
-    if base == "scph7003":
-        return True
-    m = re.fullmatch(r"scph(\d{3,4})", base)
-    return bool(m and m.group(1).endswith("1"))
-
-
 _BIOS_KNOWN_PRIORITY = [
     "scph5501",
     "scph7001",
@@ -10273,12 +10703,14 @@ def _fe_resolve_active_core_name(console_key, emu_folder):
         cfg_path = resolve_emulator_config_path()
         with open(cfg_path, "r", encoding="utf-8") as fp:
             cfg = _json.load(fp)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_fe_resolve_active_core_name: cfg_path = resolve_emulator_config_path()", _swallowed_error)
         cfg = {}
     saved = cfg.get(console_key)
     try:
         dll_files = [f for f in os.listdir(emu_folder) if f.lower().endswith(".dll")]
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_fe_resolve_active_core_name: dll_files = [f for f in os.listdir(emu_folder) if f.lower().endswit...", _swallowed_error)
         dll_files = []
     if saved:
         for fname in dll_files:
@@ -10293,7 +10725,8 @@ def _fe_resolve_active_bios_name(console_key, bios_dir):
     saved = db.config.get("active_bios", {}).get(console_key, "") if db is not None else ""
     try:
         files = sorted(f for f in os.listdir(bios_dir) if os.path.isfile(os.path.join(bios_dir, f)))
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_fe_resolve_active_bios_name: files = sorted((f for f in os.listdir(bios_dir) if os.path.isfile(o...", _swallowed_error)
         files = []
     if saved:
         for fname in files:
@@ -10314,7 +10747,7 @@ def _drop_media_from_pool(ch_key, sub_key, norm_p, reason, container_key=None):
         if len(kept) == len(entries):
             continue
         db.channels_db[ch_key][_ck][sub_key] = kept
-        
+        log.warning("[SCHEDULE] ch%s %s %s: removed %s from the schedule: %s", ch_key, _ck, sub_key, os.path.basename(norm_p), reason)
         return True
     return False
 
@@ -10333,6 +10766,7 @@ def _drop_pair_from_pool(ch_key, sub_key, norm_p1, norm_p2, reason, container_ke
         if len(kept) == len(entries):
             continue
         db.channels_db[ch_key][_ck][sub_key] = kept
+        log.warning("[SCHEDULE] ch%s %s %s: removed the pair %s + %s from the schedule: %s", ch_key, _ck, sub_key, os.path.basename(norm_p1), os.path.basename(norm_p2), reason)
         return True
     return False
 
@@ -10369,7 +10803,8 @@ def _probe_and_patch_durations(ch_key, container_key, sub_key, items_pool, _resu
             if probed is None:
                 try:
                     probed = _probe_duration_guarded(norm_p)
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("_probe_and_patch_durations: probed = _probe_duration_guarded(norm_p)", _swallowed_error)
                     probed = None
             if probed_gain is None:
                 try:
@@ -10398,7 +10833,8 @@ def _probe_and_patch_durations(ch_key, container_key, sub_key, items_pool, _resu
                         _removed_unplayable += 1
                     _update_probe_batch_progress(batch_id, items_pool[i + 1:])
                     continue
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("_probe_and_patch_durations: if _is_drive_degraded(norm_p):", _swallowed_error)
                     probed_gain = None
             if _is_commercial_block and probed and probed > COMMERCIAL_MAX_SECONDS:
                 if _drop_media_from_pool(ch_key, sub_key, norm_p,
@@ -10669,7 +11105,8 @@ def _fe_close(commit):
                     try:
                         with open(cfg_path, "r", encoding="utf-8") as fp:
                             cfg = _json.load(fp)
-                    except Exception:
+                    except Exception as _swallowed_error:
+                        _log_swallowed("_fe_close: with open(cfg_path, 'r', encoding='utf-8') as fp:", _swallowed_error)
                         cfg = {}
                     cfg[ck] = os.path.basename(dest)
                     with open(cfg_path, "w", encoding="utf-8") as fp:
@@ -10703,7 +11140,8 @@ def _fe_close(commit):
                         db.config.setdefault("console_splash_path", {})[ck] = dest
                     db.save_settings_async()
                     print(f"[GAMES] {ck} splash screen set to: {os.path.basename(dest)}")
-                    if folder:
+                    # WARNING: <CONSOLE>SplashScreen.png is the splash used when nothing is picked, so replacing a pick never deletes it.
+                    if folder and os.path.basename(str(_old_splash)).lower() != (ck + "SplashScreen.png").lower():
                         _fe_delete_old_managed_asset(_old_splash, folder, dest)
                     if game_deck is not None:
                         game_deck.refresh_from_config(db.config)
@@ -11110,10 +11548,10 @@ def _fe_render(screen, active_theme, fe_rect):
     SEL_C    = (int(_r*255), int(_g*255), int(_b*255))
     _r,_g,_b = _fecs.hsv_to_rgb(bg_hue, 0.35, 0.14)
     ITEM_BG  = (int(_r*255), int(_g*255), int(_b*255))
-    WHITE    = (255, 255, 255)
-    GREY     = (150, 150, 150)
+    WHITE    = COLOR_TEXT_WHITE
+    GREY     = COLOR_FE_TEXT_GREY
     ADDED_C  = UI_C
-    LOCKED_C = (255, 170, 60)
+    LOCKED_C = COLOR_FE_LOCKED
 
     bg_alpha = min(255, int((db.config.get("menu_opacity", 50) / 100.0) * 255) + 90) if db else 235
 
@@ -11151,10 +11589,10 @@ def _fe_render(screen, active_theme, fe_rect):
     t_lbl   = f_title.render(title, True, WHITE)
     screen.blit(t_lbl, (fx + 12, fy + (_FE_TITLE_H - t_lbl.get_height()) // 2))
 
-    pygame.draw.rect(screen, (10, 10, 10), (fx, tb_y, fw, _FE_TOOLBAR_H))
+    pygame.draw.rect(screen, COLOR_FE_BAR_BG, (fx, tb_y, fw, _FE_TOOLBAR_H))
     up_rect = pygame.Rect(fx + 6, tb_y + (_FE_TOOLBAR_H - 30) // 2, 60, 30)
     is_up   = up_rect.collidepoint(mx, my)
-    pygame.draw.rect(screen, UI_C if is_up else (40, 40, 40), up_rect)
+    pygame.draw.rect(screen, UI_C if is_up else COLOR_FE_UP_BUTTON, up_rect)
     pygame.draw.rect(screen, UI_C, up_rect, 1)
     f_sm  = _cached_sys_font("Courier New", 16, bold=True)
     up_lbl = f_sm.render("UP ^", True, WHITE)
@@ -11163,8 +11601,8 @@ def _fe_render(screen, active_theme, fe_rect):
     pb_x    = up_rect.right + 6
     pb_h    = 30
     pb_rect = pygame.Rect(pb_x, tb_y + (_FE_TOOLBAR_H - pb_h) // 2, fw - (pb_x - fx) - 6, pb_h)
-    pygame.draw.rect(screen, (18, 18, 18), pb_rect)
-    pygame.draw.rect(screen, (60, 60, 60), pb_rect, 1)
+    pygame.draw.rect(screen, COLOR_FE_PATH_BG, pb_rect)
+    pygame.draw.rect(screen, COLOR_FE_PATH_EDGE, pb_rect, 1)
     path_tx = cwd if cwd else "Computer"
     f_path  = _cached_sys_font("Courier New", 16, bold=True)
     p_lbl   = f_path.render(path_tx, True, UI_C)
@@ -11176,15 +11614,15 @@ def _fe_render(screen, active_theme, fe_rect):
     lp = pygame.Surface((_FE_LEFT_W, content_h), pygame.SRCALPHA)
     lp.fill(PANEL_C + (bg_alpha,))
     screen.blit(lp, (fx, content_y))
-    pygame.draw.line(screen, (50, 50, 50), (fx + _FE_LEFT_W, content_y), (fx + _FE_LEFT_W, content_y + content_h), 1)
+    pygame.draw.line(screen, COLOR_FE_DIVIDER, (fx + _FE_LEFT_W, content_y), (fx + _FE_LEFT_W, content_y + content_h), 1)
 
     f_lhdr = _cached_sys_font("Courier New", 14, bold=True)
     f_litem = _cached_sys_font("Courier New", 18, bold=True)
     f_btn_sym = _cached_sys_font("Courier New", 19, bold=True)
 
     def _fe_draw_left_section(hdr_label, hdr_y, items_y, items_h, items_list, scroll_key):
-        pygame.draw.rect(screen, (8, 8, 8), (fx, hdr_y, _FE_LEFT_W, _FE_LEFT_ROW_H))
-        hlbl = f_lhdr.render("  " + hdr_label.upper(), True, (100, 100, 100))
+        pygame.draw.rect(screen, COLOR_FE_SECTION_HEADER_BG, (fx, hdr_y, _FE_LEFT_W, _FE_LEFT_ROW_H))
+        hlbl = f_lhdr.render("  " + hdr_label.upper(), True, COLOR_FE_SECTION_HEADER_TEXT)
         screen.blit(hlbl, (fx + 2, hdr_y + (_FE_LEFT_ROW_H - hlbl.get_height()) // 2))
 
         rows   = items_h // _FE_LEFT_ROW_H
@@ -11208,7 +11646,7 @@ def _fe_render(screen, active_theme, fe_rect):
                 hs = pygame.Surface((row_w, _FE_LEFT_ROW_H), pygame.SRCALPHA)
                 hs.fill(UI_C + (45,))
                 screen.blit(hs, (fx, ly))
-            tc_l   = WHITE if (is_lactive or is_lhov) else (200, 200, 200)
+            tc_l   = WHITE if (is_lactive or is_lhov) else COLOR_FE_ITEM_TEXT
             lbl    = _fe_cached_label(f_litem, "  " + "  " * li["indent"] + li["label"], tc_l)
             _lp_old_clip = screen.get_clip()
             screen.set_clip(pygame.Rect(fx, ly, row_w, _FE_LEFT_ROW_H))
@@ -11217,7 +11655,7 @@ def _fe_render(screen, active_theme, fe_rect):
 
         if items_h > 0:
             lsb_x = fx + _FE_LEFT_W - 10
-            pygame.draw.rect(screen, (28, 28, 28), (lsb_x, items_y, 8, items_h))
+            pygame.draw.rect(screen, COLOR_FE_SCROLL_TRACK, (lsb_x, items_y, 8, items_h))
             if n > rows and rows > 0:
                 lth = max(20, items_h * rows // max(1, n))
                 lty = items_y + (items_h - lth) * scroll // max(1, n - rows)
@@ -11241,8 +11679,8 @@ def _fe_render(screen, active_theme, fe_rect):
     _fe_draw_left_section("Quick Access", sec2_hdr_y, sec2_items_y, sec2_items_h,
                            qa_items, "file_explorer_left_scroll_qa")
 
-    pygame.draw.rect(screen, (15, 15, 15), (right_x, content_y, right_w, _FE_COL_H))
-    pygame.draw.line(screen, (45, 45, 45), (right_x, content_y + _FE_COL_H - 1),
+    pygame.draw.rect(screen, COLOR_FE_COLUMN_HEADER_BG, (right_x, content_y, right_w, _FE_COL_H))
+    pygame.draw.line(screen, COLOR_FE_LINE, (right_x, content_y + _FE_COL_H - 1),
                      (right_x + right_w, content_y + _FE_COL_H - 1), 1)
     f_col = _cached_sys_font("Courier New", 16, bold=True)
     screen.blit(f_col.render("Name", True, GREY), (right_x + 8, content_y + (_FE_COL_H - f_col.size("Name")[1]) // 2))
@@ -11250,11 +11688,11 @@ def _fe_render(screen, active_theme, fe_rect):
     alp = pygame.Surface((rp_w, content_h), pygame.SRCALPHA)
     alp.fill(PANEL_C + (bg_alpha,))
     screen.blit(alp, (rp_x, content_y))
-    pygame.draw.line(screen, (45, 45, 45), (rp_x, content_y), (rp_x, content_y + content_h), 1)
+    pygame.draw.line(screen, COLOR_FE_LINE, (rp_x, content_y), (rp_x, content_y + content_h), 1)
 
-    pygame.draw.rect(screen, (8, 8, 8), (rp_x, content_y, rp_w, _FE_ADDLOC_HDR_H))
+    pygame.draw.rect(screen, COLOR_FE_SECTION_HEADER_BG, (rp_x, content_y, rp_w, _FE_ADDLOC_HDR_H))
     f_rphdr = _cached_sys_font("Courier New", 14, bold=True)
-    rphdr_lbl = f_rphdr.render("SAVED LOCATIONS", True, (100, 100, 100))
+    rphdr_lbl = f_rphdr.render("SAVED LOCATIONS", True, COLOR_FE_SECTION_HEADER_TEXT)
     screen.blit(rphdr_lbl, (rp_x + (rp_w - rphdr_lbl.get_width()) // 2,
                              content_y + (_FE_ADDLOC_HDR_H - rphdr_lbl.get_height()) // 2))
 
@@ -11272,7 +11710,7 @@ def _fe_render(screen, active_theme, fe_rect):
             hs.fill(UI_C + (45,))
             screen.blit(hs, (rp_x, ly))
         label = os.path.basename(p.rstrip("\\/")) or p
-        lbl = _fe_cached_label(f_litem, "  " + label, (200, 200, 200) if not is_rhov else WHITE)
+        lbl = _fe_cached_label(f_litem, "  " + label, COLOR_FE_ITEM_TEXT if not is_rhov else WHITE)
         _rp_old_clip = screen.get_clip()
         screen.set_clip(pygame.Rect(rp_x, ly, row_w, _FE_LEFT_ROW_H))
         screen.blit(lbl, (rp_x + 2, ly + (_FE_LEFT_ROW_H - lbl.get_height()) // 2))
@@ -11283,16 +11721,16 @@ def _fe_render(screen, active_theme, fe_rect):
         is_rmhov = rm_rect.collidepoint(mx, my)
         if is_rmhov:
             hs = pygame.Surface((_FE_LEFT_REMOVE_W, _FE_LEFT_ROW_H), pygame.SRCALPHA)
-            hs.fill((180, 40, 40, 90))
+            hs.fill(COLOR_FE_REMOVE_LOCATION_HOVER_TINT)
             screen.blit(hs, (rm_x, ly))
-        minus_clr = (255, 120, 120) if is_rmhov else (130, 70, 70)
+        minus_clr = COLOR_FE_REMOVE_LOCATION_HOVER if is_rmhov else COLOR_FE_REMOVE_LOCATION
         mlbl = _fe_cached_label(f_btn_sym, "-", minus_clr)
         screen.blit(mlbl, (rm_x + (_FE_LEFT_REMOVE_W - mlbl.get_width()) // 2,
                            ly + (_FE_LEFT_ROW_H - mlbl.get_height()) // 2))
 
     addloc_rect = _fe_get_addloc_rect(rp_x, rp_w, content_y, content_h)
     is_addloc_hov = addloc_rect.collidepoint(mx, my)
-    addloc_bc = (40, 80, 150) if is_addloc_hov else (25, 50, 95)
+    addloc_bc = COLOR_FE_ADD_BUTTON_HOVER if is_addloc_hov else COLOR_FE_ADD_BUTTON
     pygame.draw.rect(screen, addloc_bc, addloc_rect)
     pygame.draw.rect(screen, UI_C, addloc_rect, 1)
     f_addloc = _cached_sys_font("Courier New", 15, bold=True)
@@ -11312,7 +11750,7 @@ def _fe_render(screen, active_theme, fe_rect):
     if app_state.get("_fe_surf_cache_key") != _sc_key:
         app_state["_fe_surf_cache_key"] = _sc_key
         _a = pygame.Surface((_rsw, _FE_ROW_H), pygame.SRCALPHA)
-        _a.fill((255, 255, 255, 8))
+        _a.fill(COLOR_FE_ALT_ROW_TINT)
         app_state["_fe_surf_alt"] = _a
         _s = pygame.Surface((_rsw, _FE_ROW_H), pygame.SRCALPHA)
         _s.fill(SEL_C + (185,))
@@ -11380,7 +11818,7 @@ def _fe_render(screen, active_theme, fe_rect):
         prefix = "[+] " if is_chk else ("[A] " if is_active_item else "")
         f_use  = f_dir if is_dir else f_file
         if is_sel:
-            tc_row = (200, 225, 255)
+            tc_row = COLOR_FE_SELECTED_TEXT
         elif is_locked:
             tc_row = LOCKED_C
         elif is_chk or is_active_item:
@@ -11401,7 +11839,7 @@ def _fe_render(screen, active_theme, fe_rect):
         screen.set_clip(_old_clip)
 
     sb_x = right_x + right_w - 10
-    pygame.draw.rect(screen, (28, 28, 28), (sb_x, items_y, 8, items_h))
+    pygame.draw.rect(screen, COLOR_FE_SCROLL_TRACK, (sb_x, items_y, 8, items_h))
     _sb_thumb = _fe_scrollbar_thumb_rect(sb_x, items_y, items_h, len(items), visible, scroll)
     th, ty = _sb_thumb.h, _sb_thumb.y
     pygame.draw.rect(screen, UI_C, (sb_x, ty, 8, th))
@@ -11418,7 +11856,7 @@ def _fe_render(screen, active_theme, fe_rect):
             pygame.draw.rect(screen, UI_C, (rx, ry, rw, rh), 1)
 
     pygame.draw.line(screen, UI_C, (fx, footer_y), (fx + fw, footer_y), 1)
-    pygame.draw.rect(screen, (10, 10, 10), (fx, footer_y, fw, _FE_FOOTER_H))
+    pygame.draw.rect(screen, COLOR_FE_BAR_BG, (fx, footer_y, fw, _FE_FOOTER_H))
     n_chk = len(checked)
     f_cnt = _cached_sys_font("Courier New", 17, bold=True)
     c_clr = ADDED_C if n_chk > 0 else GREY
@@ -11470,13 +11908,13 @@ def _fe_render(screen, active_theme, fe_rect):
     for rect, key in _fe_get_btn_rects(fx, fy, fw, fh):
         is_hov = rect.collidepoint(mx, my)
         if key == "cancel":
-            bc = (210, 50, 50) if is_hov else (80, 20, 20)
+            bc = COLOR_FE_CANCEL_HOVER if is_hov else COLOR_FE_CANCEL
         elif key == "remove_sel":
-            bc = (200, 100, 30) if is_hov else (100, 50, 10)
+            bc = COLOR_FE_REMOVE_BUTTON_HOVER if is_hov else COLOR_FE_REMOVE_BUTTON
         elif key == "done":
-            bc = UI_C if is_hov else (20, 70, 20)
+            bc = UI_C if is_hov else COLOR_FE_DONE
         else:
-            bc = (40, 80, 150) if is_hov else (25, 50, 95)
+            bc = COLOR_FE_ADD_BUTTON_HOVER if is_hov else COLOR_FE_ADD_BUTTON
         pygame.draw.rect(screen, bc, rect)
         pygame.draw.rect(screen, UI_C, rect, 1)
         lum = bc[0]*299 + bc[1]*587 + bc[2]*114
@@ -11511,10 +11949,10 @@ def _fe_render(screen, active_theme, fe_rect):
     _banner_text = _fe_banner_text()
     if _banner_text:
         _f_banner = _cached_sys_font("Courier New", 16, bold=True)
-        _banner_lbl = _f_banner.render(_banner_text, True, (255, 255, 255))
+        _banner_lbl = _f_banner.render(_banner_text, True, COLOR_TEXT_WHITE)
         _bn_w, _bn_h = _banner_lbl.get_width() + 30, _banner_lbl.get_height() + 14
         _bn_x, _bn_y = fx + (fw - _bn_w) // 2, fy + 10
-        pygame.draw.rect(screen, (150, 30, 30), (_bn_x, _bn_y, _bn_w, _bn_h))
+        pygame.draw.rect(screen, COLOR_FE_BANNER_BG, (_bn_x, _bn_y, _bn_w, _bn_h))
         pygame.draw.rect(screen, UI_C, (_bn_x, _bn_y, _bn_w, _bn_h), 2)
         screen.blit(_banner_lbl, (_bn_x + 15, _bn_y + 7))
 
@@ -11529,7 +11967,7 @@ def _fe_draw_busy_overlay(screen, fx, fy, fw, fh, ui_c, panel_c, bg_c, label="PR
     by = fy + (fh - box_h) // 2
 
     dim = pygame.Surface((fw, fh), pygame.SRCALPHA)
-    dim.fill((0, 0, 0, 90))
+    dim.fill(COLOR_FE_BUSY_DIM)
     screen.blit(dim, (fx, fy))
 
     pygame.draw.rect(screen, panel_c, (bx, by, box_w, box_h))
@@ -11589,29 +12027,158 @@ _vlc_base_args_dvd = None
 # ============================================================================
 
 
-def _audio_track_pref_key(filepath):
-    try:
-        return os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
-    except Exception:
-        return filepath
+_TRACK_FIELDS = ("audio_track_id", "audio_track_name", "audio_track_index")
 
 
 def _get_saved_audio_track(filepath):
-    if db is None:
+    """(VLC track id, VLC label) of the owner's chosen audio track for a file from its library row, or None when none is saved."""
+    hub = _get_gain_hub()
+    if hub is None or not filepath:
         return None
-    prefs = db.config.get("audio_track_prefs", {})
-    entry = prefs.get(_audio_track_pref_key(filepath))
-    if not entry:
+    fields = hub.read_file_fields(os.path.normpath(filepath), _TRACK_FIELDS) or {}
+    if fields.get("audio_track_id") is None and not fields.get("audio_track_name"):
         return None
-    return entry.get("track_id"), entry.get("track_name", "")
+    return fields.get("audio_track_id"), fields.get("audio_track_name") or ""
 
 
-def _save_audio_track_pref(filepath, track_id, track_name):
+def _save_audio_track_pref(filepath, track_id, track_name, track_index=None):
+    """Remembers the owner's audio track for a file in its library row: VLC's track id and label, and its place among the file's audio tracks (0 = first) so the loudness scan measures the same track."""
+    hub = _get_gain_hub()
+    if hub is None or not filepath or not hub.note_file_fields(
+            os.path.normpath(filepath), audio_track_id=track_id, audio_track_name=track_name,
+            audio_track_index=None if track_index is None else int(track_index)):
+        log.warning("[AUDIO TRACK] the library could not save the chosen track for %s, it is not remembered",
+                    os.path.basename(str(filepath)))
+
+
+_TRACK_NUMBER_RE = re.compile(r"^\s*Track\s+(\d+)\b", re.I)
+
+
+def _scan_audio_track_for_file(filepath, streams):
+    """Which audio stream (0 = first) the loudness scan should measure for a file: the owner's saved track, by its saved place or by the number in VLC's 'Track N' label; None when nothing is saved, so the scan uses the same English-first rule as playback."""
+    hub = _get_gain_hub()
+    if hub is None or not filepath:
+        return None
+    fields = hub.read_file_fields(os.path.normpath(filepath), _TRACK_FIELDS) or {}
+    if fields.get("audio_track_index") is not None:
+        return int(fields["audio_track_index"])
+    match = _TRACK_NUMBER_RE.match(str(fields.get("audio_track_name") or ""))
+    if match and streams and 1 <= int(match.group(1)) <= len(streams):
+        return int(match.group(1)) - 1
+    return None
+
+
+media.set_audio_track_resolver(_scan_audio_track_for_file)
+
+
+def _carry_config_file_data_into_hub():
+    """Background, once per boot: moves per-file data an older version kept in the settings file (chosen audio tracks, loudness learning) into each file's library row and removes each entry from the settings file once its row holds it; an entry whose file the library cannot key yet (drive asleep, file gone) stays for the next boot."""
     if db is None:
         return
-    prefs = db.config.setdefault("audio_track_prefs", {})
-    prefs[_audio_track_pref_key(filepath)] = {"track_id": track_id, "track_name": track_name}
-    db.save_settings()
+    hub = _get_gain_hub()
+    if hub is None:
+        return
+    moved = kept = 0
+    prefs = db.config.get("audio_track_prefs")
+    if isinstance(prefs, dict) and prefs:
+        left = {}
+        for path, entry in list(prefs.items()):
+            if isinstance(entry, dict) and hub.note_file_fields(
+                    os.path.normpath(path), audio_track_id=entry.get("track_id"), audio_track_name=entry.get("track_name"),
+                    audio_track_index=entry.get("audio_index")):
+                moved += 1
+            else:
+                left[path] = entry
+        kept += len(left)
+        if left:
+            db.config["audio_track_prefs"] = left
+        else:
+            db.config.pop("audio_track_prefs", None)
+    learning = db.config.get("loudness_learning")
+    if isinstance(learning, dict):
+        per_file = {}
+        for path, value in (learning.get("baselines") or {}).items():
+            per_file.setdefault(path, {})["learn_baseline_db"] = float(value)
+        for path, value in (learning.get("applied") or {}).items():
+            per_file.setdefault(path, {})["learn_applied_db"] = float(value) if value else None
+        for show_key, record in (learning.get("series") or {}).items():
+            for path, change in ((record or {}).get("changes") or {}).items():
+                if isinstance(change, dict) and change.get("delta_db"):
+                    per_file.setdefault(path, {}).update(learn_series_key=show_key, learn_change_db=float(change["delta_db"]),
+                                                         learn_change_at=float(change.get("at") or 0.0))
+        left_paths = set()
+        for path, fields in per_file.items():
+            if hub.note_file_fields(os.path.normpath(path), **fields):
+                moved += 1
+            else:
+                left_paths.add(path)
+        kept += len(left_paths)
+        if left_paths:
+            db.config["loudness_learning"] = {
+                "baselines": {p: v for p, v in (learning.get("baselines") or {}).items() if p in left_paths},
+                "applied": {p: v for p, v in (learning.get("applied") or {}).items() if p in left_paths},
+                "series": {k: {"changes": {p: c for p, c in ((r or {}).get("changes") or {}).items() if p in left_paths}}
+                           for k, r in (learning.get("series") or {}).items()},
+            }
+        else:
+            db.config.pop("loudness_learning", None)
+    if moved or kept:
+        log.info("[GAIN HUB] moved %d file record(s) of chosen tracks and loudness learning from the settings file into the library; %d wait for their files to be readable",
+                 moved, kept)
+        try:
+            db.save_settings_async()
+        except Exception as e:
+            log.warning("[GAIN HUB] saving the settings file after the move into the library failed: %s", e)
+
+_track_gain_memo = {}
+_track_gain_memo_lock = threading.Lock()
+
+
+def _store_track_gains(norm_path, primary, gains):
+    """Keeps the scanned gain of every audio track of a file in the library and in memory, so switching tracks plays the new track at its own level."""
+    record = {"primary": int(primary), "version": media.LOUDNESS_GAIN_SCAN_VERSION, "gains": {int(k): float(v) for k, v in gains.items()}}
+    with _track_gain_memo_lock:
+        _track_gain_memo[os.path.normpath(norm_path)] = record
+    hub = _get_gain_hub()
+    if hub is None or not hub.note_track_gains(norm_path, primary, gains, media.LOUDNESS_GAIN_SCAN_VERSION):
+        log.warning("[GAIN HUB] the per-track gains of '%s' were not saved because the library could not hold them", os.path.basename(str(norm_path)))
+        return
+    log.info("[GAIN HUB] %s: gains for %d audio tracks saved (%s)", os.path.basename(str(norm_path)), len(record["gains"]),
+             ", ".join("track %d %+.1f dB" % (k + 1, 20 * math.log10(v)) for k, v in sorted(record["gains"].items())))
+
+
+media.set_track_gains_sink(_store_track_gains)
+
+
+def _load_track_gains(norm_path):
+    """Background: reads a file's per-track gains from the library into memory. Never call on the UI thread."""
+    hub = _get_gain_hub()
+    record = hub.read_track_gains(norm_path) if hub is not None else None
+    with _track_gain_memo_lock:
+        _track_gain_memo[os.path.normpath(norm_path)] = record
+    return record
+
+
+def _playing_track_gain(norm_path):
+    """The scanned gain of the audio track playing now for the file on the main player, when that track is not the one the file's saved gain was measured on; None otherwise. Reads memory only."""
+    engine = vlc_engine
+    if engine is None or not norm_path:
+        return None
+    try:
+        if os.path.normpath(getattr(engine, "current_filepath", "") or "") != norm_path:
+            return None
+    except Exception as e:
+        _log_warn_throttled("playing_track_gain", "[AUDIO TRACK] reading the playing file to pick its track gain failed: %s" % e)
+        return None
+    index = getattr(engine, "_audio_index", None)
+    if index is None:
+        return None
+    with _track_gain_memo_lock:
+        record = _track_gain_memo.get(norm_path)
+    if not record or record.get("version") != media.LOUDNESS_GAIN_SCAN_VERSION or index == record.get("primary"):
+        return None
+    gain = record.get("gains", {}).get(int(index))
+    return float(gain) if gain and gain > 0 else None
 
 
 def _get_manual_audio_gain_db(filepath):
@@ -11628,7 +12195,8 @@ def _get_manual_audio_gain_db(filepath):
         value = 0
     try:
         return max(-12, min(12, int(round(float(value)))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("_get_manual_audio_gain_db: return max(-12, min(12, int(round(float(value)))))", _swallowed_error)
         return 0
 
 
@@ -11653,9 +12221,128 @@ def _save_audio_gain_db(filepath, total_db):
     norm_path = os.path.normpath(filepath)
     baseline_db = _owner_gain_baseline_db(norm_path, hub) if hub is not None else None
     if hub is not None and hub.note_owner_gain(filepath, value):
-        _learn_from_owner_gain(norm_path, baseline_db, value)
+        _queue_owner_gain_learning(norm_path, baseline_db, value)
         return
     log.warning("[LIBRARY] the library could not save the owner's gain for %s, so the change was not kept", os.path.basename(str(filepath)))
+
+
+_AUDIO_HEADER_STREAM_RE = re.compile(r"Stream #\d+:(\d+)(?:\[[^\]]*\])?(?:\(([^)]*)\))?[^\n]*?: Audio: ([^\n]*)")
+_AUDIO_LABEL_LANGUAGE_RE = re.compile(r"\[([^\]]+)\]")
+_audio_header_stream_cache = {}
+_audio_header_stream_cache_lock = threading.Lock()
+
+
+def _gov_audio_track_value(name, fallback):
+    """One audio-track number or list from the governor table, or the fallback when the governor is missing."""
+    if performance_governor is None:
+        return fallback
+    return getattr(performance_governor, name, fallback)
+
+
+def _audio_header_streams(filepath):
+    """The file's audio streams in order as dicts (language code, description) read from ffmpeg's stream listing, cached per file; [] when it cannot be read. Never call on the UI thread."""
+    if not filepath:
+        return []
+    try:
+        _st = os.stat(filepath)
+        key = (os.path.normpath(filepath), _st.st_size, _st.st_mtime_ns)
+    except OSError as e:
+        _log_warn_throttled("audio_header_stat", "[AUDIO TRACK] could not read %s to list its audio tracks: %s" % (os.path.basename(str(filepath)), e))
+        return []
+    with _audio_header_stream_cache_lock:
+        hit = _audio_header_stream_cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        text, timed_out = media._dialogue_header_text(filepath)
+    except Exception as e:
+        log.warning("[AUDIO TRACK] reading the stream list of %s failed: %s", os.path.basename(filepath), e)
+        return []
+    if timed_out:
+        log.warning("[AUDIO TRACK] reading the stream list of %s timed out", os.path.basename(filepath))
+        return []
+    streams = [{"lang": (m.group(2) or "").strip().lower(), "desc": m.group(3).strip()}
+               for m in _AUDIO_HEADER_STREAM_RE.finditer(text or "")]
+    with _audio_header_stream_cache_lock:
+        if len(_audio_header_stream_cache) > 256:
+            _audio_header_stream_cache.clear()
+        _audio_header_stream_cache[key] = streams
+    return streams
+
+
+def _audio_language_is_preferred(text):
+    """True when a track label or language code names one of the preferred languages (English first by default)."""
+    if not text:
+        return False
+    preferred = [str(p).lower() for p in _gov_audio_track_value("AUDIO_TRACK_PREFERRED_LANGUAGES", ("english", "eng", "en"))]
+    words = re.findall(r"[a-z]+", str(text).lower())
+    return any(p in words for p in preferred)
+
+
+def _vlc_track_language(label):
+    """The language VLC names in a track label such as 'Track 2 - [English]', or ''."""
+    match = _AUDIO_LABEL_LANGUAGE_RE.search(label or "")
+    return match.group(1).strip() if match else ""
+
+
+def _audio_track_rows(tracks, header_streams):
+    """The picker rows as (track id, label): VLC's label, with the file's own language and format added when VLC's label names no language and VLC and the file list the same number of tracks."""
+    rows = []
+    same_count = len(header_streams) == len(tracks)
+    for index, (tid, label) in enumerate(tracks):
+        shown = label or "Track %s" % tid
+        if same_count and not _vlc_track_language(shown):
+            info = header_streams[index]
+            extra = ", ".join(part for part in (info.get("lang", "").upper(), info.get("desc", "")[:40]) if part)
+            if extra:
+                shown = "%s (%s)" % (shown, extra)
+        rows.append((tid, shown))
+    return rows
+
+
+def _pick_preferred_audio_track(tracks, header_streams, current_id):
+    """(track id, why) of the track a file with no saved choice should play: the first track in the preferred language, judged by VLC's label or, when VLC names no language, by the file's own stream list in the same order; (None, why) when the playing track is already right or no track is in the preferred language."""
+    if not tracks:
+        return None, "no tracks listed"
+    same_count = len(header_streams) == len(tracks)
+    for index, (tid, label) in enumerate(tracks):
+        lang = _vlc_track_language(label)
+        if not lang and same_count:
+            lang = header_streams[index].get("lang", "")
+        if _audio_language_is_preferred(lang) or (not lang and _audio_language_is_preferred(label)):
+            if tid == current_id:
+                return None, "the playing track %s is already %s" % (tid, lang or label)
+            return tid, "track %s is %s" % (tid, lang or label)
+    return None, "no track in a preferred language"
+
+
+def _refresh_audio_track_picker(filepath, started_at):
+    """Background: re-reads the track list while the Audio Track menu is open for this file, so a track VLC lists late still appears; keeps the highlighted row on the same item and logs when the list changes."""
+    refresh_s = float(_gov_audio_track_value("AUDIO_TRACK_PICKER_REFRESH_SECONDS", 15.0))
+    interval_s = float(_gov_audio_track_value("AUDIO_TRACK_PICKER_REFRESH_INTERVAL_SECONDS", 0.5))
+    try:
+        header = _audio_header_streams(filepath)
+        while time.monotonic() - started_at < refresh_s:
+            if (app_state.get("menu_layer") != "AUDIO_TRACK_PICKER" or app_state.get("audio_track_context") != "channel"
+                    or vlc_engine is None or getattr(vlc_engine, "current_filepath", None) != filepath):
+                return
+            rows = _audio_track_rows(vlc_engine.get_audio_tracks(), header)
+            old = app_state.get("audio_track_list", [])
+            if rows and rows != old:
+                _row = app_state.get("sub_menu_row_index", 0)
+                if _row >= len(old):
+                    app_state["sub_menu_row_index"] = _row + (len(rows) - len(old))
+                app_state["audio_track_list"] = rows
+                log.info("[AUDIO TRACK] menu list for %s now %d track(s): %s",
+                         os.path.basename(filepath), len(rows), "; ".join(label for _t, label in rows))
+            if header and len(header) > len(rows):
+                _log_warn_throttled("audio_track_missing_" + os.path.basename(filepath),
+                                    "[AUDIO TRACK] %s has %d audio streams but VLC lists %d: %s" % (
+                                        os.path.basename(filepath), len(header), len(rows),
+                                        "; ".join("%s %s" % (h.get("lang") or "?", h.get("desc", "")[:30]) for h in header)))
+            time.sleep(interval_s)
+    except Exception as e:
+        log.warning("[AUDIO TRACK] refreshing the menu's track list for %s failed: %s", os.path.basename(str(filepath)), e)
 
 
 def _open_audio_track_picker(target_ch_str):
@@ -11677,15 +12364,21 @@ def _open_audio_track_picker(target_ch_str):
     except StopIteration:
         highlight = 0
 
+    _picker_file = getattr(vlc_engine, "current_filepath", None)
     app_state["audio_track_list"] = tracks
     app_state["audio_track_source_channel"] = target_ch_str
     app_state["audio_track_active_id"] = current_id
-    app_state["audio_track_gain_db"] = _get_audio_gain_db(getattr(vlc_engine, "current_filepath", None), target_ch_str)
+    app_state["audio_track_gain_db"] = _get_audio_gain_db(_picker_file, target_ch_str)
     app_state["visualizer_gain_db"] = _get_audio_gain_db(app_state.get("_vis_target_filepath", ""), target_ch_str)
     app_state["audio_track_context"] = "channel"
     app_state["menu_layer"] = "AUDIO_TRACK_PICKER"
     app_state["sub_menu_row_index"] = highlight
     app_state["sub_menu_col_index"] = 0
+    log.info("[AUDIO TRACK] menu opened for %s: VLC lists %d track(s): %s (playing %s)",
+             os.path.basename(str(_picker_file)), len(tracks), "; ".join(label for _t, label in tracks), current_id)
+    if _picker_file:
+        threading.Thread(target=_refresh_audio_track_picker, args=(_picker_file, time.monotonic()),
+                         daemon=True, name="AudioTrackMenuRefresh").start()
 
 
 def _open_dvd_audio_track_picker():
@@ -11858,7 +12551,8 @@ def _stereo_mode_args():
 _VLC_CHANNEL_STEREO = 1
 _VLC_CHANNEL_MONO = 7
 _last_stereo_reassert_mono = 0.0
-_STEREO_TOGGLE_MUTE_SEC = 0.2
+# WARNING: the fallback numbers below must match STEREO_TOGGLE_MUTE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_STEREO_TOGGLE_MUTE_SEC = performance_governor.STEREO_TOGGLE_MUTE_SECONDS if performance_governor is not None else 0.2
 
 
 def _desired_vlc_channel():
@@ -11895,9 +12589,13 @@ def _apply_live_stereo_mode(reason="toggle"):
             continue
         try:
             cur = player.audio_get_channel()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_apply_live_stereo_mode: cur = player.audio_get_channel()", _swallowed_error)
             cur = None
         if reason != "toggle" and cur == want:
+            continue
+        # WARNING: VLC has no audio output to switch until a file plays (audio_set_channel answers -1), so the reassert waits for playback instead of retrying every 2 s.
+        if reason != "toggle" and not player.is_playing():
             continue
         try:
             rc = player.audio_set_channel(want)
@@ -11958,8 +12656,10 @@ def initialize_vlc_on_demand():
     if vlc_engine is None and not vlc_boot_requested:
         vlc_boot_requested = True
         print("VLC initialization triggered synchronously.")
+        _vlc_start_t0 = time.perf_counter()
         try:
             import vlc
+            _vlc_import_s = time.perf_counter() - _vlc_start_t0
             import ctypes
             
             try:
@@ -12080,34 +12780,17 @@ def initialize_vlc_on_demand():
                     self._pending_seek_at = 0.0
                     self._media_end_tracking = {}
                     self._state_cond = threading.Condition()
-                    self._last_menu_signal = None
                     self._dvd_title_menu_flags = None
 
-                    self._dvd_pending_title_change = False
-                    self._dvd_pending_chapter_change = False
-                    self._dvd_pending_state_change = False
-                    self._dvd_pending_vout_rebuild = False
 
                     self._DVD_ACTIVATE_GRACE_MS = 75000
                     self._DVD_MENU_SIGNAL_WINDOW_MS = 4000
-                    self._dvd_sig_log_pos = None
-                    self._dvd_sig_poll_next_tick = 0
                     self._dvd_sig_last_active_tick = -10**9
                     self._dvd_sig_last_active_source = None
-                    self._dvd_sig_highlight_display = None
-                    self._dvd_sig_highlight_button = None
-                    self._dvd_sig_blend_active = None
-                    self._dvd_sig_vout_open_count = 0
-                    self._dvd_sig_cell_change_count = 0
-                    self._dvd_sig_highlight_count = 0
                     self._dvd_sig_ever_seen = False
                     self._dvd_title_entered_at = 0
                     self._dvd_menu_active_last_logged = None
-                    self._dvd_sig_title_ever_highlight = False
-                    self._dvd_sig_title_ever_stillframe = False
                     self._dvd_menu_active_last_reason = None
-                    self._dvd_sig_stall_warned_at = 0
-                    self._DVD_SIG_STALL_WARN_INTERVAL_MS = 3000
                     self._dvd_sig_confirmed_title = None
                     self._dvd_sig_confirmed_title_source = None
 
@@ -12124,10 +12807,6 @@ def initialize_vlc_on_demand():
                                 _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper.__init__._on_title_changed: self._current_title = self.player.get_title()", _swallowed_error)
                             self._state_cond.notify_all()
                         self._dvd_title_entered_at = pygame.time.get_ticks()
-                        self._dvd_sig_title_ever_highlight = False
-                        self._dvd_sig_title_ever_stillframe = False
-                        self._dvd_sig_stall_warned_at = 0
-                        self._dvd_pending_title_change = True
 
                     def _on_length_changed(event):
                         with self._state_cond:
@@ -12143,25 +12822,7 @@ def initialize_vlc_on_demand():
                     _em.event_attach(vlc.EventType.MediaPlayerTitleChanged, self._on_title_changed)
                     _em.event_attach(vlc.EventType.MediaPlayerLengthChanged, self._on_length_changed)
 
-                    def _on_vout_changed(event):
-                        if getattr(self, "is_dvd_iso", False):
-                            self._dvd_pending_vout_rebuild = True
-
-                    self._on_vout_changed = _on_vout_changed
-                    try:
-                        _em.event_attach(vlc.EventType.MediaPlayerVout, self._on_vout_changed)
-                    except Exception as e:
-                        log.warning("MediaPlayerVout event_attach failed (non-fatal): %s", e)
-
                     self._current_chapter = -1
-
-                    def _on_chapter_changed(event):
-                        if getattr(self, "is_dvd_iso", False):
-                            self._dvd_pending_chapter_change = True
-
-                    self._on_chapter_changed = _on_chapter_changed
-                    _em.event_attach(vlc.EventType.MediaPlayerChapterChanged,
-                                     self._on_chapter_changed)
 
                     self._current_state = None
 
@@ -12172,8 +12833,6 @@ def initialize_vlc_on_demand():
                             except Exception as _swallowed_error:
                                 _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper.__init__._on_state_changed: self._current_state = self.player.get_state()", _swallowed_error)
                             self._state_cond.notify_all()
-                        if getattr(self, "is_dvd_iso", False):
-                            self._dvd_pending_state_change = True
 
                     self._on_state_changed = _on_state_changed
                     for _evt in (vlc.EventType.MediaPlayerPlaying,
@@ -12247,42 +12906,6 @@ def initialize_vlc_on_demand():
                     # WARNING: do not decide from is_dvd_iso alone; a plain video on the DVD engine must use dvd_screen_mode, not the global Video-tab mode.
                     _key = "dvd_screen_mode" if self.engine_label == "dvd" else "screen_mode"
                     return db.config.get(_key, "normal") if db is not None else "normal"
-
-                def resize_canvas(self, new_aspect):
-                    _decode_res = db.config.get("vlc_decode_res", "sd") if db else "sd"
-                    new_w, new_h = _video_decode_canvas_size(_decode_res)
-
-                    if new_aspect == self.target_aspect:
-                        return
-
-                    self.target_aspect = new_aspect
-                    if new_w == self.width and new_h == self.height:
-                        self._set_crop_geometry(None)
-                        return
-
-                    try:
-                        self.player.stop()
-                    except Exception as e:
-                        log.warning("resize_canvas: pre-emptive stop() failed: %s", e)
-
-                    self.width, self.height = new_w, new_h
-                    self.buf_size = self.width * self.height * 4
-                    self.raw_buffer = (ctypes.c_ubyte * self.buf_size)()
-                    self.pixel_pointer = ctypes.cast(self.raw_buffer, ctypes.c_void_p).value
-                    self._set_crop_geometry(None)
-
-                    self._decode_buffer = None
-                    self._decode_w, self._decode_h = self.width, self.height
-                    self._letterbox_offset_x = 0
-                    self._letterbox_offset_y = 0
-                    self._dvd_src_dims = None
-
-                    try:
-                        self.player.video_set_format("BGRA", self.width, self.height, self.width * 4)
-                    except Exception as e:
-                        log.warning("resize_canvas: video_set_format failed: %s", e)
-
-                    self.clear_frame_buffer()
 
                 def _configure_decode_target(self, target_w, target_h):
                     target_w = max(2, int(target_w))
@@ -12416,7 +13039,8 @@ def initialize_vlc_on_demand():
                         try:
                             import vlc as _vlc
                             _state = self.player.get_state()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper.refresh_screen_mode_geometry: import vlc as _vlc", _swallowed_error)
                             _state = None
                             _vlc = None
                         if _vlc is not None and _state not in (_vlc.State.Playing, _vlc.State.Paused):
@@ -12488,7 +13112,6 @@ def initialize_vlc_on_demand():
 
                     is_dvd_iso = is_dvd_disc_source(filepath)
                     self.is_dvd_iso = is_dvd_iso
-                    self._last_menu_signal = None
                     self._dvd_title_menu_flags = None
 
                     if is_dvd_iso and filepath != getattr(self, "current_filepath", None):
@@ -12694,6 +13317,7 @@ def initialize_vlc_on_demand():
                                        daemon=True).start()
 
                         self.current_filepath = filepath
+                        self._audio_index = None
                         try:
                             _last_vlc_play_exception.pop(os.path.normpath(filepath), None)
                         except Exception as _swallowed_error:
@@ -12711,24 +13335,86 @@ def initialize_vlc_on_demand():
                             _t2.Thread(target=self._apply_dvd_native_dims_when_ready,
                                        args=(self._seek_generation,), daemon=True).start()
                         # WARNING: set_media()/play() not raising does not mean the file opened; verify below.
-                        _OPEN_ERROR_CHECK_S = 0.25
+                        # WARNING: the fallback numbers below must match PLAY_OPEN_ERROR_CHECK_SECONDS in performance_governor.py; they are used only when that module fails to import.
+                        _OPEN_ERROR_CHECK_S = performance_governor.PLAY_OPEN_ERROR_CHECK_SECONDS if performance_governor is not None else 0.25
+                        # WARNING: libVLC can fail an open without State.Error: on a busy drive it read 0 bytes, matched no demuxer and went straight to Stopped while the app logged OPENED and left a black screen. A Stopped/Ended state that persists right after the open is a failed open; it is retried (the file is fine, the read was starved) before it is called a failure.
+                        # WARNING: the fallback numbers below must match PLAY_OPEN_CONFIRM_WINDOW_SECONDS in performance_governor.py; they are used only when that module fails to import.
+                        _OPEN_CONFIRM_WINDOW_S = performance_governor.PLAY_OPEN_CONFIRM_WINDOW_SECONDS if performance_governor is not None else 1.5
+                        # WARNING: the fallback numbers below must match PLAY_OPEN_STOPPED_DEBOUNCE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+                        _OPEN_STOPPED_DEBOUNCE_S = performance_governor.PLAY_OPEN_STOPPED_DEBOUNCE_SECONDS if performance_governor is not None else 0.15
+                        # WARNING: the fallback numbers below must match PLAY_OPEN_RETRY_DELAYS_SECONDS in performance_governor.py; they are used only when that module fails to import.
+                        _OPEN_RETRY_DELAYS_S = performance_governor.PLAY_OPEN_RETRY_DELAYS_SECONDS if performance_governor is not None else (0.5, 1.0)
 
-                        def _open_error_check():
-                            """Waits up to _OPEN_ERROR_CHECK_S for libVLC to report State.Error; returns True when the open was accepted."""
+                        def _wait_open_outcome(window_s):
+                            """Returns "error" on State.Error, "stopped" when Stopped/Ended persists, "ok" once Playing/Paused, "pending" when the window ends first."""
+                            _stopped_since = None
                             with self._state_cond:
-                                _open_deadline = time.monotonic() + _OPEN_ERROR_CHECK_S
-                                while self._current_state != vlc.State.Error:
-                                    _remaining = _open_deadline - time.monotonic()
+                                _deadline = time.monotonic() + window_s
+                                while True:
+                                    _st = self._current_state
+                                    if _st == vlc.State.Error:
+                                        return "error"
+                                    if _st in (vlc.State.Playing, vlc.State.Paused):
+                                        return "ok"
+                                    if _st in (vlc.State.Stopped, vlc.State.Ended):
+                                        if _stopped_since is None:
+                                            _stopped_since = time.monotonic()
+                                        elif time.monotonic() - _stopped_since >= _OPEN_STOPPED_DEBOUNCE_S:
+                                            return "stopped"
+                                    else:
+                                        _stopped_since = None
+                                    _remaining = _deadline - time.monotonic()
                                     if _remaining <= 0:
+                                        return "pending"
+                                    self._state_cond.wait(timeout=min(_remaining, 0.05))
+
+                        def _reopen_same_media():
+                            """Hands the same media to the player again from a helper thread (the player call can block on a stalled drive)."""
+                            with self._state_cond:
+                                self._current_state = None
+                                self._current_length = -1
+                                self._state_cond.notify_all()
+                            _again_done = threading.Event()
+
+                            def _again():
+                                try:
+                                    self.player.set_media(media)
+                                    self.player.play()
+                                except Exception as _again_err:
+                                    log.warning("[ATTEMPT %s] open retry call failed: %s", _attempt_id, _again_err)
+                                finally:
+                                    _again_done.set()
+                            threading.Thread(target=_again, daemon=True, name=f"vlc-open-retry-{self.engine_label}").start()
+                            return _again_done.wait(timeout=WEDGED_STOP_TIMEOUT_S)
+
+                        def _open_error_check(can_retry=False):
+                            """Waits for libVLC to say whether the open worked; returns True when the open was accepted. With can_retry (off the main thread only) a Stopped-after-open is re-opened up to twice before it counts as failed."""
+                            _window = _OPEN_CONFIRM_WINDOW_S if can_retry else _OPEN_ERROR_CHECK_S
+                            _tries = 0
+                            while True:
+                                _outcome = _wait_open_outcome(_window)
+                                if _outcome in ("ok", "pending"):
+                                    break
+                                if _outcome == "stopped" and can_retry and _tries < len(_OPEN_RETRY_DELAYS_S):
+                                    _delay = _OPEN_RETRY_DELAYS_S[_tries]
+                                    _tries += 1
+                                    log.warning("[ATTEMPT %s] VLC stopped right after the open without an error (read nothing); "
+                                                "retry %d of %d in %.1fs: file=%s",
+                                                _attempt_id, _tries, len(_OPEN_RETRY_DELAYS_S), _delay, filepath)
+                                    time.sleep(_delay)
+                                    if getattr(self, "_current_attempt_id", None) != _attempt_id:
+                                        return False
+                                    if not _reopen_same_media():
                                         break
-                                    self._state_cond.wait(timeout=_remaining)
-                            if self._current_state == vlc.State.Error:
+                                    continue
+                                if _outcome == "stopped" and not can_retry:
+                                    break
                                 log.warning(
                                     "[ATTEMPT %s] play() returned without raising, but libVLC "
-                                    "reported State.Error within %.0fms of the open call -- "
+                                    "reported State.%s within %.1fs of the open call -- "
                                     "treating this as a failed open, not a successful one: "
                                     "file=%s",
-                                    _attempt_id, _OPEN_ERROR_CHECK_S * 1000, filepath,
+                                    _attempt_id, "Error" if _outcome == "error" else "Stopped", _window, filepath,
                                 )
                                 try:
                                     _last_vlc_play_exception[os.path.normpath(filepath)] = (
@@ -12738,7 +13424,10 @@ def initialize_vlc_on_demand():
                                 except Exception as _swallowed_error:
                                     _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper.play_file_segmented._open_and_play._open_error_check: _last_vlc_play_exception[os.path.normpath(filepath)] = 'libVLC reported State.Error imm...", _swallowed_error)
                                 return False
-                            log.info("[ATTEMPT %s] OPENED: file=%s", _attempt_id, filepath)
+                            if _outcome == "stopped":
+                                return False
+                            log.info("[ATTEMPT %s] OPENED: file=%s%s", _attempt_id, filepath,
+                                     " (after %d open retr%s)" % (_tries, "y" if _tries == 1 else "ies") if _tries else "")
                             return True
 
                         if not verify_off_thread:
@@ -12749,7 +13438,7 @@ def initialize_vlc_on_demand():
 
                         def _verify_open_off_thread():
                             try:
-                                _confirm(_open_error_check(), deferred=True)
+                                _confirm(_open_error_check(can_retry=True), deferred=True)
                             except Exception as _verr:
                                 log.warning("[ATTEMPT %s] open error check failed: %s", _attempt_id, _verr)
                                 _confirm(False, deferred=True)
@@ -12885,7 +13574,8 @@ def initialize_vlc_on_demand():
                             return
                         try:
                             size = self.player.video_get_size(0)
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._apply_dvd_native_dims_when_ready: size = self.player.video_get_size(0)", _swallowed_error)
                             size = None
                         if size and size[0] and size[1]:
                             w, h = int(size[0]), int(size[1])
@@ -12948,6 +13638,7 @@ def initialize_vlc_on_demand():
                     import vlc as _vlc
                     saved = _get_saved_audio_track(filepath)
                     if saved is None:
+                        self._apply_preferred_audio_track_when_ready(filepath, timeout_ms)
                         return
                     saved_id, saved_name = saved
                     deadline = pygame.time.get_ticks() + timeout_ms
@@ -12965,7 +13656,8 @@ def initialize_vlc_on_demand():
                         if state in (_vlc.State.Playing, _vlc.State.Paused):
                             try:
                                 tracks = self.player.audio_get_track_description() or []
-                            except Exception:
+                            except Exception as _swallowed_error:
+                                _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._apply_saved_audio_track_when_ready: tracks = self.player.audio_get_track_description() or []", _swallowed_error)
                                 tracks = []
                             if tracks:
                                 break
@@ -12990,13 +13682,89 @@ def initialize_vlc_on_demand():
                         try:
                             self.player.audio_set_track(target_id)
                             log.info("[AUDIO TRACK] Restored saved track %s for %s", target_id, filepath)
+                            _listed = [tid for tid, _n in self.get_audio_tracks()]
+                            if target_id in _listed:
+                                self._audio_index = _listed.index(target_id)
+                            self._reapply_track_gain(filepath)
                         except Exception as e:
                             log.warning("[AUDIO TRACK] Failed to restore saved track for %s: %s", filepath, e)
+
+                def _apply_preferred_audio_track_when_ready(self, filepath, timeout_ms=4000):
+                    """For a file with no saved track choice: once VLC's track list has settled, switches to the first track in the preferred language (English first) when another track is playing; the pick is not saved, so a later choice in the menu still wins."""
+                    import vlc as _vlc
+                    try:
+                        if is_dvd_disc_source(filepath):
+                            return
+                        header = _audio_header_streams(filepath)
+                        settle_ms = int(_gov_audio_track_value("AUDIO_TRACK_SETTLE_MS", 600))
+                        settle_max_ms = int(_gov_audio_track_value("AUDIO_TRACK_SETTLE_MAX_MS", 2500))
+                        deadline = pygame.time.get_ticks() + timeout_ms
+                        tracks, stable_since, settle_deadline = None, None, None
+                        while pygame.time.get_ticks() < deadline:
+                            if getattr(self, "current_filepath", None) != filepath:
+                                return
+                            state = self.player.get_state()
+                            if state in (_vlc.State.Ended, _vlc.State.Error, _vlc.State.Stopped):
+                                return
+                            if state in (_vlc.State.Playing, _vlc.State.Paused):
+                                now_tracks = self.get_audio_tracks()
+                                now_ms = pygame.time.get_ticks()
+                                if settle_deadline is None and now_tracks:
+                                    settle_deadline = now_ms + settle_max_ms
+                                if now_tracks != tracks:
+                                    tracks, stable_since = now_tracks, now_ms
+                                elif tracks and (now_ms - stable_since >= settle_ms
+                                                 or (header and len(tracks) >= len(header))
+                                                 or now_ms >= settle_deadline):
+                                    break
+                            pygame.time.wait(100)
+                        if not tracks or getattr(self, "current_filepath", None) != filepath:
+                            return
+                        if len(tracks) < 2:
+                            return
+                        _playing_id = self.get_current_audio_track()
+                        target_id, why = _pick_preferred_audio_track(tracks, header, _playing_id)
+                        _ids = [tid for tid, _n in tracks]
+                        if target_id is None:
+                            log.info("[AUDIO TRACK] %s: kept the playing track (%s)", os.path.basename(filepath), why)
+                            if _playing_id in _ids:
+                                self._audio_index = _ids.index(_playing_id)
+                                self._reapply_track_gain(filepath)
+                            return
+                        if self.set_audio_track(target_id):
+                            log.info("[AUDIO TRACK] %s: switched to the preferred-language track, %s", os.path.basename(filepath), why)
+                            self._audio_index = _ids.index(target_id)
+                            self._reapply_track_gain(filepath)
+                        else:
+                            log.warning("[AUDIO TRACK] %s: could not switch to the preferred-language track %s", os.path.basename(filepath), target_id)
+                    except Exception as e:
+                        log.warning("[AUDIO TRACK] picking the preferred-language track for %s failed: %s", os.path.basename(str(filepath)), e)
+
+                def _reapply_track_gain(self, filepath):
+                    """Background, at file start: loads the file's per-track gains and, when the track now playing has its own gain, plays the file at it; a muted start stays muted."""
+                    try:
+                        if self is not vlc_engine:
+                            return
+                        _load_track_gains(os.path.normpath(filepath))
+                        if getattr(self, "current_filepath", None) != filepath:
+                            return
+                        new_gain = _lookup_file_gain(app_state.get("current_channel") or "", filepath)
+                        if abs(new_gain - (self.file_gain or 0.0)) < 1e-6:
+                            return
+                        self.file_gain = new_gain
+                        self.set_volume(db.config.get("global_volume", 70), db.config.get("is_muted", False))
+                        if app_state.get("_video_pending_unmute", False):
+                            self.player.audio_set_mute(True)
+                        log.info("[AUDIO TRACK] %s: playing audio track %s at its own gain x%.3f",
+                                 os.path.basename(filepath), (self._audio_index or 0) + 1, new_gain)
+                    except Exception as e:
+                        log.warning("[AUDIO TRACK] applying the gain of the playing track of %s failed: %s", os.path.basename(str(filepath)), e)
 
                 def get_audio_tracks(self):
                     try:
                         raw = self.player.audio_get_track_description() or []
-                    except Exception:
+                    except Exception as _swallowed_error:
+                        _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper.get_audio_tracks: raw = self.player.audio_get_track_description() or []", _swallowed_error)
                         raw = []
                     out = []
                     for tid, tname in raw:
@@ -13033,7 +13801,8 @@ def initialize_vlc_on_demand():
                     """Returns (state, length_ms or None); state is one of 'playing', 'paused', 'ended', 'stopped', 'error', 'opening', 'buffering' or 'other'."""
                     try:
                         raw_state = self.player.get_state()
-                    except Exception:
+                    except Exception as _swallowed_error:
+                        _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper.get_playback_state: raw_state = self.player.get_state()", _swallowed_error)
                         return "other", None
                     _STATE_NAMES = {
                         vlc.State.Playing:   "playing",
@@ -13123,7 +13892,8 @@ def initialize_vlc_on_demand():
                         while True:
                             try:
                                 _cur_at_open = self.player.get_time()
-                            except Exception:
+                            except Exception as _swallowed_error:
+                                _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._seek_when_ready: _cur_at_open = self.player.get_time()", _swallowed_error)
                                 _cur_at_open = None
                             if (_cur_at_open is not None and _cur_at_open >= 0
                                     and abs(_cur_at_open - target_ms) <= 1500):
@@ -13163,8 +13933,7 @@ def initialize_vlc_on_demand():
                         log.info("[SEEK VERIFY] seek requested: target_ms=%s file=%s", target_ms, getattr(self, "current_filepath", "?"))
                     _seek_deadline = pygame.time.get_ticks() + 3000
                     _last_set_time_at = pygame.time.get_ticks()
-                    # VALUES CHANGE HERE
-                    _SEEK_RETRY_INTERVAL_MS = 1500
+                    _SEEK_RETRY_INTERVAL_MS = SEEK_RETRY_INTERVAL_MS
                     _landed_at_ms = None
                     while pygame.time.get_ticks() < _seek_deadline:
                         if _superseded():
@@ -13202,7 +13971,8 @@ def initialize_vlc_on_demand():
                     else:
                         try:
                             _final = self.player.get_time()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._seek_when_ready: _final = self.player.get_time()", _swallowed_error)
                             _final = None
                         log.warning(
                             "_seek_when_ready: seek to %sms never landed within 3s (ended near %sms) -- "
@@ -13235,28 +14005,6 @@ def initialize_vlc_on_demand():
                                 (None if _post_cur is None else _post_cur - _total_elapsed),
                             )
 
-                def _enter_title_when_ready(self, title, timeout_ms=6000):
-                    import vlc as _vlc
-                    deadline = pygame.time.get_ticks() + timeout_ms
-                    ready = False
-                    with self._state_cond:
-                        while True:
-                            remaining_ms = deadline - pygame.time.get_ticks()
-                            if remaining_ms <= 0:
-                                break
-                            state = self._current_state
-                            if state in (_vlc.State.Ended, _vlc.State.Error, _vlc.State.Stopped):
-                                return
-                            if state in (_vlc.State.Playing, _vlc.State.Paused) and self._current_length > 0:
-                                ready = True
-                                break
-                            self._state_cond.wait(remaining_ms / 1000.0)
-                    if not ready:
-                        return
-                    try:
-                        self.player.set_title(title if title and title >= 1 else 1)
-                    except Exception as e:
-                        log.warning("_enter_title_when_ready: set_title(%s) failed: %s", title, e)
 
                 def stop(self, block=True):
                     """Stops playback and returns the _stop_done Event, which is set when player.stop() has finished."""
@@ -13363,33 +14111,15 @@ def initialize_vlc_on_demand():
                     "popup":    5,
                 }
 
-                import re as _re_dvd_sig
-                _DVD_HIGHLIGHT_RE = _re_dvd_sig.compile(
-                    r"DVDNAV_HIGHLIGHT\s*\r?\n"
-                    r".*?main debug:\s*- display=(\d+)\s*\r?\n"
-                    r".*?main debug:\s*- buttonN=(\d+)"
-                )
-                _DVD_CELL_CHANGE_RE = _re_dvd_sig.compile(r"DVDNAV_CELL_CHANGE")
-                _DVD_STILL_FRAME_RE = _re_dvd_sig.compile(r"DVDNAV_STILL_FRAME")
-                _DVD_BLEND_LOAD_RE = _re_dvd_sig.compile(
-                    r'using video blending module "blend"')
-                _DVD_BLEND_REMOVE_RE = _re_dvd_sig.compile(
-                    r'removing module "blend"')
-                _DVD_VOUT_OPEN_RE = _re_dvd_sig.compile(
-                    r"Opening vout display wrapper")
-
                 def _dvd_sig_log(self, msg):
                     with self._state_cond:
                         title = self._current_title
                     now = pygame.time.get_ticks()
                     log.info(
                         "[DVD SIGNAL] %s | title=%s confirmed_title=%s "
-                        "highlight_display=%s highlight_button=%s cell_changes=%d "
-                        "highlight_events=%d ms_since_active=%d active_source=%s "
+                        "ms_since_active=%d active_source=%s "
                         "ever_seen=%s ms_since_title_entered=%d",
                         msg, title, self._dvd_sig_confirmed_title,
-                        self._dvd_sig_highlight_display, self._dvd_sig_highlight_button,
-                        self._dvd_sig_cell_change_count, self._dvd_sig_highlight_count,
                         now - self._dvd_sig_last_active_tick, self._dvd_sig_last_active_source,
                         self._dvd_sig_ever_seen, now - self._dvd_title_entered_at,
                     )
@@ -13436,142 +14166,6 @@ def initialize_vlc_on_demand():
                 def record_time_jump_veto_evidence(self, title):
                     return self._record_veto_evidence(title, "time-jump")
 
-                def _process_pending_dvd_events(self):
-                    if self._dvd_pending_title_change:
-                        self._dvd_pending_title_change = False
-                        self._log_menu_signal_if_changed()
-                        self._ensure_menu_highlight_spu()
-                        if getattr(self, "is_dvd_iso", False):
-                            self._log_dvd_transition("TITLE")
-                    if self._dvd_pending_chapter_change:
-                        self._dvd_pending_chapter_change = False
-                        try:
-                            self._current_chapter = self.player.get_chapter()
-                        except Exception as _swallowed_error:
-                            _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._process_pending_dvd_events: self._current_chapter = self.player.get_chapter()", _swallowed_error)
-                        self._log_dvd_transition("CHAPTER")
-                    if self._dvd_pending_state_change:
-                        self._dvd_pending_state_change = False
-                        self._log_dvd_transition("STATE")
-                    if self._dvd_pending_vout_rebuild:
-                        self._dvd_pending_vout_rebuild = False
-                        self._dvd_sig_vout_rebuild_count = getattr(
-                            self, "_dvd_sig_vout_rebuild_count", 0) + 1
-
-                def _poll_dvd_menu_signals(self):
-                    self._process_pending_dvd_events()
-                    now = pygame.time.get_ticks()
-                    if now < self._dvd_sig_poll_next_tick:
-                        return
-                    self._dvd_sig_poll_next_tick = now + 120
-
-                    with self._state_cond:
-                        _stall_title = self._current_title
-                    if (_stall_title is not None and _stall_title >= 1
-                            and _stall_title != self._dvd_sig_confirmed_title
-                            and _stall_title not in self._dvd_flag_override_titles
-                            and not self._dvd_sig_title_ever_highlight
-                            and not self._dvd_sig_title_ever_stillframe
-                            and now - self._dvd_sig_stall_warned_at >= self._DVD_SIG_STALL_WARN_INTERVAL_MS):
-                        self._dvd_sig_stall_warned_at = now
-                        log.warning(
-                            "[DVD SIGNAL] STALLED -- title %s has had NO DVDNAV_HIGHLIGHT or "
-                            "DVDNAV_STILL_FRAME since it was entered %dms ago, and the disc's "
-                            "title-flags table hasn't been overridden for it. Any WASD/Enter "
-                            "presses right now are being silently dropped before they reach "
-                            "navigate(). This title may not have reached its interactive point "
-                            "yet, or this disc never emits an interactive signal for it.",
-                            _stall_title, now - self._dvd_title_entered_at)
-
-                    path = getattr(self, "_vlc_debug_log_path", None)
-                    if not path:
-                        return
-                    try:
-                        size = os.path.getsize(path)
-                    except Exception as _swallowed_error:
-                        _log_swallowed("DVD menu signals: reading the signal file", _swallowed_error)
-                        return
-                    if self._dvd_sig_log_pos is None:
-                        self._dvd_sig_log_pos = size
-                        self._dvd_sig_log("log cursor initialized at EOF (lazy init)")
-                        return
-                    if size < self._dvd_sig_log_pos:
-                        self._dvd_sig_log_pos = size
-                        return
-                    if size == self._dvd_sig_log_pos:
-                        return
-                    try:
-                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                            f.seek(self._dvd_sig_log_pos)
-                            chunk = f.read()
-                            self._dvd_sig_log_pos = f.tell()
-                    except Exception as e:
-                        log.warning("_poll_dvd_menu_signals: log read failed: %s", e)
-                        return
-                    if not chunk:
-                        return
-
-                    for _line in chunk.splitlines():
-                        if self._DVD_BLEND_LOAD_RE.search(_line):
-                            self._dvd_sig_blend_active = True
-                        elif self._DVD_BLEND_REMOVE_RE.search(_line):
-                            self._dvd_sig_blend_active = False
-                    _vout_opens = len(self._DVD_VOUT_OPEN_RE.findall(chunk))
-                    if _vout_opens:
-                        self._dvd_sig_vout_open_count = getattr(
-                            self, "_dvd_sig_vout_open_count", 0) + _vout_opens
-
-                    hl_matches = self._DVD_HIGHLIGHT_RE.findall(chunk)
-                    if hl_matches:
-                        d_str, b_str = hl_matches[-1]
-                        try:
-                            d = int(d_str)
-                            b = int(b_str)
-                        except ValueError:
-                            d = b = None
-                        if d is not None:
-                            self._dvd_sig_highlight_count += len(hl_matches)
-                            self._dvd_sig_highlight_display = d
-                            self._dvd_sig_highlight_button = b
-                            if d >= 1:
-                                self._dvd_sig_title_ever_highlight = True
-                                self.note_dvd_menu_signal_active("highlight")
-                            else:
-                                self._dvd_sig_log(
-                                    f"DVDNAV_HIGHLIGHT display=0 (button cleared, button={b})")
-
-                    still_matches = self._DVD_STILL_FRAME_RE.findall(chunk)
-                    if still_matches:
-                        with self._state_cond:
-                            _sf_title = self._current_title
-                        self._dvd_sig_title_ever_stillframe = True
-                        if _sf_title not in self._dvd_flag_override_titles:
-                            self._dvd_flag_override_titles.add(_sf_title)
-                            self._dvd_sig_log(
-                                f"title {_sf_title} flag-table veto OVERRIDDEN -- "
-                                f"DVDNAV_STILL_FRAME is dvdnav's own authoritative "
-                                f"'waiting for nav input' signal, trusted "
-                                f"unconditionally like a real highlight")
-                            try:
-                                self._ensure_menu_highlight_spu()
-                            except Exception as e:
-                                log.warning("_ensure_menu_highlight_spu (still-frame override) failed: %s", e)
-                        self.note_dvd_menu_signal_active("still-frame")
-
-                    cell_matches = self._DVD_CELL_CHANGE_RE.findall(chunk)
-                    if cell_matches:
-                        self._dvd_sig_cell_change_count += len(cell_matches)
-                        with self._state_cond:
-                            _cc_title = self._current_title
-                        if self._title_is_menu(_cc_title) is False and _cc_title not in self._dvd_flag_override_titles:
-                            if self._record_veto_evidence(_cc_title, "cell-change"):
-                                self.note_dvd_menu_signal_active("cell-change")
-                            else:
-                                self._dvd_sig_log(
-                                    f"cell-change ignored as menu-signal -- title {_cc_title} "
-                                    f"is confirmed non-menu by disc's own title-flags table")
-                        else:
-                            self.note_dvd_menu_signal_active("cell-change")
 
                 def navigate(self, direction):
                     if not self.player:
@@ -13622,13 +14216,15 @@ def initialize_vlc_on_demand():
                         track_id = None
                         try:
                             descriptions = self.player.video_get_spu_description()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._ensure_menu_highlight_spu: descriptions = self.player.video_get_spu_description()", _swallowed_error)
                             descriptions = None
                         if descriptions:
                             for desc in descriptions:
                                 try:
                                     desc_id = desc[0]
-                                except (TypeError, IndexError):
+                                except (TypeError, IndexError) as _swallowed_error:
+                                    _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._ensure_menu_highlight_spu: desc_id = desc[0]", _swallowed_error)
                                     continue
                                 if desc_id is not None and desc_id >= 0:
                                     track_id = desc_id
@@ -13666,7 +14262,8 @@ def initialize_vlc_on_demand():
                         flags_map = {}
                         try:
                             descs = self.player.get_full_title_descriptions()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._title_is_menu: descs = self.player.get_full_title_descriptions()", _swallowed_error)
                             descs = None
                         if descs:
                             for i, d in enumerate(descs):
@@ -13678,16 +14275,6 @@ def initialize_vlc_on_demand():
                     if title < 0:
                         return True
                     return flags_map.get(title, title < 1)
-
-                def _log_menu_signal_if_changed(self):
-                    with self._state_cond:
-                        title = self._current_title
-                    _menu = self._title_is_menu(title)
-                    _active = (title < 1) if _menu is None else _menu
-                    _sig = (_active,)
-                    if _sig != self._last_menu_signal:
-                        self._last_menu_signal = _sig
-                        
 
                 def get_last_error(self):
                     try:
@@ -13797,8 +14384,7 @@ def initialize_vlc_on_demand():
                         _stats[0] += 1
                         _stats[1] += _copy_ms
                         _stats[2] = max(_stats[2], _copy_ms)
-                        # VALUES CHANGE HERE
-                        if _stats[0] >= 600:
+                        if _stats[0] >= FRAME_COPY_LOG_EVERY_FRAMES:
                             log.info("[FRAME COPY] %s frames=%d avg=%.2f ms max=%.2f ms size=%dx%d",
                                      self.engine_label, _stats[0], _stats[1] / _stats[0], _stats[2], self.width, self.height)
                             _stats[0], _stats[1], _stats[2] = 0, 0.0, 0.0
@@ -13812,7 +14398,9 @@ def initialize_vlc_on_demand():
             global _VLCEngineWrapperClass
             _VLCEngineWrapperClass = VLCEngineWrapper
 
+            _vlc_main_t0 = time.perf_counter()
             vlc_engine = VLCEngineWrapper(engine_label="main")
+            _vlc_main_s = time.perf_counter() - _vlc_main_t0
             
             log.info("[DEBUG VLC MASTER] Core framework ready and operational.")
             # WARNING: a windowed build (no console) has sys.stdout set to None, so the flush is skipped there; the handler flushes below are the ones that matter for the log file.
@@ -13834,9 +14422,12 @@ def initialize_vlc_on_demand():
                 except Exception as _swallowed_error:
                     _log_swallowed("initialize_vlc_on_demand: _h.flush()", _swallowed_error)
             try:
+                _vlc_dvd_t0 = time.perf_counter()
                 dvd_engine = VLCEngineWrapper(instance_args=vlc_args_dvd, engine_label="dvd")
                 
                 log.info("[DEBUG VLC MASTER] Dedicated DVD engine ready and operational.")
+                log.info("[VLC] start-up took %.1f s: loading VLC %.1f s, main engine %.1f s, DVD engine %.1f s",
+                         time.perf_counter() - _vlc_start_t0, _vlc_import_s, _vlc_main_s, time.perf_counter() - _vlc_dvd_t0)
                 print("[DVD ENGINE] Menu navigation uses libVLC's native dvdnav "
                       "signal only (no app-side heuristics). Regular DVDs are "
                       "fully supported; interactive multi-path DVD 'games' "
@@ -14035,10 +14626,11 @@ def _paths_from_entry(entry):
 
 
 _ORDERED_CONTENT_CACHE = {}
-_ORDERED_CONTENT_CACHE_TTL_MS = 8000
-# VALUES CHANGE HERE
-_ORDERED_CONTENT_CACHE_PRUNE_EVERY_MS = 60000
-_ORDERED_CONTENT_CACHE_LAST_PRUNE_MS = 0.0
+# WARNING: the fallback numbers below must match ORDERED_CONTENT_CACHE_TTL_MS in performance_governor.py; they are used only when that module fails to import.
+_ORDERED_CONTENT_CACHE_TTL_MS = performance_governor.ORDERED_CONTENT_CACHE_TTL_MS if performance_governor is not None else 8000
+# WARNING: the fallback numbers below must match ORDERED_CONTENT_CACHE_PRUNE_EVERY_MS, ORDERED_CONTENT_CACHE_LAST_PRUNE_MS in performance_governor.py; they are used only when that module fails to import.
+_ORDERED_CONTENT_CACHE_PRUNE_EVERY_MS = performance_governor.ORDERED_CONTENT_CACHE_PRUNE_EVERY_MS if performance_governor is not None else 60000
+_ORDERED_CONTENT_CACHE_LAST_PRUNE_MS = performance_governor.ORDERED_CONTENT_CACHE_LAST_PRUNE_MS if performance_governor is not None else 0.0
 
 
 def _prune_ordered_content_cache(now_ms):
@@ -14052,14 +14644,10 @@ def _prune_ordered_content_cache(now_ms):
         _ORDERED_CONTENT_CACHE.pop(k, None)
 
 
-# VALUES CHANGE HERE
-_MIXER_SEEK_TEST_ENCODERS = {
-    ".mp3": "libmp3lame", ".ogg": "libvorbis", ".opus": "libopus", ".flac": "flac",
-    ".wav": "pcm_s16le", ".aif": "pcm_s16be", ".aiff": "pcm_s16be",
-    ".m4a": "aac", ".aac": "aac", ".wma": "wmav2",
-}
-_MIXER_SEEK_TEST_SECONDS = 4
-_MIXER_SEEK_TEST_POSITION = 1.0
+# WARNING: the fallback numbers below must match MIXER_SEEK_TEST_ENCODERS, MIXER_SEEK_TEST_SECONDS, MIXER_SEEK_TEST_POSITION in performance_governor.py; they are used only when that module fails to import.
+_MIXER_SEEK_TEST_ENCODERS = performance_governor.MIXER_SEEK_TEST_ENCODERS if performance_governor is not None else { ".mp3": "libmp3lame", ".ogg": "libvorbis", ".opus": "libopus", ".flac": "flac", ".wav": "pcm_s16le", ".aif": "pcm_s16be", ".aiff": "pcm_s16be", ".m4a": "aac", ".aac": "aac", ".wma": "wmav2", }
+_MIXER_SEEK_TEST_SECONDS = performance_governor.MIXER_SEEK_TEST_SECONDS if performance_governor is not None else 4
+_MIXER_SEEK_TEST_POSITION = performance_governor.MIXER_SEEK_TEST_POSITION if performance_governor is not None else 1.0
 
 
 def _mixer_seekable_formats():
@@ -14069,7 +14657,8 @@ def _mixer_seekable_formats():
     table = db.config.get("mixer_seekable_formats")
     try:
         mixer_version = list(pygame.mixer.get_sdl_mixer_version())
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_mixer_seekable_formats: mixer_version = list(pygame.mixer.get_sdl_mixer_version())", _swallowed_error)
         return {}
     if not isinstance(table, dict) or table.get("version") != mixer_version:
         return {}
@@ -14131,7 +14720,8 @@ def _run_mixer_seek_selftest():
                 try:
                     pygame.mixer.music.play(start=_MIXER_SEEK_TEST_POSITION)
                     can_seek = True
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("_run_mixer_seek_selftest: pygame.mixer.music.play(start=_MIXER_SEEK_TEST_POSITION)", _swallowed_error)
                     pygame.mixer.music.play()
                     can_seek = False
             except Exception as e:
@@ -14160,7 +14750,8 @@ def _visualizer_unseekable_paths():
         return {}
     try:
         mixer_version = list(pygame.mixer.get_sdl_mixer_version())
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_visualizer_unseekable_paths: mixer_version = list(pygame.mixer.get_sdl_mixer_version())", _swallowed_error)
         mixer_version = None
     if db.config.get("visualizer_unseekable_mixer") != mixer_version:
         db.config["visualizer_unseekable"] = {}
@@ -14193,7 +14784,8 @@ def _start_visualizer_music(file_path, seek_seconds):
             try:
                 pygame.mixer.music.play(start=1.0)
                 short_seek_ok = True
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_start_visualizer_music: pygame.mixer.music.play(start=1.0)", _swallowed_error)
                 pygame.mixer.music.play()
             pygame.mixer.music.stop()
         finally:
@@ -14519,7 +15111,13 @@ def _prime_missing_durations(ch_str, missing, pace=True):
 
 
 def _prime_channel_block_durations_worker(ch_str, missing):
-    _probed, _elapsed = _prime_missing_durations(ch_str, missing, pace=True)
+    # WARNING: missing[0] is what is on air (or must air first); it is probed at once in a priority scope so the channel leaves Static in about a second, never queued behind the paced scan of the files after it.
+    _t_first = time.monotonic()
+    _first_probed = _prime_one_missing_duration(ch_str, missing[0], priority=True)
+    _probed = _first_probed
+    if len(missing) > 1:
+        _probed += _prime_missing_durations(ch_str, missing[1:], pace=True)[0]
+    _elapsed = time.monotonic() - _t_first
     if _probed:
         print(f"[TUNE PRIME] ch{ch_str}: background-probed {_probed} near-term duration(s) "
               f"in {_elapsed:.2f}s (off the main thread -- "
@@ -14529,9 +15127,9 @@ def _prime_channel_block_durations_worker(ch_str, missing):
         _priming_inflight.discard(ch_str)
 
 
-# VALUES CHANGE HERE
+# WARNING: the fallback numbers below must match PRIME_DURATIONS_NEAR_TERM_N in performance_governor.py; they are used only when that module fails to import.
 # WARNING: keep in sync with the "near-term" wording in this function's log line.
-_PRIME_DURATIONS_NEAR_TERM_N = 8
+_PRIME_DURATIONS_NEAR_TERM_N = performance_governor.PRIME_DURATIONS_NEAR_TERM_N if performance_governor is not None else 8
 
 def _prime_channel_block_durations(ch_key, synchronous=False):
     """Tune-in duration priming for a channel's *near-term* lineup."""
@@ -14746,7 +15344,6 @@ def _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, tag, chu
         _picture_box_before_loudness(norm_p)
     try:
         _shortfall = {}
-        _scan_duration = {}
         _extra_kwargs = {}
         if chunk_timeout is not None:
             _extra_kwargs["chunk_timeout"] = chunk_timeout
@@ -14868,7 +15465,8 @@ def _snapshot_now_playing_loudness_targets():
             continue
         try:
             _ordered, block_key = _get_channel_ordered_content(ch_str, ch_info)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_snapshot_now_playing_loudness_targets: _ordered, block_key = _get_channel_ordered_content(ch_str, ch_info)", _swallowed_error)
             block_key = "Full Day"
         out[f"ch{ch_str}"] = ("channel", ch_str, block_key or "Full Day", norm_p)
 
@@ -14876,7 +15474,8 @@ def _snapshot_now_playing_loudness_targets():
 
 
 
-_SWEEP_SKIP_BACKOFF_SECONDS = 1.0
+# WARNING: the fallback numbers below must match SWEEP_SKIP_BACKOFF_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SWEEP_SKIP_BACKOFF_SECONDS = performance_governor.SWEEP_SKIP_BACKOFF_SECONDS if performance_governor is not None else 1.0
 
 
 def _run_first_pass_now_playing_sweep():
@@ -14984,7 +15583,8 @@ def _front_load_watched_channel(items):
     return mine + boosted + rest
 
 
-_PROBE_NOW_STATE_TTL_S = 3.0
+# WARNING: the fallback numbers below must match PROBE_NOW_STATE_TTL_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_PROBE_NOW_STATE_TTL_S = performance_governor.PROBE_NOW_STATE_TTL_SECONDS if performance_governor is not None else 3.0
 _probe_now_state_cache = {}
 
 _probe_block_timeline_cache = {}
@@ -14997,7 +15597,8 @@ def _get_probe_now_state(ch_str):
         return entry[1]
     try:
         state = calculate_slotted_playback_state(ch_str)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_get_probe_now_state: state = calculate_slotted_playback_state(ch_str)", _swallowed_error)
         state = {}
     _probe_now_state_cache[ch_str] = (now, state)
     return state
@@ -15009,10 +15610,10 @@ def _get_probe_now_state(ch_str):
 # WARNING: a published snapshot is replaced whole by one builder thread and only read elsewhere; never mutate it.
 # WARNING: "done" for a file must stay in step with the scans that actually exist (duration, loudness gain, picture box); a new info scan must be added to _scan_file_is_done.
 
-# VALUES CHANGE HERE
-SCAN_SNAPSHOT_INTERVAL_S = 5.0
-SCAN_SNAPSHOT_STALE_S = 15.0
-SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD = 200
+# WARNING: the fallback numbers below must match SCAN_SNAPSHOT_INTERVAL_S, SCAN_SNAPSHOT_STALE_S, SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD in performance_governor.py; they are used only when that module fails to import.
+SCAN_SNAPSHOT_INTERVAL_S = performance_governor.SCAN_SNAPSHOT_INTERVAL_S if performance_governor is not None else 5.0
+SCAN_SNAPSHOT_STALE_S = performance_governor.SCAN_SNAPSHOT_STALE_S if performance_governor is not None else 15.0
+SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD = performance_governor.SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD if performance_governor is not None else 200
 
 _scan_snapshot_lock = threading.Lock()
 _scan_snapshot = {"built_at": -1e9, "channels": {}}
@@ -15332,16 +15933,53 @@ def _gather_probe_priority_queue():
     return tiers
 
 
-def _gather_music_probe_queue():
-    """Every music-type source that still needs a probed gain, as the list fed to _music_precache_worker()."""
+def _music_scan_source_items(source_key, songs):
+    """Turns one playlist's songs, in play order from the one playing (distance 0), into ranked scan items; songs already scanned are left out and counted toward how far ahead the scan is."""
+    ahead = 0
+    counting = True
+    pending = []
+    for distance, (kind, ch_key, block_key, norm_p, done) in enumerate(songs):
+        if done:
+            if counting and distance > 0:
+                ahead += 1
+            continue
+        if distance > 0:
+            counting = False
+        pending.append((distance, kind, ch_key, block_key, norm_p))
+    if performance_governor is not None:
+        behind = performance_governor.music_scan_falling_behind(_music_scan_behind.get(source_key, True), ahead)
+    else:
+        behind = True
+    if behind != _music_scan_behind.get(source_key):
+        if source_key in _music_scan_behind:
+            log.info("[MUSIC PRECACHE] %s: %d next songs scanned, %s", source_key, ahead,
+                     "falling behind, scanning fast" if behind else "far enough ahead, scanning slower")
+        _music_scan_behind[source_key] = behind
     out = []
+    for distance, kind, ch_key, block_key, norm_p in pending:
+        if performance_governor is not None:
+            cls = performance_governor.music_scan_class(distance, behind)
+        else:
+            cls = "now" if distance == 0 else "next"
+        out.append((cls, distance, kind, ch_key, block_key, norm_p))
+    return out
+
+
+_music_scan_behind = {}
+_MUSIC_SCAN_CLASS_RANK = {"now": 0, "next": 1, "deep": 2}
+
+
+def _gather_music_probe_queue():
+    """Every music-type source that still needs a probed gain or length, as (kind, channel, block, path, pace class) fed to _music_precache_worker(): ranked by pace class, then by how many songs ahead of the playing one, so every playlist's next songs come before any playlist's far songs."""
+    ranked = []
     if db is None:
-        return out
+        return []
 
     if (db.config.get("game_channel_enabled", True)
             and db.config.get("ch03_menu_music_enabled", True)):
         playlist = db.config.get("ch03_menu_music", [])
         cur_idx = app_state.get("ch03_menu_music_idx", 0) % len(playlist) if playlist else 0
+        songs = []
         for k in range(len(playlist)):
             idx = (cur_idx + k) % len(playlist)
             entry = playlist[idx]
@@ -15350,9 +15988,11 @@ def _gather_music_probe_queue():
                 continue
             _have = _read_file_probe_facts(os.path.normpath(p))
             if _have.get("gain") is not None and _have.get("duration"):
+                songs.append(("ch03_menu_music", None, idx, os.path.normpath(p), True))
                 continue
             if _cached_path_exists(p):
-                out.append(("ch03_menu_music", None, idx, os.path.normpath(p)))
+                songs.append(("ch03_menu_music", None, idx, os.path.normpath(p), False))
+        ranked.extend(_music_scan_source_items("ch03 menu music", songs))
 
     for i in range(5, 45):
         ch_str = str(i).zfill(2)
@@ -15366,6 +16006,7 @@ def _gather_music_probe_queue():
             continue
         current_file = _snap_rec["current_file"]
         ordered, block_key = _snap_rec["ordered"], _snap_rec["block_key"] or "Music Tracks"
+        songs = []
         for entry in _next_n_from_ordered(ordered, current_file, n=len(ordered)):
             for p in _paths_from_entry(entry):
                 if not (p and _cached_path_exists(p)):
@@ -15374,24 +16015,24 @@ def _gather_music_probe_queue():
                 _cached = _read_file_probe_facts(norm_p)
                 has_gain = "gain" in _cached or (isinstance(entry, dict) and "gain" in entry)
                 has_dur = (_cached.get("duration") or 0) > 0 or norm_p in _music_duration_scan_attempted
-                if has_gain and has_dur:
-                    continue
-                out.append(("channel", ch_str, block_key or "Music Tracks", norm_p))
+                songs.append(("channel", ch_str, block_key or "Music Tracks", norm_p, has_gain and has_dur))
+        ranked.extend(_music_scan_source_items("ch" + ch_str, songs))
 
-    return out
+    ranked.sort(key=lambda it: (_MUSIC_SCAN_CLASS_RANK.get(it[0], 2), it[1]))
+    return [(kind, ch_key, block_key, norm_p, cls) for cls, _distance, kind, ch_key, block_key, norm_p in ranked]
 
 
 _music_duration_scan_attempted = set()
 
 
-# VALUES CHANGE HERE
-MUSIC_PRECACHE_IDLE_SLEEP_SECONDS = 20.0
-MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS = 0.5
-MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS = 10.0
+# WARNING: the fallback numbers below must match MUSIC_PRECACHE_IDLE_SLEEP_SECONDS, MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS, MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+MUSIC_PRECACHE_IDLE_SLEEP_SECONDS = performance_governor.MUSIC_PRECACHE_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
+MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS = performance_governor.MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS if performance_governor is not None else 0.5
+MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS = performance_governor.MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS if performance_governor is not None else 10.0
 
 
 def _music_precache_worker():
-    """Runs separate duration and loudness scans for ch03 menu music and Visualizer playlists."""
+    """Runs separate duration and loudness scans for ch03 menu music and Visualizer playlists: the next 3 songs of every playlist with no pause, fast until 10 songs ahead are scanned, slower after that, and fast again once fewer than 5 of the next songs are scanned."""
     if db is None:
         return
     pygame.time.wait(1000)
@@ -15415,81 +16056,88 @@ def _music_precache_worker():
         _last_music_save = _now
         _since_last_save = 0
 
+    def _music_scan_one(kind, ch_key, block_key, norm_p):
+        """Scans one song's length and loudness when they are missing; True when a scan ran."""
+        nonlocal _since_last_save
+        _ran = False
+        _worker_cached = _read_file_probe_facts(norm_p)
+        _duration = _worker_cached.get("duration") or 0
+        _gain = _worker_cached.get("gain")
+        if not _duration and norm_p not in _music_duration_scan_attempted:
+            _ran = True
+            try:
+                _duration = _scan_store_duration(kind, ch_key, block_key, norm_p)
+            except Exception as e:
+                log.warning("[MUSIC PRECACHE] duration scan failed for %s: %s", norm_p, e)
+            _music_duration_scan_attempted.add(norm_p)
+            if _duration:
+                _since_last_save += 1
+            _flush()
+
+        if _gain is not None or _loudness_probe_in_cooldown(norm_p):
+            return _ran
+
+        _is_visualizer_track = (kind == "channel")
+        try:
+            gain = _probe_music_loudness_guarded(
+                norm_p, treat_fallback_as_unknown=True,
+                raise_on_no_audio=_is_visualizer_track,
+                raise_on_unplayable=True, raise_on_timeout=True)
+        except LoudnessProbeTimeoutError:
+            _record_loudness_timeout(norm_p)
+            return True
+        except NoAudioStreamError as _naerr:
+            _drop_media_from_pool(ch_key, block_key, norm_p,
+                                   getattr(_naerr, "reason", "no audio track"))
+            _since_last_save += 1
+            _flush()
+            return True
+        except UnplayableMediaError as _uerr:
+            _register_unplayable_strike(norm_p, _uerr.reason)
+            return True
+        except Exception as e:
+            log.warning("[MUSIC PRECACHE] loudness scan failed for %s: %s", norm_p, e)
+            return True
+        if gain:
+            _clear_loudness_timeout_streak(norm_p)
+            _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=gain, duration=None)
+            _since_last_save += 1
+        _flush()
+        return True
+
     try:
         while True:
             if _app_shutting_down.is_set():
                 return
+            try:
+                _visualizer_analysis_prefetch()
+            except Exception as e:
+                _log_warn_throttled("vis_analysis_prefetch", "[VISUALIZER ANALYSIS] prefetch of the next songs failed: %s" % e)
             queue = _gather_music_probe_queue()
             if not queue:
                 _flush()
                 if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_IDLE_SLEEP_SECONDS)):
                     return
                 continue
-            for kind, ch_key, block_key, norm_p in queue:
+            _queue_built_at = time.monotonic()
+            for kind, ch_key, block_key, norm_p, _scan_cls in queue:
                 if _app_shutting_down.is_set():
                     return
+                if time.monotonic() - _queue_built_at >= SCAN_PIPELINE_PREEMPT_CHECK_SECONDS:
+                    break
                 if _background_scan_should_pause():
                     if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
                         return
                     continue
-
-                _worker_cached = _read_file_probe_facts(norm_p)
-                _duration = _worker_cached.get("duration") or 0
-                _gain = _worker_cached.get("gain")
-                if not _duration and norm_p not in _music_duration_scan_attempted:
-                    try:
-                        _duration = _scan_store_duration(kind, ch_key, block_key, norm_p)
-                    except Exception as e:
-                        log.warning("[MUSIC PRECACHE] duration scan failed for %s: %s", norm_p, e)
-                    _music_duration_scan_attempted.add(norm_p)
-                    if _duration:
-                        _since_last_save += 1
-                    _flush()
-
-                if _gain is not None:
-                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
+                with _scan_thread_slot("music", _scan_cls) as _slot_ok:
+                    if not _slot_ok:
                         return
-                    continue
-                if _loudness_probe_in_cooldown(norm_p):
-                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
-                        return
-                    continue
-
-                _is_visualizer_track = (kind == "channel")
-                try:
-                    gain = _probe_music_loudness_guarded(
-                        norm_p, treat_fallback_as_unknown=True,
-                        raise_on_no_audio=_is_visualizer_track,
-                        raise_on_unplayable=True, raise_on_timeout=True)
-                except LoudnessProbeTimeoutError:
-                    _record_loudness_timeout(norm_p)
-                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
-                        return
-                    continue
-                except NoAudioStreamError as _naerr:
-                    _drop_media_from_pool(ch_key, block_key, norm_p,
-                                           getattr(_naerr, "reason", "no audio track"))
-                    _since_last_save += 1
-                    _flush()
-                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
-                        return
-                    continue
-                except UnplayableMediaError as _uerr:
-                    _register_unplayable_strike(norm_p, _uerr.reason)
-                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
-                        return
-                    continue
-                except Exception as e:
-                    log.warning("[MUSIC PRECACHE] loudness scan failed for %s: %s", norm_p, e)
-                    if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
-                        return
-                    continue
-                if gain:
-                    _clear_loudness_timeout_streak(norm_p)
-                    _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=gain, duration=None)
-                    _since_last_save += 1
-                _flush()
-                if _app_shutting_down.wait(_scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS)):
+                    with (_governor_priority_scope() if _scan_cls == "now" else _governor_nullscope()):
+                        _worked = _music_scan_one(kind, ch_key, block_key, norm_p)
+                # WARNING: a song that needed no scan (gain in cooldown) must still wait the background pace, or a playlist of such songs spins the thread.
+                _pace = (_scan_class_pace_seconds(_scan_cls, MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS) if _worked
+                         else _scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS))
+                if _pace > 0 and _app_shutting_down.wait(_pace):
                     return
     finally:
         _flush(force=True)
@@ -15546,7 +16194,9 @@ def _gather_holiday_scan_items():
 
 
 def _gather_deep_backlog_queue():
+    """Every not-yet-scanned file behind each channel's next 3 shows, as (kind, channel, block, path): holiday files on air or opening soon first, then every channel's lineup by distance from the show on air (each channel's 4th show before any channel's 5th), commercials, the other blocks by how soon they air, and the far holiday files last."""
     out_content = []
+    _ranked_content = []
     out_commercials = []
     out_other_blocks = []
     if db is None:
@@ -15580,7 +16230,7 @@ def _gather_deep_backlog_queue():
                         norm_p = os.path.normpath(p)
                         if not _scan_stages_pending(norm_p, isinstance(entry, dict) and "gain" in entry, False, _pb_lookups):
                             continue
-                        out_content.append(("channel", ch_str, block_key, norm_p))
+                        _ranked_content.append((k, len(_ranked_content), ("channel", ch_str, block_key, norm_p)))
 
         if ch_info.get("commercials_enabled", False):
             for _casset in ch_info.get("schedules", {}).get("Commercials", []):
@@ -15604,7 +16254,9 @@ def _gather_deep_backlog_queue():
                 continue
             if _scan_stages_pending(_pend_norm, False, False, _pb_lookups):
                 _airing_pending_items.append(("channel", ch_str, _snap_rec.get("pending_block") or "", _pend_norm))
-        out_content = _airing_pending_items + out_content if not ordered else out_content + _airing_pending_items
+        _pending_base = len(ordered) if ordered else 0
+        for _pending_rank, _pending_item in enumerate(_airing_pending_items):
+            _ranked_content.append((_pending_base + _pending_rank, len(_ranked_content), _pending_item))
         for _pob in _snap_rec.get("pending_other", []):
             _pob_items = []
             for _pend_path in _pob["paths"]:
@@ -15626,6 +16278,7 @@ def _gather_deep_backlog_queue():
                     _ob_items.append(("channel", ch_str, _ob["block_key"], norm_p))
             out_other_blocks.append((_dist, _ob_items))
 
+    out_content = [_item for _d, _seq, _item in sorted(_ranked_content, key=lambda it: (it[0], it[1]))]
     _other_by_distance = sorted(out_other_blocks, key=lambda it: it[0])
     _other_flat = [_item for _d, _items in _other_by_distance for _item in _items]
     _hol_active, _hol_soon, _hol_later = _gather_holiday_scan_items()
@@ -15636,21 +16289,6 @@ def _gather_deep_backlog_queue():
 # ============================================================================
 # SECTION: Live gain patching
 # ============================================================================
-
-
-def _hot_patch_live_gain(norm_p, gain):
-    if gain is None or vlc_engine is None:
-        return
-    try:
-        if os.path.normpath(getattr(vlc_engine, "current_filepath", "") or "") == norm_p:
-            vlc_engine.file_gain = gain
-            vlc_engine.set_volume(
-                db.config.get("global_volume", 70),
-                db.config.get("is_muted", False),
-            )
-            log.info("[PRECACHE] Hot-patched live VLC gain x%.2f for %s", gain, norm_p)
-    except Exception as _hp_e:
-        log.warning("_hot_patch_live_gain: live gain hot-patch failed for %s: %s", norm_p, _hp_e)
 
 
 def _request_schedule_rebuild(ch_key, block_key):
@@ -15800,8 +16438,10 @@ _guide_preload_thread_obj = None
 def _make_guide_preload_watchdog_tick():
     """Detects a stalled GuidePreloader thread and reports where it is stuck."""
     import traceback as _tb
-    STALL_THRESHOLD_S = 2.0
-    REPORT_COOLDOWN_S = 10.0
+    # WARNING: the fallback numbers below must match GUIDE_PRELOAD_STALL_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    STALL_THRESHOLD_S = performance_governor.GUIDE_PRELOAD_STALL_SECONDS if performance_governor is not None else 2.0
+    # WARNING: the fallback numbers below must match GUIDE_PRELOAD_REPORT_COOLDOWN_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    REPORT_COOLDOWN_S = performance_governor.GUIDE_PRELOAD_REPORT_COOLDOWN_SECONDS if performance_governor is not None else 10.0
     _state = {"last_report_ts": 0.0}
 
     def _tick():
@@ -15840,7 +16480,8 @@ def _make_guide_preload_watchdog_tick():
 def _guide_preload_worker():
     """Keeps the TV guide's grid and schedule built in the background from boot, regardless of which channel is on screen."""
     global _guide_preload_scratch_surface, _guide_preload_last_tick_ts
-    GUIDE_POLL_S = 0.5
+    # WARNING: the fallback numbers below must match GUIDE_PRELOAD_POLL_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    GUIDE_POLL_S = performance_governor.GUIDE_PRELOAD_POLL_SECONDS if performance_governor is not None else 0.5
     _tick_count = 0
     _winsize_wait_since = None
     _initial_build_pending = True
@@ -15873,15 +16514,13 @@ def _guide_preload_worker():
                 # WARNING: (0, 0) is normal until the main loop draws its first frame; only a size still unset after the wait below is a failure.
                 if _winsize_wait_since is None:
                     _winsize_wait_since = time.time()
-                # VALUES CHANGE HERE
-                if time.time() - _winsize_wait_since > 30.0:
+                if time.time() - _winsize_wait_since > GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS:
                     _log_warn_throttled(
                         "guide_preload_bail_winsize",
-                        "[GUIDE] preload worker bailed: window size still not set after 30s (%s, %s)", _w, _h)
+                        "[GUIDE] preload worker bailed: window size still not set after %.0fs (%s, %s)", GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, _w, _h)
                 continue
             _winsize_wait_since = None
-            _theme_snapshot = app_state.get("_active_theme_snapshot") or {
-                "ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)}
+            _theme_snapshot = app_state.get("_active_theme_snapshot") or dict(DEFAULT_THEME)
             if (_guide_preload_scratch_surface is None
                     or _guide_preload_scratch_surface.get_size() != (_w, _h)):
                 _guide_preload_scratch_surface = pygame.Surface((_w, _h))
@@ -15913,7 +16552,7 @@ def _guide_preload_worker():
 
 def _probe_upcoming_media():
     import time as _time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
     if db is None:
         return
     pygame.time.wait(1000)
@@ -15929,49 +16568,12 @@ def _probe_upcoming_media():
         log.warning(f"[MEDIA PRECACHE] resuming interrupted probe batches failed (non-fatal): {_resume_e}")
 
     try:
-        _retarget_cleared = _invalidate_gains_for_target_lufs_change()
-        if _retarget_cleared:
-            print(f"[MEDIA PRECACHE] TARGET_LUFS changed -- cleared "
-                  f"{_retarget_cleared} cached gain(s) for re-probing "
-                  f"against the new target.")
-    except Exception as _retarget_e:
-        log.warning(f"[MEDIA PRECACHE] target_lufs retarget migration failed (non-fatal): {_retarget_e}")
-
-    try:
-        _stale_cleared = _invalidate_stale_fallback_gains()
-        if _stale_cleared:
-            print(f"[MEDIA PRECACHE] Cleared {_stale_cleared} stale fallback "
-                  f"gain(s) for re-probing.")
-    except Exception as _stale_e:
-        log.warning(f"[MEDIA PRECACHE] stale fallback gain migration failed (non-fatal): {_stale_e}")
-
-    try:
-        _mismatched = _reconcile_mismatched_pair_gains()
-        if _mismatched:
-            print(f"[MEDIA PRECACHE] Reset {_mismatched} multi-part pair(s) with "
-                  f"mismatched per-half gain for re-probing as one.")
-    except Exception as _reconcile_e:
-        log.warning(f"[MEDIA PRECACHE] pair gain reconciliation failed (non-fatal): {_reconcile_e}")
-
-    try:
-        _lufs_reset = _reset_all_loudness_gains_for_target_change()
-        if _lufs_reset:
-            print(f"[MEDIA PRECACHE] LUFS target change: cleared {_lufs_reset} "
-                  f"gain(s) for full re-probe under new loudness settings.")
-    except Exception as _lufs_reset_e:
-        log.warning(f"[MEDIA PRECACHE] LUFS target migration failed (non-fatal): {_lufs_reset_e}")
-
-    try:
-        _music_floor_reset = _reset_music_gains_for_new_target()
-        if _music_floor_reset:
-            print(f"[MEDIA PRECACHE] Music target change: cleared {_music_floor_reset} "
-                  f"music gain(s) for re-probe.")
-            try:
-                db.save_settings()
-            except Exception as _mf_save_e:
-                log.warning(f"[MEDIA PRECACHE] music floor migration save failed (non-fatal): {_mf_save_e}")
-    except Exception as _music_floor_e:
-        log.warning(f"[MEDIA PRECACHE] music gain floor migration failed (non-fatal): {_music_floor_e}")
+        _stripped = _strip_local_entry_gains()
+        if _stripped:
+            print(f"[MEDIA PRECACHE] Removed {_stripped} old gain value(s) from the channel lists; gains live only in the library.")
+            db.save_settings()
+    except Exception as _strip_e:
+        log.warning(f"[MEDIA PRECACHE] removing old gains from the channel lists failed (non-fatal): {_strip_e}")
 
     try:
         _run_first_pass_now_playing_sweep()
@@ -15979,25 +16581,21 @@ def _probe_upcoming_media():
         log.warning(f"[MEDIA PRECACHE] first-pass now-playing sweep failed (non-fatal): {_first_pass_e}")
 
     IDLE_SLEEP = PROBE_IDLE_SLEEP_SECONDS
-    _RESWEEP_COOLDOWN_S = 30.0
+    # WARNING: the fallback numbers below must match UPCOMING_PROBE_RESWEEP_COOLDOWN_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    _RESWEEP_COOLDOWN_S = performance_governor.UPCOMING_PROBE_RESWEEP_COOLDOWN_SECONDS if performance_governor is not None else 30.0
     _last_resweep_at = time.monotonic()
     BETWEEN_PROBES = BETWEEN_LOUDNESS_PROBES_SECONDS
-    SAVE_THROTTLE_S = 10.0
+    # WARNING: the fallback numbers below must match UPCOMING_PROBE_SAVE_THROTTLE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    SAVE_THROTTLE_S = performance_governor.UPCOMING_PROBE_SAVE_THROTTLE_SECONDS if performance_governor is not None else 10.0
     _last_backlog_save = 0.0
 
-    def _scan_pace(base_seconds):
-        return _background_scan_pace_seconds(base_seconds)
-
-    def _loudness_scan_pace(base_seconds):
-        _paced = _scan_pace(base_seconds)
-        if db is not None and not db.config.get("loudness_scan_enabled", True):
-            _paced *= LOUDNESS_OFF_SLOWDOWN_MULTIPLIER
-        return _paced
+    def _loudness_scan_pace(scan_class, base_seconds):
+        # WARNING: the loudness scan runs at the same pace with Loudness Scan on or off; off only stops playback from using the gains.
+        return _scan_class_pace_seconds(scan_class, base_seconds)
 
     def _pipeline_workers_now():
         # WARNING: while a video is playing, stay serial; never compete for disk/CPU with what is on screen.
-        spare = not (app_state.get("is_playing_video", False)
-                     or (db is not None and not db.config.get("loudness_scan_enabled", True)))
+        spare = not app_state.get("is_playing_video", False)
         if performance_governor is None:
             return 1
         try:
@@ -16030,7 +16628,6 @@ def _probe_upcoming_media():
             continue
 
         
-        probed_this_pass = 0
         _this_pass_results = {}
         _pass_stats = {"n": 0}
         _pass_state_lock = threading.Lock()
@@ -16261,15 +16858,18 @@ def _probe_upcoming_media():
             _chunk = [_it for _it in _pipeline_items[_pi:_pi + _workers_now] if _it[0] == _head_cls]
             _pi += len(_chunk)
             _attempted.update(_it[5] for _it in _chunk)
-            try:
-                if len(_chunk) == 1:
-                    _pipeline_scan_file(_chunk[0])
-                else:
-                    with ThreadPoolExecutor(max_workers=len(_chunk), thread_name_prefix="scan") as _sex:
-                        list(_sex.map(_pipeline_scan_file, _chunk))
-            except RuntimeError as _shutdown_e:
-                _log_warn_throttled("scan_pipeline_shutdown", f"[SCAN PIPELINE] Skipping chunk, interpreter is shutting down: {_shutdown_e}")
-                return
+            with _scan_thread_slot("loudness", _head_cls) as _slot_ok:
+                if not _slot_ok:
+                    return
+                try:
+                    if len(_chunk) == 1:
+                        _pipeline_scan_file(_chunk[0])
+                    else:
+                        with ThreadPoolExecutor(max_workers=len(_chunk), thread_name_prefix="scan") as _sex:
+                            list(_sex.map(_pipeline_scan_file, _chunk))
+                except RuntimeError as _shutdown_e:
+                    _log_warn_throttled("scan_pipeline_shutdown", f"[SCAN PIPELINE] Skipping chunk, interpreter is shutting down: {_shutdown_e}")
+                    return
             if _pass_stats["n"] != _saved_n and _time.perf_counter() - _last_backlog_save >= SAVE_THROTTLE_S:
                 _saved_n = _pass_stats["n"]
                 _last_backlog_save = _time.perf_counter()
@@ -16277,9 +16877,7 @@ def _probe_upcoming_media():
                     db.save_settings_async()
                 except Exception as _swallowed_error:
                     _log_swallowed("_probe_upcoming_media: db.save_settings_async()", _swallowed_error)
-            _pace = 0.0 if _head_cls == SCAN_CLASS_NOW else _loudness_scan_pace(BETWEEN_PROBES)
-            if _head_cls == SCAN_CLASS_DEEP:
-                _pace *= SCAN_DEEP_SLOWDOWN_MULTIPLIER
+            _pace = _loudness_scan_pace(_head_cls, BETWEEN_PROBES)
             if _pace > 0 and _app_shutting_down.wait(_pace):
                 return
 
@@ -16330,7 +16928,8 @@ def _prewarm_boot_channel_ready(boot_ch):
         if not ch_info.get("is_visualizer", False) and not is_dvd_disc_source(norm_p):
             try:
                 _ordered, block_key = _get_channel_ordered_content(boot_ch, ch_info)
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_prewarm_boot_channel_ready: _ordered, block_key = _get_channel_ordered_content(boot_ch, ch_info)", _swallowed_error)
                 block_key = "Full Day"
             # WARNING: same scan as the tune-in priority scan (priority slot, default timeouts); a short timeout here would abandon it and rescan after boot.
             _mark_loudness_priority_active()
@@ -16576,7 +17175,8 @@ def _prewarm_other_channels_now_playing(targets, units, done_lock):
         log.info("[BOOT PREWARM] %d other-channel now-playing probe(s) skipped while the PC was busy; the normal scan fills them in", _skipped[0])
 
 
-_BOOT_READY_UNIT_WEIGHT = 15
+# WARNING: the fallback numbers below must match BOOT_READY_UNIT_WEIGHT in performance_governor.py; they are used only when that module fails to import.
+_BOOT_READY_UNIT_WEIGHT = performance_governor.BOOT_READY_UNIT_WEIGHT if performance_governor is not None else 15
 
 _boot_drive_wake_done = threading.Event()
 
@@ -16654,11 +17254,13 @@ def _wake_media_drives():
 
 def _prewarm_boot_channel_paths():
     from concurrent.futures import ThreadPoolExecutor
-    _PREWARM_WORKERS = 8
+    # WARNING: the fallback numbers below must match BOOT_PREWARM_WORKERS in performance_governor.py; they are used only when that module fails to import.
+    _PREWARM_WORKERS = performance_governor.BOOT_PREWARM_WORKERS if performance_governor is not None else 8
     try:
         if db is None:
             return
-        _DB_READY_WAIT_TIMEOUT_S = 15.0
+        # WARNING: the fallback numbers below must match BOOT_PREWARM_SETTINGS_WAIT_SECONDS in performance_governor.py; they are used only when that module fails to import.
+        _DB_READY_WAIT_TIMEOUT_S = performance_governor.BOOT_PREWARM_SETTINGS_WAIT_SECONDS if performance_governor is not None else 15.0
         _db_wait_deadline = time.monotonic() + _DB_READY_WAIT_TIMEOUT_S
         while not getattr(db, "ready_flag", False) and time.monotonic() < _db_wait_deadline:
             time.sleep(0.05)
@@ -16743,7 +17345,7 @@ def _prewarm_boot_channel_paths():
         _mark_boot_step("boot_prewarm")
 
 
-SPLASH_IMAGES_BASE_DIR = os.path.join(resolve_main_dir(), "images", "splash screen images")
+SPLASH_IMAGES_BASE_DIR = media.resolve_splash_images_dir()
 SPLASH_VIDEOS_BASE_DIR = os.path.join(resolve_main_dir(), "videos", "splash screen videos")
 
 MENU_BG_BASE_DIR = os.path.join(SPLASH_IMAGES_BASE_DIR, "MENU")
@@ -16784,9 +17386,8 @@ def _caption_precache_worker():
         return
     pygame.time.wait(1000)
 
-    # VALUES CHANGE HERE
     IDLE_SLEEP = CAPTION_IDLE_SLEEP_SECONDS
-    BETWEEN_CHEAP_CHECKS = 0.3
+    BETWEEN_CHEAP_CHECKS = CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS
 
     def _scan_pace(base_seconds):
         return _background_scan_pace_seconds(base_seconds)
@@ -16892,8 +17493,8 @@ def _caption_precache_worker():
             return
 
 
-# VALUES CHANGE HERE
-_GPU_DEDICATED_VRAM_FLOOR_BYTES = 512 * 1024 * 1024
+# WARNING: the fallback numbers below must match GPU_DEDICATED_VRAM_FLOOR_BYTES in performance_governor.py; they are used only when that module fails to import.
+_GPU_DEDICATED_VRAM_FLOOR_BYTES = performance_governor.GPU_DEDICATED_VRAM_FLOOR_BYTES if performance_governor is not None else 512 * 1024 * 1024
 
 _DXGI_ADAPTER_FLAG_SOFTWARE = 0x2
 
@@ -17346,7 +17947,8 @@ def _start_performance_governor():
         _gpu_names = [a["name"] for a in db._detected_gpu_adapters if not a.get("is_software")]
         try:
             _vlc_ver = vlc.libvlc_get_version().decode("utf-8", "replace") if vlc is not None else ""
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_start_performance_governor: _vlc_ver = vlc.libvlc_get_version().decode('utf-8', 'replace') if v...", _swallowed_error)
             _vlc_ver = ""
         performance_governor.start(
             gpu_tier=db._detected_gpu_tier, gpu_names=_gpu_names, vlc_version=_vlc_ver,
@@ -17448,7 +18050,8 @@ def _start_update_check(boot=False):
 def _background_subsystem_worker():
     global db, game_deck, visualizer_deck, _guide_preload_thread_obj
 
-    _BOOT_YIELD = 0.05
+    # WARNING: the fallback numbers below must match BOOT_SUBSYSTEM_YIELD_SECONDS in performance_governor.py; they are used only when that module fails to import.
+    _BOOT_YIELD = performance_governor.BOOT_SUBSYSTEM_YIELD_SECONDS if performance_governor is not None else 0.05
 
     print("Starting database...")
     db = RetroDatabase(detected_aspect_ratio=DETECTED_ASPECT_RATIO)
@@ -17476,7 +18079,6 @@ def _background_subsystem_worker():
 
     _start_performance_governor()
 
-    db.playback_active_check = lambda: app_state.get("is_playing_video", False)
 
     _ensure_ch03_menu_music_seeded()
 
@@ -17645,6 +18247,7 @@ def _background_subsystem_worker():
     app_state["_joystick_init_done"] = True
 
     threading.Thread(target=_scan_snapshot_worker, daemon=True, name="ScanSnapshot").start()
+    threading.Thread(target=_carry_config_file_data_into_hub, daemon=True, name="HubCarryOver").start()
 
     threading.Thread(target=_probe_upcoming_media, daemon=True).start()
 
@@ -17660,6 +18263,8 @@ def _background_subsystem_worker():
 
     # WARNING: the hub's future rows are worked out on their own low-priority thread after boot, one channel per pass, only while the governor allows background work; boot never waits for them.
     threading.Thread(target=_hub_future_worker, daemon=True, name="HubFutureRows").start()
+
+    threading.Thread(target=_slider_watch_loop, daemon=True, name="VolumeWatch").start()
 
     threading.Thread(target=_drive_health_monitor_loop, daemon=True, name="DriveHealthMonitor").start()
 
@@ -17697,47 +18302,55 @@ def _safe_gain(entry, default=1.0):
     return g if g and g > 0 else default
 
 def _lookup_file_gain(ch_key, file_path, default=1.0):
+    """The gain a file plays with: the library's scanned gain (the playing track's own gain when another audio track plays) times the owner's manual dB; a channel streamed from a connected Server uses the gain the Server sent in its schedule, which is the Server's library gain."""
     if not file_path or db is None:
         return default
-    manual_db = _get_manual_audio_gain_db(file_path)
-    manual_gain = 10 ** (manual_db / 20.0)
+    manual_gain = 10 ** (_get_manual_audio_gain_db(file_path) / 20.0)
     norm_target = os.path.normpath(file_path)
-    if _library_gain_first(ch_key):
-        _library_gain = _get_library_gain(norm_target)
-        if _library_gain is not None:
-            return _library_gain * manual_gain
+    if not _library_gain_first(ch_key):
+        _server_gain = _server_entry_gain(ch_key, norm_target)
+        if _server_gain is not None:
+            return _server_gain * manual_gain
+    _library_gain = _get_library_gain(norm_target)
+    if _library_gain is not None:
+        _track_gain = _playing_track_gain(norm_target)
+        if _track_gain is not None and not _owner_set_gain(norm_target):
+            return _track_gain * 10 ** (_learned_offset_applied(norm_target) / 20.0) * manual_gain
+        return _library_gain * manual_gain
+    return default * manual_gain
+
+
+def _server_entry_gain(ch_key, norm_target):
+    """The gain the connected Server sent for a file in a streamed channel's schedule, or None when it sent none."""
     ch_info = db.channels_db.get(str(ch_key).zfill(2), {})
-    pools = list(ch_info.get("schedules", {}).values()) + list(ch_info.get("holiday_schedules", {}).values())
-    for pool in pools:
+    for pool in list(ch_info.get("schedules", {}).values()) + list(ch_info.get("holiday_schedules", {}).values()):
         if not isinstance(pool, list):
             continue
         for entry in pool:
             if not isinstance(entry, dict):
                 continue
             if os.path.normpath(entry.get("path", entry.get("file", ""))) == norm_target:
-                if "gain" in entry:
-                    return _safe_gain(entry, default) * manual_gain
-                break
+                return _safe_gain(entry, None) if "gain" in entry else None
             if entry.get("is_pair"):
-                _p1 = entry.get("pair_ep1_path", "")
-                _p2 = entry.get("pair_ep2_path", "")
-                if _p1 and os.path.normpath(_p1) == norm_target:
-                    g = entry.get("pair_ep1_gain") or entry.get("gain")
-                    if g and float(g) > 0:
-                        return float(g) * manual_gain
-                    break
-                if _p2 and os.path.normpath(_p2) == norm_target:
-                    g = entry.get("pair_ep2_gain") or entry.get("gain")
-                    if g and float(g) > 0:
-                        return float(g) * manual_gain
-                    break
-        else:
-            continue
-        break
-    _cached_gain = _read_file_probe_facts(norm_target).get("gain")
-    if _cached_gain and float(_cached_gain) > 0:
-        return float(_cached_gain) * manual_gain
-    return default * manual_gain
+                for _key, _gkey in (("pair_ep1_path", "pair_ep1_gain"), ("pair_ep2_path", "pair_ep2_gain")):
+                    _p = entry.get(_key, "")
+                    if _p and os.path.normpath(_p) == norm_target:
+                        g = entry.get(_gkey) or entry.get("gain")
+                        return float(g) if g and float(g) > 0 else None
+    return None
+
+
+def _owner_set_gain(norm_path):
+    """True when the file's saved gain is the owner's own; the owner's gain wins on every audio track."""
+    hub = _get_gain_hub()
+    if hub is None:
+        return False
+    try:
+        return hub.read(norm_path)["scan_version"] == media.OWNER_GAIN_SCAN_VERSION
+    except Exception as _swallowed_error:
+        _log_swallowed("_owner_set_gain: reading the file's gain row", _swallowed_error)
+        return False
+
 
 def _reset_marathon_anchor(ch_info):
     _n = broadcast_clock.now().replace(tzinfo=None)
@@ -17813,7 +18426,8 @@ def _missed_block_day_seeds(prev_block_key, block_name, channel_num, block_offse
         prev_year = int(parts[0])
         prev_yday = int(parts[1])
         prev_date = datetime.date(prev_year, 1, 1) + datetime.timedelta(days=prev_yday - 1)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError) as _swallowed_error:
+        _log_swallowed("_missed_block_day_seeds: prev_year = int(parts[0])", _swallowed_error)
         return []
 
     now_date = now_dt.date()
@@ -17890,7 +18504,8 @@ def _apply_scheduling_mode_change(ch_info, new_mode, target_ch_str):
                         "block":       _ls.get("block", "Morning"),
                         "interior_cut": bool(_ls.get("interior_cut", False)),
                     }
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("_apply_scheduling_mode_change: _ls = calculate_slotted_playback_state(target_ch_str)", _swallowed_error)
                 _live_now = None
 
     if _live_now and _live_now.get("file"):
@@ -18102,7 +18717,8 @@ def _cached_lineup_durations_stale(cached_durations,
     if movie_threshold_seconds is None:
         try:
             from media import MOVIE_LENGTH_THRESHOLD_SECONDS as movie_threshold_seconds
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_cached_lineup_durations_stale: from media import MOVIE_LENGTH_THRESHOLD_SECONDS as movie_threshold...", _swallowed_error)
             movie_threshold_seconds = 4800
     _frozen_aired = frozen_aired_paths or ()
     for path, frozen in cached_durations.items():
@@ -18138,9 +18754,8 @@ def _apply_repeat_guard(target_clean_key, playback_log, block_label, timeline,
     if len(_distinct_paths) <= 1:
         return target_show, position_in_playlist
 
-    # VALUES CHANGE HERE
-    _REPEAT_GUARD_SEC = 60
-    _REPEAT_GUARD_WINDOW = 900
+    _REPEAT_GUARD_SEC = SCHEDULER_REPEAT_GUARD_SECONDS
+    _REPEAT_GUARD_WINDOW = SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS
 
     _je_slot = playback_log.get("just_ended_slot")
     if _je_slot:
@@ -18270,7 +18885,8 @@ def _hub_forget_path(norm_path):
         log.warning("[SCHEDULE HUB] could not forget the lengths of %s: %s", os.path.basename(str(norm_path)), e)
 
 
-_ONDEMAND_DURATION_PROBE_COOLDOWN_S = 30.0
+# WARNING: the fallback numbers below must match ONDEMAND_DURATION_PROBE_COOLDOWN_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_ONDEMAND_DURATION_PROBE_COOLDOWN_S = performance_governor.ONDEMAND_DURATION_PROBE_COOLDOWN_SECONDS if performance_governor is not None else 30.0
 _ondemand_duration_probe_next = {}
 _duration_precache_inflight = media._InFlightGuard()
 
@@ -18412,10 +19028,10 @@ def _prime_block_durations_on_cold_start(target_clean_key, current_block, video_
 # ============================================================================
 # SECTION: Scan failure classification (stalled drive vs dead file)
 # ============================================================================
-# VALUES CHANGE HERE
-SCAN_RETRY_LIMIT = 3
-SCAN_DEAD_BURST_LIMIT = 5
-SCAN_DEAD_BURST_WINDOW_S = 300.0
+# WARNING: the fallback numbers below must match SCAN_RETRY_LIMIT, SCAN_DEAD_BURST_LIMIT, SCAN_DEAD_BURST_WINDOW_S in performance_governor.py; they are used only when that module fails to import.
+SCAN_RETRY_LIMIT = performance_governor.SCAN_RETRY_LIMIT if performance_governor is not None else 3
+SCAN_DEAD_BURST_LIMIT = performance_governor.SCAN_DEAD_BURST_LIMIT if performance_governor is not None else 5
+SCAN_DEAD_BURST_WINDOW_S = performance_governor.SCAN_DEAD_BURST_WINDOW_S if performance_governor is not None else 300.0
 
 SCAN_FAIL_DRIVE = "drive"
 SCAN_FAIL_DEAD = "dead"
@@ -18434,7 +19050,8 @@ def _scan_bounded(fn):
     def _go():
         try:
             box["r"] = fn()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_scan_bounded._go: box['r'] = fn()", _swallowed_error)
             box["r"] = "error"
 
     t = threading.Thread(target=_go, daemon=True, name="scan-read-probe")
@@ -18663,7 +19280,8 @@ _HEAVY_VISUAL_EFFECT_CONFIG_KEYS = (
     "fake_reception_lines_enabled",
 )
 
-GUIDE_BACKOFF_MULTIPLIER = 2.0
+# WARNING: the fallback numbers below must match GUIDE_BACKOFF_MULTIPLIER in performance_governor.py; they are used only when that module fails to import.
+GUIDE_BACKOFF_MULTIPLIER = performance_governor.GUIDE_BACKOFF_MULTIPLIER if performance_governor is not None else 2.0
 
 
 def _is_game_actively_playing():
@@ -18724,6 +19342,41 @@ def _background_scan_pace_seconds(base_seconds):
         factor = max(performance_governor.PACE_FACTOR_FLOOR, performance_governor.LEVEL_FACTOR[level])
         pace /= factor
     return pace
+
+
+def _scan_class_name(scan_class):
+    """The governor's pace class for a scan-pipeline class: "now" for files airing now, "deep" for the files behind the next 3 shows, "next" for the rest."""
+    if scan_class == SCAN_CLASS_NOW or scan_class == "now":
+        return "now"
+    if scan_class == SCAN_CLASS_DEEP or scan_class == "deep":
+        return "deep"
+    return "next"
+
+
+def _scan_class_pace_seconds(scan_class, base_seconds):
+    """Pause after one file of the duration, picture-box, loudness or music scan: none for a file airing now, short for the next 3 shows, longer for the files behind them; stretched by playback, the guide, the load level, the PC and the mode, shortened while the PC is quiet."""
+    name = _scan_class_name(scan_class)
+    if name == "now":
+        return 0.0
+    playing = bool(app_state.get("is_playing_video", False) or _is_game_actively_playing()
+                   or _menu_open_with_heavy_effects())
+    if performance_governor is None:
+        return _background_scan_pace_seconds(base_seconds)
+    try:
+        return performance_governor.scan_pace_seconds(name, base_seconds, playing=playing,
+                                                      guide_open=(not playing) and _guide_open())
+    except Exception as e:
+        _log_warn_throttled("scan_class_pace", "[SCAN PACE] governor pace failed, using the background pace: %s" % e)
+        return _background_scan_pace_seconds(base_seconds)
+
+
+def _scan_thread_slot(kind, scan_class):
+    """Context manager holding one of the governor's shared scan threads for one file; files airing now never wait. Yields False when the app is shutting down."""
+    if performance_governor is None:
+        import contextlib as _ctx
+        return _ctx.nullcontext(True)
+    return performance_governor.scan_thread_slot(kind, priority=_scan_class_name(scan_class) == "now",
+                                                 stop=_app_shutting_down)
 
 
 _picture_box_path_locks = {}
@@ -18826,7 +19479,6 @@ def _pipeline_stage_picture_box(norm_p):
 
 
 _PICTURE_BOX_PRE_SHOW_BUDGET_S = performance_governor.PICTURE_BOX_PRE_SHOW_BUDGET_S if performance_governor is not None else 8.0
-_PICTURE_BOX_PRE_SHOW_PARALLEL = performance_governor.PICTURE_BOX_PRE_SHOW_PARALLEL if performance_governor is not None else 6
 
 
 def _decide_picture_box_before_show(path):
@@ -18856,8 +19508,12 @@ def _decide_picture_box_before_show(path):
         if _is_drive_degraded(norm_p):
             log.info("[PICTURE BOX] pre-show: %s is on hold (drive struggling), played with its full frame", os.path.basename(norm_p))
             return None
+        # WARNING: on a PC where first-start scans must run in sequence, decoding the sample points side by side starves the file that is starting and stalls the picture.
+        _pb_parallel, _pb_why = (performance_governor.picture_box_pre_show_parallel()
+                                 if performance_governor is not None else (1, "no governor"))
+        log.info("[PICTURE BOX] pre-show: %s, %d sample point(s) at once (%s)", os.path.basename(norm_p), _pb_parallel, _pb_why)
         _t0 = time.monotonic()
-        _worker = threading.Thread(target=_picture_box_scan_one_priority, args=(lib, _ml, norm_p, _PICTURE_BOX_PRE_SHOW_PARALLEL),
+        _worker = threading.Thread(target=_picture_box_scan_one_priority, args=(lib, _ml, norm_p, _pb_parallel),
                                    daemon=True, name="pre-show-picbox")
         _worker.start()
         _worker.join(timeout=_PICTURE_BOX_PRE_SHOW_BUDGET_S)
@@ -18989,15 +19645,18 @@ def _duration_scan_worker():
             if _scan_drive_on_hold(_norm_p):
                 continue
             _attempted.add(_norm_p)
-            try:
-                with (_governor_priority_scope() if _cls == SCAN_CLASS_NOW else _governor_nullscope()):
-                    if _scan_store_duration(_kind, _ch_key, _block_key, _norm_p) > 0:
-                        _stored += 1
-                    else:
-                        _scan_duration_failed(_norm_p)
-            except Exception as e:
-                log.warning("[DURATION SCAN] %s failed (next file continues): %s", os.path.basename(_norm_p), e)
-            _pace = 0.0 if _cls == SCAN_CLASS_NOW else _background_scan_pace_seconds(BETWEEN_LOUDNESS_PROBES_SECONDS)
+            with _scan_thread_slot("duration", _cls) as _slot_ok:
+                if not _slot_ok:
+                    return
+                try:
+                    with (_governor_priority_scope() if _cls == SCAN_CLASS_NOW else _governor_nullscope()):
+                        if _scan_store_duration(_kind, _ch_key, _block_key, _norm_p) > 0:
+                            _stored += 1
+                        else:
+                            _scan_duration_failed(_norm_p)
+                except Exception as e:
+                    log.warning("[DURATION SCAN] %s failed (next file continues): %s", os.path.basename(_norm_p), e)
+            _pace = _scan_class_pace_seconds(_cls, BETWEEN_LOUDNESS_PROBES_SECONDS)
             if _pace > 0 and _app_shutting_down.wait(_pace):
                 return
             if time.monotonic() - _gathered_at >= SCAN_PIPELINE_PREEMPT_CHECK_SECONDS:
@@ -19083,13 +19742,16 @@ def _picture_box_scan_worker():
             if _scan_drive_on_hold(_norm_p):
                 continue
             _attempted.add(_norm_p)
-            try:
-                with (_governor_priority_scope() if _cls == SCAN_CLASS_NOW else _governor_nullscope()):
-                    if _pipeline_stage_picture_box(_norm_p):
-                        _scanned += 1
-            except Exception as e:
-                log.warning("[PICTURE BOX] lane: %s failed (next file continues): %s", os.path.basename(_norm_p), e)
-            _pace = 0.0 if _cls == SCAN_CLASS_NOW else _background_scan_pace_seconds(PICTURE_BOX_BETWEEN_FILES_SECONDS)
+            with _scan_thread_slot("picture_box", _cls) as _slot_ok:
+                if not _slot_ok:
+                    return
+                try:
+                    with (_governor_priority_scope() if _cls == SCAN_CLASS_NOW else _governor_nullscope()):
+                        if _pipeline_stage_picture_box(_norm_p):
+                            _scanned += 1
+                except Exception as e:
+                    log.warning("[PICTURE BOX] lane: %s failed (next file continues): %s", os.path.basename(_norm_p), e)
+            _pace = _scan_class_pace_seconds(_cls, PICTURE_BOX_BETWEEN_FILES_SECONDS)
             if _pace > 0 and _app_shutting_down.wait(_pace):
                 return
             if time.monotonic() - _gathered_at >= SCAN_PIPELINE_PREEMPT_CHECK_SECONDS:
@@ -19136,6 +19798,10 @@ def _note_missed_blocks(ch_info, channel_key, show_pos, prev_block_key, block_ke
     try:
         _history_t0 = time.perf_counter()
         playback_log = ch_info.setdefault("playback_log", {})
+        # WARNING: the block-start check and the scheduler both ask for the same gap in one pass; its records are already in the ledger and the hub after the first, so the second walk is skipped.
+        if playback_log.get("_missed_blocks_noted") == [prev_block_key, block_key]:
+            return
+        playback_log["_missed_blocks_noted"] = [prev_block_key, block_key]
         records = media.replay_missed_blocks(
             channel_key, ch_info, show_pos, prev_block_key, block_key, now,
             _cached_path_exists, commercial_tracks, lambda _offset: _start_order_seed(ch_info, _offset),
@@ -19298,7 +19964,8 @@ def _hub_future_worker():
         try:
             _watched = str(app_state.get("current_channel", "")).zfill(2)
             _channels = sorted((str(i).zfill(2) for i in range(5, 45)), key=lambda c: (c != _watched, c))
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_hub_future_worker: _watched = str(app_state.get('current_channel', '')).zfill(2)", _swallowed_error)
             _channels = [str(i).zfill(2) for i in range(5, 45)]
         for _ch in _channels:
             if _app_shutting_down.is_set():
@@ -19713,10 +20380,10 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
               if not h_raw_tracks and h_pending_tracks:
                   return {
                       "mode": "Static", "file": "", "seek": 0,
-                      "reason": "probe_failed",
+                      "reason": "first_file_scanning",
                       "reason_detail": (
-                          f"CH{target_clean_key} holiday {holiday_key}: immediate duration "
-                          f"probe failed for {len(h_pending_tracks)} scheduled file(s)"
+                          f"CH{target_clean_key} holiday {holiday_key}: waiting for the first file's length; "
+                          f"{len(h_pending_tracks)} scheduled file(s) are scanned one at a time"
                       ),
                   }
 
@@ -19926,21 +20593,18 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           block_duration_seconds = block_length_seconds(current_block)
       elif _six_block_mode:
           current_hour = now.hour
-          current_block, block_start_hour, block_end_hour = SIX_HOUR_BLOCKS[current_hour // 4]
+          current_block, block_start_hour, _block_end_hour = SIX_HOUR_BLOCKS[current_hour // 4]
       else:
           current_hour = now.hour
           if 4 <= current_hour < 12:
               current_block = "Morning"
               block_start_hour = 4
-              block_end_hour = 12
           elif 12 <= current_hour < 20:
               current_block = "Evening"
               block_start_hour = 12
-              block_end_hour = 20
           else:
               current_block = "Night"
               block_start_hour = 20
-              block_end_hour = 4
 
       if _marathon_mode:
           pass
@@ -20051,10 +20715,10 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       if not raw_tracks and _pending_tracks:
           return {
               "mode": "Static", "file": "", "seek": 0,
-              "reason": "probe_failed",
+              "reason": "first_file_scanning",
               "reason_detail": (
-                  f"CH{target_clean_key} {current_block}: immediate duration probe "
-                  f"failed for {len(_pending_tracks)} scheduled file(s)"
+                  f"CH{target_clean_key} {current_block}: waiting for the first file's length; "
+                  f"{len(_pending_tracks)} scheduled file(s) are scanned one at a time"
               ),
           }
 
@@ -20249,7 +20913,11 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                         commercial_state=playback_log.get("commercial_pos"),
                     )
                     if _old_total > 0:
-                        _old_pos = seconds_into_block % _old_total
+                        # WARNING: the place in the airing cycle must be found the same way the scheduler finds it below (from the saved cycle start, or the remainder in marathon mode); a remainder of the block time in any other mode keeps the wrong entries once a block has passed its first cycle.
+                        _old_boundary = playback_log.get("sched_cycle_boundary", 0) or 0
+                        if _old_boundary > seconds_into_block:
+                            _old_boundary = 0
+                        _old_pos = seconds_into_block % _old_total if _marathon_mode else seconds_into_block - _old_boundary
                         _vt_idx = -1
                         _last_path = None
                         _found = False
@@ -20282,13 +20950,19 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                     if (isinstance(_cycle_start_rec, dict) and _cycle_start_rec.get("block_key") == block_key
                             and isinstance(_cycle_start_rec.get("positions"), dict)
                             and isinstance(_prior_kept, int) and 0 <= _prior_kept <= _keep_n):
+                        # WARNING: the entries that aired were dealt in the slot mode and episode order saved with the cycle's start; replaying them in a mode just switched to moves each show by the wrong count and a show repeats or skips an episode.
+                        _replay_info = dict(ch_info)
+                        for _rec_field, _info_field in (("mode", "scheduling_mode"), ("order", "episode_order_mode")):
+                            if _cycle_start_rec.get(_rec_field):
+                                _replay_info[_info_field] = _cycle_start_rec[_rec_field]
                         _kept_pos = media.positions_after_aired_entries(
-                            raw_tracks, ch_info, _cycle_start_rec["positions"], day_seed, block_duration_seconds,
+                            raw_tracks, _replay_info, _cycle_start_rec["positions"], day_seed, block_duration_seconds,
                             target_clean_key, _show_order_by_block.get(current_block), _order_seed,
                             _old_video_tracks[_prior_kept:], _keep_n - _prior_kept, pending_tracks=_pending_tracks)
                         if _kept_pos is not None:
                             _tail_start_pos = _kept_pos
-                            _reflavor_cycle_rec = {"block_key": block_key, "positions": copy.deepcopy(_kept_pos), "kept": _keep_n}
+                            _reflavor_cycle_rec = {"block_key": block_key, "positions": copy.deepcopy(_kept_pos), "kept": _keep_n,
+                                                   "mode": ch_info.get("scheduling_mode"), "order": ch_info.get("episode_order_mode")}
                         else:
                             log.warning("[SCHEDULER] ch%s block=%s the kept entries could not be tied to their shows; the rebuilt tail starts from the positions as saved",
                                         target_clean_key, current_block)
@@ -20436,13 +21110,13 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
               "groups":    copy.deepcopy(playback_log.get("sched_cached_groups")),
               "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
           }
-          # VALUES CHANGE HERE
-          if len(_blk_rot_cache_n) > 12:
-              for _prune_bk_n in sorted(_blk_rot_cache_n.keys())[:-12]:
+          if len(_blk_rot_cache_n) > BLOCK_ROTATION_CACHE_MAX_BLOCKS:
+              for _prune_bk_n in sorted(_blk_rot_cache_n.keys())[:-BLOCK_ROTATION_CACHE_MAX_BLOCKS]:
                   _blk_rot_cache_n.pop(_prune_bk_n, None)
           playback_log["sched_cycle_boundary"] = 0
           playback_log["sched_cycle_total"]    = 0
-          playback_log["sched_cycle_start_pos"] = {"block_key": block_key, "positions": copy.deepcopy(_new_block_start_pos), "kept": 0}
+          playback_log["sched_cycle_start_pos"] = {"block_key": block_key, "positions": copy.deepcopy(_new_block_start_pos), "kept": 0,
+                                                   "mode": ch_info.get("scheduling_mode"), "order": ch_info.get("episode_order_mode")}
           try: db.save_settings()
           except Exception as e: log.warning("calculate_slotted_playback_state: failed to persist sched_cached_tracks: %s", e)
           app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
@@ -20535,9 +21209,6 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
       if not _marathon_mode:
           _cyc_boundary = playback_log.get("sched_cycle_boundary", 0)
           _cyc_total    = playback_log.get("sched_cycle_total", 0) or total_block_content
-          if _pending_changed and total_block_content > 0:
-              _cyc_boundary = seconds_into_block - (seconds_into_block % total_block_content)
-              _cyc_total = total_block_content
           if _cyc_boundary > seconds_into_block:
               _cyc_boundary = 0
               _cyc_total    = total_block_content
@@ -20628,7 +21299,8 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
           if _cycle_changed and timeline and total_block_content > 0:
               playback_log["show_pos"] = _sp2
               if _airing_cycle_start_pos is not None:
-                  playback_log["sched_cycle_start_pos"] = {"block_key": block_key, "positions": copy.deepcopy(_airing_cycle_start_pos), "kept": 0}
+                  playback_log["sched_cycle_start_pos"] = {"block_key": block_key, "positions": copy.deepcopy(_airing_cycle_start_pos), "kept": 0,
+                                                           "mode": ch_info.get("scheduling_mode"), "order": ch_info.get("episode_order_mode")}
               playback_log["commercial_pos"] = _live_cp2
               playback_log["commercial_next_pos"] = _cp2
               if _new_show_order2 is not None:
@@ -20811,7 +21483,7 @@ def _remove_confirmed_file_from_saved_lineups(file_path):
     if db is None or not file_path:
         return False
     changed = False
-    for _ch_info in db.channels_db.values():
+    for _ch_key, _ch_info in db.channels_db.items():
         _log = _ch_info.get("playback_log") or {}
         _tracks = _log.get("sched_cached_tracks")
         if not isinstance(_tracks, list) or file_path not in _tracks:
@@ -20820,6 +21492,7 @@ def _remove_confirmed_file_from_saved_lineups(file_path):
         _durations = dict(_log.get("sched_cached_durations") or {})
         _durations.pop(file_path, None)
         _record = copy.deepcopy(_log.get("sched_cached_groups"))
+        _pair_broken = False
         if isinstance(_record, dict) and isinstance(_record.get("groups"), list):
             _groups = []
             for _group in _record["groups"]:
@@ -20829,10 +21502,16 @@ def _remove_confirmed_file_from_saved_lineups(file_path):
                 _kind = _group.get("kind", "single")
                 if _kind == "pair" and len(_paths) != 2:
                     _kind = "single"
+                    _pair_broken = True
                 _groups.append({"kind": _kind, "paths": _paths})
             _record["groups"] = _groups
         _set_saved_lineup(_log, _new_tracks, _durations, _record)
         changed = True
+        if _pair_broken:
+            # WARNING: a short episode must not air alone because its partner was found broken; the entries still ahead are dealt again so it gets a new partner, and nothing that aired or is on air changes.
+            log.warning("[SCHEDULER] ch%s: %s was removed from a pair; the entries still ahead are dealt again so its partner gets a new one",
+                        _ch_key, os.path.basename(str(file_path)))
+            _request_schedule_rebuild(_ch_key, _log.get("sched_block_key"))
     return changed
 
 
@@ -20852,7 +21531,8 @@ def _mark_file_broken(ch_info, file_path, reason=None):
     if not _confirmed:
         try:
             _root = media._drive_root_of(file_path)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_mark_file_broken: _root = media._drive_root_of(file_path)", _swallowed_error)
             _root = None
         if _root is not None and (_root in _unresponsive_drive_roots() or _is_drive_degraded(file_path)):
             log.warning("_mark_file_broken: NOT counting this failure against %s -- drive %s "
@@ -20970,16 +21650,18 @@ def _perceptual_volume_pct(slider_pct, min_db=-40.0):
     return amplitude_frac * 100.0
 
 
-STACKED_GAIN_MIN_DB = -48.0
+# WARNING: the fallback numbers below must match STACKED_GAIN_MIN_DB in performance_governor.py; they are used only when that module fails to import.
+STACKED_GAIN_MIN_DB = performance_governor.STACKED_GAIN_MIN_DB if performance_governor is not None else -48.0
 
 
-VLC_GAIN_MIN_DB = -18.0
+# WARNING: the fallback numbers below must match VLC_GAIN_MIN_DB in performance_governor.py; they are used only when that module fails to import.
+VLC_GAIN_MIN_DB = performance_governor.VLC_GAIN_MIN_DB if performance_governor is not None else -18.0
 
 
 VLC_VOLUME_CEILING = int(100 * LOUDNESS_GAIN_CEILING)
 
-# VALUES CHANGE HERE
-MAX_COMFORTABLE_VOLUME = 135
+# WARNING: the fallback numbers below must match MAX_COMFORTABLE_VOLUME in performance_governor.py; they are used only when that module fails to import.
+MAX_COMFORTABLE_VOLUME = performance_governor.MAX_COMFORTABLE_VOLUME if performance_governor is not None else 135
 
 
 def _effective_audio_gain(min_db=-40.0):
@@ -20996,11 +21678,13 @@ def _effective_loudness_gain(gain):
         return 1.0
     try:
         return float(gain) if gain and float(gain) > 0 else 1.0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as _swallowed_error:
+        _log_swallowed("_effective_loudness_gain: return float(gain) if gain and float(gain) > 0 else 1.0", _swallowed_error)
         return 1.0
 
 
-_STATIC_AUDIO_GAIN_PRECACHED = 0.25
+# WARNING: the fallback numbers below must match STATIC_AUDIO_GAIN_PRECACHED in performance_governor.py; they are used only when that module fails to import.
+_STATIC_AUDIO_GAIN_PRECACHED = performance_governor.STATIC_AUDIO_GAIN_PRECACHED if performance_governor is not None else 0.25
 
 _STATIC_AUDIO_GAIN = _STATIC_AUDIO_GAIN_PRECACHED
 
@@ -21024,7 +21708,8 @@ def load_custom_static_sound():
 
     try:
         _mixer_freq, _mixer_fmt, _mixer_ch = pygame.mixer.get_init()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("load_custom_static_sound: _mixer_freq, _mixer_fmt, _mixer_ch = pygame.mixer.get_init()", _swallowed_error)
         _mixer_freq, _mixer_ch = 44100, 2
     _mixer_ch = _mixer_ch if _mixer_ch in (1, 2) else 2
     _duration_s = 1.0
@@ -21069,9 +21754,7 @@ _transition_static_noise_cache = {"key": None, "surface": None, "built_at": 0}
 def _render_transition_static(screen, rect, target_aspect=None):
     """Renders the transition static burst inside `rect`; target_aspect overrides the global Aspect Ratio setting."""
     # WARNING: the guide preview box is a fixed 16:9 rect; only the video inside it is pillarboxed to 4:3, never the box.
-    if 'static_audio' in globals() and static_audio is not None and static_audio.get_num_channels() == 0:
-        static_audio.play(-1)
-        static_audio.set_volume(_effective_audio_gain() * _effective_loudness_gain(_STATIC_AUDIO_GAIN))
+    _static_sound_play()
 
     fit_rect = _aspect_fit_rect(rect, target_aspect=target_aspect)
     if fit_rect.width < rect.width or fit_rect.height < rect.height:
@@ -21109,7 +21792,7 @@ def _render_transition_static(screen, rect, target_aspect=None):
             cache["built_at"] = now
         screen.blit(cache["surface"], (rect.x, rect.y))
     else:
-        screen.fill((1, 1, 1), rect)
+        screen.fill(COLOR_SCREEN_BLACK, rect)
 
 
 def _static_transition_running():
@@ -21128,12 +21811,45 @@ def _channel_transition_over():
     return not _static_transition_running()
 
 
+_static_sound_state = {"last_stop": "", "last_stop_ms": 0, "stop_counts": {}, "logged_restart": ""}
+
+
+def _static_sound_play():
+    """Starts the Static noise at the current volume when it is not playing; one line names what stopped it last."""
+    # WARNING: a mixer channel keeps the volume another sound gave it, so the channel the noise lands on is set back to full; the noise's own volume is set on the sound.
+    if 'static_audio' not in globals() or static_audio is None or static_audio.get_num_channels() != 0:
+        return
+    channel = static_audio.play(-1)
+    if channel is None:
+        _log_swallowed("_static_sound_play: starting the Static noise", RuntimeError("no free mixer channel"))
+        return
+    channel.set_volume(1.0)
+    static_audio.set_volume(_effective_audio_gain() * _effective_loudness_gain(_STATIC_AUDIO_GAIN))
+    last = _static_sound_state["last_stop"]
+    if last and last != _static_sound_state["logged_restart"]:
+        _static_sound_state["logged_restart"] = last
+        log.info("[STATIC SOUND] started again; last stopped by %s %d ms before",
+                 last, pygame.time.get_ticks() - _static_sound_state["last_stop_ms"])
+
+
+def _static_sound_stop(where):
+    """Stops the Static noise if it is playing and remembers who stopped it; the 1st, 10th, 100th ... stop from one place writes a line."""
+    if 'static_audio' not in globals() or static_audio is None or static_audio.get_num_channels() == 0:
+        return
+    static_audio.stop()
+    _static_sound_state["last_stop"] = where
+    _static_sound_state["last_stop_ms"] = pygame.time.get_ticks()
+    count = _static_sound_state["stop_counts"].get(where, 0) + 1
+    _static_sound_state["stop_counts"][where] = count
+    if count == 10 ** (len(str(count)) - 1):
+        log.info("[STATIC SOUND] stopped by %s%s", where, "" if count == 1 else " (seen %d times)" % count)
+
+
 def _stop_transition_static():
     # WARNING: this must do nothing while a Static-style burst or flip is running, or the noise is cut every frame and never heard.
     if _static_transition_running():
         return
-    if 'static_audio' in globals() and static_audio is not None:
-        static_audio.stop()
+    _static_sound_stop("a transition that is not Static style")
 
 
 def _mute_guard_engine(ch):
@@ -21150,7 +21866,8 @@ def _mute_guard_log(event, ch=None, filepath=None, extra=""):
     _cur_fp = os.path.basename(getattr(_engine, "current_filepath", "") or "") if _engine is not None else "?"
     try:
         _mute_now = _engine.player.audio_get_mute() if _engine is not None else "?"
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_mute_guard_log: _mute_now = _engine.player.audio_get_mute() if _engine is not None ...", _swallowed_error)
         _mute_now = "?"
     print(f"[MUTE GUARD] {event} | thread={_tid} ch={ch} armed_for={_short_fp} "
           f"engine_current_file={_cur_fp} pending_unmute={app_state.get('_video_pending_unmute', False)} "
@@ -21229,7 +21946,8 @@ def _lift_buffering_mute(ch, reason):
 
     try:
         _post_lift_mute = _engine.player.audio_get_mute()
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_lift_buffering_mute: _post_lift_mute = _engine.player.audio_get_mute()", _swallowed_error)
         _post_lift_mute = "?"
     if _post_lift_mute == -1:
         def _verify_mute_landed(_ch=ch, _reason=reason, _want_muted=_still_muted, _engine=_engine):
@@ -21373,9 +22091,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         and (pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0)
              or _surf_origin_active())
     )
-    if (not _mid_static_burst and not internal_advance
-            and 'static_audio' in globals() and static_audio is not None):
-        static_audio.stop()
+    if not _mid_static_burst and not internal_advance:
+        _static_sound_stop("change_channel")
     
     old_ch = app_state.get("current_channel", "05")
 
@@ -21576,7 +22293,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         try:
             if int(_warm_hl) < 5:
                 _warm_hl = "05"
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as _swallowed_error:
+            _log_swallowed("change_channel: if int(_warm_hl) < 5:", _swallowed_error)
             _warm_hl = "05"
         if (_outgoing_live_snapshot is not None
                 and _warm_hl == str(old_ch).zfill(2)):
@@ -21589,7 +22307,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         else:
             try:
                 _warm_guide_target = calculate_slotted_playback_state(_warm_hl)
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("change_channel: _warm_guide_target = calculate_slotted_playback_state(_warm_hl)", _swallowed_error)
                 _warm_guide_target = {}
         _warm_loaded_norm = os.path.normpath(
             str(getattr(vlc_engine, "current_filepath", "") or "")).lower()
@@ -21601,7 +22320,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                 and _warm_loaded_norm == _warm_target_norm):
             try:
                 _guide_entry_warm_skip_stop = vlc_engine.player.is_playing()
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("change_channel: _guide_entry_warm_skip_stop = vlc_engine.player.is_playing()", _swallowed_error)
                 _guide_entry_warm_skip_stop = False
             if _guide_entry_warm_skip_stop:
                 _guide_entry_warm_target_file = _warm_guide_target["file"]
@@ -21614,12 +22334,14 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         try:
             if int(_warm_hl_vis) < 5:
                 _warm_hl_vis = "05"
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as _swallowed_error:
+            _log_swallowed("change_channel: if int(_warm_hl_vis) < 5:", _swallowed_error)
             _warm_hl_vis = "05"
         if _warm_hl_vis == str(old_ch).zfill(2):
             try:
                 _warm_guide_vis_target = calculate_slotted_playback_state(_warm_hl_vis)
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("change_channel: _warm_guide_vis_target = calculate_slotted_playback_state(_warm_hl_...", _swallowed_error)
                 _warm_guide_vis_target = {}
             _warm_vis_loaded_norm = os.path.normpath(str(current_playing_track or "")).lower()
             _warm_vis_target_norm = os.path.normpath(
@@ -21636,7 +22358,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
     if _GUIDE_WARM_CONTINUATION_ENABLED and old_ch == "04" and new_ch != "04" and vlc_engine is not None:
         try:
             _exit_warm_target = calculate_slotted_playback_state(new_ch)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("change_channel: _exit_warm_target = calculate_slotted_playback_state(new_ch)", _swallowed_error)
             _exit_warm_target = {}
         _exit_loaded_norm = os.path.normpath(
             str(getattr(vlc_engine, "current_filepath", "") or "")).lower()
@@ -21648,7 +22371,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                 and _exit_loaded_norm == _exit_target_norm):
             try:
                 _guide_exit_warm_skip_stop = vlc_engine.player.is_playing()
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("change_channel: _guide_exit_warm_skip_stop = vlc_engine.player.is_playing()", _swallowed_error)
                 _guide_exit_warm_skip_stop = False
             if _guide_exit_warm_skip_stop:
                 _seed_last_video_frame("fullscreen", "preview")
@@ -21671,7 +22395,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         if app_state.get("music_owner") == "guide_preview" and _exit_guide_preview_track:
             try:
                 _exit_warm_vis_target = calculate_slotted_playback_state(new_ch)
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("change_channel: _exit_warm_vis_target = calculate_slotted_playback_state(new_ch)", _swallowed_error)
                 _exit_warm_vis_target = {}
             _exit_vis_loaded_norm = os.path.normpath(str(_exit_guide_preview_track or "")).lower()
             _exit_vis_target_norm = os.path.normpath(
@@ -21827,7 +22552,7 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         app_state["guide_selected_abs_time"] = None
         app_state["guide_col_anchor_abs"] = None
         app_state["_guide_live_idx_seen"] = None
-        app_state["guide_inactivity_timer"] = pygame.time.get_ticks() + 60000
+        app_state["guide_inactivity_timer"] = pygame.time.get_ticks() + MENU_IDLE_CLOSE_MS
 
         if not _guide_entry_warm_skip_stop:
             app_state["loaded_preview_path_cache"] = ""
@@ -21841,7 +22566,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
             try:
                 if int(_existing) < 5:
                     _existing = "05"
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as _swallowed_error:
+                _log_swallowed("change_channel: if int(_existing) < 5:", _swallowed_error)
                 _existing = "05"
             app_state["highlighted_guide_channel"] = _existing
             app_state["selected_guide_channel"]    = int(_existing)
@@ -21851,7 +22577,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
             ] if db is not None else []
             try:
                 _restore_pos = _allowed_guide_restore.index(_existing)
-            except ValueError:
+            except ValueError as _swallowed_error:
+                _log_swallowed("change_channel: _restore_pos = _allowed_guide_restore.index(_existing)", _swallowed_error)
                 _restore_pos = 0
             _guide_rows_restore = get_guide_visible_rows(db)
             _cur_offset = app_state.get("guide_row_offset", 0)
@@ -21865,7 +22592,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         try:
             if int(_guide_target_hl_clamped) < 5:
                 _guide_target_hl_clamped = "05"
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as _swallowed_error:
+            _log_swallowed("change_channel: if int(_guide_target_hl_clamped) < 5:", _swallowed_error)
             _guide_target_hl_clamped = "05"
         if (_outgoing_live_snapshot is not None
                 and _guide_target_hl_clamped == str(old_ch).zfill(2)):
@@ -22062,11 +22790,13 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                         _arm_mute_guard_watchdog(new_ch, t_state["file"])
 
                         _ch_key_for_retry = str(new_ch).zfill(2)
-                        _RETRY_DRIVE_BAIL_AFTER = 2
+                        # WARNING: the fallback numbers below must match PLAY_RETRY_DRIVE_BAIL_AFTER in performance_governor.py; they are used only when that module fails to import.
+                        _RETRY_DRIVE_BAIL_AFTER = performance_governor.PLAY_RETRY_DRIVE_BAIL_AFTER if performance_governor is not None else 2
                         if _played_ok is False and db is not None:
                             try:
                                 _retry_fail_root = media._drive_root_of(t_state.get("file"))
-                            except Exception:
+                            except Exception as _swallowed_error:
+                                _log_swallowed("change_channel._content_activate: _retry_fail_root = media._drive_root_of(t_state.get('file'))", _swallowed_error)
                                 _retry_fail_root = None
                             _retry_bail_reason = None
                             if _retry_fail_root and _retry_fail_root in _unresponsive_drive_roots():
@@ -22345,8 +23075,7 @@ def _surf_begin_quiet():
     app_state["surf_origin"] = origin
     app_state["surf_leave_position"] = _surf_capture_leave_position(origin)
     if _configured_transition_style() != "static":
-        if 'static_audio' in globals() and static_audio is not None:
-            static_audio.stop()
+        _static_sound_stop("_surf_begin_quiet (Up/Down surf, non-Static style)")
         _stop_transition_static()
     app_state["channel_switch_black_until"] = 0
     app_state["channel_switch_static_until"] = 0
@@ -22627,7 +23356,8 @@ def _rebuild_vlc_engines_for_loudness_toggle(rebuild_main=True, rebuild_dvd=True
                     and not getattr(game_deck, "dvd_splash_playing", False)):
                 try:
                     _t_ms = _old_dvd.player.get_time()
-                except Exception:
+                except Exception as _swallowed_error:
+                    _log_swallowed("_rebuild_vlc_engines_for_loudness_toggle: _t_ms = _old_dvd.player.get_time()", _swallowed_error)
                     _t_ms = None
                 _dvd_resume_seconds = (_t_ms / 1000.0) if _t_ms and _t_ms > 0 else 0
                 _dvd_captured_at = time.monotonic()
@@ -22807,8 +23537,10 @@ def _reload_visualizer_music_for_loudness_toggle():
     return True
 
 
-RELAUNCH_MAX_ATTEMPTS = 4
-RELAUNCH_WINDOW_SEC = 600
+# WARNING: the fallback numbers below must match RELAUNCH_MAX_ATTEMPTS in performance_governor.py; they are used only when that module fails to import.
+RELAUNCH_MAX_ATTEMPTS = performance_governor.RELAUNCH_MAX_ATTEMPTS if performance_governor is not None else 4
+# WARNING: the fallback numbers below must match RELAUNCH_WINDOW_SECONDS in performance_governor.py; they are used only when that module fails to import.
+RELAUNCH_WINDOW_SEC = performance_governor.RELAUNCH_WINDOW_SECONDS if performance_governor is not None else 600
 
 
 # ============================================================================
@@ -22831,8 +23563,7 @@ def _build_relaunch_command(after_update=False):
 
 def _attempt_self_relaunch():
     import json
-    _base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    _watchdog_dir = os.path.join(_base_dir, "watchdog")
+    _watchdog_dir = os.path.join(_app_logs_dir(), "watchdog")
     os.makedirs(_watchdog_dir, exist_ok=True)
     _state_path = os.path.join(_watchdog_dir, "watchdog_relaunch_state.json")
     _now = time.time()
@@ -22843,7 +23574,8 @@ def _attempt_self_relaunch():
                 _history = json.load(_f)
             if not isinstance(_history, list):
                 _history = []
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, ValueError) as _swallowed_error:
+            _log_swallowed("_attempt_self_relaunch: with open(_state_path, 'r', encoding='utf-8') as _f:", _swallowed_error)
             _history = []
 
         _history = [t for t in _history if isinstance(t, (int, float)) and _now - t < RELAUNCH_WINDOW_SEC]
@@ -22863,7 +23595,8 @@ def _attempt_self_relaunch():
         try:
             log.warning("[HEARTBEAT WATCHDOG] relaunch guard check failed (%s) — "
                         "skipping auto-relaunch to avoid an unguarded crash-loop.", e)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_attempt_self_relaunch: log.warning('[HEARTBEAT WATCHDOG] relaunch guard check failed (%s) ...", _swallowed_error)
             pass
         return False
 
@@ -22871,7 +23604,7 @@ def _attempt_self_relaunch():
         _cmd = _build_relaunch_command()
         _popen_kwargs = {
             "close_fds": True,
-            "cwd": _base_dir,
+            "cwd": _app_root_dir(),
         }
         if sys.platform == "win32":
             _popen_kwargs["creationflags"] = (
@@ -22885,7 +23618,8 @@ def _attempt_self_relaunch():
     except Exception as e:
         try:
             log.critical("[HEARTBEAT WATCHDOG] auto-relaunch spawn failed: %s", e)
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("_attempt_self_relaunch: log.critical('[HEARTBEAT WATCHDOG] auto-relaunch spawn failed: %s', e)", _swallowed_error)
             pass
         return False
 
@@ -23043,7 +23777,8 @@ def _force_recover_from_dead_main_loop(stalled_ms):
             for _thread_id, _frame in sys._current_frames().items():
                 _f.write(f"\n--- Thread {_thread_id} ---\n")
                 _tb.print_stack(_frame, file=_f)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_force_recover_from_dead_main_loop: import traceback as _tb", _swallowed_error)
         pass
 
     try:
@@ -23051,7 +23786,8 @@ def _force_recover_from_dead_main_loop(stalled_ms):
                       "%dms (>= %dms threshold) — main thread appears wedged. "
                       "Forcing process exit for auto-relaunch.",
                       stalled_ms, HEARTBEAT_WATCHDOG_TIMEOUT_MS)
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_force_recover_from_dead_main_loop: log.critical('[HEARTBEAT WATCHDOG] Main loop heartbeat silent for %...", _swallowed_error)
         pass
 
     _attempt_self_relaunch()
@@ -23101,7 +23837,8 @@ def _vlc_log_size_probe_worker(path, result_box):
         result_box[0] = os.path.getsize(path)
     except FileNotFoundError:
         result_box[0] = "missing"
-    except Exception:
+    except Exception as _swallowed_error:
+        _log_swallowed("_vlc_log_size_probe_worker: result_box[0] = os.path.getsize(path)", _swallowed_error)
         result_box[0] = None
 
 
@@ -23132,7 +23869,8 @@ def _make_vlc_log_watchdog_tick():
         "last_pos_ms": None,
         "last_pos_change_ticks": pygame.time.get_ticks(),
     }
-    _MISSING_FILE_GRACE_MS = 15000
+    # WARNING: the fallback numbers below must match VLC_LOG_MISSING_FILE_GRACE_MS in performance_governor.py; they are used only when that module fails to import.
+    _MISSING_FILE_GRACE_MS = performance_governor.VLC_LOG_MISSING_FILE_GRACE_MS if performance_governor is not None else 15000
 
     def _tick():
         path = VLC_DEBUG_LOG_PATH
@@ -23290,10 +24028,7 @@ def _execute_channel_media_clear(target_ch_str, ch_info):
                 vlc_engine.stop()
         except Exception as _ce:
             log.warning("[CLEAR CHANNEL] vlc_engine.stop() failed: %s", _ce)
-        if 'static_audio' in globals() and static_audio is not None:
-            try: static_audio.stop()
-            except Exception as _swallowed_error:
-                _log_swallowed("_execute_channel_media_clear: static_audio.stop()", _swallowed_error)
+        _static_sound_stop("Clear media on the channel")
         try:
             pygame.mixer.Channel(1).stop()
         except Exception as _swallowed_error:
@@ -23482,9 +24217,7 @@ def _execute_system_reset_all_settings():
             vlc_engine.stop()
     except Exception as e:
         log.warning("Reset Settings: vlc_engine.stop() failed: %s", e)
-    if 'static_audio' in globals() and static_audio is not None:
-        try: static_audio.stop()
-        except Exception as e: log.warning("Reset Settings: static_audio.stop() failed: %s", e)
+    _static_sound_stop("Reset All Settings")
     try:
         pygame.mixer.Channel(1).stop()
     except Exception as e:
@@ -23673,7 +24406,8 @@ def _guide_jump_col(direction, _source="unknown"):
         _now_dt = broadcast_clock.now().replace(tzinfo=None)
         _sys_live_c_idx = (_now_dt.hour * 2) + (1 if _now_dt.minute >= 30 else 0)
         _old_shift = app_state.get("selected_guide_time_idx", 0)
-        _MAX_STEP3_SHIFTS = 8
+        # WARNING: the fallback numbers below must match GUIDE_TIME_STEP_MAX_SHIFTS in performance_governor.py; they are used only when that module fails to import.
+        _MAX_STEP3_SHIFTS = performance_governor.GUIDE_TIME_STEP_MAX_SHIFTS if performance_governor is not None else 8
         _prev_clamped_idx = _sys_live_c_idx + _old_shift
         _next_target = None
         _new_stops = []
@@ -23725,7 +24459,8 @@ def _guide_jump_col(direction, _source="unknown"):
         _now_dt = broadcast_clock.now().replace(tzinfo=None)
         _sys_live_c_idx = (_now_dt.hour * 2) + (1 if _now_dt.minute >= 30 else 0)
         _old_shift = app_state.get("selected_guide_time_idx", 0)
-        _MAX_STEP3_SHIFTS = 8
+        # WARNING: the fallback numbers below must match GUIDE_TIME_STEP_MAX_SHIFTS in performance_governor.py; they are used only when that module fails to import.
+        _MAX_STEP3_SHIFTS = performance_governor.GUIDE_TIME_STEP_MAX_SHIFTS if performance_governor is not None else 8
         _prev_clamped_idx = _sys_live_c_idx + _old_shift
         _prev_target = None
         _new_stops = []
@@ -23830,10 +24565,10 @@ threading.Thread(target=_vlc_log_writer_loop, daemon=True, name="VlcLogWriter").
 # ============================================================================
 # SECTION: CH 03 screen saver
 # ============================================================================
-# VALUES CHANGE HERE
-_SS_SPEED_FRAC_PER_S = 0.07
-_SS_VISIBLE_MIN_ALPHA = 24
-_SS_MAX_DT_S = 0.1
+# WARNING: the fallback numbers below must match SS_SPEED_FRAC_PER_S, SS_VISIBLE_MIN_ALPHA, SS_MAX_DT_S in performance_governor.py; they are used only when that module fails to import.
+_SS_SPEED_FRAC_PER_S = performance_governor.SS_SPEED_FRAC_PER_S if performance_governor is not None else 0.07
+_SS_VISIBLE_MIN_ALPHA = performance_governor.SS_VISIBLE_MIN_ALPHA if performance_governor is not None else 24
+_SS_MAX_DT_S = performance_governor.SS_MAX_DT_S if performance_governor is not None else 0.1
 
 
 def _screensaver_visible_rect(surf):
@@ -23878,7 +24613,8 @@ def _screensaver_step(x, y, vx, vy, dt, scr_w, scr_h, vis):
 
 try:
     from game_deck import bridge_key_is_injected as _bridge_key_is_injected
-except Exception:
+except Exception as _swallowed_error:
+    _log_swallowed("module: from game_deck import bridge_key_is_injected as _bridge_key_is_inje...", _swallowed_error)
     def _bridge_key_is_injected(_key):
         return False
 
@@ -23895,9 +24631,9 @@ while True:
     if 'db' in globals() and db is not None:
         _theme_key = db.config.get("current_theme", "DefaultBlueGreen")
         active_theme = db.themes.get(_theme_key) or db.themes.get("DefaultBlueGreen") \
-            or {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)}
+            or dict(DEFAULT_THEME)
     else:
-        active_theme = {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)}
+        active_theme = dict(DEFAULT_THEME)
         
     events = pygame.event.get()
     now_ticks = pygame.time.get_ticks()
@@ -24234,10 +24970,9 @@ while True:
                                         "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
                                     }
                                     _write_prebuilt_block_to_hub(target_ch, _bkey_add, _vt_add, _raw_add)
-                                    # VALUES CHANGE HERE
-                                    if len(_brc_add) > 12:
+                                    if len(_brc_add) > BLOCK_ROTATION_CACHE_MAX_BLOCKS:
                                         for _k_prune in sorted(_brc_add)[
-                                                :len(_brc_add) - 12]:
+                                                :len(_brc_add) - BLOCK_ROTATION_CACHE_MAX_BLOCKS]:
                                             _brc_add.pop(_k_prune, None)
                                     db.save_settings_async()
                                     
@@ -24383,7 +25118,8 @@ while True:
             except Exception as e:
                 # WARNING: log the error loudly and still fall through to the unconditional exit; a quit request must never leave the process or its audio running.
                 log.error(f"[QUIT] unexpected error during shutdown cleanup -- exiting anyway: {e}", exc_info=True)
-            _PROBE_SHUTDOWN_GRACE_S = 0.4
+            # WARNING: the fallback numbers below must match SHUTDOWN_PROBE_GRACE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+            _PROBE_SHUTDOWN_GRACE_S = performance_governor.SHUTDOWN_PROBE_GRACE_SECONDS if performance_governor is not None else 0.4
             _probe_grace_deadline = time.time() + _PROBE_SHUTDOWN_GRACE_S
             while _probe_dispatch_inflight and time.time() < _probe_grace_deadline:
                 time.sleep(0.05)
@@ -24769,7 +25505,8 @@ while True:
                         _ra_dt      = pygame.time.get_ticks() - _last_accept["ms"]
                         _ra_same_key = (event.key == _last_accept["key"])
                         _ra_same_sc  = getattr(event, "scancode", 0) == _last_accept["scancode"]
-                        _REMAP_HARD_DEDUP_MS = 250
+                        # WARNING: the fallback numbers below must match KEY_CAPTURE_SAME_PRESS_MS in performance_governor.py; they are used only when that module fails to import.
+                        _REMAP_HARD_DEDUP_MS = performance_governor.KEY_CAPTURE_SAME_PRESS_MS if performance_governor is not None else 250
                         if _ra_dt < _REMAP_HARD_DEDUP_MS:
                             print(f"[REMOTE REMAP] Ignored duplicate capture event "
                                   f"(key={event.key} scancode={getattr(event, 'scancode', '?')}, "
@@ -24836,7 +25573,7 @@ while True:
                     "pixel_orbiter_toggle", "ch03_screensaver_toggle", "app_update",
                 )
                 _cc_focus = app_state.get("clear_confirm_focus", "buttons")
-                if event.key == pygame.K_ESCAPE:
+                if menu_nav.is_back(event.key):
                     if app_state.get("clear_confirm_target") == "app_update":
                         _remember_update_prompt_skip(app_state.get("clear_confirm_dont_show_again", False))
                     app_state["clear_confirm_dont_show_again"] = False
@@ -25080,10 +25817,10 @@ while True:
                 continue
 
             if app_state["current_channel"] == "04":
-                app_state["guide_inactivity_timer"] = now_ticks + 60000
+                app_state["guide_inactivity_timer"] = now_ticks + MENU_IDLE_CLOSE_MS
 
             if app_state.get("show_splash", False):
-                last_page = 6
+                last_page = NUM_CONTROL_PAGES - 1
 
                 page  = app_state.get("controls_splash_page",  0)
                 focus = app_state.get("controls_splash_focus", 1)
@@ -25116,9 +25853,8 @@ while True:
                     else:
                         app_state["controls_splash_page"]  = page + 1
                         app_state["controls_splash_focus"] = 1
-                # WARNING: M is not swallowed here; it falls through to the M handler below, which closes the splash and opens the Settings menu.
-                if event.key != pygame.K_m:
-                    continue
+                # WARNING: every key, M included, ends here while the Controls splash shows; letting M fall through to the M handler below would close the splash, and M only opens and closes the Settings menu.
+                continue
 
             if app_state.get("show_quit_confirm", False):
                 app_state["quit_confirm_shown_at"] = now_ticks
@@ -25204,6 +25940,7 @@ while True:
                     "CHANNEL_SUB_MENU":     "CHANNEL_LIST",
                     "CHANNEL_SETTINGS_SUB_MENU": "CHANNEL_LIST",
                     "HOLIDAY_SUB_MENU":     "CHANNEL_SUB_MENU",
+                    "COMMERCIALS_SUB_MENU": "CHANNEL_SUB_MENU",
                     "AUDIO_TRACK_PICKER":   "CHANNEL_SUB_MENU",
                     "GAMES_SUB_MENU":       "GAMES_LIST",
                     "GAMES_CTRL_MAP":       "GAMES_SUB_MENU",
@@ -25261,6 +25998,13 @@ while True:
                         app_state["dvd_map_capturing"] = False
                     elif _layer == "CHANNEL_SETTINGS_SUB_MENU":
                         app_state["menu_selection_index"] = 43
+                    elif _layer == "COMMERCIALS_SUB_MENU":
+                        app_state["sub_menu_row_index"] = 3
+                        app_state["sub_menu_col_index"] = 1
+                    elif _layer == "HOLIDAY_SUB_MENU":
+                        _holiday_ch = db.channels_db.get(str(app_state.get("selected_channel_row", 5)).zfill(2), {})
+                        app_state["sub_menu_row_index"] = 5 if menu_nav.shown_scheduling_mode(_holiday_ch) == "marathon" else 6
+                        app_state["sub_menu_col_index"] = 0
                     else:
                         app_state["sub_menu_row_index"] = 0
                         app_state["sub_menu_col_index"] = 0
@@ -25317,7 +26061,7 @@ while True:
                 now_ticks = pygame.time.get_ticks()
                 
                 if menu_nav.key_to_direction(event.key, arrows=True) is not None or menu_nav.is_accept(event.key):
-                    app_state["guide_inactivity_timer"] = now_ticks + 60000
+                    app_state["guide_inactivity_timer"] = now_ticks + MENU_IDLE_CLOSE_MS
 
                 if menu_nav.is_accept(event.key):
                     target_tuning_channel = str(app_state["selected_guide_channel"]).zfill(2)
@@ -25582,7 +26326,8 @@ while True:
                                 _cur_style = db.config.get("bezel_style", 1)
                                 try:
                                     _cur_style = int(_cur_style)
-                                except (TypeError, ValueError):
+                                except (TypeError, ValueError) as _swallowed_error:
+                                    _log_swallowed("module: _cur_style = int(_cur_style)", _swallowed_error)
                                     _cur_style = 1
                                 db.config["bezel_style"] = (_cur_style % _n_styles) + 1
                                 db.save_settings()
@@ -25711,7 +26456,8 @@ while True:
                                 _cur_cc = db.config.get("tv_captions_color", "white")
                                 try:
                                     _cci = LIST_TEXT_COLOR_NAMES.index(_cur_cc)
-                                except ValueError:
+                                except ValueError as _swallowed_error:
+                                    _log_swallowed("module: _cci = LIST_TEXT_COLOR_NAMES.index(_cur_cc)", _swallowed_error)
                                     _cci = 0
                                 db.config["tv_captions_color"] = LIST_TEXT_COLOR_NAMES[(_cci + 1) % len(LIST_TEXT_COLOR_NAMES)]
                                 db.save_settings()
@@ -26168,8 +26914,6 @@ while True:
                         if db.channels_db.get(str(_n).zfill(2), {}).get("active", str(_n).zfill(2) == "05")
                     )
 
-                    _clear_row = 4
-
                     if is_server_locked and menu_nav.is_accept(event.key):
                         if sub_row == max_close_row:
                             print(f"[SERVER SYNC] Closing locked channel {target_ch_str} editor.")
@@ -26196,6 +26940,9 @@ while True:
                         continue
 
                     if is_music_mode and sub_row == 4 and event.key in (pygame.K_a, pygame.K_d):
+                        # WARNING: with Loudness Scan off no gain is played, so the gain row is greyed and cannot be changed; the owner could not hear what a change does.
+                        if not db.config.get("loudness_scan_enabled", True):
+                            continue
                         _vis_file = app_state.get("_vis_target_filepath", "")
                         _vis_step = -1 if event.key == pygame.K_a else 1
                         _vis_gain = max(-12, min(12, _get_audio_gain_db(_vis_file, target_ch_str) + _vis_step))
@@ -26239,7 +26986,8 @@ while True:
                             )
                             _fe_navigate(os.path.join(WATERMARK_BASE_DIR, f"Channel {target_ch_str}"))
                             continue
-                        if sub_row == max_close_row and sub_col in (0, 3) and (not is_music_mode or sub_col == 3):
+                        # WARNING: on a TV channel that is on, the bottom row holds two buttons: column 0 is Clear All Scheduled Media (handled further down) and column 3 is Close; a music or off channel has only Close there.
+                        if sub_row == max_close_row and not ((not is_music_mode) and ch_info.get("active", True) and sub_col == 0):
                             print("[SUB-MENU CONTROLLER] Close button triggered. Returning to main Channels tab layout.")
                             app_state["menu_layer"] = "CHANNEL_LIST"
                             app_state["menu_selection_index"] = max(0, min(39, app_state.get("selected_channel_row", 5) - 5))
@@ -26260,9 +27008,6 @@ while True:
                                     app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
                             elif sub_col == 1:
                                 ch_info["is_visualizer"] = not ch_info.get("is_visualizer", False)
-                                _new_music_max_close_row = 4
-                                if ch_info["is_visualizer"] and app_state["sub_menu_row_index"] > _new_music_max_close_row:
-                                    app_state["sub_menu_row_index"] = _new_music_max_close_row
                                 print(f"[MODE ENGINE] Toggled channel mode. is_visualizer={ch_info['is_visualizer']}")
                             elif sub_col == 2: 
                                 app_state["editing_channel_name"] = True
@@ -26284,10 +27029,12 @@ while True:
                                     db.save_settings()
                                     continue
                                 elif sub_row == 1:
-                                    styles = ["Random", "PrismShards", "LiquidChrome", "PulseRings", "WarpTunnel", "GlowBraid", "EqualizerGrid", "ParticleFlow", "NeonStarfield", "Lightning"]
+                                    styles = ["Random"] + list(visualizer_deck.render_styles)
                                     _cur_style = ch_info.get("visualizer_style", "Random")
                                     try: curr_idx = styles.index(_cur_style)
-                                    except ValueError: curr_idx = 0
+                                    except ValueError as _swallowed_error:
+                                        _log_swallowed("module: curr_idx = styles.index(_cur_style)", _swallowed_error)
+                                        curr_idx = 0
                                     _next_style = styles[(curr_idx + 1) % len(styles)]
                                     _leaving_random = (_cur_style == "Random" and _next_style != "Random")
                                     if _leaving_random and not db.config.get("burn_in_protection_skip_confirm", False):
@@ -26304,20 +27051,11 @@ while True:
                                         print(f"[VISUALIZER STYLE] Cycled forward to style: {ch_info['visualizer_style']}")
                                         db.save_settings()
                                     continue
-                                elif sub_row == 3:
+                                elif sub_row in (3, 4):
                                     continue
                                 elif sub_row == 5:
                                     active_block = "Music Tracks"
                                 elif sub_row == 6:
-                                    _has_sched_content = bool(ch_info.get("schedules", {}).get("Music Tracks", []))
-                                    if _has_sched_content:
-                                        app_state["show_clear_confirm"] = True
-                                        app_state["clear_confirm_selection"] = "No"
-                                        app_state["clear_confirm_target"] = "channel_schedule"
-                                        app_state["clear_confirm_channel"] = target_ch_str
-                                        app_state["clear_confirm_shown_at"] = now_ticks
-                                    continue
-                                elif sub_row == _clear_row and sub_col == 0:
                                     _has_music_content = len(ch_info.get("schedules", {}).get("Music Tracks", [])) > 0
                                     if _has_music_content:
                                         app_state["show_clear_confirm"]    = True
@@ -26348,7 +27086,9 @@ while True:
                                         _SM = ["random_slots", "one_slot", "two_slots", "marathon"]
                                         _sc = menu_nav.shown_scheduling_mode(ch_info)
                                         try: _si = _SM.index(_sc)
-                                        except ValueError: _si = 0
+                                        except ValueError as _swallowed_error:
+                                            _log_swallowed("module: _si = _SM.index(_sc)", _swallowed_error)
+                                            _si = 0
                                         _request_scheduling_mode(ch_info, _SM[(_si + 1) % len(_SM)], target_ch_str)
                                     continue
                                 elif sub_row == 2:
@@ -26385,7 +27125,8 @@ while True:
                                     _cur_bl = ch_info.get("block_mode", "full_day")
                                     try:
                                         _bli = _BL_CYCLE.index(_cur_bl)
-                                    except ValueError:
+                                    except ValueError as _swallowed_error:
+                                        _log_swallowed("module: _bli = _BL_CYCLE.index(_cur_bl)", _swallowed_error)
                                         _bli = 0
                                     ch_info["block_mode"] = _BL_CYCLE[(_bli + 1) % len(_BL_CYCLE)]
                                     app_state["sub_menu_col_index"] = 0
@@ -26430,8 +27171,6 @@ while True:
                                 else:
                                     active_block = folder_map.get((sub_row, sub_col), "Morning")
                             
-                            if static_audio is not None:
-                                static_audio.stop()
                             pygame.mixer.Channel(1).stop()
 
                             app_state["sub_menu_row_index"] = sub_row
@@ -26461,6 +27200,9 @@ while True:
                     _at_dir = menu_nav.key_to_direction(event.key)
                     if _at_dir is not None:
                         if sub_row == gain_row and _at_dir in (menu_nav.LEFT, menu_nav.RIGHT) and _audio_ctx == "channel":
+                            # WARNING: with Loudness Scan off no gain is played, so the gain row is greyed and cannot be changed.
+                            if not db.config.get("loudness_scan_enabled", True):
+                                continue
                             _step = -1 if _at_dir == menu_nav.LEFT else 1
                             _cur_file = getattr(_target_engine, "current_filepath", None)
                             _new_gain = max(-12, min(12, int(app_state.get("audio_track_gain_db", 0)) + _step))
@@ -26500,7 +27242,17 @@ while True:
                                 _src_ch = app_state.get("audio_track_source_channel")
                                 _cur_file = getattr(_target_engine, "current_filepath", None)
                                 if _cur_file:
-                                    _save_audio_track_pref(_cur_file, track_id, track_name)
+                                    # WARNING: save VLC's own label, not the menu label with the added language, or restoring by name never matches.
+                                    _vlc_tracks = _target_engine.get_audio_tracks()
+                                    _vlc_label = dict(_vlc_tracks).get(track_id, track_name)
+                                    _vlc_index = next((i for i, (tid, _l) in enumerate(_vlc_tracks) if tid == track_id), None)
+                                    _save_audio_track_pref(_cur_file, track_id, _vlc_label, _vlc_index)
+                                    _target_engine._audio_index = _vlc_index
+                                    _target_engine.file_gain = _lookup_file_gain(_src_ch, _cur_file)
+                                    _target_engine.set_volume(db.config.get("global_volume", 70), db.config.get("is_muted", False))
+                                    app_state["audio_track_gain_db"] = _get_audio_gain_db(_cur_file, _src_ch)
+                                    log.info("[AUDIO TRACK] %s: track %s chosen, playing at gain x%.3f",
+                                             os.path.basename(_cur_file), (_vlc_index or 0) + 1, _target_engine.file_gain)
                                 app_state["audio_track_active_id"] = track_id
                                 print(f"[AUDIO TRACK] Channel {_src_ch}: switched to '{track_name}' and remembered for this file.")
                         if _audio_ctx == "dvd":
@@ -26521,12 +27273,6 @@ while True:
                     sub_row = app_state.get("sub_menu_row_index", 0)
                     sub_col = app_state.get("sub_menu_col_index", 0)
                     target_ch_str = str(app_state.get("selected_channel_row", 5)).zfill(2)
-                    if event.key == pygame.K_ESCAPE:
-                        _holiday_ch = db.channels_db.get(target_ch_str, {})
-                        app_state["menu_layer"] = "CHANNEL_SUB_MENU"
-                        app_state["sub_menu_row_index"] = 5 if menu_nav.shown_scheduling_mode(_holiday_ch) == "marathon" else 6
-                        app_state["sub_menu_col_index"] = 0
-                        continue
                     _holiday_dir = menu_nav.key_to_direction(event.key)
                     if _holiday_dir is not None:
                         _holiday_to = menu_nav.holiday_move(app_state, sub_row, sub_col, _holiday_dir)
@@ -26547,8 +27293,6 @@ while True:
                         elif 0 <= sub_row < len(media.HOLIDAY_KEYS) and sub_col == menu_nav.HOLIDAY_FORCE_COLUMN:
                             _toggle_holiday_force(media.HOLIDAY_KEYS[sub_row], target_ch_str)
                         elif 0 <= sub_row < len(media.HOLIDAY_KEYS):
-                            if static_audio is not None:
-                                static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 f"Holiday Override — {media.HOLIDAY_KEYS[sub_row].replace('_', ' ').title()} Videos",
@@ -26561,11 +27305,6 @@ while True:
                     sub_row = app_state.get("sub_menu_row_index", 0)
                     target_ch_str = str(app_state.get("selected_channel_row", 5)).zfill(2)
                     ch_info = db.channels_db.get(target_ch_str, {})
-                    if event.key == pygame.K_ESCAPE:
-                        app_state["menu_layer"] = "CHANNEL_SUB_MENU"
-                        app_state["sub_menu_row_index"] = 3
-                        app_state["sub_menu_col_index"] = 1
-                        continue
                     _com_dir = menu_nav.key_to_direction(event.key)
                     if _com_dir is not None:
                         app_state["sub_menu_row_index"] = menu_nav.commercials_move(app_state, sub_row, _com_dir)
@@ -26583,8 +27322,6 @@ while True:
                             app_state["sub_menu_col_index"] = 1
                         else:
                             _bumper_keys = ("Commercials", "Fade-in", "Fade-out")
-                            if static_audio is not None:
-                                static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 f"Add {_bumper_keys[sub_row]}",
@@ -26654,7 +27391,6 @@ while True:
                         elif cur_sel == 97:
                             _toggle_menu_music()
                         elif cur_sel == 96 and _set_music_actionable:
-                            if static_audio is not None: static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 "Game Music — Set Tracks",
@@ -26732,8 +27468,6 @@ while True:
                             import os as _os
                             emu_folder = _os.path.join(resolve_main_dir(), "cores", console_key)
                             _os.makedirs(emu_folder, exist_ok=True)
-                            if static_audio is not None:
-                                static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 f"Select Libretro Core (.dll) — {console_key}",
@@ -26829,8 +27563,6 @@ while True:
                                 from game_deck import DVD_SPLASH_IMAGE_EXTS
                                 splash_folder = _os.path.join(SPLASH_IMAGES_BASE_DIR, console_key)
                                 _os.makedirs(splash_folder, exist_ok=True)
-                                if static_audio is not None:
-                                    static_audio.stop()
                                 pygame.mixer.Channel(1).stop()
                                 _fe_open(
                                     f"Select Splash Image — {console_key}",
@@ -26846,8 +27578,6 @@ while True:
                                 from game_deck import DVD_SPLASH_VIDEO_EXTS
                                 splash_folder = _os.path.join(SPLASH_VIDEOS_BASE_DIR, console_key)
                                 _os.makedirs(splash_folder, exist_ok=True)
-                                if static_audio is not None:
-                                    static_audio.stop()
                                 pygame.mixer.Channel(1).stop()
                                 _fe_open(
                                     f"Select Splash Video — {console_key}",
@@ -26861,8 +27591,6 @@ while True:
                             if bios_dir:
                                 import os as _os
                                 _os.makedirs(bios_dir, exist_ok=True)
-                                if static_audio is not None:
-                                    static_audio.stop()
                                 pygame.mixer.Channel(1).stop()
                                 _fe_open(
                                     f"Add BIOS — {console_key}",
@@ -26875,8 +27603,6 @@ while True:
                             import os as _os
                             from game_deck import DVD_SPLASH_IMAGE_EXTS
                             _os.makedirs(MENU_BG_BASE_DIR, exist_ok=True)
-                            if static_audio is not None:
-                                static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 "Select Menu Background Image",
@@ -26889,7 +27615,8 @@ while True:
                             current = db.config.get("console_scroll_style", "carousel")
                             try:
                                 _si = CONSOLE_SCROLL_STYLES.index(current)
-                            except ValueError:
+                            except ValueError as _swallowed_error:
+                                _log_swallowed("module: _si = CONSOLE_SCROLL_STYLES.index(current)", _swallowed_error)
                                 _si = 0
                             new_style = CONSOLE_SCROLL_STYLES[(_si + 1) % len(CONSOLE_SCROLL_STYLES)]
                             db.config["console_scroll_style"] = new_style
@@ -26901,7 +27628,8 @@ while True:
                             current = db.config.get("menu_text_color", "white")
                             try:
                                 _ci = LIST_TEXT_COLOR_NAMES.index(current)
-                            except ValueError:
+                            except ValueError as _swallowed_error:
+                                _log_swallowed("module: _ci = LIST_TEXT_COLOR_NAMES.index(current)", _swallowed_error)
                                 _ci = 0
                             new_color = LIST_TEXT_COLOR_NAMES[(_ci + 1) % len(LIST_TEXT_COLOR_NAMES)]
                             db.config["menu_text_color"] = new_color
@@ -26917,8 +27645,6 @@ while True:
                             print(f"[SETTINGS] Game Screen Mode = {db.config['game_screen_mode']}")
                             pygame.event.clear(pygame.KEYDOWN)
                         elif row_id == "relocate_roms_folder":
-                            if static_audio is not None:
-                                static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             from game_deck import ROM_EXTENSIONS
                             _fe_open(
@@ -26935,7 +27661,6 @@ while True:
                                 app_state["clear_confirm_console"]  = console_key
                                 app_state["clear_confirm_shown_at"] = now_ticks
                         elif row_id == "scan_for_roms":
-                            if static_audio is not None: static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 "Scan For Roms",
@@ -26943,7 +27668,6 @@ while True:
                                 {"mode": "scan_for_roms"}
                             )
                         elif row_id == "scan_for_cores":
-                            if static_audio is not None: static_audio.stop()
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 "Scan For Cores",
@@ -27011,7 +27735,8 @@ while True:
 
                     if _capturing:
 
-                        _DVD_HARD_DEDUP_MS = 250
+                        # WARNING: the fallback numbers below must match KEY_CAPTURE_SAME_PRESS_MS in performance_governor.py; they are used only when that module fails to import.
+                        _DVD_HARD_DEDUP_MS = performance_governor.KEY_CAPTURE_SAME_PRESS_MS if performance_governor is not None else 250
                         _dvd_last = app_state.get("_dvd_map_last_accept")
                         if _dvd_last is not None:
                             _dvd_dt = pygame.time.get_ticks() - _dvd_last["ms"]
@@ -27070,9 +27795,7 @@ while True:
                         if _dm_to is not None:
                             app_state["dvd_map_cursor"] = menu_nav.dvd_map_index(_dm_to)
                         continue
-                    if menu_nav.is_back(event.key):
-                        _close_dvd_map()
-                    elif menu_nav.is_accept(event.key):
+                    if menu_nav.is_accept(event.key):
                         if _cursor == 0:
                             app_state["dvd_map_capturing"] = True
                             app_state["dvd_map_capture_idx"] = 0
@@ -27244,7 +27967,8 @@ while True:
                                 _bz_style_cfg = _get_prof_cfg(console_key, profile_num)
                                 try:
                                     _cur_style = int(_bz_style_cfg.get("border_style", 1))
-                                except (TypeError, ValueError):
+                                except (TypeError, ValueError) as _swallowed_error:
+                                    _log_swallowed("module: _cur_style = int(_bz_style_cfg.get('border_style', 1))", _swallowed_error)
                                     _cur_style = 1
                                 _new_style = (_cur_style % _n_styles) + 1
                                 _set_console_bezel_style(console_key, profile_num, _new_style)
@@ -27390,7 +28114,8 @@ while True:
             app_state["_load_progress_f"] = min(target_pct, app_state["_load_progress_f"] + _bar_rate * _dt_s)
         app_state["load_progress"] = int(app_state["_load_progress_f"])
 
-        _HOLD_AT_100_S = 0.5
+        # WARNING: the fallback numbers below must match BOOT_HOLD_AT_100_SECONDS in performance_governor.py; they are used only when that module fails to import.
+        _HOLD_AT_100_S = performance_governor.BOOT_HOLD_AT_100_SECONDS if performance_governor is not None else 0.5
         real_subsystems_loaded = len(_done) >= len(BOOT_STEPS) and app_state["_load_progress_f"] >= 100.0
         if real_subsystems_loaded:
             app_state["load_progress"] = 100
@@ -27409,17 +28134,17 @@ while True:
             ui_color = (int(r * 255), int(g * 255), int(b * 255))
             r, g, b = colorsys.hsv_to_rgb(bg_hue, 0.6, 0.15)
             bg_color = (int(r * 255), int(g * 255), int(b * 255))
-            active_theme = {"ui": ui_color, "bg": bg_color, "text": (255, 255, 255)}
+            active_theme = {"ui": ui_color, "bg": bg_color, "text": DEFAULT_THEME["text"]}
         else:
-            active_theme = {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)}
+            active_theme = dict(DEFAULT_THEME)
         
-        LOADING_GREEN = (0, 255, 128)
+        LOADING_GREEN = COLOR_LOADING_GREEN
         if loading_bg_surface:
             w_w, w_h = screen.get_size()
             _lbg_w, _lbg_h = loading_bg_surface.get_size()
             dest_w, dest_h, dest_x, dest_y = _letterbox_fit(_lbg_w, _lbg_h, w_w, w_h)
             # WARNING: not pure black; (0, 0, 0) is the game-overlay transparency key.
-            screen.fill((1, 1, 1))
+            screen.fill(COLOR_SCREEN_BLACK)
             scaled = pygame.transform.scale(loading_bg_surface, (dest_w, dest_h))
             screen.blit(scaled, (dest_x, dest_y))
 
@@ -27431,7 +28156,7 @@ while True:
             bar_x = dest_x + int(_LOAD_BAR_CENTER_X * art_scale) - stretched_w // 2
             bar_y = dest_y + int(_LOAD_BAR_CENTER_Y * art_scale) - bar_h // 2
             
-            pygame.draw.rect(screen, (20, 30, 20), (bar_x, bar_y, stretched_w, bar_h), border_radius=3)
+            pygame.draw.rect(screen, COLOR_LOADING_BAR_TRACK, (bar_x, bar_y, stretched_w, bar_h), border_radius=3)
             
             if app_state["load_progress"] > 0:
                 fill_w = int(stretched_w * (app_state["load_progress"] / 100.0))
@@ -27448,7 +28173,7 @@ while True:
                 txt_y = bar_y - lbl_txt.get_height() - text_gap
                 screen.blit(lbl_txt, (txt_x, txt_y))
         else:
-            green_loading_theme = {"ui": LOADING_GREEN, "bg": active_theme["bg"], "text": (255, 255, 255)}
+            green_loading_theme = {"ui": LOADING_GREEN, "bg": active_theme["bg"], "text": DEFAULT_THEME["text"]}
             render_loading_screen(screen, app_state["load_progress"], green_loading_theme)
 
         # WARNING: do not leave the loading screen until every real boot step is done and the bar has caught up to 100 and held there for _HOLD_AT_100_S.
@@ -27500,7 +28225,7 @@ while True:
 
     _real_screen = screen
     if (globals().get("_virtual_screen_surf") is None
-            or _virtual_screen_surf.get_size() != (w_w, w_h)):
+            or globals()["_virtual_screen_surf"].get_size() != (w_w, w_h)):
         globals()["_virtual_screen_surf"] = pygame.Surface((w_w, w_h))
     screen = globals()["_virtual_screen_surf"]
 
@@ -27516,7 +28241,7 @@ while True:
     if db is not None and getattr(db, 'ready_flag', False):
         _theme_key = db.config.get("current_theme", "DefaultBlueGreen")
         active_theme = dict(db.themes.get(_theme_key) or db.themes.get("DefaultBlueGreen")
-                             or {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)})
+                             or dict(DEFAULT_THEME))
         try:
             import colorsys as _cs
             _ui_hue = db.config.get("theme_ui_hue", 140) / 360.0
@@ -27528,7 +28253,7 @@ while True:
         except Exception as e:
             _log_warn_throttled("theme_hue_recompute", "Live theme hue recompute failed, using unmodified theme colors this frame: %s", e)
     else:
-        active_theme = {"ui": (0, 255, 128), "bg": (10, 15, 30), "text": (255, 255, 255)}
+        active_theme = dict(DEFAULT_THEME)
 
     app_state["_active_theme_snapshot"] = active_theme
 
@@ -27813,7 +28538,8 @@ while True:
                                 log.warning("WATCHDOG: _mark_file_broken (abnormal-ended) failed for ch%s: %s", ch, e)
                             try:
                                 _wd_fail_root = media._drive_root_of(str(_anchor["file"]))
-                            except Exception:
+                            except Exception as _swallowed_error:
+                                _log_swallowed("module: _wd_fail_root = media._drive_root_of(str(_anchor['file']))", _swallowed_error)
                                 _wd_fail_root = None
                             if _wd_fail_root and _wd_fail_root in _unresponsive_drive_roots():
                                 _station_confirmed_dead_drive[str(ch).zfill(2)] = _wd_fail_root
@@ -27961,7 +28687,8 @@ while True:
                     if bool(_old_anchor_ms.get("interior_cut")) and _old_anchor_ms.get("file"):
                         try:
                             _leave_pos_ms = vlc_engine.player.get_time()
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("module: _leave_pos_ms = vlc_engine.player.get_time()", _swallowed_error)
                             _leave_pos_ms = None
                         _seg_start_s = float(_old_anchor_ms.get("seek_offset", 0))
                         if (_leave_pos_ms is not None and _leave_pos_ms >= 0
@@ -28090,7 +28817,7 @@ while True:
 
     if w_w < 100 or w_h < 100:
         # WARNING: not pure black; (0, 0, 0) is the game-overlay transparency key.
-        screen.fill((1, 1, 1))
+        screen.fill(COLOR_SCREEN_BLACK)
         w_w, w_h = 100, 100
 
     _prof_mark("stall_detect")
@@ -28103,7 +28830,7 @@ while True:
         if _configured_transition_style() == "static":
             _render_transition_static(screen, _full_window_rect)
         else:
-            screen.fill(_TRANSITION_GRAY, _full_window_rect)
+            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
     elif ch != "04":
         if ch == "03":
             # WARNING: a file picker left open by an earlier settings action must not paint over this frame or consume DVD navigation keys on the next one.
@@ -28130,7 +28857,7 @@ while True:
             screen.fill(_video_bar_color())
             
             if game_deck is not None:
-                game_deck.set_theme(active_theme.get("ui", (0, 255, 128)))
+                game_deck.set_theme(active_theme.get("ui", DEFAULT_THEME["ui"]))
                 crt_cfg = {}
                 if db is not None:
                     crt_cfg = {
@@ -28165,7 +28892,7 @@ while True:
                     game_deck.render(screen, _deck_render_rect, crt_cfg=crt_cfg)
             else:
                 font_loading = _cached_sys_font("Courier New", 24, bold=True)
-                theme_color = active_theme.get("ui", (0, 255, 128))
+                theme_color = active_theme.get("ui", DEFAULT_THEME["ui"])
                 lbl = font_loading.render("Game frontend unavailable", True, theme_color)
                 screen.blit(lbl, (content_rect.centerx - lbl.get_width() // 2, content_rect.centery - 12))
         elif current_playback_state["mode"] == "Video":
@@ -28228,21 +28955,27 @@ while True:
                             app_state["_video_painted_this_frame"] = True
                         else:
                             if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
-                                screen.fill(_TRANSITION_GRAY)
+                                screen.fill(COLOR_TRANSITION_GREY)
                     else:
                         if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
-                            screen.fill(_TRANSITION_GRAY)
-                except Exception:
+                            screen.fill(COLOR_TRANSITION_GREY)
+                except Exception as _swallowed_error:
+                    _log_swallowed("module: vlc_bytes = vlc_engine.get_display_frame()", _swallowed_error)
                     if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
-                        screen.fill(_TRANSITION_GRAY)
+                        screen.fill(COLOR_TRANSITION_GREY)
 
             else:
-                screen.fill(_TRANSITION_GRAY)
+                screen.fill(COLOR_TRANSITION_GREY)
                 
         elif current_playback_state["mode"] == "Static":
-            _render_transition_static(screen, _full_window_rect)
+            if _static_visual_is_grey(("live", str(ch))):
+                # WARNING: the grey screen is still Static on air, so its noise keeps playing (the play below in the Static sound section); stopping it here fought that play every frame and cut the sound.
+                screen.fill(COLOR_TRANSITION_GREY)
+            else:
+                _render_transition_static(screen, _full_window_rect)
             _static_reason = current_playback_state.get("reason")
-            if _static_reason and _static_reason not in SILENT_STATIC_REASONS:
+            if (_static_reason and _static_reason not in SILENT_STATIC_REASONS
+                    and _static_banner_ready(("live", str(ch)), _static_reason)):
                 _sf_detail = current_playback_state.get(
                     "reason_detail",
                     "playback unavailable for this channel")
@@ -28320,7 +29053,7 @@ while True:
         px, py, pw, ph = app_state.get("guide_preview_bounds", (w_w // 2 - 400, 15, 800, 450))
 
         _guide_transition_style = _configured_transition_style()
-        _preview_base_color = (0, 0, 0) if _guide_transition_style == "black" else (1, 1, 1)
+        _preview_base_color = (0, 0, 0) if _guide_transition_style == "black" else COLOR_SCREEN_BLACK
         pygame.draw.rect(screen, _preview_base_color, (px, py, pw, ph))
 
         _now_ch04 = pygame.time.get_ticks()
@@ -28380,7 +29113,8 @@ while True:
                         if db is not None and db.config.get("fake_static_noise_enabled", False):
                             try:
                                 _hl_ch_n = int(hl_ch)
-                            except (TypeError, ValueError):
+                            except (TypeError, ValueError) as _swallowed_error:
+                                _log_swallowed("module: _hl_ch_n = int(hl_ch)", _swallowed_error)
                                 _hl_ch_n = 0
                             if hl_ch not in ("03", "04") and 5 <= _hl_ch_n <= 44:
                                 _apply_static_noise_effect(screen, pygame.Rect(px, py, pw, ph), hl_ch)
@@ -28417,11 +29151,10 @@ while True:
                                         screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
                                 else:
                                     _stop_transition_static()
-                                    screen.fill((1, 1, 1), (px, py, pw, ph))
+                                    screen.fill(COLOR_SCREEN_BLACK, (px, py, pw, ph))
                             else:
                                 _stop_transition_static()
-                                # WARNING: keep this fill identical to the other transition/buffering fills.
-                                screen.fill((15, 15, 15), (px, py, pw, ph))
+                                screen.fill(COLOR_TRANSITION_GREY, (px, py, pw, ph))
 
                             if _hl_ch_confirmed_failed:
                                 _draw_channel_failure_message(
@@ -28435,12 +29168,13 @@ while True:
                         _wm_preview_bounds = _watermark_bounds_rect_preview(
                             pygame.Rect(px, py, pw, ph))
                         _draw_watermark(screen, bounds_rect=_wm_preview_bounds, state_key="preview")
-            except Exception:
+            except Exception as _swallowed_error:
+                _log_swallowed("module: if _ch04_preview_static_visual_active and _guide_transition_style =...", _swallowed_error)
                 if not _ch04_shield_active:
                     _stop_transition_static()
                     if not _blit_last_video_frame(screen, px, py, pw, ph, apply_screen_mode=True, context="preview"):
                         _guide_transition_style = _configured_transition_style()
-                        _fallback_color = (1, 1, 1) if _guide_transition_style == "static" else (15, 15, 15)
+                        _fallback_color = COLOR_SCREEN_BLACK if _guide_transition_style == "static" else COLOR_TRANSITION_GREY
                         screen.fill(_fallback_color, (px, py, pw, ph))
 
         elif hl_state["mode"] == "Visualizer" and visualizer_deck is not None and not _ch04_shield_active:
@@ -28491,7 +29225,8 @@ while True:
                         _register_channel_playback_failure(hl_ch, target_file)
                         try:
                             _fail_root = media._drive_root_of(target_file)
-                        except Exception:
+                        except Exception as _swallowed_error:
+                            _log_swallowed("module: _fail_root = media._drive_root_of(target_file)", _swallowed_error)
                             _fail_root = None
                         if _fail_root:
                             _visualizer_confirmed_dead_drive[hl_ch] = _fail_root
@@ -28500,8 +29235,7 @@ while True:
                         app_state["guide_preview_music_track"] = ""
                         _gp_vis_load_failed = True
                     else:
-                        if 'static_audio' in globals() and static_audio is not None:
-                            static_audio.stop()
+                        _static_sound_stop("guide preview: a visualizer channel's music loaded")
                         app_state["active_music_gain"] = _lookup_file_gain(_gain_ch_key, target_file)
                         pygame.mixer.music.set_volume(
                             _effective_audio_gain(min_db=STACKED_GAIN_MIN_DB)
@@ -28525,7 +29259,7 @@ while True:
                 else:
                     mini = pygame.Surface((pw, ph))
                     # WARNING: not pure black; (0, 0, 0) is the game-overlay transparency key.
-                    mini.fill((1, 1, 1))
+                    mini.fill(COLOR_SCREEN_BLACK)
 
                     h_ch_info = db.channels_db.get(hl_ch, {})
                     preview_style = _get_channel_visualizer_style(h_ch_info)
@@ -28564,7 +29298,8 @@ while True:
                     if db is not None and db.config.get("fake_static_noise_enabled", False):
                         try:
                             _hl_ch_n_vis = int(hl_ch)
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError) as _swallowed_error:
+                            _log_swallowed("module: _hl_ch_n_vis = int(hl_ch)", _swallowed_error)
                             _hl_ch_n_vis = 0
                         if hl_ch not in ("03", "04") and 5 <= _hl_ch_n_vis <= 44:
                             _apply_static_noise_effect(screen, pygame.Rect(px, py, pw, ph), hl_ch)
@@ -28618,11 +29353,11 @@ while True:
                     screen.blit(lbl_s2, (_line2_x, _line2_y))
             except Exception as preview_err:
                 log.warning(f"[SYNC ENGINE ERROR] {preview_err}")
-                screen.fill((40, 40, 40), (px, py, pw, ph))
+                screen.fill(COLOR_GUIDE_PREVIEW_ERROR_FILL, (px, py, pw, ph))
                 
         elif hl_state["mode"] == "Visualizer_Empty" and not _ch04_shield_active:
             if vlc_engine is not None: vlc_engine.stop()
-            if 'static_audio' in globals() and static_audio is not None: static_audio.stop()
+            _static_sound_stop("guide preview: an empty visualizer channel")
             if pygame.mixer.music.get_busy(): pygame.mixer.music.stop()
             app_state["music_owner"] = ""
             app_state["guide_preview_music_track"] = ""
@@ -28652,8 +29387,7 @@ while True:
             _render_transition_static(screen, _full_window_rect)
         else:
             _stop_transition_static()
-            # WARNING: keep this fill identical to the other transition/buffering fills.
-            screen.fill((15, 15, 15), _full_window_rect)
+            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
 
     else:
         if app_state.get("_warm_static_mute_active", False):
@@ -28739,7 +29473,7 @@ while True:
             if ch == "03":
                 _stop_transition_static()
                 # WARNING: not pure black; (0, 0, 0) is the game-overlay transparency key.
-                screen.fill((1, 1, 1))
+                screen.fill(COLOR_SCREEN_BLACK)
             else:
                 _render_transition_static(screen, _full_window_rect)
 
@@ -28787,7 +29521,7 @@ while True:
                             _render_transition_static(screen, _full_window_rect)
                         else:
                             _stop_transition_static()
-                            screen.fill((15, 15, 15), _full_window_rect)
+                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
                     elif vlc_bytes:
                         _note_fresh_live_video_frame(ch)
 
@@ -28823,8 +29557,7 @@ while True:
                                 and _transition_style_wait == "static")
                         )
                         if not _about_to_render_static:
-                            if 'static_audio' in globals() and static_audio is not None:
-                                static_audio.stop()
+                            _static_sound_stop("fullscreen video: a frame is drawn and no Static is due")
                         if _stall_is_now_static:
                             _render_transition_static(screen, _full_window_rect)
                         elif _has_last_video_frame(context="fullscreen"):
@@ -28832,17 +29565,16 @@ while True:
                         elif _transition_style_wait == "static":
                             _render_transition_static(screen, _full_window_rect)
                         else:
-                            # WARNING: keep this fill identical to the other transition/buffering fills.
-                            screen.fill((15, 15, 15), _full_window_rect)
-                except Exception:
+                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+                except Exception as _swallowed_error:
                     # WARNING: do not stop static_audio on a tick that is about to restart it via _render_transition_static(), or the noise never plays long enough to be heard.
+                    _log_swallowed("module: _static_transition_active = _transition_style_wait == 'static' and ...", _swallowed_error)
                     _about_to_render_static = _stall_is_now_static or (
                         not _has_last_video_frame(context="fullscreen")
                         and _transition_style_wait == "static"
                     )
                     if not _about_to_render_static:
-                        if 'static_audio' in globals() and static_audio is not None:
-                            static_audio.stop()
+                        _static_sound_stop("fullscreen video: the picture draw failed and no Static is due")
                     if _stall_is_now_static:
                         _render_transition_static(screen, _full_window_rect)
                     elif _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
@@ -28851,8 +29583,7 @@ while True:
                         if _transition_style_wait == "static":
                             _render_transition_static(screen, _full_window_rect)
                         else:
-                            # WARNING: keep this fill identical to the other transition/buffering fills.
-                            screen.fill((15, 15, 15), _full_window_rect)
+                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
 
         elif current_state["mode"] in ("Video", "Commercial"):
             if pygame.mixer.music.get_busy():
@@ -28895,7 +29626,8 @@ while True:
                         and active_cached_track):
                     try:
                         _playing_root = media._drive_root_of(active_cached_track)
-                    except Exception:
+                    except Exception as _swallowed_error:
+                        _log_swallowed("module: _playing_root = media._drive_root_of(active_cached_track)", _swallowed_error)
                         _playing_root = None
                     if _playing_root and _playing_root in _unresponsive_drive_roots():
                         log.warning(
@@ -28949,8 +29681,7 @@ while True:
                             _vis_loop_playback_path = _resolve_compressor_playback_path(target_file, for_seek=True)
                             pygame.mixer.music.load(_vis_loop_playback_path)
                             app_state["_music_loaded_playback_path"] = _vis_loop_playback_path
-                            if 'static_audio' in globals() and static_audio is not None:
-                                static_audio.stop()
+                            _static_sound_stop("visualizer: a music track loaded")
                             app_state["active_music_gain"] = _lookup_file_gain(_ch_key_vis, target_file)
                             pygame.mixer.music.set_volume(
                                 _effective_audio_gain(min_db=STACKED_GAIN_MIN_DB)
@@ -28969,7 +29700,8 @@ while True:
                             # WARNING: a fast access rejection can leave the bare drive root answering os.path.exists() instantly, so the root check may never flag this drive.
                             try:
                                 _fail_root = media._drive_root_of(target_file)
-                            except Exception:
+                            except Exception as _swallowed_error:
+                                _log_swallowed("module: _fail_root = media._drive_root_of(target_file)", _swallowed_error)
                                 _fail_root = None
                             if _fail_root:
                                 _visualizer_confirmed_dead_drive[_ch_key_vis] = _fail_root
@@ -29020,8 +29752,7 @@ while True:
                 if not _vis_content_ok or _vis_static_burst_active:
                     _render_transition_static(screen, _vis_fixed_rect)
                 else:
-                    if 'static_audio' in globals() and static_audio is not None:
-                        static_audio.stop()
+                    _static_sound_stop("visualizer: content is playing")
                     import colorsys as _hud_colorsys
                     _hr, _hg, _hb = _hud_colorsys.hsv_to_rgb(db.config.get("theme_ui_hue", 140) / 360.0, 0.9, 1.0)
                     theme_green_color = (int(_hr * 255), int(_hg * 255), int(_hb * 255))
@@ -29059,7 +29790,7 @@ while True:
                         style_name_cleaned = visualizer_deck.current_running_style.upper()
                         app_state["_vis_card_text"] = (song_name_cleaned, f"VISUALIZER: {style_name_cleaned}")
             except Exception as e:
-                log.warning(f"[DEBUG MASTER RUNTIME ERROR] HUD drawing failed: {e}")
+                _log_warn_throttled("visualizer_frame_failed", f"[VISUALIZER] the music station frame failed to draw, showing Static: {type(e).__name__}: {e}")
                 _render_transition_static(screen, _vis_fixed_rect)
                 
         elif current_state["mode"] == "Visualizer_Empty":
@@ -29075,7 +29806,7 @@ while True:
                 _render_transition_static(screen, _full_window_rect)
             else:
                 _stop_transition_static()
-                screen.fill((15, 15, 15), _full_window_rect)
+                screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
         elif (db is not None and db.config.get("transition_type", "black") == "static"
               and pygame.time.get_ticks() < app_state.get("guide_preview_static_until", 0)):
             if app_state.get("_warm_static_mute_active", False):
@@ -29112,6 +29843,12 @@ while True:
                 if not (preview_ch_num in _channel_playback_failures
                         or preview_ch_num in _station_confirmed_dead_drive):
                     _stop_transition_static()
+
+    # WARNING: a channel airing Static keeps its noise under menus, the file explorer and popups, as a TV does; the black shield of a non-Static transition stays silent.
+    if (ch not in ("03", "04") and not _surf_quiet
+            and current_playback_state.get("mode") == "Static"
+            and pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)):
+        _static_sound_play()
 
     _prof_mark("game_deck")
 
@@ -29196,15 +29933,15 @@ while True:
     last_input = app_state.get("last_input_time", now_ticks_ms)
     elapsed_ms = now_ticks_ms - last_input
 
-    if app_state.get("show_splash", False) and elapsed_ms >= 60000:
+    if app_state.get("show_splash", False) and elapsed_ms >= MENU_IDLE_CLOSE_MS:
         app_state["show_splash"] = False
         app_state["splash_shown_at"] = 0
 
-    if app_state.get("show_quit_confirm", False) and elapsed_ms >= 20000:
+    if app_state.get("show_quit_confirm", False) and elapsed_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS:
         app_state["show_quit_confirm"] = False
         app_state["quit_confirm_shown_at"] = 0
 
-    if (app_state.get("show_clear_confirm", False) and elapsed_ms >= 20000
+    if (app_state.get("show_clear_confirm", False) and elapsed_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS
             and not app_state.get("update_install_active", False)):
         log.warning("[ANTI-BURN-IN SHIELD] Clear-confirm popup timed out. Cancelling.")
         app_state["show_clear_confirm"]     = False
@@ -29216,6 +29953,14 @@ while True:
         app_state["clear_confirm_profile_num"] = None
         app_state["clear_confirm_focus"]    = "buttons"
 
+    if game_deck is not None and elapsed_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS:
+        if getattr(game_deck, "_pick_layout_popup_player", None) is not None:
+            log.warning("[ANTI-BURN-IN SHIELD] Pick Layout popup timed out. Dismissed.")
+            game_deck.dismiss_pick_layout_popup()
+        if game_deck.mapping_reassign_pending():
+            log.warning("[ANTI-BURN-IN SHIELD] Waiting for a controller button timed out. Cancelled.")
+            game_deck.cancel_any_mapping_reassign()
+
     _fe_busy_loading = (
         app_state.get("file_explorer_scan_pending", False)
         or app_state.get("file_explorer_expand_pending", 0) > 0
@@ -29225,7 +29970,7 @@ while True:
     if app_state.get("file_explorer_active", False) and _fe_busy_loading:
         app_state["last_input_time"] = now_ticks_ms
 
-    elif app_state.get("file_explorer_active", False) and elapsed_ms >= 60000:
+    elif app_state.get("file_explorer_active", False) and elapsed_ms >= MENU_IDLE_CLOSE_MS:
         log.warning("[ANTI-BURN-IN SHIELD] File explorer timed out from inactivity -- "
               "closing explorer, menu, and guide together.")
         _fe_close(False)
@@ -29237,24 +29982,11 @@ while True:
             change_channel(_burn_target)
         app_state["last_input_time"] = now_ticks_ms
 
-    elif app_state.get("show_menu", False) and elapsed_ms >= 60000:
+    elif app_state.get("show_menu", False) and elapsed_ms >= MENU_IDLE_CLOSE_MS:
         app_state["loaded_preview_path_cache"] = ""
         app_state["show_menu"] = False
         app_state["games_tab_page"] = 0
         app_state["menu_shown_at"] = 0
-
-    if app_state["current_channel"] == "04" and elapsed_ms >= 60000:
-        if (not app_state.get("show_menu", False)
-                and not app_state.get("show_splash", False)
-                and not app_state.get("file_explorer_active", False)):
-            _burn_target = str(app_state.get("highlighted_guide_channel", "05")).zfill(2)
-            print(f"[ANTI-BURN-IN SHIELD 2] Inactivity elapsed. Switching to previewed channel: {_burn_target}")
-            app_state["loaded_preview_path_cache"] = ""
-            change_channel(_burn_target)
-
-    if 'visualizer_deck' in globals() and visualizer_deck is not None:
-        if hasattr(visualizer_deck, "flash_intensity"): visualizer_deck.flash_intensity = 0.0
-        if hasattr(visualizer_deck, "bg_flash"): visualizer_deck.bg_flash = 0
 
     if (app_state.get("current_channel") == "04"
             and not app_state.get("show_menu", False)
@@ -29299,7 +30031,7 @@ while True:
                     _gh_any = False
                     continue
                 if _gh_step == menu_nav.HOLD_REPEAT:
-                    app_state["guide_inactivity_timer"] = now_ticks_ms + 60000
+                    app_state["guide_inactivity_timer"] = now_ticks_ms + MENU_IDLE_CLOSE_MS
                     _guide_dirty_event.set()
                     _gh_axis, _gh_move = menu_nav.guide_move(menu_nav.key_to_direction(_gh_key))
                     if _gh_axis == menu_nav.GUIDE_TIME:
@@ -29330,11 +30062,6 @@ while True:
                             or app_state.get("file_explorer_active", False))
 
         OSD_COLOR = _osd_ui_color()
-
-        if 'visualizer_deck' in globals() and visualizer_deck is not None:
-            if hasattr(visualizer_deck, "flash_intensity"): visualizer_deck.flash_intensity = 0.0
-            if hasattr(visualizer_deck, "bg_flash"): visualizer_deck.bg_flash = 0
-            if hasattr(visualizer_deck, "galaxy_glow"): visualizer_deck.galaxy_glow = 0
 
         _led_rect = _bezel_channel_led_rect(w_w, w_h)
         if phase == "led" and _led_rect is not None:
@@ -29451,7 +30178,7 @@ while True:
                     screen.blit(lbl_v, (_vol_cx - lbl_v.get_width() // 2, _lbl_v_y))
                     _fill_w = int(_bar_w * _vol_pct / 100)
                     _bar_radius = max(1, _vs(8))
-                    pygame.draw.rect(screen, (80, 80, 80),   (_bar_x, _bar_y, _bar_w, _bar_h), border_radius=_bar_radius)
+                    pygame.draw.rect(screen, COLOR_VOLUME_OSD_TRACK,   (_bar_x, _bar_y, _bar_w, _bar_h), border_radius=_bar_radius)
                     pygame.draw.rect(screen, OSD_COLOR,      (_bar_x, _bar_y, _fill_w, _bar_h), border_radius=_bar_radius)
                     pygame.draw.rect(screen, OSD_COLOR,      (_bar_x, _bar_y, _bar_w, _bar_h), max(1, _vs(2)), border_radius=_bar_radius)
 
@@ -29651,7 +30378,7 @@ while True:
         
     elif app_state.get("show_restart_confirm", False):
         elapsed_popup_ms = now_ticks_ms - app_state.get("restart_confirm_shown_at", now_ticks_ms)
-        if elapsed_popup_ms >= 20000:
+        if elapsed_popup_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS:
             log.warning("[ANTI-BURN-IN SHIELD] Restart popup timed out. Reverting changes.")
             app_state["show_restart_confirm"] = False
         else:
@@ -29675,9 +30402,9 @@ while True:
             NEON_GREEN = (int(r * 255), int(g * 255), int(b * 255))
             r, g, b = colorsys.hsv_to_rgb(bg_hue, 0.6, 0.15)
             MIDNIGHT_NAVY = (int(r * 255), int(g * 255), int(b * 255))
-            TEXT_WHITE  = (255, 255, 255)
-            ARCADE_GOLD = (255, 220, 0)
-            ACTION_RED  = (255, 60, 60)
+            TEXT_WHITE  = COLOR_TEXT_WHITE
+            ARCADE_GOLD = COLOR_ARCADE_GOLD
+            ACTION_RED  = COLOR_ACTION_RED
             
             slider_val = db.config.get("menu_opacity", 50) if db is not None else 50
             menu_opacity = int((slider_val / 100.0) * 255)
@@ -29861,7 +30588,7 @@ while True:
                     except Exception as _ss_load_err:
                         log.warning(f"[SCREENSAVER] Could not load ScreenSaver.png: {_ss_load_err}")
                         _raw = pygame.Surface((120, 60), pygame.SRCALPHA)
-                        _raw.fill((255, 255, 255, 200))
+                        _raw.fill(COLOR_SCREENSAVER_FALLBACK)
                     globals()["_ch03_ss_raw"] = _raw
                 _target_w = max(80, int(content_rect.width * 0.40))
                 _aspect   = _raw.get_height() / max(1, _raw.get_width())
@@ -30077,7 +30804,7 @@ while True:
             and not app_state.get("file_explorer_active", False)):
         # WARNING: the grey cover is Black-style only; painting it in Static style hides the static the flip must show.
         if _configured_transition_style() != "static":
-            screen.fill(_TRANSITION_GRAY)
+            screen.fill(COLOR_TRANSITION_GREY)
         elif ch in ("03", "04"):
             _render_transition_static(screen, _full_window_rect)
 

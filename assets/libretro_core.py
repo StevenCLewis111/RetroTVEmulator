@@ -38,9 +38,9 @@ except Exception:
         return None
 
 try:
-    import performance_governor as _timing_governor
+    import performance_governor as _governor
 except Exception:
-    _timing_governor = None
+    _governor = None
 
 
 # ============================================================================
@@ -139,21 +139,22 @@ class GameFrameTimer:
             self._scratch.clear()
             self._scratch_counts.clear()
             self._t0 = None
-            if _timing_governor is None:
+            if _governor is None:
                 return
             now = time.monotonic()
-            early = now - self._session_t0 < _timing_governor.GAME_FRAME_TIMING_EARLY_SECONDS
-            period = (_timing_governor.GAME_FRAME_TIMING_EARLY_LOG_SECONDS if early
-                      else _timing_governor.GAME_FRAME_TIMING_LOG_SECONDS)
+            early = now - self._session_t0 < _governor.GAME_FRAME_TIMING_EARLY_SECONDS
+            period = (_governor.GAME_FRAME_TIMING_EARLY_LOG_SECONDS if early
+                      else _governor.GAME_FRAME_TIMING_LOG_SECONDS)
             if now - self._win_start >= period:
                 self._flush()
                 self._reset_window()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("GameFrameTimer.tick_end: end = time.perf_counter()", _swallowed_error)
             self._t0 = None
 
     def _flush(self):
         w = self._win
-        if w["ticks"] <= 0 or self._phase == "idle" or _timing_governor is None:
+        if w["ticks"] <= 0 or self._phase == "idle" or _governor is None:
             return
         n = float(w["ticks"])
         s = w["sum"]
@@ -205,7 +206,8 @@ GAME_FRAME_TIMER = GameFrameTimer()
 # ============================================================================
 # SECTION: Throttled logging & DLL handle
 # ============================================================================
-_WARN_THROTTLE_INTERVAL_S = 5.0
+# WARNING: the fallback number below must match LIBRETRO_WARN_THROTTLE_SECONDS in performance_governor.py; it is used only when that module fails to import.
+_WARN_THROTTLE_INTERVAL_S = _governor.LIBRETRO_WARN_THROTTLE_SECONDS if _governor is not None else 5.0
 _warn_throttle_last = {}
 
 
@@ -570,15 +572,15 @@ class LibretroInputManager:
 
 class LibretroAudio:
 
-    # VALUES CHANGE HERE
+    # WARNING: the mixer channel game audio plays on; channels 0 to 2 are reserved for the app's own sounds, so this is not a setting.
     CHANNEL_ID  = 6
-    OUT_CHUNK   = 1024
-    TARGET_OUT  = 4096
-    MAX_OUT     = 12288
-    PREBUFFER   = 3072
-    DRC_RANGE   = 0.004
-
-    LOUDNESS_GAIN = 0.45
+    # WARNING: the fallback numbers below must match LIBRETRO_AUDIO_OUT_CHUNK, LIBRETRO_AUDIO_TARGET_OUT, LIBRETRO_AUDIO_MAX_OUT, LIBRETRO_AUDIO_PREBUFFER, LIBRETRO_AUDIO_DRC_RANGE, LIBRETRO_AUDIO_LOUDNESS_GAIN in performance_governor.py; they are used only when that module fails to import.
+    OUT_CHUNK = _governor.LIBRETRO_AUDIO_OUT_CHUNK if _governor is not None else 1024
+    TARGET_OUT = _governor.LIBRETRO_AUDIO_TARGET_OUT if _governor is not None else 4096
+    MAX_OUT = _governor.LIBRETRO_AUDIO_MAX_OUT if _governor is not None else 12288
+    PREBUFFER = _governor.LIBRETRO_AUDIO_PREBUFFER if _governor is not None else 3072
+    DRC_RANGE = _governor.LIBRETRO_AUDIO_DRC_RANGE if _governor is not None else 0.004
+    LOUDNESS_GAIN = _governor.LIBRETRO_AUDIO_LOUDNESS_GAIN if _governor is not None else 0.45
 
     def __init__(self, sample_rate=32768):
         self._sample_rate = int(sample_rate) if sample_rate else 32768
@@ -604,14 +606,16 @@ class LibretroAudio:
 
         try:
             self._mixer_freq, _, self._mixer_channels = pygame.mixer.get_init()
-        except Exception:
+        except Exception as _swallowed_error:
+            _log_swallowed("LibretroAudio.__init__: self._mixer_freq, _, self._mixer_channels = pygame.mixer.get_init()", _swallowed_error)
             self._mixer_freq     = 44100
             self._mixer_channels = 2
 
         self._base_ratio = (self._mixer_freq / self._sample_rate
                              if self._sample_rate > 0 else 1.0)
 
-    MAX_BATCH_FRAMES = 500_000
+    # WARNING: the fallback number below must match LIBRETRO_AUDIO_MAX_BATCH_FRAMES in performance_governor.py; it is used only when that module fails to import.
+    MAX_BATCH_FRAMES = _governor.LIBRETRO_AUDIO_MAX_BATCH_FRAMES if _governor is not None else 500_000
 
     def push_samples(self, ptr, frames):
         """Zero-copy ingest of int16 stereo pairs from a ctypes pointer."""
@@ -757,7 +761,8 @@ class LibretroAudio:
     def set_sample_rate(self, sample_rate):
         try:
             sample_rate = float(sample_rate)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _swallowed_error:
+            _log_swallowed("LibretroAudio.set_sample_rate: sample_rate = float(sample_rate)", _swallowed_error)
             return
         if sample_rate <= 0 or sample_rate == self._sample_rate:
             return
@@ -937,7 +942,8 @@ class PixelArtScaler:
             return surface
 
 
-PIXEL_ART_SCALER_DEFAULT_FACTOR = 2
+# WARNING: the fallback number below must match LIBRETRO_PIXEL_ART_SCALE_FACTOR in performance_governor.py; it is used only when that module fails to import.
+PIXEL_ART_SCALER_DEFAULT_FACTOR = _governor.LIBRETRO_PIXEL_ART_SCALE_FACTOR if _governor is not None else 2
 
 
 # ============================================================================
@@ -1176,7 +1182,7 @@ class LibretroCore:
                     dc_struct = ctypes.cast(
                         data, ctypes.POINTER(retro_disk_control_callback)).contents
                     self._disk_control = dc_struct
-                    print("[LIBRETRO] Disk control interface registered �� live disc swap available")
+                    print("[LIBRETRO] Disk control interface registered -- live disc swap available")
                 except Exception as e:
                     log.warning(f"[LIBRETRO] Failed to read disk control interface: {e}")
                     self._disk_control = None
@@ -1268,8 +1274,9 @@ class LibretroCore:
             _log_warn_throttled("env_cb_cmd_failed", f"[LIBRETRO ENV] cmd={cmd}: {e}")
         return False
 
-    _MAX_FRAME_DIM   = 4096
-    _MAX_FRAME_PITCH = 4096 * 4
+    # WARNING: the fallback number below must match LIBRETRO_MAX_FRAME_DIM in performance_governor.py; it is used only when that module fails to import.
+    _MAX_FRAME_DIM   = _governor.LIBRETRO_MAX_FRAME_DIM if _governor is not None else 4096
+    _MAX_FRAME_PITCH = _MAX_FRAME_DIM * 4
     _MAX_FRAME_BYTES = 64 * 1024 * 1024
 
     def _cb_video_refresh(self, data, width, height, pitch):
@@ -1397,7 +1404,8 @@ class LibretroCore:
 
         try:
             _disk_size = os.path.getsize(rom_path)
-        except OSError:
+        except OSError as _swallowed_error:
+            _log_swallowed("LibretroCore.load_rom: _disk_size = os.path.getsize(rom_path)", _swallowed_error)
             _disk_size = -1
 
         if self._need_fullpath:
