@@ -3454,7 +3454,7 @@
    "at": "2026-10-13T00:00:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -3489,13 +3489,13 @@
      "used": {}
     }
    },
-   "state_sha": "0bfd527ad17c0443"
+   "state_sha": "d1580d1bf8d8b119"
   },
   {
    "at": "2026-10-13T00:37:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -3530,13 +3530,13 @@
      "used": {}
     }
    },
-   "state_sha": "47d577377795dafb"
+   "state_sha": "d9184e333c92e782"
   },
   {
    "at": "2026-10-13T01:14:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -3571,13 +3571,13 @@
      "used": {}
     }
    },
-   "state_sha": "47d577377795dafb"
+   "state_sha": "d9184e333c92e782"
   },
   {
    "at": "2026-10-13T01:51:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -3612,13 +3612,13 @@
      "used": {}
     }
    },
-   "state_sha": "430148bf04513ed1"
+   "state_sha": "8937a2b6638eadbe"
   },
   {
    "at": "2026-10-13T02:28:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -3626,7 +3626,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2405.0,
+    "seek": 2345.0,
     "seek_slot_offset": 1800
    },
    "scanned": 4,
@@ -3653,13 +3653,13 @@
      "used": {}
     }
    },
-   "state_sha": "430148bf04513ed1"
+   "state_sha": "8937a2b6638eadbe"
   },
   {
    "at": "2026-10-13T03:05:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -3667,7 +3667,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4400.0,
+    "seek": 4280.0,
     "seek_slot_offset": 3600
    },
    "scanned": 5,
@@ -3694,13 +3694,13 @@
      "used": {}
     }
    },
-   "state_sha": "430148bf04513ed1"
+   "state_sha": "8937a2b6638eadbe"
   },
   {
    "at": "2026-10-13T03:42:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -3733,13 +3733,13 @@
      "used": {}
     }
    },
-   "state_sha": "ec7504676aee15ec"
+   "state_sha": "6e70b1be637b53ce"
   },
   {
    "at": "2026-10-13T03:59:30",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -3772,13 +3772,13 @@
      "used": {}
     }
    },
-   "state_sha": "9b66494e8dd0b59d"
+   "state_sha": "383996ff839f7b15"
   },
   {
    "at": "2026-10-13T04:00:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Morning",
@@ -3813,13 +3813,13 @@
      "used": {}
     }
    },
-   "state_sha": "df7daacb24b3e2bb"
+   "state_sha": "8518ce8e405434dd"
   },
   {
    "at": "2026-10-13T04:19:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Morning",
@@ -3827,7 +3827,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2705.0,
+    "seek": 2750.0,
     "seek_slot_offset": 1800
    },
    "scanned": 9,
@@ -3854,13 +3854,13 @@
      "used": {}
     }
    },
-   "state_sha": "df7daacb24b3e2bb"
+   "state_sha": "8518ce8e405434dd"
   },
   {
    "at": "2026-10-13T04:56:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Morning",
@@ -3868,7 +3868,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4640.0,
+    "seek": 4685.0,
     "seek_slot_offset": 3600
    },
    "scanned": 10,
@@ -3895,7 +3895,7 @@
      "used": {}
     }
    },
-   "state_sha": "df7daacb24b3e2bb"
+   "state_sha": "8518ce8e405434dd"
   },
   {
    "at": "2026-10-13T05:33:05",
@@ -3935,7 +3935,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -3967,8 +3967,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -3978,7 +3978,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1460.0,
+    "seek": 1505.0,
     "seek_slot_offset": 0
    },
    "scanned": 11,
@@ -4008,7 +4008,7 @@
      "used": {}
     }
    },
-   "state_sha": "490d7be92723c593"
+   "state_sha": "799ddcbb0f9d548f"
   },
   {
    "at": "2026-10-13T06:10:05",
@@ -4048,7 +4048,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4080,8 +4080,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4091,7 +4091,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3395.0,
+    "seek": 3440.0,
     "seek_slot_offset": 1800
    },
    "scanned": 12,
@@ -4121,7 +4121,7 @@
      "used": {}
     }
    },
-   "state_sha": "ae6533598ced85df"
+   "state_sha": "53a0580feca2bfa4"
   },
   {
    "at": "2026-10-13T06:47:05",
@@ -4161,7 +4161,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4193,8 +4193,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4204,7 +4204,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 5330.0,
+    "seek": 5375.0,
     "seek_slot_offset": 3600
    },
    "scanned": 13,
@@ -4234,7 +4234,7 @@
      "used": {}
     }
    },
-   "state_sha": "ae6533598ced85df"
+   "state_sha": "53a0580feca2bfa4"
   },
   {
    "at": "2026-10-13T07:24:05",
@@ -4274,7 +4274,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4306,8 +4306,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4345,7 +4345,7 @@
      "used": {}
     }
    },
-   "state_sha": "7f2c0cc5e0cd41be"
+   "state_sha": "42412a9538b77dc0"
   },
   {
    "at": "2026-10-13T08:01:05",
@@ -4385,7 +4385,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4417,8 +4417,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4456,7 +4456,7 @@
      "used": {}
     }
    },
-   "state_sha": "94d92b2345513bfd"
+   "state_sha": "1d32a37a0c13ff1f"
   },
   {
    "at": "2026-10-13T08:38:05",
@@ -4496,7 +4496,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4528,8 +4528,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4567,7 +4567,7 @@
      "used": {}
     }
    },
-   "state_sha": "6a3f7535fffd5979"
+   "state_sha": "3ebdc83392ee445f"
   },
   {
    "at": "2026-10-13T09:15:05",
@@ -4607,7 +4607,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4639,8 +4639,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4678,7 +4678,7 @@
      "used": {}
     }
    },
-   "state_sha": "2f0205d835e3f6b0"
+   "state_sha": "94dd0207776e1863"
   },
   {
    "at": "2026-10-13T09:52:05",
@@ -4718,7 +4718,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4750,8 +4750,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4789,7 +4789,7 @@
      "used": {}
     }
    },
-   "state_sha": "0820cf4f9840c975"
+   "state_sha": "48c2c901fb95d4a4"
   },
   {
    "at": "2026-10-13T10:29:05",
@@ -4829,7 +4829,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4861,8 +4861,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -4900,7 +4900,7 @@
      "used": {}
     }
    },
-   "state_sha": "4cf9441aed5ab6c7"
+   "state_sha": "efac08509710736f"
   },
   {
    "at": "2026-10-13T11:06:05",
@@ -4940,7 +4940,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -4972,8 +4972,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -5011,7 +5011,7 @@
      "used": {}
     }
    },
-   "state_sha": "696bdfc2f0ec8a36"
+   "state_sha": "5fc82fa63c7d8cef"
   },
   {
    "at": "2026-10-13T11:43:05",
@@ -5051,7 +5051,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5083,8 +5083,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -5122,7 +5122,7 @@
      "used": {}
     }
    },
-   "state_sha": "14a2c568bf95fe76"
+   "state_sha": "3f062f64438b758f"
   },
   {
    "at": "2026-10-13T12:20:05",
@@ -5162,7 +5162,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5194,8 +5194,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5205,7 +5205,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1100.0,
+    "seek": 1190.0,
     "seek_slot_offset": 0
    },
    "scanned": 22,
@@ -5240,7 +5240,7 @@
      "used": {}
     }
    },
-   "state_sha": "9626ca7ca0683e9e"
+   "state_sha": "e6f79c060753f485"
   },
   {
    "at": "2026-10-13T12:57:05",
@@ -5280,7 +5280,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5312,8 +5312,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5323,7 +5323,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3035.0,
+    "seek": 3125.0,
     "seek_slot_offset": 1800
    },
    "scanned": 23,
@@ -5358,7 +5358,7 @@
      "used": {}
     }
    },
-   "state_sha": "89a7981b1fabacd7"
+   "state_sha": "1c0dbd6e40db4f51"
   },
   {
    "at": "2026-10-13T13:34:05",
@@ -5398,7 +5398,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5430,8 +5430,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5441,7 +5441,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4970.0,
+    "seek": 5060.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -5476,7 +5476,7 @@
      "used": {}
     }
    },
-   "state_sha": "89a7981b1fabacd7"
+   "state_sha": "1c0dbd6e40db4f51"
   },
   {
    "at": "2026-10-13T14:11:05",
@@ -5516,7 +5516,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5548,8 +5548,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5592,7 +5592,7 @@
      "used": {}
     }
    },
-   "state_sha": "a55c9442f5a89556"
+   "state_sha": "ce1b00fc5ba40074"
   },
   {
    "at": "2026-10-13T14:48:05",
@@ -5632,7 +5632,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5664,8 +5664,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5708,7 +5708,7 @@
      "used": {}
     }
    },
-   "state_sha": "c73676b375ca39fb"
+   "state_sha": "0753f92c735dda0e"
   },
   {
    "at": "2026-10-13T15:25:05",
@@ -5748,7 +5748,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5780,8 +5780,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5824,7 +5824,7 @@
      "used": {}
     }
    },
-   "state_sha": "cb678231b26bd552"
+   "state_sha": "627ee535fe5577d5"
   },
   {
    "at": "2026-10-13T16:02:05",
@@ -5864,7 +5864,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -5896,8 +5896,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -5940,7 +5940,7 @@
      "used": {}
     }
    },
-   "state_sha": "61145b3dd014ba55"
+   "state_sha": "9c512797b51b7721"
   },
   {
    "at": "2026-10-13T16:39:05",
@@ -5980,7 +5980,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6012,8 +6012,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6056,7 +6056,7 @@
      "used": {}
     }
    },
-   "state_sha": "a8039fc47283fdc9"
+   "state_sha": "ee8342aba1d494f9"
   },
   {
    "at": "2026-10-13T17:16:05",
@@ -6096,7 +6096,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6128,8 +6128,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6172,7 +6172,7 @@
      "used": {}
     }
    },
-   "state_sha": "609c982d0e699f9f"
+   "state_sha": "0274b1a605ea6325"
   },
   {
    "at": "2026-10-13T17:53:05",
@@ -6212,7 +6212,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6244,8 +6244,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6288,7 +6288,7 @@
      "used": {}
     }
    },
-   "state_sha": "a69e51f5b78075fe"
+   "state_sha": "60be8d0f9efa6844"
   },
   {
    "at": "2026-10-13T18:30:05",
@@ -6328,7 +6328,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6360,8 +6360,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6404,7 +6404,7 @@
      "used": {}
     }
    },
-   "state_sha": "53992171aee5b921"
+   "state_sha": "4ab1a87d683cba7d"
   },
   {
    "at": "2026-10-13T19:07:05",
@@ -6444,7 +6444,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6476,8 +6476,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6520,7 +6520,7 @@
      "used": {}
     }
    },
-   "state_sha": "b03036a922d2a4e9"
+   "state_sha": "089abe37c5b9a591"
   },
   {
    "at": "2026-10-13T19:44:05",
@@ -6560,7 +6560,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6592,8 +6592,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6636,7 +6636,7 @@
      "used": {}
     }
    },
-   "state_sha": "e4ff9188bdfe527d"
+   "state_sha": "b7733f58dddf1ef2"
   },
   {
    "at": "2026-10-13T19:59:50",
@@ -6676,7 +6676,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6708,8 +6708,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6752,7 +6752,7 @@
      "used": {}
     }
    },
-   "state_sha": "541c601a4dac6b36"
+   "state_sha": "0e5dfe043247f5ca"
   },
   {
    "at": "2026-10-13T20:00:05",
@@ -6792,7 +6792,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6824,8 +6824,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6835,7 +6835,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3410.0,
+    "seek": 3485.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -6870,7 +6870,7 @@
      "used": {}
     }
    },
-   "state_sha": "ab6a647788056fdf"
+   "state_sha": "a337df63813216a2"
   },
   {
    "at": "2026-10-13T20:21:05",
@@ -6910,7 +6910,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -6942,8 +6942,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -6953,7 +6953,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4445.0,
+    "seek": 4460.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -6988,7 +6988,7 @@
      "used": {}
     }
    },
-   "state_sha": "ab6a647788056fdf"
+   "state_sha": "a337df63813216a2"
   },
   {
    "at": "2026-10-13T20:58:05",
@@ -7028,7 +7028,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7060,8 +7060,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7106,7 +7106,7 @@
      "used": {}
     }
    },
-   "state_sha": "e2ce8443964132b3"
+   "state_sha": "2bb04b8512e5733a"
   },
   {
    "at": "2026-10-13T21:35:05",
@@ -7146,7 +7146,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7178,8 +7178,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7224,7 +7224,7 @@
      "used": {}
     }
    },
-   "state_sha": "3b1daee0f0691cee"
+   "state_sha": "0b51fe21e57d2acb"
   },
   {
    "at": "2026-10-13T22:12:05",
@@ -7264,7 +7264,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7296,8 +7296,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7342,7 +7342,7 @@
      "used": {}
     }
    },
-   "state_sha": "ed7d0903910a96c5"
+   "state_sha": "2bcaf9a87e0315fc"
   },
   {
    "at": "2026-10-13T22:49:05",
@@ -7382,7 +7382,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7414,8 +7414,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7460,7 +7460,7 @@
      "used": {}
     }
    },
-   "state_sha": "f8dcb6845bcfb25f"
+   "state_sha": "cc76d6ded417be2f"
   },
   {
    "at": "2026-10-13T23:26:05",
@@ -7500,7 +7500,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7532,8 +7532,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7578,7 +7578,7 @@
      "used": {}
     }
    },
-   "state_sha": "d3fd8721fd7727a6"
+   "state_sha": "a85678636c2d1de8"
   },
   {
    "at": "2026-10-13T23:59:59",
@@ -7618,7 +7618,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7650,8 +7650,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7696,7 +7696,7 @@
      "used": {}
     }
    },
-   "state_sha": "75e2cf8593bc3f0d"
+   "state_sha": "60588154f082414a"
   },
   {
    "at": "2026-10-14T00:00:05",
@@ -7736,7 +7736,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7768,8 +7768,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7814,7 +7814,7 @@
      "used": {}
     }
    },
-   "state_sha": "b303a9f34947e77e"
+   "state_sha": "d0d25efed3078ade"
   },
   {
    "at": "2026-10-14T00:03:05",
@@ -7854,7 +7854,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -7886,8 +7886,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -7932,7 +7932,7 @@
      "used": {}
     }
    },
-   "state_sha": "56ca34b143a17e8d"
+   "state_sha": "2d7e76c53fb95991"
   },
   {
    "at": "2026-10-14T00:40:05",
@@ -7972,7 +7972,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8004,8 +8004,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8050,7 +8050,7 @@
      "used": {}
     }
    },
-   "state_sha": "2715d93066266fab"
+   "state_sha": "779877eebf07d319"
   },
   {
    "at": "2026-10-14T01:17:05",
@@ -8090,7 +8090,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8122,8 +8122,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8168,7 +8168,7 @@
      "used": {}
     }
    },
-   "state_sha": "dbfefece7bd174ce"
+   "state_sha": "ddccf7fe249f71d6"
   },
   {
    "at": "2026-10-14T01:54:05",
@@ -8208,7 +8208,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8240,8 +8240,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8286,7 +8286,7 @@
      "used": {}
     }
    },
-   "state_sha": "9efab58667b95011"
+   "state_sha": "e93f6d7fb52665da"
   },
   {
    "at": "2026-10-14T02:31:05",
@@ -8326,7 +8326,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8358,8 +8358,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8404,7 +8404,7 @@
      "used": {}
     }
    },
-   "state_sha": "25f5d48a18446953"
+   "state_sha": "87bbc63ead46d570"
   },
   {
    "at": "2026-10-14T03:08:05",
@@ -8444,7 +8444,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8476,8 +8476,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8522,7 +8522,7 @@
      "used": {}
     }
    },
-   "state_sha": "8da7ba5f2f4e8f64"
+   "state_sha": "884c4099f072c781"
   },
   {
    "at": "2026-10-14T03:45:05",
@@ -8562,7 +8562,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8594,8 +8594,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8640,7 +8640,7 @@
      "used": {}
     }
    },
-   "state_sha": "8088613b0f0c7ad3"
+   "state_sha": "2ada6373b98b8254"
   },
   {
    "at": "2026-10-14T03:59:30",
@@ -8680,7 +8680,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8712,8 +8712,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8758,7 +8758,7 @@
      "used": {}
     }
    },
-   "state_sha": "fc2a8139a03d273a"
+   "state_sha": "24c5f5c6fb1531a9"
   },
   {
    "at": "2026-10-14T04:00:05",
@@ -8798,7 +8798,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8830,8 +8830,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8841,7 +8841,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1025.0,
+    "seek": 1295.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -8878,7 +8878,7 @@
      "used": {}
     }
    },
-   "state_sha": "dfa56280f3efe314"
+   "state_sha": "9dbaaeda6c38c176"
   },
   {
    "at": "2026-10-14T04:22:05",
@@ -8918,7 +8918,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -8950,8 +8950,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -8961,7 +8961,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2060.0,
+    "seek": 2330.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -8998,7 +8998,7 @@
      "used": {}
     }
    },
-   "state_sha": "dfa56280f3efe314"
+   "state_sha": "9dbaaeda6c38c176"
   },
   {
    "at": "2026-10-14T04:59:05",
@@ -9038,7 +9038,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9070,8 +9070,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -9081,7 +9081,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 3995.0,
+    "seek": 4265.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -9118,7 +9118,7 @@
      "used": {}
     }
    },
-   "state_sha": "dfa56280f3efe314"
+   "state_sha": "9dbaaeda6c38c176"
   },
   {
    "at": "2026-10-14T05:36:05",
@@ -9158,7 +9158,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9190,8 +9190,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9201,7 +9201,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 815.0,
+    "seek": 1085.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -9238,7 +9238,7 @@
      "used": {}
     }
    },
-   "state_sha": "f2efb0320ce14845"
+   "state_sha": "f72025c9b3025819"
   },
   {
    "at": "2026-10-14T06:13:05",
@@ -9278,7 +9278,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9310,8 +9310,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9321,7 +9321,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2750.0,
+    "seek": 3020.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -9358,7 +9358,7 @@
      "used": {}
     }
    },
-   "state_sha": "3bb957f66ba6b708"
+   "state_sha": "acdbbcd2d0bbb824"
   },
   {
    "at": "2026-10-14T06:50:05",
@@ -9398,7 +9398,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9430,8 +9430,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9441,7 +9441,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4685.0,
+    "seek": 4955.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -9478,7 +9478,7 @@
      "used": {}
     }
    },
-   "state_sha": "3bb957f66ba6b708"
+   "state_sha": "acdbbcd2d0bbb824"
   },
   {
    "at": "2026-10-14T07:27:05",
@@ -9518,7 +9518,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9550,8 +9550,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9596,7 +9596,7 @@
      "used": {}
     }
    },
-   "state_sha": "d57306ae9b0c766f"
+   "state_sha": "0f9abaad1c7cec98"
   },
   {
    "at": "2026-10-14T08:04:05",
@@ -9636,7 +9636,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9668,8 +9668,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9714,7 +9714,7 @@
      "used": {}
     }
    },
-   "state_sha": "8988618d6cb28dd3"
+   "state_sha": "4eb2ea7b88281ce5"
   },
   {
    "at": "2026-10-14T08:41:05",
@@ -9754,7 +9754,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9786,8 +9786,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9832,7 +9832,7 @@
      "used": {}
     }
    },
-   "state_sha": "1ab807270e847e33"
+   "state_sha": "1bbc0be19875f51c"
   },
   {
    "at": "2026-10-14T09:18:05",
@@ -9872,7 +9872,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -9904,8 +9904,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -9950,7 +9950,7 @@
      "used": {}
     }
    },
-   "state_sha": "6c949cbb0a461e2d"
+   "state_sha": "d175edb2fa64bea4"
   },
   {
    "at": "2026-10-14T09:55:05",
@@ -9990,7 +9990,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -10022,8 +10022,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -10068,7 +10068,7 @@
      "used": {}
     }
    },
-   "state_sha": "86e90b450b695e98"
+   "state_sha": "499f433479c1eb0a"
   },
   {
    "at": "2026-10-14T10:32:05",
@@ -10108,7 +10108,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -10140,8 +10140,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -10186,7 +10186,7 @@
      "used": {}
     }
    },
-   "state_sha": "82dc0afac2d70852"
+   "state_sha": "76008c6909ecff84"
   },
   {
    "at": "2026-10-14T11:09:05",
@@ -10226,7 +10226,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -10258,8 +10258,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -10304,7 +10304,7 @@
      "used": {}
     }
    },
-   "state_sha": "266b03c50119240b"
+   "state_sha": "7d6bad2b9e9b2887"
   },
   {
    "at": "2026-10-14T19:59:50",
@@ -10344,7 +10344,7 @@
       ]
      },
      "45": {
-      "cycle": 296,
+      "cycle": 255,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -10376,8 +10376,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 0,
    "refresh": 5,
@@ -10422,7 +10422,7 @@
      "used": {}
     }
    },
-   "state_sha": "a081679a33089782"
+   "state_sha": "6cb55c38f07589c7"
   },
   {
    "at": "2026-10-14T20:00:05",
@@ -10462,7 +10462,7 @@
       ]
      },
      "45": {
-      "cycle": 296,
+      "cycle": 255,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -10494,8 +10494,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 0,
    "refresh": 5,
@@ -10540,7 +10540,7 @@
      "used": {}
     }
    },
-   "state_sha": "85d7f9032c6ad98a"
+   "state_sha": "206f125e05db1ea1"
   },
   {
    "at": "2026-10-14T23:59:59",
@@ -10580,7 +10580,7 @@
       ]
      },
      "45": {
-      "cycle": 296,
+      "cycle": 255,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -10612,8 +10612,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 0,
    "refresh": 5,
@@ -10658,7 +10658,7 @@
      "used": {}
     }
    },
-   "state_sha": "a2eeb835ea7fea86"
+   "state_sha": "eee0b0247a3746f3"
   }
  ],
  "scan_eight_hour_two_slots": [
@@ -10666,7 +10666,7 @@
    "at": "2026-10-13T00:00:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -10701,13 +10701,13 @@
      "used": {}
     }
    },
-   "state_sha": "da1e67f600e21b9d"
+   "state_sha": "cd8bf8af275500f1"
   },
   {
    "at": "2026-10-13T00:37:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -10742,13 +10742,13 @@
      "used": {}
     }
    },
-   "state_sha": "c49cb7330b5bc3c4"
+   "state_sha": "6bda2799b231fafc"
   },
   {
    "at": "2026-10-13T01:14:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -10783,13 +10783,13 @@
      "used": {}
     }
    },
-   "state_sha": "c49cb7330b5bc3c4"
+   "state_sha": "6bda2799b231fafc"
   },
   {
    "at": "2026-10-13T01:51:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -10824,13 +10824,13 @@
      "used": {}
     }
    },
-   "state_sha": "7e836de69804ff62"
+   "state_sha": "451489e15a0bb6f8"
   },
   {
    "at": "2026-10-13T02:28:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -10838,7 +10838,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2405.0,
+    "seek": 2345.0,
     "seek_slot_offset": 1800
    },
    "scanned": 4,
@@ -10865,13 +10865,13 @@
      "used": {}
     }
    },
-   "state_sha": "7e836de69804ff62"
+   "state_sha": "451489e15a0bb6f8"
   },
   {
    "at": "2026-10-13T03:05:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Night",
@@ -10879,7 +10879,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4400.0,
+    "seek": 4280.0,
     "seek_slot_offset": 3600
    },
    "scanned": 5,
@@ -10906,13 +10906,13 @@
      "used": {}
     }
    },
-   "state_sha": "7e836de69804ff62"
+   "state_sha": "451489e15a0bb6f8"
   },
   {
    "at": "2026-10-13T03:42:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -10945,13 +10945,13 @@
      "used": {}
     }
    },
-   "state_sha": "ea5955ff5dd05731"
+   "state_sha": "9798d553d8a7f4d3"
   },
   {
    "at": "2026-10-13T03:59:30",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -10984,13 +10984,13 @@
      "used": {}
     }
    },
-   "state_sha": "f37398c84c8d966e"
+   "state_sha": "a320a6ad258cde8f"
   },
   {
    "at": "2026-10-13T04:00:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Morning",
@@ -11025,13 +11025,13 @@
      "used": {}
     }
    },
-   "state_sha": "30d7da1219ad91f5"
+   "state_sha": "1abb76ade547da9a"
   },
   {
    "at": "2026-10-13T04:19:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Morning",
@@ -11039,7 +11039,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2705.0,
+    "seek": 2750.0,
     "seek_slot_offset": 1800
    },
    "scanned": 9,
@@ -11066,13 +11066,13 @@
      "used": {}
     }
    },
-   "state_sha": "30d7da1219ad91f5"
+   "state_sha": "1abb76ade547da9a"
   },
   {
    "at": "2026-10-13T04:56:05",
    "block_key": "2026_285_Night",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Morning",
@@ -11080,7 +11080,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4640.0,
+    "seek": 4685.0,
     "seek_slot_offset": 3600
    },
    "scanned": 10,
@@ -11107,7 +11107,7 @@
      "used": {}
     }
    },
-   "state_sha": "30d7da1219ad91f5"
+   "state_sha": "1abb76ade547da9a"
   },
   {
    "at": "2026-10-13T05:33:05",
@@ -11147,7 +11147,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11179,8 +11179,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11190,7 +11190,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1460.0,
+    "seek": 1505.0,
     "seek_slot_offset": 0
    },
    "scanned": 11,
@@ -11220,7 +11220,7 @@
      "used": {}
     }
    },
-   "state_sha": "cf23f2b2ed356e14"
+   "state_sha": "1c2e09262b224dc4"
   },
   {
    "at": "2026-10-13T06:10:05",
@@ -11260,7 +11260,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11292,8 +11292,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11303,7 +11303,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3395.0,
+    "seek": 3440.0,
     "seek_slot_offset": 1800
    },
    "scanned": 12,
@@ -11333,7 +11333,7 @@
      "used": {}
     }
    },
-   "state_sha": "cbf88b6ed2acf3fb"
+   "state_sha": "31dfcf26175b127e"
   },
   {
    "at": "2026-10-13T06:47:05",
@@ -11373,7 +11373,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11405,8 +11405,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11416,7 +11416,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 5330.0,
+    "seek": 5375.0,
     "seek_slot_offset": 3600
    },
    "scanned": 13,
@@ -11446,7 +11446,7 @@
      "used": {}
     }
    },
-   "state_sha": "cbf88b6ed2acf3fb"
+   "state_sha": "31dfcf26175b127e"
   },
   {
    "at": "2026-10-13T07:24:05",
@@ -11486,7 +11486,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11518,8 +11518,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11557,7 +11557,7 @@
      "used": {}
     }
    },
-   "state_sha": "1ae0e5a3dcc4d4b2"
+   "state_sha": "fa7ccc7c0bb257a0"
   },
   {
    "at": "2026-10-13T08:01:05",
@@ -11597,7 +11597,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11629,8 +11629,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11668,7 +11668,7 @@
      "used": {}
     }
    },
-   "state_sha": "f3451a9695973ed5"
+   "state_sha": "dcdea5f257c996b7"
   },
   {
    "at": "2026-10-13T08:38:05",
@@ -11708,7 +11708,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11740,8 +11740,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11779,7 +11779,7 @@
      "used": {}
     }
    },
-   "state_sha": "4ffeac900acc86a0"
+   "state_sha": "3f976f7ece43ab64"
   },
   {
    "at": "2026-10-13T09:15:05",
@@ -11819,7 +11819,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11851,8 +11851,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -11890,7 +11890,7 @@
      "used": {}
     }
    },
-   "state_sha": "15f087c0de0a353f"
+   "state_sha": "e765e7d5bcacbe8e"
   },
   {
    "at": "2026-10-13T09:52:05",
@@ -11930,7 +11930,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -11962,8 +11962,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -12001,7 +12001,7 @@
      "used": {}
     }
    },
-   "state_sha": "868a898c31b2dc04"
+   "state_sha": "2b89203017d20b4b"
   },
   {
    "at": "2026-10-13T10:29:05",
@@ -12041,7 +12041,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12073,8 +12073,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -12112,7 +12112,7 @@
      "used": {}
     }
    },
-   "state_sha": "4ee8347bac2f90df"
+   "state_sha": "342e51d0b3fa71f1"
   },
   {
    "at": "2026-10-13T11:06:05",
@@ -12152,7 +12152,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12184,8 +12184,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -12223,7 +12223,7 @@
      "used": {}
     }
    },
-   "state_sha": "34a23d650b711192"
+   "state_sha": "c82a2e26a8ae087e"
   },
   {
    "at": "2026-10-13T11:43:05",
@@ -12263,7 +12263,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12295,8 +12295,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -12334,7 +12334,7 @@
      "used": {}
     }
    },
-   "state_sha": "7c881e26b308ba73"
+   "state_sha": "335c04d182989aaa"
   },
   {
    "at": "2026-10-13T12:20:05",
@@ -12374,7 +12374,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12406,8 +12406,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -12417,7 +12417,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1100.0,
+    "seek": 1190.0,
     "seek_slot_offset": 0
    },
    "scanned": 22,
@@ -12452,7 +12452,7 @@
      "used": {}
     }
    },
-   "state_sha": "db34e1953212b0a8"
+   "state_sha": "148fb9384c96bde0"
   },
   {
    "at": "2026-10-13T12:57:05",
@@ -12492,7 +12492,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12524,8 +12524,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -12535,7 +12535,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3035.0,
+    "seek": 3125.0,
     "seek_slot_offset": 1800
    },
    "scanned": 23,
@@ -12570,7 +12570,7 @@
      "used": {}
     }
    },
-   "state_sha": "ff2bbe53476cd7ee"
+   "state_sha": "d9633119b96bc2f1"
   },
   {
    "at": "2026-10-13T13:34:05",
@@ -12610,7 +12610,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12642,8 +12642,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -12653,7 +12653,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4970.0,
+    "seek": 5060.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -12688,7 +12688,7 @@
      "used": {}
     }
    },
-   "state_sha": "ff2bbe53476cd7ee"
+   "state_sha": "d9633119b96bc2f1"
   },
   {
    "at": "2026-10-13T14:11:05",
@@ -12728,7 +12728,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12760,8 +12760,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -12804,7 +12804,7 @@
      "used": {}
     }
    },
-   "state_sha": "b9116e9080879024"
+   "state_sha": "66cfa37d5ac6fa79"
   },
   {
    "at": "2026-10-13T14:48:05",
@@ -12844,7 +12844,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12876,8 +12876,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -12920,7 +12920,7 @@
      "used": {}
     }
    },
-   "state_sha": "9e94b54337e0952d"
+   "state_sha": "43423314ea22ce10"
   },
   {
    "at": "2026-10-13T15:25:05",
@@ -12960,7 +12960,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -12992,8 +12992,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13036,7 +13036,7 @@
      "used": {}
     }
    },
-   "state_sha": "43ba48c5f06a978b"
+   "state_sha": "669d576a0f5e0704"
   },
   {
    "at": "2026-10-13T16:02:05",
@@ -13076,7 +13076,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13108,8 +13108,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13152,7 +13152,7 @@
      "used": {}
     }
    },
-   "state_sha": "dd007fdd9a74c11a"
+   "state_sha": "8b14bd2be2bd51a4"
   },
   {
    "at": "2026-10-13T16:39:05",
@@ -13192,7 +13192,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13224,8 +13224,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13268,7 +13268,7 @@
      "used": {}
     }
    },
-   "state_sha": "ddd5d48f7e50cca9"
+   "state_sha": "56aeba30ffa7634a"
   },
   {
    "at": "2026-10-13T17:16:05",
@@ -13308,7 +13308,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13340,8 +13340,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13384,7 +13384,7 @@
      "used": {}
     }
    },
-   "state_sha": "5c06ce842341d485"
+   "state_sha": "ac196b097ffe1bbe"
   },
   {
    "at": "2026-10-13T17:53:05",
@@ -13424,7 +13424,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13456,8 +13456,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13500,7 +13500,7 @@
      "used": {}
     }
    },
-   "state_sha": "2588eceac4742799"
+   "state_sha": "4d52cd2a07116cca"
   },
   {
    "at": "2026-10-13T18:30:05",
@@ -13540,7 +13540,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13572,8 +13572,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13616,7 +13616,7 @@
      "used": {}
     }
    },
-   "state_sha": "db89fccba955bc86"
+   "state_sha": "36a9bdfe460940a9"
   },
   {
    "at": "2026-10-13T19:07:05",
@@ -13656,7 +13656,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13688,8 +13688,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13732,7 +13732,7 @@
      "used": {}
     }
    },
-   "state_sha": "78a1a7f348ab35dd"
+   "state_sha": "6498f197d08b2313"
   },
   {
    "at": "2026-10-13T19:44:05",
@@ -13772,7 +13772,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13804,8 +13804,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13848,7 +13848,7 @@
      "used": {}
     }
    },
-   "state_sha": "d7ca0732feaa0b92"
+   "state_sha": "ed6992283729985e"
   },
   {
    "at": "2026-10-13T19:59:50",
@@ -13888,7 +13888,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -13920,8 +13920,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -13964,7 +13964,7 @@
      "used": {}
     }
    },
-   "state_sha": "dca46aa046bf2857"
+   "state_sha": "51a0064e96e6bbe4"
   },
   {
    "at": "2026-10-13T20:00:05",
@@ -14004,7 +14004,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14036,8 +14036,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14047,7 +14047,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3410.0,
+    "seek": 3485.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -14082,7 +14082,7 @@
      "used": {}
     }
    },
-   "state_sha": "b9baad2018a1c36a"
+   "state_sha": "7bfb2098a388cd9c"
   },
   {
    "at": "2026-10-13T20:21:05",
@@ -14122,7 +14122,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14154,8 +14154,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14165,7 +14165,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4445.0,
+    "seek": 4460.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -14200,7 +14200,7 @@
      "used": {}
     }
    },
-   "state_sha": "b9baad2018a1c36a"
+   "state_sha": "7bfb2098a388cd9c"
   },
   {
    "at": "2026-10-13T20:58:05",
@@ -14240,7 +14240,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14272,8 +14272,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14318,7 +14318,7 @@
      "used": {}
     }
    },
-   "state_sha": "3252e0a96c27fe5a"
+   "state_sha": "79f73a9e0a5631b0"
   },
   {
    "at": "2026-10-13T21:35:05",
@@ -14358,7 +14358,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14390,8 +14390,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14436,7 +14436,7 @@
      "used": {}
     }
    },
-   "state_sha": "605ffef4cf440ad2"
+   "state_sha": "892ef13a9522b25e"
   },
   {
    "at": "2026-10-13T22:12:05",
@@ -14476,7 +14476,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14508,8 +14508,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14554,7 +14554,7 @@
      "used": {}
     }
    },
-   "state_sha": "9e87f19f4dab1f58"
+   "state_sha": "c7a6e96b87416290"
   },
   {
    "at": "2026-10-13T22:49:05",
@@ -14594,7 +14594,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14626,8 +14626,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14672,7 +14672,7 @@
      "used": {}
     }
    },
-   "state_sha": "8a8d747eb43172fc"
+   "state_sha": "b45592b2b04f1178"
   },
   {
    "at": "2026-10-13T23:26:05",
@@ -14712,7 +14712,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14744,8 +14744,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14790,7 +14790,7 @@
      "used": {}
     }
    },
-   "state_sha": "e3123eab2510f522"
+   "state_sha": "01b8205f544350fd"
   },
   {
    "at": "2026-10-13T23:59:59",
@@ -14830,7 +14830,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14862,8 +14862,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -14908,7 +14908,7 @@
      "used": {}
     }
    },
-   "state_sha": "f2ae0f31b112325b"
+   "state_sha": "db7a9f2a0bd8a7a3"
   },
   {
    "at": "2026-10-14T00:00:05",
@@ -14948,7 +14948,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -14980,8 +14980,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15026,7 +15026,7 @@
      "used": {}
     }
    },
-   "state_sha": "61c32468b66a1e42"
+   "state_sha": "351837f76ca29f93"
   },
   {
    "at": "2026-10-14T00:03:05",
@@ -15066,7 +15066,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15098,8 +15098,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15144,7 +15144,7 @@
      "used": {}
     }
    },
-   "state_sha": "be103ee7777b38e7"
+   "state_sha": "c66ffd61337acfb8"
   },
   {
    "at": "2026-10-14T00:40:05",
@@ -15184,7 +15184,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15216,8 +15216,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15262,7 +15262,7 @@
      "used": {}
     }
    },
-   "state_sha": "4dcb7d38328cd3ea"
+   "state_sha": "059afbc49066456d"
   },
   {
    "at": "2026-10-14T01:17:05",
@@ -15302,7 +15302,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15334,8 +15334,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15380,7 +15380,7 @@
      "used": {}
     }
    },
-   "state_sha": "2e9b8aa97433add7"
+   "state_sha": "c275abd117a76974"
   },
   {
    "at": "2026-10-14T01:54:05",
@@ -15420,7 +15420,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15452,8 +15452,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15498,7 +15498,7 @@
      "used": {}
     }
    },
-   "state_sha": "ee84e82ab57ad3c3"
+   "state_sha": "f603311e385ecba2"
   },
   {
    "at": "2026-10-14T02:31:05",
@@ -15538,7 +15538,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15570,8 +15570,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15616,7 +15616,7 @@
      "used": {}
     }
    },
-   "state_sha": "92673b80579a9bfc"
+   "state_sha": "154367f53d53ae91"
   },
   {
    "at": "2026-10-14T03:08:05",
@@ -15656,7 +15656,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15688,8 +15688,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15734,7 +15734,7 @@
      "used": {}
     }
    },
-   "state_sha": "626cc3a3a4d9e331"
+   "state_sha": "7120637997356ba6"
   },
   {
    "at": "2026-10-14T03:45:05",
@@ -15774,7 +15774,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15806,8 +15806,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15852,7 +15852,7 @@
      "used": {}
     }
    },
-   "state_sha": "d25cf1246ee253b7"
+   "state_sha": "5affc0d2dcef3515"
   },
   {
    "at": "2026-10-14T03:59:30",
@@ -15892,7 +15892,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -15924,8 +15924,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -15970,7 +15970,7 @@
      "used": {}
     }
    },
-   "state_sha": "2e505429335efe2f"
+   "state_sha": "3902eb79b21f9ed1"
   },
   {
    "at": "2026-10-14T04:00:05",
@@ -16010,7 +16010,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16042,8 +16042,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -16053,7 +16053,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1025.0,
+    "seek": 1295.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -16090,7 +16090,7 @@
      "used": {}
     }
    },
-   "state_sha": "0a9fb076b54f50d9"
+   "state_sha": "e05c084228f49ac1"
   },
   {
    "at": "2026-10-14T04:22:05",
@@ -16130,7 +16130,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16162,8 +16162,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -16173,7 +16173,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2060.0,
+    "seek": 2330.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -16210,7 +16210,7 @@
      "used": {}
     }
    },
-   "state_sha": "0a9fb076b54f50d9"
+   "state_sha": "e05c084228f49ac1"
   },
   {
    "at": "2026-10-14T04:59:05",
@@ -16250,7 +16250,7 @@
       ]
      },
      "45": {
-      "cycle": 31,
+      "cycle": 27,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16282,8 +16282,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -16293,7 +16293,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 3995.0,
+    "seek": 4265.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -16330,7 +16330,7 @@
      "used": {}
     }
    },
-   "state_sha": "0a9fb076b54f50d9"
+   "state_sha": "e05c084228f49ac1"
   },
   {
    "at": "2026-10-14T05:36:05",
@@ -16370,7 +16370,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16402,8 +16402,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -16413,7 +16413,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 815.0,
+    "seek": 1085.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -16450,7 +16450,7 @@
      "used": {}
     }
    },
-   "state_sha": "1316bc3dc8a1b2a1"
+   "state_sha": "53cb834ac8859161"
   },
   {
    "at": "2026-10-14T06:13:05",
@@ -16490,7 +16490,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16522,8 +16522,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -16533,7 +16533,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2750.0,
+    "seek": 3020.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -16570,7 +16570,7 @@
      "used": {}
     }
    },
-   "state_sha": "fed34bf580901c7e"
+   "state_sha": "8a5ec7a0b1b50c66"
   },
   {
    "at": "2026-10-14T06:50:05",
@@ -16610,7 +16610,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16642,8 +16642,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -16653,7 +16653,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4685.0,
+    "seek": 4955.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -16690,7 +16690,7 @@
      "used": {}
     }
    },
-   "state_sha": "fed34bf580901c7e"
+   "state_sha": "8a5ec7a0b1b50c66"
   },
   {
    "at": "2026-10-14T07:27:05",
@@ -16730,7 +16730,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16762,8 +16762,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -16808,7 +16808,7 @@
      "used": {}
     }
    },
-   "state_sha": "684e59633ae6efc0"
+   "state_sha": "5719a403a2abb8b9"
   },
   {
    "at": "2026-10-14T08:04:05",
@@ -16848,7 +16848,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16880,8 +16880,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -16926,7 +16926,7 @@
      "used": {}
     }
    },
-   "state_sha": "d054d27667b43460"
+   "state_sha": "7d4e3eea8c4f9d3c"
   },
   {
    "at": "2026-10-14T08:41:05",
@@ -16966,7 +16966,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -16998,8 +16998,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -17044,7 +17044,7 @@
      "used": {}
     }
    },
-   "state_sha": "d7c5be0ea0f8d166"
+   "state_sha": "e7d7993603f22b4e"
   },
   {
    "at": "2026-10-14T09:18:05",
@@ -17084,7 +17084,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17116,8 +17116,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -17162,7 +17162,7 @@
      "used": {}
     }
    },
-   "state_sha": "9bb2eb0e7c143062"
+   "state_sha": "aebd14fda32facad"
   },
   {
    "at": "2026-10-14T09:55:05",
@@ -17202,7 +17202,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17234,8 +17234,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -17280,7 +17280,7 @@
      "used": {}
     }
    },
-   "state_sha": "ddc97e092d5b8fed"
+   "state_sha": "814dd83cc0962988"
   },
   {
    "at": "2026-10-14T10:32:05",
@@ -17320,7 +17320,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17352,8 +17352,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -17398,7 +17398,7 @@
      "used": {}
     }
    },
-   "state_sha": "6459c262aa1d0ad9"
+   "state_sha": "7427cb85af2cf342"
   },
   {
    "at": "2026-10-14T11:09:05",
@@ -17438,7 +17438,7 @@
       ]
      },
      "45": {
-      "cycle": 279,
+      "cycle": 240,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17470,8 +17470,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -17516,7 +17516,7 @@
      "used": {}
     }
    },
-   "state_sha": "d695bf9f48e5a398"
+   "state_sha": "44c82dd09da5a104"
   },
   {
    "at": "2026-10-14T19:59:50",
@@ -17556,7 +17556,7 @@
       ]
      },
      "45": {
-      "cycle": 296,
+      "cycle": 255,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17588,8 +17588,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 0,
    "refresh": 5,
@@ -17634,7 +17634,7 @@
      "used": {}
     }
    },
-   "state_sha": "1f280b112b451ae2"
+   "state_sha": "78b8f236c7433742"
   },
   {
    "at": "2026-10-14T20:00:05",
@@ -17674,7 +17674,7 @@
       ]
      },
      "45": {
-      "cycle": 296,
+      "cycle": 255,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17706,8 +17706,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 0,
    "refresh": 5,
@@ -17752,7 +17752,7 @@
      "used": {}
     }
    },
-   "state_sha": "4a71485ade4fdcd5"
+   "state_sha": "70e85bde8151871c"
   },
   {
    "at": "2026-10-14T23:59:59",
@@ -17792,7 +17792,7 @@
       ]
      },
      "45": {
-      "cycle": 296,
+      "cycle": 255,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -17824,8 +17824,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad5.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 0,
    "refresh": 5,
@@ -17870,7 +17870,7 @@
      "used": {}
     }
    },
-   "state_sha": "ca83dbfd5a37020e"
+   "state_sha": "52e5a79decc32ddd"
   }
  ],
  "scan_eight_hour_two_slots_random_order": [
@@ -22567,7 +22567,7 @@
    "at": "2026-10-13T00:00:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -22602,13 +22602,13 @@
      "used": {}
     }
    },
-   "state_sha": "0141f9e2c7502634"
+   "state_sha": "2ba1fb0b98ecce23"
   },
   {
    "at": "2026-10-13T00:37:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -22643,13 +22643,13 @@
      "used": {}
     }
    },
-   "state_sha": "660783bf72b72d00"
+   "state_sha": "44a36b0074d23c9f"
   },
   {
    "at": "2026-10-13T01:14:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -22684,13 +22684,13 @@
      "used": {}
     }
    },
-   "state_sha": "660783bf72b72d00"
+   "state_sha": "44a36b0074d23c9f"
   },
   {
    "at": "2026-10-13T01:51:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -22725,13 +22725,13 @@
      "used": {}
     }
    },
-   "state_sha": "a2f460241a842242"
+   "state_sha": "1c11cf1cc23c17c7"
   },
   {
    "at": "2026-10-13T02:28:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -22739,7 +22739,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2405.0,
+    "seek": 2345.0,
     "seek_slot_offset": 1800
    },
    "scanned": 4,
@@ -22766,13 +22766,13 @@
      "used": {}
     }
    },
-   "state_sha": "a2f460241a842242"
+   "state_sha": "1c11cf1cc23c17c7"
   },
   {
    "at": "2026-10-13T03:05:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -22780,7 +22780,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4400.0,
+    "seek": 4280.0,
     "seek_slot_offset": 3600
    },
    "scanned": 5,
@@ -22807,13 +22807,13 @@
      "used": {}
     }
    },
-   "state_sha": "a2f460241a842242"
+   "state_sha": "1c11cf1cc23c17c7"
   },
   {
    "at": "2026-10-13T03:42:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -22846,13 +22846,13 @@
      "used": {}
     }
    },
-   "state_sha": "592d78bfdc18baaa"
+   "state_sha": "51a103f31aec6faf"
   },
   {
    "at": "2026-10-13T03:59:30",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -22885,13 +22885,13 @@
      "used": {}
     }
    },
-   "state_sha": "1c8e045495542fcf"
+   "state_sha": "d47e9915d102b8cd"
   },
   {
    "at": "2026-10-13T04:00:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -22924,13 +22924,13 @@
      "used": {}
     }
    },
-   "state_sha": "c406836b866e3d2a"
+   "state_sha": "b6a8acf1822512f5"
   },
   {
    "at": "2026-10-13T04:19:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -22963,13 +22963,13 @@
      "used": {}
     }
    },
-   "state_sha": "2cb42668b1762a7a"
+   "state_sha": "b6c7bfb177eccc8b"
   },
   {
    "at": "2026-10-13T04:56:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23002,13 +23002,13 @@
      "used": {}
     }
    },
-   "state_sha": "d177b35fb23953ca"
+   "state_sha": "60aa1e6d56315029"
   },
   {
    "at": "2026-10-13T05:33:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23041,13 +23041,13 @@
      "used": {}
     }
    },
-   "state_sha": "180b8890e784932a"
+   "state_sha": "162ab385773d589f"
   },
   {
    "at": "2026-10-13T06:10:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23080,13 +23080,13 @@
      "used": {}
     }
    },
-   "state_sha": "b23e94569bd47a10"
+   "state_sha": "11d6b85fc2c8b360"
   },
   {
    "at": "2026-10-13T06:47:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23119,13 +23119,13 @@
      "used": {}
     }
    },
-   "state_sha": "a1324c22aaca14c4"
+   "state_sha": "60b5391bec679388"
   },
   {
    "at": "2026-10-13T07:24:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23158,13 +23158,13 @@
      "used": {}
     }
    },
-   "state_sha": "4d7e12447d4b78b9"
+   "state_sha": "f5d389f69bdaf35d"
   },
   {
    "at": "2026-10-13T08:01:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23197,13 +23197,13 @@
      "used": {}
     }
    },
-   "state_sha": "72d42c2a3f370475"
+   "state_sha": "50e34e855c343bfb"
   },
   {
    "at": "2026-10-13T08:38:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23236,13 +23236,13 @@
      "used": {}
     }
    },
-   "state_sha": "0fa33613cda22f33"
+   "state_sha": "4e681906bc55ce87"
   },
   {
    "at": "2026-10-13T09:15:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23275,13 +23275,13 @@
      "used": {}
     }
    },
-   "state_sha": "ac7f63709e36f2a9"
+   "state_sha": "133617c49adf2f35"
   },
   {
    "at": "2026-10-13T09:52:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23314,13 +23314,13 @@
      "used": {}
     }
    },
-   "state_sha": "e0835edd4a8dfc81"
+   "state_sha": "19aa36eff1e40904"
   },
   {
    "at": "2026-10-13T10:29:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23353,13 +23353,13 @@
      "used": {}
     }
    },
-   "state_sha": "94f7b646feec2485"
+   "state_sha": "cc45507721344852"
   },
   {
    "at": "2026-10-13T11:06:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23392,13 +23392,13 @@
      "used": {}
     }
    },
-   "state_sha": "431693c9662d7019"
+   "state_sha": "2b1aaaa40df4c974"
   },
   {
    "at": "2026-10-13T11:43:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23431,13 +23431,13 @@
      "used": {}
     }
    },
-   "state_sha": "6e73d0a3251dad45"
+   "state_sha": "5175c0555971dfe4"
   },
   {
    "at": "2026-10-13T12:20:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23470,13 +23470,13 @@
      "used": {}
     }
    },
-   "state_sha": "622c81bcbb47bbda"
+   "state_sha": "db6adf11be41a101"
   },
   {
    "at": "2026-10-13T12:57:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23509,13 +23509,13 @@
      "used": {}
     }
    },
-   "state_sha": "42d73d2753495453"
+   "state_sha": "a4e188df1d07ef8d"
   },
   {
    "at": "2026-10-13T13:34:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23548,13 +23548,13 @@
      "used": {}
     }
    },
-   "state_sha": "189540889944bcf2"
+   "state_sha": "d01cf064a1bc95eb"
   },
   {
    "at": "2026-10-13T14:11:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23587,13 +23587,13 @@
      "used": {}
     }
    },
-   "state_sha": "99b1ce3f434b1cfd"
+   "state_sha": "fe85ce4161001a16"
   },
   {
    "at": "2026-10-13T14:48:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23626,13 +23626,13 @@
      "used": {}
     }
    },
-   "state_sha": "5e49beda1e9c19b9"
+   "state_sha": "6080f80fd09c8268"
   },
   {
    "at": "2026-10-13T15:25:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23665,13 +23665,13 @@
      "used": {}
     }
    },
-   "state_sha": "e06b7f10b887fad3"
+   "state_sha": "a614ee032e78a0bd"
   },
   {
    "at": "2026-10-13T16:02:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23704,13 +23704,13 @@
      "used": {}
     }
    },
-   "state_sha": "d823082d1b91d69c"
+   "state_sha": "4a5e3bdb135639b5"
   },
   {
    "at": "2026-10-13T16:39:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23743,13 +23743,13 @@
      "used": {}
     }
    },
-   "state_sha": "49ba0a5d0d6527ce"
+   "state_sha": "7b6b02a49677d682"
   },
   {
    "at": "2026-10-13T17:16:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23782,13 +23782,13 @@
      "used": {}
     }
    },
-   "state_sha": "561bf0d662e21140"
+   "state_sha": "d332af630ce287e8"
   },
   {
    "at": "2026-10-13T17:53:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23821,13 +23821,13 @@
      "used": {}
     }
    },
-   "state_sha": "5b2253c02ba4fc77"
+   "state_sha": "1989227ea860e886"
   },
   {
    "at": "2026-10-13T18:30:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23860,13 +23860,13 @@
      "used": {}
     }
    },
-   "state_sha": "f62129050926ce42"
+   "state_sha": "5cb0f9d1ba074a9b"
   },
   {
    "at": "2026-10-13T19:07:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23899,13 +23899,13 @@
      "used": {}
     }
    },
-   "state_sha": "667fd42baf648a0e"
+   "state_sha": "54095629f689a66d"
   },
   {
    "at": "2026-10-13T19:44:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23938,13 +23938,13 @@
      "used": {}
     }
    },
-   "state_sha": "03c739f0875263f8"
+   "state_sha": "2f880a7249cfd4d5"
   },
   {
    "at": "2026-10-13T19:59:50",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -23977,13 +23977,13 @@
      "used": {}
     }
    },
-   "state_sha": "a7c7e39f568b06e1"
+   "state_sha": "ea0fec24bf774988"
   },
   {
    "at": "2026-10-13T20:00:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24016,13 +24016,13 @@
      "used": {}
     }
    },
-   "state_sha": "9668afe0c6058f78"
+   "state_sha": "e7bc784a754fd2ba"
   },
   {
    "at": "2026-10-13T20:21:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24055,13 +24055,13 @@
      "used": {}
     }
    },
-   "state_sha": "1e50bfab8c480d70"
+   "state_sha": "fb33bbca0ad741ea"
   },
   {
    "at": "2026-10-13T20:58:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24094,13 +24094,13 @@
      "used": {}
     }
    },
-   "state_sha": "b2458c69a222c38b"
+   "state_sha": "8ec11b5b86ffe929"
   },
   {
    "at": "2026-10-13T21:35:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24133,13 +24133,13 @@
      "used": {}
     }
    },
-   "state_sha": "e5f69273e43901ee"
+   "state_sha": "c3c7520781eee4f7"
   },
   {
    "at": "2026-10-13T22:12:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24172,13 +24172,13 @@
      "used": {}
     }
    },
-   "state_sha": "a8bcbbf6168aa83c"
+   "state_sha": "2571c222cffbca01"
   },
   {
    "at": "2026-10-13T22:49:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24211,13 +24211,13 @@
      "used": {}
     }
    },
-   "state_sha": "db1f7141adcdbebe"
+   "state_sha": "f970a97a43d74bf5"
   },
   {
    "at": "2026-10-13T23:26:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24250,13 +24250,13 @@
      "used": {}
     }
    },
-   "state_sha": "b0bb0fe2e8842a38"
+   "state_sha": "22b91216b7556451"
   },
   {
    "at": "2026-10-13T23:59:59",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24289,13 +24289,13 @@
      "used": {}
     }
    },
-   "state_sha": "ae66faadfeb8d69e"
+   "state_sha": "6b4fe1fb9f1a8c0b"
   },
   {
    "at": "2026-10-14T00:00:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -24303,7 +24303,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4370.0,
+    "seek": 4520.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -24330,13 +24330,13 @@
      "used": {}
     }
    },
-   "state_sha": "56553a3e677d2e7a"
+   "state_sha": "ec60717ee5b6915c"
   },
   {
    "at": "2026-10-14T00:03:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "Full Day",
@@ -24344,7 +24344,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4550.0,
+    "seek": 4700.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -24371,13 +24371,13 @@
      "used": {}
     }
    },
-   "state_sha": "56553a3e677d2e7a"
+   "state_sha": "ec60717ee5b6915c"
   },
   {
    "at": "2026-10-14T00:40:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24418,13 +24418,13 @@
      "used": {}
     }
    },
-   "state_sha": "51a6cc0ba944e5e3"
+   "state_sha": "fcb6567a9c5c0055"
   },
   {
    "at": "2026-10-14T01:17:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24465,13 +24465,13 @@
      "used": {}
     }
    },
-   "state_sha": "c951f3e12e38a911"
+   "state_sha": "7303757fa7844a9b"
   },
   {
    "at": "2026-10-14T01:54:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24512,13 +24512,13 @@
      "used": {}
     }
    },
-   "state_sha": "aa291084c6da5944"
+   "state_sha": "e084970f3f4f4b16"
   },
   {
    "at": "2026-10-14T02:31:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24559,13 +24559,13 @@
      "used": {}
     }
    },
-   "state_sha": "5abc22284e5f0785"
+   "state_sha": "31e46576eae8c126"
   },
   {
    "at": "2026-10-14T03:08:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24606,13 +24606,13 @@
      "used": {}
     }
    },
-   "state_sha": "5499b0b84a58c3de"
+   "state_sha": "a7758e5992e2e60b"
   },
   {
    "at": "2026-10-14T03:45:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24653,13 +24653,13 @@
      "used": {}
     }
    },
-   "state_sha": "4ec8d43d6b7e2802"
+   "state_sha": "ddcc57f530e4aadc"
   },
   {
    "at": "2026-10-14T03:59:30",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24700,13 +24700,13 @@
      "used": {}
     }
    },
-   "state_sha": "f4025d8674c66bb2"
+   "state_sha": "7e810f22b0bab977"
   },
   {
    "at": "2026-10-14T04:00:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24747,13 +24747,13 @@
      "used": {}
     }
    },
-   "state_sha": "374c9bbaf05e8753"
+   "state_sha": "18f60abdcd0067b1"
   },
   {
    "at": "2026-10-14T04:22:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24794,13 +24794,13 @@
      "used": {}
     }
    },
-   "state_sha": "8e2f35a28218df5b"
+   "state_sha": "38332c3793ebda9c"
   },
   {
    "at": "2026-10-14T04:59:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24841,13 +24841,13 @@
      "used": {}
     }
    },
-   "state_sha": "6fd648680fe14fad"
+   "state_sha": "2abe8d645ee46e33"
   },
   {
    "at": "2026-10-14T05:36:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24888,13 +24888,13 @@
      "used": {}
     }
    },
-   "state_sha": "555ff9f7bc06d4f8"
+   "state_sha": "d94e1af148d49435"
   },
   {
    "at": "2026-10-14T06:13:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24935,13 +24935,13 @@
      "used": {}
     }
    },
-   "state_sha": "9102f94c9a15fd23"
+   "state_sha": "48644e59d9f73bc6"
   },
   {
    "at": "2026-10-14T06:50:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -24982,13 +24982,13 @@
      "used": {}
     }
    },
-   "state_sha": "ab840a6500fbf2c0"
+   "state_sha": "7baff306044da0ef"
   },
   {
    "at": "2026-10-14T07:27:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25029,13 +25029,13 @@
      "used": {}
     }
    },
-   "state_sha": "fab4ec6ce1cfe9c9"
+   "state_sha": "40e4a91c56772b9d"
   },
   {
    "at": "2026-10-14T08:04:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25076,13 +25076,13 @@
      "used": {}
     }
    },
-   "state_sha": "599bec7fbd5bcaaa"
+   "state_sha": "b8b328826da2658c"
   },
   {
    "at": "2026-10-14T08:41:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25123,13 +25123,13 @@
      "used": {}
     }
    },
-   "state_sha": "46ea8ac11423e479"
+   "state_sha": "2514a850e9afed1a"
   },
   {
    "at": "2026-10-14T09:18:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25170,13 +25170,13 @@
      "used": {}
     }
    },
-   "state_sha": "4e87746b37fe1c3f"
+   "state_sha": "f4f6916ce7219a72"
   },
   {
    "at": "2026-10-14T09:55:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25217,13 +25217,13 @@
      "used": {}
     }
    },
-   "state_sha": "c1e3f268144b197a"
+   "state_sha": "c33d79dbe2911f3b"
   },
   {
    "at": "2026-10-14T10:32:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25264,13 +25264,13 @@
      "used": {}
     }
    },
-   "state_sha": "ae7ccc0039e972db"
+   "state_sha": "0c30390cbd6038eb"
   },
   {
    "at": "2026-10-14T11:09:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25311,13 +25311,13 @@
      "used": {}
     }
    },
-   "state_sha": "584cf90171e5ea35"
+   "state_sha": "05719aabde3513a8"
   },
   {
    "at": "2026-10-14T19:59:50",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25358,13 +25358,13 @@
      "used": {}
     }
    },
-   "state_sha": "c8fb27714f58308b"
+   "state_sha": "6bd7df191554221d"
   },
   {
    "at": "2026-10-14T20:00:05",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25405,13 +25405,13 @@
      "used": {}
     }
    },
-   "state_sha": "1afb29c2de2f9f00"
+   "state_sha": "b1b003f9d4773731"
   },
   {
    "at": "2026-10-14T23:59:59",
    "block_key": "2026_286_Full Day",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25452,7 +25452,7 @@
      "used": {}
     }
    },
-   "state_sha": "41cd3f37197d12e3"
+   "state_sha": "52ca8ad927691810"
   }
  ],
  "scan_six_block_random_slots": [
@@ -25460,7 +25460,7 @@
    "at": "2026-10-13T00:00:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "12-4am",
@@ -25495,13 +25495,13 @@
      "used": {}
     }
    },
-   "state_sha": "9b296d9069100c25"
+   "state_sha": "1d57024bc329a2b6"
   },
   {
    "at": "2026-10-13T00:37:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "12-4am",
@@ -25536,13 +25536,13 @@
      "used": {}
     }
    },
-   "state_sha": "8fb2632eb7a26ef3"
+   "state_sha": "6561ee19d5b2bbaa"
   },
   {
    "at": "2026-10-13T01:14:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "12-4am",
@@ -25577,13 +25577,13 @@
      "used": {}
     }
    },
-   "state_sha": "8fb2632eb7a26ef3"
+   "state_sha": "6561ee19d5b2bbaa"
   },
   {
    "at": "2026-10-13T01:51:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "12-4am",
@@ -25618,13 +25618,13 @@
      "used": {}
     }
    },
-   "state_sha": "6cd63abe0b4584a6"
+   "state_sha": "b233a6c4f7207610"
   },
   {
    "at": "2026-10-13T02:28:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "12-4am",
@@ -25632,7 +25632,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2405.0,
+    "seek": 2345.0,
     "seek_slot_offset": 1800
    },
    "scanned": 4,
@@ -25659,13 +25659,13 @@
      "used": {}
     }
    },
-   "state_sha": "6cd63abe0b4584a6"
+   "state_sha": "b233a6c4f7207610"
   },
   {
    "at": "2026-10-13T03:05:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "12-4am",
@@ -25673,7 +25673,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4400.0,
+    "seek": 4280.0,
     "seek_slot_offset": 3600
    },
    "scanned": 5,
@@ -25700,13 +25700,13 @@
      "used": {}
     }
    },
-   "state_sha": "6cd63abe0b4584a6"
+   "state_sha": "b233a6c4f7207610"
   },
   {
    "at": "2026-10-13T03:42:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25739,13 +25739,13 @@
      "used": {}
     }
    },
-   "state_sha": "74bf2e60f40a7592"
+   "state_sha": "ed8fcfd7122a64f1"
   },
   {
    "at": "2026-10-13T03:59:30",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "file": "",
@@ -25778,13 +25778,13 @@
      "used": {}
     }
    },
-   "state_sha": "8ed2f416f78f6a64"
+   "state_sha": "152c07d1bf220a9f"
   },
   {
    "at": "2026-10-13T04:00:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "4-8am",
@@ -25819,13 +25819,13 @@
      "used": {}
     }
    },
-   "state_sha": "1fb1dafda4e5b9a6"
+   "state_sha": "f93127d04b6764b6"
   },
   {
    "at": "2026-10-13T04:19:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "4-8am",
@@ -25833,7 +25833,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2705.0,
+    "seek": 2750.0,
     "seek_slot_offset": 1800
    },
    "scanned": 9,
@@ -25860,13 +25860,13 @@
      "used": {}
     }
    },
-   "state_sha": "1fb1dafda4e5b9a6"
+   "state_sha": "f93127d04b6764b6"
   },
   {
    "at": "2026-10-13T04:56:05",
    "block_key": "2026_286_12-4am",
    "commercial_pos": {},
-   "cycle_total": 12555,
+   "cycle_total": 12510,
    "refresh": 1,
    "result": {
     "block": "4-8am",
@@ -25874,7 +25874,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4640.0,
+    "seek": 4685.0,
     "seek_slot_offset": 3600
    },
    "scanned": 10,
@@ -25901,7 +25901,7 @@
      "used": {}
     }
    },
-   "state_sha": "1fb1dafda4e5b9a6"
+   "state_sha": "f93127d04b6764b6"
   },
   {
    "at": "2026-10-13T05:33:05",
@@ -25941,7 +25941,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -25973,8 +25973,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -25984,7 +25984,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1460.0,
+    "seek": 1505.0,
     "seek_slot_offset": 0
    },
    "scanned": 11,
@@ -26014,7 +26014,7 @@
      "used": {}
     }
    },
-   "state_sha": "e84c24b8e67aad86"
+   "state_sha": "2ed768ec7285c6a1"
   },
   {
    "at": "2026-10-13T06:10:05",
@@ -26054,7 +26054,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26086,8 +26086,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -26097,7 +26097,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3395.0,
+    "seek": 3440.0,
     "seek_slot_offset": 1800
    },
    "scanned": 12,
@@ -26127,7 +26127,7 @@
      "used": {}
     }
    },
-   "state_sha": "e0b2932045a9b84d"
+   "state_sha": "1f16053dff62b7cb"
   },
   {
    "at": "2026-10-13T06:47:05",
@@ -26167,7 +26167,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26199,8 +26199,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -26210,7 +26210,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 5330.0,
+    "seek": 5375.0,
     "seek_slot_offset": 3600
    },
    "scanned": 13,
@@ -26240,7 +26240,7 @@
      "used": {}
     }
    },
-   "state_sha": "e0b2932045a9b84d"
+   "state_sha": "1f16053dff62b7cb"
   },
   {
    "at": "2026-10-13T07:24:05",
@@ -26280,7 +26280,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26312,8 +26312,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
@@ -26351,7 +26351,7 @@
      "used": {}
     }
    },
-   "state_sha": "a8243ab5cc762091"
+   "state_sha": "2546e922fdc690e4"
   },
   {
    "at": "2026-10-13T08:01:05",
@@ -26391,7 +26391,7 @@
       ]
      },
      "45": {
-      "cycle": 14,
+      "cycle": 12,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26423,18 +26423,18 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 2,
    "result": {
     "block": "8-12pm",
-    "duration": 60,
-    "file": "/m/Ads/ad7.mkv",
+    "duration": 15,
+    "file": "/m/Ads/ad0.mkv",
     "interior_cut": false,
     "mode": "Commercial",
-    "seek": 20.0,
+    "seek": 5.0,
     "seek_slot_offset": 0
    },
    "scanned": 15,
@@ -26464,7 +26464,7 @@
      "used": {}
     }
    },
-   "state_sha": "18fab306a328d09f"
+   "state_sha": "0c661e7b8c5703ce"
   },
   {
    "at": "2026-10-13T08:38:05",
@@ -26504,7 +26504,7 @@
       ]
      },
      "45": {
-      "cycle": 24,
+      "cycle": 21,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26536,8 +26536,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -26547,7 +26547,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 335.0,
+    "seek": 380.0,
     "seek_slot_offset": 0
    },
    "scanned": 16,
@@ -26580,7 +26580,7 @@
      "used": {}
     }
    },
-   "state_sha": "9cc53e16df60750c"
+   "state_sha": "963fb8663947eb5c"
   },
   {
    "at": "2026-10-13T09:15:05",
@@ -26620,7 +26620,7 @@
       ]
      },
      "45": {
-      "cycle": 24,
+      "cycle": 21,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26652,8 +26652,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -26663,7 +26663,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2270.0,
+    "seek": 2315.0,
     "seek_slot_offset": 1800
    },
    "scanned": 17,
@@ -26696,7 +26696,7 @@
      "used": {}
     }
    },
-   "state_sha": "0cab9d2f8c29203c"
+   "state_sha": "d88048c03715f316"
   },
   {
    "at": "2026-10-13T09:52:05",
@@ -26736,7 +26736,7 @@
       ]
      },
      "45": {
-      "cycle": 24,
+      "cycle": 21,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26768,8 +26768,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -26779,7 +26779,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4205.0,
+    "seek": 4250.0,
     "seek_slot_offset": 3600
    },
    "scanned": 18,
@@ -26812,7 +26812,7 @@
      "used": {}
     }
    },
-   "state_sha": "0cab9d2f8c29203c"
+   "state_sha": "d88048c03715f316"
   },
   {
    "at": "2026-10-13T10:29:05",
@@ -26852,7 +26852,7 @@
       ]
      },
      "45": {
-      "cycle": 24,
+      "cycle": 21,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26884,8 +26884,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -26926,7 +26926,7 @@
      "used": {}
     }
    },
-   "state_sha": "69b9df5783293cba"
+   "state_sha": "603fb3f3d3952b7e"
   },
   {
    "at": "2026-10-13T11:06:05",
@@ -26966,7 +26966,7 @@
       ]
      },
      "45": {
-      "cycle": 24,
+      "cycle": 21,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -26998,8 +26998,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -27040,7 +27040,7 @@
      "used": {}
     }
    },
-   "state_sha": "de544739b64a3959"
+   "state_sha": "65dc1df1f8ae49fa"
   },
   {
    "at": "2026-10-13T11:43:05",
@@ -27080,7 +27080,7 @@
       ]
      },
      "45": {
-      "cycle": 24,
+      "cycle": 21,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27112,8 +27112,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 3,
@@ -27154,7 +27154,7 @@
      "used": {}
     }
    },
-   "state_sha": "7af477289cacf2cb"
+   "state_sha": "bcd603afbcef9577"
   },
   {
    "at": "2026-10-13T12:20:05",
@@ -27194,7 +27194,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27226,8 +27226,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -27273,7 +27273,7 @@
      "used": {}
     }
    },
-   "state_sha": "aa7d4c10dd65adc4"
+   "state_sha": "38baefa5535b184e"
   },
   {
    "at": "2026-10-13T12:57:05",
@@ -27313,7 +27313,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27345,8 +27345,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -27392,7 +27392,7 @@
      "used": {}
     }
    },
-   "state_sha": "ecebfd2ddfd24e22"
+   "state_sha": "2c41999782f71b9d"
   },
   {
    "at": "2026-10-13T13:34:05",
@@ -27432,7 +27432,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27464,8 +27464,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -27511,7 +27511,7 @@
      "used": {}
     }
    },
-   "state_sha": "ecebfd2ddfd24e22"
+   "state_sha": "2c41999782f71b9d"
   },
   {
    "at": "2026-10-13T14:11:05",
@@ -27551,7 +27551,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27583,8 +27583,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -27628,7 +27628,7 @@
      "used": {}
     }
    },
-   "state_sha": "63ce399c0f92c952"
+   "state_sha": "8568170cd951183b"
   },
   {
    "at": "2026-10-13T14:48:05",
@@ -27668,7 +27668,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27700,8 +27700,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -27745,7 +27745,7 @@
      "used": {}
     }
    },
-   "state_sha": "53316f5b209105d8"
+   "state_sha": "0b46a2525f051647"
   },
   {
    "at": "2026-10-13T15:25:05",
@@ -27785,7 +27785,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27817,8 +27817,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -27862,7 +27862,7 @@
      "used": {}
     }
    },
-   "state_sha": "df34184f605e60fb"
+   "state_sha": "00195886c4bd09a8"
   },
   {
    "at": "2026-10-13T16:02:05",
@@ -27902,7 +27902,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -27934,18 +27934,18 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
    "result": {
     "block": "4-8pm",
-    "duration": 30,
-    "file": "/m/Ads/ad2.mkv",
+    "duration": 60,
+    "file": "/m/Ads/ad7.mkv",
     "interior_cut": false,
     "mode": "Commercial",
-    "seek": 5.0,
+    "seek": 20.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -27981,7 +27981,7 @@
      "used": {}
     }
    },
-   "state_sha": "582306ca6fa0bfa2"
+   "state_sha": "f9835ac9c5fe5942"
   },
   {
    "at": "2026-10-13T16:39:05",
@@ -28021,7 +28021,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28053,8 +28053,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28064,7 +28064,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 3770.0,
+    "seek": 3650.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -28100,7 +28100,7 @@
      "used": {}
     }
    },
-   "state_sha": "582306ca6fa0bfa2"
+   "state_sha": "f9835ac9c5fe5942"
   },
   {
    "at": "2026-10-13T17:16:05",
@@ -28140,7 +28140,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28172,8 +28172,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28219,7 +28219,7 @@
      "used": {}
     }
    },
-   "state_sha": "66933db8791c328d"
+   "state_sha": "6c35a05049f54541"
   },
   {
    "at": "2026-10-13T17:53:05",
@@ -28259,7 +28259,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28291,8 +28291,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28338,7 +28338,7 @@
      "used": {}
     }
    },
-   "state_sha": "38e73afb74a70f31"
+   "state_sha": "2e38e14516c7fbf4"
   },
   {
    "at": "2026-10-13T18:30:05",
@@ -28378,7 +28378,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28410,8 +28410,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28457,7 +28457,7 @@
      "used": {}
     }
    },
-   "state_sha": "3279e1a3e8f21676"
+   "state_sha": "5b41f32f018a41e2"
   },
   {
    "at": "2026-10-13T19:07:05",
@@ -28497,7 +28497,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28529,8 +28529,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28576,7 +28576,7 @@
      "used": {}
     }
    },
-   "state_sha": "b25a4f6a0bbee754"
+   "state_sha": "45950ca0bc08c9f4"
   },
   {
    "at": "2026-10-13T19:44:05",
@@ -28616,7 +28616,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28648,8 +28648,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28695,7 +28695,7 @@
      "used": {}
     }
    },
-   "state_sha": "56d6f35ea0a759f7"
+   "state_sha": "c0d8728bc1dcad34"
   },
   {
    "at": "2026-10-13T19:59:50",
@@ -28735,7 +28735,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28767,8 +28767,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28814,7 +28814,7 @@
      "used": {}
     }
    },
-   "state_sha": "f3a730a89b65c9e5"
+   "state_sha": "bdd11e04078903dc"
   },
   {
    "at": "2026-10-13T20:00:05",
@@ -28854,7 +28854,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -28886,8 +28886,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -28897,7 +28897,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3500.0,
+    "seek": 3485.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -28935,7 +28935,7 @@
      "used": {}
     }
    },
-   "state_sha": "59ee4ad08e2f360b"
+   "state_sha": "9c6f1753eedc5aa4"
   },
   {
    "at": "2026-10-13T20:21:05",
@@ -28975,7 +28975,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29007,8 +29007,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29018,7 +29018,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4535.0,
+    "seek": 4460.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -29056,7 +29056,7 @@
      "used": {}
     }
    },
-   "state_sha": "59ee4ad08e2f360b"
+   "state_sha": "9c6f1753eedc5aa4"
   },
   {
    "at": "2026-10-13T20:58:05",
@@ -29096,7 +29096,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29128,8 +29128,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29176,7 +29176,7 @@
      "used": {}
     }
    },
-   "state_sha": "8aa0fddcdd53d02c"
+   "state_sha": "9d0f4a9861d5a56a"
   },
   {
    "at": "2026-10-13T21:35:05",
@@ -29216,7 +29216,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29248,8 +29248,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29296,7 +29296,7 @@
      "used": {}
     }
    },
-   "state_sha": "8a46412da5ef7529"
+   "state_sha": "1283db72c2357e39"
   },
   {
    "at": "2026-10-13T22:12:05",
@@ -29336,7 +29336,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29368,8 +29368,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29416,7 +29416,7 @@
      "used": {}
     }
    },
-   "state_sha": "3b7bd4a642159ac4"
+   "state_sha": "d47dbeb400e757e3"
   },
   {
    "at": "2026-10-13T22:49:05",
@@ -29456,7 +29456,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29488,8 +29488,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29536,7 +29536,7 @@
      "used": {}
     }
    },
-   "state_sha": "2122f20563984110"
+   "state_sha": "f0db370d06389612"
   },
   {
    "at": "2026-10-13T23:26:05",
@@ -29576,7 +29576,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29608,8 +29608,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29656,7 +29656,7 @@
      "used": {}
     }
    },
-   "state_sha": "ca6e1bf17a06c783"
+   "state_sha": "b29a20335ef1ef48"
   },
   {
    "at": "2026-10-13T23:59:59",
@@ -29696,7 +29696,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29728,8 +29728,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29776,7 +29776,7 @@
      "used": {}
     }
    },
-   "state_sha": "359922968fcace93"
+   "state_sha": "7a5b23b1601e3fc1"
   },
   {
    "at": "2026-10-14T00:00:05",
@@ -29816,7 +29816,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29848,8 +29848,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29859,7 +29859,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 5120.0,
+    "seek": 5090.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -29898,7 +29898,7 @@
      "used": {}
     }
    },
-   "state_sha": "5229ee1392541a53"
+   "state_sha": "b99ead7cc8f85a95"
   },
   {
    "at": "2026-10-14T00:03:05",
@@ -29938,7 +29938,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -29970,8 +29970,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -29981,7 +29981,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 5300.0,
+    "seek": 5270.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -30020,7 +30020,7 @@
      "used": {}
     }
    },
-   "state_sha": "5229ee1392541a53"
+   "state_sha": "b99ead7cc8f85a95"
   },
   {
    "at": "2026-10-14T00:40:05",
@@ -30060,7 +30060,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30092,8 +30092,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30141,7 +30141,7 @@
      "used": {}
     }
    },
-   "state_sha": "24e0edf9e7dfa832"
+   "state_sha": "58defbbb4592f5ea"
   },
   {
    "at": "2026-10-14T01:17:05",
@@ -30181,7 +30181,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30213,8 +30213,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30262,7 +30262,7 @@
      "used": {}
     }
    },
-   "state_sha": "ac1b75fa592b7925"
+   "state_sha": "8393c188376bb8f5"
   },
   {
    "at": "2026-10-14T01:54:05",
@@ -30302,7 +30302,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30334,8 +30334,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30383,7 +30383,7 @@
      "used": {}
     }
    },
-   "state_sha": "cde1dff5c8b64475"
+   "state_sha": "63a412a9f74747e2"
   },
   {
    "at": "2026-10-14T02:31:05",
@@ -30423,7 +30423,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30455,8 +30455,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30504,7 +30504,7 @@
      "used": {}
     }
    },
-   "state_sha": "0a9874a77f897c59"
+   "state_sha": "5df807de61c7c001"
   },
   {
    "at": "2026-10-14T03:08:05",
@@ -30544,7 +30544,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30576,8 +30576,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30625,7 +30625,7 @@
      "used": {}
     }
    },
-   "state_sha": "ab41a4fd0bbe81b5"
+   "state_sha": "69ba00516ee892e8"
   },
   {
    "at": "2026-10-14T03:45:05",
@@ -30665,7 +30665,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30697,8 +30697,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30746,7 +30746,7 @@
      "used": {}
     }
    },
-   "state_sha": "d98e2322f65dd6d3"
+   "state_sha": "4acb00e5c8d3135a"
   },
   {
    "at": "2026-10-14T03:59:30",
@@ -30786,7 +30786,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30818,8 +30818,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30867,7 +30867,7 @@
      "used": {}
     }
    },
-   "state_sha": "3242c61eac2b7988"
+   "state_sha": "20300573d479f7ce"
   },
   {
    "at": "2026-10-14T04:00:05",
@@ -30907,7 +30907,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -30939,8 +30939,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -30950,7 +30950,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 1115.0,
+    "seek": 1295.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -30990,7 +30990,7 @@
      "used": {}
     }
    },
-   "state_sha": "129bcf8d7a03375b"
+   "state_sha": "e60cbc004f007139"
   },
   {
    "at": "2026-10-14T04:22:05",
@@ -31030,7 +31030,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31062,8 +31062,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -31073,7 +31073,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2150.0,
+    "seek": 2330.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -31113,7 +31113,7 @@
      "used": {}
     }
    },
-   "state_sha": "129bcf8d7a03375b"
+   "state_sha": "e60cbc004f007139"
   },
   {
    "at": "2026-10-14T04:59:05",
@@ -31153,7 +31153,7 @@
       ]
      },
      "45": {
-      "cycle": 34,
+      "cycle": 30,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31185,8 +31185,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 4,
@@ -31196,7 +31196,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4085.0,
+    "seek": 4265.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -31236,7 +31236,7 @@
      "used": {}
     }
    },
-   "state_sha": "129bcf8d7a03375b"
+   "state_sha": "e60cbc004f007139"
   },
   {
    "at": "2026-10-14T05:36:05",
@@ -31276,7 +31276,7 @@
       ]
      },
      "45": {
-      "cycle": 345,
+      "cycle": 297,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31308,8 +31308,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 5,
@@ -31319,7 +31319,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 905.0,
+    "seek": 1085.0,
     "seek_slot_offset": 0
    },
    "scanned": 24,
@@ -31359,7 +31359,7 @@
      "used": {}
     }
    },
-   "state_sha": "8ffcdd634b533fc1"
+   "state_sha": "7e11cc4fba2132e5"
   },
   {
    "at": "2026-10-14T06:13:05",
@@ -31399,7 +31399,7 @@
       ]
      },
      "45": {
-      "cycle": 345,
+      "cycle": 297,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31431,8 +31431,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 5,
@@ -31442,7 +31442,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 2840.0,
+    "seek": 3020.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -31482,7 +31482,7 @@
      "used": {}
     }
    },
-   "state_sha": "6f0f1535324fab8e"
+   "state_sha": "4a3a38059ebcd7d5"
   },
   {
    "at": "2026-10-14T06:50:05",
@@ -31522,7 +31522,7 @@
       ]
      },
      "45": {
-      "cycle": 345,
+      "cycle": 297,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31554,8 +31554,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 5,
@@ -31565,7 +31565,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 4775.0,
+    "seek": 4955.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -31605,7 +31605,7 @@
      "used": {}
     }
    },
-   "state_sha": "6f0f1535324fab8e"
+   "state_sha": "4a3a38059ebcd7d5"
   },
   {
    "at": "2026-10-14T07:27:05",
@@ -31645,7 +31645,7 @@
       ]
      },
      "45": {
-      "cycle": 345,
+      "cycle": 297,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31677,8 +31677,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 5,
@@ -31726,7 +31726,7 @@
      "used": {}
     }
    },
-   "state_sha": "3a11c2b6719e9039"
+   "state_sha": "8a250281726ba4f1"
   },
   {
    "at": "2026-10-14T08:04:05",
@@ -31766,7 +31766,7 @@
       ]
      },
      "45": {
-      "cycle": 345,
+      "cycle": 297,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31798,8 +31798,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 5,
@@ -31809,7 +31809,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3245.0,
+    "seek": 3425.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -31849,7 +31849,7 @@
      "used": {}
     }
    },
-   "state_sha": "cb4d58f8ce66b782"
+   "state_sha": "73badccdab1b5c36"
   },
   {
    "at": "2026-10-14T08:41:05",
@@ -31889,7 +31889,7 @@
       ]
      },
      "45": {
-      "cycle": 345,
+      "cycle": 297,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -31921,8 +31921,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad2.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 5,
@@ -31932,7 +31932,7 @@
     "file": "/m/Movies/Big Movie (1999).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 5180.0,
+    "seek": 5360.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -31972,7 +31972,7 @@
      "used": {}
     }
    },
-   "state_sha": "cb4d58f8ce66b782"
+   "state_sha": "73badccdab1b5c36"
   },
   {
    "at": "2026-10-14T09:18:05",
@@ -32012,7 +32012,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32044,19 +32044,19 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
    "result": {
     "block": "8-12pm",
-    "duration": 60,
-    "file": "/m/Ads/ad7.mkv",
-    "interior_cut": false,
-    "mode": "Commercial",
-    "seek": 20.0,
-    "seek_slot_offset": 0
+    "duration": 1800.0,
+    "file": "/m/Movies/Long Movie (2004).mkv",
+    "interior_cut": true,
+    "mode": "Video",
+    "seek": 1895.0,
+    "seek_slot_offset": 1800
    },
    "scanned": 24,
    "show_order": {
@@ -32095,7 +32095,7 @@
      "used": {}
     }
    },
-   "state_sha": "46c19c20964444be"
+   "state_sha": "f14a669e2d0ce1a1"
   },
   {
    "at": "2026-10-14T09:55:05",
@@ -32135,7 +32135,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32167,8 +32167,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
@@ -32178,7 +32178,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": false,
     "mode": "Video",
-    "seek": 3650.0,
+    "seek": 3830.0,
     "seek_slot_offset": 3600
    },
    "scanned": 24,
@@ -32218,7 +32218,7 @@
      "used": {}
     }
    },
-   "state_sha": "3a65f03407a9fea2"
+   "state_sha": "f14a669e2d0ce1a1"
   },
   {
    "at": "2026-10-14T10:32:05",
@@ -32258,7 +32258,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32290,8 +32290,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
@@ -32339,7 +32339,7 @@
      "used": {}
     }
    },
-   "state_sha": "bbd6ab2327137c71"
+   "state_sha": "78ca32f862b843ab"
   },
   {
    "at": "2026-10-14T11:09:05",
@@ -32379,7 +32379,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32411,8 +32411,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
@@ -32460,7 +32460,7 @@
      "used": {}
     }
    },
-   "state_sha": "045dce0bc3ba6999"
+   "state_sha": "80fef0b689dce64f"
   },
   {
    "at": "2026-10-14T19:59:50",
@@ -32500,7 +32500,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32532,8 +32532,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
@@ -32581,7 +32581,7 @@
      "used": {}
     }
    },
-   "state_sha": "ff6c76fe7969f486"
+   "state_sha": "a94604165d5577c6"
   },
   {
    "at": "2026-10-14T20:00:05",
@@ -32621,7 +32621,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32653,8 +32653,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
@@ -32664,7 +32664,7 @@
     "file": "/m/Movies/Long Movie (2004).mkv",
     "interior_cut": true,
     "mode": "Video",
-    "seek": 3290.0,
+    "seek": 3455.0,
     "seek_slot_offset": 1800
    },
    "scanned": 24,
@@ -32704,7 +32704,7 @@
      "used": {}
     }
    },
-   "state_sha": "327a196126b29972"
+   "state_sha": "afd1fe977fafb0bc"
   },
   {
    "at": "2026-10-14T23:59:59",
@@ -32744,7 +32744,7 @@
       ]
      },
      "45": {
-      "cycle": 355,
+      "cycle": 306,
       "drawn": [],
       "recent": [
        "/m/Ads/ad3.mkv",
@@ -32776,8 +32776,8 @@
       ]
      }
     },
-    "last": "/m/Ads/ad3.mkv",
-    "turn_ceiling": 60
+    "last": "/m/Ads/ad1.mkv",
+    "turn_ceiling": 45
    },
    "cycle_total": 6255,
    "refresh": 6,
@@ -32825,7 +32825,7 @@
      "used": {}
     }
    },
-   "state_sha": "7334453705cc92f8"
+   "state_sha": "cab72b58266c4661"
   }
  ]
 }

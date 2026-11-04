@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re as _re
 try:
@@ -1698,13 +1699,54 @@ class _PathMemoHub:
         self._memo = {}
         self._paths = {}
         self._must_resolve = set()
+        self._generation = 0
+        self._recheck_queue = {}
+        self._peek_keys = {}
+
+    def generation(self):
+        """A number that changes whenever any answer this hub holds changes."""
+        return self._generation
+
+    def peek(self, path):
+        """The (measured, estimate) this hub holds for a path, or None when it holds nothing; never asks the library."""
+        key = self._peek_keys.get(path)
+        if key is None:
+            key = _hub_key(path)
+            if len(self._peek_keys) > 200000:
+                self._peek_keys.clear()
+            self._peek_keys[path] = key
+        held = self._memo.get(key)
+        return None if held is None else (held[0], held[1])
+
+    def _set_memo(self, key, value):
+        """Stores one remembered answer and moves the generation on when the answer differs from the one held; call with the lock held."""
+        held = self._memo.get(key)
+        if held is None or held[0] != value[0] or held[1] != value[1]:
+            self._generation += 1
+        self._memo[key] = value
 
     def forget(self, path):
         """Drops what the hub remembers about a path because the file changed on disk; the next look-up re-keys the file from disk and finds that file's own record. The library rows stay."""
         key = _hub_key(path)
         with self._lock:
-            self._memo.pop(key, None)
+            if self._memo.pop(key, None) is not None:
+                self._generation += 1
             self._must_resolve.add(key)
+
+    def rechecks_waiting(self):
+        """How many answers the screen thread used while they were due to be asked again."""
+        with self._lock:
+            return len(self._recheck_queue)
+
+    def run_queued_rechecks(self, limit=None):
+        """Asks the library again for the answers the screen thread used while they were due (oldest first, at most `limit`); returns how many were asked. For a background thread only."""
+        with self._lock:
+            items = list(self._recheck_queue.items())[:limit] if limit else list(self._recheck_queue.items())
+            for key, _path in items:
+                self._recheck_queue.pop(key, None)
+        for key, path in items:
+            self._lookup(key, path, background=True)
+        return len(items)
 
     def known_paths(self):
         """The paths this hub has been asked about, as the caller gave them."""
@@ -1736,13 +1778,19 @@ class DurationHub(_PathMemoHub):
         return (float(row[0]) if row[0] and row[0] > 0 else None,
                 float(row[1]) if row[1] and row[1] > 0 else None)
 
-    def _lookup(self, key, path):
-        """Returns [measured, estimate, looked-up-at] for a path, asking the library once and remembering the answer; a path with no measured length is asked again after the recheck time, and a path the library has no length for gets its old settings values carried in first."""
+    def _lookup(self, key, path, background=False):
+        """Returns [measured, estimate, looked-up-at] for a path, asking the library once and remembering the answer; a path with no measured length is asked again after the recheck time (on the screen thread the answer held is used and the ask is queued for a background thread), and a path the library has no length for gets its old settings values carried in first."""
         with self._lock:
             held = self._memo.get(key)
             force = key in self._must_resolve
         now = time.monotonic()
         if held is not None and not force and (held[0] or now - held[2] < _UNMEASURED_RECHECK_SECONDS):
+            return held
+        if (held is not None and not force and not background
+                and threading.current_thread() is threading.main_thread()):
+            # WARNING: the screen thread never waits on the library for an answer it already holds (owner 2026-11-02, N1); the due recheck runs on the channel-ready thread.
+            with self._lock:
+                self._recheck_queue[key] = str(path)
             return held
         measured = estimate = None
         try:
@@ -1756,14 +1804,15 @@ class DurationHub(_PathMemoHub):
             if held is not None and held[0] and not force:
                 return held
             held = [measured, estimate or (held[1] if held and not force else None), now]
-            self._memo[key] = held
+            self._set_memo(key, held)
         return held
 
     def read(self, path):
         """Returns (whole seconds, kind) for a file: its measured length, else its saved estimate, else (None, None)."""
         measured, estimate, _at = self._lookup(_hub_key(path), path)
         if measured and measured > 0:
-            return int(measured), DURATION_KIND_MEASURED
+            # WARNING: rounded up, never down: a slot shorter than its file makes the file run past it and the next one start late, opened part way in (owner log 2026-11-03: every 30.1 to 30.6 s commercial had a 30 s slot).
+            return int(math.ceil(float(measured) - 1e-6)), DURATION_KIND_MEASURED
         if estimate and estimate > 0:
             return int(estimate), DURATION_KIND_ESTIMATED
         return None, None
@@ -1788,7 +1837,7 @@ class DurationHub(_PathMemoHub):
         key = _hub_key(path)
         with self._lock:
             held = self._memo.get(key)
-            self._memo[key] = [recorded, held[1] if held else None, time.monotonic()]
+            self._set_memo(key, [recorded, held[1] if held else None, time.monotonic()])
         return saved
 
     def store_estimate(self, path, seconds, basis):
@@ -1805,7 +1854,7 @@ class DurationHub(_PathMemoHub):
         saved = float(int(round(seconds)))
         with self._lock:
             held = self._memo.get(key)
-            self._memo[key] = [held[0] if held else None, saved, time.monotonic()]
+            self._set_memo(key, [held[0] if held else None, saved, time.monotonic()])
             self._pending_estimates[key] = (str(path), saved, basis)
             self._estimate_idle.clear()
             if self._estimate_thread is None or not self._estimate_thread.is_alive():
@@ -1849,12 +1898,12 @@ class DurationHub(_PathMemoHub):
         entry = self.probe_library.library.get_entry(content_key) or {}
         if entry.get("duration") and entry["duration"] > 0:
             with self._lock:
-                self._memo[key] = [float(entry["duration"]), entry.get("estimated_duration"), time.monotonic()]
+                self._set_memo(key, [float(entry["duration"]), entry.get("estimated_duration"), time.monotonic()])
             return
         if entry.get("estimated_duration") and entry["estimated_duration"] > 0:
             with self._lock:
                 held = self._memo.get(key)
-                self._memo[key] = [held[0] if held else None, float(entry["estimated_duration"]), time.monotonic()]
+                self._set_memo(key, [held[0] if held else None, float(entry["estimated_duration"]), time.monotonic()])
             return
         self.probe_library.library.upsert_fields(
             content_key, estimated_duration=saved, estimated_at=time.time(), estimate_basis=basis)

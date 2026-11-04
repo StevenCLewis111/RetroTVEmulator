@@ -215,6 +215,8 @@ OWN_LOAD_LEARN_RATE = 0.2
 OWN_LOAD_SETTLE_SECONDS = 6.0
 OWN_LOAD_MIN_GAIN = 0.05
 OWN_LOAD_MIN_EXCESS = 0.10
+# VALUES CHANGE HERE (the minimum excess also grows with the screen's own load: at least this share of the own load, so the frame-to-frame swings of a screen already over its time are not read as background pressure, N11)
+OWN_LOAD_MIN_EXCESS_SHARE = 0.15
 OWN_LOAD_LOG_STEP = 0.10
 OWN_LOAD_LOG_INTERVAL_SECONDS = 60.0
 STALL_LOG_MS = 100.0
@@ -262,9 +264,10 @@ BOOT_BAR_CONFIG_KEY = "_boot_bar_costs"
 LOOP_BLOCKED_GAP_MS = 1000
 # VALUES CHANGE HERE (milliseconds between retries when a wedged playback engine is replaced)
 WEDGED_ENGINE_REPLACE_RETRY_MS = 5000
-# VALUES CHANGE HERE (tester report: bytes read from the end of app_log.txt and of each crash file; the most warning, error and failure lines of app_log.txt kept; the most lines kept from each crash file)
+# VALUES CHANGE HERE (tester report: bytes read from the end of app_log.txt and of each crash file; the most warning, error and failure lines of app_log.txt kept; the most health report lines kept; the most lines kept from each crash file)
 TESTER_REPORT_LOG_TAIL_BYTES = 524288
 TESTER_REPORT_MAX_LOG_LINES = 300
+TESTER_REPORT_MAX_HEALTH_LINES = 80
 TESTER_REPORT_MAX_CRASH_LINES = 200
 # VALUES CHANGE HERE (boot stall watchdog: seconds into boot before one [BOOT STALL] report names what is unfinished, 0 = off; seconds before the optional boot warm-up stops holding the loading screen, 0 = never)
 BOOT_STALL_REPORT_SECONDS = 8.0
@@ -374,6 +377,10 @@ GPU_FRAME_FAILURE_LIMIT = 3
 GPU_DEVICE_LOST_LIMIT = 3
 GPU_RETRY_COOLDOWN_SECONDS = 30.0
 GPU_FRAME_LOG_INTERVAL_FRAMES = 600
+# VALUES CHANGE HERE (N7 owner 2026-11-03: the back-buffer size the GPU self-check is drawn at, the same for every window size, so switching between full screen and a window reopens the GPU path at once)
+GPU_SELF_CHECK_TARGET_SIZE = (960, 540)
+# VALUES CHANGE HERE (GPU frame path, the Video tab's Tint: colour shift per step away from 50, the same as the CPU picture pass)
+GPU_PICTURE_TINT_PER_STEP = 1.5
 
 # VALUES CHANGE HERE (menu key trace: key events landing in one frame that write a [MENU NAV BURST] warning; loop profile: frames collected before a [LOOP PROFILE] line is written, 0 = off)
 MENU_NAV_BURST_WARN_EVENTS = 3
@@ -564,6 +571,9 @@ STATIC_NOISE_REFRESH_MS = 110
 
 # VALUES CHANGE HERE
 STATIC_NOISE_AMBIENT_REFRESH_MS = 80
+# VALUES CHANGE HERE (Static Noise: how many noise pictures are made once per screen size and shown in turn, one per refresh, so none is made while a show plays; how many screen sizes keep their pictures)
+STATIC_NOISE_POOL_FRAMES = 8
+STATIC_NOISE_POOL_SIZES = 3
 
 # VALUES CHANGE HERE
 STATIC_WEAK = 0.16
@@ -726,7 +736,7 @@ RECEPTION_LINE_BIG_FRAC_RANGE = (0.035, 0.09)
 RECEPTION_LINE_SMALL_FRAC_RANGE = (0.012, 0.03)
 RECEPTION_LINE_SPEED_PX_MS = 0.85
 
-# VALUES CHANGE HERE (file explorer: milliseconds a folder may take to open before it is given up)
+# VALUES CHANGE HERE (file explorer: milliseconds a folder walk may go without reaching a new folder or file before it is given up as a drive that stopped answering)
 FILE_EXPLORER_EXPAND_TIMEOUT_MS = 6000
 
 # VALUES CHANGE HERE (playback seek: milliseconds between retries while a seek is checked to have landed)
@@ -759,6 +769,22 @@ PATH_EXISTS_CACHE_MAX_ENTRIES = 20000
 PATH_NOT_FOUND_TTL_MS = 5000
 PATH_FOUND_TTL_MS = 30000
 PATH_UNKNOWN_TTL_MS = 1500
+# VALUES CHANGE HERE (each channel ready ahead, owner 2026-11-02 N1: the screen thread uses a path status it holds for up to this long while its re-check runs on the channel-ready thread; path classes kept; track builds kept)
+PATH_STALE_KEEP_MS = 600000
+GUESS_CLASS_MEMO_MAX = 60000
+TRACK_BUILD_MEMO_MAX = 400
+# VALUES CHANGE HERE (media.py, show grouping: most files whose show, season and episode read from the path are kept, so a lineup rebuild does not read every file name again)
+SHOW_NAME_MEMO_MAX = 60000
+# VALUES CHANGE HERE (channel-ready thread: seconds between passes, pause between channels, re-checks and first checks per pass, seconds between its log lines)
+CHANNEL_READY_INTERVAL_SECONDS = 2.0
+CHANNEL_READY_CHANNEL_PAUSE_SECONDS = 0.05
+CHANNEL_READY_REFRESH_BATCH = 400
+CHANNEL_READY_WARM_BATCH = 400
+CHANNEL_READY_LOG_SECONDS = 60.0
+# VALUES CHANGE HERE (one [VIDEO DRAW] line with the part times of the TV picture every this many drawn pictures)
+VIDEO_DRAW_LOG_FRAMES = 600
+# VALUES CHANGE HERE (seconds between [MUSIC SCAN] lines)
+MUSIC_SCAN_LOG_SECONDS = 60.0
 PATH_EXISTS_PROBE_TIMEOUT_MS = 2500
 
 # VALUES CHANGE HERE (media.py, disk and scan slots: fast-disk reads at once, loudness scans at once, loudness sample windows read side by side, music loudness scans at once; seconds background work waits for the playing file's reads before going on)
@@ -933,6 +959,8 @@ BREAK_MAX_PER_HALF_HOUR = 2
 # VALUES CHANGE HERE (media.py, settings save: a change to retro_config.json is written by the settings writer thread at most this many seconds after it was asked for, and every change asked for in that time goes into the same write (owner 2026-11-02: 2 seconds); one [SETTINGS SAVE] summary line is written at most once per report seconds)
 SETTINGS_SAVE_DELAY_SECONDS = 2.0
 SETTINGS_SAVE_REPORT_SECONDS = 60.0
+# VALUES CHANGE HERE (media.py, N13 owner 2026-11-03: the settings text is made in pieces of at most this many schedule entries, and the screen gets a turn between pieces, so a big library never holds the picture for the whole save)
+SETTINGS_SAVE_PIECE_ENTRIES = 500
 
 # ============================================================================
 # SECTION: Menu and guide drawing values (read by ui.py)
@@ -964,6 +992,22 @@ CONTROLS_COL_KEY_GAP_PX = 40
 CONTROLS_COL_GAP_PX = 90
 CONTROLS_SECTION_EXTRA_PX = 22
 
+# VALUES CHANGE HERE (ui.py, controls splash key pictures: height of every key in pixels (a long key such as ENTER is as tall and wider); the space between keys shown together; the space between rows; the height of the small keys in the footer; how solid a pixel must be (0 to 255) to count as part of a key when its picture is trimmed to the key's own outline; a picture this many times wider than tall is a long key, anything narrower is drawn exactly square)
+CONTROLS_KEY_H_PX = 54
+CONTROLS_KEY_GAP_PX = 10
+CONTROLS_KEY_ROW_GAP_PX = 14
+CONTROLS_FOOTER_KEY_H_PX = 30
+CONTROLS_KEY_ALPHA_CUTOFF = 200
+CONTROLS_LONG_KEY_MIN_RATIO = 1.25
+
+# VALUES CHANGE HERE (ui.py and game_deck.py, hint lines with key pictures (popups, menu rows, the game menu legend): a key is this many times as tall as the hint's text; the space between a key and its words; the space between one key-and-words pair and the next, in pixels)
+CONTROLS_HINT_KEY_SCALE = 1.45
+CONTROLS_HINT_KEY_WORD_GAP_PX = 8
+CONTROLS_HINT_GROUP_GAP_PX = 26
+
+# VALUES CHANGE HERE (ui.py, controller pictures: how tall the long controller buttons (SELECT, START) are drawn, as a share of a key's height, so they sit beside the round buttons at a matching size)
+CONTROLS_PAD_LONG_BUTTON_SCALE = 0.62
+
 # VALUES CHANGE HERE (ui.py, TV guide and controls splash: channel rows shown in 16:9 and in 4:3, time columns in 16:9 and in 4:3, the guide header, clock and smallest font sizes, the controls splash body font size, width of an icon key, and the gaps under the title, between a section title and its body and between sub rows, in pixels)
 GUIDE_VISIBLE_ROWS_16_9 = 8
 GUIDE_VISIBLE_ROWS_4_3 = 5
@@ -974,7 +1018,7 @@ GUIDE_CLOCK_FONT_PX = 17
 GUIDE_MIN_FONT_PX = 17
 CONTROLS_BODY_FONT_PX = 22
 CONTROLS_ICON_KEY_W_PX = 64
-CONTROLS_TITLE_SECTION_GAP_PX = 60
+CONTROLS_TITLE_SECTION_GAP_PX = 18
 CONTROLS_SECTION_BODY_GAP_PX = 24
 CONTROLS_SUB_BODY_GAP_PX = 20
 
@@ -991,7 +1035,7 @@ GUIDE_43_HDR_CELL_PAD_PX = 12
 GUIDE_43_CLOCK_PAIR_GAP_PX = 8
 GUIDE_43_HDR_TO_CLOCK_RATIO = 22.0 / 17.0
 
-# VALUES CHANGE HERE (ui.py, settings menu layout in pixels: options toggle box width; remote remap label column, key box width and height, gap between the two columns; channel settings header gap, bottom space and smallest top; Holiday rows spread evenly between the title and the Close button (top and bottom space, smallest and largest row height, row padding, toggle width, gap, side space); Video tab slider row space, largest and smallest slider spacing; Theme tab last block space, largest and smallest block spacing, smallest first gap and its trim)
+# VALUES CHANGE HERE (ui.py, settings menu layout in pixels: options toggle box width; remote remap label column, key box width and height, gap between the two columns; channel settings header gap, bottom space and smallest top; Holiday rows spread evenly between the title and the Close button (top and bottom space, smallest and largest row height, row padding, toggle width, gap); Video tab slider row space, largest and smallest slider spacing; Theme tab last block space, largest and smallest block spacing, smallest first gap and its trim)
 OPTIONS_TOGGLE_BOX_W_PX = 18 + 24
 REMOTE_REMAP_LABEL_COL_W_PX = 195
 REMOTE_REMAP_KEY_BOX_W_PX = 110
@@ -1007,7 +1051,6 @@ HOLIDAY_ROW_MAX_H_PX = 56
 HOLIDAY_ROW_SLOT_PAD_PX = 8
 HOLIDAY_TOGGLE_W_PX = 190
 HOLIDAY_TOGGLE_GAP_PX = 12
-HOLIDAY_ROW_SIDE_SPACE_PX = 70
 VIDEO_SLIDER_ROW_RESERVE_PX = 40
 VIDEO_SLIDER_SPACING_MAX_PX = 70
 VIDEO_SLIDER_SPACING_MIN_PX = 40
@@ -1092,10 +1135,12 @@ GAME_MAP_OPTIONS_TOP_GAP_PX = 14
 GAME_MAP_NES_OPTIONS_LIFT_FRAC = 0.04
 GAME_MAP_OPTIONS_DROP_PX = 20
 
-# VALUES CHANGE HERE (game_deck.py, key legend at the bottom of the game screens: row height and bottom padding in pixels, and how much darker the key names are than the titles (0 to 255))
+# VALUES CHANGE HERE (game_deck.py, key legend at the bottom of the game screens: a text row height that nothing reads (left for the owner's yes, R5), bottom padding in pixels, how much darker the key names are than the titles (0 to 255), the height of its key pictures and the space between its rows in pixels)
 GAME_LEGEND_ROW_H_PX = 20
 GAME_LEGEND_BOTTOM_PAD_PX = 8
 GAME_LEGEND_KEY_DARKEN = 60
+GAME_LEGEND_KEY_H_PX = 22
+GAME_LEGEND_ROW_GAP_PX = 3
 
 # VALUES CHANGE HERE (game_deck.py, console picker and ROM list in pixels: size of the console switch arrows, their space beside the logo, how far past the Back column the ROM list arrows sit, the space under the ROM list and the gap of its arrows from the middle; the ROM list logo box width and height (on the menu canvas, scaled with it), how much taller it is, and its top space)
 GAME_NAV_ARROW_SIZE_PX = 15
@@ -1909,6 +1954,8 @@ def gpu_gate_values():
         "failure_limit": int(GPU_FRAME_FAILURE_LIMIT),
         "lost_limit": int(GPU_DEVICE_LOST_LIMIT),
         "retry_cooldown_s": float(GPU_RETRY_COOLDOWN_SECONDS),
+        "target_width": int(GPU_SELF_CHECK_TARGET_SIZE[0]),
+        "target_height": int(GPU_SELF_CHECK_TARGET_SIZE[1]),
     }
 
 
@@ -2091,6 +2138,17 @@ GUIDE_PRELOAD_REPORT_COOLDOWN_SECONDS = 10.0
 RELAUNCH_MAX_ATTEMPTS = 4
 RELAUNCH_WINDOW_SECONDS = 600
 
+# VALUES CHANGE HERE (main script, start-up: seconds a new start waits for the app already running to close before it gives up as a second copy; seconds it waits instead when Reset All Settings restarted the app, so the old copy can finish closing before its saved data is wiped)
+SINGLE_INSTANCE_WAIT_SECONDS = 3.0
+FRESH_START_WAIT_FOR_OLD_APP_SECONDS = 30.0
+
+# VALUES CHANGE HERE (main script, the Reset All Settings button: seconds between its looks at the disk for game saves and the app's own work folders, so the System tab never reads the disk every frame)
+RESET_DISK_CHECK_SECONDS = 2.0
+
+# VALUES CHANGE HERE (main script, the background loudness pass over every channel's airing show: the most seconds it waits for the length and picture-box scans of the airing shows before it scans loudness anyway, and seconds between its looks)
+LOUDNESS_SWEEP_WAIT_FOR_INFO_SCANS_MAX_SECONDS = 120.0
+LOUDNESS_SWEEP_WAIT_RECHECK_SECONDS = 2.0
+
 # VALUES CHANGE HERE (main script, background scan pacing: how many times slower scans go while a file plays; seconds the caption scan sleeps when it has nothing to do; seconds between the picture-box scans of two files, and its sleep when it has nothing to do; seconds before a skipped sweep is tried again; seconds a now-playing probe answer is trusted; seconds before one file's on-demand length probe may run again; how many times slower scans go while the guide is open; seconds before the upcoming-media sweep may run again; seconds between saves of its progress; seconds the guide preload waits between checks; ms a channel's ordered file list is kept; seconds a file whose loudness scan timed out waits before its next try, for the 1st, 2nd, 3rd and later timeouts)
 SCAN_BACKOFF_WHILE_PLAYING_MULTIPLIER = 6.0
 CAPTION_IDLE_SLEEP_SECONDS = 20.0
@@ -2114,6 +2172,34 @@ GUIDE_CLOSED_REBUILD_SECONDS = 15.0
 PYTHON_SWITCH_INTERVAL_SECONDS = 0.001
 ORDERED_CONTENT_CACHE_TTL_MS = 8000
 LOUDNESS_TIMEOUT_BACKOFF_SECONDS = (600, 1800, 7200, 21600)
+
+# VALUES CHANGE HERE (main script, channel loads: seconds one load may run before it counts as stuck, is set aside so the next load can run, and the player is replaced; keep it above PICTURE_BOX_PRE_SHOW_BUDGET_S plus WEDGED_STOP_TIMEOUT_SECONDS plus a few seconds, the longest a healthy load takes; seconds between checks for a stuck load)
+ACTIVATION_STUCK_SECONDS = 20.0
+ACTIVATION_WATCH_CHECK_SECONDS = 0.5
+
+# VALUES CHANGE HERE (main script, locked picture finder: how many times a frame may step around a locked picture before the error goes through; seconds the first search for what holds the lock may take on the screen thread)
+SURFACE_LOCK_SWAPS_MAX = 5
+SURFACE_LOCK_FIND_SECONDS = 4.0
+
+# VALUES CHANGE HERE (health_monitor.py, the app's health report: on or off; ms between looks at what every thread is doing; seconds between report blocks in app_log.txt; seconds of looks kept to explain a stall; a screen-thread gap this long or longer is explained; how many gaps are explained per minute at most)
+HEALTH_MONITOR_ENABLED = True
+HEALTH_SAMPLE_MS = 50
+HEALTH_REPORT_SECONDS = 60.0
+HEALTH_RING_SECONDS = 15.0
+HEALTH_EXPLAIN_GAP_MS = 100
+HEALTH_EXPLAIN_MAX_PER_MINUTE = 20
+
+# VALUES CHANGE HERE (health_monitor.py, stuck threads: seconds a thread may sit on one line of code before it is reported stuck; the shorter limit for the screen thread; seconds a short job thread may wait before it is reported; seconds between full dumps of every thread; ms a watched lock may be held before it is reported; how many places each busy thread lists)
+HEALTH_STUCK_SECONDS = 10.0
+HEALTH_SCREEN_STUCK_SECONDS = 3.0
+HEALTH_JOB_WAIT_WARN_SECONDS = 120.0
+HEALTH_DUMP_MIN_GAP_SECONDS = 60.0
+HEALTH_LOCK_HOLD_WARN_MS = 500
+HEALTH_PROFILE_TOP = 5
+
+# VALUES CHANGE HERE (health_monitor.py: threads whose long waits are normal and are never reported stuck; name starts of short job threads, which are reported when they wait too long)
+HEALTH_NEVER_STUCK_THREADS = ("OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport")
+HEALTH_JOB_THREAD_STARTS = ("content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "NextItemPrep", "HubRowSync", "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
 
 # VALUES CHANGE HERE (main script, playback: ms of Static between channels; ms of black while a guide preview settles; ms a guide preview may take to load; ms a playing file may stall before it is called stalled, and the longer limit for its first buffering; ms the sound is held after a seek; ms from the end that counts as ending; seconds a stuck stop may take; seconds of the short wait for a quick stop; seconds the picture-size probe may hold up an open; ms of grace for the first frame after a seek; seconds from the end a seek is kept away from; seconds an open is checked for an error, the longer window when it may be retried, seconds Stopped must last to count as a failed open, and the seconds before each retry; failed plays on one drive before that drive is held; seconds the sound is muted while stereo or mono is switched; failures before a file is set aside as unplayable; ms a channel's failure message stays; ms between sweeps for dead drives; seconds a DVD's audio track count is kept)
 STATIC_TRANSITION_MS = 1500
@@ -2359,8 +2445,6 @@ COLOR_GAME_SWITCH_ON = (40, 167, 69)
 COLOR_GAME_SWITCH_OFF = (45, 65, 100)
 COLOR_GAME_HINT_TEXT = (120, 120, 140)
 COLOR_GAME_OFF_RED = (220, 53, 69)
-COLOR_GAME_NEUTRAL_BUTTON = (45, 80, 130)
-COLOR_GAME_CONFIRM_BLUE = (45, 110, 200)
 
 # VALUES CHANGE HERE (game_deck.py, player number boxes: a connected and an empty player, one waiting for a new controller, the number on a lit box, on a connected one and on an empty one)
 COLOR_GAME_PLAYER_BOX_CONNECTED = (70, 70, 95)
@@ -2398,20 +2482,39 @@ COLOR_GAME_OSD_TEXT = (255, 255, 180)
 COLOR_GAME_DISCONNECT_FILL = (120, 20, 20, 225)
 
 # VALUES CHANGE HERE (ui.py, menu buttons and rows: a plain button, a greyed one and its text, a blue button and its dimmed form while another capture runs, the button blue that is on and its edge, a button that is off, the off red and on green of a switch, a switch that is off and greyed, the switch track when off, and a row that is off)
-COLOR_MENU_BUTTON = (25, 45, 80)
+COLOR_MENU_BUTTON = (40, 78, 145)
 COLOR_MENU_BUTTON_GREYED = (32, 32, 40)
 COLOR_MENU_TEXT_GREYED = (105, 105, 115)
-COLOR_MENU_BUTTON_BLUE = (45, 80, 130)
-COLOR_MENU_BUTTON_BLUE_DIM = (35, 60, 95)
+COLOR_MENU_BUTTON_BLUE = (40, 78, 145)
+COLOR_MENU_BUTTON_BLUE_DIM = (32, 58, 105)
 COLOR_MENU_ON_BLUE = (40, 100, 180)
 COLOR_MENU_ON_BLUE_EDGE = (60, 140, 220)
 COLOR_MENU_OFF_BUTTON = (35, 45, 60)
 COLOR_MENU_OFF_RED = (220, 53, 69)
 COLOR_MENU_ON_GREEN = (40, 167, 69)
+# VALUES CHANGE HERE (ui.py, the commercials and holiday sub-menus, owner 2026-11-03: the rows are this share of the menu width, centred side to side, with this gap in pixels between rows, and the block of rows sits centred between the title and the bottom buttons)
+SUB_MENU_ROW_WIDTH_SHARE = 0.6
+SUB_MENU_ROW_GAP_PX = 40
+
+# VALUES CHANGE HERE (one look for the same kind of button everywhere, owner 2026-11-03: Close and No the same red; Clear Media a darker red; Yes green; every add-media button a darker green than Yes)
+COLOR_BUTTON_CLOSE = (220, 53, 69)
+COLOR_BUTTON_NO = (220, 53, 69)
+COLOR_BUTTON_YES = (40, 167, 69)
+COLOR_BUTTON_CLEAR = (130, 28, 38)
+COLOR_BUTTON_ADD = (22, 100, 42)
+# VALUES CHANGE HERE (the small Add box beside a toggle: watermark Add and the game music Add, owner 2026-11-03: black)
+COLOR_BUTTON_TOGGLE_ADD = (0, 0, 0)
+# VALUES CHANGE HERE (the audio track button of every channel, owner 2026-11-03: yellow and the dark text on it; while it cannot be used it takes the same greyed look as every other button)
+COLOR_BUTTON_AUDIO_TRACK = (230, 190, 40)
+COLOR_BUTTON_AUDIO_TRACK_TEXT = (20, 20, 20)
+# VALUES CHANGE HERE (where the shared buttons sit in every settings menu and popup: Close at the bottom right, Clear Media at the bottom left, as (inset from the panel side, up from the panel bottom, width, height); Yes left and No right of the popup's centre by the offset, both the given size)
+MENU_CLOSE_BUTTON_PLACE = (25, 52, 110, 40)
+MENU_CLEAR_BUTTON_PLACE = (25, 52, 240, 40)
+POPUP_YES_NO_OFFSET = 100
+POPUP_YES_NO_SIZE = (110, 36)
 COLOR_MENU_SWITCH_OFF = (45, 65, 100)
 COLOR_MENU_SWITCH_GREYED = (35, 35, 45)
 COLOR_MENU_TRACK_OFF = (55, 55, 60)
-COLOR_MENU_ROW_OFF = (35, 35, 35)
 
 # VALUES CHANGE HERE (ui.py, menu text: a value in mint, grey for a disabled label, a lighter disabled grey, the off-label grey, dim text, help lines, the warning red, the flash message red, the last-item grey, text on a lit box, the section label, and greyed text and its focused form)
 COLOR_MENU_VALUE_MINT = (200, 255, 200)
@@ -2439,12 +2542,8 @@ COLOR_MENU_LOCKED_SWITCH_KNOB = (130, 130, 130)
 COLOR_MENU_KNOB_GREYED = (80, 80, 90)
 COLOR_MENU_TOGGLE_GREYED = (22, 22, 30)
 COLOR_MENU_TOGGLE_GREYED_EDGE = (150, 150, 170)
-COLOR_MENU_HOLIDAY_ROW = (30, 50, 90)
 
 # VALUES CHANGE HERE (ui.py, clear buttons and key capture: the clear button, its text and dimmed form, a key box that clashes with another key and its text, and a key box waiting for a press)
-COLOR_MENU_CLEAR_BUTTON = (80, 30, 30)
-COLOR_MENU_CLEAR_TEXT = (255, 150, 150)
-COLOR_MENU_CLEAR_BUTTON_DIM = (45, 20, 25)
 COLOR_MENU_KEY_CONFLICT_FILL = (120, 20, 20)
 COLOR_MENU_KEY_CONFLICT_TEXT = (255, 100, 100)
 COLOR_MENU_KEY_CAPTURE_FILL = (90, 30, 30)
@@ -2527,6 +2626,14 @@ GAME_DISPLAY_ASPECTS = {"NES": 4.0 / 3.0, "SNES": 4.0 / 3.0}
 # ============================================================================
 # SECTION: Picture box before the show
 # ============================================================================
+# VALUES CHANGE HERE (media.py, the Video tab's picture adjustments done inside VLC, owner 2026-11-03 option 1: degrees of hue turned for each Tint step away from 50; VLC sharpen strength for each Sharpness step above 50; VLC blur strength (sigma) for each Sharpness step below 50)
+VLC_TINT_HUE_DEGREES_PER_STEP = 0.6
+VLC_SHARPEN_SIGMA_PER_STEP = 0.02
+VLC_BLUR_SIGMA_PER_STEP = 0.02
+
+# VALUES CHANGE HERE (retro_tv_emulator.py, N16 owner 2026-11-03: a station file whose open waited at least this many seconds after its start position was worked out (picture box, size probe, stop) opens that much further in, so it joins where the clock is)
+OPEN_WAIT_JOIN_CLOCK_MIN_SECONDS = 0.5
+
 # VALUES CHANGE HERE
 PICTURE_BOX_PRE_SHOW_BUDGET_S = 8.0
 PICTURE_BOX_PRE_SHOW_PARALLEL = 6
@@ -2534,6 +2641,8 @@ PICTURE_BOX_PRE_SHOW_PARALLEL = 6
 # VALUES CHANGE HERE (next-item prep: when a file starts on the channel on air, the picture boxes of the next this-many items of its block are scanned ahead, nearest first, as priority work, so each one opens without a picture-box wait; on a PC whose plan runs first-start scans in sequence it first waits up to the wait seconds for the playing file's own first-start scans)
 NEXT_ITEM_PREP_ITEMS = 3
 NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS = 60.0
+# VALUES CHANGE HERE (N16 owner 2026-11-03: when the next items are a commercial break, the look-ahead keeps going through the whole break and the item after it, up to this many items in all; while a break is on or next it does not wait for the playing file's first-start scans, since its items are seconds apart)
+NEXT_ITEM_PREP_BREAK_MAX_ITEMS = 12
 
 
 # ============================================================================
@@ -2571,6 +2680,8 @@ PENDING_SCHEDULE_PROBE_REQUEST_STALE_SECONDS = 30.0
 
 # VALUES CHANGE HERE (pending-file probe priority: the first this-many files of a channel's request are needed soon and probe at priority, every channel's next file before any channel's second; every file after them is backlog, probed one per interval, only while the load level is at or below the max level; the interval is stretched by the load level and by the weak-PC and lite-mode multipliers)
 PENDING_PROBE_URGENT_COUNT = 4
+# VALUES CHANGE HERE (pending-file probe: seconds between stores of one block's backlog lengths; each store makes that block's lineup be built again, so they are stored together; a length needed soon is stored at once)
+PENDING_PROBE_STORE_BATCH_SECONDS = 15.0
 PENDING_BACKLOG_INTERVAL_SECONDS = 1.5
 PENDING_BACKLOG_MAX_LEVEL = 1
 PENDING_BACKLOG_WEAK_PC_MULTIPLIER = 2.0
@@ -2756,7 +2867,8 @@ class Throttle:
             pressure = ratio
             if own is not None:
                 excess = ratio - own
-                pressure = min(ratio, 1.0 + excess) if excess >= OWN_LOAD_MIN_EXCESS else 0.0
+                min_excess = max(OWN_LOAD_MIN_EXCESS, own * OWN_LOAD_MIN_EXCESS_SHARE)
+                pressure = min(ratio, 1.0 + excess) if excess >= min_excess else 0.0
                 if pressure == 0.0 and ratio >= BUSY_RATIO_LEVELS[0][0]:
                     self._own_note = "%s busy=%d%% own=%d%%" % (kind, round(ratio * 100), round(own * 100))
             lvl = 0
@@ -3146,6 +3258,17 @@ def enforcing():
 def current_level():
     t = _gate_state["throttle"]
     return t.level if t is not None else 0
+
+
+def health_snapshot():
+    """Short text of the governor's state for the health report: the load level, the work running in each lane, the gate waits so far and the scans with work waiting for their turn."""
+    with _activity._lock:
+        lanes = {lane: n for lane, n in _activity._inflight.items() if n}
+    with _scan_turns_lock:
+        waiting = sorted(kind for kind, entry in _scan_turns.items() if entry.get("rank") is not None)
+    return "level %d, running %s, gate waits %d, starved %d, scans with work waiting %s" % (
+        current_level(), ", ".join("%s %d" % kv for kv in sorted(lanes.items())) or "nothing",
+        _gate_state["waits"], _gate_state["starved"], ", ".join(waiting) or "none")
 
 
 def background_active(now=None):
@@ -3691,7 +3814,23 @@ def apply_boot_mode(config, force_auto=False):
     config[MODE_FINGERPRINT_CONFIG_KEY] = fingerprint
     set_mode(mode)
     log.info("[GOVERNOR] mode=%s source=%s auto_pick=%s (%s) fingerprint=%s", mode, source, auto, why, fingerprint)
+    log_mode_ceilings()
     return before != (mode, source, auto, fingerprint)
+
+
+def log_mode_ceilings():
+    """Writes the [GOVERNOR] ceilings line for the mode now in effect: the lane ceilings, thread counts and core budget it gives."""
+    profile = get_profile()
+    mode_now = _state["mode"]
+    log.info(
+        "[GOVERNOR] ceilings mode=%s budget_cores=%.1f probe+duration=%s loudness+bake=%s music=%s whisper_slots=%s "
+        "whisper_threads=%d cropdetect_threads=%s vlc_avcodec_threads=%d affordable_threads=%d caption_cadence=%s "
+        "scan_threads=%d scan_gpu_decode=%s",
+        mode_now, core_budget(profile, mode_now), lane_ceiling("probe_and_duration"), lane_ceiling("loudness_and_bake"),
+        lane_ceiling("music_loudness"), lane_ceiling("whisper_slots"),
+        whisper_threads(profile), lane_ceiling("cropdetect_threads"), vlc_decoder_threads(profile),
+        affordable_threads(profile), caption_cadence(), scan_threads(profile),
+        SCAN_GPU_DECODE_HWACCEL if scan_gpu_decode_allowed(profile) else "off")
 
 
 def choose_mode(config, mode):
@@ -3701,6 +3840,7 @@ def choose_mode(config, mode):
     config[MODE_SOURCE_CONFIG_KEY] = "user"
     set_mode(mode)
     log.info("[GOVERNOR] mode=%s source=user (menu)", mode)
+    log_mode_ceilings()
     return mode
 
 
@@ -3724,26 +3864,17 @@ def start(gpu_tier="none", gpu_names=(), vlc_version="", app_version="", pygame_
             _state["boot_scan_failed"] = False
     if first:
         _log_boot_scan(profile)
-        mode_now = _state["mode"]
-        _apply_cv2_threads_logged()
+        # WARNING: the start mode (lite, standard or performance) is picked a moment later by apply_boot_mode; nothing that depends on the mode is logged here, or the boot log names the wrong mode (L16).
+        apply_cv2_threads(_state["mode"])
         log.info(
             "[GOVERNOR] profile cores=%d/%d (efficiency=%d) ram=%.1fGB (avail %.1fGB) gpu=%s [%s] "
-            "tier=%s budget_cores=%.1f mode=%s shell=%s shadow=%s frame_budget=%.2fms cpu_source=%s "
+            "tier=%s shell=%s shadow=%s frame_budget=%.2fms cpu_source=%s "
             "pygame=%s sdl=%s fingerprint=%s",
             profile.physical_cores, profile.logical_cores, profile.efficiency_cores,
             profile.ram_total_gb, profile.ram_avail_gb, profile.gpu_tier,
-            "; ".join(profile.gpu_names) or "none", profile.tier, core_budget(profile, mode_now),
-            mode_now, _shell["active"], SHADOW_MODE, profile.frame_budget_ms, profile.cpu_source,
+            "; ".join(profile.gpu_names) or "none", profile.tier,
+            _shell["active"], SHADOW_MODE, profile.frame_budget_ms, profile.cpu_source,
             pygame_version or "unknown", sdl_version or "unknown", _state["fingerprint"])
-        log.info(
-            "[GOVERNOR] ceilings mode=%s probe+duration=%s loudness+bake=%s music=%s whisper_slots=%s "
-            "whisper_threads=%d cropdetect_threads=%s vlc_avcodec_threads=%d affordable_threads=%d caption_cadence=%s "
-            "scan_threads=%d scan_gpu_decode=%s",
-            mode_now, lane_ceiling("probe_and_duration"), lane_ceiling("loudness_and_bake"),
-            lane_ceiling("music_loudness"), lane_ceiling("whisper_slots"),
-            whisper_threads(profile), lane_ceiling("cropdetect_threads"), vlc_decoder_threads(profile),
-            affordable_threads(profile), caption_cadence(), scan_threads(profile),
-            SCAN_GPU_DECODE_HWACCEL if scan_gpu_decode_allowed(profile) else "off")
     return profile
 
 
@@ -3764,7 +3895,7 @@ __all__ = [
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
-    "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode",
+    "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
     "scan_pace_seconds", "quiet_seconds", "pc_is_quiet", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
     "music_scan_class", "music_scan_falling_behind",
 ]

@@ -1,7 +1,7 @@
 """
 Reference math for the GPU frame shaders: one definition of the constant-buffer layouts and a NumPy twin of both shader passes.
 
-Owns: FrameParams and pack_constants() (pass 1: warp, vignette, scan lines), ScalePlan, CompositePlan and
+Owns: FrameParams and pack_constants() (pass 1: picture settings, warp, vignette, scan lines), picture_adjust_values(), ScalePlan, CompositePlan and
 pack_composite_constants() (pass 2: scale into the bezel cutout, power-on effect, bezel image, LED readout), power_on_plan(),
 reference_frame(), reference_scale() and reference_composite() (the shader formulas in NumPy), scale_supported() and
 compare_frames() (the checks used by the GPU frame module and the GPU self-check).
@@ -41,21 +41,38 @@ class FrameParams:
     bloom_strength: float = 0.95
     bloom_gamma: float = 1.6
     sample_steps: int = DEFAULT_SAMPLE_STEPS
+    picture_on: bool = False
+    bright_offset: float = 0.0
+    contrast_gain: float = 1.0
+    saturation_gain: float = 1.0
+    tint_shift: float = 0.0
+    sharpen_amount: float = 0.0
+    picture_rect: tuple = (0, 0, 0, 0)
+
+
+def picture_adjust_values(brightness=50, contrast=50, color=50, sharpness=50, tint=50, tint_per_step=1.5):
+    """The Video tab's Brightness, Contrast, Color, Sharpness and Tint as the shader's (on, brightness offset, contrast gain, saturation gain, tint shift, sharpen amount), the same math the CPU picture pass used; off when all five are at 50."""
+    on = (brightness, contrast, color, sharpness, tint) != (50, 50, 50, 50, 50)
+    return (on, (brightness - 50) * 2.55, contrast / 50.0, color / 50.0, (tint - 50) * float(tint_per_step),
+            (sharpness - 50) / 50.0)
 
 
 # WARNING: the field order and the 16-byte rows below must match cbuffer FrameCB in d3d11_gpu_frame.py, or every shader value is read from the wrong slot.
-CONSTANT_BUFFER_BYTES = 64
+CONSTANT_BUFFER_BYTES = 96
 
 
 def pack_constants(p: FrameParams) -> bytes:
-    """Packs FrameParams into the 64-byte pass 1 cbuffer: four float4 rows."""
+    """Packs FrameParams into the 96-byte pass 1 cbuffer: six float4 rows."""
     period = max(1.0, p.height / float(max(1, p.scan_lines)))
+    r = p.picture_rect
     return struct.pack(
-        "<16f",
+        "<24f",
         float(p.width), float(p.height), float(p.curvature), float(p.vignette),
         float(p.scan_floor), float(p.bloom_strength), float(p.bloom_gamma), float(period),
-        float(1 if p.warp else 0), float(p.scan_mode), float(p.sample_steps), 0.0,
-        0.0, 0.0, 0.0, 0.0,
+        float(1 if p.warp else 0), float(p.scan_mode), float(p.sample_steps), float(1 if p.picture_on else 0),
+        float(p.bright_offset), float(p.contrast_gain), float(p.saturation_gain), float(p.tint_shift),
+        float(p.sharpen_amount), 0.0, 0.0, 0.0,
+        float(r[0]), float(r[1]), float(r[2]), float(r[3]),
     )
 
 
@@ -193,11 +210,47 @@ def _scan_shape(rows: np.ndarray, period: float) -> np.ndarray:
     return np.float32(0.5) + np.float32(0.5) * np.cos(frac * _TWO_PI)
 
 
-def reference_frame(src: np.ndarray, p: FrameParams) -> np.ndarray:
-    """Runs the pass 1 formulas on a (h, w, 3) uint8 picture and returns the (h, w, 3) uint8 result."""
+_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
+def _adjust_color(c: np.ndarray, p: FrameParams) -> np.ndarray:
+    c = (c + np.float32(p.bright_offset) - np.float32(128.0)) * np.float32(p.contrast_gain) + np.float32(128.0)
+    c = c + np.array([0.5, -1.0, 0.5], dtype=np.float32) * np.float32(p.tint_shift)
+    c = np.clip(c, 0.0, 255.0).astype(np.float32)
+    gray = (c @ _LUMA)[:, :, None].astype(np.float32)
+    return np.clip(gray + (c - gray) * np.float32(p.saturation_gain), 0.0, 255.0).astype(np.float32)
+
+
+def reference_picture(src: np.ndarray, p: FrameParams, pic: np.ndarray | None = None) -> np.ndarray:
+    """The pass 1 texel values as float32 (h, w, 3): the Video tab's picture settings applied to every texel inside picture_rect that is unchanged from the picture layer `pic` (the screen before menus and on-screen readouts were drawn), every other texel as it is."""
+    raw = src.astype(np.float32)
+    if not p.picture_on:
+        return raw
+    adj = _adjust_color(raw, p)
+    if p.sharpen_amount != 0.0:
+        pad = np.pad(adj, ((1, 1), (1, 1), (0, 0)), mode="edge")
+        box = np.zeros_like(adj)
+        for dy in range(3):
+            for dx in range(3):
+                box += pad[dy:dy + adj.shape[0], dx:dx + adj.shape[1]]
+        box = box / np.float32(9.0)
+        adj = np.clip(adj + np.float32(p.sharpen_amount) * (adj - box), 0.0, 255.0).astype(np.float32)
+    h, w = raw.shape[0], raw.shape[1]
+    x0, y0, x1, y1 = p.picture_rect
+    ys = np.arange(h)[:, None]
+    xs = np.arange(w)[None, :]
+    mask = (xs >= x0) & (xs < x1) & (ys >= y0) & (ys < y1)
+    if pic is not None:
+        mask = mask & np.all(src == pic, axis=2)
+    return np.where(mask[:, :, None], adj, raw).astype(np.float32)
+
+
+def reference_frame(src: np.ndarray, p: FrameParams, pic: np.ndarray | None = None) -> np.ndarray:
+    """Runs the pass 1 formulas on a (h, w, 3) uint8 picture (with its picture layer `pic`, the same picture when nothing was drawn over it) and returns the (h, w, 3) uint8 result."""
     h, w = p.height, p.width
     if src.shape[0] != h or src.shape[1] != w:
         raise ValueError("source size does not match FrameParams")
+    texels = reference_picture(src, p, pic)
     xs = np.arange(w, dtype=np.float32)[None, :]
     ys = np.arange(h, dtype=np.float32)[:, None]
     nx = (xs / np.float32(max(w - 1, 1))) * 2.0 - 1.0
@@ -215,12 +268,12 @@ def reference_frame(src: np.ndarray, p: FrameParams) -> np.ndarray:
         sy = np.clip(sy_raw, 0, h - 1).astype(np.float32)
         vradius = np.sqrt(nx * nx * 0.85 + ny * ny * 0.85)
         vig = (1.0 - np.float32(p.vignette) * np.clip(vradius, 0.0, 1.0) ** 2) * valid
-        sampled = _bilinear_clamped(src, _quantize(sx, p.sample_steps), _quantize(sy, p.sample_steps))
+        sampled = _bilinear_clamped(texels, _quantize(sx, p.sample_steps), _quantize(sy, p.sample_steps))
         warped = np.floor(sampled + 0.5)
         mult = vig.astype(np.float32)
         map_y = sy
     else:
-        warped = src.astype(np.float32)
+        warped = np.floor(texels + 0.5)
         mult = np.ones((h, w), dtype=np.float32)
         map_y = np.broadcast_to(ys, (h, w))
 

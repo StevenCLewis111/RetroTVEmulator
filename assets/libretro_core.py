@@ -39,7 +39,8 @@ except Exception:
 
 try:
     import performance_governor as _governor
-except Exception:
+except Exception as _governor_import_error:
+    logging.getLogger(__name__).warning("[LIBRETRO] could not import performance_governor, using the fallback values written in libretro_core.py: %s", _governor_import_error)
     _governor = None
 
 
@@ -219,6 +220,24 @@ def _log_warn_throttled(_key, msg, *args, **kwargs):
         return
     _warn_throttle_last[_key] = now
     log.warning(msg, *args)
+
+
+def _write_file_safely(path, data):
+    """Writes data to path through a temporary file next to it and a rename, so a save cut off by a crash or power cut leaves the old file whole; raises OSError when the write fails, after removing the temporary file."""
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError as _cleanup_error:
+            _log_swallowed("_write_file_safely: removing the temporary file", _cleanup_error)
+        raise
 
 
 def _free_dll_handle(dll):
@@ -622,12 +641,12 @@ class LibretroAudio:
         try:
             frames = int(frames)
         except (TypeError, ValueError):
-            log.error("[LIBRETRO AUDIO] non-integer frame count from core")
+            _log_warn_throttled("audio_bad_count", "[LIBRETRO AUDIO] non-integer frame count from core")
             return 0
         if frames <= 0:
             return frames
         if frames > self.MAX_BATCH_FRAMES:
-            log.error("[LIBRETRO AUDIO] frame count %d exceeds the %d-frame safety cap", frames, self.MAX_BATCH_FRAMES)
+            _log_warn_throttled("audio_over_cap", "[LIBRETRO AUDIO] frame count %d exceeds the %d-frame safety cap", frames, self.MAX_BATCH_FRAMES)
             return 0
         try:
             raw = np.frombuffer(
@@ -643,7 +662,7 @@ class LibretroAudio:
                     dropped = self._in_blocks.popleft()
                     self._in_count -= len(dropped)
         except Exception as exc:
-            log.error("[LIBRETRO AUDIO] push_samples error: %s", exc)
+            _log_warn_throttled("audio_push", "[LIBRETRO AUDIO] push_samples error: %s", exc)
         return frames
 
 
@@ -734,7 +753,7 @@ class LibretroAudio:
             elif self._channel.get_queue() is None:
                 self._feed_one_chunk(start=False)
         except Exception as exc:
-            log.error("[LIBRETRO AUDIO] tick feed error: %s", exc)
+            _log_warn_throttled("audio_tick", "[LIBRETRO AUDIO] tick feed error: %s", exc)
 
     def _feed_one_chunk(self, start):
         """Pop one OUT_CHUNK of output and play or queue it on the channel."""
@@ -748,7 +767,7 @@ class LibretroAudio:
         try:
             snd = pygame.sndarray.make_sound(chunk)
         except Exception as exc:
-            log.warning(f"[LIBRETRO AUDIO] make_sound error: {exc}")
+            _log_warn_throttled("audio_make_sound", "[LIBRETRO AUDIO] make_sound error: %s", exc)
             return
         self._snd_playing = self._snd_queued
         self._snd_queued  = snd
@@ -968,6 +987,7 @@ class LibretroCore:
         self._dll       = None
         self._rom_path  = ""
         self._loaded    = False
+        self._initialized = False
         self._frozen    = False
         self._pixel_fmt = RETRO_PIXEL_FORMAT_XRGB8888
 
@@ -1037,10 +1057,14 @@ class LibretroCore:
         self._setup_prototypes()
         self._register_callbacks()
 
+        self._initialized = False
         try:
             self._dll.retro_init()
+            self._initialized = True
         except Exception as e:
             log.warning(f"[LIBRETRO] retro_init() failed: {e}")
+            # WARNING: a core that failed to start must still be freed, or its .dll stays locked until the app quits.
+            self.unload()
             return False
 
         self._need_fullpath = False
@@ -1297,8 +1321,9 @@ class LibretroCore:
         if width <= 0 or height <= 0 or pitch <= 0:
             _log_warn_throttled("video_cb_bad_geometry", f"[LIBRETRO VIDEO] non-positive frame geometry w={width} h={height} pitch={pitch}")
             return
+        _bytes_per_pixel = 4 if self._pixel_fmt == RETRO_PIXEL_FORMAT_XRGB8888 else 2
         if (width > self._MAX_FRAME_DIM or height > self._MAX_FRAME_DIM
-                or pitch > self._MAX_FRAME_PITCH or pitch < width):
+                or pitch > self._MAX_FRAME_PITCH or pitch < width * _bytes_per_pixel):
             _log_warn_throttled("video_cb_bad_geometry", f"[LIBRETRO VIDEO] frame geometry out of bounds w={width} h={height} pitch={pitch}")
             return
         if height * pitch > self._MAX_FRAME_BYTES:
@@ -1587,17 +1612,27 @@ class LibretroCore:
         return ok
 
     def unload(self):
-        if not self._loaded:
+        """Shuts the core down and frees its .dll: the game is unloaded when one is loaded, retro_deinit runs only for a core that finished retro_init, and the .dll handle is always released, so a ROM that failed to load never leaves the core locked."""
+        if self._dll is None:
             return
-        # WARNING: save SRAM before the core and its memory buffer are released.
-        self.save_sram()
+        if self._loaded:
+            # WARNING: save SRAM before the core and its memory buffer are released.
+            self.save_sram()
+            try:
+                self._dll.retro_unload_game()
+            except Exception as e:
+                log.warning(f"[LIBRETRO] Unload error (unload game): {e}")
+        if getattr(self, "_initialized", False):
+            try:
+                self._dll.retro_deinit()
+            except Exception as e:
+                log.warning(f"[LIBRETRO] Unload error (deinit): {e}")
         try:
-            self._dll.retro_unload_game()
-            self._dll.retro_deinit()
+            self._audio.stop()
         except Exception as e:
-            log.warning(f"[LIBRETRO] Unload error: {e}")
-        self._audio.stop()
+            log.warning(f"[LIBRETRO] Unload: stopping the core's sound failed: {e}")
         self._loaded = False
+        self._initialized = False
         _free_dll_handle(self._dll)
         self._dll    = None
         print("[LIBRETRO] Core unloaded.")
@@ -1745,8 +1780,7 @@ class LibretroCore:
             # WARNING: copy the data out before the pointer can move or be invalidated.
             data = bytes(buf)
             path = self._sram_path()
-            with open(path, "wb") as f:
-                f.write(data)
+            _write_file_safely(path, data)
             print(f"[LIBRETRO] SRAM saved → {os.path.basename(path)} ({size} bytes)")
             return True
         except Exception as e:
@@ -1812,7 +1846,7 @@ class LibretroCore:
             if not ok: return False
             path = self._state_path(slot)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f: f.write(bytes(buf))
+            _write_file_safely(path, bytes(buf))
             print(f"[LIBRETRO] State saved → {os.path.basename(path)}")
             return True
         except Exception as e:
@@ -1862,6 +1896,22 @@ class LibretroCore:
 BIOS_REQUIRED_CONSOLES = {"PSX"}
 
 
+def _remembered_file(saved, old_copy_folder):
+    """Return the file a remembered setting points at: a full path where it sits, or an old bare name copied into old_copy_folder by earlier versions, else None."""
+    if not saved:
+        return None
+    saved = str(saved)
+    if os.path.isabs(saved):
+        return saved if os.path.isfile(saved) else None
+    try:
+        for fname in os.listdir(old_copy_folder):
+            if fname.lower() == saved.lower() and os.path.isfile(os.path.join(old_copy_folder, fname)):
+                return os.path.join(old_copy_folder, fname)
+    except OSError:
+        return None
+    return None
+
+
 def build_core_for_console(console, base_dir, preferred_name=None, preferred_bios_name=None):
     emu_dir    = os.path.join(base_dir, "main", "cores", console)
     save_dir   = os.path.join(base_dir, "main", "roms", console, "saves")
@@ -1869,68 +1919,25 @@ def build_core_for_console(console, base_dir, preferred_name=None, preferred_bio
 
     system_dir = os.path.join(emu_dir, "system")
 
-    if not os.path.isdir(emu_dir):
-        log.warning(f"[LIBRETRO]   core folder does NOT exist: {emu_dir}")
-
-    dll_path = None
-    if os.path.isdir(emu_dir):
-        _dll_files = [f for f in os.listdir(emu_dir) if f.lower().endswith(".dll")]
-        if preferred_name:
-            for fname in _dll_files:
-                if fname.lower() == preferred_name.lower():
-                    dll_path = os.path.join(emu_dir, fname)
-                    break
-            if dll_path is None:
-                log.warning(f"[LIBRETRO]   saved active core {preferred_name!r} not found "
-                      f"in {emu_dir}, auto-detecting instead.")
-        if dll_path is None:
-            _preferred_fname = None
-            try:
-                from game_deck import resolve_preferred_core_filename
-                _preferred_fname = resolve_preferred_core_filename(console, _dll_files)
-            except Exception as _pref_err:
-                log.warning(f"[LIBRETRO]   resolve_preferred_core_filename failed, "
-                      f"falling back to directory order: {_pref_err}")
-            if _preferred_fname:
-                dll_path = os.path.join(emu_dir, _preferred_fname)
-            else:
-                for fname in _dll_files:
-                    if fname.lower().endswith("_libretro.dll") or fname.lower().endswith("libretro.dll"):
-                        dll_path = os.path.join(emu_dir, fname)
-                        break
-                if dll_path is None and _dll_files:
-                    dll_path = os.path.join(emu_dir, _dll_files[0])
-
+    dll_path = _remembered_file(preferred_name, emu_dir)
     if dll_path is None:
-        log.warning(f"[LIBRETRO] No core .dll found in {emu_dir}")
+        log.warning(f"[LIBRETRO] {console}: core {preferred_name or '(none set)'} not found "
+              f"-- add one with Select Core or Scan for Cores")
         return None
 
-    if needs_bios:
-        if os.path.isdir(system_dir):
-            _bios_files = os.listdir(system_dir)
-            if not any(
-                os.path.isfile(os.path.join(system_dir, name))
-                for name in _bios_files
-            ):
-                log.warning(f"[LIBRETRO]   *** BIOS folder exists but is EMPTY: {system_dir} ***")
-                log.warning("[LIBRETRO]   *** Place the required BIOS file(s) there and retry. ***")
-        else:
-            log.warning(f"[LIBRETRO]   *** BIOS folder does NOT exist yet: {system_dir} ***")
-            log.warning("[LIBRETRO]   *** It will be created on first launch, but it needs "
-                  "BIOS files placed inside it before the core can boot. ***")
+    bios_path = _remembered_file(preferred_bios_name, system_dir) if needs_bios else None
+    create_system_dir = needs_bios
+    if bios_path is not None:
+        system_dir = os.path.dirname(bios_path)
+        create_system_dir = False
+    elif needs_bios:
+        log.warning(f"[LIBRETRO] {console}: BIOS {preferred_bios_name or '(none set)'} not found "
+              f"-- using the built-in HLE BIOS; add one with Add Bios")
 
-    core = LibretroCore(dll_path, system_dir, save_dir, create_system_dir=needs_bios)
+    core = LibretroCore(dll_path, system_dir, save_dir, create_system_dir=create_system_dir)
 
     if console == "PSX":
-        _bios_choice = "HLE"
-        if preferred_bios_name and os.path.isdir(system_dir):
-            for _bf in os.listdir(system_dir):
-                if _bf.lower() == preferred_bios_name.lower():
-                    _bios_choice = _bf
-                    break
-            else:
-                log.warning(f"[LIBRETRO]   active BIOS {preferred_bios_name!r} not found "
-                      f"in {system_dir}, falling back to HLE.")
+        _bios_choice = os.path.basename(bios_path) if bios_path else "HLE"
         print(f"[LIBRETRO] pcsx_rearmed_bios = {_bios_choice}")
         core.set_variable("pcsx_rearmed_bios", _bios_choice)
 

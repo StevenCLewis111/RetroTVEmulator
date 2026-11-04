@@ -273,7 +273,10 @@ VIDEO_DISPLAY_EXTS = {
 AUDIO_DISPLAY_EXTS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma"}
 
 
-def clean_video_display_title(raw_title):
+_title_failures_logged = set()
+
+
+def clean_video_display_title(raw_title, log_failure=True):
     """Clean a video's display name: strips season/episode markers, resolution, codec and rip tags, folder path and extension."""
 
     def _strip_markers(text):
@@ -340,7 +343,11 @@ def clean_video_display_title(raw_title):
                 break
             _folder = _next
 
-    log.error("Unable to derive a video title from %r", _original_raw)
+    if log_failure and _original_raw not in _title_failures_logged:
+        # WARNING: logged once per name; the guide asks for the same name on every build (owner log 2026-11-03: 48 repeats).
+        if len(_title_failures_logged) < 5000:
+            _title_failures_logged.add(_original_raw)
+        log.warning("[TITLE] no title could be read from %r; the file shows without one", _original_raw)
     return cleaned
 
 
@@ -443,7 +450,8 @@ def guide_display_title(entry):
     episode = re.sub(r"(?<![A-Za-z])\\d{1,3}(?:[\\s._-]+|$)", " ", episode)
     episode = re.sub(r"[\\(\\[][^\\)\\]]*(?:480p|720p|1080p|dvdrip|webrip|x264|h264)[^\\)\\]]*[\\)\\]]", " ", episode, flags=re.IGNORECASE)
     episode = re.sub(r"\\s+", " ", episode).strip(" .-_:")
-    episode = clean_video_display_title(episode)
+    # WARNING: an episode part with nothing left once the show name and episode code are taken out is normal; the guide shows the show name then, so it is not a failure.
+    episode = clean_video_display_title(episode, log_failure=False)
     if not episode or _normalize_show_key(episode) == _normalize_show_key(series):
         return series or clean_video_display_title(stem)
     return (series + " — " + episode) if series else episode
@@ -566,6 +574,54 @@ def _apply_video_effects_cv2(cached_surf, offs, current_params, channel_lut, col
     finally:
         view = None
         del buf
+
+
+# WARNING: the fallback numbers below must match VLC_TINT_HUE_DEGREES_PER_STEP, VLC_SHARPEN_SIGMA_PER_STEP, VLC_BLUR_SIGMA_PER_STEP in performance_governor.py; they are used only when that module fails to import.
+VLC_TINT_HUE_DEGREES_PER_STEP = _perf_governor.VLC_TINT_HUE_DEGREES_PER_STEP if _perf_governor is not None else 0.6
+VLC_SHARPEN_SIGMA_PER_STEP = _perf_governor.VLC_SHARPEN_SIGMA_PER_STEP if _perf_governor is not None else 0.02
+VLC_BLUR_SIGMA_PER_STEP = _perf_governor.VLC_BLUR_SIGMA_PER_STEP if _perf_governor is not None else 0.02
+
+
+def vlc_picture_adjust(brightness=50, contrast=50, color=50, tint=50):
+    """Returns the values of VLC's adjust filter (brightness, contrast, saturation, hue, gamma) that look like the Video tab's Brightness, Contrast, Color and Tint, or None when all four are at 50."""
+    # WARNING: VLC works out a picture as (brightness - 1) * 255 + contrast * value, turning on 0, while the Video tab turns contrast on the middle grey (128); the brightness handed to VLC carries that difference, and VLC's contrast leaves colour alone, so the saturation handed over carries the contrast too.
+    if brightness == 50 and contrast == 50 and color == 50 and tint == 50:
+        return None
+    gain = contrast / 50.0
+    offset = (brightness - 50) * 2.55
+    lift = ((offset - 128.0) * gain + 128.0) / 255.0
+    return {
+        "brightness": max(0.0, min(2.0, 1.0 + lift)),
+        "contrast": max(0.0, min(2.0, gain)),
+        "saturation": max(0.0, min(3.0, (color / 50.0) * gain)),
+        "hue": max(-180.0, min(180.0, (tint - 50) * VLC_TINT_HUE_DEGREES_PER_STEP)),
+        "gamma": 1.0,
+    }
+
+
+def vlc_sharpness_filter(sharpness=50):
+    """Returns (VLC filter name, its strength option, strength) for the Video tab's Sharpness: sharpen above 50, gaussianblur below 50; None at 50."""
+    if sharpness > 50:
+        return "sharpen", "sharpen-sigma", min(2.0, (sharpness - 50) * VLC_SHARPEN_SIGMA_PER_STEP)
+    if sharpness < 50:
+        return "gaussianblur", "gaussianblur-sigma", (50 - sharpness) * VLC_BLUR_SIGMA_PER_STEP
+    return None
+
+
+def vlc_picture_media_options(brightness=50, contrast=50, color=50, sharpness=50, tint=50):
+    """Returns (the media options that make VLC draw the Video tab's picture adjustments for one file, whether the adjust filter is in them)."""
+    adjust = vlc_picture_adjust(brightness, contrast, color, tint)
+    sharp = vlc_sharpness_filter(sharpness)
+    chain, options = [], []
+    if adjust is not None:
+        chain.append("adjust")
+        options += [":%s=%.4f" % (name, value) for name, value in adjust.items()]
+    if sharp is not None:
+        chain.append(sharp[0])
+        options.append(":%s=%.4f" % (sharp[1], sharp[2]))
+    if chain:
+        options.insert(0, ":video-filter=" + ":".join(chain))
+    return options, adjust is not None
 
 
 def apply_video_effects(surface, brightness=50, contrast=50, color=50, sharpness=50, tint=50):
@@ -707,6 +763,11 @@ _last_path_exists_cache_sweep_ms = 0.0
 _PATH_NOT_FOUND_TTL_MS = _perf_governor.PATH_NOT_FOUND_TTL_MS if _perf_governor is not None else 5000
 _PATH_FOUND_TTL_MS = _perf_governor.PATH_FOUND_TTL_MS if _perf_governor is not None else 30000
 _PATH_UNKNOWN_TTL_MS = _perf_governor.PATH_UNKNOWN_TTL_MS if _perf_governor is not None else 1500
+# WARNING: the fallback number below must match PATH_STALE_KEEP_MS in performance_governor.py; it is used only when that module fails to import.
+_PATH_STALE_KEEP_MS = _perf_governor.PATH_STALE_KEEP_MS if _perf_governor is not None else 600000
+_path_status_generation = [0]
+_path_refresh_queue = {}
+_path_last_status = {}
 
 # WARNING: treat PATH_UNKNOWN like PRESENT for eligibility; never drop a file because its drive had a rough moment.
 PATH_PRESENT = "present"
@@ -820,7 +881,7 @@ def _sweep_path_exists_cache(now_ms):
             ttl = _PATH_FOUND_TTL_MS
         else:
             ttl = _PATH_UNKNOWN_TTL_MS
-        if now_ms - cached_at >= ttl:
+        if now_ms - cached_at >= max(ttl, _PATH_STALE_KEEP_MS):
             expired.append(path)
     for path in expired:
         _path_exists_cache.pop(path, None)
@@ -876,8 +937,36 @@ def _bounded_os_path_exists(p, timeout_ms=_PATH_EXISTS_PROBE_TIMEOUT_MS):
     return PATH_UNKNOWN
 
 
+def _path_status_ttl_ms(status):
+    if status == PATH_MISSING:
+        return _PATH_NOT_FOUND_TTL_MS
+    if status == PATH_PRESENT:
+        return _PATH_FOUND_TTL_MS
+    return _PATH_UNKNOWN_TTL_MS
+
+
+def _store_path_status(p, status, now_ms):
+    """Remembers a path's status and moves the path generation on when the status differs from the one held."""
+    with _path_exists_cache_lock:
+        if _path_last_status.get(p) != status:
+            _path_last_status[p] = status
+            _path_status_generation[0] += 1
+        _path_exists_cache[p] = (status, now_ms)
+
+
+def _check_path_status_now(p):
+    if not _is_drive_responsive(p):
+        return PATH_UNKNOWN
+    return _bounded_os_path_exists(p)
+
+
+def path_status_generation():
+    """A number that changes whenever any remembered path status changes."""
+    return _path_status_generation[0]
+
+
 def _path_status(p):
-    """Tri-state existence check: PATH_PRESENT / PATH_MISSING / PATH_UNKNOWN."""
+    """Tri-state existence check: PATH_PRESENT / PATH_MISSING / PATH_UNKNOWN; on the screen thread a status held past its time is used and its re-check is queued for a background thread."""
     if not p:
         return PATH_MISSING
     now_ms = _now_ms()
@@ -886,23 +975,59 @@ def _path_status(p):
         cached = _path_exists_cache.get(p)
     if cached is not None:
         _cached_status, _cached_at = cached
-        if _cached_status == PATH_MISSING:
-            _ttl = _PATH_NOT_FOUND_TTL_MS
-        elif _cached_status == PATH_PRESENT:
-            _ttl = _PATH_FOUND_TTL_MS
-        else:
-            _ttl = _PATH_UNKNOWN_TTL_MS
-        if now_ms - _cached_at < _ttl:
+        if now_ms - _cached_at < _path_status_ttl_ms(_cached_status):
+            return _cached_status
+        if threading.current_thread() is threading.main_thread():
+            # WARNING: the screen thread never waits on a drive for a path it has a status for (owner 2026-11-02, N1: 13.8 s freezes); the re-check runs on the channel-ready thread.
+            with _path_exists_cache_lock:
+                _path_refresh_queue[p] = True
             return _cached_status
 
-    if not _is_drive_responsive(p):
-        status = PATH_UNKNOWN
-    else:
-        status = _bounded_os_path_exists(p)
-
-    with _path_exists_cache_lock:
-        _path_exists_cache[p] = (status, now_ms)
+    status = _check_path_status_now(p)
+    _store_path_status(p, status, now_ms)
     return status
+
+
+def queued_path_refreshes():
+    """How many path re-checks the screen thread has queued."""
+    with _path_exists_cache_lock:
+        return len(_path_refresh_queue)
+
+
+def run_queued_path_refreshes(limit=None):
+    """Re-checks the paths the screen thread used past their time (oldest first, at most `limit`); returns how many were checked. For a background thread only."""
+    with _path_exists_cache_lock:
+        paths = list(_path_refresh_queue)[:limit] if limit else list(_path_refresh_queue)
+        for p in paths:
+            _path_refresh_queue.pop(p, None)
+    for p in paths:
+        _store_path_status(p, _check_path_status_now(p), _now_ms())
+    return len(paths)
+
+
+def warm_path_statuses(paths, limit=None):
+    """Checks the given paths that have no status held yet, at most `limit` of them; returns how many were checked. For a background thread only."""
+    done = 0
+    for p in paths:
+        if limit is not None and done >= limit:
+            break
+        if not p:
+            continue
+        with _path_exists_cache_lock:
+            held = p in _path_exists_cache
+        if held:
+            continue
+        _store_path_status(p, _check_path_status_now(p), _now_ms())
+        done += 1
+    return done
+
+
+def note_paths_present(paths):
+    """Records paths just seen in a folder listing as present, so nothing has to check them again soon."""
+    now_ms = _now_ms()
+    for p in paths:
+        if p:
+            _store_path_status(p, PATH_PRESENT, now_ms)
 
 
 def _cached_path_exists(p):
@@ -1736,6 +1861,33 @@ def _flex_episode_sort_key(item):
     return (item["_season_number"], (0, item["_episode_number"], 0, name))
 
 
+# WARNING: the fallback number below must match SHOW_NAME_MEMO_MAX in performance_governor.py; it is used only when that module fails to import.
+_SHOW_NAME_MEMO_MAX = _perf_governor.SHOW_NAME_MEMO_MAX if _perf_governor is not None else 60000
+_show_name_memo = {}
+_show_name_memo_lock = threading.Lock()
+
+
+def _flex_path_facts(path):
+    """What group_shows_flexible reads from one file's path, worked out once per path: (extra, title, season, episode, show key, copy-free name key)."""
+    path = str(path)
+    with _show_name_memo_lock:
+        held = _show_name_memo.get(path)
+    if held is not None:
+        return held
+    track = {"path": path}
+    extra = _flex_is_non_episode_track(track)
+    title, season, episode = ("", None, None) if extra else _flex_series_and_season(track)
+    key = _normalize_show_key(title) if title else ""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r"(?i)(?:\.ia|[\s._-]+copy(?:[\s._-]+\d+)?|\s*\(\d+\))+$", "", stem)
+    facts = (extra, title, season, episode, key, _normalize_show_key(stem))
+    with _show_name_memo_lock:
+        if len(_show_name_memo) >= _SHOW_NAME_MEMO_MAX:
+            _show_name_memo.clear()
+        _show_name_memo[path] = facts
+    return facts
+
+
 def group_shows_flexible(raw_tracks):
     """Resolve arbitrary layouts into stable series/season/episode groups."""
     import collections as _col
@@ -1744,13 +1896,8 @@ def group_shows_flexible(raw_tracks):
     for track in raw_tracks:
         if not isinstance(track, dict):
             track = {"path": str(track)}
-        if _flex_is_non_episode_track(track):
-            continue
-        title, season, episode = _flex_series_and_season(track)
-        if not title:
-            continue
-        key = _normalize_show_key(title)
-        if not key:
+        extra, title, season, episode, key, _stem_key = _flex_path_facts(track.get("path", track.get("file", "")))
+        if extra or not title or not key:
             continue
         item = dict(track)
         item["_series_key"] = key
@@ -1768,10 +1915,8 @@ def group_shows_flexible(raw_tracks):
         order = []
         for item in items:
             path = item.get("path", item.get("file", ""))
-            stem = os.path.splitext(os.path.basename(str(path)))[0]
-            stem = re.sub(r"(?i)(?:\.ia|[\s._-]+copy(?:[\s._-]+\d+)?|\s*\(\d+\))+$", "", stem)
             identity = (key, item["_season_number"], item["_episode_number"],
-                        _normalize_show_key(stem) if not item["_episode_number"] else "")
+                        _flex_path_facts(path)[5] if not item["_episode_number"] else "")
             if identity not in best:
                 best[identity] = item
                 order.append(identity)
@@ -1886,6 +2031,12 @@ def get_duration_hub():
     return _duration_hub
 
 
+def whole_seconds_up(seconds):
+    """A file's length as the whole seconds its slot needs: rounded up, so the slot is never shorter than the file."""
+    # WARNING: owner log 2026-11-03: lengths rounded down gave every 30.1 to 30.6 s commercial a 30 s slot; each ran past it, the next started late and was opened part way in, and those opens went silent near the end.
+    return int(math.ceil(float(seconds) - 1e-6))
+
+
 def read_track_duration(path, stored_duration):
     """The one place a file's length is read: returns (seconds, kind) where kind is DURATION_MEASURED (the hub, then the schedule entry's own length), DURATION_ESTIMATED (a saved estimate only) or None."""
     estimate = None
@@ -1916,8 +2067,25 @@ def track_duration_is_estimated(path, stored_duration):
     return read_track_duration(path, stored_duration)[1] != DURATION_MEASURED
 
 
+_guess_class_memo = {}
+# WARNING: the fallback number below must match GUESS_CLASS_MEMO_MAX in performance_governor.py; it is used only when that module fails to import.
+_GUESS_CLASS_MEMO_MAX = _perf_governor.GUESS_CLASS_MEMO_MAX if _perf_governor is not None else 60000
+
+
 def _guess_class(path):
-    """Returns (class, series key) for a file: "commercial", "movie" (in a Movies folder), "episode" (an identifiable series, with its key) or "other"."""
+    """Returns (class, series key) for a file: "commercial", "movie" (in a Movies folder), "episode" (an identifiable series, with its key) or "other"; the answer depends on the path text only, so it is worked out once per path."""
+    key = str(path)
+    held = _guess_class_memo.get(key)
+    if held is not None:
+        return held
+    answer = _guess_class_uncached(key)
+    if len(_guess_class_memo) >= _GUESS_CLASS_MEMO_MAX:
+        _guess_class_memo.clear()
+    _guess_class_memo[key] = answer
+    return answer
+
+
+def _guess_class_uncached(path):
     normalized_path = str(path).replace("\\", "/").lower()
     if any(k in normalized_path for k in ("/commercials/", "/commercial/", "/ads/")):
         return "commercial", None
@@ -1972,7 +2140,83 @@ def _series_duration_guesses(items, path_exists):
     return guesses
 
 
+_track_build_memo = {}
+_track_build_memo_lock = threading.Lock()
+# WARNING: the fallback number below must match TRACK_BUILD_MEMO_MAX in performance_governor.py; it is used only when that module fails to import.
+_TRACK_BUILD_MEMO_MAX = _perf_governor.TRACK_BUILD_MEMO_MAX if _perf_governor is not None else 400
+
+
+def _items_signature(items):
+    """What a schedule list's track build reads from the list itself: each entry's path and stored length, in order."""
+    out = []
+    for item in items or ():
+        if isinstance(item, dict):
+            out.append((item.get("path", item.get("file", "")), item.get("duration", 0)))
+        else:
+            out.append((str(item), 0))
+    return hash(tuple(out))
+
+
+def _facts_generation():
+    hub = _duration_hub
+    return (path_status_generation(), id(hub), hub.generation() if hub is not None and hasattr(hub, "generation") else 0)
+
+
+_list_signature_cache = {}
+
+
+def _list_signature(items):
+    """(entries signature, facts signature) of a schedule list: its paths and stored lengths, and the path status and held length of each of its paths; the facts part is worked out again only when some path or length fact has changed anywhere."""
+    items_sig = _items_signature(items)
+    gen = _facts_generation()
+    cache_key = (id(items), len(items or ()))
+    held = _list_signature_cache.get(cache_key)
+    if held is not None and held[0] == gen and held[1] == items_sig:
+        return items_sig, held[2]
+    hub = _duration_hub
+    peek = getattr(hub, "peek", None) if hub is not None else None
+    facts = []
+    for item in items or ():
+        p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
+        facts.append((_path_last_status.get(p), peek(p) if peek is not None and p else None))
+    facts_sig = hash((id(hub), tuple(facts)))
+    if len(_list_signature_cache) > _TRACK_BUILD_MEMO_MAX:
+        _list_signature_cache.clear()
+    _list_signature_cache[cache_key] = (gen, items_sig, facts_sig)
+    return items_sig, facts_sig
+
+
+def _memo_track_build(kind, builder, items, path_exists, *flags):
+    """Runs a track build once per (schedule list, its paths and stored lengths, the status and held length of each of its paths); the same inputs give the answer kept from last time. Only builds that read the real path cache are kept."""
+    if path_exists is not _cached_path_exists:
+        return builder()
+    key = (kind, id(items), len(items or ())) + _list_signature(items) + tuple(flags)
+    with _track_build_memo_lock:
+        held = _track_build_memo.get(key)
+    if held is not None:
+        return [dict(t) for t in held]
+    result = builder()
+    with _track_build_memo_lock:
+        if len(_track_build_memo) >= _TRACK_BUILD_MEMO_MAX:
+            _track_build_memo.clear()
+        _track_build_memo[key] = [dict(t) for t in result]
+    return result
+
+
+def track_build_is_ready(items):
+    """True when the track build of this schedule list is already kept for its current paths, lengths and facts."""
+    sig = (id(items), len(items or ())) + _list_signature(items)
+    with _track_build_memo_lock:
+        return any(k[0] == "raw" and k[1:5] == sig for k in _track_build_memo)
+
+
 def build_raw_tracks(items, path_exists, keep_gain=False, include_unknown=False):
+    """Turns schedule entries into tracks with a resolved duration (kept per inputs, see _memo_track_build)."""
+    return _memo_track_build("raw", lambda: _build_raw_tracks_uncached(items, path_exists, keep_gain, include_unknown),
+                             items, path_exists, bool(keep_gain), bool(include_unknown))
+
+
+def _build_raw_tracks_uncached(items, path_exists, keep_gain=False, include_unknown=False):
     """Turns schedule entries into tracks with a resolved duration; entries whose path does not exist are left out, and so is a file whose duration is not known yet unless include_unknown is set (then it is marked estimated)."""
     # WARNING: a file with an unknown duration must never be placed; it is listed by build_pending_tracks and the rotation waits for it.
     guesses = _series_duration_guesses(items, path_exists)
@@ -1998,7 +2242,11 @@ def build_raw_tracks(items, path_exists, keep_gain=False, include_unknown=False)
 
 
 def build_pending_tracks(items, path_exists):
-    """The schedule entries whose path exists but whose duration is not known yet, as tracks with a path only, in schedule order."""
+    """The schedule entries whose path exists but whose duration is not known yet, as tracks with a path only, in schedule order (kept per inputs, see _memo_track_build)."""
+    return _memo_track_build("pending", lambda: _build_pending_tracks_uncached(items, path_exists), items, path_exists)
+
+
+def _build_pending_tracks_uncached(items, path_exists):
     pending = []
     for item in items:
         p = item.get("path", item.get("file", "")) if isinstance(item, dict) else str(item)
@@ -4164,6 +4412,20 @@ HOLIDAY_ROTATION_MODE = "random_slots"
 HOLIDAY_EPISODE_ORDER = "random"
 HOLIDAY_DAY_SECONDS = 86400
 HOLIDAY_KEYS = ("halloween", "christmas", "thanksgiving")
+
+
+def channel_clear_schedule_keys():
+    """Returns every schedule list the channel's own Clear Media empties: the show slots, intros and outros, and the commercials sub-menu's commercials, fade-in and fade-out."""
+    return ["Morning", "Commercials", "Fade-in", "Fade-out", "Evening", "Intros", "Night",
+            "Outros", "Marathon", "Full Day"] + list(SIX_HOUR_BLOCK_NAMES)
+
+
+def channel_has_clearable_media(ch_info):
+    """True when the channel's own Clear Media has something to empty: any schedule list it clears or any holiday list."""
+    schedules = ch_info.get("schedules", {}) or {}
+    if any(len(schedules.get(k, []) or []) > 0 for k in channel_clear_schedule_keys()):
+        return True
+    return any(len(v or []) > 0 for v in (ch_info.get("holiday_schedules") or {}).values())
 # WARNING: the fallback number must match HOLIDAY_WINDOW_DAYS in performance_governor.py; it is used only when that module fails to import.
 _HOLIDAY_WINDOW_DAYS = _perf_governor.HOLIDAY_WINDOW_DAYS if _perf_governor is not None else 3
 
@@ -4635,7 +4897,7 @@ def commercial_bundle_ceiling(duration):
 
 
 def build_commercial_tracks(items, path_exists, max_seconds=COMMERCIAL_MAX_SECONDS):
-    """Turns the Commercials schedule entries into tracks with a whole-second duration; entries whose path does not exist, or that run longer than max_seconds (None keeps every length), are left out."""
+    """Turns the Commercials schedule entries into tracks with a whole-second duration (rounded up, see whole_seconds_up); entries whose path does not exist, or that run longer than max_seconds (None keeps every length), are left out."""
     tracks = []
     for asset in items:
         path = asset.get("path", asset.get("file", "")) if isinstance(asset, dict) else str(asset)
@@ -4646,7 +4908,7 @@ def build_commercial_tracks(items, path_exists, max_seconds=COMMERCIAL_MAX_SECON
                 continue
             if max_seconds is not None and duration > max_seconds:
                 continue
-            tracks.append({"path": path, "duration": int(duration)})
+            tracks.append({"path": path, "duration": whole_seconds_up(duration)})
     return tracks
 
 
@@ -4736,6 +4998,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     _bundle_turn = _bundle_order.index(_saved_turn_ceiling) if _saved_turn_ceiling in _bundle_order else 0
 
     commercial_pool = list(commercial_tracks or [])
+    _ad_lengths = [int(c.get("duration") or 0) for c in commercial_pool if isinstance(c, dict) and int(c.get("duration") or 0) > 0]
+    _shortest_ad_seconds = min(_ad_lengths) if _ad_lengths else BREAK_MIN_SECONDS
 
     timeline = []
     total_block_content = 0
@@ -4899,41 +5163,33 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             _deferred_fill += leftover
         return t
 
-    def _pack_even_interior_breaks(show, show_dur, gap, num_breaks, t_block_content, next_mark):
-        nonlocal _deferred_fill
-        per_break  = gap / float(num_breaks)
-        capped_per = min(per_break, max_interrupt_break_seconds) if max_interrupt_break_seconds else per_break
-        if per_break > capped_per:
-            _deferred_fill += (per_break - capped_per) * (num_breaks - 1)
-        capped_per = max(capped_per, BREAK_MIN_SECONDS)
+    def _breaks_for_show(show_dur):
+        """How many breaks a show of 30 minutes or more gets: one for every half hour it runs into, and never fewer than 2; the last one is at its end (owner 2026-11-03)."""
+        return max(2, int(-(-int(show_dur) // HALF_HOUR)))
 
-        base_seg    = int(show_dur) // num_breaks
+    def _pack_even_breaks(show, show_dur, num_breaks, t_block_content, next_mark, first_cut=None):
+        """Cuts the show into num_breaks equal parts (a pair at its seam) with a break after each, the last one at its end; the ad time up to next_mark is shared evenly so the next show starts on its mark."""
+        nonlocal _deferred_fill
+        # WARNING: these breaks are held neither to max_interrupt_break_seconds nor to BREAK_MIN_SECONDS; either made a show under an hour get a 3rd break or lose one, or pushed the next show off its mark (owner 2026-11-03: the break count is the rule, a break every half hour and one at the end).
+        gap = max(0, next_mark - (t_block_content + show_dur))
+        per_break = gap / float(num_breaks)
         seek_offset = 0
         for i in range(num_breaks):
             is_last = (i == num_breaks - 1)
-            seg = (show_dur - seek_offset) if is_last else base_seg
+            if is_last:
+                seg = show_dur - seek_offset
+            elif i == 0 and first_cut:
+                seg = int(first_cut)
+            else:
+                seg = (int(show_dur) * (i + 1)) // num_breaks - seek_offset
             timeline.append(_show_entry(show, seg, t_block_content, seek_offset,
                                         interior_cut=not is_last))
             t_block_content += seg
             seek_offset     += seg
-            if is_last:
-                end_budget = next_mark - t_block_content
-                if 0 < end_budget < BREAK_MIN_SECONDS:
-                    _deferred_fill += end_budget
-                else:
-                    t_block_content = _pack_and_round(
-                        end_budget, t_block_content,
-                        max_seconds=max_interrupt_break_seconds)
-            else:
-                picked, used = _pack_break(capped_per)
-                t_block_content = _append_break(picked, t_block_content)
+            budget = (next_mark - t_block_content) if is_last else per_break
+            if budget > 0:
+                t_block_content = _pack_and_round(budget, t_block_content)
         return t_block_content
-
-    def _ceil_div(a, b):
-        """Integer ceiling division, safe on a non-positive divisor."""
-        if not b or b <= 0:
-            return 1
-        return int(-(-a // b))
 
     def _maybe_flush_deferred_fill(t):
         nonlocal _deferred_fill
@@ -5017,143 +5273,45 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
+            if show_dur >= interrupt_floor_seconds:
+                _n = 2 if show_dur < HALF_HOUR else _breaks_for_show(show_dur)
+                while gap < _n * _shortest_ad_seconds:
+                    # WARNING: too little ad time for one commercial in each break; the show runs to the next half-hour mark so it keeps all its breaks and the next show still starts on a mark.
+                    next_mark += HALF_HOUR
+                    gap = next_mark - natural_end
+                total_block_content = _pack_even_breaks(
+                    show, show_dur, _n, total_block_content, next_mark,
+                    first_cut=_mid_split_point(show, show_dur) if _n == 2 else None)
+                continue
+
             if 0 < gap < BREAK_MIN_SECONDS:
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
             if gap <= 0:
                 _fallback_break_len = max_interrupt_break_seconds if max_interrupt_break_seconds else BREAK_MIN_SECONDS
-
-                if show_dur < interrupt_floor_seconds:
-                    timeline.append(_show_entry(show, show_dur, total_block_content, 0))
-                    total_block_content += show_dur
-                    if _half_hour_capped(total_block_content):
-                        _deferred_fill += _fallback_break_len
-                    else:
-                        total_block_content = _pack_and_round(
-                            _fallback_break_len, total_block_content,
-                            max_seconds=max_interrupt_break_seconds)
-
-                elif show_dur < HALF_HOUR:
-                    mid_point = _mid_split_point(show, show_dur)
-                    timeline.append(_show_entry(show, mid_point, total_block_content, 0,
-                                                interior_cut=True))
-                    total_block_content += mid_point
-                    picked, used = _pack_break(_fallback_break_len)
-                    total_block_content = _append_break(picked, total_block_content)
-                    remaining_half = show_dur - mid_point
-                    timeline.append(_show_entry(show, remaining_half, total_block_content, mid_point))
-                    total_block_content += remaining_half
+                timeline.append(_show_entry(show, show_dur, total_block_content, 0))
+                total_block_content += show_dur
+                if _half_hour_capped(total_block_content):
+                    _deferred_fill += _fallback_break_len
+                else:
                     total_block_content = _pack_and_round(
                         _fallback_break_len, total_block_content,
                         max_seconds=max_interrupt_break_seconds)
-
-                else:
-                    num_interior_breaks = max(1, int(show_dur // HALF_HOUR))
-                    seek_offset    = 0
-                    remaining_show = show_dur
-                    for _i in range(num_interior_breaks):
-                        seg = HALF_HOUR
-                        _is_true_tail = (seek_offset + seg) >= show_dur
-                        timeline.append(_show_entry(show, seg, total_block_content, seek_offset,
-                                                    interior_cut=not _is_true_tail))
-                        total_block_content += seg
-                        seek_offset         += seg
-                        remaining_show      -= seg
-                        picked, used = _pack_break(_fallback_break_len)
-                        total_block_content   = _append_break(picked, total_block_content)
-
-                    if remaining_show > 0:
-                        timeline.append(_show_entry(show, remaining_show, total_block_content, seek_offset))
-                        total_block_content += remaining_show
-                        total_block_content = _pack_and_round(
-                            _fallback_break_len, total_block_content,
-                            max_seconds=max_interrupt_break_seconds)
                 continue
 
-            if show_dur < interrupt_floor_seconds:
-                timeline.append(_show_entry(show, show_dur, total_block_content, 0))
-                total_block_content += show_dur
-                end_budget = next_mark - total_block_content
-                if _deferred_fill > 0:
-                    end_budget += _deferred_fill
-                    _deferred_fill = 0
-                if end_budget > 0 and _half_hour_capped(total_block_content):
-                    _deferred_fill += end_budget
-                elif end_budget > 0:
-                    total_block_content = _pack_and_round(
-                        end_budget, total_block_content,
-                        max_seconds=max_interrupt_break_seconds)
-
-            elif show_dur < HALF_HOUR:
-                if gap < 2 * BREAK_MIN_SECONDS:
-                    timeline.append(_show_entry(show, show_dur, total_block_content, 0))
-                    total_block_content += show_dur
-                    end_budget = next_mark - total_block_content
-                    total_block_content = _pack_and_round(
-                        end_budget, total_block_content,
-                        max_seconds=max_interrupt_break_seconds)
-                else:
-                    # WARNING: at most 2 breaks per half-hour slot, each capped at max_interrupt_break_seconds.
-                    mid_budget = gap / 2.0
-                    if max_interrupt_break_seconds:
-                        mid_budget = min(mid_budget, max_interrupt_break_seconds)
-                    mid_point  = _mid_split_point(show, show_dur)
-
-                    timeline.append(_show_entry(show, mid_point, total_block_content, 0,
-                                                interior_cut=True))
-                    total_block_content += mid_point
-
-                    picked, used = _pack_break(mid_budget)
-                    total_block_content = _append_break(picked, total_block_content)
-
-                    remaining_half = show_dur - mid_point
-                    timeline.append(_show_entry(show, remaining_half, total_block_content, mid_point))
-                    total_block_content += remaining_half
-
-                    end_budget = next_mark - total_block_content
-                    total_block_content = _pack_and_round(
-                        end_budget, total_block_content,
-                        max_seconds=max_interrupt_break_seconds)
-
-            else:
-                num_interior_breaks = int(show_dur // HALF_HOUR)
-                baseline_breaks      = num_interior_breaks + 1
-                baseline_per_break   = gap / float(baseline_breaks)
-
-                if max_interrupt_break_seconds and baseline_per_break > max_interrupt_break_seconds:
-                    num_breaks = max(baseline_breaks, _ceil_div(gap, max_interrupt_break_seconds))
-                    total_block_content = _pack_even_interior_breaks(
-                        show, show_dur, gap, num_breaks, total_block_content, next_mark)
-                else:
-                    capped_per = min(baseline_per_break, max_interrupt_break_seconds) if max_interrupt_break_seconds else baseline_per_break
-                    capped_per = max(capped_per, BREAK_MIN_SECONDS)
-
-                    seek_offset    = 0
-                    remaining_show = show_dur
-                    for i in range(num_interior_breaks):
-                        seg = HALF_HOUR
-                        _is_true_tail = (seek_offset + seg) >= show_dur
-                        timeline.append(_show_entry(show, seg, total_block_content, seek_offset,
-                                                    interior_cut=not _is_true_tail))
-                        total_block_content += seg
-                        seek_offset         += seg
-                        remaining_show      -= seg
-
-                        picked, used = _pack_break(capped_per)
-                        total_block_content   = _append_break(picked, total_block_content)
-
-                    if remaining_show > 0:
-                        timeline.append(_show_entry(show, remaining_show, total_block_content, seek_offset))
-                        total_block_content += remaining_show
-
-                    end_budget = next_mark - total_block_content
-                    if 0 < end_budget < BREAK_MIN_SECONDS:
-                        _deferred_fill += end_budget
-                    else:
-                        total_block_content = _pack_and_round(
-                            end_budget, total_block_content,
-                            max_seconds=max_interrupt_break_seconds)
+            timeline.append(_show_entry(show, show_dur, total_block_content, 0))
+            total_block_content += show_dur
+            end_budget = next_mark - total_block_content
+            if _deferred_fill > 0:
+                end_budget += _deferred_fill
+                _deferred_fill = 0
+            if end_budget > 0 and _half_hour_capped(total_block_content):
+                _deferred_fill += end_budget
+            elif end_budget > 0:
+                total_block_content = _pack_and_round(
+                    end_budget, total_block_content,
+                    max_seconds=max_interrupt_break_seconds)
 
     elif commercial_tracks and commercial_placement == "end_of_show":
         for show in video_tracks:
@@ -9884,6 +10042,45 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
 # WARNING: the fallback numbers below must match SETTINGS_SAVE_DELAY_SECONDS, SETTINGS_SAVE_REPORT_SECONDS in performance_governor.py; they are used only when that module fails to import.
 SETTINGS_SAVE_DELAY_SECONDS = _perf_governor.SETTINGS_SAVE_DELAY_SECONDS if _perf_governor is not None else 2.0
 SETTINGS_SAVE_REPORT_SECONDS = _perf_governor.SETTINGS_SAVE_REPORT_SECONDS if _perf_governor is not None else 60.0
+# WARNING: the fallback number below must match SETTINGS_SAVE_PIECE_ENTRIES in performance_governor.py; it is used only when that module fails to import.
+SETTINGS_SAVE_PIECE_ENTRIES = _perf_governor.SETTINGS_SAVE_PIECE_ENTRIES if _perf_governor is not None else 500
+
+
+def _settings_snapshot(value, depth=0):
+    """A copy of a channel's settings for saving: every dict and list down to the schedule lists copied (each in one step), the entries inside them shared."""
+    if depth > 3:
+        return value
+    if isinstance(value, dict):
+        return {k: _settings_snapshot(v, depth + 1) for k, v in list(value.items())}
+    if isinstance(value, list):
+        return list(value) if depth >= 2 else [_settings_snapshot(v, depth + 1) for v in list(value)]
+    return value
+
+
+def _settings_text_pieces(value, pieces):
+    """Appends the JSON text of value to pieces, a long list in slices of SETTINGS_SAVE_PIECE_ENTRIES with a turn for the other threads between slices; the text reads back the same as json.dumps(value)."""
+    if isinstance(value, dict):
+        pieces.append("{")
+        first = True
+        for key, item in value.items():
+            if not first:
+                pieces.append(", ")
+            first = False
+            pieces.append(json.dumps(str(key)))
+            pieces.append(": ")
+            _settings_text_pieces(item, pieces)
+        pieces.append("}")
+        return
+    if isinstance(value, list) and len(value) > SETTINGS_SAVE_PIECE_ENTRIES:
+        pieces.append("[")
+        for start in range(0, len(value), SETTINGS_SAVE_PIECE_ENTRIES):
+            if start:
+                pieces.append(", ")
+            pieces.append(json.dumps(value[start:start + SETTINGS_SAVE_PIECE_ENTRIES])[1:-1])
+            time.sleep(0)
+        pieces.append("]")
+        return
+    pieces.append(json.dumps(value))
 
 
 class RetroDatabase:
@@ -10728,7 +10925,7 @@ class RetroDatabase:
 
     def _encode_main_settings(self):
         """Returns the text of retro_config.json (compact JSON of config and channels, runtime-only keys left out), or None when it cannot be made."""
-        # WARNING: the whole tree is turned into text by one json.dumps call, which Python runs without letting another thread change the trees halfway, so the file always holds one moment's settings; json.dump(indent=...) runs in Python code, takes many times longer and can be interrupted.
+        # WARNING: the lists are copied first, each in one step (Python lets no other thread change a list while list() copies it), so every list in the file holds one moment's entries; the text is then made from the copies in pieces of SETTINGS_SAVE_PIECE_ENTRIES with a turn for the screen between them (one json.dumps of the whole 4 MB tree held the screen 32 ms, N13).
         try:
             with self._remote_schedule_lock:
                 if self._remote_schedule_active and self._remote_local_channels_snapshot is not None:
@@ -10738,12 +10935,16 @@ class RetroDatabase:
                     source = self.channels_db
                 channels_view = {}
                 for key, info in list(source.items()):
-                    if isinstance(info, dict) and any(k in info for k in RUNTIME_ONLY_CHANNEL_KEYS):
-                        info = dict(info)
+                    if isinstance(info, dict):
+                        info = _settings_snapshot(info)
                         for runtime_key in RUNTIME_ONLY_CHANNEL_KEYS:
                             info.pop(runtime_key, None)
                     channels_view[key] = info
-                return json.dumps({"config": self.config, "channels": channels_view})
+                config_text = json.dumps(self.config)
+            pieces = ['{"config": ', config_text, ', "channels": ']
+            _settings_text_pieces(channels_view, pieces)
+            pieces.append("}")
+            return "".join(pieces)
         except Exception as encode_err:
             log.error("[SETTINGS SAVE] the settings could not be turned into JSON, nothing written: %s: %s",
                       type(encode_err).__name__, encode_err)
@@ -10804,99 +11005,13 @@ class RetroDatabase:
             if now - stats["since"] < SETTINGS_SAVE_REPORT_SECONDS:
                 return
             line = ("[SETTINGS SAVE] %d write(s) for %d request(s) in the last %.0fs; retro_config.json %.1f MB; "
-                    "making the text avg %.0f ms max %.0f ms (the screen waits this long); writing to disk avg %.0f ms max %.0f ms (in the background)"
+                    "making the text avg %.0f ms max %.0f ms (in pieces, the screen gets a turn between them); writing to disk avg %.0f ms max %.0f ms (in the background)"
                     % (stats["writes"], stats["requests"], now - stats["since"], stats["bytes"] / 1048576.0,
                        stats["encode_ms"] / stats["writes"], stats["encode_max_ms"],
                        stats["write_ms"] / stats["writes"], stats["write_max_ms"]))
             self._settings_save_stats = {"writes": 0, "requests": 0, "bytes": size, "encode_ms": 0.0, "encode_max_ms": 0.0,
                                          "write_ms": 0.0, "write_max_ms": 0.0, "since": now}
         log.info(line)
-
-    def factory_reset(self):
-
-        game_ch_flag   = self.config.get("game_channel_enabled", True)
-        guide_ch_flag  = self.config.get("tv_guide_enabled", True)
-        theme_name     = self.config.get("current_theme", "DefaultBlueGreen")
-        theme_bg_color = self.config.get("theme_bg_color", "Blue")
-        theme_ui_color = self.config.get("theme_ui_color", "Green")
-        theme_bg_hue   = self.config.get("theme_bg_hue", 220)
-        theme_ui_hue   = self.config.get("theme_ui_hue", 140)
-        menu_opacity   = self.config.get("menu_opacity", 50)
-        transition_type = self.config.get("transition_type", "black")
-        remote_bindings = self.config.get("remote_bindings", {})
-
-        consoles_enabled      = self.config.get("consoles_enabled", {})
-        console_rom_dir       = self.config.get("console_rom_dir", {})
-        active_bios           = self.config.get("active_bios", {})
-        console_profiles      = self.config.get("console_profiles", {})
-        all_profiles_sync     = self.config.get("all_profiles_sync", False)
-        all_profiles_sync_tgt = self.config.get("all_profiles_sync_target", 1)
-        console_scroll_style  = self.config.get("console_scroll_style", "carousel")
-        console_splash_enabled = self.config.get("console_splash_enabled", {})
-        console_splash_path   = self.config.get("console_splash_path", {})
-        dvd_splash_enabled    = self.config.get("dvd_splash_enabled", False)
-        dvd_splash_path       = self.config.get("dvd_splash_path", "")
-
-        self.config = {
-            "global_volume": 70,
-            "current_theme": theme_name,
-            "show_controls_on_launch": True,
-            "tv_guide_enabled": guide_ch_flag,
-            "game_channel_enabled": game_ch_flag,
-            "start_on_boot": False,
-            "kiosk_mode_enabled": False,
-            "server_mode_enabled": False,
-            "is_muted": False,
-            "audio_stereo": True,
-            "brightness": 50,
-            "contrast": 50,
-            "color": 50,
-            "sharpness": 50,
-            "tint": 50,
-            "vlc_decode_res": "sd",
-            "theme_bg_color": theme_bg_color,
-            "theme_ui_color": theme_ui_color,
-            "theme_bg_hue": theme_bg_hue,
-            "theme_ui_hue": theme_ui_hue,
-            "menu_opacity": menu_opacity,
-            "transition_type": transition_type,
-            "aspect_ratio": "16:9",
-            "fake_43_border_enabled": False,
-            "bezel_style": 1,
-            "fake_43_scanlines_enabled": False,
-            "fake_static_noise_enabled": False,
-            "loudness_scan_enabled": True,
-            "screen_mode": "normal",
-            "dvd_screen_mode": "normal",
-            "pixel_orbiter_enabled": True,
-            "burn_in_protection_skip_confirm": False,
-            "console_bezel_skip_confirm": False,
-            "program_bezel_skip_confirm": False,
-            "pixel_orbiter_skip_confirm": False,
-            "ch03_screensaver_skip_confirm": False,
-            "screen_offset_x": 0,
-            "screen_offset_y": 0,
-            "screen_edge_left": 0,
-            "screen_edge_right": 0,
-            "screen_edge_top": 0,
-            "screen_edge_bottom": 0,
-            "remote_bindings": remote_bindings,
-            "consoles_enabled": consoles_enabled,
-            "console_rom_dir": console_rom_dir,
-            "active_bios": active_bios,
-            "console_profiles": console_profiles,
-            "all_profiles_sync": all_profiles_sync,
-            "all_profiles_sync_target": all_profiles_sync_tgt,
-            "console_scroll_style": console_scroll_style,
-            "console_splash_enabled": console_splash_enabled,
-            "console_splash_path": console_splash_path,
-            "dvd_splash_enabled": dvd_splash_enabled,
-            "dvd_splash_path": dvd_splash_path,
-        }
-
-        self.channels_db = self._build_channels_db({})
-
-        self.save_settings()
 
 
 # ============================================================================
@@ -10922,7 +11037,7 @@ __all__ = [
     "RetroDatabase",
     "SELECTION_BORDER_WIDTH", "SHORTCUT_EXTENSIONS", "SHORT_EPISODE_PAIRING_VERSION",
     "SIX_HOUR_BLOCKS", "SIX_HOUR_BLOCK_NAMES", "TARGET_LUFS", "TRUE_PEAK_CEILING_DBTP",
-    "UnplayableMediaError", "VIDEO_DISPLAY_EXTS", "apply_video_effects",
+    "UnplayableMediaError", "VIDEO_DISPLAY_EXTS", "apply_video_effects", "vlc_picture_adjust", "vlc_sharpness_filter", "vlc_picture_media_options",
     "asr_known_unavailable", "bake_compressor_pass", "bezel_style_count",
     "build_block_timeline", "build_ordered_tracks", "build_show_rotation",
     "check_media_truly_ended", "clean_display_title_for_ext", "clean_music_display_title",

@@ -15,6 +15,9 @@ import re
 import array
 import subprocess
 import random
+import collections
+import gc
+import types
 import copy
 import functools
 import itertools
@@ -27,6 +30,9 @@ import time
 import logging
 import logging.handlers
 import traceback
+
+# WARNING: the health monitor is imported near the main loop; this name must exist from the start, because VLC's picture callback and the exit path can run before that import and would fail on a missing name.
+health_monitor = None
 
 
 # ============================================================================
@@ -404,6 +410,8 @@ _WEDGED_ENGINE_REPLACE_RETRY_MS = performance_governor.WEDGED_ENGINE_REPLACE_RET
 _TESTER_REPORT_LOG_TAIL_BYTES = performance_governor.TESTER_REPORT_LOG_TAIL_BYTES if performance_governor is not None else 524288
 # WARNING: the 300 fallback must match TESTER_REPORT_MAX_LOG_LINES in performance_governor.py; it is used only when that module fails to import.
 _TESTER_REPORT_MAX_LOG_LINES = performance_governor.TESTER_REPORT_MAX_LOG_LINES if performance_governor is not None else 300
+# WARNING: the fallback number below must match TESTER_REPORT_MAX_HEALTH_LINES in performance_governor.py; it is used only when that module fails to import.
+_TESTER_REPORT_MAX_HEALTH_LINES = performance_governor.TESTER_REPORT_MAX_HEALTH_LINES if performance_governor is not None else 80
 # WARNING: the 200 fallback must match TESTER_REPORT_MAX_CRASH_LINES in performance_governor.py; it is used only when that module fails to import.
 _TESTER_REPORT_MAX_CRASH_LINES = performance_governor.TESTER_REPORT_MAX_CRASH_LINES if performance_governor is not None else 200
 from media import resolve_main_dir, resolve_loudness_dir, resolve_bezel_dir, discover_bezel_style_files, LOUDNESS_PROBE_MAX_CONCURRENT, get_music_loudness_gain
@@ -435,7 +443,9 @@ def _thread_crash_hook(args):
 def _write_crash_log_main_thread(exc_type, exc_value, exc_tb):
     _write_crash_log(exc_type, exc_value, exc_tb)
     try:
-        _attempt_self_relaunch()
+        if _attempt_self_relaunch():
+            # WARNING: once the replacement is started this process must end here; returning lets the built exe show its error window and keep running, which holds the single-instance lock, so the replacement gives up and quits as a duplicate. Without a replacement (crash-loop guard or a failed start) it returns, so the error window shows why the app stopped.
+            _hard_exit_process(1)
     except NameError:
         pass
     except Exception as _relaunch_err:
@@ -605,6 +615,98 @@ _SINGLE_INSTANCE_HANDLE = None
 
 
 # ============================================================================
+# SECTION: Fresh start after Reset All Settings
+# ============================================================================
+# WARNING: the fallback numbers below must match SINGLE_INSTANCE_WAIT_SECONDS and FRESH_START_WAIT_FOR_OLD_APP_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SINGLE_INSTANCE_WAIT_S = performance_governor.SINGLE_INSTANCE_WAIT_SECONDS if performance_governor is not None else 3.0
+_FRESH_START_WAIT_FOR_OLD_APP_S = performance_governor.FRESH_START_WAIT_FOR_OLD_APP_SECONDS if performance_governor is not None else 30.0
+FRESH_START_MARKER_NAME = "fresh_start_pending.json"
+_FRESH_START_ROOT_FILES = ("retro_config.json", "emulator_config.json")
+_FRESH_START_LOGS_FILES = ("playback_runtime.json", "playback_runtime.json.tmp", "_probe_inflight.json",
+                           "retro_config.json.tmp", os.path.join("controllers", "emulator_config.json"))
+_FRESH_START_MAIN_FILES = (os.path.join("media_library", "library.sqlite3"), os.path.join("media_library", "library.sqlite3-wal"),
+                           os.path.join("media_library", "library.sqlite3-shm"), os.path.join("media_library", "library.sqlite3-journal"))
+_FRESH_START_MAIN_FOLDERS = ("loudness", "captions", "visualizer_analysis")
+
+
+def _fresh_start_marker_path():
+    """logs\\fresh_start_pending.json: written by Reset All Settings, read and removed by the next start."""
+    return os.path.join(_app_logs_dir(), FRESH_START_MARKER_NAME)
+
+
+def _wait_for_old_app_to_close(pid, seconds):
+    """Waits until the copy of the app that asked for the reset has closed (outside Windows; on Windows the single-instance guard already waited); False when it is still running."""
+    if os.name == "nt" or not pid or pid == os.getpid():
+        return True
+    _end = time.time() + seconds
+    while time.time() < _end:
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _fresh_start_remove(path, removed, failed):
+    """Deletes one file or folder of saved data; a failure is written as one line in `failed`."""
+    import shutil as _shutil
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            _shutil.rmtree(path)
+        elif os.path.lexists(path):
+            os.remove(path)
+        else:
+            return
+        removed.append(path)
+    except Exception as e:
+        failed.append("could not delete %s: %s" % (path, e))
+
+
+def _wipe_saved_data_for_fresh_start(root_dir, logs_dir, main_dir):
+    """Runs at the start after Reset All Settings: deletes every setting and saved fact the app keeps (settings, file facts, guide and loudness data, captions, visualizer analysis, station positions, core and controller settings, game saves and the core and BIOS copies older versions made), never the user's own files or the files the app ships with; returns (removed, failed) or None when no reset was asked."""
+    marker = os.path.join(logs_dir, FRESH_START_MARKER_NAME)
+    if not os.path.isfile(marker):
+        return None
+    import json as _json
+    removed, failed = [], []
+    try:
+        with open(marker, "r", encoding="utf-8") as fp:
+            request = _json.load(fp)
+        if not isinstance(request, dict):
+            request = {}
+    except Exception as e:
+        failed.append("could not read %s (%s); wiping anyway" % (marker, e))
+        request = {}
+    if not _wait_for_old_app_to_close(request.get("old_app_pid"), _FRESH_START_WAIT_FOR_OLD_APP_S):
+        failed.append("the app that asked for the reset was still running after %.0f s; wiping anyway" % _FRESH_START_WAIT_FOR_OLD_APP_S)
+    for name in _FRESH_START_ROOT_FILES:
+        _fresh_start_remove(os.path.join(root_dir, name), removed, failed)
+    for name in _FRESH_START_LOGS_FILES:
+        _fresh_start_remove(os.path.join(logs_dir, name), removed, failed)
+    for name in _FRESH_START_MAIN_FILES:
+        _fresh_start_remove(os.path.join(main_dir, name), removed, failed)
+    for name in _FRESH_START_MAIN_FOLDERS:
+        _fresh_start_remove(os.path.join(main_dir, name), removed, failed)
+    roms_dir = os.path.join(main_dir, "roms")
+    try:
+        consoles = sorted(os.listdir(roms_dir)) if os.path.isdir(roms_dir) else []
+    except OSError as e:
+        consoles = []
+        failed.append("could not list %s: %s" % (roms_dir, e))
+    for console in consoles:
+        _fresh_start_remove(os.path.join(roms_dir, console, "saves"), removed, failed)
+    cores_dir = os.path.normcase(os.path.abspath(os.path.join(main_dir, "cores")))
+    for path in request.get("old_tool_copies", []) or []:
+        _abs = os.path.abspath(str(path))
+        # WARNING: only files inside main\\cores are ever deleted from this list; anything else in it is left alone.
+        if os.path.normcase(_abs).startswith(cores_dir + os.sep) and os.path.isfile(_abs):
+            _fresh_start_remove(_abs, removed, failed)
+    _fresh_start_remove(marker, removed, failed)
+    return removed, failed
+
+
+# ============================================================================
 # SECTION: Process lifetime: single instance, job object & hard exit
 # ============================================================================
 
@@ -624,7 +726,7 @@ def _acquire_single_instance():
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         mutex_name = "RetroTVEmulator_SingleInstance_Mutex"
         import time as _time
-        _deadline = _time.time() + 3.0
+        _deadline = _time.time() + (_FRESH_START_WAIT_FOR_OLD_APP_S if os.path.isfile(_fresh_start_marker_path()) else _SINGLE_INSTANCE_WAIT_S)
         while True:
             handle = kernel32.CreateMutexW(None, True, mutex_name)
             last_err = ctypes.get_last_error()
@@ -645,6 +747,15 @@ if __name__ == "__main__":
     if not _acquire_single_instance():
         log.info("[SINGLE INSTANCE] Another instance is already running -- exiting this duplicate launch.")
         sys.exit(0)
+    try:
+        _fresh_start_result = _wipe_saved_data_for_fresh_start(_app_root_dir(), _app_logs_dir(), resolve_main_dir())
+    except Exception as _fresh_start_error:
+        _fresh_start_result = None
+        log.warning("[FRESH START] Reset All Settings: the wipe stopped early: %s", _fresh_start_error)
+    if _fresh_start_result is not None:
+        log.info("[FRESH START] Reset All Settings: deleted %d saved file(s) and folder(s); the user's own files were not touched", len(_fresh_start_result[0]))
+        for _fresh_line in _fresh_start_result[1]:
+            log.warning("[FRESH START] %s", _fresh_line)
 
 
 # ============================================================================
@@ -737,6 +848,9 @@ def _write_tester_report(reason):
         _out += ["", "=== app_log.txt warnings, errors and failures (latest %d) ===" % _TESTER_REPORT_MAX_LOG_LINES]
         _kept = [l for l in (_lines or []) if " [WARNING] " in l or " [ERROR] " in l or " [CRITICAL] " in l]
         _out += ["(none)"] if not _kept else _kept[-_TESTER_REPORT_MAX_LOG_LINES:]
+        _health_lines = [l for l in (_lines or []) if " [HEALTH" in l and " [WARNING] " not in l]
+        _out += ["", "=== app_log.txt health report (latest %d lines) ===" % _TESTER_REPORT_MAX_HEALTH_LINES]
+        _out += ["(none)"] if not _health_lines else _health_lines[-_TESTER_REPORT_MAX_HEALTH_LINES:]
         _final = os.path.join(_dir, "tester_report.txt")
         with open(_final + ".tmp", "w", encoding="utf-8") as _f:
             _f.write("\n".join(_out) + "\n")
@@ -861,6 +975,12 @@ def _hard_exit_process(code):
             log.warning("[QUIT] _hard_exit_process: writing the waiting settings save failed: %s", _flush_error)
         _clear_run_marker()
     try:
+        _exit_health = globals().get("health_monitor")
+        if _exit_health is not None:
+            _exit_health.final_report("exit code %s" % code)
+    except Exception as _health_exit_error:
+        log.warning("[QUIT] _hard_exit_process: the health summary failed: %s", _health_exit_error)
+    try:
         _flush_app_log()
     except Exception as _swallowed_error:
         _log_swallowed("_hard_exit_process: _flush_app_log()", _swallowed_error)
@@ -972,11 +1092,13 @@ def _bootstrap_libvlc():
     def _log(msg):
         print(msg, flush=True)
 
+    # WARNING: the app's own VLC lives in tools\vlc (root\tools\vlc in the project, _internal\tools\vlc in the built exe, owner 2026-11-03) so the app runs from a drive plugged into any computer; vlc\ beside the scripts is the older place, kept so an install updated from before the move still finds its VLC.
     base_dir = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
-    bundled_dir = os.path.join(base_dir, "vlc")
+    bundled_dir = os.path.join(base_dir, "tools", "vlc")
 
     candidates = [
         bundled_dir,
+        os.path.join(base_dir, "vlc"),
         r"C:\Program Files\VideoLAN\VLC",
         r"C:\Program Files (x86)\VideoLAN\VLC",
     ]
@@ -998,6 +1120,9 @@ def _bootstrap_libvlc():
             except Exception as e:
                 _log(f"[BOOT] add_dll_directory failed for {chosen}: {e}")
         _log(f"libVLC located at: {chosen}")
+        if chosen != bundled_dir:
+            _log(f"[BOOT WARNING] the app's own VLC is not at {bundled_dir}; using {chosen} instead, "
+                 "so on another computer without it video will not play. Put the VLC folder at tools\\vlc.")
 
         try:
             ctypes.CDLL(os.path.join(chosen, "libvlc.dll"))
@@ -1024,7 +1149,7 @@ def _bootstrap_libvlc():
                      "DVD support. Fix: copy the full 'plugins\\access' folder "
                      "(and libdvdnav/libdvdread .dll files, if separate) from a "
                      "full desktop VLC install of the SAME bit-width/version "
-                     "into this app's vlc\\plugins folder, or point this app at "
+                     "into this app's tools\\vlc\\plugins folder, or point this app at "
                      "a full VLC install instead of the trimmed bundled copy.")
 
         if os.path.isdir(plugins_dir):
@@ -1052,7 +1177,7 @@ def _bootstrap_libvlc():
                      "trimmed without the directsound module. Fix: copy "
                      "'plugins\\audio_output\\libdirectsound_plugin.dll' from a "
                      "full desktop VLC install of the SAME bit-width/version "
-                     "into this app's vlc\\plugins\\audio_output folder.")
+                     "into this app's tools\\vlc\\plugins\\audio_output folder.")
 
             _found_compressor_plugin = any(
                 "compressor" in _f.lower()
@@ -1068,6 +1193,18 @@ def _bootstrap_libvlc():
                      "Fix: copy 'plugins\\audio_filter\\libcompressor_plugin.dll' "
                      "from a full desktop VLC install of the SAME "
                      "bit-width/version.")
+
+            _picture_plugin_files = {_f.lower() for _r, _d, _fs in os.walk(plugins_dir) for _f in _fs}
+            _missing_picture_plugins = [_p for _p in ("libadjust_plugin.dll", "libsharpen_plugin.dll", "libgaussianblur_plugin.dll")
+                                        if _p not in _picture_plugin_files]
+            if _missing_picture_plugins:
+                _log("[BOOT WARNING] VLC picture filter plugin(s) missing under "
+                     f"{plugins_dir}: {', '.join(_missing_picture_plugins)} -- the Video tab's "
+                     "Brightness, Contrast, Color, Tint (adjust) and Sharpness (sharpen, gaussianblur) "
+                     "cannot be drawn and the picture plays unadjusted. Fix: copy them from "
+                     "'plugins\\video_filter' of a full desktop VLC install of the SAME bit-width/version.")
+            else:
+                _log("[BOOT] VLC picture filter plugins found (adjust, sharpen, gaussianblur)")
 
         _found_libdvdcss = False
         for _scan_dir in (chosen, plugins_dir):
@@ -1086,16 +1223,42 @@ def _bootstrap_libvlc():
                  "case above: a fast State.Ended shortly after open, for "
                  "every commercial disc regardless of title. Fix: place "
                  "libdvdcss-2.dll (or libdvdcss.dll, depending on version) "
-                 "next to libvlc.dll in this app's vlc folder -- it ships "
+                 "next to libvlc.dll in this app's tools\\vlc folder -- it ships "
                  "with any full desktop VLC install of the SAME "
                  "bit-width/version, or can be obtained standalone from "
                  "videolan.org.")
     else:
-        _log("[BOOT WARNING] No libvlc.dll found in bundled 'vlc' folder or "
-             "standard install paths. Video playback will not work on this "
-             "machine unless VLC (matching 32/64-bit) is installed.")
+        _log(f"[BOOT WARNING] No libvlc.dll found in the app's own {bundled_dir} (or the older vlc folder, "
+             "or a VLC installed on this computer). Video playback will not work; put the app's VLC "
+             "folder at tools\\vlc (root\\tools\\vlc in the project, _internal\\tools\\vlc in the built app).")
 
+    if chosen == bundled_dir:
+        _start_old_vlc_folder_removal(os.path.join(base_dir, "vlc"), chosen)
     return chosen is not None
+
+
+def _start_old_vlc_folder_removal(old_dir, in_use_dir):
+    """Removes the VLC folder left at the old place (vlc\\ beside the scripts, _internal\\vlc in the exe) once the app plays from its own tools\\vlc, on a thread of its own so the start never waits for it."""
+    # WARNING: only a folder that is a VLC folder (libvlc.dll, libvlccore.dll or a plugins folder, so a removal cut short by a quit is finished at the next start) and is not the one in use is removed; an update only adds files, so this is how an install updated from before the move (owner 2026-11-03) loses its old copy.
+    if not (os.path.isfile(os.path.join(old_dir, "libvlc.dll"))
+            or os.path.isfile(os.path.join(old_dir, "libvlccore.dll"))
+            or os.path.isdir(os.path.join(old_dir, "plugins"))):
+        return
+    if os.path.normcase(os.path.abspath(old_dir)) == os.path.normcase(os.path.abspath(in_use_dir)):
+        return
+
+    def _remove():
+        import shutil as _shutil
+        _left = []
+        _shutil.rmtree(old_dir, onerror=lambda _fn, _path, _exc: _left.append(_path))
+        if _left or os.path.exists(old_dir):
+            print(f"[BOOT WARNING] the old VLC folder {old_dir} could not be removed fully ({len(_left)} item(s) left, "
+                  f"first: {_left[0] if _left else old_dir}); the app keeps using {in_use_dir} and tries again at the next start", flush=True)
+        else:
+            print(f"[BOOT] removed the old VLC folder {old_dir}; the app plays from {in_use_dir}", flush=True)
+
+    threading.Thread(target=_remove, name="OldVlcCleanup", daemon=True).start()
+
 
 _libvlc_located = _bootstrap_libvlc()
 
@@ -3646,9 +3809,118 @@ def _bezel_video_pixel_aspect(win_w, win_h):
         return 1.0
 
 
+# ============================================================================
+# SECTION: Picture adjustments done by VLC
+# ============================================================================
+
+
+# WARNING: these must match the libvlc_video_adjust_option_t values.
+_VLC_ADJUST_ENABLE = 0
+_VLC_ADJUST_FLOAT_OPTIONS = (("contrast", 1), ("brightness", 2), ("hue", 3), ("saturation", 4), ("gamma", 5))
+_picture_adjust_live_state = {"key": None, "started": False}
+
+
+def _gpu_draws_picture_settings():
+    """True when the graphics-card drawing step applies the Video tab's picture settings, so VLC is asked for none: the GPU frame path is wanted and its gate is not switched off."""
+    if not _gpu_frame_path_requested():
+        return False
+    _gate = _gpu_frame_state.get("gate")
+    if _gate is None:
+        return True
+    try:
+        return _gate.state != "disabled"
+    except Exception as _swallowed_error:
+        _log_swallowed("_gpu_draws_picture_settings: reading the GPU gate state", _swallowed_error)
+        return False
+
+
+def _picture_settings_neutral():
+    """True when Brightness, Contrast, Color, Sharpness and Tint are all at 50."""
+    brightness, contrast, color_sat, sharpness, tint, _fx = _get_video_effects(db)
+    return (brightness, contrast, color_sat, sharpness, tint) == (50, 50, 50, 50, 50)
+
+
+def _vlc_does_picture_settings():
+    """True when VLC's own filters must draw the Video tab's picture settings for the file being opened: no graphics-card drawing step applies them and at least one is not at 50; VLC then decodes the file on the CPU, because its filters cannot take a picture the graphics card decoded."""
+    # WARNING: owner log 2026-11-03: with graphics-card decoding VLC dropped every filter ("Failed to compensate for the format changes, removing all filters") and each try made a late picture at every open.
+    return not _gpu_draws_picture_settings() and not _picture_settings_neutral()
+
+
+def _picture_adjust_media_options():
+    """Returns (the VLC media options for the Video tab's Brightness, Contrast, Color, Sharpness and Tint as they are now, whether the adjust filter is in them) for the file being opened; none when the graphics-card drawing step applies them."""
+    if not _vlc_does_picture_settings():
+        return [], False
+    brightness, contrast, color_sat, sharpness, tint, _fx = _get_video_effects(db)
+    return media.vlc_picture_media_options(brightness, contrast, color_sat, sharpness, tint)
+
+
+def _apply_picture_adjust_to_engine(engine, adjust):
+    """Hands the adjust values to one engine's playing picture; adds VLC's adjust filter to it when it has none and takes it off when every value is back at 50."""
+    if engine is None or getattr(engine, "_closed", False) or getattr(engine, "player", None) is None:
+        return
+    player = engine.player
+    try:
+        if adjust is not None:
+            for name, option in _VLC_ADJUST_FLOAT_OPTIONS:
+                player.video_set_adjust_float(option, float(adjust[name]))
+            if not getattr(engine, "_adjust_in_chain", False):
+                player.video_set_adjust_int(_VLC_ADJUST_ENABLE, 1)
+                engine._adjust_in_chain = True
+        elif getattr(engine, "_adjust_in_chain", False):
+            player.video_set_adjust_int(_VLC_ADJUST_ENABLE, 0)
+            engine._adjust_in_chain = False
+    except Exception as e:
+        _log_warn_throttled("picture_adjust_live_%s" % getattr(engine, "engine_label", "?"),
+                            "[PICTURE ADJUST] the %s picture could not take the new Video tab values (they show from the next file): %s",
+                            getattr(engine, "engine_label", "?"), e)
+
+
+def _picture_adjust_live_tick():
+    """Each frame: when Brightness, Contrast, Color or Tint changed, hands the new values to the picture VLC is drawing now; Sharpness shows from the next file that opens."""
+    brightness, contrast, color_sat, _sharp, tint, _fx = _get_video_effects(db)
+    adjust = media.vlc_picture_adjust(brightness, contrast, color_sat, tint)
+    key = tuple(sorted(adjust.items())) if adjust is not None else None
+    # WARNING: the first look only records the values; every file opened since boot already took them through _picture_adjust_media_options.
+    if not _picture_adjust_live_state["started"]:
+        _picture_adjust_live_state.update(key=key, started=True)
+        return
+    if key == _picture_adjust_live_state["key"]:
+        return
+    _picture_adjust_live_state["key"] = key
+    if _gpu_draws_picture_settings():
+        return
+    for engine in (vlc_engine, dvd_engine):
+        if adjust is not None and not getattr(engine, "_adjust_in_chain", False) and getattr(engine, "_decoding_on_gpu", False):
+            continue
+        _apply_picture_adjust_to_engine(engine, adjust)
+
+
+_video_draw_stats = {"n": 0, "parts": [0.0, 0.0, 0.0, 0.0, 0.0], "max": 0.0}
+# WARNING: the fallback number below must match VIDEO_DRAW_LOG_FRAMES in performance_governor.py; it is used only when that module fails to import.
+VIDEO_DRAW_LOG_FRAMES = performance_governor.VIDEO_DRAW_LOG_FRAMES if performance_governor is not None else 600
+
+
+def _note_video_draw_timing(copy_s, prepare_s, place_s, scale_s, store_s, mode):
+    """Adds one drawn video picture's part times and writes one [VIDEO DRAW] line every VIDEO_DRAW_LOG_FRAMES pictures."""
+    st = _video_draw_stats
+    parts = (copy_s, prepare_s, place_s, scale_s, store_s)
+    st["n"] += 1
+    for i, v in enumerate(parts):
+        st["parts"][i] += v
+    st["max"] = max(st["max"], sum(parts))
+    if st["n"] >= VIDEO_DRAW_LOG_FRAMES:
+        n = float(st["n"])
+        log.info("[VIDEO DRAW] %s pictures=%d avg ms: copy=%.2f crop+effects=%.2f place=%.2f scale+blit=%.2f keep=%.2f total=%.2f max=%.1f",
+                 mode, st["n"], *[1000.0 * v / n for v in st["parts"]], 1000.0 * sum(st["parts"]) / n, 1000.0 * st["max"])
+        st.update(n=0, parts=[0.0, 0.0, 0.0, 0.0, 0.0], max=0.0)
+
+
+_replay_scaled_cache = {}
+
+
 def _blit_video_with_screen_mode(screen, surf, rect, mode=None, analysis_surf=None, geom_out=None, pixel_aspect=1.0,
-                                  timing_out=None, fit_aspect=None):
-    """Scale `surf` into `rect` per the active Screen Mode and blit it, handling letterbox bars and cropping."""
+                                  timing_out=None, fit_aspect=None, reuse_key=None):
+    """Scale `surf` into `rect` per the active Screen Mode and blit it, handling letterbox bars and cropping; with reuse_key, the same picture drawn again at the same size reuses its scaled copy."""
     # WARNING: pixel_aspect applies to Normal only; Crop / Pan & Scan / Stretch keep the real ratio so they never distort.
     if mode is None:
         mode = _active_screen_mode()
@@ -3696,7 +3968,13 @@ def _blit_video_with_screen_mode(screen, surf, rect, mode=None, analysis_surf=No
             draw_w = max(1, round(draw_h * source_aspect))
 
     _ss_t0 = time.perf_counter()
-    scaled = pygame.transform.smoothscale(surf, (draw_w, draw_h))
+    _held = _replay_scaled_cache.get(reuse_key) if reuse_key is not None else None
+    if _held is not None and _held[0] is surf and _held[1] == (draw_w, draw_h):
+        scaled = _held[2]
+    else:
+        scaled = pygame.transform.smoothscale(surf, (draw_w, draw_h))
+        if reuse_key is not None:
+            _replay_scaled_cache[reuse_key] = (surf, (draw_w, draw_h), scaled)
     if timing_out is not None:
         timing_out["smoothscale_ms"] = (time.perf_counter() - _ss_t0) * 1000.0
 
@@ -4194,9 +4472,58 @@ def _gpu_frame_gate():
     return _st["gate"]
 
 
+# WARNING: the fallback number below must match GPU_PICTURE_TINT_PER_STEP in performance_governor.py; it is used only when that module fails to import.
+_GPU_PICTURE_TINT_PER_STEP = performance_governor.GPU_PICTURE_TINT_PER_STEP if performance_governor is not None else 1.5
+_picture_layer_state = {"surf": None, "rect": None, "taken": False}
+
+
+def _picture_layer_rect(win_w, win_h):
+    """The part of the screen that is broadcast picture this frame, as (x0, y0, x1, y1), or None: the whole screen on a TV channel, only the preview window in the guide, the whole screen while a game or disc plays on channel 03 and nothing in its menus (owner 2026-11-03)."""
+    ch = app_state.get("current_channel")
+    if ch == "04":
+        px, py, pw, ph = app_state.get("guide_preview_bounds", (0, 0, 0, 0))
+        return (px, py, px + pw, py + ph) if pw > 0 and ph > 0 else None
+    if ch == "03":
+        if game_deck is not None and (getattr(game_deck, "mode", "") == "GAME" or getattr(game_deck, "dvd_playback_active", False)):
+            return (0, 0, win_w, win_h)
+        return None
+    return (0, 0, win_w, win_h)
+
+
+def _ui_layer_expected_this_frame():
+    """True when something that is not broadcast picture is drawn over it after the overlays: a menu, popup, splash or file explorer, the volume or channel readout, a status banner or the Visualizer song card."""
+    now = pygame.time.get_ticks()
+    return bool(app_state.get("show_menu", False) or app_state.get("show_splash", False)
+                or app_state.get("show_quit_confirm", False) or app_state.get("show_restart_confirm", False)
+                or app_state.get("show_clear_confirm", False) or app_state.get("file_explorer_active", False)
+                or now < app_state.get("osd_volume_timer", 0) or now < app_state.get("osd_channel_timer", 0)
+                or not _channel_transition_over() or app_state.get("_vis_card_text")
+                or _status_banner_current is not None or _caption_memory_banner_pending)
+
+
+def _take_picture_layer(surf):
+    """At the end of the overlays: records which part of the screen is broadcast picture, and keeps a copy of it when the graphics card will apply the Video tab's picture settings and menus or readouts are drawn over it, so the settings leave those alone."""
+    st = _picture_layer_state
+    w, h = surf.get_size()
+    st["rect"] = _picture_layer_rect(w, h)
+    st["taken"] = False
+    if st["rect"] is None or _picture_settings_neutral() or not _gpu_draws_picture_settings() or not _ui_layer_expected_this_frame():
+        return
+    if st["surf"] is None or st["surf"].get_size() != (w, h) or st["surf"].get_masks() != surf.get_masks():
+        st["surf"] = surf.copy()
+    else:
+        st["surf"].blit(surf, (0, 0))
+    st["taken"] = True
+
+
 def _gpu_effect_params(win_w, win_h, mode, scanlines_wanted):
-    """Build the pass 1 FrameParams for this frame from the app's own CRT constants and the effect mode from _crt_effect_mode."""
+    """Build the pass 1 FrameParams for this frame from the app's own CRT constants, the effect mode from _crt_effect_mode and the Video tab's picture settings for the broadcast picture."""
     _ref = _gpu_frame_state["modules"][2]
+    _b, _c, _col, _sh, _t, _fx = _get_video_effects(db)
+    _pic_on, _pic_b, _pic_c, _pic_s, _pic_t, _pic_sh = _ref.picture_adjust_values(_b, _c, _col, _sh, _t, _GPU_PICTURE_TINT_PER_STEP)
+    _pic_rect = _picture_layer_state.get("rect")
+    if _pic_rect is None:
+        _pic_on, _pic_rect = False, (0, 0, 0, 0)
     _scan_lines = _crt_scanline_target_lines(win_h)
     _scan_mode = _ref.SCAN_NONE
     if mode == "warp":
@@ -4211,7 +4538,9 @@ def _gpu_effect_params(win_w, win_h, mode, scanlines_wanted):
         width=win_w, height=win_h, warp=(mode == "warp"),
         curvature=_active_crt_shader_curvature(), vignette=_CRT_SHADER_VIGNETTE,
         scan_mode=_scan_mode, scan_lines=_scan_lines, scan_floor=_CRT_SCANLINE_DARKEN_FLOOR,
-        bloom_strength=_CRT_SCANLINE_BLOOM_STRENGTH, bloom_gamma=_CRT_SCANLINE_BLOOM_GAMMA)
+        bloom_strength=_CRT_SCANLINE_BLOOM_STRENGTH, bloom_gamma=_CRT_SCANLINE_BLOOM_GAMMA,
+        sample_steps=_ref.DEFAULT_SAMPLE_STEPS, picture_on=_pic_on, bright_offset=_pic_b, contrast_gain=_pic_c,
+        saturation_gain=_pic_s, tint_shift=_pic_t, sharpen_amount=_pic_sh, picture_rect=tuple(_pic_rect))
 
 
 def _gpu_sync_overlays(pipeline, win_w, win_h, bezel_wanted):
@@ -4289,7 +4618,8 @@ def _gpu_draw_frame(real_screen, virtual_surf, ignore_package_aspect, scanlines_
         _power_on = None if _elapsed is None else _ref.power_on_plan(
             _elapsed, tuple(_power_rect), CRT_POWERON_EXPAND_MS, CRT_POWERON_TOTAL_MS, CRT_POWERON_PEAK_ALPHA)
         _gpu_sync_overlays(_pipeline, vw, vh, _geom is not None)
-        _pipeline.render(virtual_surf, _params, _plan, _clip, _bar_color, _power_on)
+        _pipeline.render(virtual_surf, _params, _plan, _clip, _bar_color, _power_on,
+                         picture_layer=_picture_layer_state["surf"] if _picture_layer_state.get("taken") else None)
     except Exception as e:
         _gate.report_failure(e)
         return False
@@ -5009,7 +5339,10 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
 _STATIC_NOISE_REFRESH_MS = performance_governor.STATIC_NOISE_REFRESH_MS if performance_governor is not None else 110
 # WARNING: the fallback numbers below must match STATIC_NOISE_AMBIENT_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REFRESH_MS if performance_governor is not None else 80
-_static_noise_overlay_cache = {"key": None, "surface": None, "built_at": 0}
+# WARNING: the fallback numbers below must match STATIC_NOISE_POOL_FRAMES and STATIC_NOISE_POOL_SIZES in performance_governor.py; they are used only when that module fails to import.
+_STATIC_NOISE_POOL_FRAMES = performance_governor.STATIC_NOISE_POOL_FRAMES if performance_governor is not None else 8
+_STATIC_NOISE_POOL_SIZES = performance_governor.STATIC_NOISE_POOL_SIZES if performance_governor is not None else 3
+_static_noise_pools = collections.OrderedDict()
 _static_noise_cycle_started = None
 
 _last_screen_mode_picture_rect = None
@@ -5133,8 +5466,37 @@ def _tinted_bright_rgb(count, style, saturation=0.42):
     return (np.stack([r, g, b], axis=1) * 255).astype(np.uint8)
 
 
+def _static_noise_frame(w, h, tint_style):
+    """Makes one full-strength snow picture of w x h: speckles at the density of heavy reception, each at an alpha of 35 to 115."""
+    sw, sh = max(8, w // 3), max(8, h // 3)
+    density = 0.18 + _STATIC_HEAVY * 0.5
+    speckle = np.random.random((sw, sh)) < density
+    alpha = np.zeros((sw, sh), dtype=np.uint8)
+    alpha[speckle] = np.random.randint(35, 115, size=int(speckle.sum()))
+    rgb = np.zeros((sw, sh, 3), dtype=np.uint8)
+    bright = np.random.random((sw, sh)) >= 0.5
+    rgb[bright] = _tinted_bright_rgb(int(bright.sum()), tint_style)
+    overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
+    overlay_rgb = pygame.surfarray.pixels3d(overlay)
+    overlay_rgb[:] = rgb
+    del overlay_rgb
+    overlay_alpha = pygame.surfarray.pixels_alpha(overlay)
+    overlay_alpha[:] = alpha
+    del overlay_alpha
+    scaled = pygame.transform.scale(overlay, (w, h))
+    # WARNING: a surface in the screen's own pixel format blends several times faster each frame than a plain SRCALPHA one (N6: this overlay cost 5 to 12 ms a frame on the weak PC).
+    return scaled.convert_alpha() if pygame.display.get_surface() is not None else scaled
+
+
+def _static_noise_strength_alpha(severity):
+    """The surface alpha (0 to 255) that gives full-strength snow the same average opacity the snow of this severity always had (speckle alpha max(18, 35 x severity) to max(36, 115 x severity))."""
+    mean_now = (max(18.0, 35.0 * severity) + max(36.0, 115.0 * severity)) / 2.0
+    return max(0, min(255, int(round(255.0 * mean_now / 75.0))))
+
+
 def _apply_static_noise_effect(screen, rect, ch_str):
-    """Persistent grainy 'snow' overlay for whatever channel is currently on screen (or being previewed)."""
+    """Persistent grainy 'snow' overlay for whatever channel is currently on screen (or being previewed): a few snow pictures made once per screen size, shown in turn, at the reception strength of the moment."""
+    # WARNING: owner log 2026-11-03: making a new snow picture every 80 ms (and on every strength change) on the screen thread cost 50 to 140 ms spikes; pictures are made once, one per refresh until the set is full, then only shown.
     try:
         rect = rect.clip(screen.get_rect())
         w, h = rect.width, rect.height
@@ -5144,34 +5506,22 @@ def _apply_static_noise_effect(screen, rect, ch_str):
         severity = _static_noise_severity_at(now)
         tint_style = _current_noise_tint_style()
         tint_hue = db.config.get("theme_bg_hue", 220) if (db is not None and tint_style == "theme") else 0
-        cache = _static_noise_overlay_cache
-        key = (w, h, round(severity, 2), tint_style, tint_hue)
-        if (cache["key"] != key or cache["surface"] is None
-                or now - cache["built_at"] >= _STATIC_NOISE_AMBIENT_REFRESH_MS):
-            sw, sh = max(8, w // 3), max(8, h // 3)
-            density = 0.18 + _STATIC_HEAVY * 0.5
-            speckle = np.random.random((sw, sh)) < density
-            alpha = np.zeros((sw, sh), dtype=np.uint8)
-            alpha[speckle] = np.random.randint(
-                max(18, int(35 * severity)),
-                max(36, int(115 * severity)),
-                size=int(speckle.sum()),
-            )
-            rgb = np.zeros((sw, sh, 3), dtype=np.uint8)
-            bright = np.random.random((sw, sh)) >= 0.5
-            n_bright = int(bright.sum())
-            rgb[bright] = _tinted_bright_rgb(n_bright, tint_style)
-            overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-            overlay_rgb = pygame.surfarray.pixels3d(overlay)
-            overlay_rgb[:] = rgb
-            del overlay_rgb
-            overlay_alpha = pygame.surfarray.pixels_alpha(overlay)
-            overlay_alpha[:] = alpha
-            del overlay_alpha
-            cache["surface"] = pygame.transform.scale(overlay, (w, h))
-            cache["key"] = key
-            cache["built_at"] = now
-        screen.blit(cache["surface"], rect.topleft)
+        key = (w, h, tint_style, tint_hue)
+        pool = _static_noise_pools.get(key)
+        if pool is None:
+            pool = {"frames": [], "last_tick": None}
+            _static_noise_pools[key] = pool
+            while len(_static_noise_pools) > max(1, int(_STATIC_NOISE_POOL_SIZES)):
+                _static_noise_pools.popitem(last=False)
+        else:
+            _static_noise_pools.move_to_end(key)
+        tick = now // max(1, int(_STATIC_NOISE_AMBIENT_REFRESH_MS))
+        if pool["last_tick"] != tick and len(pool["frames"]) < max(1, int(_STATIC_NOISE_POOL_FRAMES)):
+            pool["frames"].append(_static_noise_frame(w, h, tint_style))
+        pool["last_tick"] = tick
+        frame = pool["frames"][tick % len(pool["frames"])]
+        frame.set_alpha(_static_noise_strength_alpha(severity))
+        screen.blit(frame, rect.topleft)
     except Exception as e:
         log.warning("_apply_static_noise_effect: draw failed: %s", e)
 
@@ -5338,10 +5688,13 @@ def _is_live_tv_broadcast_channel(ch):
 
 
 def _channel_watermark_path(channel):
-    """Return the per-channel watermark path, using the channel folder case-insensitively."""
+    """Return the channel's watermark: the remembered image where it sits, else watermark.png in the channel's folder (found case-insensitively)."""
     channel_name = str(channel or "").zfill(2)
     if not channel_name:
         return ""
+    _remembered = (db.channels_db.get(channel_name, {}) if db is not None else {}).get("watermark_path", "")
+    if _remembered and os.path.isfile(_remembered):
+        return _remembered
     try:
         for entry in os.listdir(WATERMARK_BASE_DIR):
             if entry.lower() == f"channel {channel_name}".lower():
@@ -6610,6 +6963,8 @@ _channel_playback_failures = {}
 _playback_attempt_ids = itertools.count(1)
 
 _PLAYBACK_PENDING = object()
+# WARNING: returned by play_file_segmented for a load the viewer has already left; it is not a failure, so nothing is marked broken and no Static is shown for it.
+_PLAYBACK_STALE = object()
 
 _last_attempt_reason = {}
 
@@ -6741,6 +7096,18 @@ def _static_visual_is_grey(key):
         _static_visual_seen[key] = record
     record[1] = now
     return now - record[0] >= _STATIC_TO_GREY_S
+
+
+def _draw_static_channel(screen, rect, key, target_aspect=None):
+    """Draws a channel that is on Static, the one look the station and the guide preview share: snow, then the grey screen once it has stayed on Static for _STATIC_TO_GREY_S; the Static noise keeps playing under both."""
+    if _static_visual_is_grey(key):
+        _static_sound_play()
+        fit_rect = _aspect_fit_rect(rect, target_aspect=target_aspect)
+        if fit_rect.width < rect.width or fit_rect.height < rect.height:
+            screen.fill(_video_bar_color(), rect)
+        screen.fill(COLOR_TRANSITION_GREY, fit_rect)
+    else:
+        _render_transition_static(screen, rect, target_aspect=target_aspect)
 
 
 def _static_banner_ready(key, reason):
@@ -7018,6 +7385,8 @@ def _blit_last_video_frame(screen, x, y, w, h, apply_screen_mode=True, context="
     frame = _last_video_frame.get(context)
     if frame is None:
         return False
+    if context == "fullscreen":
+        app_state["_held_frame_drawn_this_frame"] = True
     try:
         if apply_screen_mode:
             _pa = 1.0
@@ -7035,7 +7404,7 @@ def _blit_last_video_frame(screen, x, y, w, h, apply_screen_mode=True, context="
                 screen.fill(_video_bar_color(), outer_rect)
             _blit_video_with_screen_mode(screen, frame, _rect, mode=_mode,
                                           analysis_surf=_last_video_frame_raw.get(context),
-                                          pixel_aspect=_pa, fit_aspect=_fit_a)
+                                          pixel_aspect=_pa, fit_aspect=_fit_a, reuse_key=context)
         else:
             screen.blit(pygame.transform.smoothscale(frame, (w, h)), (x, y))
         return True
@@ -7111,6 +7480,9 @@ WEDGED_STOP_TIMEOUT_S = performance_governor.WEDGED_STOP_TIMEOUT_SECONDS if perf
 # WARNING: the fallback numbers below must match PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS in performance_governor.py; they are used only when that module fails to import.
 _PLAY_SEGMENTED_STOP_FAST_WAIT_S = performance_governor.PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS if performance_governor is not None else 0.05
 
+# WARNING: the fallback number below must match OPEN_WAIT_JOIN_CLOCK_MIN_SECONDS in performance_governor.py; it is used only when that module fails to import.
+OPEN_WAIT_JOIN_CLOCK_MIN_S = performance_governor.OPEN_WAIT_JOIN_CLOCK_MIN_SECONDS if performance_governor is not None else 0.5
+
 # WARNING: the fallback numbers below must match PRE_OPEN_DIMS_PROBE_BOUND_SECONDS in performance_governor.py; they are used only when that module fails to import.
 PRE_OPEN_DIMS_PROBE_BOUND_S = performance_governor.PRE_OPEN_DIMS_PROBE_BOUND_SECONDS if performance_governor is not None else 0.35
 
@@ -7171,13 +7543,21 @@ def _start_guide_preview_load(hl_ch, hl_state):
     )
 
     app_state["last_video_play_started_at"] = pygame.time.get_ticks()
-    vlc_engine.play_file_segmented(
-        hl_state["file"],
-        hl_state["seek"],
-        gain=_lookup_file_gain(hl_ch, hl_state["file"]),
-        defer_unmute=True,
-        on_confirmed=_gp_on_confirmed,
-    )
+    _gp_file, _gp_seek = hl_state["file"], hl_state["seek"]
+    _gp_gain = _lookup_file_gain(hl_ch, _gp_file)
+
+    def _gp_open():
+        vlc_engine.play_file_segmented(
+            _gp_file,
+            _gp_seek,
+            gain=_gp_gain,
+            defer_unmute=True,
+            on_confirmed=_gp_on_confirmed,
+            follow_clock=True,
+        )
+
+    # WARNING: owner 2026-11-03: the picture box is scanned first and then the preview opens, never on the screen thread; the open runs on the same worker as a channel change, so the guide keeps drawing and taking keys while a scan runs (owner log: the guide froze 5.6 s in the pre-show scan).
+    _dispatch_content_activation(_gp_open)
     _mute_guard_log("ARM (guide preview load)", ch=hl_ch, filepath=hl_state["file"])
     app_state["loaded_preview_path_cache"] = hl_state["file"]
     app_state["guide_preview_loading"] = True
@@ -7878,7 +8258,7 @@ from media import (
     bake_compressor_pass,
 )
 import ui
-from ui import render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, fit_design_canvas, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
+from ui import draw_popup_yes_no, render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, fit_design_canvas, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
     get_server_picker_entries, get_server_picker_selectable_count, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
     UPDATER_AND_SERVER_FEATURES_ENABLED, SERVER_TOGGLE_ENABLED, GPU_RENDER_MODE_ENABLED, NUM_CONTROL_PAGES
 from visualizers import VisualizerDeck
@@ -7907,7 +8287,7 @@ _FE_ADDLOC_HDR_H = performance_governor.FE_ADDLOC_HDR_H if performance_governor 
 _FE_ADDLOC_W = performance_governor.FE_ADDLOC_W if performance_governor is not None else 150
 
 # WARNING: _fe_add_selected_to_queue() must replace, not append, when one of these is the active context.
-_FE_SINGLE_PICK_MODES = {"libretro_core", "console_splash", "menu_bg", "watermark_select"}
+_FE_SINGLE_PICK_MODES = {"libretro_core", "add_bios", "console_splash", "menu_bg", "watermark_select"}
 
 
 # WARNING: the fallback numbers below must match FILE_EXPLORER_LEFT_ITEMS_TTL_MS in performance_governor.py; they are used only when that module fails to import.
@@ -8073,6 +8453,21 @@ def _fe_cache_kind(valid_exts):
     return "fe:" + (",".join(sorted(valid_exts)) if valid_exts else "all")
 
 
+# WARNING: these must match the Windows FILE_ATTRIBUTE_HIDDEN and FILE_ATTRIBUTE_SYSTEM values.
+_FE_ATTR_HIDDEN = 0x2
+_FE_ATTR_SYSTEM = 0x4
+
+
+def _fe_is_protected_system_entry(entry):
+    """True for an entry Windows marks both hidden and system (its own protected items: System Volume Information, $Recycle.Bin, and the My Music, My Pictures and My Videos links inside Documents), which Windows Explorer does not show either and which deny reading."""
+    try:
+        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError as _swallowed_error:
+        _log_swallowed("_fe_is_protected_system_entry: entry.stat", _swallowed_error)
+        return False
+    return (attrs & _FE_ATTR_HIDDEN) and (attrs & _FE_ATTR_SYSTEM)
+
+
 def _fe_list_dir(path, valid_exts):
     """Lists `path` for the file explorer and returns (items, status); status is ok, unresponsive, missing or error."""
     if not path:
@@ -8086,6 +8481,8 @@ def _fe_list_dir(path, valid_exts):
     try:
         with os.scandir(path) as it:
             for entry in it:
+                if _fe_is_protected_system_entry(entry):
+                    continue
                 try:
                     kind, real_path, disp_name = media.resolve_dir_entry(entry.path, entry.name)
                 except OSError as _swallowed_error:
@@ -8365,13 +8762,17 @@ def _fe_poll_expand():
             app_state["file_explorer_expand_result"] = None
     if result is None:
         pending    = app_state.get("file_explorer_expand_pending", 0)
-        started_ms = app_state.get("file_explorer_expand_started_ms", 0)
         timeout_ms = app_state.get("file_explorer_expand_timeout_ms", 6000)
-        if pending > 0 and started_ms and (pygame.time.get_ticks() - started_ms) > timeout_ms:
+        _found_n, _last_progress = app_state.get("file_explorer_expand_progress", (0, time.monotonic()))
+        # WARNING: the walk is given up only when it has found nothing new for the timeout (a drive that stopped answering), never because a big folder takes long; giving up on a clock let Done close with 0 files while the count was still coming (owner 2026-11-02, N3).
+        if pending > 0 and (time.monotonic() - _last_progress) * 1000.0 > timeout_ms:
+            log.warning("[FILE EXPLORER] folder walk found nothing new for %.0fs after %d file(s); the drive may have stopped answering, the walk is given up",
+                        timeout_ms / 1000.0, _found_n)
+            _fe_banner("THE DRIVE STOPPED ANSWERING - FOLDER NOT ADDED")
             app_state["file_explorer_expand_request_id"] += 1
             app_state["file_explorer_expand_pending"]    = 0
             app_state["file_explorer_expand_started_ms"] = 0
-            _fe_request_close()
+            app_state["file_explorer_done_requested"] = False
         return
     op, found, session_id = result
     if session_id != app_state.get("file_explorer_session_id", 0):
@@ -8877,6 +9278,23 @@ def _sync_profile_setting_across_consoles(source_console, profile_num, key, valu
           f"Profile {profile_num} (Sync Profile) to Profile {profile_num} on every other console")
 
 
+def _set_splash_enabled(console, enabled):
+    """Turns a console's splash screen on or off; with All Settings on it turns every console's on or off (a splash is not a profile choice). A console with no splash picture on disk shows its normal loading screen, as if it were off."""
+    from game_deck import CONSOLE_ORDER
+    consoles = [c for c in CONSOLE_ORDER if c != "MENU"] if db.config.get("all_profiles_sync", False) else [console]
+    _cse = db.config.setdefault("console_splash_enabled", {})
+    for con in consoles:
+        if con == "DVD":
+            db.config["dvd_splash_enabled"] = enabled
+        else:
+            _cse[con] = enabled
+    db.save_settings()
+    if len(consoles) > 1:
+        print(f"[GAMES] All Settings: splash screen enabled = {enabled} on every console (from {console})")
+    else:
+        print(f"[GAMES] {console} splash screen enabled = {enabled}")
+
+
 def _set_console_bezel_enabled(console, profile_num, value):
     """Sets a console's TV bezel on/off outside the games menu layer, so the burn-in popup can commit it."""
     profiles = (db.config
@@ -8926,30 +9344,11 @@ def _set_console_bezel_style(console, profile_num, style):
 # ============================================================================
 
 
-def _fe_pick_bios_in_folder(items, sel, context):
-    """Inside a console's BIOS folder, marks the first selected file as the one to use, replacing any earlier pick made in that folder and keeping files queued from elsewhere."""
-    bios_dir = os.path.normpath(context.get("bios_dir", ""))
-    picked = None
-    for idx in sorted(sel):
-        if 0 <= idx < len(items) and items[idx]["type"] == "file":
-            picked = os.path.normpath(items[idx]["path"])
-            break
-    app_state["file_explorer_selection"] = set()
-    if picked is None:
-        return
-    checked = app_state.setdefault("file_explorer_checked", [])
-    checked[:] = [f for f in checked if os.path.normpath(os.path.dirname(f)) != bios_dir]
-    checked.append(picked)
-
-
 def _fe_add_selected_to_queue():
     items      = app_state.get("file_explorer_items", [])
     sel        = app_state.get("file_explorer_selection", set())
     context    = app_state.get("file_explorer_context", {})
     valid_exts = app_state.get("file_explorer_exts", set())
-    if _fe_in_bios_dir(context):
-        _fe_pick_bios_in_folder(items, sel, context)
-        return
     if context.get("mode", "") in _FE_SINGLE_PICK_MODES:
         checked = []
         app_state["file_explorer_checked"] = checked
@@ -8976,6 +9375,7 @@ def _fe_add_selected_to_queue():
         session_id = app_state.get("file_explorer_session_id", 0)
         if app_state.get("file_explorer_expand_pending", 0) == 0:
             app_state["file_explorer_expand_started_ms"] = pygame.time.get_ticks()
+            app_state["file_explorer_expand_progress"] = (0, time.monotonic())
         app_state["file_explorer_expand_pending"] += 1
         threading.Thread(
             target=_fe_expand_worker,
@@ -9102,16 +9502,29 @@ def _fe_expand_worker(req_id, op, dir_paths, valid_exts, session_id=0):
     }
     found = []
     seen = set()
+    _walk_t0 = time.monotonic()
+    app_state["file_explorer_expand_progress"] = (0, _walk_t0)
+    _folders = [0]
+
+    def _folder_seen(dir_path):
+        _folders[0] += 1
+        app_state["file_explorer_expand_progress"] = (len(found), time.monotonic())
+        return _is_drive_responsive(dir_path)
+
     for p in dir_paths:
         if not _is_drive_responsive(p):
             continue
         for fp in media.iter_files_resolving_shortcuts(
                 p, ignored_dir_names=ignored_dirs, valid_exts=valid_exts,
-                is_drive_responsive=_is_drive_responsive):
+                is_drive_responsive=_folder_seen):
             fp = os.path.normpath(fp)
             if fp not in seen:
                 seen.add(fp)
                 found.append(fp)
+                app_state["file_explorer_expand_progress"] = (len(found), time.monotonic())
+    media.note_paths_present(found)
+    log.info("[FILE EXPLORER] folder walk (%s): %d file(s) in %d folder(s) from %d picked folder(s) in %.1fs",
+             op, len(found), _folders[0], len(dir_paths), time.monotonic() - _walk_t0)
     with app_state["file_explorer_expand_lock"]:
         app_state["file_explorer_expand_result"] = (op, found, session_id)
 
@@ -9626,10 +10039,22 @@ _PENDING_PROBE_REQUEST_STALE_SECONDS = (performance_governor.PENDING_SCHEDULE_PR
 # WARNING: the fallback must match PENDING_PROBE_URGENT_COUNT in performance_governor.py; used only when that module fails to import.
 _PENDING_PROBE_URGENT_COUNT = (performance_governor.PENDING_PROBE_URGENT_COUNT
                                if performance_governor is not None else 4)
-# WARNING: this dict is the only state of the pending probe; the worker threads never touch the database, only the calling thread stores results. A path in "awaiting_store" has a result waiting in "results" and must not be probed again until a caller has stored it, or the same result is stored several times.
+# WARNING: this dict is the only state of the pending probe; the probe threads never touch the database, only the PendingStore thread stores results (never the screen thread: owner log 2026-11-03, stores made from the scheduler call held the screen 200 to 480 ms). A path in "awaiting_store" has a result waiting in "results" and must not be probed again until it is stored, or the same result is stored several times.
 _pending_probe_state = {"lock": threading.Lock(), "wake": threading.Event(), "requests": {},
                         "results": [], "in_flight": set(), "retry_at": {}, "threads": [], "active": 0,
-                        "urgent_active": 0, "last_backlog": 0.0, "awaiting_store": set()}
+                        "urgent_active": 0, "last_backlog": 0.0, "awaiting_store": set(), "stored": set(),
+                        "last_store": {}, "store_wake": threading.Event(), "store_thread": None}
+# WARNING: the fallback must match PENDING_PROBE_STORE_BATCH_SECONDS in performance_governor.py; used only when that module fails to import.
+_PENDING_PROBE_STORE_BATCH_S = (performance_governor.PENDING_PROBE_STORE_BATCH_SECONDS
+                                if performance_governor is not None else 15.0)
+
+
+def _stored_length_held(path):
+    """True when the length hub already holds a measured length for this path (read from what it holds, never from disk)."""
+    hub = media.get_duration_hub()
+    peek = getattr(hub, "peek", None) if hub is not None else None
+    held = peek(path) if peek is not None else None
+    return bool(held and held[0])
 
 
 def _pending_probe_worker():
@@ -9648,7 +10073,7 @@ def _pending_probe_worker():
                     continue
                 for rank, path in enumerate(request["paths"]):
                     if (path in state["in_flight"] or path in state["awaiting_store"]
-                            or state["retry_at"].get(path, 0.0) > now_m):
+                            or (path in state.get("stored", ()) and _stored_length_held(path)) or state["retry_at"].get(path, 0.0) > now_m):
                         continue
                     if best is None or rank < best[0]:
                         best = (rank, key, path)
@@ -9695,8 +10120,10 @@ def _pending_probe_worker():
                         set_live_playback_priority(False)
                 state["retry_at"][path] = time.monotonic() + _PENDING_PROBE_RETRY_SECONDS
                 if result is not None:
-                    state["results"].append((key, result, time.monotonic() - started))
+                    state["results"].append((key, result, time.monotonic() - started, urgent))
                     state["awaiting_store"].add(path)
+            if result is not None:
+                state["store_wake"].set()
 
 
 def _pending_backlog_may_run(state, now_m):
@@ -9718,8 +10145,52 @@ def _pending_backlog_may_run(state, now_m):
         return now_m - state.get("last_backlog", 0.0) >= 1.5
 
 
+def _store_pending_probe_results():
+    """Stores the finished pending-probe lengths of every block that is due: a block with a length needed soon at once, any other block once every _PENDING_PROBE_STORE_BATCH_S; returns how many were stored. Runs on the PendingStore thread."""
+    state = _pending_probe_state
+    with state["lock"]:
+        # WARNING: every stored length makes that block's lineup be built again, so a block's backlog lengths are stored together once every _PENDING_PROBE_STORE_BATCH_S; a length needed soon (an urgent probe) stores its whole block at once (owner log 2026-11-03: lineups rebuilt 50 to 64 s of every minute while lengths came in).
+        _now_store = time.monotonic()
+        _last_store = state.setdefault("last_store", {})
+        _due_keys = {r[0] for r in state["results"]
+                     if (len(r) > 3 and r[3]) or _now_store - _last_store.get(r[0], 0.0) >= _PENDING_PROBE_STORE_BATCH_S}
+        finished = [r[:3] for r in state["results"] if r[0] in _due_keys]
+        state["results"] = [r for r in state["results"] if r[0] not in _due_keys]
+        for _due in _due_keys:
+            _last_store[_due] = _now_store
+        state["awaiting_store"].difference_update(item[0] for _key, item, _took in finished)
+        # WARNING: a file in two channels' lists is probed once; the other channel's request still names it until that channel resolves again (owner log 2026-11-02: 190 files stored twice, N10).
+        state.setdefault("stored", set()).update(item[0] for _key, item, _took in finished if item[1])
+        waiting = {key: len(request.get("paths", [])) for key, request in state["requests"].items()}
+    for result_key, item, took in finished:
+        norm_path, duration, dimensions = item
+        _patch_probed_gain("channel", result_key[0], result_key[2], norm_path,
+                           duration=duration,
+                           dims=dimensions)
+        log.info("[SCHEDULER] ch%s %s: background probe stored %s (%.0fs long) in %.2fs; %d pending file(s) of this block still waiting.",
+                 result_key[0], result_key[2], os.path.basename(norm_path), duration, took, max(0, waiting.get(result_key, 1) - 1))
+    if finished:
+        try:
+            db.save_settings_async()
+        except Exception as exc:
+            log.warning("[SCHEDULER] could not persist background duration probes: %s", exc)
+    return len(finished)
+
+
+def _pending_store_worker():
+    """PendingStore thread: stores the pending probe's finished lengths off the screen thread, woken by each finished probe and once a second for the blocks whose batch falls due."""
+    state = _pending_probe_state
+    while not _app_shutting_down.is_set():
+        state["store_wake"].wait(1.0)
+        state["store_wake"].clear()
+        try:
+            _store_pending_probe_results()
+        except Exception as e:
+            log.warning("[SCHEDULER] storing background duration probes failed (tried again next pass): %s", e)
+
+
 def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tracks):
-    """Hands a channel's pending files to the one-at-a-time background probe and stores every result that has finished; it never waits for a probe."""
+    """Hands a channel's pending files to the one-at-a-time background probe and wakes the PendingStore thread for the results that have finished; it never waits for a probe and never stores anything itself."""
     if db is None or _channel_is_server_streamed(ch_key):
         return
     state = _pending_probe_state
@@ -9741,12 +10212,15 @@ def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tra
                 request["seen"] = time.monotonic()
         else:
             state["requests"].pop(key, None)
-        finished = state["results"]
-        state["results"] = []
-        state["awaiting_store"].difference_update(item[0] for _key, item, _took in finished)
-        waiting = len(norm_paths)
         state["threads"] = [t for t in state["threads"] if t.is_alive()]
         missing_workers = (max(1, _PENDING_SCHEDULE_PROBE_PARALLEL) - len(state["threads"])) if norm_paths else 0
+        _store_thread = state.get("store_thread")
+        start_store = (_store_thread is None or not _store_thread.is_alive()) and bool(norm_paths or state["results"])
+        if start_store:
+            state["store_thread"] = threading.Thread(target=_pending_store_worker, name="PendingStore", daemon=True)
+            _store_thread = state["store_thread"]
+    if start_store:
+        _store_thread.start()
     if missing_workers > 0:
         initialize_vlc_on_demand()
         for _ in range(missing_workers):
@@ -9756,18 +10230,8 @@ def _priority_probe_pending_schedule(ch_key, container_key, sub_key, pending_tra
                 state["threads"].append(worker)
     if norm_paths:
         state["wake"].set()
-    for result_key, item, took in finished:
-        norm_path, duration, dimensions = item
-        _patch_probed_gain("channel", result_key[0], result_key[2], norm_path,
-                           duration=duration,
-                           dims=dimensions)
-        log.info("[SCHEDULER] ch%s %s: background probe stored %s (%.0fs long) in %.2fs; %d pending file(s) of this block still waiting.",
-                 result_key[0], result_key[2], os.path.basename(norm_path), duration, took, max(0, waiting - 1))
-    if finished:
-        try:
-            db.save_settings_async()
-        except Exception as exc:
-            log.warning("[SCHEDULER] could not persist background duration probes: %s", exc)
+    if state["results"]:
+        state["store_wake"].set()
 
 
 # WARNING: the fallback numbers below must match SHOW_SMOOTH_TOLERANCE_DB in performance_governor.py; they are used only when that module fails to import.
@@ -10441,36 +10905,6 @@ def _mark_confirmed_no_audio(norm_path, reason):
           f"'{os.path.basename(norm_path)}' -- {reason}")
 
 
-def _save_schedule_lengths_into_library():
-    """Copies the lengths held only in channel schedule entries into the library, for any file it does not already have one for; returns how many lengths were saved."""
-    if db is None:
-        return 0
-    channels = getattr(db, "channels_db", None)
-    if not isinstance(channels, dict):
-        return 0
-    saved = 0
-    for _ch_id, ch_info in list(channels.items()):
-        if not isinstance(ch_info, dict):
-            continue
-        schedules = ch_info.get("schedules", {})
-        if not isinstance(schedules, dict):
-            continue
-        for _block_name, entries in list(schedules.items()):
-            if not isinstance(entries, list):
-                continue
-            for entry in entries:
-                if not isinstance(entry, dict) or not entry.get("path"):
-                    continue
-                dur = entry.get("duration")
-                if not (isinstance(dur, (int, float)) and not isinstance(dur, bool) and dur > 0):
-                    continue
-                norm = os.path.normpath(str(entry["path"]))
-                _hub = media.get_duration_hub()
-                if _hub is not None and _hub.read(norm)[1] != media.DURATION_MEASURED and _hub_note_measured_duration(norm, dur):
-                    saved += 1
-    return saved
-
-
 def _register_probe_batch(batch_id, ch_key, container_key, sub_key, remaining_paths):
     """Records a batch probe pass so it can be resumed if the app goes down mid-pass."""
     if db is None:
@@ -10761,98 +11195,16 @@ def _fe_remove_selected_from_queue():
         ).start()
 
 
-def _fe_managed_delete_dir(context):
-    """Returns the one folder, if any, where the explorer's footer button deletes from disk: the console's cores folder or its system/BIOS folder."""
-    # WARNING: everywhere else that button only deselects and must never delete.
-    mode = context.get("mode", "")
-    if mode == "libretro_core":
-        return context.get("emu_folder", "")
-    if mode == "add_bios":
-        return context.get("bios_dir", "")
-    return ""
-
-
-def _fe_in_managed_delete_dir(context):
-    managed_dir = _fe_managed_delete_dir(context)
-    cwd = app_state.get("file_explorer_cwd")
-    return bool(managed_dir) and bool(cwd) and os.path.normpath(cwd) == os.path.normpath(managed_dir)
-
-
-def _fe_apply_bios_selection(ck, bios_dir, checked):
-    """Copies queued BIOS files from outside the console's BIOS folder into it, then sets the active BIOS: the file picked inside the folder, else the saved one, else the best one there."""
-    if not (bios_dir and ck and checked):
+def _fe_apply_bios_selection(ck, checked):
+    """Remembers the picked BIOS file where it sits as the console's active BIOS; nothing is copied."""
+    if not (ck and checked):
         return
-    import shutil as _shutil
-    os.makedirs(bios_dir, exist_ok=True)
-    _bios_norm = os.path.normpath(bios_dir)
-    copied, failed = 0, 0
-    in_folder_pick = None
-    for src in checked:
-        if os.path.normpath(os.path.dirname(src)) == _bios_norm:
-            in_folder_pick = os.path.basename(src)
-            continue
-        dest = os.path.join(bios_dir, os.path.basename(src))
-        try:
-            _shutil.copy2(src, dest)
-            copied += 1
-        except Exception as _be:
-            failed += 1
-            _log_warn_throttled("rtv_L6402", f"[GAMES] Could not copy BIOS file {src}: {_be}")
-    if copied or failed:
-        print(f"[GAMES] Add Bios: copied {copied} file(s) into {bios_dir} for {ck}"
-              + (f" ({failed} failed)" if failed else ""))
-    _active_map = db.config.setdefault("active_bios", {})
-    _best_in_folder = _fe_resolve_active_bios_name(ck, bios_dir)
-    if in_folder_pick:
-        _active_map[ck] = in_folder_pick
-    elif _best_in_folder:
-        _active_map[ck] = _best_in_folder
+    picked = os.path.abspath(checked[0])
+    db.config.setdefault("active_bios", {})[ck] = picked
     db.save_settings_async()
-    print(f"[GAMES] Active BIOS for {ck} is: {_active_map.get(ck, '(none)')}")
+    print(f"[GAMES] Active BIOS for {ck} is: {picked}")
     if game_deck is not None:
         game_deck.refresh_from_config(db.config)
-
-
-def _fe_in_bios_dir(context):
-    """Whether the explorer is a BIOS browser currently showing that console's own BIOS folder."""
-    return context.get("mode", "") == "add_bios" and _fe_in_managed_delete_dir(context)
-
-
-def _fe_add_button_label(context):
-    """The explorer footer button's text: ADD TO BIOS in a BIOS browser outside the BIOS folder, otherwise ADD SELECTED."""
-    if context.get("mode", "") == "add_bios" and not _fe_in_bios_dir(context):
-        return "ADD TO BIOS"
-    return "ADD SELECTED"
-
-
-def _fe_remove_button_label(context):
-    """The explorer footer button's text: DELETE SELECTED where it deletes files from disk, otherwise REMOVE SELECTED."""
-    return "DELETE SELECTED" if _fe_in_managed_delete_dir(context) else "REMOVE SELECTED"
-
-
-def _fe_delete_selected_files():
-    """Deletes the selected files from disk in a managed-folder browser."""
-    items   = app_state.get("file_explorer_items", [])
-    sel     = app_state.get("file_explorer_selection", set())
-    checked = app_state.get("file_explorer_checked", [])
-    deleted = set()
-    for idx in sorted(sel):
-        if not (0 <= idx < len(items)):
-            continue
-        item = items[idx]
-        if item["type"] != "file":
-            continue
-        p = item["path"]
-        try:
-            os.remove(p)
-            deleted.add(os.path.normpath(p))
-            
-        except Exception as e:
-            _log_warn_throttled("rtv_L5864", f"[FILE EXPLORER] Could not delete {p}: {e}")
-    if deleted:
-        app_state["file_explorer_checked"] = [f for f in checked if os.path.normpath(f) not in deleted]
-        media.listing_cache_invalidate()
-    _fe_navigate(app_state.get("file_explorer_cwd"))
 
 
 _BIOS_KNOWN_PRIORITY = [
@@ -10900,44 +11252,121 @@ def _bios_priority_key(fname):
     return (1, _bios_region_rank(fname), base)
 
 
-def _fe_resolve_active_core_name(console_key, emu_folder):
-    """Which core .dll in this console's folder is actually live right now."""
+def _read_emulator_config():
+    """Reads emulator_config.json, or {} when it is missing or unreadable."""
     import json as _json
     from game_deck import resolve_emulator_config_path
     try:
-        cfg_path = resolve_emulator_config_path()
-        with open(cfg_path, "r", encoding="utf-8") as fp:
-            cfg = _json.load(fp)
+        with open(resolve_emulator_config_path(), "r", encoding="utf-8") as fp:
+            return _json.load(fp)
+    except FileNotFoundError:
+        return {}
     except Exception as _swallowed_error:
-        _log_swallowed("_fe_resolve_active_core_name: cfg_path = resolve_emulator_config_path()", _swallowed_error)
-        cfg = {}
-    saved = cfg.get(console_key)
+        _log_swallowed("_read_emulator_config: open emulator_config.json", _swallowed_error)
+        return {}
+
+
+def _write_emulator_config(cfg):
+    """Writes emulator_config.json and has the game deck reload it."""
+    import json as _json
+    from game_deck import resolve_emulator_config_path
+    cfg_path = resolve_emulator_config_path()
     try:
-        dll_files = [f for f in os.listdir(emu_folder) if f.lower().endswith(".dll")]
-    except Exception as _swallowed_error:
-        _log_swallowed("_fe_resolve_active_core_name: dll_files = [f for f in os.listdir(emu_folder) if f.lower().endswit...", _swallowed_error)
-        dll_files = []
-    if saved:
-        for fname in dll_files:
-            if fname.lower() == saved.lower():
-                return fname
-    from game_deck import resolve_preferred_core_filename
-    return resolve_preferred_core_filename(console_key, dll_files)
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        with open(cfg_path, "w", encoding="utf-8") as fp:
+            _json.dump(cfg, fp, indent=2)
+    except Exception as e:
+        log.warning(f"[GAMES] Could not save {cfg_path}: {e}")
+        return False
+    if game_deck is not None and hasattr(game_deck, "reload_emulator_config"):
+        game_deck.reload_emulator_config()
+    return True
 
 
-def _fe_resolve_active_bios_name(console_key, bios_dir):
-    """Which BIOS file in this console's system folder is actually the active one right now."""
+def _fe_active_core_path(console_key):
+    """The core file this console actually plays with right now, wherever it sits, else None."""
+    from game_deck import resolve_active_core_path
+    return resolve_active_core_path(console_key, _read_emulator_config().get(console_key),
+                                    os.path.join(resolve_main_dir(), "cores"))
+
+
+def _fe_active_bios_path(console_key):
+    """The BIOS file this console actually boots with right now, wherever it sits, else None."""
+    from game_deck import resolve_active_bios_path
     saved = db.config.get("active_bios", {}).get(console_key, "") if db is not None else ""
+    return resolve_active_bios_path(console_key, saved, base_dir)
+
+
+def _old_tool_copies_on_disk(cores_root):
+    """Every core .dll in main/cores/<console> and every file in main/cores/<console>/system: the copies older versions made."""
+    found = []
     try:
-        files = sorted(f for f in os.listdir(bios_dir) if os.path.isfile(os.path.join(bios_dir, f)))
-    except Exception as _swallowed_error:
-        _log_swallowed("_fe_resolve_active_bios_name: files = sorted((f for f in os.listdir(bios_dir) if os.path.isfile(o...", _swallowed_error)
-        files = []
-    if saved:
-        for fname in files:
-            if fname.lower() == saved.lower():
-                return fname
-    return min(files, key=_bios_priority_key) if files else None
+        consoles = sorted(os.listdir(cores_root)) if os.path.isdir(cores_root) else []
+    except OSError as e:
+        log.warning(f"[GAMES] Could not list {cores_root}: {e}")
+        return found
+    for console in consoles:
+        folder = os.path.join(cores_root, console)
+        for sub, keep in ((folder, lambda f: f.lower().endswith(".dll")), (os.path.join(folder, "system"), lambda f: True)):
+            try:
+                names = sorted(os.listdir(sub)) if os.path.isdir(sub) else []
+            except OSError as e:
+                log.warning(f"[GAMES] Could not list {sub}: {e}")
+                continue
+            found.extend(os.path.abspath(os.path.join(sub, n)) for n in names if keep(n) and os.path.isfile(os.path.join(sub, n)))
+    return found
+
+
+def _remember_old_core_and_bios_copies():
+    """One time only: remembers, by full path, the cores and BIOS files earlier versions copied into main/cores, so they keep working now that nothing is copied, and lists them for Reset All Settings to delete."""
+    if db is None or db.config.get("remembered_tools_v1"):
+        return
+    if getattr(db, "config_was_missing", False):
+        # WARNING: a fresh start (first install or after Reset All Settings) has no old copies; files found in main/cores then were put there by hand and must be added again, never picked up here.
+        db.config["remembered_tools_v1"] = True
+        db.config["old_tool_copies"] = []
+        db.save_settings()
+        return
+    from game_deck import (CONSOLE_ORDER, BIOS_REQUIRED_CONSOLES, is_console_core_key,
+                           resolve_active_core_path, resolve_active_bios_path,
+                           resolve_preferred_core_filename, get_bios_dir_for_console)
+    cores_root = os.path.join(resolve_main_dir(), "cores")
+    db.config["old_tool_copies"] = _old_tool_copies_on_disk(cores_root)
+    cfg = _read_emulator_config()
+    cfg_changed = False
+    for console in CONSOLE_ORDER:
+        if not is_console_core_key(console):
+            continue
+        path = resolve_active_core_path(console, cfg.get(console), cores_root)
+        if path is None:
+            folder = os.path.join(cores_root, console)
+            try:
+                dlls = [f for f in os.listdir(folder) if f.lower().endswith(".dll")]
+            except OSError:
+                dlls = []
+            best = resolve_preferred_core_filename(console, dlls)
+            path = os.path.join(folder, best) if best else None
+        if path and cfg.get(console) != os.path.abspath(path):
+            cfg[console] = os.path.abspath(path)
+            cfg_changed = True
+            print(f"[GAMES] {console}: remembered core {cfg[console]}")
+    if cfg_changed:
+        _write_emulator_config(cfg)
+    active_bios = db.config.setdefault("active_bios", {})
+    for console in BIOS_REQUIRED_CONSOLES:
+        path = resolve_active_bios_path(console, active_bios.get(console), base_dir)
+        if path is None:
+            folder = get_bios_dir_for_console(base_dir, console)
+            try:
+                files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+            except (OSError, TypeError):
+                files = []
+            path = os.path.join(folder, min(files, key=_bios_priority_key)) if files else None
+        if path:
+            active_bios[console] = os.path.abspath(path)
+            print(f"[GAMES] {console}: remembered BIOS {active_bios[console]}")
+    db.config["remembered_tools_v1"] = True
+    db.save_settings()
 
 
 def _drop_media_from_pool(ch_key, sub_key, norm_p, reason, container_key=None):
@@ -11097,24 +11526,6 @@ def _dedupe_incoming_files(existing_entries, incoming_paths):
     return out
 
 
-def _fe_delete_old_managed_asset(old_path, managed_folder, new_path):
-    """Deletes the file a single-file asset (menu background, splash, libretro core) just replaced."""
-    if not old_path or not managed_folder:
-        return
-    try:
-        old_abs = os.path.abspath(old_path)
-        new_abs = os.path.abspath(new_path) if new_path else ""
-        if old_abs == new_abs:
-            return
-        if os.path.dirname(old_abs) != os.path.abspath(managed_folder):
-            return
-        if os.path.isfile(old_abs):
-            os.remove(old_abs)
-            print(f"[FILE EXPLORER] Removed previous asset: {os.path.basename(old_abs)}")
-    except Exception as e:
-        log.warning(f"[FILE EXPLORER] Could not remove previous asset {old_path}: {e}")
-
-
 # ============================================================================
 # SECTION: File explorer: close, bulk scan, events & rendering
 # ============================================================================
@@ -11164,6 +11575,7 @@ def _fe_close(commit):
                       + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
                 _note_scan_work_added()
                 if new_paths:
+                    _warm_new_file_lengths(new_paths)
                     threading.Thread(
                         target=_probe_and_patch_durations,
                         args=(ch_key, "schedules", block, list(new_paths)),
@@ -11184,6 +11596,7 @@ def _fe_close(commit):
                       + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
                 _note_scan_work_added()
                 if new_paths:
+                    _warm_new_file_lengths(new_paths)
                     threading.Thread(
                         target=_probe_and_patch_durations,
                         args=(ch_key, "holiday_schedules", hkey, list(new_paths)),
@@ -11230,13 +11643,13 @@ def _fe_close(commit):
                 results, unresponsive_roots = game_deck.bulk_scan_for_cores(picked)
                 if hasattr(game_deck, "reload_emulator_config"):
                     game_deck.reload_emulator_config()
-                total_new = sum(n for n, _p in results.values())
+                total_found = sum(n for n, _set in results.values())
                 if results:
                     per_console = ", ".join(
-                        f"{ck}: +{n}" + (f" ({p} already there)" if p else "")
-                        for ck, (n, p) in sorted(results.items())
+                        f"{ck}: {n}" + (" (now active)" if set_now else "")
+                        for ck, (n, set_now) in sorted(results.items())
                     )
-                    summary = (f"Scan For Cores: added {total_new} core(s) across "
+                    summary = (f"Scan For Cores: found {total_found} core(s) for "
                                f"{len(results)} console(s) ({per_console})")
                 else:
                     summary = "Scan For Cores: no matching cores found"
@@ -11303,104 +11716,46 @@ def _fe_close(commit):
         elif checked:
             if mode == "libretro_core":
                 ck      = context.get("console_key", "")
-                folder  = context.get("emu_folder", "")
                 chosen  = checked[0] if checked else ""
                 if chosen and ck:
-                    import json as _json, shutil as _shutil
-                    dest = os.path.join(folder, os.path.basename(chosen))
-                    try:
-                        if os.path.abspath(chosen) != os.path.abspath(dest):
-                            _shutil.copy2(chosen, dest)
-                            print(f"[GAMES] Copied core into {folder}")
-                    except Exception as _ce:
-                        log.warning(f"[GAMES] Could not copy core: {_ce}")
-                        dest = chosen
-                    from game_deck import resolve_emulator_config_path
-                    cfg_path = resolve_emulator_config_path()
-                    try:
-                        with open(cfg_path, "r", encoding="utf-8") as fp:
-                            cfg = _json.load(fp)
-                    except Exception as _swallowed_error:
-                        _log_swallowed("_fe_close: with open(cfg_path, 'r', encoding='utf-8') as fp:", _swallowed_error)
-                        cfg = {}
-                    cfg[ck] = os.path.basename(dest)
-                    with open(cfg_path, "w", encoding="utf-8") as fp:
-                        _json.dump(cfg, fp, indent=2)
-                    print(f"[GAMES] Libretro core for {ck} set to: {os.path.basename(dest)}")
-                    if game_deck is not None and hasattr(game_deck, "reload_emulator_config"):
-                        game_deck.reload_emulator_config()
+                    cfg = _read_emulator_config()
+                    cfg[ck] = os.path.abspath(chosen)
+                    if _write_emulator_config(cfg):
+                        print(f"[GAMES] Libretro core for {ck} set to: {cfg[ck]}")
             elif mode == "add_bios":
-                _fe_apply_bios_selection(context.get("console_key", ""), context.get("bios_dir", ""), checked)
+                _fe_apply_bios_selection(context.get("console_key", ""), checked)
             elif mode == "console_splash":
-                folder = context.get("splash_folder", "")
                 ck     = context.get("console_key", "DVD")
                 chosen = checked[0] if checked else ""
                 if chosen:
-                    import shutil as _shutil
-                    dest = chosen
-                    if folder:
-                        dest = os.path.join(folder, os.path.basename(chosen))
-                        try:
-                            if os.path.abspath(chosen) != os.path.abspath(dest):
-                                _shutil.copy2(chosen, dest)
-                                print(f"[GAMES] Copied splash screen into {folder}")
-                        except Exception as _se:
-                            log.warning(f"[GAMES] Could not copy splash screen: {_se}")
-                            dest = chosen
+                    dest = os.path.abspath(chosen)
                     if ck == "DVD":
-                        _old_splash = db.config.get("dvd_splash_path", "")
                         db.config["dvd_splash_path"] = dest
                     else:
-                        _old_splash = db.config.get("console_splash_path", {}).get(ck, "")
                         db.config.setdefault("console_splash_path", {})[ck] = dest
                     db.save_settings_async()
-                    print(f"[GAMES] {ck} splash screen set to: {os.path.basename(dest)}")
-                    # WARNING: <CONSOLE>SplashScreen.png is the splash used when nothing is picked, so replacing a pick never deletes it.
-                    if folder and os.path.basename(str(_old_splash)).lower() != (ck + "SplashScreen.png").lower():
-                        _fe_delete_old_managed_asset(_old_splash, folder, dest)
+                    print(f"[GAMES] {ck} splash screen set to: {dest}")
                     if game_deck is not None:
                         game_deck.refresh_from_config(db.config)
             elif mode == "menu_bg":
                 chosen = checked[0] if checked else ""
                 if chosen:
-                    import shutil as _shutil
-                    dest = os.path.join(MENU_BG_BASE_DIR, os.path.basename(chosen))
-                    _old_bg = db.config.get("menu_bg_path", "")
-                    try:
-                        if os.path.abspath(chosen) != os.path.abspath(dest):
-                            _shutil.copy2(chosen, dest)
-                            print(f"[GAMES] Copied menu background into {MENU_BG_BASE_DIR}")
-                    except Exception as _me:
-                        log.warning(f"[GAMES] Could not copy menu background: {_me}")
-                        dest = chosen
+                    dest = os.path.abspath(chosen)
                     db.config["menu_bg_path"] = dest
                     db.save_settings_async()
-                    print(f"[GAMES] Menu background set to: {os.path.basename(dest)}")
-                    _fe_delete_old_managed_asset(_old_bg, MENU_BG_BASE_DIR, dest)
+                    print(f"[GAMES] Menu background set to: {dest}")
                     if game_deck is not None:
                         game_deck.refresh_from_config(db.config)
             elif mode == "watermark_select":
                 chosen = checked[0] if checked else ""
                 if chosen:
-                    import shutil as _shutil
                     _wm_channel = str(context.get("channel", app_state.get("current_channel", "05"))).zfill(2)
-                    _wm_folder = next((os.path.join(WATERMARK_BASE_DIR, entry)
-                                       for entry in os.listdir(WATERMARK_BASE_DIR)
-                                       if entry.lower() == f"channel {_wm_channel}".lower()),
-                                      os.path.join(WATERMARK_BASE_DIR, f"Channel {_wm_channel}"))
-                    os.makedirs(_wm_folder, exist_ok=True)
-                    dest = os.path.join(_wm_folder, "watermark.png")
-                    try:
-                        if os.path.abspath(chosen) != os.path.abspath(dest):
-                            _shutil.copy2(chosen, dest)
-                            print(f"[WATERMARK] Replaced watermark in {_wm_folder}")
-                    except Exception as _we:
-                        log.warning(f"[WATERMARK] Could not copy watermark image: {_we}")
-                        dest = chosen
+                    dest = os.path.abspath(chosen)
                     _wm_channel_info = db.channels_db.setdefault(_wm_channel, {})
                     _wm_channel_info["watermark_enabled"] = True
+                    _wm_channel_info["watermark_path"] = dest
                     db.save_settings_async()
-                    print(f"[WATERMARK] Watermark image set to: {os.path.basename(dest)}")
+                    print(f"[WATERMARK] Channel {_wm_channel} watermark image set to: {dest}")
                     _watermark_cache["path"] = None
                     _watermark_cache["raw"] = None
                     _watermark_cache["surface"] = None
@@ -11541,19 +11896,17 @@ def _fe_handle_event(event):
         app_state["last_input_time"] = pygame.time.get_ticks()
 
     if app_state.get("file_explorer_bulkscan_pending", False):
-        _bs_key_action = menu_nav.key_to_action(event.key, parent=True) if event.type == pygame.KEYDOWN else None
+        _bs_key_action = menu_nav.key_to_action(event.key) if event.type == pygame.KEYDOWN else None
         if _bs_key_action == menu_nav.BACK or (event.type == pygame.MOUSEBUTTONDOWN and getattr(event, "button", 1) == 3):
             _fe_cancel_bulkscan()
         return
 
-    _fe_key_action = menu_nav.key_to_action(event.key, parent=True) if event.type == pygame.KEYDOWN else None
+    # WARNING: the file explorer is mouse driven; Escape is its only key, and going up a folder is the toolbar's up button.
+    _fe_key_action = menu_nav.key_to_action(event.key) if event.type == pygame.KEYDOWN else None
     if _fe_key_action == menu_nav.BACK:
         if app_state.get("file_explorer_done_requested", False):
             return
         _fe_close(False)
-        return
-    if _fe_key_action == menu_nav.PARENT:
-        _fe_go_up()
         return
 
     fe_rect = app_state.get("file_explorer_rect")
@@ -11585,6 +11938,10 @@ def _fe_handle_event(event):
     sel    = app_state.get("file_explorer_selection", set())
 
     visible_rows = menu_nav.explorer_visible_rows(items_h, _FE_ROW_H)
+
+    if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEWHEEL) and app_state.get("file_explorer_expand_pending", 0) > 0:
+        # WARNING: nothing in the explorer takes a click while the add bar is up; Done is usable only once the found files are counted and shown (owner 2026-11-02, N3).
+        return
 
     if event.type == pygame.MOUSEBUTTONDOWN:
         mx, my = _real_to_virtual_pos(event.pos)
@@ -11651,8 +12008,6 @@ def _fe_handle_event(event):
                         _ctx.pop("picked_rom_folder", None)
                         _ctx.pop("picked_rom_count", None)
                         app_state["file_explorer_checked"] = []
-                    elif _fe_in_managed_delete_dir(_ctx):
-                        _fe_delete_selected_files()
                     else:
                         _fe_remove_selected_from_queue()
                 elif key == "add_sel":
@@ -11686,6 +12041,9 @@ def _fe_handle_event(event):
             shift, ctrl = menu_nav.explorer_modifiers(pygame.key.get_mods())
             app_state["file_explorer_selection"], app_state["file_explorer_sel_anchor"] = menu_nav.explorer_select(
                 idx, len(items), sel, app_state.get("file_explorer_sel_anchor", 0), shift, ctrl)
+            if not (0 <= idx < len(items)) and not (shift or ctrl) and items:
+                # WARNING: a press on the empty space under the last file starts a drag from the last file, the row nearest the press; keeping the old anchor made a drag select from the top of the list (owner 2026-11-02, N9).
+                app_state["file_explorer_sel_anchor"] = len(items) - 1
             if 0 <= idx < len(items):
                 now = pygame.time.get_ticks()
                 if menu_nav.explorer_double_click(now, app_state.get("file_explorer_last_click_ms", 0),
@@ -11981,20 +12339,12 @@ def _fe_render(screen, active_theme, fe_rect):
     _locked_path = _fe_locked_playing_path(_fe_ctx)
 
     _active_managed_path = None
-    if _fe_ctx.get("mode") == "libretro_core":
+    if _fe_ctx.get("mode") in ("libretro_core", "add_bios"):
         _active_console = _fe_ctx.get("console_key", "")
-        _active_folder  = _fe_ctx.get("emu_folder", "")
-        if _active_console and _active_folder and cwd and os.path.normpath(cwd) == os.path.normpath(_active_folder):
-            _active_name = _fe_resolve_active_core_name(_active_console, _active_folder)
-            if _active_name:
-                _active_managed_path = os.path.normpath(os.path.join(_active_folder, _active_name))
-    elif _fe_ctx.get("mode") == "add_bios":
-        _active_console = _fe_ctx.get("console_key", "")
-        _active_folder  = _fe_ctx.get("bios_dir", "")
-        if _active_console and _active_folder and cwd and os.path.normpath(cwd) == os.path.normpath(_active_folder):
-            _active_name = _fe_resolve_active_bios_name(_active_console, _active_folder)
-            if _active_name:
-                _active_managed_path = os.path.normpath(os.path.join(_active_folder, _active_name))
+        _active_path = (_fe_active_core_path(_active_console) if _fe_ctx.get("mode") == "libretro_core"
+                        else _fe_active_bios_path(_active_console)) if _active_console else None
+        if _active_path and cwd and os.path.normpath(cwd) == os.path.normpath(os.path.dirname(_active_path)):
+            _active_managed_path = os.path.normpath(_active_path)
 
     _checked_dirs = set()
     if checked:
@@ -12100,16 +12450,8 @@ def _fe_render(screen, active_theme, fe_rect):
         else:
             cnt_txt = "Select a folder, then click ADD SELECTED"
     elif _fe_ctx_mode == "add_bios":
-        _bios_dir_n = os.path.normpath(_fe_ctx.get("bios_dir", ""))
-        _bios_use = [os.path.basename(f) for f in checked if os.path.normpath(os.path.dirname(f)) == _bios_dir_n]
-        _bios_copy_n = n_chk - len(_bios_use)
-        if _fe_in_bios_dir(_fe_ctx):
-            cnt_txt = (f"Use: {_bios_use[0]} — click DONE" if _bios_use
-                       else f"{len(sel)} currently selected   |   click ADD SELECTED to choose the BIOS to use")
-        elif _bios_copy_n > 0:
-            cnt_txt = f"{_bios_copy_n} file(s) will be copied to the BIOS folder — click DONE"
-        else:
-            cnt_txt = f"{len(sel)} currently selected   |   click ADD TO BIOS to copy into the BIOS folder"
+        cnt_txt = (f"Use: {os.path.basename(checked[0])} — click DONE" if checked
+                   else f"{len(sel)} currently selected   |   click ADD SELECTED to choose the BIOS to use")
     else:
         _fe_scheduling_mode = _fe_ctx_mode in ("schedule", "commercial", "holiday", "add_roms", "ch03_menu_music")
         _cnt_word = "scheduled" if _fe_scheduling_mode else "queued"
@@ -12119,9 +12461,10 @@ def _fe_render(screen, active_theme, fe_rect):
     screen.blit(cnt_lbl, (fx + (fw - cnt_lbl.get_width()) // 2, footer_y + 18))
 
     f_btn   = _cached_sys_font("Courier New", 19, bold=True)
-    labels  = {"cancel": "CANCEL", "remove_sel": _fe_remove_button_label(_fe_ctx), "add_sel": _fe_add_button_label(_fe_ctx), "done": "DONE"}
+    labels  = {"cancel": "CANCEL", "remove_sel": "REMOVE SELECTED", "add_sel": "ADD SELECTED", "done": "DONE"}
+    _fe_walk_busy = app_state.get("file_explorer_expand_pending", 0) > 0
     for rect, key in _fe_get_btn_rects(fx, fy, fw, fh):
-        is_hov = rect.collidepoint(mx, my)
+        is_hov = rect.collidepoint(mx, my) and not _fe_walk_busy
         if key == "cancel":
             bc = COLOR_FE_CANCEL_HOVER if is_hov else COLOR_FE_CANCEL
         elif key == "remove_sel":
@@ -12141,10 +12484,10 @@ def _fe_render(screen, active_theme, fe_rect):
     scan_pending    = app_state.get("file_explorer_scan_pending", False)
     scan_started_ms = app_state.get("file_explorer_scan_started_ms", 0)
     _done_waiting = app_state.get("file_explorer_done_requested", False)
-    if pending > 0 and started_ms and (
-            _done_waiting or (pygame.time.get_ticks() - started_ms) >= 1000):
+    if pending > 0:
+        _walk_found = app_state.get("file_explorer_expand_progress", (0, 0))[0]
         _fe_draw_busy_overlay(screen, fx, fy, fw, fh, UI_C, PANEL_C, BG_C,
-                               "FINISHING FOLDER SCAN..." if _done_waiting else "PROCESSING FILES...")
+                               "ADDING FILES... %d FOUND" % _walk_found)
     elif scan_pending and scan_started_ms and (
             _done_waiting or (pygame.time.get_ticks() - scan_started_ms) >= (
                 1500 if app_state.get("file_explorer_scan_revalidating", False) else 150)):
@@ -12454,7 +12797,7 @@ def _gov_audio_track_value(name, fallback):
 
 
 def _audio_header_streams(filepath):
-    """The file's audio streams in order as dicts (language code, description) read from ffmpeg's stream listing, cached per file; [] when it cannot be read. Never call on the UI thread."""
+    """The audio streams of the file on air in order as dicts (language code, description) read from ffmpeg's stream listing as priority work, cached per file; [] when it cannot be read. Never call on the UI thread."""
     if not filepath:
         return []
     try:
@@ -12468,7 +12811,12 @@ def _audio_header_streams(filepath):
     if hit is not None:
         return hit
     try:
-        text, timed_out = media._dialogue_header_text(filepath)
+        # WARNING: this lists the tracks of the file on air (the English-first pick and the Audio Track menu); as background work it waited up to 60 s at the gate while the wrong language played (L11), so it runs as priority work.
+        if performance_governor is not None:
+            with performance_governor.priority_scope():
+                text, timed_out = media._dialogue_header_text(filepath)
+        else:
+            text, timed_out = media._dialogue_header_text(filepath)
     except Exception as e:
         log.warning("[AUDIO TRACK] reading the stream list of %s failed: %s", os.path.basename(filepath), e)
         return []
@@ -12798,6 +13146,9 @@ def _apply_live_stereo_mode(reason="toggle"):
             cur = None
         if reason != "toggle" and cur == want:
             continue
+        # WARNING: VLC answers 0 (no mode set) for every new file, and its own default for 0 is the file's normal stereo; switching it to Stereo then restarts the sound output, which VLC fills with half a second of silence (N17, owner logs 2026-11-03: every "playing silence" followed this reassert). Only a real difference is switched.
+        if reason != "toggle" and cur == 0 and want == _VLC_CHANNEL_STEREO:
+            continue
         # WARNING: VLC has no audio output to switch until a file plays (audio_set_channel answers -1), so the reassert waits for playback instead of retrying every 2 s.
         if reason != "toggle" and not player.is_playing():
             continue
@@ -13068,7 +13419,12 @@ def initialize_vlc_on_demand():
                     self.ready_flag = True
 
                 def _vid_lock_callback(self, opaque, planes):
+                    _lock_t0 = time.perf_counter()
                     self._frame_lock.acquire()
+                    _lock_wait = time.perf_counter() - _lock_t0
+                    # WARNING: only waits over 1 ms are counted; counting every picture would take a lock on VLC's picture thread for each frame.
+                    if _lock_wait > 0.001 and health_monitor is not None:
+                        health_monitor.note("VLC picture hand-off waits over 1 ms", _lock_wait)
                     planes[0] = self.pixel_pointer
                     return None
 
@@ -13286,9 +13642,22 @@ def initialize_vlc_on_demand():
                         log.warning("refresh_screen_mode_geometry failed: %s", e)
 
                 def play_file_segmented(self, filepath, seek_seconds, gain=1.0,
-                                        defer_unmute=False, on_confirmed=None):
-                    """Opens the file in this engine; on_confirmed, if given, is called once with (success, attempt_id, deferred) when VLC has accepted or failed the open."""
+                                        defer_unmute=False, on_confirmed=None, follow_clock=False):
+                    """Opens the file in this engine; on_confirmed, if given, is called once with (success, attempt_id, deferred) when VLC has accepted or failed the open; with follow_clock the time spent before the open is added to seek_seconds."""
                     _attempt_id = next(_playback_attempt_ids)
+                    # WARNING: a load for a channel the viewer has left must not open its file or report back (owner log 2026-11-04 01:20:58: a ch10 load opened Snowpiercer and switched the app back to ch10 after the viewer had gone to ch11). Checked before anything here touches the player or its attempt number, so the show on air is left alone.
+                    _act_token = _current_activation_token()
+
+                    def _attempt_stale():
+                        return _activation_token_stale(_act_token)
+
+                    if _attempt_stale():
+                        log.info("[ATTEMPT %s] not started: the channel on screen is no longer the one this load was for: %s",
+                                 _attempt_id, os.path.basename(str(filepath)))
+                        return _PLAYBACK_STALE
+                    # WARNING: taken first, before the stop, the picture-box wait and the size probe, so _seek_at_open counts every second the open waited.
+                    _requested_seek = seek_seconds
+                    _requested_at = time.monotonic()
                     self._current_attempt_id = _attempt_id
                     self._current_attempt_file = filepath
                     # WARNING: set until this attempt has handed its file to VLC (or given up); the mid-stream check reads it, and without it a tune whose picture box takes more than 2 s opens the same file a second time.
@@ -13300,6 +13669,18 @@ def initialize_vlc_on_demand():
                             self._open_inflight = None
 
                     def _confirm(success, deferred):
+                        if _attempt_stale():
+                            log.info("[ATTEMPT %s] result not used: the channel on screen is no longer the one this load was for: %s",
+                                     _attempt_id, os.path.basename(str(filepath)))
+                            # WARNING: a tune from the guide keeps the preview's file playing and takes this attempt as its own; that video is wanted on the channel now on screen and must not be stopped.
+                            _taken_over = (app_state.get("is_playing_video", False)
+                                           and app_state.get("_live_playback_channel") == str(app_state.get("current_channel", "")).zfill(2))
+                            if success is True and getattr(self, "_current_attempt_id", None) == _attempt_id and not _taken_over:
+                                try:
+                                    self.stop(block=False)
+                                except Exception as _stale_stop_err:
+                                    log.warning("[ATTEMPT %s] stopping the out-of-date open failed: %s", _attempt_id, _stale_stop_err)
+                            return
                         if on_confirmed is not None:
                             try:
                                 on_confirmed(success, _attempt_id, deferred)
@@ -13449,12 +13830,37 @@ def initialize_vlc_on_demand():
                         finally:
                             _open_handed_over()
 
+                    def _seek_at_open():
+                        """The start position for the open now happening: what was asked, plus the time the open waited when the file follows the station clock (R18)."""
+                        if not follow_clock or is_dvd_iso:
+                            return _requested_seek
+                        _waited = time.monotonic() - _requested_at
+                        if _waited < OPEN_WAIT_JOIN_CLOCK_MIN_S:
+                            return _requested_seek
+                        _joined = (_requested_seek or 0.0) + _waited
+                        log.info("[ATTEMPT %s][JOIN CLOCK] the open waited %.2fs after its start was worked out; opening at %.2fs instead of %.2fs: %s",
+                                 _attempt_id, _waited, _joined, _requested_seek or 0.0, os.path.basename(str(filepath)))
+                        self._pending_seek_ms = int(_joined * 1000)
+                        self._pending_seek_at = time.monotonic()
+                        return _joined
+
                     def _open_and_play_steps(verify_off_thread=False):
+                        if _attempt_stale():
+                            log.info("[ATTEMPT %s] dropped before the open: the channel on screen is no longer the one this load was for: %s",
+                                     _attempt_id, os.path.basename(str(filepath)))
+                            return _PLAYBACK_STALE
+                        seek_seconds = _seek_at_open()
                         try:
                             media = self.instance.media_new(media_source)
-                            if self.engine_label == "dvd" and not is_dvd_iso and DVD_FILE_HW_DECODE:
+                            _cpu_for_picture = _vlc_does_picture_settings()
+                            self._decoding_on_gpu = False
+                            if _cpu_for_picture:
+                                log.info("[PICTURE ADJUST] no graphics-card drawing step: the CPU decodes %s so VLC can draw the Video tab's picture settings",
+                                         os.path.basename(str(filepath)))
+                            elif self.engine_label == "dvd" and not is_dvd_iso and DVD_FILE_HW_DECODE:
                                 try:
                                     media.add_option(":avcodec-hw=any")
+                                    self._decoding_on_gpu = True
                                     log.info("[DVD DECODE] hardware decode requested for %s",
                                              os.path.basename(str(filepath)))
                                 except Exception as _hw_e:
@@ -13465,9 +13871,18 @@ def initialize_vlc_on_demand():
                                 try:
                                     # WARNING: VLC switches hardware decoding off for every player that hands frames to the app (avcodec-hw=none); only this per-file option turns it back on, and VLC decodes the file on the CPU by itself when the card cannot open it.
                                     media.add_option(":avcodec-hw=any")
+                                    self._decoding_on_gpu = True
                                 except Exception as _hw_e:
                                     log.warning("[VIDEO DECODE] could not ask VLC to decode %s on the graphics card "
                                                 "(the CPU decodes it): %s", os.path.basename(str(filepath)), _hw_e)
+                            _picture_options, _picture_adjust_on = _picture_adjust_media_options()
+                            for _picture_option in _picture_options:
+                                try:
+                                    media.add_option(_picture_option)
+                                except Exception as _pic_e:
+                                    log.warning("[PICTURE ADJUST] VLC would not take %s for %s (the picture plays unadjusted): %s",
+                                                _picture_option, os.path.basename(str(filepath)), _pic_e)
+                            self._adjust_in_chain = _picture_adjust_on
                             _opened_at_position = False
                             if (SEEK_AT_OPEN and seek_seconds and seek_seconds > 0
                                     and not is_dvd_iso):
@@ -13637,7 +14052,7 @@ def initialize_vlc_on_demand():
                                                 "retry %d of %d in %.1fs: file=%s",
                                                 _attempt_id, _tries, len(_OPEN_RETRY_DELAYS_S), _delay, filepath)
                                     time.sleep(_delay)
-                                    if getattr(self, "_current_attempt_id", None) != _attempt_id:
+                                    if getattr(self, "_current_attempt_id", None) != _attempt_id or _attempt_stale():
                                         return False
                                     if not _reopen_same_media():
                                         break
@@ -13700,7 +14115,12 @@ def initialize_vlc_on_demand():
                               _attempt_id, filepath, _PLAY_SEGMENTED_STOP_FAST_WAIT_S * 1000)
 
                     def _open_after_stop_settles(_done=_pending_stop_done, _fp=filepath, _aid=_attempt_id):
-                        if _done.wait(timeout=WEDGED_STOP_TIMEOUT_S) and not self._wedged:
+                        _stop_settled = _done.wait(timeout=WEDGED_STOP_TIMEOUT_S)
+                        if _attempt_stale():
+                            log.info("[ATTEMPT %s][STOP RACE GUARD] deferred open dropped: the channel on screen is no longer the one this load was for: %s", _aid, _fp)
+                            _open_handed_over()
+                            return
+                        if _stop_settled and not self._wedged:
                             _deferred_ok = _open_and_play()
                             log.info("[ATTEMPT %s][STOP RACE GUARD] deferred open %s: file=%s",
                                       _aid, "OPENED" if _deferred_ok else "FAILED", _fp)
@@ -14724,6 +15144,93 @@ def _toggle_holiday_force(holiday_key, channel_key):
     return True
 
 
+# WARNING: the fallback numbers below must match CHANNEL_READY_INTERVAL_SECONDS, CHANNEL_READY_CHANNEL_PAUSE_SECONDS, CHANNEL_READY_REFRESH_BATCH, CHANNEL_READY_WARM_BATCH, CHANNEL_READY_LOG_SECONDS in performance_governor.py; they are used only when that module fails to import.
+CHANNEL_READY_INTERVAL_SECONDS = performance_governor.CHANNEL_READY_INTERVAL_SECONDS if performance_governor is not None else 2.0
+CHANNEL_READY_CHANNEL_PAUSE_SECONDS = performance_governor.CHANNEL_READY_CHANNEL_PAUSE_SECONDS if performance_governor is not None else 0.05
+CHANNEL_READY_REFRESH_BATCH = performance_governor.CHANNEL_READY_REFRESH_BATCH if performance_governor is not None else 400
+CHANNEL_READY_WARM_BATCH = performance_governor.CHANNEL_READY_WARM_BATCH if performance_governor is not None else 400
+CHANNEL_READY_LOG_SECONDS = performance_governor.CHANNEL_READY_LOG_SECONDS if performance_governor is not None else 60.0
+_channel_ready_stats = {"builds": 0, "build_s": 0.0, "paths": 0, "rechecks": 0, "warmed": 0, "last_log": 0.0}
+
+
+def _channel_ready_order():
+    """The active TV channels, the one on air first, then the one on screen, the one highlighted in the guide and the one open in the file explorer, then the rest in number order."""
+    if db is None:
+        return []
+    first = [str(app_state.get("_live_playback_channel", "") or ""), str(app_state.get("current_channel", "") or ""),
+             str(app_state.get("highlighted_guide_channel", "") or ""),
+             str((app_state.get("file_explorer_context") or {}).get("ch", "") or "")]
+    order = []
+    for key in [k.zfill(2) for k in first if k] + ["%02d" % i for i in range(5, 45)]:
+        info = db.channels_db.get(key)
+        if key in order or not info or not info.get("active", True) or info.get("is_visualizer", False):
+            continue
+        order.append(key)
+    return order
+
+
+def _channel_ready_lists(ch_info):
+    """The schedule lists a channel reads right now: its live block and its commercials."""
+    schedules = ch_info.get("schedules", {}) or {}
+    out = []
+    for name in (_compute_live_block_name(ch_info), "Commercials"):
+        items = schedules.get(name)
+        if items:
+            out.append(items)
+    return out
+
+
+def _channel_ready_pass():
+    """One pass of the channel-ready thread: re-checks what the screen thread used past its time, then makes each active channel's track build ready so the screen thread only compares the clock with it."""
+    stats = _channel_ready_stats
+    stats["paths"] += media.run_queued_path_refreshes(limit=CHANNEL_READY_REFRESH_BATCH)
+    hub = media.get_duration_hub()
+    if hub is not None and hasattr(hub, "run_queued_rechecks"):
+        stats["rechecks"] += hub.run_queued_rechecks(limit=CHANNEL_READY_REFRESH_BATCH)
+    lists = [items for ch_key in _channel_ready_order() for items in _channel_ready_lists(db.channels_db.get(ch_key) or {})]
+    # WARNING: every first path check is done before any build; a check made after a build moves the path generation on and the build would be made again.
+    for items in lists:
+        if _app_shutting_down.is_set():
+            return
+        paths = [it.get("path", it.get("file", "")) if isinstance(it, dict) else str(it) for it in list(items)]
+        stats["warmed"] += media.warm_path_statuses(paths, limit=CHANNEL_READY_WARM_BATCH)
+    for items in lists:
+        if _app_shutting_down.is_set():
+            return
+        if media.track_build_is_ready(items):
+            continue
+        t0 = time.monotonic()
+        media.build_raw_tracks(items, media._cached_path_exists)
+        media.build_pending_tracks(items, media._cached_path_exists)
+        stats["builds"] += 1
+        stats["build_s"] += time.monotonic() - t0
+        if _app_shutting_down.wait(CHANNEL_READY_CHANNEL_PAUSE_SECONDS):
+            return
+
+
+def _channel_ready_worker():
+    """ChannelReady thread (owner 2026-11-02, N1: "i want the info for that channel ready to go"): keeps every active channel's file facts and track build ready ahead so the screen thread never builds a lineup or waits on a drive."""
+    while not _app_shutting_down.is_set():
+        if db is not None and getattr(db, "ready_flag", False):
+            try:
+                _channel_ready_pass()
+            except Exception as _ready_err:
+                _log_warn_throttled("channel_ready_pass", "[CHANNEL READY] pass failed, the screen thread builds what it needs itself: %s", _ready_err)
+            stats = _channel_ready_stats
+            now = time.monotonic()
+            if now - stats["last_log"] >= CHANNEL_READY_LOG_SECONDS:
+                if stats["builds"] or stats["paths"] or stats["rechecks"] or stats["warmed"]:
+                    log.info("[CHANNEL READY] last %.0fs: %d lineup build(s) made ready (%.1fs), %d path(s) re-checked and %d first checked, %d length(s) asked again, off the screen thread",
+                             now - stats["last_log"] if stats["last_log"] else 0.0, stats["builds"], stats["build_s"],
+                             stats["paths"], stats["warmed"], stats["rechecks"])
+                stats.update(builds=0, build_s=0.0, paths=0, rechecks=0, warmed=0, last_log=now)
+        _added_seen = _scan_files_added_generation[0]
+        _until = time.monotonic() + CHANNEL_READY_INTERVAL_SECONDS
+        while time.monotonic() < _until and _scan_files_added_generation[0] == _added_seen:
+            if _app_shutting_down.wait(0.1):
+                return
+
+
 def _compute_live_block_name(ch_info):
     """Returns the schedule block name that is live right now for this channel, from its scheduling_mode/block_mode and the wall clock."""
     smode = ch_info.get("scheduling_mode", "random_slots")
@@ -15283,6 +15790,15 @@ def _next_n_from_block_timeline(ch_str, current_file, n=4):
     start_idx = None
     if current_file:
         norm_cur = os.path.normpath(current_file)
+        now_entry = cached.get("now")
+        if now_entry and now_entry[0] == norm_cur:
+            # WARNING: a commercial airs many times a block; the item airing now is found by its place in the block, never by its first airing (owner 2026-11-02, N5: the break's later commercials got no picture box).
+            for i, it in enumerate(items):
+                if (it.get("path") and os.path.normpath(it["path"]) == norm_cur
+                        and it.get("start_time") == now_entry[1]):
+                    start_idx = i
+                    break
+    if current_file and start_idx is None:
         for i, it in enumerate(items):
             if it.get("path") and os.path.normpath(it["path"]) == norm_cur:
                 start_idx = i
@@ -15714,84 +16230,129 @@ def _snapshot_now_playing_loudness_targets():
 _SWEEP_SKIP_BACKOFF_SECONDS = performance_governor.SWEEP_SKIP_BACKOFF_SECONDS if performance_governor is not None else 1.0
 
 
+# WARNING: the fallback numbers below must match LOUDNESS_SWEEP_WAIT_FOR_INFO_SCANS_MAX_SECONDS and LOUDNESS_SWEEP_WAIT_RECHECK_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SWEEP_INFO_WAIT_MAX_S = performance_governor.LOUDNESS_SWEEP_WAIT_FOR_INFO_SCANS_MAX_SECONDS if performance_governor is not None else 120.0
+_SWEEP_INFO_WAIT_RECHECK_S = performance_governor.LOUDNESS_SWEEP_WAIT_RECHECK_SECONDS if performance_governor is not None else 2.0
+
+
+def _airing_shows_missing_info():
+    """The airing shows of every channel that still need their length or picture box (a file on a held drive or confirmed bad is left out)."""
+    missing = []
+    lookups = [SCAN_GATHER_LIBRARY_LOOKUPS]
+    try:
+        airing = _gather_probe_priority_queue()[0]
+    except Exception as e:
+        _log_warn_throttled("sweep_info_gather", "[LOUDNESS PROBE] could not list the airing shows: %s" % e)
+        return missing
+    for _kind, _ch, _block, norm_p in airing:
+        if media.file_is_confirmed_bad(norm_p) or _scan_drive_on_hold(norm_p):
+            continue
+        if (not _scan_duration_reported(_read_file_probe_facts(norm_p), False)
+                or not _scan_picture_box_reported(norm_p, lookups)):
+            missing.append(norm_p)
+    return missing
+
+
+def _sweep_wait_for_airing_info_scans():
+    """Holds the background loudness pass while an airing show still needs its length or picture box, at most _SWEEP_INFO_WAIT_MAX_S; True when the app is shutting down."""
+    # WARNING: owner order 2026-11-02 and 2026-11-03: every channel's airing show gets its length and picture box first, loudness after.
+    _t0 = time.monotonic()
+    _first = None
+    while time.monotonic() - _t0 < _SWEEP_INFO_WAIT_MAX_S:
+        missing = _airing_shows_missing_info()
+        if not missing:
+            if _first is not None:
+                log.info("[LOUDNESS PROBE] airing shows' length and picture-box scans finished; loudness pass goes on after %.1fs", time.monotonic() - _t0)
+            return False
+        if _first is None:
+            _first = len(missing)
+            log.info("[LOUDNESS PROBE] loudness pass waits for the length and picture-box scans of %d airing show(s)", _first)
+        if _app_shutting_down.wait(_SWEEP_INFO_WAIT_RECHECK_S):
+            return True
+    log.info("[LOUDNESS PROBE] waited %.0fs for the airing shows' length and picture-box scans; loudness pass goes on", _SWEEP_INFO_WAIT_MAX_S)
+    return False
+
+
 def _run_first_pass_now_playing_sweep():
-    """Scans every currently-airing audio target back to back before any ambient backlog tier work, until nothing live is left unscanned."""
+    """Scans every currently-airing audio target back to back before any ambient backlog tier work, until nothing live is left unscanned; each scan waits first for the airing shows' length and picture-box scans."""
     if db is None:
         return
     print("[LOUDNESS PROBE] First-pass now-playing sweep starting...")
-    _mark_loudness_priority_active()
     _t0 = time.monotonic()
     _scanned = 0
     _crashed = False
     try:
-        try:
-            _known_channels = set(db.channels_db.keys())
-            pending = _snapshot_now_playing_loudness_targets()
-            while True:
-                if _app_shutting_down.is_set():
-                    return
+        _known_channels = set(db.channels_db.keys())
+        pending = _snapshot_now_playing_loudness_targets()
+        while True:
+            if _app_shutting_down.is_set():
+                return
 
-                _current_channels = set(db.channels_db.keys())
-                _new_channels = _current_channels - _known_channels
-                if _new_channels:
-                    _interrupted = False
-                    for new_ch in sorted(_new_channels, key=_channel_scan_rank):
-                        _known_channels.add(new_ch)
-                        ch_info = db.channels_db.get(new_ch, {})
-                        if not ch_info or not ch_info.get("active", True):
-                            continue
-                        block_key, norm_p = _first_scheduled_target_for_channel(new_ch, ch_info)
-                        if not norm_p:
-                            continue
-                        print(f"[LOUDNESS PROBE] New channel ch{new_ch} detected mid-sweep -- "
-                              f"pausing to scan its first scheduled show before resuming.")
-                        if _probe_and_apply_loudness_blocking(
-                                "channel", new_ch, block_key or "Full Day", norm_p,
-                                "new-channel priority scan"):
-                            _scanned += 1
-                        elif _app_shutting_down.wait(_SWEEP_SKIP_BACKOFF_SECONDS):
-                            return
-                        _interrupted = True
-                    if _interrupted:
+            _current_channels = set(db.channels_db.keys())
+            _new_channels = _current_channels - _known_channels
+            if _new_channels:
+                _interrupted = False
+                for new_ch in sorted(_new_channels, key=_channel_scan_rank):
+                    _known_channels.add(new_ch)
+                    ch_info = db.channels_db.get(new_ch, {})
+                    if not ch_info or not ch_info.get("active", True):
                         continue
-
-                _fresh = _snapshot_now_playing_loudness_targets()
-                _drifted_key = None
-                for key, target in _fresh.items():
-                    _prev = pending.get(key)
-                    if _prev is not None and _prev[3] != target[3]:
-                        _drifted_key = key
-                        break
-                if _drifted_key is not None:
-                    kind, ch_key, block_key, norm_p = _fresh[_drifted_key]
-                    _label = f"ch{ch_key}" if ch_key else kind
-                    print(f"[LOUDNESS PROBE] {_label} now-playing changed mid-sweep -- "
-                          f"pausing to scan the new show before resuming.")
+                    block_key, norm_p = _first_scheduled_target_for_channel(new_ch, ch_info)
+                    if not norm_p:
+                        continue
+                    print(f"[LOUDNESS PROBE] New channel ch{new_ch} detected mid-sweep -- "
+                          f"pausing to scan its first scheduled show before resuming.")
+                    if _sweep_wait_for_airing_info_scans():
+                        return
                     if _probe_and_apply_loudness_blocking(
-                            kind, ch_key, block_key, norm_p, "now-playing priority scan"):
+                            "channel", new_ch, block_key or "Full Day", norm_p,
+                            "new-channel priority scan"):
                         _scanned += 1
                     elif _app_shutting_down.wait(_SWEEP_SKIP_BACKOFF_SECONDS):
                         return
-                    pending = _fresh
+                    _interrupted = True
+                if _interrupted:
                     continue
 
-                for key, target in _fresh.items():
-                    pending.setdefault(key, target)
-                if not pending:
+            _fresh = _snapshot_now_playing_loudness_targets()
+            _drifted_key = None
+            for key, target in _fresh.items():
+                _prev = pending.get(key)
+                if _prev is not None and _prev[3] != target[3]:
+                    _drifted_key = key
                     break
-                key, (kind, ch_key, block_key, norm_p) = next(iter(pending.items()))
-                del pending[key]
-                if _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, "first-pass scan"):
+            if _drifted_key is not None:
+                kind, ch_key, block_key, norm_p = _fresh[_drifted_key]
+                _label = f"ch{ch_key}" if ch_key else kind
+                print(f"[LOUDNESS PROBE] {_label} now-playing changed mid-sweep -- "
+                      f"pausing to scan the new show before resuming.")
+                if _sweep_wait_for_airing_info_scans():
+                    return
+                if _probe_and_apply_loudness_blocking(
+                        kind, ch_key, block_key, norm_p, "now-playing priority scan"):
                     _scanned += 1
                 elif _app_shutting_down.wait(_SWEEP_SKIP_BACKOFF_SECONDS):
                     return
-        except Exception:
-            _crashed = True
-            log.exception(
-                "[LOUDNESS PROBE] First-pass now-playing sweep crashed mid-scan -- "
-                "completing early so dependent scan tiers aren't blocked forever")
-    finally:
-        _mark_loudness_priority_done()
+                pending = _fresh
+                continue
+
+            for key, target in _fresh.items():
+                pending.setdefault(key, target)
+            if not pending:
+                break
+            if _sweep_wait_for_airing_info_scans():
+                return
+            key, (kind, ch_key, block_key, norm_p) = next(iter(pending.items()))
+            del pending[key]
+            if _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, "first-pass scan"):
+                _scanned += 1
+            elif _app_shutting_down.wait(_SWEEP_SKIP_BACKOFF_SECONDS):
+                return
+    except Exception:
+        _crashed = True
+        log.exception(
+            "[LOUDNESS PROBE] First-pass now-playing sweep crashed mid-scan -- "
+            "completing early so dependent scan tiers aren't blocked forever")
     print(f"[LOUDNESS PROBE] First-pass now-playing sweep "
           f"{'aborted after error' if _crashed else 'complete'} -- "
           f"{_scanned} file(s) scanned in {time.monotonic() - _t0:.1f}s")
@@ -16258,6 +16819,17 @@ def _gather_music_probe_queue():
                 has_gain = "gain" in _cached or (isinstance(entry, dict) and "gain" in entry)
                 has_dur = (_cached.get("duration") or 0) > 0 or norm_p in _music_duration_scan_attempted
                 songs.append(("channel", ch_str, block_key or "Music Tracks", norm_p, has_gain and has_dur))
+        # WARNING: a song gets into the lineup only once its length is known, so the songs still without one are walked too, after the lineup; without them a Visualizer whose songs are all new never starts (owner log 2026-11-03: 564 songs, Static for 25 minutes).
+        _in_songs = {s[3] for s in songs}
+        for p in _snap_rec.get("pending", []) or []:
+            norm_p = os.path.normpath(p)
+            if norm_p in _in_songs or not _cached_path_exists(norm_p):
+                continue
+            _in_songs.add(norm_p)
+            _cached = _read_file_probe_facts(norm_p)
+            has_gain = "gain" in _cached
+            has_dur = (_cached.get("duration") or 0) > 0 or norm_p in _music_duration_scan_attempted
+            songs.append(("channel", ch_str, block_key or "Music Tracks", norm_p, has_gain and has_dur))
         ranked.extend(_music_scan_source_items("ch" + ch_str, songs))
 
     ranked.sort(key=lambda it: (_MUSIC_SCAN_CLASS_RANK.get(it[0], 2), it[1]))
@@ -16271,6 +16843,27 @@ _music_duration_scan_attempted = set()
 MUSIC_PRECACHE_IDLE_SLEEP_SECONDS = performance_governor.MUSIC_PRECACHE_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
 MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS = performance_governor.MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS if performance_governor is not None else 0.5
 MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS = performance_governor.MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS if performance_governor is not None else 10.0
+
+
+_music_scan_stats = {"songs": 0, "priority": 0, "seconds": 0.0, "since": None}
+# WARNING: the fallback number below must match MUSIC_SCAN_LOG_SECONDS in performance_governor.py; it is used only when that module fails to import.
+MUSIC_SCAN_LOG_SECONDS = performance_governor.MUSIC_SCAN_LOG_SECONDS if performance_governor is not None else 60.0
+
+
+def _note_music_scan(scan_class, seconds):
+    """Counts one scanned song and writes one [MUSIC SCAN] line a minute: songs, how many ran as priority, the time spent and the governor's level (owner 2026-11-02, N12)."""
+    st = _music_scan_stats
+    now = time.monotonic()
+    if st["since"] is None:
+        st["since"] = now
+    st["songs"] += 1
+    st["priority"] += 1 if scan_class == "now" else 0
+    st["seconds"] += seconds
+    if now - st["since"] >= MUSIC_SCAN_LOG_SECONDS:
+        log.info("[MUSIC SCAN] last %.0fs: %d song(s) scanned, %d as priority (the next songs of a music channel), %.1fs of scanning, load level %s",
+                 now - st["since"], st["songs"], st["priority"], st["seconds"],
+                 performance_governor.current_level() if performance_governor is not None else "n/a")
+        st.update(songs=0, priority=0, seconds=0.0, since=now)
 
 
 def _music_precache_worker():
@@ -16375,8 +16968,11 @@ def _music_precache_worker():
                 with _scan_thread_slot("music", _scan_cls) as _slot_ok:
                     if not _slot_ok:
                         return
+                    _song_t0 = time.monotonic()
                     with (_governor_priority_scope() if _scan_cls == "now" else _governor_nullscope()):
                         _worked = _music_scan_one(kind, ch_key, block_key, norm_p)
+                    if _worked:
+                        _note_music_scan(_scan_cls, time.monotonic() - _song_t0)
                 # WARNING: a song that needed no scan (gain in cooldown) must still wait the background pace, or a playlist of such songs spins the thread.
                 _pace = (_scan_class_pace_seconds(_scan_cls, MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS) if _worked
                          else _scan_pace(MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS))
@@ -16590,7 +17186,7 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
     ch_info = db.channels_db.get(ch_key, {})
 
     if duration is not None and duration > 0 and isinstance(ch_info, dict):
-        _real_dur = int(duration)
+        _real_dur = media.whole_seconds_up(duration)
         _anchor = ch_info.get("playback_anchor")
         if isinstance(_anchor, dict) and _anchor.get("file"):
             try:
@@ -16652,7 +17248,7 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
             if _ep == norm_p:
                 if gain is not None:
                     if duration is not None and duration > 0:
-                        entry["duration"] = int(duration)
+                        entry["duration"] = media.whole_seconds_up(duration)
                         _request_schedule_rebuild(ch_key, block_key)
                     return
             if entry.get("is_pair"):
@@ -16661,9 +17257,9 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
                 if norm_p in (_p1, _p2):
                     if duration is not None and duration > 0:
                         if norm_p == _p1:
-                            entry["pair_ep1_duration"] = int(duration)
+                            entry["pair_ep1_duration"] = media.whole_seconds_up(duration)
                         else:
-                            entry["pair_ep2_duration"] = int(duration)
+                            entry["pair_ep2_duration"] = media.whole_seconds_up(duration)
                         _request_schedule_rebuild(ch_key, block_key)
                     return
 
@@ -18529,6 +19125,11 @@ def _background_subsystem_worker():
     if db.config.get("start_on_boot", False):
         _set_start_on_boot(True)
 
+    try:
+        _remember_old_core_and_bios_copies()
+    except Exception as e:
+        log.warning(f"[GAMES] Could not remember the old core and BIOS copies: {e}")
+
     print("Creating game frontend deck...")
     try:
         from game_deck import ExternalGameDeck
@@ -18574,6 +19175,7 @@ def _background_subsystem_worker():
 
     threading.Thread(target=_scan_snapshot_worker, daemon=True, name="ScanSnapshot").start()
     threading.Thread(target=_carry_config_file_data_into_hub, daemon=True, name="HubCarryOver").start()
+    threading.Thread(target=_channel_ready_worker, daemon=True, name="ChannelReady").start()
 
     threading.Thread(target=_probe_upcoming_media, daemon=True).start()
 
@@ -19926,6 +20528,48 @@ def _new_channel_airing_paths(ch):
     return ([os.path.normpath(_file)] if _file else []), (_state.get("block") or "Full Day")
 
 
+def _warm_new_file_lengths(paths):
+    """Asks the library for every just-saved file's length on a background thread, so the screen thread finds each answer already held and never waits on the library file by file."""
+    # WARNING: owner log 2026-11-03: the first lineup build of a 2651-file channel asked the library once per file on the screen thread.
+    _paths = [str(p) for p in (paths or []) if p]
+    if not _paths:
+        return
+
+    def _worker():
+        _t0 = time.monotonic()
+        for _i, _p in enumerate(_paths):
+            if _app_shutting_down.is_set():
+                return
+            try:
+                media.read_track_duration(os.path.normpath(_p), 0)
+            except Exception as e:
+                _log_warn_throttled("warm_lengths", "[LENGTH WARM] could not read the length of %s: %s" % (os.path.basename(_p), e))
+            if _i % 50 == 49:
+                time.sleep(0)
+        log.info("[LENGTH WARM] %d saved file(s) looked up in the library in %.1fs, off the screen thread", len(_paths), time.monotonic() - _t0)
+
+    threading.Thread(target=_worker, daemon=True, name="LengthWarm").start()
+
+
+def _new_channel_first_pending(ch):
+    """The channel's first file that has no length yet, in its airing block (a Visualizer: its first song), and that block; ("", block) when there is none."""
+    ch_info = db.channels_db.get(ch, {}) if db is not None else {}
+    if ch_info.get("is_visualizer", False):
+        _unseekable, _unseekable_exts = _visualizer_admission_inputs()
+        _paths = media.pending_visualizer_paths(ch_info.get("schedules", {}).get("Music Tracks", []), _unseekable, _unseekable_exts)
+        _block = "Music Tracks"
+    else:
+        _block = _airing_block_name(ch_info, broadcast_clock.now().replace(tzinfo=None))
+        _broken = set(ch_info.get("broken_files", []))
+        _paths = [t["path"] for t in build_pending_tracks(ch_info.get("schedules", {}).get(_block, []), _cached_path_exists)
+                  if t["path"] not in _broken]
+    for _path in _paths:
+        _norm = os.path.normpath(_path)
+        if _cached_path_exists(_norm) and not _scan_duration_reported(_read_file_probe_facts(_norm), False):
+            return _norm, _block
+    return "", _block
+
+
 def _new_channel_first_show_worker():
     """Scans each queued channel's airing show for its duration and picture box, in the order the channels were set up, with the other background scans paused."""
     while not _app_shutting_down.is_set():
@@ -19941,6 +20585,17 @@ def _new_channel_first_show_worker():
             _t0 = time.monotonic()
             try:
                 _paths, _block = _new_channel_airing_paths(_ch)
+                if not _paths:
+                    # WARNING: a channel whose files have no length yet airs Static, so the scheduler names no show; one length is scanned first so it can name the show it would air (owner 2026-11-03: every new channel's first show scanned in 3 to 5 s).
+                    _first, _first_block = _new_channel_first_pending(_ch)
+                    if _first:
+                        with _governor_priority_scope():
+                            _first_dur = _scan_store_duration("channel", _ch, _first_block, _first)
+                        log.info("[NEW CHANNEL] ch%s: no show has a length yet; %s scanned first: duration %s, %.1fs",
+                                 _ch, os.path.basename(_first), "stored" if _first_dur else "not found", time.monotonic() - _t0)
+                        _paths, _block = _new_channel_airing_paths(_ch)
+                    if not _paths:
+                        log.info("[NEW CHANNEL] ch%s: still no show to air after its first length scan; the normal scans will reach it", _ch)
                 for _path in _paths:
                     if not _cached_path_exists(_path):
                         continue
@@ -20000,7 +20655,13 @@ def _decide_picture_box_before_show(path):
         _worker = threading.Thread(target=_picture_box_scan_one_priority, args=(lib, _ml, norm_p, _pb_parallel),
                                    daemon=True, name="pre-show-picbox")
         _worker.start()
-        _worker.join(timeout=_PICTURE_BOX_PRE_SHOW_BUDGET_S)
+        _wait_until = _t0 + _PICTURE_BOX_PRE_SHOW_BUDGET_S
+        while _worker.is_alive() and time.monotonic() < _wait_until:
+            # WARNING: a load the viewer has left stops waiting here at once; the scan itself goes on and stores its answer for later.
+            if _activation_superseded():
+                log.info("[PICTURE BOX] pre-show: stopped waiting for %s, the viewer left the channel", os.path.basename(norm_p))
+                return None
+            _worker.join(timeout=min(0.1, max(0.0, _wait_until - time.monotonic())))
         box = _stored()
         _took = time.monotonic() - _t0
         if box is None:
@@ -20207,6 +20868,8 @@ def _picture_box_lane_wait():
 
 # WARNING: the fallback numbers below must match NEXT_ITEM_PREP_ITEMS, NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS in performance_governor.py; they are used only when that module fails to import.
 NEXT_ITEM_PREP_ITEMS = performance_governor.NEXT_ITEM_PREP_ITEMS if performance_governor is not None else 3
+# WARNING: the fallback number below must match NEXT_ITEM_PREP_BREAK_MAX_ITEMS in performance_governor.py; it is used only when that module fails to import.
+NEXT_ITEM_PREP_BREAK_MAX_ITEMS = performance_governor.NEXT_ITEM_PREP_BREAK_MAX_ITEMS if performance_governor is not None else 12
 NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS = performance_governor.NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS if performance_governor is not None else 60.0
 # WARNING: only _request_next_item_prep writes "request" and only the NextItemPrep thread takes it; a newer request replaces an older one that has not started.
 _next_item_prep_state = {"lock": threading.Lock(), "wake": threading.Event(), "request": None, "thread": None}
@@ -20225,20 +20888,36 @@ def _request_next_item_prep(ch_key, file_path):
     state["wake"].set()
 
 
-def _next_item_prep_paths(ch_key, file_path):
-    """The video files of the next NEXT_ITEM_PREP_ITEMS items after file_path in ch_key's block, nearest first, each once; [] when the block's order is not known."""
-    items = _next_n_from_block_timeline(ch_key, file_path, n=NEXT_ITEM_PREP_ITEMS + 1)
+def _next_item_prep_plan(ch_key, file_path):
+    """Returns (the video files to ready ahead, nearest first, each once; whether a commercial break is on or next): the next NEXT_ITEM_PREP_ITEMS items after file_path, and when a break is among or right after them, on through the whole break and the item after it, up to NEXT_ITEM_PREP_BREAK_MAX_ITEMS; ([], False) when the block's order is not known."""
+    window = max(NEXT_ITEM_PREP_ITEMS, NEXT_ITEM_PREP_BREAK_MAX_ITEMS) + 1
+    items = _next_n_from_block_timeline(ch_key, file_path, n=window)
     if items is not None:
-        paths = [it.get("path", "") for it in items[1:]]
+        upcoming = [(it.get("path", ""), bool(it.get("is_commercial"))) for it in items[1:]]
+        on_air_is_break = bool(items[0].get("is_commercial")) if items else False
     else:
         rec = _scan_snapshot_channel(ch_key)
         if not rec or not rec.get("ordered"):
-            return []
-        paths = [p for entry in _next_n_from_ordered(rec["ordered"], file_path, n=NEXT_ITEM_PREP_ITEMS + 1)
-                 for p in _paths_from_entry(entry)]
+            return [], False
+        upcoming = [(p, False) for entry in _next_n_from_ordered(rec["ordered"], file_path, n=NEXT_ITEM_PREP_ITEMS + 1)
+                    for p in _paths_from_entry(entry)]
+        on_air_is_break = False
+    chosen = []
+    in_break = on_air_is_break
+    for i, (path, is_commercial) in enumerate(upcoming):
+        if i >= NEXT_ITEM_PREP_ITEMS and not in_break:
+            break
+        if i >= NEXT_ITEM_PREP_BREAK_MAX_ITEMS:
+            break
+        chosen.append(path)
+        if is_commercial:
+            in_break = True
+        elif in_break and i >= NEXT_ITEM_PREP_ITEMS - 1:
+            break
+    break_near = on_air_is_break or any(c for _p, c in upcoming[:NEXT_ITEM_PREP_ITEMS])
     current = os.path.normpath(file_path)
     out = []
-    for p in paths:
+    for p in chosen:
         if not p:
             continue
         norm_p = os.path.normpath(p)
@@ -20247,7 +20926,12 @@ def _next_item_prep_paths(ch_key, file_path):
         if os.path.splitext(norm_p)[1].lower() not in media.VIDEO_DISPLAY_EXTS:
             continue
         out.append(norm_p)
-    return out[:NEXT_ITEM_PREP_ITEMS]
+    return out, break_near
+
+
+def _next_item_prep_paths(ch_key, file_path):
+    """The video files _next_item_prep_plan readies ahead after file_path in ch_key's block."""
+    return _next_item_prep_plan(ch_key, file_path)[0]
 
 
 def _first_start_scans_run_alone():
@@ -20280,17 +20964,18 @@ def _next_item_prep_worker():
             return (state["request"] is not None or _app_shutting_down.is_set()
                     or str(app_state.get("_live_playback_channel", "") or "").zfill(2) != ch_key)
 
+        try:
+            paths, _break_near = _next_item_prep_plan(ch_key, file_path)
+        except Exception as e:
+            log.warning("[NEXT ITEM] ch%s: working out the next items after %s failed: %s", ch_key, os.path.basename(str(file_path)), e)
+            continue
+        # WARNING: a break's items start seconds apart, so waiting here for the playing file's first-start scans leaves its later commercials with no picture box at their open (N16).
         _waited_from = time.monotonic()
-        while (_first_start_scans_run_alone() and not _stale()
+        while (not _break_near and _first_start_scans_run_alone() and not _stale()
                and time.monotonic() - _waited_from < NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS):
             if _app_shutting_down.wait(PICTURE_BOX_PAUSE_RECHECK_SECONDS):
                 return
         if _stale():
-            continue
-        try:
-            paths = _next_item_prep_paths(ch_key, file_path)
-        except Exception as e:
-            log.warning("[NEXT ITEM] ch%s: working out the next items after %s failed: %s", ch_key, os.path.basename(str(file_path)), e)
             continue
         started = time.monotonic()
         made = []
@@ -20950,7 +21635,15 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
               _is_live_ch = (str(app_state.get("_live_playback_channel", "")).zfill(2) == target_clean_key
                              and app_state.get("is_playing_video", False))
               _still_playing_live = False
-              if _is_live_ch and vlc_engine is not None and getattr(vlc_engine, "player", None) is not None:
+              _part_ends_at_cut = bool(anchor.get("interior_cut", False))
+              if _part_ends_at_cut and _is_live_ch:
+                  # WARNING: a part that ends at an interior cut ends on the clock, not when VLC stops; holding it while VLC plays on skips the break and puts the screen ahead of the schedule (L7, owner 2026-11-02: "always on schedule is the most important").
+                  _log_info_throttled(
+                      "interior_cut_end:%s:%s" % (target_clean_key, anchor.get("anchor_written_at")),
+                      "[INTERIOR-BREAK] ch%s: %s reached the planned end of its part (%.1fs past it); the clock's next item airs now",
+                      target_clean_key, os.path.basename(str(anchor.get("file", ""))), -remaining)
+              if (_is_live_ch and not _part_ends_at_cut
+                      and vlc_engine is not None and getattr(vlc_engine, "player", None) is not None):
                   try:
                       _vstate = vlc_engine.player.get_state()
                       _state_ok2 = vlc is not None and _vstate not in (vlc.State.Ended, vlc.State.Error) and (
@@ -21208,7 +21901,8 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
                           _probe_block_timeline_cache[target_clean_key] = {
                               "block_key": h_block_key,
                               "items": [
-                                  {"path": _hte.get("path", ""), "is_commercial": bool(_hte.get("is_commercial"))}
+                                  {"path": _hte.get("path", ""), "is_commercial": bool(_hte.get("is_commercial")),
+                                   "start_time": _hte.get("start_time")}
                                   for _hte in h_timeline if isinstance(_hte, dict) and _hte.get("path")
                               ],
                           }
@@ -21846,7 +22540,8 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
               _probe_block_timeline_cache[target_clean_key] = {
                   "block_key": block_key,
                   "items": [
-                      {"path": _te.get("path", ""), "is_commercial": bool(_te.get("is_commercial"))}
+                      {"path": _te.get("path", ""), "is_commercial": bool(_te.get("is_commercial")),
+                       "start_time": _te.get("start_time")}
                       for _te in timeline if isinstance(_te, dict) and _te.get("path")
                   ],
               }
@@ -22043,6 +22738,9 @@ def calculate_slotted_playback_state(channel_id, snap_internal_advance=False, tr
 
       target_show, position_in_playlist = _maybe_correct_estimated_target_duration(
           target_clean_key, current_block, timeline, target_show, position_in_playlist, now)
+      _tl_now_cache = _probe_block_timeline_cache.get(target_clean_key)
+      if _tl_now_cache is not None and _tl_now_cache.get("block_key") == block_key and target_show.get("path"):
+          _tl_now_cache["now"] = (os.path.normpath(str(target_show.get("path"))), target_show.get("start_time"))
       _clock_shift_seconds = position_in_playlist - _position_before_guard
 
       if target_show is not None:
@@ -22417,6 +23115,139 @@ def _aspect_fit_rect(rect, target_aspect=None):
     return pygame.Rect(dx, dy, dw, dh)
 
 
+# ============================================================================
+# SECTION: Locked picture finder
+# ============================================================================
+
+# WARNING: the fallback numbers below must match SURFACE_LOCK_SWAPS_MAX and SURFACE_LOCK_FIND_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SURFACE_LOCK_SWAPS_MAX = performance_governor.SURFACE_LOCK_SWAPS_MAX if performance_governor is not None else 5
+_SURFACE_LOCK_FIND_SECONDS = performance_governor.SURFACE_LOCK_FIND_SECONDS if performance_governor is not None else 4.0
+_surface_lock_events = {}
+_surface_lock_unreadable = [0]
+
+
+def _surface_lock_refers(value, target):
+    """True when value is target or hangs off it through .base or .obj."""
+    try:
+        for _step in range(5):
+            if value is target:
+                return True
+            value = getattr(value, "base", None) if getattr(value, "base", None) is not None else getattr(value, "obj", None)
+            if value is None:
+                return False
+    except Exception:
+        _surface_lock_unreadable[0] += 1
+    return False
+
+
+def _surface_lock_targets(surface):
+    """The objects that hold a picture's locks; a locked sub-picture is followed to what locks it."""
+    targets = []
+    pending = [surface]
+    seen = set()
+    while pending and len(seen) < 12:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        for lock in item.get_locks():
+            if isinstance(lock, pygame.Surface) and lock is not item:
+                pending.append(lock)
+            targets.append(lock)
+    return targets
+
+
+def _surface_lock_scan(container, path, depth, targets, found, deadline, seen):
+    """Looks through a container, and containers inside it, for the lock holders."""
+    if time.monotonic() > deadline or id(container) in seen:
+        return
+    seen.add(id(container))
+    try:
+        if isinstance(container, dict):
+            items = list(container.items())
+        else:
+            items = list(enumerate(container))
+    except Exception:
+        _surface_lock_unreadable[0] += 1
+        return
+    for key, value in items:
+        if any(_surface_lock_refers(value, t) for t in targets):
+            found.append("%s[%s]" % (path, key))
+        elif depth > 0 and isinstance(value, (dict, list, tuple, set, collections.deque)):
+            _surface_lock_scan(value, "%s[%s]" % (path, key), depth - 1, targets, found, deadline, seen)
+        elif depth > 0 and hasattr(value, "__dict__") and not isinstance(value, (type, types.ModuleType, types.FunctionType)):
+            _surface_lock_scan(vars(value), "%s[%s].attr" % (path, key), depth - 1, targets, found, deadline, seen)
+
+
+def _surface_lock_threads():
+    """Where every thread is right now, as text."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    parts = []
+    frames = sys._current_frames()
+    try:
+        for ident, frame in frames.items():
+            code = frame.f_code
+            parts.append("%s in %s (%s:%d)" % (names.get(ident, "?"), code.co_name, os.path.basename(code.co_filename or "?"), frame.f_lineno))
+    finally:
+        frames.clear()
+    return "; ".join(parts)
+
+
+def _surface_lock_find(surface):
+    """Names what holds a picture's locks: a running function's variable, a stored container, or a frame kept alive."""
+    started = time.monotonic()
+    deadline = started + _SURFACE_LOCK_FIND_SECONDS
+    targets = _surface_lock_targets(surface)
+    found = []
+    plain = [t for t in targets if not isinstance(t, pygame.Surface)]
+    if not plain:
+        found.append("a lock() that was never unlocked, on a %dx%d picture" % surface.get_size())
+    own_codes = (_surface_lock_find.__code__, _surface_lock_scan.__code__, _surface_lock_threads.__code__)
+    frames = sys._current_frames()
+    try:
+        for ident, top in frames.items():
+            frame = top
+            while frame is not None:
+                if frame.f_code not in own_codes:
+                    for name, value in list(frame.f_locals.items()):
+                        if any(_surface_lock_refers(value, t) for t in plain):
+                            found.append("variable %s in %s (%s:%d) of thread %s" % (name, frame.f_code.co_name, os.path.basename(frame.f_code.co_filename or "?"), frame.f_lineno, ident))
+                frame = frame.f_back
+    finally:
+        frames.clear()
+        top = frame = None
+    modules = sorted(list(sys.modules.items()), key=lambda item: ("site-packages" in str(getattr(item[1], "__file__", "")), item[0]))
+    seen = set()
+    for name, module in modules:
+        if plain and time.monotonic() < deadline and module is not None:
+            _surface_lock_scan(vars(module), "module %s" % name, 2, plain, found, deadline, seen)
+    for target in plain[:4]:
+        for referrer in gc.get_referrers(target)[:8]:
+            if isinstance(referrer, types.FrameType) and referrer.f_code not in own_codes:
+                found.append("a kept frame of %s (%s:%d)" % (referrer.f_code.co_name, os.path.basename(referrer.f_code.co_filename or "?"), referrer.f_lineno))
+            elif isinstance(referrer, (types.TracebackType, types.GeneratorType)):
+                found.append("a kept %s" % type(referrer).__name__)
+    referrer = None
+    return "%s; %d lock(s); found in %.2fs, %d unreadable" % (" | ".join(found) if found else "no holder found", len(targets), time.monotonic() - started, _surface_lock_unreadable[0])
+
+
+def _surface_lock_event(surface, label):
+    """Writes the [SURFACE LOCK] line for a locked picture and says whether the caller may recover."""
+    count = _surface_lock_events.get(label, 0) + 1
+    _surface_lock_events[label] = count
+    if count == 1:
+        try:
+            holders = _surface_lock_find(surface)
+        except Exception as error:
+            holders = "the holder search failed: %s: %s" % (type(error).__name__, error)
+        log.error("[SURFACE LOCK] %s is locked at frame %d; holders: %s; threads: %s", label, _main_frame_clock["n"], holders, _surface_lock_threads())
+    elif count <= _SURFACE_LOCK_SWAPS_MAX:
+        log.error("[SURFACE LOCK] %s is locked again (%d) at frame %d", label, count, _main_frame_clock["n"])
+    else:
+        log.error("[SURFACE LOCK] %s is locked again (%d) at frame %d; the recovery limit of %d is used up, the error goes through", label, count, _main_frame_clock["n"], _SURFACE_LOCK_SWAPS_MAX)
+    return count <= _SURFACE_LOCK_SWAPS_MAX
+
+
 _transition_static_noise_cache = {"key": None, "surface": None, "built_at": 0}
 
 
@@ -22456,9 +23287,15 @@ def _render_transition_static(screen, rect, target_aspect=None):
                 gray = np.random.randint(10, 55, (sw, sh, 1), dtype=np.uint8)
                 noise = np.repeat(gray, 3, axis=2)
             surf = pygame.surfarray.make_surface(noise)
-            cache["surface"] = pygame.transform.scale(surf, (rect.width, rect.height))
+            _scaled_noise = pygame.transform.scale(surf, (rect.width, rect.height))
+            cache["surface"] = _scaled_noise.convert() if pygame.display.get_surface() is not None else _scaled_noise
             cache["key"] = key
             cache["built_at"] = now
+        if cache["surface"].get_locked() and _surface_lock_event(cache["surface"], "static noise picture"):
+            cache["surface"] = None
+            return
+        if screen.get_locked() and _surface_lock_event(screen, "static draw target"):
+            return
         screen.blit(cache["surface"], (rect.x, rect.y))
     else:
         screen.fill(COLOR_SCREEN_BLACK, rect)
@@ -22715,25 +23552,113 @@ def _run_pending_channel_activation():
             log.warning("[ACTIVATION] pending channel activation failed: %s", e)
 
 
-_channel_activation_lock = threading.Lock()
 _channel_activation_generation = 0
+# WARNING: one load runs at a time; only the newest load waits for its turn, and a load that runs past _ACTIVATION_STUCK_S is set aside (owner log 2026-11-04 01:20:59: one load stuck while holding the old lock and 100+ later loads waited behind it, every channel black).
+_activation_slot = threading.Condition()
+_activation_running = {"token": None}
+_activation_local = threading.local()
+_activation_watch = {"thread": None}
+# WARNING: the fallback numbers below must match ACTIVATION_STUCK_SECONDS and ACTIVATION_WATCH_CHECK_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_ACTIVATION_STUCK_S = performance_governor.ACTIVATION_STUCK_SECONDS if performance_governor is not None else 20.0
+_ACTIVATION_WATCH_CHECK_S = performance_governor.ACTIVATION_WATCH_CHECK_SECONDS if performance_governor is not None else 0.5
+
+
+def _drop_channel_loads(reason):
+    """Makes every load asked for so far out of date, so none of them opens a file or reports back; called the moment the viewer leaves the channel on screen."""
+    global _channel_activation_generation
+    _channel_activation_generation += 1
+    with _activation_slot:
+        _running = _activation_running["token"]
+        _activation_slot.notify_all()
+    if _running is not None:
+        log.info("[ACTIVATION] ch%s load dropped: %s", _running["channel"], reason)
+
+
+def _activation_token_stale(token):
+    """True when the load this token belongs to is for a screen the viewer has left: a newer load was asked for, the channel on screen is not the one it was asked for, or it was set aside as stuck."""
+    if token is None:
+        return False
+    if token.get("abandoned") or token["generation"] != _channel_activation_generation:
+        return True
+    return str(app_state.get("current_channel", "")).zfill(2) != token["channel"]
+
+
+def _current_activation_token():
+    """The token of the load running on this thread, or None off the load thread."""
+    return getattr(_activation_local, "token", None)
+
+
+def _activation_superseded():
+    """True on a load thread whose load is out of date (see _activation_token_stale); always False on any other thread."""
+    return _activation_token_stale(_current_activation_token())
+
+
+def _activation_watch_loop():
+    """ActivationWatch thread: a load that runs past _ACTIVATION_STUCK_S is set aside so the next load can run, its call stack is logged once, and the main player is flagged for replacement (the screen loop builds a fresh one and tunes the channel on screen again)."""
+    while not _app_shutting_down.is_set():
+        time.sleep(_ACTIVATION_WATCH_CHECK_S)
+        with _activation_slot:
+            token = _activation_running["token"]
+            if token is None or token.get("started") is None:
+                continue
+            took = time.monotonic() - token["started"]
+            if took < _ACTIVATION_STUCK_S:
+                continue
+            token["abandoned"] = True
+            _activation_running["token"] = None
+            _activation_slot.notify_all()
+        frame = sys._current_frames().get(token.get("ident"))
+        stack = "".join(traceback.format_stack(frame)) if frame is not None else "(the load thread has already ended)\n"
+        log.error("[ACTIVATION] ch%s load stuck for %.0fs; set aside so the next load can run, and the player is replaced. Where it is stuck:\n%s",
+                  token["channel"], took, stack.rstrip())
+        set_live_playback_priority(False)
+        if vlc_engine is not None:
+            vlc_engine._wedged = True
+
+
+def _ensure_activation_watch():
+    """Starts the ActivationWatch thread once."""
+    _watch = _activation_watch["thread"]
+    if _watch is None or not _watch.is_alive():
+        _activation_watch["thread"] = threading.Thread(target=_activation_watch_loop, daemon=True, name="ActivationWatch")
+        _activation_watch["thread"].start()
 
 
 def _dispatch_content_activation(fn):
+    """Runs one load (a tune, a guide preview, the next item) on its own thread for the channel on screen now; it waits for the load before it, is dropped if the viewer moves on first, and never runs side by side with another load."""
     global _channel_activation_generation
     _channel_activation_generation += 1
-    my_generation = _channel_activation_generation
+    token = {"generation": _channel_activation_generation,
+             "channel": str(app_state.get("current_channel", "")).zfill(2),
+             "started": None, "ident": None, "abandoned": False}
+    _ensure_activation_watch()
 
     def _run():
-        with _channel_activation_lock:
-            if my_generation != _channel_activation_generation:
+        with _activation_slot:
+            while _activation_running["token"] is not None:
+                if _activation_token_stale(token):
+                    return
+                _activation_slot.wait(_ACTIVATION_WATCH_CHECK_S)
+            if _activation_token_stale(token):
                 return
-            set_live_playback_priority(True)
-            try:
-                fn()
-            except Exception as e:
-                log.warning("[ACTIVATION] channel content activation failed: %s", e)
-            finally:
+            token["started"] = time.monotonic()
+            token["ident"] = threading.get_ident()
+            _activation_running["token"] = token
+        _activation_local.token = token
+        set_live_playback_priority(True)
+        try:
+            fn()
+        except Exception as e:
+            log.warning("[ACTIVATION] channel content activation failed: %s", e)
+        finally:
+            _activation_local.token = None
+            with _activation_slot:
+                _still_running = _activation_running["token"] is token
+                if _still_running:
+                    _activation_running["token"] = None
+                _activation_slot.notify_all()
+            # WARNING: a load set aside as stuck has already given the priority back; clearing it again here would take it from the load running now.
+            if _still_running:
                 set_live_playback_priority(False)
 
     threading.Thread(target=_run, daemon=True, name="content-activate").start()
@@ -22764,6 +23689,8 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         _static_sound_stop("change_channel")
     
     old_ch = app_state.get("current_channel", "05")
+    if str(old_ch).zfill(2) != str(new_ch).zfill(2):
+        _drop_channel_loads(f"the viewer went from ch{str(old_ch).zfill(2)} to ch{str(new_ch).zfill(2)}")
 
     if not internal_advance and performance_governor is not None:
         performance_governor.hold_background_for_tune()
@@ -23431,6 +24358,9 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                                 "empty playback state returned by scheduler"
                             )
 
+                        if _activation_superseded():
+                            log.info("[ACTIVATION] ch%s load dropped before it touched the player: the viewer left the channel", _cc_ch_key)
+                            return
                         if vlc_engine.player.is_playing():
                             vlc_engine.stop(block=False)
                         vlc_engine.set_volume(db.config["global_volume"], db.config.get("is_muted", False))
@@ -23452,7 +24382,10 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                             gain=_lookup_file_gain(new_ch, t_state["file"]),
                             defer_unmute=True,
                             on_confirmed=_make_cc_on_confirmed(dict(t_state)),
+                            follow_clock=True,
                         )
+                        if _played_ok is _PLAYBACK_STALE:
+                            return
 
                         try:
                             vlc_engine.player.audio_set_mute(True)
@@ -23644,8 +24577,7 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                     guide_target,
                 )
 
-            global _channel_activation_generation
-            _channel_activation_generation += 1
+            _drop_channel_loads(f"ch{new_ch} has no video to load")
         app_state["is_playing_video"] = False
         print(f"[CHANNEL] Switched to non-video channel {new_ch}")
         
@@ -23746,6 +24678,7 @@ def _surf_begin_quiet():
     origin = str(app_state.get("current_channel", "05")).zfill(2)
     app_state["surf_origin"] = origin
     app_state["surf_leave_position"] = _surf_capture_leave_position(origin)
+    _drop_channel_loads(f"Up, Down or a channel number was pressed on ch{origin}")
     if _configured_transition_style() != "static":
         _static_sound_stop("_surf_begin_quiet (Up/Down surf, non-Static style)")
         _stop_transition_static()
@@ -24246,8 +25179,11 @@ def _attempt_self_relaunch():
                 _history = json.load(_f)
             if not isinstance(_history, list):
                 _history = []
-        except (FileNotFoundError, ValueError) as _swallowed_error:
-            _log_swallowed("_attempt_self_relaunch: with open(_state_path, 'r', encoding='utf-8') as _f:", _swallowed_error)
+        except FileNotFoundError:
+            # WARNING: no relaunch record yet is the normal first relaunch, not a failure; the record is written just below.
+            _history = []
+        except ValueError as _swallowed_error:
+            _log_swallowed("_attempt_self_relaunch: the relaunch record is unreadable and is started again", _swallowed_error)
             _history = []
 
         _history = [t for t in _history if isinstance(t, (int, float)) and _now - t < RELAUNCH_WINDOW_SEC]
@@ -24720,8 +25656,30 @@ def _background_watchdog_scheduler():
 # ============================================================================
 
 
+COMMERCIAL_SUB_MENU_KEYS = ("Commercials", "Fade-in", "Fade-out")
+
+
+def _reset_channel_lineup_after_clear(target_ch_str, ch_info):
+    """After a Clear Media on the channel on screen, its saved lineup is dropped so the next resolve builds from what is left, as a file-explorer remove does."""
+    if str(app_state.get("current_channel", "")).zfill(2) == str(target_ch_str).zfill(2):
+        _plog = ch_info.setdefault("playback_log", {})
+        _plog["sched_block_key"] = ""
+        _set_saved_lineup(_plog, [], {}, groups=None)
+
+
+def _execute_commercial_media_clear(target_ch_str, ch_info):
+    """Clears everything the Commercials sub-menu holds (commercials, fade-in and fade-out) for one channel."""
+    for key in COMMERCIAL_SUB_MENU_KEYS:
+        ch_info.setdefault("schedules", {})[key] = []
+    _reset_channel_lineup_after_clear(target_ch_str, ch_info)
+    db.save_settings()
+    invalidate_guide_cache()
+    print(f"[CLEARED COMMERCIAL MEDIA] Channel {target_ch_str}.")
+
+
 def _execute_holiday_media_clear(target_ch_str, ch_info):
     ch_info["holiday_schedules"] = {}
+    _reset_channel_lineup_after_clear(target_ch_str, ch_info)
     db.save_settings()
     invalidate_guide_cache()
     print(f"[CLEARED HOLIDAY MEDIA] Storage wiped for Channel {target_ch_str}.")
@@ -24731,8 +25689,9 @@ def _execute_channel_media_clear(target_ch_str, ch_info):
     if ch_info.get("is_visualizer", False):
         ch_info["schedules"]["Music Tracks"] = []
     else:
-        for key in ["Morning", "Commercials", "Evening", "Intros", "Night", "Outros", "Marathon", "Full Day"] + list(SIX_HOUR_BLOCK_NAMES):
-            ch_info["schedules"][key] = []
+        for key in media.channel_clear_schedule_keys():
+            ch_info.setdefault("schedules", {})[key] = []
+        ch_info["holiday_schedules"] = {}
 
     ch_info.pop("sched_cached_tracks",   None)
     ch_info.pop("marathon_anchor_epoch", None)
@@ -24798,49 +25757,23 @@ def _execute_clear_console_manual_roms(console_key):
 
 
 def _execute_clear_all_cores():
-    """"Clear Cores" -- the "Clear Roms" companion for libretro cores."""
-    import json as _json
-    from game_deck import resolve_emulator_config_path
-    cores_root = os.path.join(resolve_main_dir(), "cores")
-    removed = 0
-    if os.path.isdir(cores_root):
-        for console_dir in os.listdir(cores_root):
-            full_dir = os.path.join(cores_root, console_dir)
-            if not os.path.isdir(full_dir):
-                continue
-            for fname in os.listdir(full_dir):
-                if fname.lower().endswith(".dll"):
-                    try:
-                        os.remove(os.path.join(full_dir, fname))
-                        removed += 1
-                    except Exception as e:
-                        _log_warn_throttled("rtv_L13948", f"[GAMES] Clear Cores: could not remove {fname} in {console_dir}: {e}")
-
-    cfg_path = resolve_emulator_config_path()
-    try:
-        with open(cfg_path, "w", encoding="utf-8") as fp:
-            _json.dump({}, fp, indent=2)
-    except Exception as e:
-        log.warning(f"[GAMES] Clear Cores: could not reset {cfg_path}: {e}")
-
-    if game_deck is not None and hasattr(game_deck, "reload_emulator_config"):
-        game_deck.reload_emulator_config()
-    print(f"[GAMES] Clear Cores: removed {removed} core file(s) across all consoles; emulator_config.json reset.")
+    """"Clear Cores": forgets every console's core; the core files stay where they are and controller maps are kept."""
+    from game_deck import is_console_core_key
+    cfg = _read_emulator_config()
+    forgotten = [k for k in list(cfg) if is_console_core_key(k)]
+    for k in forgotten:
+        cfg.pop(k, None)
+    if _write_emulator_config(cfg):
+        print(f"[GAMES] Clear Cores: forgot the core for {len(forgotten)} console(s); no files were deleted.")
 
 
 def _any_cores_exist():
-    """Whether the system-wide "Clear Cores" button has anything to wipe."""
-    cores_root = os.path.join(resolve_main_dir(), "cores")
-    if not os.path.isdir(cores_root):
-        return False
-    for console_dir in os.listdir(cores_root):
-        full_dir = os.path.join(cores_root, console_dir)
-        if not os.path.isdir(full_dir):
-            continue
-        for fname in os.listdir(full_dir):
-            if fname.lower().endswith(".dll"):
-                return True
-    return False
+    """Whether the system-wide "Clear Cores" button has anything to forget."""
+    from game_deck import is_console_core_key
+    cfg = getattr(game_deck, "emulator_config", None) if game_deck is not None else None
+    if cfg is None:
+        cfg = _read_emulator_config()
+    return any(is_console_core_key(k) and v for k, v in cfg.items())
 
 
 _FACTORY_DEFAULT_CONFIG = {
@@ -24895,8 +25828,38 @@ def _cycle_performance_mode():
     print(f"[SETTINGS] Performance Mode = {_new_mode}")
 
 
+# WARNING: the fallback number below must match RESET_DISK_CHECK_SECONDS in performance_governor.py; it is used only when that module fails to import.
+_RESET_DISK_CHECK_S = performance_governor.RESET_DISK_CHECK_SECONDS if performance_governor is not None else 2.0
+_reset_disk_check = {"at": None, "found": False}
+
+
+def _saved_data_on_disk():
+    """Whether a game save or save state, or a file in the app's own loudness, captions or visualizer folders, is on disk; looked at once every _RESET_DISK_CHECK_S seconds."""
+    now = time.monotonic()
+    if _reset_disk_check["at"] is not None and now - _reset_disk_check["at"] < _RESET_DISK_CHECK_S:
+        return _reset_disk_check["found"]
+    main = resolve_main_dir()
+    folders = [os.path.join(main, name) for name in _FRESH_START_MAIN_FOLDERS]
+    roms = os.path.join(main, "roms")
+    try:
+        folders += [os.path.join(roms, c, "saves") for c in os.listdir(roms)] if os.path.isdir(roms) else []
+    except OSError as e:
+        _log_warn_throttled("reset_disk_check", f"[SETTINGS] Reset button: could not list {roms}: {e}")
+    found = False
+    for folder in folders:
+        for _dirpath, _dirnames, filenames in os.walk(folder):
+            if filenames:
+                found = True
+                break
+        if found:
+            break
+    _reset_disk_check["at"] = now
+    _reset_disk_check["found"] = found
+    return found
+
+
 def _any_settings_to_reset():
-    """Whether "Reset All Settings" has anything to reset: a setting differs from its factory default, or a channel has schedule content."""
+    """Whether "Reset All Settings" has anything to reset: a setting differs from its factory default, a channel has schedule content or a watermark, a core, BIOS, rom, splash screen or menu background is remembered, or game saves or the app's own work files are on disk."""
     if db is None:
         return False
     for key, default_val in _FACTORY_DEFAULT_CONFIG.items():
@@ -24914,76 +25877,91 @@ def _any_settings_to_reset():
             return True
         if any(len(v) > 0 for v in (ch_info.get("holiday_schedules") or {}).values()):
             return True
-    return False
+        if ch_info.get("watermark_path"):
+            return True
+    if _any_cores_exist():
+        return True
+    for key in ("active_bios", "console_roms_manual", "console_splash_path", "dvd_splash_path", "menu_bg_path"):
+        value = db.config.get(key)
+        if isinstance(value, dict) and any(value.values()) or (value and not isinstance(value, dict)):
+            return True
+    return _saved_data_on_disk()
 
 
 def _execute_system_reset_all_settings():
-    # WARNING: lengths and gains held only in schedule entries are copied into the library before the channels are cleared.
-    _save_schedule_lengths_into_library()
-    db.factory_reset()
-    _apply_boot_gpu_choice("reset")
-    if performance_governor is not None:
-        try:
-            performance_governor.apply_boot_mode(db.config, force_auto=True)
-        except Exception as _mode_err:
-            log.warning("Reset Settings: performance mode re-pick failed: %s", _mode_err)
-    db.save_settings()
-    invalidate_guide_cache()
+    """Reset All Settings: asks the next start to wipe every setting and saved fact (_wipe_saved_data_for_fresh_start), starts the app again and ends this copy."""
+    import json as _json
     _set_start_on_boot(False)
-
+    request = {
+        "requested_at": broadcast_clock.now().replace(tzinfo=None).isoformat(),
+        "old_app_pid": os.getpid(),
+        "old_tool_copies": list(db.config.get("old_tool_copies", []) or []) if db is not None else [],
+    }
+    marker = _fresh_start_marker_path()
     try:
+        with open(marker + ".tmp", "w", encoding="utf-8") as fp:
+            _json.dump(request, fp, indent=2)
+        os.replace(marker + ".tmp", marker)
+    except Exception as e:
+        log.warning(f"[RESET] Reset All Settings: could not write {marker} ({e}); nothing was reset")
+        return
+    log.info("[RESET] Reset All Settings: the app restarts and the new start wipes every setting and saved fact")
+    try:
+        _popen_kwargs = {"close_fds": True, "cwd": _app_root_dir()}
+        if sys.platform == "win32":
+            _popen_kwargs["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+            )
+        _cmd = _build_relaunch_command(after_update=True)
+        subprocess.Popen(_cmd, **_popen_kwargs)
+        log.info(f"[RESET] started the app again: {_cmd}")
+    except Exception as e:
+        log.warning(f"[RESET] could not start the app again ({e}); the saved data is wiped the next time the app is started")
+    _exit_program("RESET", keep_settings=False)
+
+
+def _exit_program(tag, keep_settings=True):
+    """Stops playback, the engines and the game deck and ends the app; keep_settings=False skips saving the last channel (Reset All Settings)."""
+    _app_shutting_down.set()
+    try:
+        try: media.request_media_shutdown()
+        except Exception as e: log.warning(f"[{tag}] media shutdown signal failed: {e}")
+        try:
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+        except Exception as e: log.warning(f"[{tag}] mixer music stop failed: {e}")
+        if db is not None and getattr(db, "server_listener", None) is not None:
+            try: db.server_listener.stop()
+            except Exception as e: log.warning(f"[{tag}] server listener stop failed: {e}")
+        try: _disconnect_remote_server("application closing")
+        except Exception as e: log.warning(f"[{tag}] remote server disconnect failed: {e}")
         if vlc_engine is not None:
-            vlc_engine.stop()
+            try: vlc_engine.stop()
+            except Exception as e: log.warning(f"[{tag}] vlc stop failed: {e}")
+            try: vlc_engine.close()
+            except Exception as e: log.warning(f"[{tag}] vlc close failed: {e}")
+        if dvd_engine is not None:
+            try: dvd_engine.stop()
+            except Exception as e: log.warning(f"[{tag}] dvd engine stop failed: {e}")
+            try: dvd_engine.close()
+            except Exception as e: log.warning(f"[{tag}] dvd engine close failed: {e}")
+        if game_deck is not None and hasattr(game_deck, "shutdown_deck"):
+            try: game_deck.shutdown_deck()
+            except Exception as e: log.warning(f"[{tag}] game_deck shutdown failed: {e}")
+        if db is not None and keep_settings:
+            _exit_ch = app_state.get("current_channel", "05")
+            if _exit_ch not in ("03", "04"):
+                db.config["last_channel"] = _exit_ch
+            try: db.save_settings()
+            except Exception as e: log.warning(f"[{tag}] save_settings failed: {e}")
+        if db is not None and keep_settings and db.config.get("start_on_boot", False):
+            _launch_explorer_fallback()
     except Exception as e:
-        log.warning("Reset Settings: vlc_engine.stop() failed: %s", e)
-    _static_sound_stop("Reset All Settings")
-    try:
-        pygame.mixer.Channel(1).stop()
-    except Exception as e:
-        log.warning("Reset Settings: mixer Channel(1).stop() failed: %s", e)
-    try:
-        if pygame.mixer.music.get_busy():
-            pygame.mixer.music.stop()
-        pygame.mixer.music.unload()
-    except Exception as e:
-        log.warning("Reset Settings: pygame.mixer.music stop/unload failed: %s", e)
-
-    _clear_last_video_frame()
-
-    app_state["is_playing_video"]            = False
-    app_state["active_music_track_file"]     = ""
-    app_state["music_owner"]                 = ""
-    app_state["guide_preview_music_track"]   = ""
-    app_state["last_scheduled_vis_track"]    = {}
-    app_state["persistent_track_pool_cache"] = ""
-    app_state["loaded_preview_path_cache"]   = ""
-    app_state["last_vlc_retry_at"]           = 0
-    app_state["last_video_play_started_at"]  = 0
-    if db is not None:
-        for _rc in list(db.channels_db.keys()):
-            _rc_info = db.channels_db[_rc]
-            _rc_info.pop("sched_cached_tracks",    None)
-            _rc_info.pop("marathon_anchor_epoch",  None)
-            _rc_info.pop("playback_log",           None)
-
-    try:
-        if vlc_engine is not None:
-            vlc_engine.set_volume(db.config.get("global_volume", 70), db.config.get("is_muted", False))
-    except Exception as vol_err:
-        log.warning(f"[SETTINGS] Could not reapply volume after reset: {vol_err}")
-
-    app_state["show_menu"]            = False
-    app_state["menu_shown_at"]        = 0
-    app_state["active_menu_tab"]      = "System"
-    app_state["menu_layer"]           = "TAB_SELECTION"
-    app_state["menu_selection_index"] = 0
-    app_state["show_splash"]          = db.config.get("show_controls_on_launch", True)
-    if app_state["show_splash"]:
-        _splash_now = pygame.time.get_ticks()
-        app_state["last_input_time"] = _splash_now
-        app_state["splash_shown_at"] = _splash_now
-    change_channel("05")
-    print("[SETTINGS] Full media clear complete — returned to first-launch state.")
+        log.error(f"[{tag}] unexpected error during shutdown cleanup -- exiting anyway: {e}", exc_info=True)
+    pygame.quit()
+    _hard_exit_process(0)
 
 
 # ============================================================================
@@ -25252,6 +26230,34 @@ def _guide_keep_highlight_in_view():
     _resync_guide_stop_after_row_switch()
 
 
+def _guide_snap_highlight_to_stop():
+    """Moves the guide highlight onto the stop that owns its time when that time is no longer a stop of the highlighted row's last drawing, so the highlight never sits on nothing or on a commercial break sliver."""
+    if not db:
+        return
+    _ch_str = str(app_state.get("selected_guide_channel", 5)).zfill(2)
+    _cached = get_cached_row_stops(_ch_str, expected_time_idx=get_current_guide_time_idx(app_state, db))
+    if _cached is None:
+        return
+    _stops = sorted(_cached[1] or [], key=lambda s: s.get("abs", 0))
+    if not _stops:
+        return
+    _target = app_state.get("guide_selected_abs_time")
+    if _target is not None and any(_s.get("abs") == _target for _s in _stops):
+        return
+    if _target is None:
+        _now_dt = broadcast_clock.now().replace(tzinfo=None)
+        _target = _now_dt.hour * 3600 + _now_dt.minute * 60 + _now_dt.second
+    _owning = [_s for _s in _stops if _s.get("abs", 0) <= _target]
+    _owner = max(_owning, key=lambda s: s.get("abs", 0)) if _owning else _stops[0]
+    _log_warn_throttled("guide_highlight_snapped",
+                        "[GUIDE] ch%s highlight time %s was on no stop of the row; moved to the stop at %s",
+                        _ch_str, app_state.get("guide_selected_abs_time"), _owner.get("abs"))
+    app_state["guide_selected_stop_key"] = _owner.get("key")
+    app_state["guide_selected_abs_time"] = _owner.get("abs")
+    app_state["guide_col_pos"] = min(_owner.get("col", 0), get_guide_num_cols(db) - 1)
+    _guide_dirty_event.set()
+
+
 # ============================================================================
 # SECTION: Standby & CRT power-off
 # ============================================================================
@@ -25325,6 +26331,125 @@ def _screensaver_step(x, y, vx, vy, dt, scr_w, scr_h, vis):
         y, vy = max_y, -abs(vy)
     return x, y, vx, vy
 
+
+# ============================================================================
+# SECTION: Health monitor
+# ============================================================================
+
+try:
+    # WARNING: the health monitor lives in the tests folder; the folder's empty __init__.py makes it importable here and lets the exe build find it.
+    from tests import health_monitor
+except Exception as _health_import_error:
+    health_monitor = None
+    log.warning("[HEALTH] could not import health_monitor, the health report is off for this run: %s", _health_import_error)
+
+_HEALTH_TIMED_MAIN = (
+    "calculate_slotted_playback_state", "change_channel", "_patch_probed_gain", "_save_file_probe_facts", "_read_file_probe_facts",
+    "_request_schedule_rebuild", "_sync_hub_rows_for_block", "_write_missed_blocks_to_hub", "_hub_future_for_channel",
+    "_probe_pending_schedule_one", "_store_pending_probe_results", "_picture_box_scan_one", "_decide_picture_box_before_show",
+    "_probe_loudness_guarded", "_probe_music_loudness_guarded", "_probe_and_persist_duration", "_warm_new_file_lengths",
+    "_confirm_playback_started", "_confirm_playback_failed", "_register_channel_playback_failure", "_mark_file_broken",
+    "_drop_media_from_pool", "_start_guide_preview_load", "_replace_wedged_vlc_engine", "render_tv_guide_async",
+    "guide_preload_tick", "_apply_static_noise_effect", "_draw_video_picture", "_store_last_video_frame",
+    "build_channel_timeline", "build_block_rotation", "build_raw_tracks", "build_pending_tracks", "build_commercial_tracks",
+    "reconcile_cached_lineup", "_probe_duration_seconds_fast", "get_media_duration", "get_media_loudness_gain",
+    "get_media_video_dimensions")
+_HEALTH_TIMED_MEDIA = (
+    "build_block_timeline", "build_channel_timeline", "build_block_rotation", "build_raw_tracks", "build_pending_tracks",
+    "build_commercial_tracks", "reconcile_cached_lineup", "read_track_duration", "_probe_duration_seconds_fast",
+    "get_media_duration", "get_media_loudness_gain", "get_media_video_dimensions")
+_HEALTH_INSTANCE_LOCKS = (
+    ("settings save", lambda: db, "_save_lock"), ("settings save request", lambda: db, "_save_request_lock"),
+    ("settings write", lambda: db, "_settings_write_lock"), ("channels", lambda: db, "_channels_lock"),
+    ("channels source", lambda: db, "_channels_source_lock"), ("settings runtime", lambda: db, "_runtime_lock"),
+    ("remote schedule", lambda: db, "_remote_schedule_lock"),
+    ("library database", lambda: getattr(getattr(sys.modules.get("media_library"), "_shared_probe_library", None), "library", None), "_lock"),
+    ("length hub", lambda: getattr(sys.modules.get("media_library"), "_shared_duration_hub", None), "_lock"),
+    ("gain hub", lambda: getattr(sys.modules.get("media_library"), "_shared_gain_hub", None), "_lock"),
+    ("file facts hub", lambda: getattr(sys.modules.get("media_library"), "_shared_file_facts_hub", None), "_lock"))
+_health_instance_locks_done = set()
+
+
+def _health_watch_instance_locks():
+    """Hands the settings' and the hubs' own locks to the health monitor once each exists; called at start and with every heartbeat until all are watched."""
+    if health_monitor is None or len(_health_instance_locks_done) == len(_HEALTH_INSTANCE_LOCKS):
+        return
+    for name, owner, attr in _HEALTH_INSTANCE_LOCKS:
+        if name in _health_instance_locks_done:
+            continue
+        try:
+            if health_monitor.watch_lock_attr(owner(), attr, name):
+                _health_instance_locks_done.add(name)
+        except Exception as e:
+            _health_instance_locks_done.add(name)
+            log.warning("[HEALTH] could not watch the %s lock: %s", name, e)
+
+
+def _health_loads_text():
+    """The channel load running now (its channel and age) and how many loads wait behind it."""
+    token = _activation_running["token"]
+    waiting = sum(1 for t in threading.enumerate() if t.name == "content-activate") - (1 if token is not None else 0)
+    if token is None or token.get("started") is None:
+        return "none running, %d waiting" % max(0, waiting)
+    return "ch%s running %.1fs, %d waiting" % (token["channel"], time.monotonic() - token["started"], max(0, waiting))
+
+
+def _health_pending_probe_text():
+    """The background length probe's requests, files asked for, files being probed, and results waiting to be stored."""
+    state = _pending_probe_state
+    return "%d request(s) %d file(s), %d probing, %d result(s) waiting" % (
+        len(state["requests"]), sum(len(r.get("paths", ())) for r in list(state["requests"].values())),
+        len(state["in_flight"]), len(state["results"]))
+
+
+def _health_station_text():
+    """How many channels are on and how many files their schedules hold in all."""
+    if db is None:
+        return "settings not loaded yet"
+    files = 0
+    for ch_info in list(db.channels_db.values()):
+        for items in list((ch_info.get("schedules") or {}).values()):
+            files += len(items) if isinstance(items, list) else 0
+    return "%d channel(s) on, %d file(s) in their schedules" % (_count_active_content_channels(db), files)
+
+
+def _start_health_monitor():
+    """Starts the health monitor and hands it the jobs to time, the locks, queues and stores to watch."""
+    if health_monitor is None:
+        return False
+    try:
+        if not health_monitor.start():
+            return False
+        _jobs = health_monitor.time_functions(globals(), _HEALTH_TIMED_MAIN)
+        _jobs += health_monitor.time_functions(vars(media), _HEALTH_TIMED_MEDIA)
+        _locks = health_monitor.watch_module_locks(globals())
+        _locks += health_monitor.watch_module_locks(vars(media), prefix="media.")
+        if sys.modules.get("media_library") is not None:
+            _locks += health_monitor.watch_module_locks(vars(sys.modules["media_library"]), prefix="media_library.")
+            health_monitor.watch_containers(vars(sys.modules["media_library"]), prefix="media_library.")
+        _health_watch_instance_locks()
+        health_monitor.watch_containers(globals())
+        health_monitor.watch_containers(vars(media), prefix="media.")
+        health_monitor.watch_value("station", _health_station_text)
+        health_monitor.watch_value("channel loads", _health_loads_text)
+        health_monitor.watch_value("background length probe", _health_pending_probe_text)
+        health_monitor.watch_value("VLC log lines waiting", lambda: _vlc_log_queue.qsize())
+        if globals().get("_log_queue") is not None:
+            health_monitor.watch_value("app log lines waiting", lambda: _log_queue.qsize())
+        health_monitor.watch_value("drives not responding", lambda: len(_unresponsive_drive_roots()))
+        health_monitor.watch_value("channels in failure", lambda: len(_channel_playback_failures))
+        health_monitor.watch_value("settings file", lambda: "%.1f MB" % (os.path.getsize(db.config_path) / 1048576.0) if db is not None and db.config_path and os.path.exists(db.config_path) else "unknown")
+        health_monitor.watch_value("length hub remembers", lambda: len(getattr(media.get_duration_hub(), "_memo", ())))
+        if performance_governor is not None:
+            health_monitor.watch_value("governor", performance_governor.health_snapshot)
+        log.info("[HEALTH] watching %d job(s) and %d lock(s); the settings' and hubs' own locks are added as they appear", _jobs, _locks)
+        return True
+    except Exception as e:
+        log.warning("[HEALTH] starting the health monitor failed, the health report is off for this run: %s", e)
+        return False
+
+
+_start_health_monitor()
 
 # ============================================================================
 # SECTION: Main loop
@@ -25442,10 +26567,11 @@ while True:
         if performance_governor is not None:
             performance_governor.set_game_active(_is_game_actively_playing())
         _log_frame_time_sample(_fgap_ms, app_state.get("current_channel"))
+        if health_monitor is not None:
+            health_monitor.explain_gap(_fgap_ms, "ch%s%s" % (app_state.get("current_channel"), ", guide open" if app_state.get("current_channel") == "04" else ""))
         if _fgap_ms >= 200:
-            _fgap_threads = ", ".join(
-                t.name for t in threading.enumerate() if t.is_alive()
-            )
+            _fgap_threads = (health_monitor.thread_groups_text() if health_monitor is not None
+                             else ", ".join(t.name for t in threading.enumerate() if t.is_alive()))
             log.warning(
                 "[FRAME GAP] iteration took %sms (top-of-loop to top-of-loop), "
                 "channel=%s, guide_open=%s, alive_threads=[%s]",
@@ -25464,6 +26590,7 @@ while True:
         print(f"[HEARTBEAT] main loop alive at {now_ticks}ms, "
               f"channel={app_state.get('current_channel')}, "
               f"fullscreen={app_state.get('is_fullscreen')}", flush=True)
+        _health_watch_instance_locks()
 
     if (sys.platform == "win32" and pygame_hwnd
             and app_state.get("is_fullscreen", False)
@@ -25501,6 +26628,7 @@ while True:
 
     if app_state["current_channel"] == "04":
         _guide_keep_highlight_in_view()
+        _guide_snap_highlight_to_stop()
         if (now_ticks >= app_state.get("guide_inactivity_timer", 0)
                 and not app_state.get("file_explorer_active", False)
                 and not app_state.get("show_menu", False)):
@@ -25612,6 +26740,7 @@ while True:
 
                 db.save_settings_async()
                 if newly_added_paths:
+                    _warm_new_file_lengths(newly_added_paths)
                     _queue_new_channel_first_show(target_ch)
                 
 
@@ -25725,6 +26854,10 @@ while True:
     # SECTION: Event handling
     # ========================================================================
 
+    try:
+        _picture_adjust_live_tick()
+    except Exception as _pic_tick_e:
+        _log_warn_throttled("picture_adjust_tick", "[PICTURE ADJUST] checking the Video tab values failed: %s", _pic_tick_e)
     _prof_mark("housekeeping")
     _nav_frame_begin = _menu_nav_frame_begin()
 
@@ -26291,11 +27424,7 @@ while True:
                         elif _cc_target == "commercial_media":
                             _cc_ch_str = app_state.get("clear_confirm_channel")
                             if _cc_ch_str:
-                                _cc_ch_info = db.channels_db.get(_cc_ch_str, {})
-                                _cc_ch_info.setdefault("schedules", {})["Commercials"] = []
-                                db.save_settings()
-                                invalidate_guide_cache()
-                                print(f"[CLEARED COMMERCIAL MEDIA] Channel {_cc_ch_str}.")
+                                _execute_commercial_media_clear(_cc_ch_str, db.channels_db.get(_cc_ch_str, {}))
                         elif _cc_target == "holiday_media":
                             _cc_ch_str = app_state.get("clear_confirm_channel")
                             if _cc_ch_str:
@@ -27265,44 +28394,7 @@ while True:
                                 app_state["clear_confirm_shown_at"] = now_ticks
                         elif is_enter and row_id == "exit_program":
                             log.info("[EXIT] Exit program chosen in Settings; shutting down")
-                            _app_shutting_down.set()
-                            try:
-                                try: media.request_media_shutdown()
-                                except Exception as e: log.warning(f"[EXIT] media shutdown signal failed: {e}")
-                                try:
-                                    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                                        pygame.mixer.music.stop()
-                                except Exception as e: log.warning(f"[EXIT] mixer music stop failed: {e}")
-                                if db is not None and getattr(db, "server_listener", None) is not None:
-                                    try: db.server_listener.stop()
-                                    except Exception as e: log.warning(f"[EXIT] server listener stop failed: {e}")
-                                try: _disconnect_remote_server("application closing")
-                                except Exception as e: log.warning(f"[EXIT] remote server disconnect failed: {e}")
-                                if vlc_engine is not None:
-                                    try: vlc_engine.stop()
-                                    except Exception as e: log.warning(f"[EXIT] vlc stop failed: {e}")
-                                    try: vlc_engine.close()
-                                    except Exception as e: log.warning(f"[EXIT] vlc close failed: {e}")
-                                if dvd_engine is not None:
-                                    try: dvd_engine.stop()
-                                    except Exception as e: log.warning(f"[EXIT] dvd engine stop failed: {e}")
-                                    try: dvd_engine.close()
-                                    except Exception as e: log.warning(f"[EXIT] dvd engine close failed: {e}")
-                                if game_deck is not None and hasattr(game_deck, "shutdown_deck"):
-                                    try: game_deck.shutdown_deck()
-                                    except Exception as e: log.warning(f"[EXIT] game_deck shutdown failed: {e}")
-                                if db is not None:
-                                    _exit_ch = app_state.get("current_channel", "05")
-                                    if _exit_ch not in ("03", "04"):
-                                        db.config["last_channel"] = _exit_ch
-                                    try: db.save_settings()
-                                    except Exception as e: log.warning(f"[EXIT] save_settings failed: {e}")
-                                if db is not None and db.config.get("start_on_boot", False):
-                                    _launch_explorer_fallback()
-                            except Exception as e:
-                                log.error(f"[EXIT] unexpected error during shutdown cleanup -- exiting anyway: {e}", exc_info=True)
-                            pygame.quit()
-                            _hard_exit_process(0)
+                            _exit_program("EXIT")
                         elif is_enter and row_id == "poweroff":
                             app_state["show_clear_confirm"]     = True
                             app_state["clear_confirm_selection"] = "No"
@@ -27597,10 +28689,10 @@ while True:
                         continue
 
                     _reactive_mode_available = (performance_governor.get_mode() if performance_governor is not None else "lite") in ("standard", "performance")
-                    if is_music_mode and sub_row == 3 and not _reactive_mode_available and event.key in (pygame.K_a, pygame.K_d):
+                    if is_music_mode and sub_row == 5 and not _reactive_mode_available and event.key in (pygame.K_a, pygame.K_d):
                         continue
 
-                    if is_music_mode and sub_row == 3 and ch_info.get("reactive_visualizer_enabled", True) and event.key in (pygame.K_a, pygame.K_d):
+                    if is_music_mode and sub_row == 5 and ch_info.get("reactive_visualizer_enabled", True) and event.key in (pygame.K_a, pygame.K_d):
                         # WARNING: this slider must move exactly like the Video and Theme sliders: the same SLIDER_STEP and rule (menu_nav.reactive_strength_adjust), the same step gate, and the same deferred save; the menu picture redraws at once because _channel_menu_fingerprint in ui.py includes this value.
                         if not menu_nav.step_ready(app_state.setdefault("_step_gate", {}), "reactive_strength", now_ticks):
                             continue
@@ -27609,7 +28701,7 @@ while True:
                             _mark_settings_dirty()
                         continue
 
-                    if is_music_mode and sub_row == 4 and event.key in (pygame.K_a, pygame.K_d):
+                    if is_music_mode and sub_row == 3 and event.key in (pygame.K_a, pygame.K_d):
                         # WARNING: with Loudness Scan off no gain is played, so the gain row is greyed and cannot be changed; the owner could not hear what a change does.
                         if not db.config.get("loudness_scan_enabled", True):
                             continue
@@ -27649,12 +28741,13 @@ while True:
                         if sub_row == 4 and sub_col == 2 and not is_music_mode and ch_info.get("active", True):
                             from game_deck import DVD_SPLASH_IMAGE_EXTS
                             os.makedirs(WATERMARK_BASE_DIR, exist_ok=True)
+                            _wm_now = _channel_watermark_path(target_ch_str)
                             _fe_open(
                                 f"Select Channel {target_ch_str} Watermark",
                                 DVD_SPLASH_IMAGE_EXTS,
                                 {"mode": "watermark_select", "channel": target_ch_str}
                             )
-                            _fe_navigate(os.path.join(WATERMARK_BASE_DIR, f"Channel {target_ch_str}"))
+                            _fe_navigate(os.path.dirname(_wm_now) if _wm_now else os.path.join(WATERMARK_BASE_DIR, f"Channel {target_ch_str}"))
                             continue
                         # WARNING: on a TV channel that is on, the bottom row holds two buttons: column 0 is Clear All Scheduled Media (handled further down) and column 3 is Close; a music or off channel has only Close there.
                         if sub_row == max_close_row and not ((not is_music_mode) and ch_info.get("active", True) and sub_col == 0):
@@ -27692,7 +28785,7 @@ while True:
                             active_block = "Morning"
                             
                             if is_music_mode:
-                                if sub_row == 2:
+                                if sub_row == 4:
                                     if (performance_governor.get_mode() if performance_governor is not None else "lite") not in ("standard", "performance"):
                                         continue
                                     ch_info["reactive_visualizer_enabled"] = not ch_info.get("reactive_visualizer_enabled", True)
@@ -27721,9 +28814,9 @@ while True:
                                         print(f"[VISUALIZER STYLE] Cycled forward to style: {ch_info['visualizer_style']}")
                                         db.save_settings()
                                     continue
-                                elif sub_row in (3, 4):
+                                elif sub_row in (3, 5):
                                     continue
-                                elif sub_row == 5:
+                                elif sub_row == 2:
                                     active_block = "Music Tracks"
                                 elif sub_row == 6:
                                     _has_music_content = len(ch_info.get("schedules", {}).get("Music Tracks", [])) > 0
@@ -27824,10 +28917,7 @@ while True:
                                         _open_audio_track_picker(target_ch_str)
                                     continue
                                 elif sub_row == max_close_row:
-                                    _sched_keys_all = ["Morning", "Commercials", "Evening", "Intros", "Night",
-                                                        "Outros", "Marathon", "Full Day"] + list(SIX_HOUR_BLOCK_NAMES)
-                                    _has_sched_content = any(len(ch_info.get("schedules", {}).get(k, [])) > 0 for k in _sched_keys_all)
-                                    if _has_sched_content:
+                                    if media.channel_has_clearable_media(ch_info):
                                         app_state["show_clear_confirm"]    = True
                                         app_state["clear_confirm_selection"] = "No"
                                         app_state["clear_confirm_target"]  = "channel_schedule"
@@ -27950,6 +29040,9 @@ while True:
                         continue
                     if menu_nav.is_accept(event.key):
                         if sub_row == menu_nav.HOLIDAY_CLEAR_ROW:
+                            # WARNING: every Clear Media button works the same way: greyed and doing nothing when there is nothing to clear, else the Yes/No popup (owner 2026-11-03).
+                            if not any(len(v or []) > 0 for v in (db.channels_db.get(target_ch_str, {}).get("holiday_schedules") or {}).values()):
+                                continue
                             app_state["show_clear_confirm"] = True
                             app_state["clear_confirm_selection"] = "No"
                             app_state["clear_confirm_target"] = "holiday_media"
@@ -27981,6 +29074,8 @@ while True:
                         continue
                     if menu_nav.is_accept(event.key):
                         if sub_row == menu_nav.COMMERCIALS_CLEAR_ROW:
+                            if not any(len(ch_info.get("schedules", {}).get(k, [])) > 0 for k in COMMERCIAL_SUB_MENU_KEYS):
+                                continue
                             app_state["show_clear_confirm"] = True
                             app_state["clear_confirm_selection"] = "No"
                             app_state["clear_confirm_target"] = "commercial_media"
@@ -28138,13 +29233,14 @@ while True:
                             import os as _os
                             emu_folder = _os.path.join(resolve_main_dir(), "cores", console_key)
                             _os.makedirs(emu_folder, exist_ok=True)
+                            _active_core = _fe_active_core_path(console_key)
                             pygame.mixer.Channel(1).stop()
                             _fe_open(
                                 f"Select Libretro Core (.dll) — {console_key}",
                                 {".dll"},
-                                {"mode": "libretro_core", "console_key": console_key, "emu_folder": emu_folder}
+                                {"mode": "libretro_core", "console_key": console_key}
                             )
-                            _fe_navigate(emu_folder)
+                            _fe_navigate(_os.path.dirname(_active_core) if _active_core else emu_folder)
                         elif row_id == "multitap_toggle":
                             from game_deck import MULTITAP_CONSOLES
                             enabled = not db.config.get("multitap_enabled_global", False)
@@ -28217,14 +29313,10 @@ while True:
                         elif row_id == "splash_toggle":
                             if console_key == "DVD":
                                 enabled = not db.config.get("dvd_splash_enabled", False)
-                                db.config["dvd_splash_enabled"] = enabled
                             else:
-                                _cse = db.config.setdefault("console_splash_enabled", {})
-                                enabled = not _cse.get(console_key, False)
-                                _cse[console_key] = enabled
-                            db.save_settings()
+                                enabled = not db.config.get("console_splash_enabled", {}).get(console_key, False)
+                            _set_splash_enabled(console_key, enabled)
                             if game_deck is not None: game_deck.refresh_from_config(db.config)
-                            print(f"[GAMES] {console_key} splash screen enabled = {enabled}")
                         elif row_id == "splash_select_image":
                             _splash_is_on = (db.config.get("dvd_splash_enabled", False) if console_key == "DVD"
                                               else db.config.get("console_splash_enabled", {}).get(console_key, False))
@@ -28262,13 +29354,14 @@ while True:
                                 import os as _os
                                 _os.makedirs(bios_dir, exist_ok=True)
                                 pygame.mixer.Channel(1).stop()
+                                _active_bios = _fe_active_bios_path(console_key)
                                 _fe_open(
                                     f"Add BIOS — {console_key}",
                                     {".bin"} | set(ARCHIVE_EXTS),
-                                    {"mode": "add_bios", "console_key": console_key, "bios_dir": bios_dir}
+                                    {"mode": "add_bios", "console_key": console_key}
                                 )
-                                # WARNING: always land in the console's own BIOS folder, not the last-browsed folder.
-                                _fe_navigate(bios_dir)
+                                # WARNING: land where the active BIOS sits, else the console's own BIOS folder, never the last-browsed folder.
+                                _fe_navigate(_os.path.dirname(_active_bios) if _active_bios else bios_dir)
                         elif row_id == "menu_bg_select_image":
                             import os as _os
                             from game_deck import DVD_SPLASH_IMAGE_EXTS
@@ -28892,8 +29985,13 @@ while True:
     _surf_quiet = _surf_origin_active()
 
     app_state["_video_painted_this_frame"] = False
+    app_state["_held_frame_drawn_this_frame"] = False
 
     _real_screen = screen
+    if (globals().get("_virtual_screen_surf") is not None
+            and globals()["_virtual_screen_surf"].get_locked()
+            and _surface_lock_event(globals()["_virtual_screen_surf"], "virtual screen")):
+        globals()["_virtual_screen_surf"] = None
     if (globals().get("_virtual_screen_surf") is None
             or globals()["_virtual_screen_surf"].get_size() != (w_w, w_h)):
         globals()["_virtual_screen_surf"] = pygame.Surface((w_w, w_h))
@@ -29068,12 +30166,12 @@ while True:
 
                     # WARNING: stamp this before the call; see the mid-stream content-change race note in change_channel().
                     app_state["last_video_play_started_at"] = pygame.time.get_ticks()
-                    vlc_engine.play_file_segmented(
-                        _bg_next["file"], _bg_next.get("seek", 0),
-                        gain=_lookup_file_gain(_bg_ch, _bg_next["file"]),
-                        defer_unmute=True,
-                        on_confirmed=_bg_on_confirmed,
-                    )
+                    _bg_file, _bg_seek = _bg_next["file"], _bg_next.get("seek", 0)
+                    _bg_gain = _lookup_file_gain(_bg_ch, _bg_file)
+                    # WARNING: opens on the content-activate thread like a tune, so a picture-box wait never freezes the menu or guide drawn over it (N5).
+                    _dispatch_content_activation(
+                        lambda _f=_bg_file, _sk=_bg_seek, _g=_bg_gain, _cb=_bg_on_confirmed:
+                            vlc_engine.play_file_segmented(_f, _sk, gain=_g, defer_unmute=True, on_confirmed=_cb, follow_clock=True))
                 else:
                     try:
                         vlc_engine.stop(block=False)
@@ -29304,6 +30402,7 @@ while True:
                                 gain=_lookup_file_gain(_resume_ch_key, str(_anchor["file"])),
                                 defer_unmute=False,
                                 on_confirmed=_resume_on_confirmed,
+                                follow_clock=True,
                             )
                         except Exception as e:
                             log.warning("WATCHDOG: spurious-blip resume failed for ch%s: %s", ch, e)
@@ -29424,17 +30523,19 @@ while True:
                                                   reason="mid_stream_content_change_open_failed")
 
                 app_state["last_video_play_started_at"] = pygame.time.get_ticks()
-                vlc_engine.play_file_segmented(
-                    current_playback_state["file"], _resume_seek,
-                    gain=_lookup_file_gain(ch, current_playback_state["file"]),
-                    defer_unmute=True,
-                    on_confirmed=_ms_on_confirmed,
-                )
-                vlc_engine.set_volume(db.config["global_volume"], db.config.get("is_muted", False))
-                try:
-                    vlc_engine.player.audio_set_mute(True)
-                except Exception as _swallowed_error:
-                    _log_swallowed("main script: vlc_engine.player.audio_set_mute(True)", _swallowed_error)
+                _ms_file = current_playback_state["file"]
+                _ms_gain = _lookup_file_gain(ch, _ms_file)
+
+                def _ms_open(_file=_ms_file, _seek=_resume_seek, _gain=_ms_gain, _cb=_ms_on_confirmed):
+                    vlc_engine.play_file_segmented(_file, _seek, gain=_gain, defer_unmute=True, on_confirmed=_cb, follow_clock=True)
+                    vlc_engine.set_volume(db.config["global_volume"], db.config.get("is_muted", False))
+                    try:
+                        vlc_engine.player.audio_set_mute(True)
+                    except Exception as _swallowed_error:
+                        _log_swallowed("main script: vlc_engine.player.audio_set_mute(True)", _swallowed_error)
+
+                # WARNING: the next item of a channel on air opens on the content-activate thread like a tune; opened here its picture-box wait froze the picture 2 to 4 s mid-break (owner log 2026-11-02 21:59, N5).
+                _dispatch_content_activation(_ms_open)
         except Exception as e:
             log.warning(f"[SCHEDULE] Mid-stream resync check failed: {e}")
 
@@ -29586,21 +30687,20 @@ while True:
                 _draw_channel_failure_message(screen, _full_window_rect, str(ch).zfill(2))
             elif vlc_engine is not None:
                 try:
+                    _vd_t0 = time.perf_counter()
                     vlc_bytes = vlc_engine.get_display_frame()
                     if vlc_bytes is not None and len(vlc_bytes) >= vlc_engine.buf_size:
                         _note_fresh_live_video_frame(ch)
+                        _vd_t1 = time.perf_counter()
                         video_surf = pygame.image.frombuffer(vlc_bytes, (vlc_engine.width, vlc_engine.height), "BGRA")
                         video_surf = _true_content_surf(video_surf, vlc_engine)
                         _picture_box_set_content(current_playback_state.get("file", ""))
                         video_surf, _pb_aspect = _apply_picture_box_crop(video_surf)
                         if video_surf.get_width() > 0 and video_surf.get_height() > 0:
                             
-                            brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
-
-                            if fx_active:
-                                effected_surf = apply_video_effects(video_surf, brightness, contrast, color_sat, sharpness, tint)
-                            else:
-                                effected_surf = video_surf
+                            # WARNING: the Video tab's adjustments are drawn by VLC itself (_picture_adjust_media_options); adding the CPU pass here would apply them twice.
+                            effected_surf = video_surf
+                            _vd_t2 = time.perf_counter()
 
                             _pan_scan_set_content(current_playback_state.get("file", ""))
                             _video_sa = _snap_standard_aspect(_pb_aspect or (video_surf.get_width() / video_surf.get_height()))
@@ -29609,11 +30709,13 @@ while True:
                                     or _video_target_rect.height < content_rect.height):
                                 screen.fill(_video_bar_color(), content_rect)
                             _real_blit_geom = {}
+                            _vd_t3 = time.perf_counter()
                             _draw_video_picture(screen, effected_surf, _video_target_rect,
                                                 mode=_bezel_video_fit_mode(),
                                                 analysis_surf=video_surf, geom_out=_real_blit_geom,
                                                 pixel_aspect=_video_pixel_aspect(w_w, w_h, _video_sa),
                                                 fit_aspect=_video_sa)
+                            _vd_t4 = time.perf_counter()
                             _rbg_key = (tuple(content_rect), tuple(_video_target_rect),
                                         video_surf.get_size(), tuple(sorted(_real_blit_geom.items())) if _real_blit_geom else None)
                             if _real_video_blit_log_state.get("key") != _rbg_key:
@@ -29627,6 +30729,8 @@ while True:
                                           if _real_blit_geom.get("draw_w") and _real_blit_geom.get("draw_h") else None),
                                          _video_target_rect.width / _video_target_rect.height if _video_target_rect.height else 0)
                             _store_last_video_frame(effected_surf, raw_surf=video_surf, context="fullscreen", fit_aspect=_video_sa)
+                            _note_video_draw_timing(_vd_t1 - _vd_t0, _vd_t2 - _vd_t1, _vd_t3 - _vd_t2, _vd_t4 - _vd_t3,
+                                                    time.perf_counter() - _vd_t4, current_playback_state.get("mode", ""))
                             app_state["_video_painted_this_frame"] = True
                         else:
                             if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
@@ -29643,11 +30747,8 @@ while True:
                 screen.fill(COLOR_TRANSITION_GREY)
                 
         elif current_playback_state["mode"] == "Static":
-            if _static_visual_is_grey(("live", str(ch))):
-                # WARNING: the grey screen is still Static on air, so its noise keeps playing (the play below in the Static sound section); stopping it here fought that play every frame and cut the sound.
-                screen.fill(COLOR_TRANSITION_GREY)
-            else:
-                _render_transition_static(screen, _full_window_rect)
+            # WARNING: the grey screen is still Static on air, so its noise keeps playing; stopping it here fought the play in the Static sound section every frame and cut the sound.
+            _draw_static_channel(screen, _full_window_rect, ("live", str(ch)))
             _static_reason = current_playback_state.get("reason")
             if (_static_reason and _static_reason not in SILENT_STATIC_REASONS
                     and _static_banner_ready(("live", str(ch)), _static_reason)):
@@ -29772,12 +30873,7 @@ while True:
                         video_surf, _pv_pb_aspect = _apply_picture_box_crop(video_surf)
                         _pv_fit_aspect = _snap_standard_aspect(
                             _pv_pb_aspect or (video_surf.get_width() / video_surf.get_height()))
-                        brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
-
-                        if fx_active:
-                            processed_surf = apply_video_effects(video_surf, brightness, contrast, color_sat, sharpness, tint)
-                        else:
-                            processed_surf = video_surf
+                        processed_surf = video_surf
                         _draw_video_picture(
                             screen, processed_surf, pygame.Rect(px, py, pw, ph),
                             mode=_bezel_video_fit_mode(),
@@ -29964,7 +31060,8 @@ while True:
 
                     brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
 
-                    if fx_active:
+                    # WARNING: with the graphics-card drawing step the Video tab settings are applied to the whole preview window there; doing them here too would apply them twice.
+                    if fx_active and not _gpu_draws_picture_settings():
                         processed_mini = apply_video_effects(mini, brightness, contrast, color_sat, sharpness, tint)
                         screen.blit(processed_mini, (px, py))
                     else:
@@ -30048,7 +31145,11 @@ while True:
                 app_state["loaded_preview_path_cache"] = ""
             if (hl_state["mode"] == "Static"
                     or (_guide_transition_style == "static" and _ch04_preview_static_visual_active)):
-                _render_transition_static(screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
+                if hl_state["mode"] == "Static":
+                    # WARNING: one look for a channel on Static, the station's and the guide's (owner 2026-11-02, N8: "dont fix one, remove one and have the call from the same source").
+                    _draw_static_channel(screen, pygame.Rect(px, py, pw, ph), ("guide", str(hl_ch)), target_aspect=16.0 / 9.0)
+                else:
+                    _render_transition_static(screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
 
                 if hl_state["mode"] == "Static":
                     _draw_static_reason_banner(
@@ -30206,12 +31307,7 @@ while True:
                             _picture_box_set_content(current_playback_state.get("file", ""))
                             video_surf, _pb_aspect = _apply_picture_box_crop(video_surf)
 
-                            brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
-
-                            if fx_active:
-                                processed_surf = apply_video_effects(video_surf, brightness, contrast, color_sat, sharpness, tint)
-                            else:
-                                processed_surf = video_surf
+                            processed_surf = video_surf
                             _pan_scan_set_content(current_playback_state.get("file", ""))
                             _video_sa = _snap_standard_aspect(_pb_aspect or (video_surf.get_width() / video_surf.get_height()))
                             _video_target_rect = _video_screen_mode_rect(content_rect, w_w, w_h, source_aspect=_video_sa)
@@ -30443,7 +31539,8 @@ while True:
                     
                     brightness, contrast, color_sat, sharpness, tint, fx_active = _get_video_effects(db)
                     
-                    if fx_active:
+                    # WARNING: with the graphics-card drawing step the Video tab settings are applied to the whole picture there; doing them here too would apply them twice.
+                    if fx_active and not _gpu_draws_picture_settings():
                         processed_surf = apply_video_effects(vis_surf, brightness, contrast, color_sat, sharpness, tint)
                         _blit_video_with_screen_mode(screen, processed_surf, _vis_fixed_rect)
                     else:
@@ -30541,8 +31638,10 @@ while True:
             _static_live_tv = _is_live_tv_broadcast_channel(_static_cur_ch)
             _static_ch_info = db.channels_db.get(str(_static_cur_ch).zfill(2), {}) if _static_live_tv else {}
             _static_transition_over = _channel_transition_over()
+            # WARNING: a held picture (a freeze, an advance or a stall) keeps its Static Noise like the moving picture; dropping it showed a clean frozen picture (owner 2026-11-02 23:12).
             _static_content_active = _static_transition_over and (
                 (app_state.get("is_playing_video", False) and app_state.get("_had_first_frame_this_tune", False))
+                or app_state.get("_held_frame_drawn_this_frame", False)
                 or (_static_ch_info.get("is_visualizer", False)
                     and pygame.mixer.music.get_busy())
             )
@@ -30560,6 +31659,7 @@ while True:
             _lines_transition_over = _channel_transition_over()
             _lines_content_active = _lines_transition_over and (
                 (app_state.get("is_playing_video", False) and app_state.get("_had_first_frame_this_tune", False))
+                or app_state.get("_held_frame_drawn_this_frame", False)
                 or (_lines_ch_info.get("is_visualizer", False) and pygame.mixer.music.get_busy())
             )
             if (_lines_live_tv
@@ -30591,6 +31691,11 @@ while True:
             _transition_style_cap = db.config.get("transition_type", "black") if db is not None else "black"
             if _transition_style_cap == "static":
                 _render_transition_static(screen, _full_window_rect)
+    try:
+        _take_picture_layer(screen)
+    except Exception as _pic_layer_err:
+        _picture_layer_state.update(rect=None, taken=False)
+        _log_warn_throttled("picture_layer", "[PICTURE ADJUST] could not mark the broadcast picture, the Video tab settings skip this frame: %s" % _pic_layer_err)
 
     _prof_mark("overlays")
 
@@ -31111,18 +32216,9 @@ while True:
             rs_surf.blit(lbl_setup_warning, (box_x + (box_w // 2) - (lbl_setup_warning.get_width() // 2), box_y + padding_y3))
             
             current_choice = app_state.get("restart_confirm_selection", "No")
-            yes_color = NEON_GREEN if current_choice == "Yes" else TEXT_WHITE
-            no_color = NEON_GREEN if current_choice == "No" else TEXT_WHITE
-            
-            lbl_yes = font_sm.render("[ YES ]", True, yes_color)
-            lbl_no  = font_sm.render("[ NO ]", True, no_color)
-            
             button_y = box_y + (135 if w_w >= native_box_w else max(25, int(135 * scale_factor)))
-            yes_x = box_x + int(box_w * 0.25) - (lbl_yes.get_width() // 2)
-            no_x  = box_x + int(box_w * 0.75) - (lbl_no.get_width() // 2)
-            
-            rs_surf.blit(lbl_yes, (yes_x, button_y))
-            rs_surf.blit(lbl_no, (no_x, button_y))
+            # WARNING: every Yes/No popup draws its buttons through ui.draw_popup_yes_no: Yes green on the left, No red on the right (owner 2026-11-03).
+            draw_popup_yes_no(rs_surf, box_x + box_w // 2, button_y, current_choice, True, font_sm, NEON_GREEN)
             
             time_left_sec = max(0, 20 - int(elapsed_popup_ms / 1000.0))
             lbl_foot = font_sm.render(f"AUTO-CLOSE IN {time_left_sec}S TO REVERT", True, ACTION_RED)

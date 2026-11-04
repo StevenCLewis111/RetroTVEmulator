@@ -51,6 +51,8 @@ class GateSettings:
     failure_limit: int
     lost_limit: int
     retry_cooldown_s: float
+    target_width: int = 960
+    target_height: int = 540
 
 
 @dataclass(frozen=True)
@@ -169,8 +171,11 @@ def prepare_self_check(width: int, height: int, effects: FrameParams, settings: 
     for plan in (plan_inset, plan_full):
         if not scale_supported(plan):
             raise SelfCheckError("self-check picture %dx%d cannot be scaled to %dx%d" % (cw, ch, plan.draw_w, plan.draw_h))
-    warp_params = dataclasses.replace(effects, width=cw, height=ch, warp=True, scan_mode=SCAN_BLOOM)
-    plain_params = dataclasses.replace(effects, width=cw, height=ch, warp=False, scan_mode=SCAN_PLAIN)
+    # WARNING: the picture settings are checked with these fixed values on the left three quarters of the check picture, never the Video tab's own, so changing a Video tab value never builds a new reference (N7).
+    picture = dict(picture_on=True, bright_offset=12.75, contrast_gain=1.2, saturation_gain=1.1, tint_shift=3.0,
+                   picture_rect=(0, 0, (3 * cw) // 4, ch))
+    warp_params = dataclasses.replace(effects, width=cw, height=ch, warp=True, scan_mode=SCAN_BLOOM, sharpen_amount=0.2, **picture)
+    plain_params = dataclasses.replace(effects, width=cw, height=ch, warp=False, scan_mode=SCAN_PLAIN, sharpen_amount=0.0, **picture)
     power_on = PowerOn(0, 0, bw, bh, bh // 4, (3 * bh) // 4, 60)
     bar_color = (20, 10, 30)
     cases = []
@@ -248,6 +253,7 @@ class GPUGate:
         self._prepared = None
         self._prep_thread = None
         self._prep_error = None
+        self._shaders_compiled = False
 
     # ========================================================================
     # SECTION: State
@@ -275,11 +281,19 @@ class GPUGate:
             return None
         if not self._ensure_backend():
             return None
-        prepared = self._prepared_check(width, height, effects)
+        check_effects = self._check_effects(effects)
+        prepared = self._prepared_check(self._settings.target_width, self._settings.target_height, check_effects)
         if prepared is None:
             return None
-        self._open(hwnd, width, height, effects, template, prepared)
+        self._open(hwnd, width, height, check_effects, template, prepared)
         return self._pipeline if self._state == STATE_READY else None
+
+    def _check_effects(self, effects: FrameParams) -> FrameParams:
+        """The effect values the self-check is built for: the frame's own, at the gate's fixed check size and scanline count, so the one check made at the first open serves every window size of the run (N7)."""
+        # WARNING: the self-check proves the shaders draw what the NumPy twin draws; that does not depend on the window's size, so a window size change must never build a new reference (it took 8.7 s on a weak PC while the CPU drew the picture).
+        return dataclasses.replace(effects, width=self._settings.target_width, height=self._settings.target_height,
+                                   scan_lines=FrameParams.scan_lines, picture_on=False, bright_offset=0.0, contrast_gain=1.0,
+                                   saturation_gain=1.0, tint_shift=0.0, sharpen_amount=0.0, picture_rect=(0, 0, 0, 0))
 
     def _ensure_backend(self) -> bool:
         if self._backend is not None:
@@ -318,10 +332,11 @@ class GPUGate:
             prepared = prepare_self_check(width, height, effects, self._settings)
             shader_ms = 0.0
             precompile = self._backend.precompile
-            if precompile is not None:
+            if precompile is not None and not self._shaders_compiled:
                 started = time.perf_counter()
                 try:
                     precompile()
+                    self._shaders_compiled = True
                     shader_ms = (time.perf_counter() - started) * 1000.0
                 except Exception as exc:
                     log.warning("[GPU GATE] compiling the shaders in the background failed, the open will compile them: %s", exc)
@@ -339,7 +354,10 @@ class GPUGate:
             device_done = self._clock()
             pipeline = backend.pipeline_class(core)
             shaders_done = self._clock()
+            # WARNING: the check is drawn at the fixed check size and the back buffer is put back to the window's size before the first real frame.
+            core.resize(prepared.width, prepared.height)
             results = run_self_check(core, pipeline, effects, self._settings, template, prepared)
+            core.resize(width, height)
         except SelfCheckError as exc:
             self._teardown(core, pipeline)
             self._disable("self-check failed: %s" % exc)

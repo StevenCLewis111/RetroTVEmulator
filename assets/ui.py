@@ -3,6 +3,7 @@
 WARNING: guide and menu canvases are filled with (1, 1, 1), never pure black. (0, 0, 0) is the
 game-overlay transparency key.
 """
+import os
 import pygame
 import logging
 import threading
@@ -39,20 +40,31 @@ COLOR_TEXT_WHITE = performance_governor.COLOR_TEXT_WHITE if performance_governor
 COLOR_ARCADE_GOLD = performance_governor.COLOR_ARCADE_GOLD if performance_governor is not None else (255, 220, 0)
 COLOR_ACTION_RED = performance_governor.COLOR_ACTION_RED if performance_governor is not None else (255, 60, 60)
 COLOR_SCREEN_BLACK = performance_governor.COLOR_SCREEN_BLACK if performance_governor is not None else (1, 1, 1)
-COLOR_MENU_BUTTON = performance_governor.COLOR_MENU_BUTTON if performance_governor is not None else (25, 45, 80)
+COLOR_MENU_BUTTON = performance_governor.COLOR_MENU_BUTTON if performance_governor is not None else (40, 78, 145)
 COLOR_MENU_BUTTON_GREYED = performance_governor.COLOR_MENU_BUTTON_GREYED if performance_governor is not None else (32, 32, 40)
 COLOR_MENU_TEXT_GREYED = performance_governor.COLOR_MENU_TEXT_GREYED if performance_governor is not None else (105, 105, 115)
-COLOR_MENU_BUTTON_BLUE = performance_governor.COLOR_MENU_BUTTON_BLUE if performance_governor is not None else (45, 80, 130)
-COLOR_MENU_BUTTON_BLUE_DIM = performance_governor.COLOR_MENU_BUTTON_BLUE_DIM if performance_governor is not None else (35, 60, 95)
+COLOR_MENU_BUTTON_BLUE = performance_governor.COLOR_MENU_BUTTON_BLUE if performance_governor is not None else (40, 78, 145)
+COLOR_MENU_BUTTON_BLUE_DIM = performance_governor.COLOR_MENU_BUTTON_BLUE_DIM if performance_governor is not None else (32, 58, 105)
 COLOR_MENU_ON_BLUE = performance_governor.COLOR_MENU_ON_BLUE if performance_governor is not None else (40, 100, 180)
 COLOR_MENU_ON_BLUE_EDGE = performance_governor.COLOR_MENU_ON_BLUE_EDGE if performance_governor is not None else (60, 140, 220)
 COLOR_MENU_OFF_BUTTON = performance_governor.COLOR_MENU_OFF_BUTTON if performance_governor is not None else (35, 45, 60)
 COLOR_MENU_OFF_RED = performance_governor.COLOR_MENU_OFF_RED if performance_governor is not None else (220, 53, 69)
 COLOR_MENU_ON_GREEN = performance_governor.COLOR_MENU_ON_GREEN if performance_governor is not None else (40, 167, 69)
+COLOR_BUTTON_CLOSE = performance_governor.COLOR_BUTTON_CLOSE if performance_governor is not None else (220, 53, 69)
+COLOR_BUTTON_NO = performance_governor.COLOR_BUTTON_NO if performance_governor is not None else (220, 53, 69)
+COLOR_BUTTON_YES = performance_governor.COLOR_BUTTON_YES if performance_governor is not None else (40, 167, 69)
+COLOR_BUTTON_CLEAR = performance_governor.COLOR_BUTTON_CLEAR if performance_governor is not None else (130, 28, 38)
+COLOR_BUTTON_ADD = performance_governor.COLOR_BUTTON_ADD if performance_governor is not None else (22, 100, 42)
+COLOR_BUTTON_TOGGLE_ADD = performance_governor.COLOR_BUTTON_TOGGLE_ADD if performance_governor is not None else (0, 0, 0)
+COLOR_BUTTON_AUDIO_TRACK = performance_governor.COLOR_BUTTON_AUDIO_TRACK if performance_governor is not None else (230, 190, 40)
+COLOR_BUTTON_AUDIO_TRACK_TEXT = performance_governor.COLOR_BUTTON_AUDIO_TRACK_TEXT if performance_governor is not None else (20, 20, 20)
+MENU_CLOSE_BUTTON_PLACE = performance_governor.MENU_CLOSE_BUTTON_PLACE if performance_governor is not None else (25, 52, 110, 40)
+MENU_CLEAR_BUTTON_PLACE = performance_governor.MENU_CLEAR_BUTTON_PLACE if performance_governor is not None else (25, 52, 240, 40)
+POPUP_YES_NO_OFFSET = performance_governor.POPUP_YES_NO_OFFSET if performance_governor is not None else 100
+POPUP_YES_NO_SIZE = performance_governor.POPUP_YES_NO_SIZE if performance_governor is not None else (110, 36)
 COLOR_MENU_SWITCH_OFF = performance_governor.COLOR_MENU_SWITCH_OFF if performance_governor is not None else (45, 65, 100)
 COLOR_MENU_SWITCH_GREYED = performance_governor.COLOR_MENU_SWITCH_GREYED if performance_governor is not None else (35, 35, 45)
 COLOR_MENU_TRACK_OFF = performance_governor.COLOR_MENU_TRACK_OFF if performance_governor is not None else (55, 55, 60)
-COLOR_MENU_ROW_OFF = performance_governor.COLOR_MENU_ROW_OFF if performance_governor is not None else (35, 35, 35)
 COLOR_MENU_VALUE_MINT = performance_governor.COLOR_MENU_VALUE_MINT if performance_governor is not None else (200, 255, 200)
 COLOR_MENU_DISABLED_GREY = performance_governor.COLOR_MENU_DISABLED_GREY if performance_governor is not None else (100, 100, 100)
 COLOR_MENU_TEXT_DISABLED_LIGHT = performance_governor.COLOR_MENU_TEXT_DISABLED_LIGHT if performance_governor is not None else (140, 140, 140)
@@ -76,10 +88,6 @@ COLOR_MENU_LOCKED_SWITCH_KNOB = performance_governor.COLOR_MENU_LOCKED_SWITCH_KN
 COLOR_MENU_KNOB_GREYED = performance_governor.COLOR_MENU_KNOB_GREYED if performance_governor is not None else (80, 80, 90)
 COLOR_MENU_TOGGLE_GREYED = performance_governor.COLOR_MENU_TOGGLE_GREYED if performance_governor is not None else (22, 22, 30)
 COLOR_MENU_TOGGLE_GREYED_EDGE = performance_governor.COLOR_MENU_TOGGLE_GREYED_EDGE if performance_governor is not None else (150, 150, 170)
-COLOR_MENU_HOLIDAY_ROW = performance_governor.COLOR_MENU_HOLIDAY_ROW if performance_governor is not None else (30, 50, 90)
-COLOR_MENU_CLEAR_BUTTON = performance_governor.COLOR_MENU_CLEAR_BUTTON if performance_governor is not None else (80, 30, 30)
-COLOR_MENU_CLEAR_TEXT = performance_governor.COLOR_MENU_CLEAR_TEXT if performance_governor is not None else (255, 150, 150)
-COLOR_MENU_CLEAR_BUTTON_DIM = performance_governor.COLOR_MENU_CLEAR_BUTTON_DIM if performance_governor is not None else (45, 20, 25)
 COLOR_MENU_KEY_CONFLICT_FILL = performance_governor.COLOR_MENU_KEY_CONFLICT_FILL if performance_governor is not None else (120, 20, 20)
 COLOR_MENU_KEY_CONFLICT_TEXT = performance_governor.COLOR_MENU_KEY_CONFLICT_TEXT if performance_governor is not None else (255, 100, 100)
 COLOR_MENU_KEY_CAPTURE_FILL = performance_governor.COLOR_MENU_KEY_CAPTURE_FILL if performance_governor is not None else (90, 30, 30)
@@ -131,7 +139,7 @@ GUIDE_CLOCK_FONT_PX = performance_governor.GUIDE_CLOCK_FONT_PX if performance_go
 GUIDE_MIN_FONT_PX = performance_governor.GUIDE_MIN_FONT_PX if performance_governor is not None else 17
 CONTROLS_BODY_FONT_PX = performance_governor.CONTROLS_BODY_FONT_PX if performance_governor is not None else 22
 CONTROLS_ICON_KEY_W_PX = performance_governor.CONTROLS_ICON_KEY_W_PX if performance_governor is not None else 64
-CONTROLS_TITLE_SECTION_GAP_PX = performance_governor.CONTROLS_TITLE_SECTION_GAP_PX if performance_governor is not None else 60
+CONTROLS_TITLE_SECTION_GAP_PX = performance_governor.CONTROLS_TITLE_SECTION_GAP_PX if performance_governor is not None else 18
 CONTROLS_SECTION_BODY_GAP_PX = performance_governor.CONTROLS_SECTION_BODY_GAP_PX if performance_governor is not None else 24
 CONTROLS_SUB_BODY_GAP_PX = performance_governor.CONTROLS_SUB_BODY_GAP_PX if performance_governor is not None else 20
 OPTIONS_LEFT_TOGGLE_OFFSET_PX = performance_governor.OPTIONS_LEFT_TOGGLE_OFFSET_PX if performance_governor is not None else 370
@@ -152,6 +160,57 @@ SELECTION_BORDER_WIDTH = media.SELECTION_BORDER_WIDTH
 CHANNEL_SCAN_BAR_HEIGHT_PX = performance_governor.CHANNEL_SCAN_BAR_HEIGHT_PX if performance_governor is not None else 3
 CHANNEL_SCAN_BAR_HEAD_PX = performance_governor.CHANNEL_SCAN_BAR_HEAD_PX if performance_governor is not None else 6
 CHANNEL_SCAN_BAR_HALO_MIX = performance_governor.CHANNEL_SCAN_BAR_HALO_MIX if performance_governor is not None else 0.35
+
+
+def _menu_close_rect(cx, content_w, content_y, content_h):
+    """The one place of the Close button in every settings menu and sub-menu: bottom right of the panel."""
+    inset, up, w, h = MENU_CLOSE_BUTTON_PLACE
+    return pygame.Rect(cx + content_w - inset - w, content_y + content_h - up, w, h)
+
+
+def _menu_clear_rect(cx, content_y, content_h):
+    """The one place of the Clear Media button in every menu that has one: bottom left of the panel."""
+    inset, up, w, h = MENU_CLEAR_BUTTON_PLACE
+    return pygame.Rect(cx + inset, content_y + content_h - up, w, h)
+
+
+def _draw_shared_button(canvas, rect, color, label, focused, font, focus_color, text_color=None):
+    """Draws one shared button (Close, Clear Media, Yes, No): the filled shape, the focus border and the centred label."""
+    pygame.draw.rect(canvas, color, rect, border_radius=4)
+    if focused:
+        _aa_rounded_rect(canvas, focus_color, rect, SELECTION_BORDER_WIDTH, border_radius=4)
+    lbl = font.render(label, True, text_color or COLOR_TEXT_WHITE)
+    canvas.blit(lbl, (rect.x + rect.w // 2 - lbl.get_width() // 2, rect.y + rect.h // 2 - lbl.get_height() // 2))
+
+
+def _draw_menu_close(canvas, cx, content_w, content_y, content_h, focused, font, focus_color):
+    """Draws the Close button of a settings menu at its one place, in its one colour."""
+    _draw_shared_button(canvas, _menu_close_rect(cx, content_w, content_y, content_h), COLOR_BUTTON_CLOSE, "Close", focused, font, focus_color)
+
+
+def _draw_menu_clear(canvas, cx, content_y, content_h, focused, has_media, font, focus_color):
+    """Draws the Clear Media button at its one place: darker red, greyed when there is nothing to clear."""
+    rect = _menu_clear_rect(cx, content_y, content_h)
+    color = COLOR_BUTTON_CLEAR if has_media else COLOR_MENU_BUTTON_GREYED
+    _draw_shared_button(canvas, rect, color, "Clear Media", focused, font, focus_color,
+                        text_color=None if has_media else COLOR_MENU_TEXT_GREYED)
+    return rect
+
+
+def popup_yes_no_rects(center_x, btn_y):
+    """(yes rect, no rect) of every Yes/No popup: Yes left and No right of the centre."""
+    w, h = POPUP_YES_NO_SIZE
+    return (pygame.Rect(center_x - POPUP_YES_NO_OFFSET - w // 2, btn_y, w, h),
+            pygame.Rect(center_x + POPUP_YES_NO_OFFSET - w // 2, btn_y, w, h))
+
+
+def draw_popup_yes_no(surface, center_x, btn_y, selection, focused, font, focus_color=None):
+    """Draws the Yes and No buttons of a popup in their one place and colours: Yes green on the left, No red (the Close colour) on the right; the picked one has a white edge, which shows on both colours."""
+    focus_color = COLOR_TEXT_WHITE
+    yes_rect, no_rect = popup_yes_no_rects(center_x, btn_y)
+    _draw_shared_button(surface, yes_rect, COLOR_BUTTON_YES, "YES", focused and selection == "Yes", font, focus_color)
+    _draw_shared_button(surface, no_rect, COLOR_BUTTON_NO, "NO", focused and selection == "No", font, focus_color)
+    return yes_rect, no_rect
 
 
 def _aa_rounded_rect(surface, color, rect, width=0, border_radius=0, supersample=4):
@@ -445,7 +504,7 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
 
     btn_h = 40
     btn_pad_x = 28
-    btn_y = win_y + win_h - 56
+    btn_y = win_y + win_h - MENU_CLOSE_BUTTON_PLACE[1]
     map_focused = (not capturing) and cursor == 0
     mb_lbl = f_btn.render("Map Buttons", True, NEON_GREEN if map_focused else TEXT_WHITE)
     mb_w = mb_lbl.get_width() + (btn_pad_x * 2)
@@ -456,14 +515,7 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
     surface.blit(mb_lbl, (mb_x + mb_w // 2 - mb_lbl.get_width() // 2, btn_y + btn_h // 2 - mb_lbl.get_height() // 2))
 
     close_focused = (not capturing) and cursor == 1
-    cb_w, cb_h = 110, 40
-    cb_x = win_x + win_w - cb_w - 25
-    cb_y = btn_y
-    pygame.draw.rect(surface, OFF_RED, (cb_x, cb_y, cb_w, cb_h), border_radius=5)
-    if close_focused:
-        _aa_rounded_rect(surface, NEON_GREEN, (cb_x, cb_y, cb_w, cb_h), SELECTION_BORDER_WIDTH, border_radius=5)
-    cb_lbl = f_btn.render("Close", True, TEXT_WHITE)
-    surface.blit(cb_lbl, (cb_x + cb_w // 2 - cb_lbl.get_width() // 2, cb_y + cb_h // 2 - cb_lbl.get_height() // 2))
+    _draw_menu_close(surface, win_x, win_w, win_y, win_h, close_focused, f_btn, NEON_GREEN)
 
 
 # ============================================================================
@@ -1203,7 +1255,7 @@ def _draw_console_splash_panel(menu_canvas, db, console_key, cx, content_w, top_
     bios_row_y = (btn_row_y + cell_h + y_gap) if has_pickers else btn_row_y
     if "add_bios" in full_rows:
         is_bios_focused = (sub_row == full_rows.index("add_bios"))
-        pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (right_col_x, bios_row_y, right_col_w, cell_h), border_radius=6)
+        pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (right_col_x, bios_row_y, right_col_w, cell_h), border_radius=6)
         if is_bios_focused:
             pygame.draw.rect(menu_canvas, neon_green, (right_col_x, bios_row_y, right_col_w, cell_h), 2, border_radius=6)
         lbl_bios = f_body.render("Add Bios", True, neon_green if is_bios_focused else text_white)
@@ -1214,7 +1266,7 @@ def _draw_console_splash_panel(menu_canvas, db, console_key, cx, content_w, top_
     if "relocate_roms_folder" in full_rows:
         reloc_row_y = bios_row_y
         is_reloc_focused = (sub_row == full_rows.index("relocate_roms_folder"))
-        pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (right_col_x, reloc_row_y, right_col_w, cell_h), border_radius=6)
+        pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (right_col_x, reloc_row_y, right_col_w, cell_h), border_radius=6)
         if is_reloc_focused:
             pygame.draw.rect(menu_canvas, neon_green, (right_col_x, reloc_row_y, right_col_w, cell_h), 2, border_radius=6)
         lbl_reloc = f_body.render("Add/Remove Roms", True, neon_green if is_reloc_focused else text_white)
@@ -1230,8 +1282,8 @@ def _draw_console_splash_panel(menu_canvas, db, console_key, cx, content_w, top_
             clear_row_y = reloc_row_y + cell_h + y_gap
             is_clear_focused = (sub_row == full_rows.index("clear_console_roms"))
             if _manual_n:
-                _clear_bg  = COLOR_MENU_CLEAR_BUTTON
-                _clear_txt = neon_green if is_clear_focused else COLOR_MENU_CLEAR_TEXT
+                _clear_bg  = COLOR_BUTTON_CLEAR
+                _clear_txt = neon_green if is_clear_focused else COLOR_TEXT_WHITE
             else:
                 _clear_bg  = COLOR_MENU_BUTTON_GREYED
                 _clear_txt = COLOR_MENU_TEXT_GREYED
@@ -1306,6 +1358,172 @@ CONTROLS_SECTION_EXTRA_PX = performance_governor.CONTROLS_SECTION_EXTRA_PX if pe
 
 
 # WARNING: one title per page of the Controls splash, in page order; the main script's page keys stop at the last of them, and render_controls_splash pairs each title with its rows.
+# WARNING: the fallback numbers below must match the CONTROLS_KEY_ values in performance_governor.py; they are used only when that module fails to import.
+CONTROLS_KEY_H_PX = performance_governor.CONTROLS_KEY_H_PX if performance_governor is not None else 54
+CONTROLS_KEY_GAP_PX = performance_governor.CONTROLS_KEY_GAP_PX if performance_governor is not None else 10
+CONTROLS_KEY_ROW_GAP_PX = performance_governor.CONTROLS_KEY_ROW_GAP_PX if performance_governor is not None else 14
+CONTROLS_FOOTER_KEY_H_PX = performance_governor.CONTROLS_FOOTER_KEY_H_PX if performance_governor is not None else 30
+CONTROLS_KEY_ALPHA_CUTOFF = performance_governor.CONTROLS_KEY_ALPHA_CUTOFF if performance_governor is not None else 200
+CONTROLS_LONG_KEY_MIN_RATIO = performance_governor.CONTROLS_LONG_KEY_MIN_RATIO if performance_governor is not None else 1.25
+CONTROLS_HINT_KEY_SCALE = performance_governor.CONTROLS_HINT_KEY_SCALE if performance_governor is not None else 1.45
+CONTROLS_PAD_LONG_BUTTON_SCALE = performance_governor.CONTROLS_PAD_LONG_BUTTON_SCALE if performance_governor is not None else 0.62
+CONTROLS_HINT_KEY_WORD_GAP_PX = performance_governor.CONTROLS_HINT_KEY_WORD_GAP_PX if performance_governor is not None else 8
+CONTROLS_HINT_GROUP_GAP_PX = performance_governor.CONTROLS_HINT_GROUP_GAP_PX if performance_governor is not None else 26
+
+# ============================================================================
+# SECTION: Controls splash key pictures
+# ============================================================================
+
+CONTROL_KEY_FILES = {
+    "up": "key_up.png", "down": "key_down.png", "left": "key_left.png", "right": "key_right.png",
+    "w": "key_w.png", "a": "key_a.png", "s": "key_s.png", "d": "key_d.png",
+    "c": "key_c.png", "m": "key_m.png", "n": "key_n.png",
+    "enter": "key_enter.png", "esc": "key_esc.png", "backspace": "key_backspace.png",
+    "play": "key_play.png", "rewind": "key_rewind.png", "fastforward": "key_fastforward.png",
+    "pad_dpad": "pad_dpad.png", "pad_up": "pad_up.png", "pad_down": "pad_down.png", "pad_left": "pad_left.png",
+    "pad_right": "pad_right.png", "pad_a": "pad_a.png", "pad_b": "pad_b.png", "pad_x": "pad_x.png", "pad_y": "pad_y.png",
+    "pad_select": "pad_select.png", "pad_start": "pad_start.png",
+}
+CONTROL_KEY_TEXT = {
+    "up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT", "w": "W", "a": "A", "s": "S", "d": "D",
+    "c": "C", "m": "M", "n": "N", "enter": "ENTER", "esc": "ESC", "backspace": "BACKSPACE",
+    "play": "PLAY", "rewind": "REWIND", "fastforward": "FAST FORWARD",
+    "pad_dpad": "D-PAD", "pad_up": "UP", "pad_down": "DOWN", "pad_left": "LEFT", "pad_right": "RIGHT",
+    "pad_a": "A", "pad_b": "B", "pad_x": "X", "pad_y": "Y", "pad_select": "SELECT", "pad_start": "START",
+}
+_control_key_raw = {}
+_control_key_scaled = {}
+
+
+def _control_key_trimmed(name):
+    """The key picture `name` from main/images/controls, trimmed to the key's own outline (its faint glow and empty border cut away); None when it is missing or unreadable, which is logged once."""
+    if name in _control_key_raw:
+        return _control_key_raw[name]
+    path = os.path.join(media.resolve_main_dir(), "images", "controls", CONTROL_KEY_FILES[name])
+    picture = None
+    try:
+        loaded = pygame.image.load(path).convert_alpha()
+        rects = pygame.mask.from_surface(loaded, CONTROLS_KEY_ALPHA_CUTOFF).get_bounding_rects()
+        if rects:
+            bound = rects[0].unionall(rects[1:])
+            picture = loaded.subsurface(bound).copy()
+        else:
+            log.warning("[CONTROLS] key picture %s has no solid pixels, the key is shown as text", path)
+    except Exception as e:
+        log.warning("[CONTROLS] key picture %s could not be loaded, the key is shown as text: %s", path, e)
+    _control_key_raw[name] = picture
+    return picture
+
+
+def control_key_picture(name, height):
+    """The key picture `name` at `height` pixels, whatever size the file is: every square key is exactly height by height, and a long key (ENTER, ESC, BACKSPACE) is the same height and as wide as its own shape, so every key looks like it comes off one keyboard; None when the picture is missing."""
+    cache_key = (name, int(height))
+    if cache_key in _control_key_scaled:
+        return _control_key_scaled[cache_key]
+    trimmed = _control_key_trimmed(name)
+    scaled = None
+    if trimmed is not None and trimmed.get_height() > 0:
+        ratio = trimmed.get_width() / float(trimmed.get_height())
+        if ratio >= CONTROLS_LONG_KEY_MIN_RATIO and name.startswith("pad_"):
+            # WARNING: a controller's long buttons (SELECT, START) drawn as tall as a key look far bigger than the round buttons beside them; they are drawn smaller and centred in the key's height so rows still line up.
+            pill_h = max(1, int(round(height * CONTROLS_PAD_LONG_BUTTON_SCALE)))
+            inner = pygame.transform.smoothscale(trimmed, (max(1, int(round(pill_h * ratio))), pill_h))
+            scaled = pygame.Surface((inner.get_width(), int(height)), pygame.SRCALPHA)
+            scaled.blit(inner, (0, (int(height) - pill_h) // 2))
+        elif ratio >= CONTROLS_LONG_KEY_MIN_RATIO:
+            scaled = pygame.transform.smoothscale(trimmed, (max(int(height), int(round(height * ratio))), int(height)))
+        elif name.startswith("pad_"):
+            # WARNING: controller buttons are round or arrow shaped; they keep their own shape inside the square instead of being squeezed to it.
+            fit = float(height) / max(trimmed.get_width(), trimmed.get_height())
+            inner = pygame.transform.smoothscale(trimmed, (max(1, int(round(trimmed.get_width() * fit))), max(1, int(round(trimmed.get_height() * fit)))))
+            scaled = pygame.Surface((int(height), int(height)), pygame.SRCALPHA)
+            scaled.blit(inner, ((int(height) - inner.get_width()) // 2, (int(height) - inner.get_height()) // 2))
+        else:
+            scaled = pygame.transform.smoothscale(trimmed, (int(height), int(height)))
+        # WARNING: pure black (0, 0, 0) is the game overlay's see-through colour (see the top of this script); the keys' black faces are lifted to (1, 1, 1) after scaling, or they show as holes over a game.
+        rgb = pygame.surfarray.pixels3d(scaled)
+        rgb[(rgb[:, :, 0] == 0) & (rgb[:, :, 1] == 0) & (rgb[:, :, 2] == 0)] = 1
+        del rgb
+    _control_key_scaled[cache_key] = scaled
+    return scaled
+
+
+def control_keys_size(keys, height, gap):
+    """(width, height) of a group of key pictures drawn together, or None when one of them is missing; "wasd" is the W key over S with A and D at its sides."""
+    if keys == ("wasd",):
+        if any(control_key_picture(k, height) is None for k in ("w", "a", "s", "d")):
+            return None
+        return 3 * height + 2 * gap, 2 * height + gap
+    pictures = [control_key_picture(k, height) for k in keys]
+    if any(p is None for p in pictures):
+        return None
+    return sum(p.get_width() for p in pictures) + gap * (len(pictures) - 1), height
+
+
+def draw_control_keys(target, keys, x, y, height, gap):
+    """Draws a group of key pictures with its top-left at (x, y); returns its (width, height)."""
+    if keys == ("wasd",):
+        step = height + gap
+        for name, dx, dy in (("w", step, 0), ("a", 0, step), ("s", step, step), ("d", 2 * step, step)):
+            target.blit(control_key_picture(name, height), (x + dx, y + dy))
+        return 3 * height + 2 * gap, 2 * height + gap
+    cx = x
+    for name in keys:
+        picture = control_key_picture(name, height)
+        target.blit(picture, (cx, y))
+        cx += picture.get_width() + gap
+    return cx - gap - x, height
+
+
+def key_hint_size(parts, font, key_h, gap=None):
+    """(width, height) of a hint line (see draw_key_hint) without drawing it."""
+    return draw_key_hint(None, parts, 0, 0, font, (0, 0, 0), key_h, gap)
+
+
+def draw_key_hint(target, parts, x, center_y, font, color, key_h=None, gap=None, center=False):
+    """Draws a hint line: parts is a list of key groups (tuples of key picture names, drawn side by side), words (strings) and joining words (a list, such as ["OR"], kept close on both sides), e.g. [("a", "d"), "TO NAVIGATE", ("enter",), "TO SELECT"]; a key whose picture is missing is written as its name instead. The line is centred up and down on center_y, and side to side on x when center is True; returns its (width, height). With target None it only measures."""
+    key_h = int(key_h or round(font.get_height() * CONTROLS_HINT_KEY_SCALE))
+    gap = max(2, key_h // 8) if gap is None else gap
+    pieces = []
+    after_keys = False
+    for n, part in enumerate(parts):
+        nxt = parts[n + 1] if n + 1 < len(parts) else None
+        if isinstance(part, tuple):
+            for i, name in enumerate(part):
+                picture = control_key_picture(name, key_h)
+                if picture is None:
+                    picture = font.render("[%s]" % CONTROL_KEY_TEXT.get(name, name.upper()), True, color)
+                last = i == len(part) - 1
+                pieces.append((picture, gap if not last else (CONTROLS_HINT_GROUP_GAP_PX if isinstance(nxt, tuple) else CONTROLS_HINT_KEY_WORD_GAP_PX)))
+            after_keys = True
+        elif isinstance(part, list):
+            pieces.append((font.render(" ".join(part), True, color), CONTROLS_HINT_KEY_WORD_GAP_PX))
+            after_keys = False
+        else:
+            pieces.append((font.render(part, True, color), CONTROLS_HINT_GROUP_GAP_PX if after_keys else CONTROLS_HINT_KEY_WORD_GAP_PX))
+            after_keys = False
+    if not pieces:
+        return 0, 0
+    width = sum(p.get_width() for p, _g in pieces) + sum(g for _p, g in pieces[:-1])
+    height = max(p.get_height() for p, _g in pieces)
+    if target is not None:
+        cx = x - width // 2 if center else x
+        for picture, after in pieces:
+            target.blit(picture, (cx, center_y - picture.get_height() // 2))
+            cx += picture.get_width() + after
+    return width, height
+
+
+def draw_key_hint_fitted(target, parts, x, center_y, font_name, font_px, color, max_w, center=True, min_px=11):
+    """draw_key_hint with the largest font (and keys to match) from font_px down to min_px whose line fits max_w; returns its (width, height)."""
+    size = font_px
+    while True:
+        font = _get_font(font_name, size, bold=True)
+        if key_hint_size(parts, font, None)[0] <= max_w or size <= min_px:
+            return draw_key_hint(target, parts, x, center_y, font, color, center=center)
+        size -= 1
+
+
 CONTROLS_SPLASH_TITLES = ("TV CONTROLS", "TV GUIDE", "MENU NAVIGATION", "GAME CHANNEL — KEYBOARD", "GAME CHANNEL — CONTROLLER",
                           "DVD PLAYER — KEYBOARD", "DVD PLAYER — CONTROLLER")
 NUM_CONTROL_PAGES = len(CONTROLS_SPLASH_TITLES)
@@ -1346,50 +1564,56 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
     focus = app_state.get("controls_splash_focus", 1)
 
     tv_controls = [
-        ("UP / DOWN",    "CHANNEL UP / CHANNEL DOWN"),
-        ("LEFT / RIGHT", "VOLUME DOWN / VOLUME UP"),
-        ("N",            "MUTE / UNMUTE"),
-        ("M",            "OPEN / CLOSE MAIN MENU"),
-        ("C",            "OPEN / CLOSE CONTROL MENU"),
-        ("ESCAPE",       "MINIMIZE WINDOW"),
+        (("up", "down"),    "UP / DOWN",    "CHANNEL UP / CHANNEL DOWN"),
+        (("left", "right"), "LEFT / RIGHT", "VOLUME DOWN / VOLUME UP"),
+        (("n",),            "N",            "MUTE / UNMUTE"),
+        (("m",),            "M",            "OPEN / CLOSE MAIN MENU"),
+        (("c",),            "C",            "OPEN / CLOSE CONTROLS MENU"),
+        (("esc", "enter"),  "ESC, ENTER",   "MINIMIZE / FULLSCREEN  (ESC, THEN ENTER)"),
+        (None,              "NUMBER KEYS",  "TUNE STRAIGHT TO A CHANNEL"),
     ]
     guide_controls = [
-        ("W / S",  "SCROLL CHANNELS UP / DOWN"),
-        ("A / D",  "SCROLL TIME SLOTS LEFT / RIGHT"),
-        ("ENTER",  "TUNE TO SELECTED CHANNEL"),
+        (("w", "s"), "W / S", "SCROLL CHANNELS UP / DOWN"),
+        (("a", "d"), "A / D", "SCROLL TIME SLOTS LEFT / RIGHT"),
+        (("enter",), "ENTER", "TUNE TO SELECTED CHANNEL"),
     ]
     menu_controls = [
-        ("W / S",  "NAVIGATE UP / DOWN"),
-        ("A / D",  "NAVIGATE LEFT / RIGHT"),
-        ("ENTER",  "SELECT / CONFIRM"),
-        ("ESCAPE", "BACK / MINIMIZE"),
+        (("w", "s"), "W / S",  "NAVIGATE UP / DOWN"),
+        (("a", "d"), "A / D",  "NAVIGATE LEFT / RIGHT"),
+        (("enter",), "ENTER",  "SELECT / CONFIRM"),
+        (("esc",),   "ESCAPE", "BACK / MINIMIZE"),
+        (None,       "MOUSE",  "FILE EXPLORER  (MOUSE ONLY)"),
     ]
     game_controls_kb = [
-        ("W / A / S / D", "NAVIGATE MENUS"),
-        ("ENTER",  "SELECT / CONFIRM"),
-        ("ESCAPE", "BACK / QUIT GAME"),
+        (("wasd",),  "W / A / S / D", "NAVIGATE MENUS"),
+        (("enter",), "ENTER",         "SELECT / CONFIRM"),
+        (("esc",),   "ESCAPE",        "BACK / QUIT GAME"),
+        (None,       "LAUNCHED GAMES", "PLAYING  (CONTROLLER ONLY)"),
     ]
     game_controls_pad = [
-        ("D-PAD",           "NAVIGATE MENUS"),
-        ("A BUTTON",        "SELECT / CONFIRM"),
-        ("B BUTTON",        "BACK"),
-        ("START / SELECT",  "QUIT GAME "),
+        (("pad_dpad",),               "D-PAD",          "NAVIGATE MENUS"),
+        (("pad_a",),                  "A BUTTON",       "SELECT / CONFIRM"),
+        (("pad_b",),                  "B BUTTON",       "BACK"),
+        (("pad_start", "pad_select"), "START / SELECT", "QUIT GAME "),
     ]
     dvd_controls_kb = [
-        (("ICON", "play"), "PLAY / PAUSE"),
-        (("ICON", "rew"),  "TAP TO SKIP BACK  •  HOLD TO SEEK"),
-        (("ICON", "ff"),   "TAP TO SKIP AHEAD  •  HOLD TO SEEK"),
-        ("BACKSPACE",      "RETURN TO MAIN MENU  (ISO DISC ONLY)"),
-        ("ESCAPE",         "QUIT  —  YES / NO PROMPT"),
-        ("ENTER",          "CONFIRM YES / NO SELECTION"),
+        (("play",),        ("ICON", "play"), "PLAY / PAUSE"),
+        (("rewind",),      ("ICON", "rew"),  "TAP TO SKIP BACK  •  HOLD TO SEEK"),
+        (("fastforward",), ("ICON", "ff"),   "TAP TO SKIP AHEAD  •  HOLD TO SEEK"),
+        (("backspace",),   "BACKSPACE",      "RETURN TO MAIN MENU  (DVD OPTION)"),
+        (("esc",),         "ESCAPE",         "QUIT DVD"),
+        (("wasd",),        "W / A / S / D",  "NAVIGATION  (DISC MENUS, YES / NO)"),
+        (("enter",),       "ENTER",          "CONFIRM YES / NO SELECTION"),
     ]
     dvd_controls_pad = [
-        ("DOWN",            "PLAY / PAUSE"),
-        ("LEFT",            "TAP TO SKIP BACK  •  HOLD TO SEEK"),
-        ("RIGHT",           "TAP TO SKIP AHEAD  •  HOLD TO SEEK"),
-        ("Y BUTTON",        "RETURN TO MAIN MENU  (ISO DISC ONLY)"),
-        ("A BUTTON",        "SELECT"),
-        ("START / SELECT",  "QUIT GAME"),
+        (("pad_down",),               "DOWN",           "PLAY / PAUSE"),
+        (("pad_left",),               "LEFT",           "TAP TO SKIP BACK  •  HOLD TO SEEK"),
+        (("pad_right",),              "RIGHT",          "TAP TO SKIP AHEAD  •  HOLD TO SEEK"),
+        (("pad_dpad",),               "D-PAD",          "NAVIGATION  (DISC MENUS, YES / NO)"),
+        (("pad_y",),                  "Y BUTTON",       "RETURN TO MAIN MENU  (DVD OPTION)"),
+        (("pad_a",),                  "A BUTTON",       "SELECT"),
+        (("pad_b",),                  "B BUTTON",       "BACK"),
+        (("pad_start", "pad_select"), "START / SELECT", "QUIT DVD"),
     ]
 
     PAGES = [{"title": title, "rows": rows} for title, rows in zip(
@@ -1441,18 +1665,50 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
         desc_w = max(f_body.size(d)[0] for _, d in rows)
         return key_w, desc_w
 
-    def draw_rows_block(rows, top_y, key_w, gap=ROW_KEY_GAP, desc_w=0):
+    KEY_GAP = CONTROLS_KEY_GAP_PX
+
+    def row_key_size(row, key_h):
+        """(width, height) of a row's keys: its key pictures, or its text label when a picture is missing or the row has none."""
+        keys, text_key, _desc = row
+        size = control_keys_size(keys, key_h, KEY_GAP) if keys else None
+        if size is not None:
+            return size
+        if _is_icon_key(text_key):
+            return ICON_KEY_W, f_body.get_height()
+        return f_body.size(text_key)[0], f_body.get_height()
+
+    def rows_layout(rows, room_h):
+        """The key height for a page and each row's key size, the key height made smaller only when the rows with at least CONTROLS_KEY_ROW_GAP_PX above, between and below them would not fit the room."""
+        key_h = CONTROLS_KEY_H_PX
+        while True:
+            sizes = [row_key_size(row, key_h) for row in rows]
+            total = sum(max(h, key_h) for _w, h in sizes)
+            if total + CONTROLS_KEY_ROW_GAP_PX * (len(rows) + 1) <= room_h or key_h <= f_body.get_height():
+                return key_h, sizes, total
+            key_h -= 2
+
+    def draw_rows_block(rows, top_y, room_h, gap=ROW_KEY_GAP):
+        key_h, sizes, total = rows_layout(rows, room_h)
+        key_w = max(w for w, _h in sizes)
+        desc_w = max(f_body.size(d)[0] for _k, _t, d in rows)
         key_x = CANVAS_W // 2 - (key_w + gap + desc_w) // 2
         desc_x = key_x + key_w + gap
-        yy = top_y
-        for key_lbl, desc_lbl in rows:
-            if _is_icon_key(key_lbl):
-                draw_icon(key_lbl[1], key_x, yy, f_body.get_height(), ARCADE_GOLD)
+        # WARNING: the rows are spread evenly: the same space above the first row, between every two rows and below the last (owner 2026-11-04 03:53).
+        even_gap = max(0.0, (room_h - total) / float(len(rows) + 1))
+        yy = top_y + even_gap
+        for (keys, text_key, desc_lbl), (w, h) in zip(rows, sizes):
+            row_h = max(h, key_h)
+            kx = key_x + (key_w - w) // 2
+            ky = int(round(yy)) + (row_h - h) // 2
+            if keys and control_keys_size(keys, key_h, KEY_GAP) is not None:
+                draw_control_keys(canvas, keys, kx, ky, key_h, KEY_GAP)
+            elif _is_icon_key(text_key):
+                draw_icon(text_key[1], kx, ky, f_body.get_height(), ARCADE_GOLD)
             else:
-                canvas.blit(f_body.render(key_lbl, True, ARCADE_GOLD), (key_x, yy))
-            canvas.blit(f_body.render(desc_lbl, True, TEXT_WHITE),  (desc_x, yy))
-            yy += ROW_STEP
-        return len(rows) * ROW_STEP
+                canvas.blit(f_body.render(text_key, True, ARCADE_GOLD), (kx, ky))
+            canvas.blit(f_body.render(desc_lbl, True, TEXT_WHITE), (desc_x, int(round(yy)) + (row_h - f_body.get_height()) // 2))
+            yy += row_h + even_gap
+        return total
 
     def draw_sect_title_centered(text, y):
         lbl = f_sect.render(text, True, TEXT_WHITE)
@@ -1466,8 +1722,8 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
     def draw_footer(page_num):
         footer_y = CANVAS_H - 52
         pygame.draw.line(canvas, NEON_GREEN, (40, footer_y - 8), (CANVAS_W - 40, footer_y - 8), 1)
-        hint = f_footer.render("A / D  TO NAVIGATE    ENTER  TO SELECT", True, TEXT_WHITE)
-        canvas.blit(hint, (margin, footer_y + 6))
+        draw_key_hint(canvas, [("a", "d"), "TO NAVIGATE", ("enter",), "TO SELECT", ("c",), ["OR"], ("esc",), "TO QUIT"], margin,
+                      footer_y + 6 + f_footer.get_height() // 2, f_footer, TEXT_WHITE, key_h=CONTROLS_FOOTER_KEY_H_PX)
 
         if page_num == 0:
             lbl   = f_footer.render("  \u25ba  ", True, MIDNIGHT_NAVY)
@@ -1515,7 +1771,7 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
                              (lx_ - 4, ly_, lw + 4, lh), border_radius=4)
             canvas.blit(ll, (lx_, ly_ + 2))
 
-    title_lbl = f_title.render("CONTROL MENU", True, ARCADE_GOLD)
+    title_lbl = f_title.render("CONTROLS MENU", True, ARCADE_GOLD)
     canvas.blit(title_lbl, (CANVAS_W//2 - title_lbl.get_width()//2, 15))
     title_bottom = 15 + title_lbl.get_height() + 4
     pygame.draw.line(canvas, ARCADE_GOLD, (40, title_bottom), (CANVAS_W - 40, title_bottom), 1)
@@ -1528,9 +1784,11 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
 
     if "rows" in page_data:
         rows = page_data["rows"]
-        key_w, desc_w = measure_rows(rows)
-        th = draw_sect_title_centered(page_data["title"], SECTION_TITLE_Y)
-        draw_rows_block(rows, SECTION_TITLE_Y + th + GAP_SECTION_BODY, key_w, desc_w=desc_w)
+        draw_sect_title_centered(page_data["title"], SECTION_TITLE_Y)
+        # WARNING: these two lines must match the underline drawn by draw_sect_title_centered and the footer line drawn by draw_footer; the rows are centred between them.
+        body_top = SECTION_TITLE_Y + f_sect.get_height() + 9
+        body_bottom = CANVAS_H - 60
+        draw_rows_block(rows, body_top, body_bottom - body_top)
 
     else:
         cols = page_data["cols"]
@@ -2925,6 +3183,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     "col": rounded_start_block_col,
                     "abs": show_abs_start,
                     "key": ("show", round(show_abs_start)),
+                    "kind": "break" if (isinstance(show, dict) and show.get("is_commercial")) else "show",
                 })
                 
                 cell_x = col_width + int(col_start_float * col_width + 1e-6)
@@ -3077,6 +3336,9 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             surface.blit(lbl_cell, (cell_x + 15, start_y + (row_height // 2 - lbl_cell.get_height() // 2)))
             
             current_row_blocks_list.sort()
+            # WARNING: a commercial break cell is only a few pixels wide, so the highlight must never rest on one; the breaks stay drawn but are not stops while the row has any other stop.
+            if any(s.get("kind") != "break" for s in current_row_stops_list):
+                current_row_stops_list = [s for s in current_row_stops_list if s.get("kind") != "break"]
             current_row_stops_list.sort(key=lambda s: s.get("abs", 0))
             import time as _time
             _guide_row_stops_cache[ch_str] = {
@@ -3179,7 +3441,7 @@ def _channel_menu_fingerprint(ch_info):
         ch_info.get("reactive_visualizer_enabled", True),
         ch_info.get("reactive_visualizer_strength", 50),
         ch_info.get("name", ""),
-        ch_info.get("scheduling_mode", "random_slots"),
+        menu_nav.shown_scheduling_mode(ch_info),
         ch_info.get("block_mode", "full_day"),
         ch_info.get("episode_order_mode", "sequential"),
         ch_info.get("pair_threshold_minutes", 15),
@@ -3306,7 +3568,7 @@ def render_settings_overlay_menu(surface, theme, app_state, db):
     surface.blit(stamp, pos)
 
 
-# WARNING: the fallback numbers below must match OPTIONS_TOGGLE_BOX_W_PX, REMOTE_REMAP_LABEL_COL_W_PX, REMOTE_REMAP_KEY_BOX_W_PX, REMOTE_REMAP_KEY_BOX_H_PX, REMOTE_REMAP_COL_GAP_PX, CHANNEL_SETTINGS_HEADER_GAP_PX, CHANNEL_SETTINGS_BOTTOM_RESERVED_PX, CHANNEL_SETTINGS_MIN_TOP_PX, HOLIDAY_ROWS_TOP_PX, HOLIDAY_ROWS_BOTTOM_PX, HOLIDAY_ROW_MIN_H_PX, HOLIDAY_ROW_MAX_H_PX, HOLIDAY_ROW_SLOT_PAD_PX, HOLIDAY_TOGGLE_W_PX, HOLIDAY_TOGGLE_GAP_PX, HOLIDAY_ROW_SIDE_SPACE_PX, VIDEO_SLIDER_ROW_RESERVE_PX, VIDEO_SLIDER_SPACING_MAX_PX, VIDEO_SLIDER_SPACING_MIN_PX, THEME_SLIDER_LAST_BLOCK_RESERVE_PX, THEME_SLIDER_SPACING_MAX_PX, THEME_SLIDER_SPACING_MIN_PX, THEME_SLIDER_FIRST_GAP_MIN_PX, THEME_SLIDER_FIRST_GAP_TRIM_PX in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match OPTIONS_TOGGLE_BOX_W_PX, REMOTE_REMAP_LABEL_COL_W_PX, REMOTE_REMAP_KEY_BOX_W_PX, REMOTE_REMAP_KEY_BOX_H_PX, REMOTE_REMAP_COL_GAP_PX, CHANNEL_SETTINGS_HEADER_GAP_PX, CHANNEL_SETTINGS_BOTTOM_RESERVED_PX, CHANNEL_SETTINGS_MIN_TOP_PX, HOLIDAY_ROWS_TOP_PX, HOLIDAY_ROWS_BOTTOM_PX, HOLIDAY_ROW_MIN_H_PX, HOLIDAY_ROW_MAX_H_PX, HOLIDAY_ROW_SLOT_PAD_PX, HOLIDAY_TOGGLE_W_PX, HOLIDAY_TOGGLE_GAP_PX, SUB_MENU_ROW_WIDTH_SHARE, SUB_MENU_ROW_GAP_PX, VIDEO_SLIDER_ROW_RESERVE_PX, VIDEO_SLIDER_SPACING_MAX_PX, VIDEO_SLIDER_SPACING_MIN_PX, THEME_SLIDER_LAST_BLOCK_RESERVE_PX, THEME_SLIDER_SPACING_MAX_PX, THEME_SLIDER_SPACING_MIN_PX, THEME_SLIDER_FIRST_GAP_MIN_PX, THEME_SLIDER_FIRST_GAP_TRIM_PX in performance_governor.py; they are used only when that module fails to import.
 OPTIONS_TOGGLE_BOX_W_PX = performance_governor.OPTIONS_TOGGLE_BOX_W_PX if performance_governor is not None else 18 + 24
 REMOTE_REMAP_LABEL_COL_W_PX = performance_governor.REMOTE_REMAP_LABEL_COL_W_PX if performance_governor is not None else 195
 REMOTE_REMAP_KEY_BOX_W_PX = performance_governor.REMOTE_REMAP_KEY_BOX_W_PX if performance_governor is not None else 110
@@ -3322,7 +3584,8 @@ HOLIDAY_ROW_MAX_H_PX = performance_governor.HOLIDAY_ROW_MAX_H_PX if performance_
 HOLIDAY_ROW_SLOT_PAD_PX = performance_governor.HOLIDAY_ROW_SLOT_PAD_PX if performance_governor is not None else 8
 HOLIDAY_TOGGLE_W_PX = performance_governor.HOLIDAY_TOGGLE_W_PX if performance_governor is not None else 190
 HOLIDAY_TOGGLE_GAP_PX = performance_governor.HOLIDAY_TOGGLE_GAP_PX if performance_governor is not None else 12
-HOLIDAY_ROW_SIDE_SPACE_PX = performance_governor.HOLIDAY_ROW_SIDE_SPACE_PX if performance_governor is not None else 70
+SUB_MENU_ROW_WIDTH_SHARE = performance_governor.SUB_MENU_ROW_WIDTH_SHARE if performance_governor is not None else 0.6
+SUB_MENU_ROW_GAP_PX = performance_governor.SUB_MENU_ROW_GAP_PX if performance_governor is not None else 40
 VIDEO_SLIDER_ROW_RESERVE_PX = performance_governor.VIDEO_SLIDER_ROW_RESERVE_PX if performance_governor is not None else 40
 VIDEO_SLIDER_SPACING_MAX_PX = performance_governor.VIDEO_SLIDER_SPACING_MAX_PX if performance_governor is not None else 70
 VIDEO_SLIDER_SPACING_MIN_PX = performance_governor.VIDEO_SLIDER_SPACING_MIN_PX if performance_governor is not None else 40
@@ -3695,17 +3958,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         sys_rows_close_idx = len(sys_rows)
         is_cl_focused = (layer == "SYSTEM_ROWS" and cur_sel == sys_rows_close_idx)
-        close_btn_w = 110
-        close_btn_h = 40
-        close_btn_x = cx + content_w - close_btn_w - 25
         close_btn_y = bottom_row_y
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_cl_focused: 
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_c = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_c, (close_btn_x + (close_btn_w // 2) - (lbl_c.get_width() // 2), close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_cl_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: System tab: advanced settings
@@ -3859,12 +4114,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _as_draw_text(f_ch_btn, _as_lbl_txt, _as_txt_col, _as_bar_y, _as_focused)
 
         _as_close_focused = _as_cur_row == _as_close_idx
-        _as_bk_x, _as_bk_y, _as_bk_w, _as_bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-        pygame.draw.rect(menu_canvas, OFF_RED, (_as_bk_x, _as_bk_y, _as_bk_w, _as_bk_h), border_radius=4)
-        if _as_close_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_bk_x, _as_bk_y, _as_bk_w, _as_bk_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        _as_bk_lbl = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(_as_bk_lbl, (_as_bk_x + _as_bk_w // 2 - _as_bk_lbl.get_width() // 2, _as_bk_y + _as_bk_h // 2 - _as_bk_lbl.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, _as_close_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: System tab: remote remap
@@ -3961,7 +4211,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         btn_h = 40
         btn_pad_x = 28
         btn_text_y_offset = (btn_h // 2) - (f_ch_btn.get_height() // 2)
-        btn_y = content_y + content_h - 45
+        btn_y = content_y + content_h - MENU_CLOSE_BUTTON_PLACE[1]
 
         prompt_y = btn_y - 28
         if is_capturing:
@@ -4006,17 +4256,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         menu_canvas.blit(numbers_lbl, (bx_numbers + (numbers_btn_w // 2) - (numbers_lbl.get_width() // 2), btn_y + btn_text_y_offset))
 
         is_cl_focused = (not is_capturing) and rr_sel == 2
-        close_btn_w = 110
-        close_btn_h = 40
-        close_btn_x = cx + content_w - close_btn_w - 25
         close_btn_y = btn_y
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_cl_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_c2 = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_c2, (close_btn_x + (close_btn_w // 2) - (lbl_c2.get_width() // 2), close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_cl_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: System tab: server menu
@@ -4112,7 +4354,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         btn_h = 40
         btn_pad_x = 28
         btn_text_y_offset = (btn_h // 2) - (f_ch_btn.get_height() // 2)
-        btn_y = content_y + content_h - 45
+        btn_y = content_y + content_h - MENU_CLOSE_BUTTON_PLACE[1]
 
         if _srv_extra_btn_visible:
             is_ms_focused = srv_sel == 2
@@ -4128,17 +4370,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             menu_canvas.blit(lbl_ms, (ms_btn_x + (ms_btn_w // 2) - (lbl_ms.get_width() // 2), ms_btn_y + btn_text_y_offset))
 
         is_cl_focused = srv_sel == _srv_close_idx
-        close_btn_w = 110
-        close_btn_h = btn_h
-        close_btn_x = cx + content_w - close_btn_w - 25
         close_btn_y = btn_y
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_cl_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_c3 = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_c3, (close_btn_x + (close_btn_w // 2) - (lbl_c3.get_width() // 2), close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_cl_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: System tab: server slots
@@ -4245,18 +4479,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         btn_h = 40
         btn_pad_x = 28
-        close_btn_w = 110
-        close_btn_h = btn_h
-        close_btn_x = cx + content_w - close_btn_w - 25
         close_btn_y = content_y + content_h - 45
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
         is_close_focused = cur_sel == CLOSE_IDX
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_close_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_close = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_close, (close_btn_x + (close_btn_w // 2) - (lbl_close.get_width() // 2), close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: System tab: server slot actions
@@ -4340,8 +4566,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         visible_entries = entries[scroll:scroll + SP_VISIBLE_ROWS]
         _sp_window_reaches_end = (scroll + SP_VISIBLE_ROWS) >= total_entries
         display_rows = get_server_picker_display_rows(visible_entries, include_close=False)
-        if _sp_window_reaches_end:
-            display_rows.append({"type": "close"})
 
         f_header_row = _get_font("Courier New", 15, bold=True)
         f_row = _get_font("Courier New", 18)
@@ -4367,7 +4591,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 menu_canvas.blit(lbl_up, (row_x + row_w - lbl_up.get_width(), content_y + 6))
             if down_txt:
                 lbl_down = f_scroll_hint.render(down_txt, True, COLOR_MENU_DIM_TEXT)
-                menu_canvas.blit(lbl_down, (row_x + row_w - lbl_down.get_width(), content_y + content_h - 30))
+                menu_canvas.blit(lbl_down, (row_x, content_y + content_h - 30))
 
         y = row_y
         selectable_i = scroll
@@ -4396,12 +4620,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 menu_canvas.blit(lbl, (text_x, name_y))
                 lbl_host = f_host.render(disp_row["host"], True, COLOR_MENU_DIM_TEXT)
                 menu_canvas.blit(lbl_host, (text_x, name_y + lbl.get_height() - 2))
-            else:
-                lbl = f_row.render("Close", True, NEON_GREEN)
-                menu_canvas.blit(lbl, (row_x + 16, y + (row_h // 2) - (lbl.get_height() // 2)))
 
             y += row_h + row_gap
             selectable_i += 1
+
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, cur_sel >= total_entries, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Channels tab: channel list
@@ -4529,17 +4752,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                      arrow_btn_y + (arrow_btn_h - page_lbl.get_height()) // 2))
 
         is_close_focused = (layer == "CHANNEL_LIST" and cur_sel == 99)
-        close_btn_w = 110
-        close_btn_h = 40
-        close_btn_x = cx + content_w - close_btn_w - 25
         close_btn_y = content_y + content_h - 52
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_close_focused: 
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_cl, (close_btn_x + (close_btn_w // 2) - (lbl_cl.get_width() // 2), close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
 
         _settings_btn_w = 150
         _settings_btn_h = box_h_43
@@ -4680,12 +4895,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         _cs_close_idx = len(_cs_rows)
         _cs_close_focused = _cs_cur_row == _cs_close_idx
-        _cs_bk_x, _cs_bk_y, _cs_bk_w, _cs_bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-        pygame.draw.rect(menu_canvas, OFF_RED, (_cs_bk_x, _cs_bk_y, _cs_bk_w, _cs_bk_h), border_radius=4)
-        if _cs_close_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cs_bk_x, _cs_bk_y, _cs_bk_w, _cs_bk_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        _cs_bk_lbl = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(_cs_bk_lbl, (_cs_bk_x + _cs_bk_w // 2 - _cs_bk_lbl.get_width() // 2, _cs_bk_y + _cs_bk_h // 2 - _cs_bk_lbl.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, _cs_close_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Channels tab: per-channel sub-menu
@@ -4799,21 +5009,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             
             close_row_idx = 1
             is_close_focused = (sub_r == close_row_idx)
-            _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-            pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-            if is_close_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-            lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-            menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+            _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
         elif t_vis:
             row_x = cx + 25
             row_w = content_w - 60
             vis_row_h = 40
             vis_gap = 20
 
-            _reactive_row_idx = 2
-            _reactive_strength_row_idx = 3
-            _gain_row_idx = 4
-            _audio_row_idx = 5
+            _audio_row_idx = 2
+            _gain_row_idx = 3
+            _reactive_row_idx = 4
+            _reactive_strength_row_idx = 5
             _clear_row_idx = 6
             close_row_idx = 7
             is_close_focused = (sub_r == close_row_idx)
@@ -4828,7 +5034,16 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_style = f_ch_label.render(f"VISUALIZER ENGINE STYLE: < {style_str} >", True, _style_text_col)
             menu_canvas.blit(lbl_style, (row_x + 20, style_y + vis_row_h // 2 - lbl_style.get_height() // 2))
 
-            reactive_y = style_y + vis_row_h + vis_gap
+            audio_y = style_y + vis_row_h + vis_gap
+            is_audio_dir_focused = (sub_r == _audio_row_idx)
+            pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (row_x, audio_y, row_w, vis_row_h), border_radius=6)
+            if is_audio_dir_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, audio_y, row_w, vis_row_h), SELECTION_BORDER_WIDTH, border_radius=6)
+            _audio_ct = len(ch_info.get("schedules", {}).get("Music Tracks", []))
+            lbl_audio = f_ch_label.render(f"AUDIO FILES: ({'ADD' if _audio_ct == 0 else _audio_ct})", True, NEON_GREEN if is_audio_dir_focused else TEXT_WHITE)
+            menu_canvas.blit(lbl_audio, (row_x + 20, audio_y + vis_row_h // 2 - lbl_audio.get_height() // 2))
+
+            gain_y = audio_y + vis_row_h + vis_gap
+            reactive_y = gain_y + vis_row_h + vis_gap
             reactive_enabled = ch_info.get("reactive_visualizer_enabled", True)
             # WARNING: Lite mode never produces real-music data (see _visualizer_reactive_frame in retro_tv_emulator.py), so both reactive controls are greyed out and ignore input there.
             _reactive_mode = performance_governor.get_mode() if performance_governor is not None else "lite"
@@ -4879,31 +5094,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if is_strength_focused:
                 pygame.draw.circle(menu_canvas, NEON_GREEN if reactive_enabled else COLOR_MENU_TEXT_GREYED, (handle_x, slider_y), 10, SELECTION_BORDER_WIDTH)
 
-            gain_y = strength_y + vis_row_h + vis_gap
-            _vis_audio_min_y = gain_y + vis_row_h + vis_gap
-            _vis_audio_max_y = content_y + content_h - 52 - vis_row_h - 10
-            audio_y = max(_vis_audio_min_y, min(_vis_audio_min_y + vis_gap, _vis_audio_max_y))
-            is_audio_dir_focused = (sub_r == _audio_row_idx)
-            pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (row_x, audio_y, row_w, vis_row_h), border_radius=6)
-            if is_audio_dir_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, audio_y, row_w, vis_row_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            _audio_ct = len(ch_info.get("schedules", {}).get("Music Tracks", []))
-            lbl_audio = f_ch_label.render(f"AUDIO FILES: ({'ADD' if _audio_ct == 0 else _audio_ct})", True, NEON_GREEN if is_audio_dir_focused else TEXT_WHITE)
-            menu_canvas.blit(lbl_audio, (row_x + 20, audio_y + vis_row_h // 2 - lbl_audio.get_height() // 2))
 
-            _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
 
             _has_music_content = len(ch_info.get("schedules", {}).get("Music Tracks", [])) > 0
-            clear_h = 40
-            clear_y = _cb_y
             is_clear_focused = (sub_r == _clear_row_idx)
-            _clear_txt_col = (NEON_GREEN if is_clear_focused else TEXT_WHITE) if _has_music_content else COLOR_MENU_TEXT_GREYED
-            _clear_bg_col  = (OFF_RED if is_clear_focused else COLOR_MENU_CLEAR_BUTTON_DIM) if _has_music_content else COLOR_MENU_BUTTON_GREYED
-            lbl_clr = f_ch_label.render("CLEAR ALL SCHEDULED MUSIC", True, _clear_txt_col)
-            clear_w = min(lbl_clr.get_width() + 40, row_w)
-            clear_x = row_x
-            pygame.draw.rect(menu_canvas, _clear_bg_col, (clear_x, clear_y, clear_w, clear_h), border_radius=6)
-            if is_clear_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (clear_x, clear_y, clear_w, clear_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            menu_canvas.blit(lbl_clr, (clear_x + clear_w // 2 - lbl_clr.get_width() // 2, clear_y + clear_h // 2 - lbl_clr.get_height() // 2))
+            _draw_menu_clear(menu_canvas, cx, content_y, content_h, is_clear_focused, _has_music_content, f_ch_btn, NEON_GREEN)
 
             _vis_gain_db = int(app_state.get("visualizer_gain_db", 0))
             _vis_gain_path = app_state.get("_vis_target_filepath", "")
@@ -4914,26 +5109,26 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             # WARNING: with Loudness Scan off no gain is played, so the row is drawn greyed (reachable, not adjustable), like the other greyed rows.
             _vis_gain_live = db.config.get("loudness_scan_enabled", True)
             if _vis_gain_live:
-                gain_label = f_ch_label.render(f"LOUDNESS GAIN: {_vis_gain_db:+d} dB  A/D TO ADJUST", True, NEON_GREEN if is_gain_focused else TEXT_WHITE)
+                gain_label = f_ch_label.render(f"LOUDNESS GAIN: {_vis_gain_db:+d} dB", True, NEON_GREEN if is_gain_focused else TEXT_WHITE)
             else:
                 gain_label = f_ch_label.render("LOUDNESS GAIN: LOUDNESS SCAN IS OFF", True, COLOR_MENU_TEXT_GREYED)
             pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON if _vis_gain_live else COLOR_MENU_BUTTON_GREYED, (row_x, gain_y, row_w, gain_h), border_radius=6)
             if is_gain_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, gain_y, row_w, gain_h), SELECTION_BORDER_WIDTH, border_radius=6)
             menu_canvas.blit(gain_label, (row_x + 20, gain_y + gain_h // 2 - gain_label.get_height() // 2))
+            if _vis_gain_live:
+                draw_key_hint(menu_canvas, [("a", "d"), "TO ADJUST"], row_x + 20 + gain_label.get_width() + CONTROLS_HINT_GROUP_GAP_PX,
+                              gain_y + gain_h // 2, f_ch_label, NEON_GREEN if is_gain_focused else TEXT_WHITE)
 
-            pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-            if is_close_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-            lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-            menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+            _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
         else:
             row_x = cx + 25
             row_w = content_w - 60
 
             SCHED_LABELS = {
-                "random_slots": "RANDOM SLOTS",
-                "one_slot":     "ONE SLOT",
-                "two_slots":    "TWO SLOTS",
+                "random_slots": "RANDOM",
+                "one_slot":     "ONE",
+                "two_slots":    "TWO",
                 "marathon":     "MARATHON",
             }
             cur_sched = menu_nav.shown_scheduling_mode(ch_info)
@@ -4950,16 +5145,16 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             sched_r_h = 36
             sched_y   = grid_y_start
             is_sched_focused = (sub_r == 1 and sub_c == 0)
-            lbl_sched = f_ch_label.render(
-                f"SCHEDULING MODE: \u25c4  {SCHED_LABELS.get(cur_sched, cur_sched.upper())}  \u25ba",
-                True, NEON_GREEN if is_sched_focused else TEXT_WHITE
-            )
+            _sched_color = NEON_GREEN if is_sched_focused else TEXT_WHITE
+            _sched_prefix_surf = f_ch_label.render("NUMBER OF EPISODES:  \u25c4  ", True, _sched_color)
+            _sched_word_surf   = f_ch_label.render(SCHED_LABELS.get(cur_sched, cur_sched.upper()), True, _sched_color)
+            _sched_suffix_surf = f_ch_label.render("  \u25ba", True, _sched_color)
+            _sched_word_slot_w = max(f_ch_label.size(w)[0] for w in SCHED_LABELS.values())
             sched_x = row_x
             _row1_gap = 20
             _row1_right = cx + content_w - 25
             if _sched_is_marathon:
                 sched_w = row_w
-                sched_text_x = sched_x + 20
                 order_w = 0
                 order_x = 0
             else:
@@ -4967,24 +5162,28 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _order_suffix_txt = "  \u25ba"
                 _order_prefix_probe = f_ch_label.render(_order_prefix_txt, True, TEXT_WHITE)
                 _order_suffix_probe = f_ch_label.render(_order_suffix_txt, True, TEXT_WHITE)
-                _order_word_seq_probe  = f_ch_label.render("SEQUENTIAL", True, TEXT_WHITE)
+                _order_word_seq_probe  = f_ch_label.render("IN ORDER", True, TEXT_WHITE)
                 _order_word_rand_probe = f_ch_label.render("RANDOM", True, TEXT_WHITE)
                 _order_word_slot_w = max(_order_word_seq_probe.get_width(), _order_word_rand_probe.get_width())
                 order_w = _order_prefix_probe.get_width() + _order_word_slot_w + _order_suffix_probe.get_width() + 40
                 order_x = _row1_right - order_w
                 sched_w = (order_x - _row1_gap) - sched_x
-                sched_text_x = sched_x + sched_w // 2 - lbl_sched.get_width() // 2
+            sched_text_x = sched_x + 20
+            _sched_text_y = sched_y + sched_r_h // 2 - _sched_prefix_surf.get_height() // 2
             pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (sched_x, sched_y, sched_w, sched_r_h), border_radius=6)
             if is_sched_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (sched_x, sched_y, sched_w, sched_r_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            menu_canvas.blit(lbl_sched, (sched_text_x, sched_y + sched_r_h // 2 - lbl_sched.get_height() // 2))
+            menu_canvas.blit(_sched_prefix_surf, (sched_text_x, _sched_text_y))
+            _sched_word_x = sched_text_x + _sched_prefix_surf.get_width() + (_sched_word_slot_w - _sched_word_surf.get_width()) // 2
+            menu_canvas.blit(_sched_word_surf, (_sched_word_x, _sched_text_y))
+            menu_canvas.blit(_sched_suffix_surf, (sched_text_x + _sched_prefix_surf.get_width() + _sched_word_slot_w, _sched_text_y))
 
             if not _sched_is_marathon:
                 is_order_focused = (sub_r == 1 and sub_c == 1)
                 _order_mode = ch_info.get("episode_order_mode", "sequential")
                 _order_color = NEON_GREEN if is_order_focused else TEXT_WHITE
                 _order_prefix_surf = f_ch_label.render(_order_prefix_txt, True, _order_color)
-                _order_word_surf   = f_ch_label.render(_order_mode.upper(), True, _order_color)
+                _order_word_surf   = f_ch_label.render("IN ORDER" if _order_mode == "sequential" else _order_mode.upper(), True, _order_color)
                 _order_suffix_surf = f_ch_label.render(_order_suffix_txt, True, _order_color)
                 _order_content_w = _order_prefix_surf.get_width() + _order_word_slot_w + _order_suffix_surf.get_width()
                 _order_content_x = order_x + (order_w - _order_content_w) // 2
@@ -5041,7 +5240,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     True, NEON_GREEN if is_com_btn_focused else TEXT_WHITE)
                 btn_w2 = btn_txt2.get_width() + 40
                 pygame.draw.rect(menu_canvas,
-                                 COLOR_MENU_BUTTON,
+                                 COLOR_BUTTON_ADD,
                                  (btn_x2, com_row_y, btn_w2, com_h), border_radius=8)
                 if is_com_btn_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (btn_x2, com_row_y, btn_w2, com_h), SELECTION_BORDER_WIDTH, border_radius=8)
@@ -5114,8 +5313,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _wm_handle_x = _wm_pill_x + 42 if _wm_enabled else _wm_pill_x + 12
                 pygame.draw.circle(menu_canvas, TEXT_WHITE, (_wm_handle_x, _wm_pill_y + _wm_pill_h // 2), 9)
                 is_wm_add_focused = (sub_r == 4 and sub_c == 2)
-                _wm_add_label = f_ch_btn.render("Add", True, TEXT_WHITE)
-                pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (_wm_add_x, _wm_y, _wm_add_w, bl_h), border_radius=4)
+                _wm_add_label = f_ch_btn.render("Add", True, COLOR_MENU_VALUE_MINT if is_wm_add_focused else TEXT_WHITE)
+                pygame.draw.rect(menu_canvas, COLOR_BUTTON_TOGGLE_ADD, (_wm_add_x, _wm_y, _wm_add_w, bl_h), border_radius=4)
                 if is_wm_add_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (_wm_add_x, _wm_y, _wm_add_w, bl_h), SELECTION_BORDER_WIDTH, border_radius=4)
                 menu_canvas.blit(_wm_add_label, (_wm_add_x + (_wm_add_w - _wm_add_label.get_width()) // 2, _wm_y + (bl_h - _wm_add_label.get_height()) // 2))
@@ -5127,11 +5326,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if cur_sched == "marathon":
                 is_slot_focused = (sub_r == _folder_row)
                 file_count = len(ch_info.get("schedules", {}).get("Marathon", []))
-                pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (row_x, folder_y_start, slots_total_w, f_cell_h), border_radius=6)
+                pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (row_x, folder_y_start, slots_total_w, f_cell_h), border_radius=6)
                 if is_slot_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, folder_y_start, slots_total_w, f_cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
                 lbl_m = f_ch_label.render(
-                    f"24-HOUR MARATHON  ({'ADD' if file_count == 0 else str(file_count) + (' file' if file_count == 1 else ' files')})",
+                    f"24-HOUR MARATHON  ({'ADD' if file_count == 0 else file_count})",
                     True, NEON_GREEN if is_slot_focused else TEXT_WHITE
                 )
                 menu_canvas.blit(lbl_m, (row_x + slots_total_w // 2 - lbl_m.get_width() // 2,
@@ -5139,11 +5338,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             elif _is_full_day:
                 is_slot_focused = (sub_r == _folder_row)
                 file_count = len(ch_info.get("schedules", {}).get("Full Day", []))
-                pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (row_x, folder_y_start, slots_total_w, f_cell_h), border_radius=6)
+                pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (row_x, folder_y_start, slots_total_w, f_cell_h), border_radius=6)
                 if is_slot_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, folder_y_start, slots_total_w, f_cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
                 lbl_fd = f_ch_label.render(
-                    f"24-HOUR BLOCK  ({'ADD' if file_count == 0 else str(file_count) + (' file' if file_count == 1 else ' files')})",
+                    f"24-HOUR BLOCK  ({'ADD' if file_count == 0 else file_count})",
                     True, NEON_GREEN if is_slot_focused else TEXT_WHITE
                 )
                 menu_canvas.blit(lbl_fd, (row_x + slots_total_w // 2 - lbl_fd.get_width() // 2,
@@ -5178,7 +5377,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 def _draw_slot(idx, name, item_x, item_y, cell_w, cell_h):
                     is_slot_focused = (sub_r == _folder_row and sub_c == idx)
                     file_count = len(ch_info.get("schedules", {}).get(name, []))
-                    pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (item_x, item_y, cell_w, cell_h), border_radius=6)
+                    pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (item_x, item_y, cell_w, cell_h), border_radius=6)
                     if is_slot_focused:
                         _aa_rounded_rect(menu_canvas, NEON_GREEN, (item_x, item_y, cell_w, cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
                     lbl_slot = _slot_font.render(
@@ -5196,9 +5395,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             hol_h  = 40
             if not _sched_is_marathon:
                 is_hol_focused = (sub_r == _holiday_row and sub_c == 0)
-                lbl_hol = f_ch_label.render("HOLIDAY SCHEDULE OVERRIDES", True, NEON_GREEN if is_hol_focused else TEXT_WHITE)
+                lbl_hol = f_ch_label.render("HOLIDAY SCHEDULE", True, NEON_GREEN if is_hol_focused else TEXT_WHITE)
                 hol_w = lbl_hol.get_width() + 40
-                pygame.draw.rect(menu_canvas, COLOR_MENU_HOLIDAY_ROW, (row_x, hol_y, hol_w, hol_h), border_radius=6)
+                pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (row_x, hol_y, hol_w, hol_h), border_radius=6)
                 if is_hol_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, hol_y, hol_w, hol_h), SELECTION_BORDER_WIDTH, border_radius=6)
                 menu_canvas.blit(lbl_hol, (row_x + 20, hol_y + hol_h // 2 - lbl_hol.get_height() // 2))
@@ -5218,11 +5417,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             atr_h = hol_h
             _atr_col = 0 if _sched_is_marathon else 1
             is_atr_focused = (sub_r == _audio_track_row and sub_c == _atr_col)
-            _atr_bg = COLOR_MENU_HOLIDAY_ROW if _atr_enabled else COLOR_MENU_ROW_OFF
-            _atr_txt_color = TEXT_WHITE if _atr_enabled else COLOR_MENU_OFF_LABEL_GREY
+            _atr_bg = COLOR_BUTTON_AUDIO_TRACK if _atr_enabled else COLOR_MENU_BUTTON_GREYED
+            _atr_txt_color = COLOR_BUTTON_AUDIO_TRACK_TEXT if _atr_enabled else COLOR_MENU_TEXT_GREYED
             lbl_atr = f_ch_label.render(
                 "CURRENT PLAYING AUDIO SETTINGS  \u25ba",
-                True, NEON_GREEN if (is_atr_focused and _atr_enabled) else _atr_txt_color
+                True, _atr_txt_color
             )
             _atr_gap = 0 if _sched_is_marathon else 16
             atr_x = row_x + hol_w + _atr_gap
@@ -5232,30 +5431,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (atr_x, atr_y, atr_w, atr_h), SELECTION_BORDER_WIDTH, border_radius=6)
             menu_canvas.blit(lbl_atr, (atr_x + atr_w // 2 - lbl_atr.get_width() // 2, atr_y + atr_h // 2 - lbl_atr.get_height() // 2))
 
-            clear_y = max(atr_y + atr_h + 20 + (bl_h + 16 if _sched_is_marathon else 0),
-                          content_y + content_h - 52)
-            clear_h = 40
             is_clear_focused = (sub_r == _close_row and sub_c == 0)
-            _sched_keys_all = ["Morning", "Commercials", "Evening", "Intros", "Night",
-                                "Outros", "Marathon", "Full Day"] + list(media.SIX_HOUR_BLOCK_NAMES)
-            _has_sched_content = any(len(ch_info.get("schedules", {}).get(k, [])) > 0 for k in _sched_keys_all)
-            _clear_txt_col = (NEON_GREEN if is_clear_focused else TEXT_WHITE) if _has_sched_content else COLOR_MENU_TEXT_GREYED
-            _clear_bg_col  = (OFF_RED if is_clear_focused else COLOR_MENU_CLEAR_BUTTON_DIM) if _has_sched_content else COLOR_MENU_BUTTON_GREYED
-            lbl_clr = f_ch_label.render("CLEAR ALL SCHEDULED MEDIA", True, _clear_txt_col)
-            clear_w = min(lbl_clr.get_width() + 40, row_w)
-            clear_x = row_x
-            pygame.draw.rect(menu_canvas, _clear_bg_col, (clear_x, clear_y, clear_w, clear_h), border_radius=6)
-            if is_clear_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (clear_x, clear_y, clear_w, clear_h), SELECTION_BORDER_WIDTH, border_radius=6)
-            menu_canvas.blit(lbl_clr, (clear_x + clear_w // 2 - lbl_clr.get_width() // 2, clear_y + clear_h // 2 - lbl_clr.get_height() // 2))
+            _has_sched_content = media.channel_has_clearable_media(ch_info)
+            _draw_menu_clear(menu_canvas, cx, content_y, content_h, is_clear_focused, _has_sched_content, f_ch_btn, NEON_GREEN)
 
-            _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
             is_close_focused = (sub_r == _close_row and sub_c == 3)
-            pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-            if is_close_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-            lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-            menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+            _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
 
         if ch_info.get("server_locked", False):
             _lock_top = content_y + 55
@@ -5343,18 +5524,16 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         if is_gain_focused:
             _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, gain_y, row_w, row_h), SELECTION_BORDER_WIDTH, border_radius=6)
         lbl_gain = f_ch_label.render(
-            f"LOUDNESS GAIN: {gain_db:+d} dB  LEFT/RIGHT TO ADJUST" if _gain_live else "LOUDNESS GAIN: LOUDNESS SCAN IS OFF",
+            f"LOUDNESS GAIN: {gain_db:+d} dB" if _gain_live else "LOUDNESS GAIN: LOUDNESS SCAN IS OFF",
             True, (NEON_GREEN if is_gain_focused else TEXT_WHITE) if _gain_live else COLOR_MENU_TEXT_GREYED
         )
         menu_canvas.blit(lbl_gain, (row_x + 15, gain_y + row_h // 2 - lbl_gain.get_height() // 2))
+        if _gain_live:
+            draw_key_hint(menu_canvas, [("a", "d"), "TO ADJUST"], row_x + 15 + lbl_gain.get_width() + CONTROLS_HINT_GROUP_GAP_PX,
+                          gain_y + row_h // 2, f_ch_label, NEON_GREEN if is_gain_focused else TEXT_WHITE)
 
         is_close_focused = (sub_r == close_row)
-        _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-        pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-        if is_close_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Channels tab: commercials and bumper sub-menu
@@ -5369,36 +5548,30 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         f_sub_title = _get_font("Courier New", 20, bold=True)
         lbl_hdr = f_sub_title.render(f"Channel {target_ch_str} — Commercials", True, TEXT_WHITE)
         menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
-        row_x = cx + 35
-        row_w = content_w - 70
-        row_top = content_y + 72
+        row_w = int(content_w * SUB_MENU_ROW_WIDTH_SHARE)
+        row_x = cx + (content_w - row_w) // 2
         row_h = 44
-        close_y = content_y + content_h - 52
-        row_gap = max(18, (close_y - row_top - row_h * len(labels)) // len(labels))
+        row_gap = SUB_MENU_ROW_GAP_PX
+        _com_area_top = content_y + HOLIDAY_ROWS_TOP_PX
+        _com_area_bottom = content_y + content_h - HOLIDAY_ROWS_BOTTOM_PX
+        _com_block_h = row_h * len(labels) + row_gap * (len(labels) - 1)
+        row_top = _com_area_top + max(0, (_com_area_bottom - _com_area_top - _com_block_h) // 2)
         for idx, (label, key) in enumerate(zip(labels, keys)):
             y = row_top + idx * (row_h + row_gap)
             focused = sub_r == idx
             count = len(ch_info.get("schedules", {}).get(key, []))
-            pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (row_x, y, row_w, row_h), border_radius=6)
+            pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (row_x, y, row_w, row_h), border_radius=6)
             if focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, y, row_w, row_h), SELECTION_BORDER_WIDTH, border_radius=6)
             text = f_ch_label.render(f"{label.upper()} ({'ADD' if count == 0 else count})", True, NEON_GREEN if focused else TEXT_WHITE)
             menu_canvas.blit(text, (row_x + row_w // 2 - text.get_width() // 2, y + row_h // 2 - text.get_height() // 2))
-        clear_x, clear_w = cx + 35, 240
         focused = sub_r == menu_nav.COMMERCIALS_CLEAR_ROW
-        pygame.draw.rect(menu_canvas, OFF_RED, (clear_x, close_y, clear_w, 40), border_radius=4)
-        if focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (clear_x, close_y, clear_w, 40), SELECTION_BORDER_WIDTH, border_radius=4)
-        text = f_ch_btn.render("Clear Media", True, TEXT_WHITE)
-        menu_canvas.blit(text, (clear_x + clear_w // 2 - text.get_width() // 2, close_y + 20 - text.get_height() // 2))
+        _com_has_media = any(len(ch_info.get("schedules", {}).get(k, [])) > 0 for k in keys)
+        _draw_menu_clear(menu_canvas, cx, content_y, content_h, focused, _com_has_media, f_ch_btn, NEON_GREEN)
 
         focused = sub_r == menu_nav.COMMERCIALS_CLOSE_ROW
         close_x = cx + content_w - 135
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_x, close_y, 110, 40), border_radius=4)
-        if focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_x, close_y, 110, 40), SELECTION_BORDER_WIDTH, border_radius=4)
-        text = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(text, (close_x + 55 - text.get_width() // 2, close_y + 20 - text.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Channels tab: holiday sub-menu
@@ -5413,7 +5586,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         f_sub_title = _get_font("Courier New", 20, bold=True)
         lbl_hdr = f_sub_title.render(
-            f"Channel {target_ch_str}  —  Holiday Schedule Overrides", True, TEXT_WHITE
+            f"Channel {target_ch_str}  —  Holiday Schedule", True, TEXT_WHITE
         )
         menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
 
@@ -5429,27 +5602,30 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         cell_h_hol = max(HOLIDAY_ROW_MIN_H_PX, min(HOLIDAY_ROW_MAX_H_PX, _hol_slot_h - HOLIDAY_ROW_SLOT_PAD_PX))
         _tog_w     = HOLIDAY_TOGGLE_W_PX
         _tog_gap   = HOLIDAY_TOGGLE_GAP_PX
-        _row_w     = content_w - HOLIDAY_ROW_SIDE_SPACE_PX
+        _row_w     = int(content_w * SUB_MENU_ROW_WIDTH_SHARE)
         _pick_w    = _row_w - _tog_w - _tog_gap
+        _pair_x    = cx + (content_w - _row_w) // 2
+        _hol_block_h = cell_h_hol * 3 + SUB_MENU_ROW_GAP_PX * 2
+        _hol_block_top = _hol_top + max(0, (_hol_bottom - _hol_top - _hol_block_h) // 2)
 
         for h_idx, (h_key, h_name) in enumerate(zip(HKEYS, HNAMES)):
-            hy = _hol_top + h_idx * _hol_slot_h + (_hol_slot_h - cell_h_hol) // 2
+            hy = _hol_block_top + h_idx * (cell_h_hol + SUB_MENU_ROW_GAP_PX)
             is_focused = (sub_r == h_idx and sub_c == 0)
             entries    = ch_info.get("holiday_schedules", {}).get(h_key, [])
             fc = len(entries)
-            pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (cx + 35, hy, _pick_w, cell_h_hol), border_radius=6)
+            pygame.draw.rect(menu_canvas, COLOR_BUTTON_ADD, (_pair_x, hy, _pick_w, cell_h_hol), border_radius=6)
             if is_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (cx + 35, hy, _pick_w, cell_h_hol), SELECTION_BORDER_WIDTH, border_radius=6)
+                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_pair_x, hy, _pick_w, cell_h_hol), SELECTION_BORDER_WIDTH, border_radius=6)
             lbl_h = f_ch_label.render(
-                f"{h_name.upper()}:  {fc} file{'s' if fc != 1 else ''} selected — ENTER to pick files",
+                f"{h_name.upper()} ({'ADD' if fc == 0 else fc})",
                 True, NEON_GREEN if is_focused else TEXT_WHITE
             )
-            menu_canvas.blit(lbl_h, (cx + 55, hy + cell_h_hol // 2 - lbl_h.get_height() // 2))
+            menu_canvas.blit(lbl_h, (_pair_x + _pick_w // 2 - lbl_h.get_width() // 2, hy + cell_h_hol // 2 - lbl_h.get_height() // 2))
 
             _tog_on = (_force_states.get(h_key) == "on")
             _tog_greyed = (_force_states.get(h_key, "greyed") == "greyed")
             _tog_focused = (sub_r == h_idx and sub_c == 1)
-            _tog_x = cx + 35 + _pick_w + _tog_gap
+            _tog_x = _pair_x + _pick_w + _tog_gap
             _tog_bg = COLOR_MENU_TOGGLE_GREYED if _tog_greyed else COLOR_MENU_BUTTON
             pygame.draw.rect(menu_canvas, _tog_bg, (_tog_x, hy, _tog_w, cell_h_hol), border_radius=6)
             if _tog_focused:
@@ -5468,20 +5644,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             pygame.draw.circle(menu_canvas, COLOR_MENU_KNOB_GREYED if _tog_greyed else TEXT_WHITE, (_knob_x, _sw_y + _sw_h // 2), 9)
 
         is_clear_focused = (sub_r == menu_nav.HOLIDAY_CLEAR_ROW)
-        _clear_x, _clear_y, _clear_w, _clear_h = cx + 35, content_y + content_h - 52, 200, 40
-        pygame.draw.rect(menu_canvas, OFF_RED, (_clear_x, _clear_y, _clear_w, _clear_h), border_radius=4)
-        if is_clear_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_clear_x, _clear_y, _clear_w, _clear_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        lbl_clear = f_ch_btn.render("Clear Media", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_clear, (_clear_x + _clear_w // 2 - lbl_clear.get_width() // 2, _clear_y + _clear_h // 2 - lbl_clear.get_height() // 2))
+        _hol_has_media = any(len(v or []) > 0 for v in (ch_info.get("holiday_schedules") or {}).values())
+        _draw_menu_clear(menu_canvas, cx, content_y, content_h, is_clear_focused, _hol_has_media, f_ch_btn, NEON_GREEN)
 
         is_back_focused = (sub_r == menu_nav.HOLIDAY_CLOSE_ROW)
-        _bk_x, _bk_y, _bk_w, _bk_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-        pygame.draw.rect(menu_canvas, OFF_RED, (_bk_x, _bk_y, _bk_w, _bk_h), border_radius=4)
-        if is_back_focused:
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (_bk_x, _bk_y, _bk_w, _bk_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        lbl_bk = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_bk, (_bk_x + _bk_w // 2 - lbl_bk.get_width() // 2, _bk_y + _bk_h // 2 - lbl_bk.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_back_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Video tab
@@ -5491,7 +5658,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         
         top_buttons_y = content_y + 20
         close_button_y = content_y + content_h - 50
-        _close_btn_y = close_button_y - 8
 
         box_radius = 4
         inner_radius = 3
@@ -5565,15 +5731,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if is_sl_focused: pygame.draw.circle(menu_canvas, NEON_GREEN, (handle_x, sy + 33), focus_handle_rad, SELECTION_BORDER_WIDTH)
 
         is_cl_focused = (layer == "VIDEO_ROWS" and cur_sel == 9)
-        close_btn_w = 110
-        close_btn_h = 40
-        close_btn_x = cx + content_w - close_btn_w - 25
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, _close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_cl_focused: _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, _close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_c = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_c, (close_btn_x + (close_btn_w // 2) - (lbl_c.get_width() // 2), _close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_cl_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Theme tab
@@ -5604,11 +5763,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         BUTTON_BLUE = COLOR_MENU_BUTTON_BLUE
         trans_btn_h = 40
 
-        close_btn_w = 110
-        close_btn_h = 40
-        close_btn_x = cx + content_w - close_btn_w - 25
         close_btn_y = content_y + content_h - 52
-        close_txt_y_offset = (close_btn_h // 2) - (f_ch_btn.get_height() // 2)
 
         top_area_y = content_y + 20
 
@@ -5749,11 +5904,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         is_cl_focused = (layer == "THEME_ROWS" and cur_sel == 5)
 
-        pygame.draw.rect(menu_canvas, OFF_RED, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), border_radius=box_radius)
-        if is_cl_focused: 
-            _aa_rounded_rect(menu_canvas, NEON_GREEN, (close_btn_x, close_btn_y, close_btn_w, close_btn_h), focus_thickness, border_radius=box_radius)
-        lbl_c = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_c, (close_btn_x + (close_btn_w // 2) - (lbl_c.get_width() // 2), close_btn_y + close_txt_y_offset))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_cl_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Games tab: console list
@@ -5878,7 +6029,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         elif mm_count > 1:
             mm_badge_txt = f"{mm_count} tracks"
         else:
-            mm_badge_txt = "default"
+            mm_badge_txt = "Add"
         MM_BADGE_MAX_STR = "100 tracks"
         PROFILE_BADGE_MAX_STR = "Profile 8"
 
@@ -6003,7 +6154,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                  (col_right_x, row3_y, set_btn_w, row_h), SELECTION_BORDER_WIDTH, border_radius=5)
             menu_canvas.blit(btn_lbl, (col_right_x + (set_btn_w - btn_lbl.get_width()) // 2,
                                         row3_y + (row_h - btn_lbl.get_height()) // 2))
-            badge_col  = (0, 0, 0)
+            badge_col  = COLOR_BUTTON_TOGGLE_ADD
             if mm_enabled:
                 badge_txt_col = COLOR_MENU_VALUE_MINT if is_set_focused else TEXT_WHITE
             else:
@@ -6020,14 +6171,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                            row3_y + (row_h - badge_surf.get_height()) // 2))
 
         is_close_g = (cur_sel_g == 99)
-        _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-        pygame.draw.rect(menu_canvas, OFF_RED,
-                         (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-        if is_close_g:
-            pygame.draw.rect(menu_canvas, NEON_GREEN,
-                             (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_g, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Games tab: console sub-menu
@@ -6133,12 +6277,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             menu_canvas.blit(lbl_msg2, (cx + content_w // 2 - lbl_msg2.get_width() // 2, msg_y + 34))
 
             is_close_focused = (sub_row == 1)
-            _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-            pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-            if is_close_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-            lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-            menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+            _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
         elif console_key == "DVD":
             dvd_sub_rows  = get_games_sub_menu_rows(db, app_state, console_key, is_on)
             dvd_full_rows = ["status"] + dvd_sub_rows + ["close"]
@@ -6169,14 +6308,13 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _dvd_audio_enabled = _dvd_audio_track_count > 1
             audio_row_y = top_y + (cell_h + y_gap) * 3
             is_audio_focused = (sub_row == dvd_full_rows.index("dvd_audio_track"))
-            _audio_bg = COLOR_MENU_BUTTON if _dvd_audio_enabled else COLOR_MENU_ROW_OFF
-            _audio_txt_color = TEXT_WHITE if _dvd_audio_enabled else COLOR_MENU_OFF_LABEL_GREY
+            _audio_bg = COLOR_BUTTON_AUDIO_TRACK if _dvd_audio_enabled else COLOR_MENU_BUTTON_GREYED
+            _audio_txt_color = COLOR_BUTTON_AUDIO_TRACK_TEXT if _dvd_audio_enabled else COLOR_MENU_TEXT_GREYED
             pygame.draw.rect(menu_canvas, _audio_bg, (row_x, audio_row_y, short_row_w, cell_h), border_radius=6)
             if is_audio_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, audio_row_y, short_row_w, cell_h), SELECTION_BORDER_WIDTH, border_radius=6)
             lbl_audio = f_ch_label.render(
-                "CHANGE AUDIO SELECTION", True,
-                NEON_GREEN if (is_audio_focused and _dvd_audio_enabled) else _audio_txt_color
+                "CHANGE AUDIO SELECTION", True, _audio_txt_color
             )
             menu_canvas.blit(lbl_audio, (row_x + 20, audio_row_y + cell_h // 2 - lbl_audio.get_height() // 2))
 
@@ -6222,12 +6360,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 pygame.draw.circle(menu_canvas, NEON_GREEN, (_res_handle_x, _resume_row_y + 12), 11, SELECTION_BORDER_WIDTH)
 
             is_close_focused = (sub_row == dvd_full_rows.index("close"))
-            _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-            pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-            if is_close_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-            lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-            menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+            _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
         else:
             sub_rows = get_games_sub_menu_rows(db, app_state, console_key, is_on)
             full_rows = sub_rows + ["close"] if console_key == "MENU" else ["status"] + sub_rows + ["close"]
@@ -6313,8 +6446,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 is_focused = (sub_row == row_idx)
                 if row_id in ("clear_roms", "clear_cores"):
                     _has_content = _menu_clear_has_content[row_id]
-                    _row_bg = COLOR_MENU_CLEAR_BUTTON if _has_content else COLOR_MENU_BUTTON_GREYED
-                    _row_txt_col = (NEON_GREEN if is_focused else COLOR_MENU_CLEAR_TEXT) if _has_content else COLOR_MENU_TEXT_GREYED
+                    _row_bg = COLOR_BUTTON_CLEAR if _has_content else COLOR_MENU_BUTTON_GREYED
+                    _row_txt_col = (NEON_GREEN if is_focused else TEXT_WHITE) if _has_content else COLOR_MENU_TEXT_GREYED
+                elif row_id in ("scan_for_roms", "scan_for_cores"):
+                    _row_bg = COLOR_BUTTON_ADD
+                    _row_txt_col = NEON_GREEN if is_focused else TEXT_WHITE
                 else:
                     _row_bg = COLOR_MENU_BUTTON
                     _row_txt_col = NEON_GREEN if is_focused else TEXT_WHITE
@@ -6424,19 +6560,20 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 elif cur_idx < 0:
                     val_str = f"{len(discs)} DISCS FOUND"
                     if is_disc_focused:
-                        val_str += "  --  ENTER FOR DISC 1"
+                        val_str = [val_str + "  --", ("enter",), "FOR DISC 1"]
                     val_col = COLOR_MENU_VALUE_MINT if is_disc_focused else TEXT_WHITE
                 elif has_next_disc:
                     val_str = f"ON DISC {cur_idx + 1} / {len(discs)}"
                     if is_disc_focused:
-                        val_str += f"  --  ENTER FOR DISC {cur_idx + 2}"
+                        val_str = [val_str + "  --", ("enter",), f"FOR DISC {cur_idx + 2}"]
                     val_col = COLOR_MENU_VALUE_MINT if is_disc_focused else TEXT_WHITE
                 else:
                     val_str = f"FINAL DISC ({cur_idx + 1} / {len(discs)}) -- NO SWAP AVAILABLE"
                     val_col = COLOR_MENU_DISC_TEXT_OFF
-                lbl_val = f_ch_label.render(val_str, True, val_col)
-                menu_canvas.blit(lbl_val, (row_x + disc_row_w - lbl_val.get_width() - 16,
-                                            disc_row_y + cell_h // 2 - lbl_val.get_height() // 2))
+                _val_parts = val_str if isinstance(val_str, list) else [val_str]
+                _val_w = key_hint_size(_val_parts, f_ch_label, None)[0]
+                draw_key_hint(menu_canvas, _val_parts, row_x + disc_row_w - _val_w - 16,
+                              disc_row_y + cell_h // 2, f_ch_label, val_col)
 
             if console_key != "MENU":
                 _draw_console_splash_panel(menu_canvas, db, console_key, cx, content_w, top_y,
@@ -6454,12 +6591,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             close_row = full_rows.index("close")
             is_close_focused = (sub_row == close_row)
-            _cb_x, _cb_y, _cb_w, _cb_h = cx + content_w - 135, content_y + content_h - 52, 110, 40
-            pygame.draw.rect(menu_canvas, OFF_RED, (_cb_x, _cb_y, _cb_w, _cb_h), border_radius=4)
-            if is_close_focused:
-                _aa_rounded_rect(menu_canvas, NEON_GREEN, (_cb_x, _cb_y, _cb_w, _cb_h), SELECTION_BORDER_WIDTH, border_radius=4)
-            lbl_cl = f_ch_btn.render("Close", True, TEXT_WHITE)
-            menu_canvas.blit(lbl_cl, (_cb_x + _cb_w // 2 - lbl_cl.get_width() // 2, _cb_y + _cb_h // 2 - lbl_cl.get_height() // 2))
+            _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Games tab: save profile
@@ -6672,15 +6804,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                            greyed=(not is_active) or _outer_bezel_blocks)
 
         is_back_foc = (profile_row == back_row)
-        _bk_x, _bk_y, _bk_w, _bk_h = cx + content_w - 135, close_y, 110, close_h
-        pygame.draw.rect(menu_canvas, OFF_RED,
-                         (_bk_x, _bk_y, _bk_w, _bk_h), border_radius=4)
-        if is_back_foc:
-            pygame.draw.rect(menu_canvas, NEON_GREEN,
-                             (_bk_x, _bk_y, _bk_w, _bk_h), SELECTION_BORDER_WIDTH, border_radius=4)
-        lbl_bk = f_ch_btn.render("Close", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_bk, (_bk_x + _bk_w // 2 - lbl_bk.get_width() // 2,
-                                   _bk_y + _bk_h // 2 - lbl_bk.get_height() // 2))
+        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_back_foc, f_ch_btn, NEON_GREEN)
 
         if not is_active:
             note = _get_font("Courier New", 11).render(
@@ -6742,12 +6866,11 @@ def render_quit_prompt(surface, theme, db=None):
     f_body  = _get_font("Courier New", 19, bold=True)
 
     lbl1 = f_title.render("MINIMIZE PROGRAM?", True, ARCADE_GOLD)
-    lbl2 = f_body.render("PRESS  [ ESCAPE ]  TO RESUME", True, TEXT_WHITE)
-    lbl3 = f_body.render("PRESS  [ ENTER ]  TO TOGGLE WINDOW", True, ACTION_RED)
-
     canvas.blit(lbl1, (CANVAS_W//2 - lbl1.get_width()//2, 30))
-    canvas.blit(lbl2, (CANVAS_W//2 - lbl2.get_width()//2, 100))
-    canvas.blit(lbl3, (CANVAS_W//2 - lbl3.get_width()//2, 140))
+    draw_key_hint(canvas, ["PRESS", ("esc",), "TO RESUME"], CANVAS_W // 2, 100 + f_body.get_height() // 2,
+                  f_body, TEXT_WHITE, center=True)
+    draw_key_hint(canvas, ["PRESS", ("enter",), "TO TOGGLE WINDOW"], CANVAS_W // 2, 144 + f_body.get_height() // 2,
+                  f_body, ACTION_RED, center=True)
 
     dest_w, dest_h, dest_x, dest_y = fit_design_canvas(CANVAS_W, CANVAS_H, real_w, real_h)
     if dest_w == CANVAS_W and dest_h == CANVAS_H:
@@ -6816,8 +6939,8 @@ def render_pick_layout_popup(surface, theme, db, game_deck, player_num):
     surface.blit(remap_lbl, (remap_rect.centerx - remap_lbl.get_width() // 2,
                               remap_rect.centery - remap_lbl.get_height() // 2))
 
-    hint = f_hint.render("ENTER  REMAP NOW     ESC  DO IT LATER", True, COLOR_MENU_POPUP_HINT)
-    surface.blit(hint, (real_w // 2 - hint.get_width() // 2, box_y + box_h - 32))
+    draw_key_hint(surface, [("enter",), "REMAP NOW", ("esc",), "DO IT LATER"], real_w // 2,
+                  box_y + box_h - 32 + f_hint.get_height() // 2, f_hint, COLOR_MENU_POPUP_HINT, center=True)
 
 
 def render_controller_pick_wait_popup(surface, theme, db, game_deck, player_num):
@@ -6874,8 +6997,8 @@ def render_controller_pick_wait_popup(surface, theme, db, game_deck, player_num)
     sub2 = f_sub.render(sub2_txt, True, COLOR_MENU_POPUP_SUBTEXT_DIM)
     surface.blit(sub2, (real_w // 2 - sub2.get_width() // 2, box_y + 92))
 
-    hint = f_hint.render("ESC  CANCEL", True, COLOR_MENU_POPUP_HINT)
-    surface.blit(hint, (real_w // 2 - hint.get_width() // 2, box_y + box_h - 32))
+    draw_key_hint(surface, [("esc",), "CANCEL"], real_w // 2,
+                  box_y + box_h - 32 + f_hint.get_height() // 2, f_hint, COLOR_MENU_POPUP_HINT, center=True)
 
 
 def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
@@ -6921,9 +7044,16 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         f"Version {_update_version} is available." if _update_version else "A new version is available.",
         "The app restarts when it finishes.",
     ]
+    _reset_body = [
+        "Every setting and everything saved is forgotten.",
+        "Your own files stay. The app restarts.",
+    ]
+    _has_body = _is_burnin_family or target in ("app_update", "reset_settings")
 
     if _has_checkbox:
         box_h = 290
+    elif _has_body:
+        box_h = 240
     box_x = (real_w - box_w) // 2
     box_y = (real_h - box_h) // 2
 
@@ -6979,8 +7109,9 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
     title = f_title.render(title_text, True, COLOR_ARCADE_GOLD)
     surface.blit(title, (real_w // 2 - title.get_width() // 2, box_y + 25))
 
-    if _is_burnin_family or target == "app_update":
-        _body_lines = _BURNIN_BODY[_burnin_key] if _is_burnin_family else _update_body
+    if _has_body:
+        _body_lines = (_BURNIN_BODY[_burnin_key] if _is_burnin_family
+                       else _update_body if target == "app_update" else _reset_body)
         _body_max_w = box_w - 40
         _body_size = 15
         while _body_size > 10:
@@ -6994,33 +7125,12 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
             surface.blit(_lbl, (real_w // 2 - _lbl.get_width() // 2, _body_y))
             _body_y += 19
 
-    btn_w, btn_h = 110, 36
-    btn_y = box_y + (145 if _has_checkbox else 85)
-    yes_x = real_w // 2 - 100 - btn_w // 2
-    no_x = real_w // 2 + 100 - btn_w // 2
+    btn_y = box_y + (145 if _has_checkbox else 125 if _has_body else 85)
     selection = state.get("clear_confirm_selection", "No")
     _cc_focus = state.get("clear_confirm_focus", "buttons")
     _buttons_focused = (not _has_checkbox) or _cc_focus == "buttons"
-
-    pygame.draw.rect(surface, COLOR_MENU_OFF_RED, (yes_x, btn_y, btn_w, btn_h), border_radius=4)
-    if selection == "Yes" and _buttons_focused:
-        pygame.draw.rect(surface, ui_color, (yes_x, btn_y, btn_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=4)
-    yes_label = f_btn.render("YES", True, COLOR_TEXT_WHITE)
-    surface.blit(
-        yes_label,
-        (yes_x + btn_w // 2 - yes_label.get_width() // 2,
-         btn_y + btn_h // 2 - yes_label.get_height() // 2),
-    )
-
-    pygame.draw.rect(surface, COLOR_MENU_BUTTON_BLUE, (no_x, btn_y, btn_w, btn_h), border_radius=4)
-    if selection == "No" and _buttons_focused:
-        pygame.draw.rect(surface, ui_color, (no_x, btn_y, btn_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=4)
-    no_label = f_btn.render("NO", True, COLOR_TEXT_WHITE)
-    surface.blit(
-        no_label,
-        (no_x + btn_w // 2 - no_label.get_width() // 2,
-         btn_y + btn_h // 2 - no_label.get_height() // 2),
-    )
+    btn_h = POPUP_YES_NO_SIZE[1]
+    draw_popup_yes_no(surface, real_w // 2, btn_y, selection, _buttons_focused, f_btn, ui_color)
 
     if _has_checkbox:
         _dont_show = state.get("clear_confirm_dont_show_again", False)
@@ -7037,25 +7147,20 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
             pygame.draw.rect(surface, ui_color, (_cb_x - 6, _cb_y - 5, _cb_row_w + 12, _cb_size + 10), SELECTION_BORDER_WIDTH, border_radius=4)
         surface.blit(_cb_label, (_cb_x + _cb_size + 8, _cb_y + (_cb_size // 2) - (_cb_label.get_height() // 2)))
 
-        _hint_text = "W/A/S/D  NAVIGATE     ENTER  CONFIRM"
+        _hint_parts = [("w", "a", "s", "d"), "NAVIGATE", ("enter",), "CONFIRM"]
     else:
-        _hint_text = "A/D  NAVIGATE     ENTER  CONFIRM"
+        _hint_parts = [("a", "d"), "NAVIGATE", ("enter",), "CONFIRM"]
 
-    _hint_max_w = box_w - 20
-    _hint_size = 17
-    while _hint_size > 11:
-        f_hint = _get_font("Courier New", _hint_size, bold=True)
-        if f_hint.render(_hint_text, True, COLOR_MENU_POPUP_HINT).get_width() <= _hint_max_w:
-            break
-        _hint_size -= 1
-    hint = f_hint.render(_hint_text, True, COLOR_MENU_POPUP_HINT)
-    surface.blit(hint, (real_w // 2 - hint.get_width() // 2, box_y + box_h - 35))
+    _hint_font = _get_font("Courier New", 17, bold=True)
+    draw_key_hint_fitted(surface, _hint_parts, real_w // 2, box_y + box_h - 35 + _hint_font.get_height() // 2,
+                         "Courier New", 17, COLOR_MENU_POPUP_HINT, box_w - 20)
 
 
 # ============================================================================
 # SECTION: Exports
 # ============================================================================
 __all__ = [
+    "draw_popup_yes_no", "popup_yes_no_rects",
     "CONTROLS_SPLASH_TITLES", "NUM_CONTROL_PAGES",
     "CAPTIONS_COLOR_BOX_SEL",
     "DEFAULT_REMOTE_BINDINGS",

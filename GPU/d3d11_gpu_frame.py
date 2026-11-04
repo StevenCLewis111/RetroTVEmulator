@@ -90,7 +90,9 @@ VSOut VSMain(uint vid : SV_VertexID)
 
 HLSL_PASS1_BINDINGS = """
 Texture2D srcTex : register(t0);
+Texture2D picTex : register(t1);
 float4 LoadSrc(int2 p) { return srcTex.Load(int3(p, 0)); }
+float4 LoadPic(int2 p) { return picTex.Load(int3(p, 0)); }
 """
 
 HLSL_PASS1_CORE = """
@@ -106,15 +108,66 @@ cbuffer FrameCB
     float warpOn;
     float scanMode;
     float sampleSteps;
-    float padA;
-    float4 padB;
+    float pictureOn;
+    float brightOffset;
+    float contrastGain;
+    float saturationGain;
+    float tintShift;
+    float sharpenAmount;
+    float3 padS;
+    float4 pictureRect;
 };
 
 static const float TWO_PI = 6.28318530718;
 
+float3 AdjustColor(float3 c)
+{
+    c = (c + brightOffset - 128.0) * contrastGain + 128.0;
+    c = c + float3(0.5, -1.0, 0.5) * tintShift;
+    c = clamp(c, 0.0, 255.0);
+    float gray = dot(c, float3(0.299, 0.587, 0.114));
+    return clamp(gray + (c - gray) * saturationGain, 0.0, 255.0);
+}
+
+bool IsPictureTexel(int2 q)
+{
+    float2 p = float2(q);
+    if (!(p.x >= pictureRect.x && p.x < pictureRect.z && p.y >= pictureRect.y && p.y < pictureRect.w))
+    {
+        return false;
+    }
+    return all(LoadSrc(q).rgb == LoadPic(q).rgb);
+}
+
+float3 AdjustedTexel(int2 q, int2 size)
+{
+    float3 a = AdjustColor(LoadSrc(q).rgb * 255.0);
+    if (sharpenAmount != 0.0)
+    {
+        float3 box = float3(0.0, 0.0, 0.0);
+        [unroll]
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int2 n = clamp(q + int2(dx, dy), int2(0, 0), size - int2(1, 1));
+                box += AdjustColor(LoadSrc(n).rgb * 255.0);
+            }
+        }
+        box = box / 9.0;
+        a = clamp(a + sharpenAmount * (a - box), 0.0, 255.0);
+    }
+    return a;
+}
+
 float3 LoadRGB255(int2 p, int2 size)
 {
     int2 q = clamp(p, int2(0, 0), size - int2(1, 1));
+    if (pictureOn > 0.5 && IsPictureTexel(q))
+    {
+        return AdjustedTexel(q, size);
+    }
     return LoadSrc(q).rgb * 255.0;
 }
 
@@ -475,6 +528,8 @@ class GPUFramePipeline:
         self._cb2 = VOIDP()
         self._src_tex = VOIDP()
         self._src_srv = VOIDP()
+        self._pic_tex = VOIDP()
+        self._pic_srv = VOIDP()
         self._mid_tex = VOIDP()
         self._mid_srv = VOIDP()
         self._mid_rtv = VOIDP()
@@ -521,10 +576,12 @@ class GPUFramePipeline:
     # SECTION: Sized resources
     # ========================================================================
     def _release_sized(self):
-        for obj in (self._mid_rtv, self._mid_srv, self._mid_tex, self._src_srv, self._src_tex):
+        for obj in (self._mid_rtv, self._mid_srv, self._mid_tex, self._pic_srv, self._pic_tex, self._src_srv, self._src_tex):
             release(obj)
         self._src_tex = VOIDP()
         self._src_srv = VOIDP()
+        self._pic_tex = VOIDP()
+        self._pic_srv = VOIDP()
         self._mid_tex = VOIDP()
         self._mid_srv = VOIDP()
         self._mid_rtv = VOIDP()
@@ -553,6 +610,8 @@ class GPUFramePipeline:
         try:
             self._src_tex = self._create_texture(width, height, src_format, D3D11_BIND_SHADER_RESOURCE, "screen")
             self._src_srv = self._create_srv(self._src_tex, "screen")
+            self._pic_tex = self._create_texture(width, height, src_format, D3D11_BIND_SHADER_RESOURCE, "picture layer")
+            self._pic_srv = self._create_srv(self._pic_tex, "picture layer")
             self._mid_tex = self._create_texture(width, height, DXGI_FORMAT_B8G8R8A8_UNORM,
                                                  D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, "pass 1 output")
             self._mid_srv = self._create_srv(self._mid_tex, "pass 1 output")
@@ -677,13 +736,13 @@ class GPUFramePipeline:
         none = (VOIDP * 3)()
         call(self._context, CTX_PSSetShaderResources, None, [UINT, UINT, ctypes.POINTER(VOIDP)], 0, 3, none)
 
-    def _run_pass1(self, params: FrameParams):
+    def _run_pass1(self, params: FrameParams, pic_srv):
         self._update_constants(self._cb1, pack_constants(params), "_last_cb1")
         w, h = self._size
         call(self._context, CTX_OMSetRenderTargets, None, [UINT, ctypes.POINTER(VOIDP), VOIDP],
              1, ctypes.byref(self._mid_rtv), None)
         self._set_viewport(0, 0, w, h)
-        self._draw(self._ps1, [self._src_srv], self._cb1)
+        self._draw(self._ps1, [self._src_srv, pic_srv], self._cb1)
 
     def _run_pass2(self, composite: CompositePlan, source_srv):
         self._core.begin_frame()
@@ -691,8 +750,8 @@ class GPUFramePipeline:
         self._draw(self._ps2, [source_srv, self._bezel.srv, self._led.srv], self._cb2)
 
     def render(self, surface, params: FrameParams, plan: ScalePlan, clip=None, bar_color=(0, 0, 0), power_on=None,
-               draw_overlays: bool = True) -> None:
-        """Draws `surface` through pass 1 (skipped when no effect is on) and pass 2 into the back buffer; draw_overlays False leaves the bezel and LED out; does not present."""
+               draw_overlays: bool = True, picture_layer=None) -> None:
+        """Draws `surface` through pass 1 (skipped when no effect and no picture setting is on) and pass 2 into the back buffer; picture_layer is the screen as it was before menus and on-screen readouts were drawn over it (None when nothing was), so the picture settings leave those alone; draw_overlays False leaves the bezel and LED out; does not present."""
         if self._closed:
             raise GPUFrameError("GPUFramePipeline is closed")
         width, height = surface.get_size()
@@ -707,8 +766,14 @@ class GPUFramePipeline:
         self._ensure_textures(width, height, self._format_for(surface))
         self._upload_surface(self._src_tex, surface)
         source_srv = self._src_srv
-        if params.warp or params.scan_mode != SCAN_NONE:
-            self._run_pass1(params)
+        if params.warp or params.scan_mode != SCAN_NONE or params.picture_on:
+            pic_srv = self._src_srv
+            if params.picture_on and picture_layer is not None:
+                if picture_layer.get_size() != (width, height) or self._format_for(picture_layer) != self._src_format:
+                    raise GPUFrameError("picture layer does not match the screen surface")
+                self._upload_surface(self._pic_tex, picture_layer)
+                pic_srv = self._pic_srv
+            self._run_pass1(params, pic_srv)
             source_srv = self._mid_srv
         bw, bh = self._core.size
         visible = _intersect(ClipRect(plan.dest_x, plan.dest_y, plan.draw_w, plan.draw_h),

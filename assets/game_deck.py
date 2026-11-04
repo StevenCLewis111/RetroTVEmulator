@@ -23,7 +23,7 @@ import performance_governor as _gov
 import media as _media_listing
 
 from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info, console_splash_file,
-                    is_dvd_disc_source, apply_video_effects,
+                    is_dvd_disc_source,
                     generate_captions_via_asr_chunked, _asr_slot, resolve_caption_source)
 
 
@@ -51,29 +51,72 @@ except Exception:
 # ============================================================================
 
 
+# WARNING: 7z.exe is a console program; started from the windowed app without this flag Windows flashes a console window for every archive look.
+_SEVENZIP_RUN_KW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)} if sys.platform == "win32" else {}
+
+
+def _bundled_7zip_candidates():
+    """The app's own 7-Zip places, nearest first: 7z.exe (opens .7z, .zip and .rar) before 7za.exe (7-Zip Extra: .7z and .zip, no .rar), each in _internal\\tools\\7zip in the built app, then tools\\7zip beside the main script and beside this file in the project (owner 2026-11-03: portable, no install needed)."""
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    if main_file:
+        roots.append(os.path.dirname(os.path.abspath(main_file)))
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    out = []
+    for name in ("7z.exe", "7za.exe"):
+        for root in roots:
+            path = os.path.join(root, "tools", "7zip", name)
+            if path not in out:
+                out.append(path)
+    return out
+
+
 def _find_7zip_exe():
-    """Return path to 7z.exe, or None when 7-Zip is not installed / not on PATH."""
-    candidates = [
+    """Return the path to the 7z.exe to use: the app's own copy in tools\\7zip first, then an installed 7-Zip; None when there is none."""
+    bundled = _bundled_7zip_candidates()
+    candidates = [p for p in bundled if os.path.isfile(p)] + [
         r"C:\Program Files\7-Zip\7z.exe",
         r"C:\Program Files (x86)\7-Zip\7z.exe",
         "7z",
         "7z.exe",
     ]
     for path in candidates:
+        if os.path.isabs(path) and not os.path.isfile(path):
+            continue
         try:
             r = subprocess.run(
                 [path, "i"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5,
+                timeout=5, **_SEVENZIP_RUN_KW,
             )
             if r.returncode == 0:
+                if path in bundled:
+                    log.info("[GAMES] 7-Zip: using the app's own copy at %s", path)
+                    if os.path.basename(path).lower() == "7za.exe":
+                        log.warning("[GAMES] 7-Zip: the app's own copy is 7za.exe (7-Zip Extra), which cannot open .rar; .rar games "
+                                    "will not open. For .rar put 7z.exe and 7z.dll from a full 7-Zip in tools\\7zip.")
+                else:
+                    log.warning("[GAMES] 7-Zip: the app's own copy is missing (%s); using %s, so on a computer without it "
+                                ".7z and .rar games cannot open. Put 7z.exe and 7z.dll in tools\\7zip.", bundled[0], path)
                 return path
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             continue
+    log.warning("[GAMES] 7-Zip not found: no 7z.exe at %s and none installed; .7z and .rar games cannot open "
+                "(.zip games still do). Put 7z.exe and 7z.dll in tools\\7zip.", bundled[0])
     return None
 
 
 ARCHIVE_EXTS = (".zip", ".7z", ".rar")
+
+
+def _7zip_opens(ext):
+    """True when the 7-Zip found at start can open an archive with this ending: 7za.exe (7-Zip Extra) has no RAR."""
+    if _7ZIP_EXE is None:
+        return False
+    return not (ext == ".rar" and str(_7ZIP_EXE).replace("\\", "/").rsplit("/", 1)[-1].lower() == "7za.exe")
 
 
 def _list_archive_entries(archive_path):
@@ -85,11 +128,11 @@ def _list_archive_entries(archive_path):
                 return [(info.filename, info.file_size)
                         for info in zf.infolist() if not info.is_dir()]
         elif ext in (".7z", ".rar"):
-            if _7ZIP_EXE is None:
+            if not _7zip_opens(ext):
                 return None
             list_r = subprocess.run(
                 [_7ZIP_EXE, "l", "-slt", archive_path],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=30, **_SEVENZIP_RUN_KW,
             )
             if list_r.returncode != 0:
                 return None
@@ -157,7 +200,7 @@ def _archive_matches_console(archive_path, console):
                 _ARCHIVE_CONTENT_CACHE.popitem(last=False)
     return result
 
-# WARNING: importing this module runs _find_7zip_exe() (up to 4 subprocess calls).
+# WARNING: importing this module runs _find_7zip_exe() (one subprocess call when the app's own copy is there, up to 4 otherwise).
 # WARNING: retro_tv_emulator.py imports game_deck lazily inside functions on purpose; a top-level import moves that cost into app boot.
 _7ZIP_EXE = _find_7zip_exe()
 
@@ -589,6 +632,39 @@ def get_bios_dir_for_console(base_dir, console):
     if console not in BIOS_REQUIRED_CONSOLES:
         return None
     return os.path.join(base_dir, "main", "cores", console, "system")
+
+
+def _remembered_file_path(saved, old_copy_folder):
+    """Return the file a remembered setting points at: a full path where it sits, or an old bare name copied into old_copy_folder by earlier versions, else None."""
+    if not saved:
+        return None
+    saved = str(saved)
+    if os.path.isabs(saved):
+        return saved if os.path.isfile(saved) else None
+    if not old_copy_folder:
+        return None
+    try:
+        for fname in os.listdir(old_copy_folder):
+            if fname.lower() == saved.lower() and os.path.isfile(os.path.join(old_copy_folder, fname)):
+                return os.path.join(old_copy_folder, fname)
+    except OSError:
+        return None
+    return None
+
+
+def resolve_active_core_path(console, saved, cores_dir):
+    """Return the core file a console plays with, from its remembered location in emulator_config.json, else None."""
+    return _remembered_file_path(saved, os.path.join(cores_dir, console) if cores_dir else "")
+
+
+def resolve_active_bios_path(console, saved, base_dir):
+    """Return the BIOS file a console boots with, from its remembered location in the settings, else None."""
+    return _remembered_file_path(saved, get_bios_dir_for_console(base_dir, console) if base_dir else "")
+
+
+def is_console_core_key(key):
+    """Whether an emulator_config.json key holds a console's core (the file also keeps controller maps under other keys)."""
+    return key in CONSOLE_ORDER and key not in ("MENU", "DVD")
 
 
 # ============================================================================
@@ -3488,6 +3564,7 @@ class ExternalGameDeck:
             emu_folder = os.path.join(self.cores_dir, c)
             rom_folder = self._get_console_rom_dir(c)
             if (os.path.isdir(emu_folder)
+                    or resolve_active_core_path(c, self.emulator_config.get(c), self.cores_dir)
                     or os.path.isdir(rom_folder)
                     or bool(self.console_roms_manual.get(c))):
                 found.append(c)
@@ -4944,7 +5021,7 @@ class ExternalGameDeck:
         return results, sorted(r for r in unresponsive_roots if r)
 
     def bulk_scan_for_cores(self, parent_folder, max_depth=6):
-        """"Scan For Cores": walk `parent_folder` for *_libretro.dll files and copy each match into main/cores/<CONSOLE>/."""
+        """"Scan For Cores": walk `parent_folder` for *_libretro.dll files and remember where they are; nothing is copied."""
         found = {}
         unresponsive_roots = set()
 
@@ -4965,42 +5042,19 @@ class ExternalGameDeck:
                         _walk(entry.path, depth + 1)
                     elif entry.is_file() and entry.name.lower().endswith("_libretro.dll"):
                         for console in match_consoles_for_core_filename(entry.name):
-                            found.setdefault(console, []).append(entry.path)
+                            found.setdefault(console, []).append(os.path.abspath(entry.path))
                 except OSError as _swallowed_error:
                     _log_swallowed("ExternalGameDeck.bulk_scan_for_cores._walk: if entry.is_dir() and (not entry.name.startswith(('.', '$'))):", _swallowed_error)
                     continue
 
         _walk(parent_folder, 0)
 
-        results = {}
-        for console, src_paths in found.items():
-            dest_dir = os.path.join(self.cores_dir, console)
-            try:
-                os.makedirs(dest_dir, exist_ok=True)
-            except Exception as e:
-                log.warning(f"[CORES] Could not create {dest_dir}: {e}")
-                continue
-            n_new, n_present = 0, 0
-            for src in src_paths:
-                dest = os.path.join(dest_dir, os.path.basename(src))
-                if os.path.exists(dest):
-                    n_present += 1
-                    continue
-                try:
-                    shutil.copy2(src, dest)
-                    n_new += 1
-                    log.info(f"[CORES] Copied {os.path.basename(src)} -> {dest_dir}")
-                except Exception as e:
-                    log.warning(f"[CORES] Could not copy {src} -> {dest}: {e}")
-            if n_new or n_present:
-                results[console] = (n_new, n_present)
-
-        if results:
-            self._assign_default_cores_after_scan(list(results.keys()))
+        set_now = self._assign_default_cores_after_scan(found) if found else set()
+        results = {console: (len(paths), 1 if console in set_now else 0) for console, paths in found.items()}
         return results, sorted(r for r in unresponsive_roots if r)
 
-    def _assign_default_cores_after_scan(self, consoles):
-        """Give each console without an active core in emulator_config.json the best match in its folder per PREFERRED_CORE_ORDER."""
+    def _assign_default_cores_after_scan(self, found):
+        """Give each console whose remembered core is missing the best core the scan found (PREFERRED_CORE_ORDER), remembered where it sits; returns the consoles set."""
         try:
             with open(self.config_path, "r", encoding="utf-8") as fp:
                 cfg = json.load(fp)
@@ -5010,24 +5064,20 @@ class ExternalGameDeck:
         except Exception as _swallowed_error:
             _log_swallowed("ExternalGameDeck._assign_default_cores_after_scan: with open(self.config_path, 'r', encoding='utf-8') as fp:", _swallowed_error)
             cfg = {}
-        changed = False
-        for console in consoles:
-            if cfg.get(console):
+        set_now = set()
+        for console, paths in found.items():
+            if resolve_active_core_path(console, cfg.get(console), self.cores_dir):
                 continue
-            dest_dir = os.path.join(self.cores_dir, console)
-            try:
-                present = [f for f in os.listdir(dest_dir) if f.lower().endswith(".dll")]
-            except Exception as _swallowed_error:
-                _log_swallowed("ExternalGameDeck._assign_default_cores_after_scan: present = [f for f in os.listdir(dest_dir) if f.lower().endswith('....", _swallowed_error)
-                present = []
-            if not present:
-                continue
-            chosen = resolve_preferred_core_filename(console, present)
+            by_name = {}
+            for path in paths:
+                by_name.setdefault(os.path.basename(path), path)
+            chosen = resolve_preferred_core_filename(console, list(by_name))
             if not chosen:
                 continue
-            cfg[console] = chosen
-            changed = True
-            log.info(f"[CORES] {console}: default active core set to {chosen}")
+            cfg[console] = by_name[chosen]
+            set_now.add(console)
+            log.info(f"[CORES] {console}: active core set to {by_name[chosen]}")
+        changed = bool(set_now)
         if changed:
             try:
                 os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
@@ -5035,6 +5085,7 @@ class ExternalGameDeck:
                     json.dump(cfg, fp, indent=2)
             except Exception as e:
                 log.warning(f"[CORES] Could not save {self.config_path}: {e}")
+        return set_now
 
     def _scan_roms(self, console):
         target_folder = getattr(self, "current_browse_dir", "")
@@ -7510,12 +7561,11 @@ class ExternalGameDeck:
         else:
             close_idx = 2
 
-        OFF_RED = _gov.COLOR_GAME_OFF_RED
-        close_w, close_h = 110, 40
-        close_x = x + w - close_w - 25
-        close_y = y + h - 52
+        _close_inset, _close_up, close_w, close_h = _gov.MENU_CLOSE_BUTTON_PLACE
+        close_x = x + w - close_w - _close_inset
+        close_y = y + h - _close_up
         is_close_sel = (cursor == close_idx)
-        pygame.draw.rect(surface, OFF_RED, (close_x, close_y, close_w, close_h), border_radius=4)
+        pygame.draw.rect(surface, _gov.COLOR_BUTTON_CLOSE, (close_x, close_y, close_w, close_h), border_radius=4)
         if is_close_sel:
             pygame.draw.rect(surface, ui_color, (close_x, close_y, close_w, close_h), SELECTION_BORDER_WIDTH, border_radius=4)
         lbl_close = f_opt.render("Close", True, _gov.COLOR_TEXT_WHITE)
@@ -7524,8 +7574,9 @@ class ExternalGameDeck:
 
         if seq_running and active_btn:
             ctrl_bottom = y + h - 6
-            hint_lbl = f_small.render("BACKSPACE to skip button   ESC to cancel remap", True, _gov.COLOR_GAME_REMAP_HINT)
-            surface.blit(hint_lbl, (center_x - hint_lbl.get_width() // 2, ctrl_bottom - 14))
+            import ui as _ui
+            _ui.draw_key_hint(surface, [("backspace",), "to skip button", ("esc",), "to cancel remap"], center_x,
+                              ctrl_bottom - 14 + f_small.get_height() // 2, f_small, _gov.COLOR_GAME_REMAP_HINT, center=True)
 
         if _target_w > 0 and _target_h > 0:
             _scaled_panel = pygame.transform.smoothscale(surface, (_target_w, _target_h))
@@ -7790,27 +7841,35 @@ class ExternalGameDeck:
     def set_theme(self, ui_color):
         if ui_color: self.ui_color = ui_color
 
+    _LEGEND_CONTROLLER_PICTURES = {"\u2190\u2191\u2193\u2192": ("pad_dpad",), "\u2190/\u2192": ("pad_left", "pad_right"),
+                                   "\u2191/\u2193": ("pad_up", "pad_down"), "A": ("pad_a",), "B": ("pad_b",)}
+    _LEGEND_KEYBOARD_PICTURES = {"W/A/S/D": ("w", "a", "s", "d"), "A/D": ("a", "d"), "W/S": ("w", "s"),
+                                 "Enter": ("enter",), "ESC": ("esc",)}
+
     def _draw_legend(self, screen, cx, y, h, groups):
+        """Draws the legend under a game menu: each action's name, then its controller button and its keyboard key as pictures (as text when a picture is missing)."""
+        import ui as _ui
         f     = self._font_small
         col_w = 130
-        row_h = _gov.GAME_LEGEND_ROW_H_PX
+        key_h = _gov.GAME_LEGEND_KEY_H_PX
+        gap   = _gov.GAME_LEGEND_ROW_GAP_PX
         total_w = col_w * len(groups)
         block_x = cx - total_w // 2
-        y_title = y + h - 3 * row_h - _gov.GAME_LEGEND_BOTTOM_PAD_PX
-        y_ctrl  = y_title + row_h
-        y_kb    = y_ctrl  + row_h
+        y_title = y + h - (f.get_height() + 2 * key_h + 2 * gap) - _gov.GAME_LEGEND_BOTTOM_PAD_PX
+        y_ctrl  = y_title + f.get_height() + gap + key_h // 2
+        y_kb    = y_ctrl + key_h + gap
         tc = self.list_text_color
         title_col = tc
         key_col   = tuple(max(0, c - _gov.GAME_LEGEND_KEY_DARKEN) for c in tc[:3])
         for i, (action, ctrl_key, kb_key) in enumerate(groups):
             col_cx = block_x + i * col_w + col_w // 2
-            for text, color, row_y in [
-                (action,   title_col, y_title),
-                (ctrl_key, key_col,   y_ctrl),
-                (kb_key,   key_col,   y_kb),
-            ]:
-                lbl = f.render(text, True, color)
-                screen.blit(lbl, (col_cx - lbl.get_width() // 2, row_y))
+            lbl = f.render(action, True, title_col)
+            screen.blit(lbl, (col_cx - lbl.get_width() // 2, y_title))
+            for text, pictures, row_cy in ((ctrl_key, self._LEGEND_CONTROLLER_PICTURES, y_ctrl),
+                                           (kb_key, self._LEGEND_KEYBOARD_PICTURES, y_kb)):
+                keys = pictures.get(text)
+                _ui.draw_key_hint(screen, [keys] if keys else [text], col_cx, row_cy, f, key_col,
+                                  key_h=key_h, center=True)
 
     # ========================================================================
     # SECTION: Rendering: console carousel
@@ -7818,7 +7877,6 @@ class ExternalGameDeck:
 
     def render(self, screen, rect, crt_cfg=None):
         self._ensure_fonts()
-        self._active_crt_cfg = crt_cfg
         x, y, w, h = rect
         cx = x + w // 2
 
@@ -8388,7 +8446,6 @@ class ExternalGameDeck:
             frame = vlc.get_display_frame()
             if frame:
                 surf = pygame.image.frombuffer(frame, (vlc.width, vlc.height), "BGRA")
-                surf = self._apply_crt_cfg_to_surface(surf)
                 surf = self._dvd_true_content_surf(vlc, surf)
                 # WARNING: the splash video uses the DVD Screen Mode, not the global Video-tab setting.
                 _dvd_mode = "normal"
@@ -8482,20 +8539,6 @@ class ExternalGameDeck:
             _log_warn_throttled("dvd_video_fit",
                                 "DVD Bezel fit failed, using plain canvas fit: %s", e)
         return target, 1.0
-
-    def _apply_crt_cfg_to_surface(self, surf):
-        """Apply the Video-tab Brightness/Contrast/Color/Sharpness/Tint filter to a raw VLC frame surface, mapping crt_cfg keys onto apply_video_effects() parameters."""
-        cfg = getattr(self, "_active_crt_cfg", None)
-        if not cfg:
-            return surf
-        return apply_video_effects(
-            surf,
-            brightness=cfg.get("brightness", 50),
-            contrast=cfg.get("contrast", 50),
-            color=cfg.get("saturation", 50),
-            sharpness=cfg.get("sharpness", 50),
-            tint=cfg.get("hue_shift", 50),
-        )
 
     def _render_dvd_player(self, screen, rect):
         x, y, w, h = rect
@@ -8746,7 +8789,6 @@ class ExternalGameDeck:
                         _log_warn_throttled("dvd_lift_buffering_mute",
                                              "DVD first-frame mute-guard lift failed: %s", _e)
                     surf = pygame.image.frombuffer(frame, (vlc.width, vlc.height), "BGRA")
-                    surf = self._apply_crt_cfg_to_surface(surf)
                     surf = self._dvd_true_content_surf(vlc, surf)
                     _dvd_mode = "normal"
                     _main_mod_bl = sys.modules.get("__main__")
@@ -8866,26 +8908,26 @@ class ExternalGameDeck:
             focus_thickness = SELECTION_BORDER_WIDTH
             btn_w, btn_h    = 110, 36
             btn_y           = box_y + 85
-            OFF_RED         = _gov.COLOR_GAME_OFF_RED
-            NEUTRAL_BTN     = _gov.COLOR_GAME_NEUTRAL_BUTTON
 
             yes_btn_x = cx - 100 - btn_w // 2
             no_btn_x  = cx + 100 - btn_w // 2
 
-            pygame.draw.rect(screen, OFF_RED, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
+            pygame.draw.rect(screen, _gov.COLOR_BUTTON_YES, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_exit_selection == "Yes":
-                pygame.draw.rect(screen, accent_col, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
+                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
             lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
 
-            pygame.draw.rect(screen, NEUTRAL_BTN, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
+            pygame.draw.rect(screen, _gov.COLOR_BUTTON_NO, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_exit_selection == "No":
-                pygame.draw.rect(screen, accent_col, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
+                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
             lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
 
-            lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, _gov.COLOR_GAME_POPUP_HINT)
-            screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
+            import ui as _ui
+            _ui.draw_key_hint_fitted(screen, [("a", "d"), "SELECT", ("enter",), "CONFIRM"], cx,
+                                     box_y + box_h - 35 + f_hint2.get_height() // 2, "Courier New", 17,
+                                     _gov.COLOR_GAME_POPUP_HINT, box_w - 20)
 
         if self.dvd_return_menu_confirm:
             import colorsys
@@ -8923,48 +8965,38 @@ class ExternalGameDeck:
             focus_thickness = SELECTION_BORDER_WIDTH
             btn_w, btn_h    = 110, 36
             btn_y           = box_y + 85
-            CONFIRM_BLUE    = _gov.COLOR_GAME_CONFIRM_BLUE
-            NEUTRAL_BTN     = _gov.COLOR_GAME_NEUTRAL_BUTTON
 
             yes_btn_x = cx - 100 - btn_w // 2
             no_btn_x  = cx + 100 - btn_w // 2
 
-            pygame.draw.rect(screen, CONFIRM_BLUE, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
+            pygame.draw.rect(screen, _gov.COLOR_BUTTON_YES, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_return_menu_selection == "Yes":
-                pygame.draw.rect(screen, accent_col, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
+                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
             lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
 
-            pygame.draw.rect(screen, NEUTRAL_BTN, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
+            pygame.draw.rect(screen, _gov.COLOR_BUTTON_NO, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
             if self.dvd_return_menu_selection == "No":
-                pygame.draw.rect(screen, accent_col, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
+                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
             lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
             screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
 
-            lbl_h = f_hint2.render("A / D  SELECT     ENTER  CONFIRM", True, _gov.COLOR_GAME_POPUP_HINT)
-            screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
+            import ui as _ui
+            _ui.draw_key_hint_fitted(screen, [("a", "d"), "SELECT", ("enter",), "CONFIRM"], cx,
+                                     box_y + box_h - 35 + f_hint2.get_height() // 2, "Courier New", 17,
+                                     _gov.COLOR_GAME_POPUP_HINT, box_w - 20)
 
     # ========================================================================
     # SECTION: Libretro: cores & XInput map
     # ========================================================================
 
     def _has_libretro_core(self, console):
-        emu_dir = os.path.join(self.cores_dir, console)
-        if not os.path.isdir(emu_dir):
-            log.warning(f"[LIBRETRO DBG] _has_libretro_core({console}): core folder does not "
-                  f"exist: {emu_dir}")
-            return None
-        _all = os.listdir(emu_dir)
-        for fname in _all:
-            fl = fname.lower()
-            if fl.endswith("_libretro.dll") or fl.endswith("libretro.dll"):
-                return os.path.join(emu_dir, fname)
-        for fname in _all:
-            if fname.lower().endswith(".dll"):
-                return os.path.join(emu_dir, fname)
-        log.warning(f"[LIBRETRO DBG] _has_libretro_core({console}): folder exists ({emu_dir}) "
-              f"but contains no .dll -- found: {_all if _all else '(empty folder)'}")
-        return None
+        saved = self.emulator_config.get(console)
+        path = resolve_active_core_path(console, saved, self.cores_dir)
+        if path is None:
+            log.warning(f"[LIBRETRO] {console}: no core to play with ({saved or 'none set'}) "
+                  f"-- add one with Select Core or Scan for Cores")
+        return path
 
     def _apply_menu_nav_mapping_from_libretro_map(self):
         apply_menu_nav_mapping(self._libretro_xinput_map.get("MENU", {}).get(1, {}))
@@ -9069,10 +9101,10 @@ class ExternalGameDeck:
 
     def _extract_rom_from_zip(self, console, archive_path):
         ext = os.path.splitext(archive_path)[1].lower()
-        if ext not in (".zip", ".7z"):
+        if ext not in ARCHIVE_EXTS:
             return archive_path
 
-        real_exts = [e for e in ROM_EXTENSIONS.get(console, []) if e not in (".zip", ".7z")]
+        real_exts = [e for e in ROM_EXTENSIONS.get(console, []) if e not in ARCHIVE_EXTS]
         cache_dir = os.path.join(self.base_dir, "main", "roms", console, ".extracted_cache")
         base_name = os.path.basename(archive_path)
 
@@ -9135,10 +9167,14 @@ class ExternalGameDeck:
                 if _7ZIP_EXE is None:
                     log.warning(f"[LIBRETRO] Cannot extract {base_name} — 7-Zip not found")
                     return None
+                if not _7zip_opens(ext):
+                    log.warning(f"[LIBRETRO] Cannot extract {base_name}: the app's 7-Zip is 7za.exe, which has no RAR; "
+                                f"put 7z.exe and 7z.dll from a full 7-Zip in tools\\7zip")
+                    return None
 
                 list_r = subprocess.run(
                     [_7ZIP_EXE, "l", "-slt", archive_path],
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=30, **_SEVENZIP_RUN_KW,
                 )
                 if list_r.returncode != 0:
                     log.warning(f"[LIBRETRO] 7z list failed for {base_name}: "
@@ -9213,7 +9249,7 @@ class ExternalGameDeck:
                     ext_r = subprocess.run(
                         [_7ZIP_EXE, "e", archive_path,
                          "-o" + target_dir, chosen, "-y"],
-                        capture_output=True, text=True, timeout=60,
+                        capture_output=True, text=True, timeout=60, **_SEVENZIP_RUN_KW,
                     )
                     if ext_r.returncode != 0:
                         log.warning(f"[LIBRETRO] 7z extraction failed for {base_name}: "
@@ -9976,26 +10012,26 @@ class ExternalGameDeck:
         focus_thickness = SELECTION_BORDER_WIDTH
         btn_w, btn_h    = 110, 36
         btn_y           = box_y + 85
-        OFF_RED         = _gov.COLOR_GAME_OFF_RED
-        NEUTRAL_BTN     = _gov.COLOR_GAME_NEUTRAL_BUTTON
 
         yes_btn_x = cx - 100 - btn_w // 2
         no_btn_x  = cx + 100 - btn_w // 2
 
-        pygame.draw.rect(screen, OFF_RED, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
+        pygame.draw.rect(screen, _gov.COLOR_BUTTON_YES, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
         if self.game_exit_selection == "Yes":
-            pygame.draw.rect(screen, accent_col, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
+            pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
         lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
         screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
 
-        pygame.draw.rect(screen, NEUTRAL_BTN, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
+        pygame.draw.rect(screen, _gov.COLOR_BUTTON_NO, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
         if self.game_exit_selection == "No":
-            pygame.draw.rect(screen, accent_col, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
+            pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
         lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
         screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
 
-        lbl_h = f_hint2.render("\u2190/\u2192 OR A/D  SELECT     A  CONFIRM     B  CANCEL", True, _gov.COLOR_GAME_POPUP_HINT)
-        screen.blit(lbl_h, (cx - lbl_h.get_width() // 2, box_y + box_h - 35))
+        import ui as _ui
+        _ui.draw_key_hint_fitted(screen, [("pad_left", "pad_right"), ["OR"], ("a", "d"), "SELECT", ("pad_a",), "CONFIRM", ("pad_b",), "CANCEL"],
+                                 cx, box_y + box_h - 35 + f_hint2.get_height() // 2, "Courier New", 17,
+                                 _gov.COLOR_GAME_POPUP_HINT, box_w - 20)
 
     # ========================================================================
     # SECTION: Libretro: quit & volume
@@ -10277,6 +10313,9 @@ __all__ = [
     "player_gpstate",
     "player_is_connected",
     "pygame_hwnd_ref",
+    "is_console_core_key",
+    "resolve_active_bios_path",
+    "resolve_active_core_path",
     "resolve_emulator_config_path",
     "resolve_preferred_core_filename",
 ]
