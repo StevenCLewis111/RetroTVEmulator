@@ -2485,6 +2485,13 @@ _TV_BORDER_KNOWN_CUTOUTS = performance_governor.TV_BORDER_KNOWN_CUTOUTS if perfo
 
 # WARNING: the fallback numbers below must match TV_BORDER_OSD_OFFSET in performance_governor.py; they are used only when that module fails to import.
 _TV_BORDER_OSD_OFFSET = performance_governor.TV_BORDER_OSD_OFFSET if performance_governor is not None else (48, 64)
+# WARNING: the fallback below must match TV_BORDER_OSD_OFFSET_BY_STEM in performance_governor.py; it is used only when that module fails to import.
+_TV_BORDER_OSD_OFFSET_BY_STEM = performance_governor.TV_BORDER_OSD_OFFSET_BY_STEM if performance_governor is not None else {"bezel3": (160, 105)}
+
+
+def _tv_border_osd_offset(stem):
+    """The (right, top) inset in picture pixels of the on-picture channel number and the song title for the bezel style `stem`."""
+    return _TV_BORDER_OSD_OFFSET_BY_STEM.get(stem, _TV_BORDER_OSD_OFFSET)
 
 
 # WARNING: the fallback numbers below must match CH_NUM_TOP_ALIGN_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
@@ -5609,40 +5616,44 @@ def _build_tracking_noise_surface(w, band_h, seed_step, tint_style="white", line
 
 
 def _spawn_tracking_line_batch(h, now):
-    """Build one batch of rolling tracking-line entries for a spawn event."""
+    """Build one batch of rolling tracking-line entries for a spawn event: one to three lines of random sizes, some starting at the top and some part way down, that all roll at one speed and never touch each other."""
     BIG_FRAC_RANGE = RECEPTION_LINE_BIG_FRAC_RANGE
     SMALL_FRAC_RANGE = RECEPTION_LINE_SMALL_FRAC_RANGE
-    SPEED_PX_MS = RECEPTION_LINE_SPEED_PX_MS
-
-    def make_line(frac_range, y_start_frac, delay_ms=0, speed_mult=1.0):
-        band_h = max(4, int(h * random.uniform(*frac_range)))
-        y_start = int(h * y_start_frac) if y_start_frac is not None else -band_h
-        travel = max(1, (h - y_start) + band_h)
-        speed = SPEED_PX_MS * speed_mult * random.uniform(0.9, 1.1)
-        duration = max(300, int(travel / speed))
-        return {
-            "band_h": band_h,
-            "y_start": y_start,
-            "travel": travel,
-            "spawn": now + delay_ms,
-            "duration": duration,
-            "seed_step": random.randint(0, 10_000),
-            "line_id": next(_tracking_line_id_counter),
-        }
+    # WARNING: owner 2026-11-06: lines have random sizes and counts and may start part way down the screen, but they never stack on or roll into each other. Every line of a batch rolls at the same speed and is placed with a gap from its neighbours, so the gaps cannot close.
+    speed = RECEPTION_LINE_SPEED_PX_MS * random.uniform(0.9, 1.1)
+    gap = max(8, int(h * 0.04))
 
     count = random.randint(1, 3)
     include_big = random.random() < 0.30
-
-    lines = []
+    bands = []
     for i in range(count):
         is_big = include_big and i == 0
         frac_range = BIG_FRAC_RANGE if is_big else SMALL_FRAC_RANGE
-        # WARNING: every tracking line starts just above the top and rolls the whole way down, one full sweep of the screen; lines that began part way down made bands that appeared from nothing and looked like lines moving up and down.
-        y_start_frac = None
-        delay = 0 if i == 0 else random.randint(60, 300)
-        speed_mult = 1.0 if is_big else random.uniform(0.95, 1.15)
-        lines.append(make_line(frac_range, y_start_frac, delay_ms=delay, speed_mult=speed_mult))
+        band_h = max(4, int(h * random.uniform(*frac_range)))
+        starts_mid = random.random() < 0.40
+        y_start = int(h * random.uniform(0.05, 0.65)) if starts_mid else -band_h
+        bands.append([band_h, y_start])
 
+    # WARNING: placed lowest first; a line that would sit on the one below it is moved up until it clears it, so it arrives from above the top later instead of overlapping.
+    bands.sort(key=lambda bd: bd[1], reverse=True)
+    for k in range(1, len(bands)):
+        lower_top = bands[k - 1][1]
+        if bands[k][1] + bands[k][0] + gap > lower_top:
+            bands[k][1] = lower_top - bands[k][0] - gap
+
+    lines = []
+    for band_h, y_start in bands:
+        travel = max(1, (h - y_start) + band_h)
+        duration = max(300, int(travel / speed))
+        lines.append({
+            "band_h": band_h,
+            "y_start": y_start,
+            "travel": travel,
+            "spawn": now,
+            "duration": duration,
+            "seed_step": random.randint(0, 10_000),
+            "line_id": next(_tracking_line_id_counter),
+        })
     return lines
 
 
@@ -32464,7 +32475,7 @@ while True:
                 _ch_scale_x = 1.0 / _ch_geom[1]
             else:
                 _ch_scale_x = 1.0
-            _osd_right_off, _osd_top_off = _TV_BORDER_OSD_OFFSET
+            _osd_right_off, _osd_top_off = _tv_border_osd_offset(_bezel_led_stem())
             def _cs(px):
                 return max(1, round(px * _ch_scale))
             def _cs_x(px):

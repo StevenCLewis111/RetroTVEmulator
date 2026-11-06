@@ -27268,15 +27268,37 @@ class TestCloseButtonMatchesEsc(unittest.TestCase):
         self.assertNotIn('_layer == "GAMES_SUB_MENU"', text[start:start + 6000].split("print(f\"[SETTINGS ENGINE] ESC: stepped back")[0])
 
 
-class TestTrackingLinesSweepWholeScreen(unittest.TestCase):
-    """Every rolling reception line starts above the top edge and ends below the bottom edge."""
+class TestTrackingLinesNeverOverlap(unittest.TestCase):
+    """Owner 2026-11-06: rolling static has random sizes and counts and may start part way down, but lines never stack or roll into each other"""
 
-    def test_every_line_makes_one_full_sweep(self):
-        text = read(MAIN_SCRIPT)
-        start = text.index("def _spawn_tracking_line_batch")
-        block = text[start:start + 2600]
-        self.assertIn("y_start_frac = None\n", block)
-        self.assertNotIn("random.uniform(0.05, 0.85)", block)
+    def _batches(self):
+        rng = random.Random(5)
+        ns = {"random": rng, "RECEPTION_LINE_BIG_FRAC_RANGE": gov.RECEPTION_LINE_BIG_FRAC_RANGE,
+              "RECEPTION_LINE_SMALL_FRAC_RANGE": gov.RECEPTION_LINE_SMALL_FRAC_RANGE,
+              "RECEPTION_LINE_SPEED_PX_MS": gov.RECEPTION_LINE_SPEED_PX_MS,
+              "_tracking_line_id_counter": itertools.count()}
+        exec(main_function_code("_spawn_tracking_line_batch"), ns)
+        return [ns["_spawn_tracking_line_batch"](1080, 0) for _ in range(600)]
+
+    def test_lines_never_overlap_at_any_moment(self):
+        for lines in self._batches():
+            for t in range(0, 12000, 40):
+                spans = []
+                for ln in lines:
+                    if t >= ln["duration"]:
+                        continue
+                    y = ln["y_start"] + ln["travel"] * (t / ln["duration"])
+                    spans.append((y, y + ln["band_h"]))
+                spans.sort()
+                for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+                    self.assertLessEqual(a1, b0, "two rolling lines touched")
+
+    def test_sizes_counts_and_part_way_starts_still_vary(self):
+        batches = self._batches()
+        self.assertEqual({len(b) for b in batches}, {1, 2, 3})
+        self.assertTrue(any(ln["y_start"] > 0 for b in batches for ln in b), "some lines start part way down")
+        self.assertTrue(any(ln["y_start"] < 0 for b in batches for ln in b), "some lines start above the top")
+        self.assertGreater(len({ln["band_h"] for b in batches for ln in b}), 20)
 
 
 class TestBezelTitleRowAndStyleThree(unittest.TestCase):
@@ -27678,6 +27700,23 @@ class TestGuideBlockIsOnePress(unittest.TestCase):
         self.assertEqual(state["guide_selected_stop_key"], ("show", 0), "and one more reaches the first show")
         ns["_guide_jump_col"](1)
         self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "going right again is not stuck")
+
+
+class TestBezelThreeNumberPlace(unittest.TestCase):
+    """Owner 2026-11-06: on bezel 3 the channel number and the song title come in from the rounded glass corner"""
+
+    def test_bezel3_offset_is_further_in_than_the_default(self):
+        right, top = gov.TV_BORDER_OSD_OFFSET_BY_STEM["bezel3"]
+        self.assertGreater(right, gov.TV_BORDER_OSD_OFFSET[0])
+        self.assertGreater(top, gov.TV_BORDER_OSD_OFFSET[1])
+
+    def test_main_script_picks_the_offset_by_bezel(self):
+        ns = {"_TV_BORDER_OSD_OFFSET": (48, 64), "_TV_BORDER_OSD_OFFSET_BY_STEM": {"bezel3": (160, 105)}}
+        exec(main_function_code("_tv_border_osd_offset"), ns)
+        self.assertEqual(ns["_tv_border_osd_offset"]("bezel3"), (160, 105))
+        self.assertEqual(ns["_tv_border_osd_offset"]("bezel1"), (48, 64))
+        self.assertEqual(ns["_tv_border_osd_offset"](None), (48, 64))
+        self.assertIn("_osd_right_off, _osd_top_off = _tv_border_osd_offset(_bezel_led_stem())", MAIN_SRC)
 
 
 class TestMusicScanOwnLane(unittest.TestCase):

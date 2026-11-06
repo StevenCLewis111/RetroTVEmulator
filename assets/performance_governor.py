@@ -546,6 +546,10 @@ TV_BORDER_KNOWN_CUTOUTS = {
 
 # VALUES CHANGE HERE
 TV_BORDER_OSD_OFFSET = (48, 64)
+# VALUES CHANGE HERE (bezels whose number and song title sit further in from the picture's top right corner than the others, in picture pixels (from the right edge, from the top edge); bezel3's glass has deep rounded corners that hid the number and cut the title off at the top, so both come in to the spot the owner marked on 2026-11-06)
+TV_BORDER_OSD_OFFSET_BY_STEM = {
+    "bezel3": (160, 105),
+}
 
 # VALUES CHANGE HERE
 PIXEL_ORBITER_MARGIN_PX = 3
