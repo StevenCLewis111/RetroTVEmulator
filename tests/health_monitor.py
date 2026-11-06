@@ -135,6 +135,14 @@ def where(frame):
     return place, "call"
 
 
+def _where_text(where):
+    """A place kept as (code, line) as function (file.py:line); text and None are passed through."""
+    if isinstance(where, tuple):
+        code, line = where
+        return "%s (%s:%d)" % (code.co_name, os.path.basename(code.co_filename or "?"), line)
+    return where
+
+
 def _stack_text(frame, limit=25):
     """A thread's stack as text, innermost call last."""
     return "".join(traceback.format_stack(frame, limit=limit)).rstrip()
@@ -167,7 +175,7 @@ class WatchedLock:
         self.wait_total = 0.0
         self.wait_max = 0.0
         self.hold_max = 0.0
-        self.hold_max_at = None
+        self._hold_max_where = None
         self.warned_since = None
 
     def _take(self, blocking, timeout, caller_depth):
@@ -198,7 +206,8 @@ class WatchedLock:
         self._owner = me
         self._depth = 1
         self._since = time.perf_counter()
-        self._taken_at = _place(caller)
+        # WARNING: where the lock was taken is kept as code and line and only made into text when reported; making the text on every take cost more than the lock itself on busy locks.
+        self._taken_at = (caller.f_code, caller.f_lineno)
         self.taken += 1
         return True
 
@@ -219,7 +228,7 @@ class WatchedLock:
             held = time.perf_counter() - since
             if held > self.hold_max:
                 self.hold_max = held
-                self.hold_max_at = taken_at
+                self._hold_max_where = taken_at
 
     def __enter__(self):
         return self._take(True, -1, 2)
@@ -232,12 +241,21 @@ class WatchedLock:
         inner_locked = getattr(self._inner, "locked", None)
         return inner_locked() if inner_locked is not None else self._owner is not None
 
+    @property
+    def hold_max_at(self):
+        """Where the longest hold since the last report was taken, as function (file.py:line), or None."""
+        return _where_text(self._hold_max_where)
+
+    @hold_max_at.setter
+    def hold_max_at(self, value):
+        self._hold_max_where = value
+
     def held_now(self):
         """(seconds held so far, owner thread id, where it was taken) for a held lock, or None."""
-        since, owner = self._since, self._owner
+        since, owner, taken_at = self._since, self._owner, self._taken_at
         if since is None or owner is None:
             return None
-        return time.perf_counter() - since, owner, self._taken_at
+        return time.perf_counter() - since, owner, _where_text(taken_at)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -273,33 +291,64 @@ def watch_lock_attr(owner, attr, name):
 # SECTION: Timed jobs and notes
 # ============================================================================
 
-_work = {}
-_work_lock = threading.Lock()
 _main_ident = threading.main_thread().ident
+# WARNING: every thread counts its jobs in its own table, so a count never waits for a lock; one shared lock here was taken hundreds of thousands of times a minute and on a 4-core PC the scans spent most of their time waiting for it.
+_work_local = threading.local()
+_work_tables = []
+_work_tables_lock = threading.Lock()
+
+
+def _own_table():
+    table = getattr(_work_local, "table", None)
+    if table is None:
+        table = _work_local.table = {}
+        with _work_tables_lock:
+            _work_tables.append((threading.current_thread(), table))
+    return table
 
 
 def note(name, seconds):
     """Counts one run of a job (or one wait) that took this many seconds."""
-    on_screen = threading.get_ident() == _main_ident
-    with _work_lock:
-        rec = _work.get(name)
-        if rec is None:
-            rec = _work[name] = [0, 0.0, 0.0, 0, 0.0, 0, collections.Counter()]
-        rec[0] += 1
-        rec[1] += seconds
-        if seconds > rec[2]:
-            rec[2] = seconds
-        if on_screen:
-            rec[3] += 1
-            rec[4] += seconds
-        rec[6][thread_group(threading.current_thread().name)] += 1
+    table = _own_table()
+    rec = table.get(name)
+    if rec is None:
+        rec = table[name] = [0, 0.0, 0.0, 0]
+    rec[0] += 1
+    rec[1] += seconds
+    if seconds > rec[2]:
+        rec[2] = seconds
 
 
 def _note_error(name):
-    with _work_lock:
-        rec = _work.get(name)
-        if rec is not None:
-            rec[5] += 1
+    rec = _own_table().get(name)
+    if rec is not None:
+        rec[3] += 1
+
+
+def take_work():
+    """Every job counted since the last call, by name: [runs, seconds, longest, screen-thread runs, screen-thread seconds, failed, runs by thread family]; the counts start again from nothing."""
+    with _work_tables_lock:
+        tables = list(_work_tables)
+        _work_tables[:] = [(thread, table) for thread, table in tables if thread.is_alive()]
+    rows = {}
+    for thread, table in tables:
+        group = thread_group(thread.name)
+        on_screen = thread.ident == _main_ident
+        items = list(table.items())
+        table.clear()
+        for name, rec in items:
+            row = rows.get(name)
+            if row is None:
+                row = rows[name] = [0, 0.0, 0.0, 0, 0.0, 0, collections.Counter()]
+            row[0] += rec[0]
+            row[1] += rec[1]
+            row[2] = max(row[2], rec[2])
+            if on_screen:
+                row[3] += rec[0]
+                row[4] += rec[1]
+            row[5] += rec[3]
+            row[6][group] += rec[0]
+    return rows
 
 
 def timed(name, fn):
@@ -369,6 +418,16 @@ def _read(name, read):
 
 _gc_started = [None]
 _gc_events = collections.deque(maxlen=200)
+
+
+def _snapshot(items):
+    """A list copy of a deque that another thread may be changing at the same moment, tried a few times; an empty list when it never settles."""
+    for _attempt in range(5):
+        try:
+            return list(items)
+        except RuntimeError:
+            continue
+    return []
 _gc_interval = [0, 0.0, 0.0, None]
 
 
@@ -541,10 +600,10 @@ class _Monitor:
             return
         self.explained_at.append(end)
         start = end - gap_ms / 1000.0
-        looks = [s for s in self.ring if start - _SAMPLE_S <= s[0] <= end]
+        looks = [s for s in _snapshot(self.ring) if start - _SAMPLE_S <= s[0] <= end]
         screen = collections.Counter(s[1][0] for s in looks if s[1] is not None)
         others = collections.Counter("%s in %s" % item for s in looks for item in s[2])
-        gcs = [e for e in _gc_events if start <= e[0] <= end + 0.05 and e[1] >= 0.01]
+        gcs = [e for e in _snapshot(_gc_events) if start <= e[0] <= end + 0.05 and e[1] >= 0.01]
         screen_text = ", ".join("%s %d" % kv for kv in screen.most_common(3)) or "no looks taken"
         others_text = ", ".join("%s %d" % kv for kv in others.most_common(_PROFILE_TOP)) or "none"
         gc_text = ("; garbage collection ran %s" % ", ".join("%.0f ms (generation %s, on %s)" % (e[1] * 1000, e[2], e[3]) for e in gcs)) if gcs else ""
@@ -666,9 +725,7 @@ class _Monitor:
             lock._reset_stats()
 
     def report_work(self):
-        with _work_lock:
-            rows = sorted(_work.items(), key=lambda kv: -kv[1][1])
-            _work.clear()
+        rows = sorted(take_work().items(), key=lambda kv: -kv[1][1])
         if rows:
             log.info("[HEALTH WORK] %s", "; ".join(
                 "%s %d run(s) %.2fs in all, longest %.0f ms%s%s, by %s"

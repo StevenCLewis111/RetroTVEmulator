@@ -246,9 +246,7 @@ except ImportError as _e:
 
     GAME_FRAME_TIMER = _NoFrameTimer()
     _LIBRETRO_AVAILABLE = False
-    log.warning(f"[GAME DECK] libretro_core not found — .exe fallback mode: {_e}")
-
-pygame_hwnd_ref = [None]
+    log.warning(f"[GAME DECK] libretro_core not found — games cannot start: {_e}")
 
 _WIN = sys.platform == "win32"
 if _WIN:
@@ -281,115 +279,6 @@ def _gd_drive_root_of(path):
         drive, _tail = os.path.splitdrive(str(path))
         return (drive + "\\") if drive else None
     return "/"
-
-
-# ============================================================================
-# SECTION: Per-process audio (WASAPI)
-# ============================================================================
-
-
-def _wasapi_set_process_audio(pid, *, mute=None, volume_pct=None):
-    if not _WIN or (mute is None and volume_pct is None):
-        return False
-    try:
-        import uuid as _uuid
-        _c   = ctypes
-        _ole = _c.windll.ole32
-        _ole.CoInitializeEx(None, 0)
-
-        def _mk_guid(s):
-            b = _uuid.UUID(s).bytes_le
-            return (_c.c_byte * 16)(*b)
-
-        CLSID_MMDE = _mk_guid("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
-        IID_MMDE   = _mk_guid("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
-        IID_ASM2   = _mk_guid("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
-        IID_ASC2   = _mk_guid("{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}")
-        IID_SAV    = _mk_guid("{87CE5498-68D6-44E5-9215-6DA47EF883D8}")
-        GUID_T     = _c.c_byte * 16
-        PVOID      = _c.c_void_p
-
-        def _vt(iface, idx, restype, argtypes, *args):
-            """Call COM vtable method[idx] on a raw c_void_p interface pointer."""
-            vt   = _c.cast(iface, _c.POINTER(PVOID)).contents.value
-            fptr = _c.cast(_c.cast(vt, _c.POINTER(PVOID))[idx],
-                           _c.WINFUNCTYPE(restype, PVOID, *argtypes))
-            return fptr(iface, *args)
-
-        pE = PVOID()
-        if _ole.CoCreateInstance(
-                _c.byref(CLSID_MMDE), None, 1,
-                _c.byref(IID_MMDE), _c.byref(pE)) != 0 or not pE.value:
-            return False
-
-        pDev = PVOID()
-        hr = _vt(pE, 4, _c.c_long,
-                 [_c.c_int, _c.c_int, _c.POINTER(PVOID)],
-                 0, 0, _c.byref(pDev))
-        _vt(pE, 2, _c.c_long, [])
-        if hr != 0 or not pDev.value:
-            return False
-
-        pMgr = PVOID()
-        hr = _vt(pDev, 3, _c.c_long,
-                 [_c.POINTER(GUID_T), _c.c_uint, PVOID, _c.POINTER(PVOID)],
-                 _c.byref(IID_ASM2), 23, None, _c.byref(pMgr))
-        _vt(pDev, 2, _c.c_long, [])
-        if hr != 0 or not pMgr.value:
-            return False
-
-        pSE = PVOID()
-        hr = _vt(pMgr, 5, _c.c_long, [_c.POINTER(PVOID)], _c.byref(pSE))
-        _vt(pMgr, 2, _c.c_long, [])
-        if hr != 0 or not pSE.value:
-            return False
-
-        n = _c.c_int(0)
-        _vt(pSE, 3, _c.c_long, [_c.POINTER(_c.c_int)], _c.byref(n))
-
-        found = False
-        for i in range(n.value):
-            pCtl = PVOID()
-            if _vt(pSE, 4, _c.c_long,
-                   [_c.c_int, _c.POINTER(PVOID)], i, _c.byref(pCtl)) != 0:
-                continue
-            if not pCtl.value:
-                continue
-
-            pCtl2 = PVOID()
-            qhr = _vt(pCtl, 0, _c.c_long,
-                      [_c.POINTER(GUID_T), _c.POINTER(PVOID)],
-                      _c.byref(IID_ASC2), _c.byref(pCtl2))
-            spid = _c.c_ulong(0)
-            if qhr == 0 and pCtl2.value:
-                _vt(pCtl2, 14, _c.c_long,
-                    [_c.POINTER(_c.c_ulong)], _c.byref(spid))
-                _vt(pCtl2, 2, _c.c_long, [])
-
-            if spid.value == pid:
-                pVol = PVOID()
-                vhr = _vt(pCtl, 0, _c.c_long,
-                          [_c.POINTER(GUID_T), _c.POINTER(PVOID)],
-                          _c.byref(IID_SAV), _c.byref(pVol))
-                if vhr == 0 and pVol.value:
-                    if volume_pct is not None:
-                        gain = max(0.0, min(1.0, float(volume_pct) / 100.0))
-                        _vt(pVol, 3, _c.c_long,
-                            [_c.c_float, PVOID], gain, None)
-                    if mute is not None:
-                        _vt(pVol, 5, _c.c_long,
-                            [_c.c_int, PVOID], int(bool(mute)), None)
-                    _vt(pVol, 2, _c.c_long, [])
-                    found = True
-
-            _vt(pCtl, 2, _c.c_long, [])
-
-        _vt(pSE, 2, _c.c_long, [])
-        return found
-
-    except Exception as e:
-        _log_warn_throttled("wasapi_ctypes_init", f"[WASAPI ctypes] error: {e}")
-        return False
 
 
 # ============================================================================
@@ -634,6 +523,50 @@ def get_bios_dir_for_console(base_dir, console):
     return os.path.join(base_dir, "main", "cores", console, "system")
 
 
+def _files_have_same_bytes(first, second):
+    """True when both files have the same size and the same bytes, read in pieces."""
+    # WARNING: written by hand on purpose; the built app does not carry the filecmp module, and importing it crashed Add BIOS (owner log 2026-11-05).
+    try:
+        if os.path.getsize(first) != os.path.getsize(second):
+            return False
+        with open(first, "rb") as one, open(second, "rb") as other:
+            while True:
+                left, right = one.read(1 << 20), other.read(1 << 20)
+                if left != right:
+                    return False
+                if not left:
+                    return True
+    except OSError:
+        return False
+
+
+def copy_tool_into(source, dest_dir):
+    """Copies a core or BIOS file into dest_dir, the console's own folder, unless it already sits there; returns (the path to remember, True when this call made a new copy)."""
+    # WARNING: the copy is written beside its final name and renamed into place, so one that stops half way never leaves a broken core or BIOS in the folder; the original file is never touched, and a file already in the folder is remembered as it is, so picking another file there just switches the live one.
+    import stat
+    src = os.path.abspath(str(source))
+    dest_dir = os.path.abspath(dest_dir)
+    if os.path.normcase(os.path.dirname(src)) == os.path.normcase(dest_dir):
+        return src, False
+    dest = os.path.join(dest_dir, os.path.basename(src))
+    os.makedirs(dest_dir, exist_ok=True)
+    if os.path.isfile(dest) and _files_have_same_bytes(src, dest):
+        return dest, False
+    tmp = dest + ".copying"
+    try:
+        shutil.copy2(src, tmp)
+        # WARNING: copy2 carries the source's read-only flag onto the copy, and Windows will not delete a read-only file (rmtree and os.remove stop with Access is denied, which stops a new build from replacing the app folder); a copy the app makes is always writable.
+        os.chmod(tmp, stat.S_IREAD | stat.S_IWRITE)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError as _swallowed_error:
+                _log_swallowed("copy_tool_into: os.remove(tmp)", _swallowed_error)
+    return dest, True
+
+
 def _remembered_file_path(saved, old_copy_folder):
     """Return the file a remembered setting points at: a full path where it sits, or an old bare name copied into old_copy_folder by earlier versions, else None."""
     if not saved:
@@ -732,6 +665,16 @@ def console_bezel_currently_active(console, db):
     return bool(this_prof.get("border_enabled", this_prof.get("gb_border", False)))
 
 
+def warp_bezel_available(db):
+    """True while a bezel that warps its picture is on: the CRT TV Bezels switch, or the own bezel of a console that is not a handheld (a handheld's bezel does not warp)."""
+    # WARNING: Warp Screen is greyed out and cannot be changed while this is False, and its saved choice is kept, so it comes back by itself with the next bezel; the handheld consoles must never count here.
+    if db is None:
+        return False
+    if bool(db.config.get("fake_43_border_enabled", False)):
+        return True
+    return any(console_bezel_currently_active(_console, db) for _console in sorted(BORDER_CONSOLES_HOME))
+
+
 # ============================================================================
 # SECTION: Players, screen sizes & PSX discs
 # ============================================================================
@@ -795,9 +738,6 @@ def find_psx_disc_siblings(rom_path):
 # SECTION: Gamepad input: XInput, DirectInput & HID (Windows)
 # ============================================================================
 
-
-_PROCESS_SUSPEND_RESUME = 0x0800
-_PROCESS_QUERY_INFORMATION = 0x0400
 
 VK_NAMES = {
     0x08: "Backspace", 0x0D: "Enter",    0x1B: "Escape",
@@ -3014,37 +2954,8 @@ def apply_menu_nav_mapping(bit_by_button):
 
 
 # ============================================================================
-# SECTION: Controller keystroke guard
+# SECTION: Controller menu navigation state
 # ============================================================================
-
-_BRIDGE_KEY_GRACE_MS = _gov.BRIDGE_KEY_GRACE_MS
-
-_bridge_keys_lock = threading.Lock()
-_bridge_keys_down = set()
-_bridge_keys_released_at = {}
-
-
-def bridge_note_key(vk, key_up):
-    """Records that a controller-to-keyboard bridge key press or release was just sent, so the TV can ignore the matching keyboard event."""
-    pg_key = _nav.bridge_vk_to_key(vk)
-    if pg_key is None:
-        return
-    with _bridge_keys_lock:
-        if key_up:
-            _bridge_keys_down.discard(pg_key)
-            _bridge_keys_released_at[pg_key] = time.monotonic()
-        else:
-            _bridge_keys_down.add(pg_key)
-
-
-def bridge_key_is_injected(pg_key):
-    """Returns True while a pygame key is held by the controller bridge, or was released by it within the grace window."""
-    with _bridge_keys_lock:
-        if pg_key in _bridge_keys_down:
-            return True
-        released = _bridge_keys_released_at.get(pg_key)
-    return released is not None and (time.monotonic() - released) * 1000.0 <= _BRIDGE_KEY_GRACE_MS
-
 
 _xi_nav_state = {
     "ch03_active":   False,
@@ -3320,13 +3231,6 @@ class ExternalGameDeck:
 
         self._rom_hold = _nav.HoldState()
 
-        self.deck_process = None
-        self.game_hwnd = None
-        self.ui_overlay_hwnd = None
-        self._fit_rect = None
-        self.parent_hwnd = None
-        self.is_embedded = False
-        self.is_frozen = False
         self._pause_reasons = set()
         self.active_console = None
         self.current_browse_dir = ""
@@ -3340,13 +3244,6 @@ class ExternalGameDeck:
         self.emulator_load_msg = ""
 
         self.overlay_ready = False
-
-        self._audio_vol_lock = threading.Lock()
-        self._audio_vol_pending = None
-        self._audio_vol_worker_running = False
-
-        self._child_visible = None
-        self._vis_lock = __import__("threading").Lock()
 
         self._logo_cache = {}
         self._logo_raw_cache = {}
@@ -5021,7 +4918,7 @@ class ExternalGameDeck:
         return results, sorted(r for r in unresponsive_roots if r)
 
     def bulk_scan_for_cores(self, parent_folder, max_depth=6):
-        """"Scan For Cores": walk `parent_folder` for *_libretro.dll files and remember where they are; nothing is copied."""
+        """"Scan For Cores": walk `parent_folder` for *_libretro.dll files and copy each one into the folder of every console it plays (main/cores/<console>), so each console's own folder holds its cores; the copies made are left in self.last_scan_copies for the caller to remember."""
         found = {}
         unresponsive_roots = set()
 
@@ -5048,6 +4945,23 @@ class ExternalGameDeck:
                     continue
 
         _walk(parent_folder, 0)
+
+        self.last_scan_copies = []
+        for console in list(found):
+            _by_name = {}
+            for _path in found[console]:
+                _by_name.setdefault(os.path.basename(_path).lower(), _path)
+            _placed = []
+            for _path in _by_name.values():
+                try:
+                    _kept, _made = copy_tool_into(_path, os.path.join(self.cores_dir, console))
+                except OSError as _copy_error:
+                    log.warning(f"[CORES] {console}: could not copy {_path} into its folder ({_copy_error}); it stays where it is")
+                    _kept, _made = os.path.abspath(_path), False
+                _placed.append(_kept)
+                if _made:
+                    self.last_scan_copies.append(_kept)
+            found[console] = _placed
 
         set_now = self._assign_default_cores_after_scan(found) if found else set()
         results = {console: (len(paths), 1 if console in set_now else 0) for console, paths in found.items()}
@@ -5540,16 +5454,22 @@ class ExternalGameDeck:
         _core_dll = self._has_libretro_core(console)
         _use_libretro = bool(_LIBRETRO_AVAILABLE and _core_dll)
         if _use_libretro:
+            if console in BIOS_REQUIRED_CONSOLES and resolve_active_bios_path(console, self.active_bios.get(console), self.base_dir) is None:
+                _blocked = bool(_gov.GAME_NO_BIOS_BLOCKS_LAUNCH)
+                log.warning(f"[LIBRETRO] {console}: no BIOS set up -- " + ("not starting the game" if _blocked else "starting with the core's built-in BIOS") + "; add one with Add Bios")
+                self._romlist_error_msg   = (f"No BIOS set up for {console} yet — use Add BIOS" if _blocked
+                                             else f"No BIOS set up for {console} yet — using the built-in BIOS, use Add BIOS")
+                self._romlist_error_until = pygame.time.get_ticks() + 4000
+                if _blocked:
+                    pygame.event.clear(pygame.KEYDOWN)
+                    return
             self._launch_libretro(console, full_path)
         else:
-            exe = self._resolve_emulator_exe(console)
-            if exe:
-                self._launch_emulator(exe, full_path, console)
-            else:
-                log.warning(f"[LIBRETRO DBG] {console}: no libretro core AND no fallback .exe "
-                      f"found -- nothing to launch this ROM with. Check that "
-                      f"main/cores/{console}/ contains a *_libretro.dll (preferred) or "
-                      f"that an external emulator .exe is configured for this console.")
+            log.warning(f"[LIBRETRO DBG] {console}: no libretro core -- nothing to launch this ROM with. "
+                        f"Check that main/cores/{console}/ contains a *_libretro.dll (Scan For Cores copies one there).")
+            self._romlist_error_msg   = f"No core set up for {console} yet — use Scan For Cores"
+            self._romlist_error_until = pygame.time.get_ticks() + 4000
+            pygame.event.clear(pygame.KEYDOWN)
 
     # ========================================================================
     # SECTION: DVD captions
@@ -5967,797 +5887,25 @@ class ExternalGameDeck:
             log.warning(f"[DVD] Failed to play {self.dvd_file_path}: {e}")
 
     # ========================================================================
-    # SECTION: External emulator launch & monitoring
+    # SECTION: Core settings & running state
     # ========================================================================
-
-    def _resolve_emulator_exe(self, console):
-        folder = os.path.join(self.cores_dir, console)
-        chosen = self.emulator_config.get(console)
-
-        candidates = []
-        try:
-            for root, dirs, files in os.walk(folder):
-                for name in files:
-                    if name.lower().endswith(".exe"):
-                        candidates.append(os.path.join(root, name))
-        except Exception as e:
-            log.warning(f"[GAMEDECK RESOLVE] Walk error: {e}")
-
-        if not candidates:
-            log.warning(f"[GAMEDECK RESOLVE] No exe found. Put emulator in {folder}")
-            return None
-
-        if chosen:
-            for c in candidates:
-                if os.path.basename(c).lower() == chosen.lower():
-                    return c
-            log.info(f"[GAMEDECK RESOLVE] Saved name {chosen!r} not found in tree, auto-detecting.")
-
-        gui = [c for c in candidates if "sdl" not in os.path.basename(c).lower()]
-        pool = gui if gui else candidates
-        pool.sort(key=lambda p: os.path.getsize(p), reverse=True)
-        return pool[0]
 
     def reload_emulator_config(self):
         self.emulator_config = self._load_emulator_config()
 
-    def _patch_mgba_config(self, exe_dir):
-        targets = {
-            "ports.qt": {
-                "fullscreen":           "1",
-                "audiodriver":          "sdl",
-                "allowbackgroundinput": "1",
-                "key.a":                "90",
-                "key.b":                "88",
-                "key.l":                "65",
-                "key.r":                "83",
-                "key.start":            "16777221",
-                "key.select":           "16777219",
-                "key.up":               "16777235",
-                "key.down":             "16777237",
-                "key.left":             "16777234",
-                "key.right":            "16777236",
-            },
-            "": {
-                "allowbackgroundinput": "1",
-            },
-        }
-
-        paths_to_patch = [os.path.join(exe_dir, "config.ini")]
-        appdata = os.environ.get("APPDATA", "")
-        if appdata:
-            roaming = os.path.join(appdata, "mGBA", "config.ini")
-            if os.path.exists(roaming):
-                paths_to_patch.append(roaming)
-                log.info(f"[GAMEDECK] Also patching roaming config: {roaming}")
-
-        def _patch_one(config_path):
-            try:
-                if os.path.exists(config_path):
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                else:
-                    lines = []
-
-                current_section = None
-                patched = set()
-                new_lines = []
-
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped.startswith("[") and stripped.endswith("]"):
-                        current_section = stripped[1:-1].lower()
-                        new_lines.append(line)
-                        continue
-                    if (current_section in targets
-                            and "=" in stripped
-                            and not stripped.startswith("#")):
-                        key = stripped.split("=", 1)[0].strip().lower()
-                        if key in targets[current_section]:
-                            new_lines.append(
-                                f"{key} = {targets[current_section][key]}\n")
-                            patched.add((current_section, key))
-                            continue
-                    new_lines.append(line)
-
-                for section, kvs in targets.items():
-                    missing = [(k, v) for k, v in kvs.items()
-                               if (section, k) not in patched]
-                    if not missing:
-                        continue
-                    if section == "":
-                        insert_lines = [f"{k} = {v}\n" for k, v in missing]
-                        new_lines = insert_lines + new_lines
-                        continue
-                    header = f"[{section}]"
-                    has_section = any(
-                        l.strip().lower() == header.lower() for l in new_lines)
-                    if not has_section:
-                        new_lines.append(f"\n[{section}]\n")
-                        for k, v in missing:
-                            new_lines.append(f"{k} = {v}\n")
-                    else:
-                        insert_at = None
-                        in_sec = False
-                        for i, l in enumerate(new_lines):
-                            s = l.strip()
-                            if s.lower() == header.lower():
-                                in_sec = True
-                                insert_at = i + 1
-                            elif in_sec:
-                                if s.startswith("[") and s.endswith("]"):
-                                    break
-                                insert_at = i + 1
-                        if insert_at is not None:
-                            for k, v in missing:
-                                new_lines.insert(insert_at, f"{k} = {v}\n")
-                                insert_at += 1
-
-                os.makedirs(os.path.dirname(config_path), exist_ok=True)
-                with open(config_path, "w", encoding="utf-8") as f:
-                    f.writelines(new_lines)
-
-                ok = any("allowbackgroundinput" in l.lower() for l in new_lines)
-                log.info(f"[GAMEDECK] Patched {config_path} "
-                      f"(allowBackgroundInput confirmed: {ok})")
-            except Exception as e:
-                log.warning(f"[GAMEDECK] Could not patch {config_path}: {e}")
-
-        for p in paths_to_patch:
-            _patch_one(p)
-
-    def _launch_emulator(self, exe, rom_path, console):
-        """Show loading bar while emulator boots, then mount as true child window."""
-        try:
-            self.emulator_loading  = True
-            self.emulator_load_pct = 0
-            self.emulator_load_msg = f"Loading {console}..."
-            self.active_console    = console
-            self.mode              = "GAME"
-            self.is_frozen         = False
-
-            self._patch_mgba_config(os.path.dirname(exe))
-
-            launch_env = os.environ.copy()
-            launch_env["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"]       = "1"
-            launch_env["SDL_GAMECONTROLLER_ALLOW_BACKGROUND_EVENTS"]  = "1"
-
-            if _WIN:
-                ctypes.windll.user32.AllowSetForegroundWindow(-1)
-
-            if _WIN:
-                import subprocess as _sp
-                si = _sp.STARTUPINFO()
-                si.dwFlags     = _sp.STARTF_USESHOWWINDOW
-                si.wShowWindow = 0
-                self.deck_process = _sp.Popen(
-                    [exe, rom_path],
-                    cwd=os.path.dirname(exe),
-                    stdout=_sp.DEVNULL,
-                    stderr=_sp.DEVNULL,
-                    env=launch_env,
-                    startupinfo=si,
-                )
-            else:
-                self.deck_process = subprocess.Popen(
-                    [exe, rom_path],
-                    cwd=os.path.dirname(exe),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=launch_env,
-                )
-            log.info(f"[GAMEDECK LAUNCH] PID={self.deck_process.pid}")
-            threading.Thread(target=self._monitor_emulator, daemon=True).start()
-            threading.Thread(target=self._controller_exit_watcher, daemon=True).start()
-
-        except Exception:
-            log.exception("[GAMEDECK LAUNCH] FAILED")
-            self.emulator_loading = False
-            self.mode = "ROMLIST"
-
-    def _monitor_emulator(self):
-        """Animate loading bar, find window, mount as child, wait for close."""
-        deadline   = time.time() + 90
-        found_hwnd = None
-        poll_n     = 0
-        pid        = self.deck_process.pid if self.deck_process else None
-        log.info("[GAMEDECK MONITOR] Watching PID=%s for up to 90s...", pid)
-
-        while time.time() < deadline:
-            if self.deck_process is None:
-                log.warning("[GAMEDECK MONITOR] deck_process gone.")
-                break
-            code = self.deck_process.poll()
-            if code is not None:
-                log.warning("[GAMEDECK MONITOR] Process exited (code=%s).", code)
-                break
-
-            elapsed = time.time() - (deadline - 90)
-            self.emulator_load_pct = min(90, int(elapsed / 90 * 90))
-            self.emulator_load_msg = f"Loading {self.active_console or 'emulator'}..."
-
-            if _WIN:
-                hwnd = self._find_emulator_hwnd()
-                if hwnd:
-                    found_hwnd = hwnd
-                    log.info("[GAMEDECK MONITOR] Window found after %.1fs (HWND=%s)", elapsed, hwnd)
-                    break
-
-            poll_n += 1
-            time.sleep(0.05)
-
-        self.emulator_load_pct = 100
-        self.emulator_load_msg = "Mounting to Channel 03..."
-
-        if found_hwnd and _WIN:
-            try:
-                pygame_hwnd = pygame_hwnd_ref[0]
-                if not pygame_hwnd:
-                    log.warning("[GAMEDECK MONITOR] No pygame HWND — cannot mount.")
-                elif not ctypes.windll.user32.IsWindow(pygame_hwnd):
-                    log.warning("[GAMEDECK MONITOR] Cached pygame HWND is no "
-                                "longer a valid window — skipping mount to "
-                                "avoid attaching to a stale/reused handle.")
-                else:
-                    GWL_STYLE           = -16
-                    GWL_EXSTYLE         = -20
-                    WS_CHILD            = 0x40000000
-                    WS_VISIBLE          = 0x10000000
-                    WS_CLIPSIBLINGS     = 0x04000000
-                    WS_CLIPCHILDREN     = 0x02000000
-                    WS_EX_TOOLWINDOW    = 0x00000080
-                    WS_EX_APPWINDOW     = 0x00040000
-                    WS_EX_NOACTIVATE    = 0x08000000
-
-                    ctypes.windll.user32.SetParent(found_hwnd, pygame_hwnd)
-
-                    new_style = (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN)
-                    ctypes.windll.user32.SetWindowLongW(found_hwnd, GWL_STYLE, new_style)
-
-                    ex = ctypes.windll.user32.GetWindowLongW(found_hwnd, GWL_EXSTYLE)
-                    ctypes.windll.user32.SetWindowLongW(
-                        found_hwnd, GWL_EXSTYLE,
-                        (ex & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-
-                    SWP_NOMOVE       = 0x0002
-                    SWP_NOSIZE       = 0x0001
-                    SWP_NOZORDER     = 0x0004
-                    SWP_NOACTIVATE   = 0x0010
-                    SWP_FRAMECHANGED = 0x0020
-                    ctypes.windll.user32.SetWindowPos(
-                        found_hwnd, None, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-
-                    if self._fit_rect:
-                        fx, fy, cw, ch = (int(v) for v in self._fit_rect)
-                    else:
-                        rc = wintypes.RECT()
-                        ctypes.windll.user32.GetClientRect(pygame_hwnd, ctypes.byref(rc))
-                        fx, fy = 0, 0
-                        cw = rc.right  - rc.left
-                        ch = rc.bottom - rc.top
-                    ctypes.windll.user32.MoveWindow(found_hwnd, fx, fy, cw, ch, True)
-
-                    SWP_SHOWWINDOW = 0x0040
-                    HWND_TOP       = 0
-                    ctypes.windll.user32.SetWindowPos(
-                        found_hwnd, HWND_TOP, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
-                    ctypes.windll.user32.ShowWindow(found_hwnd, 9)
-                    log.info("[GAMEDECK MONITOR] mGBA shown as WS_CHILD inside pygame.")
-
-                    self.game_hwnd  = found_hwnd
-                    self.is_embedded = True
-                    self._child_visible = True
-
-                    ctypes.windll.user32.SetFocus(pygame_hwnd)
-                    ctypes.windll.user32.SetForegroundWindow(pygame_hwnd)
-
-            except Exception:
-                log.exception("[GAMEDECK MONITOR] Child mount failed")
-
-        self.emulator_loading = False
-        self.overlay_ready    = True
-        log.info("[GAMEDECK MONITOR] Mount complete. Game running.")
-
-        if self.deck_process:
-            self.deck_process.wait()
-
-        self.overlay_ready = False
-        log.info("[GAMEDECK] Emulator closed. Restoring Retro TV...")
-        self._on_emulator_closed()
-
-    def _find_emulator_hwnd(self):
-        if not self.deck_process or not _WIN:
-            return None
-        target_pid = self.deck_process.pid
-        found = []
-
-        # WARNING: the EnumWindows callback must stay alive through a persistent reference.
-        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_size_t, ctypes.c_size_t)
-
-        def _cb(hwnd, _lp):
-            try:
-                pid = ctypes.c_ulong(0)
-                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if pid.value == target_pid:
-                    rc = wintypes.RECT()
-                    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rc))
-                    w = max(0, rc.right  - rc.left)
-                    h = max(0, rc.bottom - rc.top)
-                    found.append((w * h, hwnd))
-            except Exception as e:
-                log.warning("GetWindowRect failed while scoring a candidate mGBA child window: %s", e)
-            return True
-
-        _enum_cb = WNDENUMPROC(_cb)
-        try:
-            ctypes.windll.user32.EnumWindows(_enum_cb, 0)
-        except Exception as e:
-            log.warning(f"[GAMEDECK FIND] EnumWindows error: {e}")
-
-        if not found:
-            return None
-        found.sort(reverse=True)
-        return found[0][1]
-
-    def _on_emulator_closed(self):
-        if self.game_hwnd and _WIN:
-            try:
-                ctypes.windll.user32.SetParent(self.game_hwnd, None)
-                log.info("[GAMEDECK] mGBA child window detached.")
-            except Exception as e:
-                log.warning("SetParent (detach mGBA child window) failed: %s", e)
-
-        if self.ui_overlay_hwnd and _WIN:
-            try:
-                ctypes.windll.user32.DestroyWindow(self.ui_overlay_hwnd)
-                log.info("[GAMEDECK] UI overlay window destroyed.")
-            except Exception as e:
-                log.warning("DestroyWindow for UI overlay child failed: %s", e)
-        self.ui_overlay_hwnd = None
-
-        self.deck_process = None
-        self.game_hwnd    = None
-        self.is_embedded  = False
-        self.is_frozen    = False
-        self.emulator_loading = False
-        self._child_visible = None
-
-        if not self.roms and self.active_console:
-            log.info(f"[GAMEDECK] ROM list empty on return — re-scanning {self.active_console}.")
-            self._scan_roms(self.active_console)
-
-        self.mode = "ROMLIST"
-        log.info(f"[GAMEDECK] Retro TV restored. Back in ROM list at index {self.rom_index}.")
-
-    def _controller_exit_watcher(self):
-        HOLD_MS = _gov.GAME_CONTROLLER_EXIT_HOLD_MS
-
-        KEYEVENTF_KEYUP = 0x0002
-        INPUT_KEYBOARD  = 1
-
-        class _KEYBDINPUT(ctypes.Structure):
-            _fields_ = [
-                ("wVk",         ctypes.c_ushort),
-                ("wScan",       ctypes.c_ushort),
-                ("dwFlags",     ctypes.c_ulong),
-                ("time",        ctypes.c_ulong),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-            ]
-
-        class _INPUT_UNION(ctypes.Union):
-            _fields_ = [("ki", _KEYBDINPUT), ("padding", ctypes.c_byte * 24)]
-
-        class _INPUT(ctypes.Structure):
-            _fields_ = [("type", ctypes.c_ulong), ("_", _INPUT_UNION)]
-
-        def _send_key(vk, key_up=False):
-            if not vk:
-                return
-            inp = _INPUT()
-            bridge_note_key(vk, key_up)
-            inp.type       = INPUT_KEYBOARD
-            inp._.ki.wVk   = vk
-            inp._.ki.dwFlags = KEYEVENTF_KEYUP if key_up else 0
-            inp._.ki.dwExtraInfo = ctypes.cast(
-                ctypes.pointer(ctypes.c_ulong(0)), ctypes.POINTER(ctypes.c_ulong))
-            ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
-
-        my_process = self.deck_process
-
-        log.info("[GAMEDECK CTRL WATCHER] Started — waiting for overlay_ready...")
-
-        wait_deadline = time.time() + 120
-        while not getattr(self, "overlay_ready", False) and time.time() < wait_deadline:
-            time.sleep(0.15)
-
-        if my_process is None or my_process.poll() is not None:
-            log.info("[GAMEDECK CTRL WATCHER] Emulator gone before watcher activated.")
-            return
-
-        log.info("[GAMEDECK CTRL WATCHER] Live — hold Start+Select 0.6s to exit.")
-
-        def _active_controller_map(console):
-            """Return the effective physical-bit -> logical-button map."""
-            try:
-                return self._ensure_xi_map(console, 1)
-            except Exception as _swallowed_error:
-                # WARNING: the watcher must stay usable during early startup.
-                _log_swallowed("ExternalGameDeck._controller_exit_watcher._active_controller_map: return self._ensure_xi_map(console, 1)", _swallowed_error)
-                return {
-                    logical: bit
-                    for bit, logical in _get_console_def(console)["xinput_map"].items()
-                }
-
-        hold_since   = None
-        prev_buttons = 0
-        TRIG_THRESH  = _gov.TRIGGER_PRESS_THRESHOLD
-
-        while my_process.poll() is None:
-            time.sleep(0.016)
-
-            _main_mod = sys.modules.get("__main__")
-            _off_game_channel = bool(_main_mod and getattr(_main_mod, "app_state", None)
-                                     and _main_mod.app_state.get("current_channel") != "03")
-            _overlay_open = _off_game_channel or bool(_main_mod and getattr(_main_mod, "app_state", None) and (
-                _main_mod.app_state.get("show_menu", False) or
-                _main_mod.app_state.get("show_splash", False) or
-                _main_mod.app_state.get("show_quit_confirm", False) or
-                _main_mod.app_state.get("show_restart_confirm", False) or
-                _main_mod.app_state.get("file_explorer_active", False)
-            ))
-            if self.is_frozen or _overlay_open:
-                if prev_buttons:
-                    _active_con_f = getattr(self, "active_console", "GBA") or "GBA"
-                    _xi_map_f     = _active_controller_map(_active_con_f)
-                    for console_btn, bit in _xi_map_f.items():
-                        if prev_buttons & bit:
-                            vk = self.ctrl_mapping.get(console_btn, 0)
-                            if vk:
-                                _send_key(vk, key_up=True)
-                    prev_buttons = 0
-                    hold_since   = None
-                continue
-
-            buttons = 0
-            gp = _read_gamepad_state()
-            if gp is not None:
-                buttons = gp.wButtons
-                if self.ctrl_mapping.get("stick_as_dpad", False):
-                    DEAD = stick_axis_threshold_raw(getattr(self, "_active_mapping_player", 1) or 1)
-                    if not hasattr(self, "_ctrl_test_dpad_latch"):
-                        self._ctrl_test_dpad_latch = {}
-                    up, down, left, right = _stick_to_dpad_hysteresis(
-                        gp.sLX, gp.sLY, DEAD, self._ctrl_test_dpad_latch)
-                    if up:    buttons |= _XI_UP
-                    if down:  buttons |= _XI_DOWN
-                    if left:  buttons |= _XI_LEFT
-                    if right: buttons |= _XI_RIGHT
-                if gp.bLT >= TRIG_THRESH: buttons |= _XI_LT
-                if gp.bRT >= TRIG_THRESH: buttons |= _XI_RT
-
-            _active_con_now = getattr(self, "active_console", "GBA") or "GBA"
-            _active_map_now = _active_controller_map(_active_con_now)
-            _start_bit = _active_map_now.get("Start", _XI_START)
-            _select_bit = _active_map_now.get("Select", _XI_BACK)
-            if (buttons & _start_bit) and (buttons & _select_bit):
-                if hold_since is None:
-                    hold_since = time.time()
-                    log.info("[GAMEDECK CTRL WATCHER] Start+Select held — confirming...")
-                elif (time.time() - hold_since) * 1000 >= HOLD_MS:
-                    log.info("[GAMEDECK CTRL WATCHER] Confirmed. Killing emulator.")
-                    _active_con_e = getattr(self, "active_console", "GBA") or "GBA"
-                    _xi_map_e     = _active_controller_map(_active_con_e)
-                    for console_btn, bit in _xi_map_e.items():
-                        if prev_buttons & bit:
-                            vk = self.ctrl_mapping.get(console_btn, 0)
-                            _send_key(vk, key_up=True)
-                    try:
-                        my_process.kill()
-                    except Exception as e:
-                        log.warning("Failed to kill deck_process during controller-mapping key-release cleanup: %s", e)
-                    break
-                prev_buttons = buttons
-                continue
-            else:
-                if hold_since is not None:
-                    log.info("[GAMEDECK CTRL WATCHER] Released early — reset hold timer.")
-                hold_since = None
-
-            changed = buttons ^ prev_buttons
-            if changed:
-                _active_con = getattr(self, "active_console", "GBA") or "GBA"
-                _xi_map     = _active_controller_map(_active_con)
-                for console_btn, bit in _xi_map.items():
-                    if changed & bit:
-                        vk = self.ctrl_mapping.get(console_btn, 0)
-                        if vk:
-                            pressed = bool(buttons & bit)
-                            _send_key(vk, key_up=not pressed)
-
-            prev_buttons = buttons
-
-        log.info("[GAMEDECK CTRL WATCHER] Exited.")
-
-    # ========================================================================
-    # SECTION: Emulator window embedding & process control
-    # ========================================================================
-
-    def _set_child_visible(self, visible):
-        if not _WIN or not self.game_hwnd:
-            return
-        want = bool(visible)
-        with self._vis_lock:
-            if self._child_visible == want:
-                return
-            try:
-                HWND_TOP       = 0
-                SWP_NOMOVE     = 0x0002
-                SWP_NOSIZE     = 0x0001
-                SWP_NOACTIVATE = 0x0010
-                SWP_SHOWWINDOW = 0x0040
-                if want:
-                    pygame_hwnd = pygame_hwnd_ref[0]
-                    if pygame_hwnd:
-                        if self._fit_rect:
-                            fx, fy, cw, ch = (int(v) for v in self._fit_rect)
-                        else:
-                            rc = wintypes.RECT()
-                            ctypes.windll.user32.GetClientRect(pygame_hwnd, ctypes.byref(rc))
-                            fx, fy = 0, 0
-                            cw = rc.right - rc.left
-                            ch = rc.bottom - rc.top
-                        ctypes.windll.user32.MoveWindow(self.game_hwnd, fx, fy, cw, ch, True)
-                    ctypes.windll.user32.SetWindowPos(
-                        self.game_hwnd, HWND_TOP, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
-                    ctypes.windll.user32.ShowWindow(self.game_hwnd, 8)
-                else:
-                    ctypes.windll.user32.ShowWindow(self.game_hwnd, 0)
-                self._child_visible = want
-            except Exception as e:
-                _log_warn_throttled("set_child_visible", f"[GAMEDECK VIS] _set_child_visible({want}) failed: {e}")
-
-    def sync_child_window(self, show, fit_rect=None):
-        if not _WIN or not self.game_hwnd:
-            return
-        if fit_rect is not None:
-            new_rect = tuple(int(v) for v in fit_rect)
-            if new_rect != self._fit_rect and self._child_visible and show:
-                self._fit_rect = new_rect
-                with self._vis_lock:
-                    self._child_visible = None
-            else:
-                self._fit_rect = new_rect
-        self._set_child_visible(bool(show))
-
-    def set_viewport_state(self, visible=True, target_rect=None):
-        if not _WIN:
-            return True
-        if getattr(self, "emulator_loading", False):
-            return True
-        if not self.game_hwnd:
-            return True
-
-        try:
-            if not visible:
-                self._set_child_visible(False)
-                # WARNING: call NtSuspendProcess inline so the process is confirmed suspended before returning; a quick channel change could land in the gap.
-                try:
-                    self._suspend_process()
-                except Exception as e:
-                    log.warning("_suspend_process() call failed: %s", e)
-                log.info("[GAMEDECK VIEWPORT] Left ch03 — child hidden, mGBA suspended.")
-
-            else:
-                self._resume_process()
-                self.is_frozen = False
-                with self._vis_lock:
-                    self._child_visible = None
-                self._set_child_visible(True)
-                log.info("[GAMEDECK VIEWPORT] Returned to ch03 — mGBA resumed + child visible.")
-
-        except Exception:
-            log.exception("[GAMEDECK VIEWPORT] set_viewport_state failed")
-        return True
-
-    def _suspend_process(self):
-        if not (_WIN and self.is_process_running()) or self.is_frozen: return
-        try:
-            h = ctypes.windll.kernel32.OpenProcess(
-                _PROCESS_SUSPEND_RESUME | _PROCESS_QUERY_INFORMATION, False, self.deck_process.pid)
-            if h:
-                ctypes.windll.ntdll.NtSuspendProcess(h)
-                ctypes.windll.kernel32.CloseHandle(h)
-                self.is_frozen = True
-        except Exception as e:
-            log.warning("NtSuspendProcess failed, emulator process not suspended: %s", e)
-
-    def _resume_process(self):
-        if not (_WIN and self.is_process_running()) or not self.is_frozen: return
-        try:
-            h = ctypes.windll.kernel32.OpenProcess(
-                _PROCESS_SUSPEND_RESUME | _PROCESS_QUERY_INFORMATION, False, self.deck_process.pid)
-            if h:
-                ctypes.windll.ntdll.NtResumeProcess(h)
-                ctypes.windll.kernel32.CloseHandle(h)
-                self.is_frozen = False
-        except Exception as e:
-            log.warning("NtResumeProcess failed, emulator process not resumed: %s", e)
-
     def is_process_running(self):
-        """Returns True if a libretro core is loaded, or a legacy .exe is running."""
-        if self._libretro_core is not None and self._libretro_core.is_loaded:
-            return True
-        return bool(self.deck_process and self.deck_process.poll() is None)
+        """Returns True while a libretro core is loaded."""
+        return bool(self._libretro_core is not None and self._libretro_core.is_loaded)
 
     # ========================================================================
-    # SECTION: Deck lifecycle: freeze, audio & shutdown
+    # SECTION: Deck lifecycle: boot & shutdown
     # ========================================================================
 
-    def pre_boot_background_deck(self, parent_hwnd=None):
-        if parent_hwnd: self.parent_hwnd = parent_hwnd
+    def pre_boot_background_deck(self):
         self.ready_flag = True
         return True
 
-    def freeze_inputs(self):
-        if not _WIN or not self.is_process_running():
-            return
-        try:
-            KEYEVENTF_KEYUP = 0x0002
-            INPUT_KEYBOARD  = 1
-
-            class _KI(ctypes.Structure):
-                _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
-                             ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
-                             ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-            class _IU(ctypes.Union):
-                _fields_ = [("ki", _KI), ("padding", ctypes.c_byte * 24)]
-
-            class _IN(ctypes.Structure):
-                _fields_ = [("type", ctypes.c_ulong), ("_", _IU)]
-
-            vk_codes = set()
-            for v in self.ctrl_mapping.values():
-                if isinstance(v, int):
-                    vk_codes.add(v)
-            # WARNING: TV shell keys must never leak into the game.
-            tv_keys = [
-                0x4D,
-                0x43,
-                0x4E,
-                0x1B,
-                0x26,
-                0x28,
-                0x25,
-                0x27,
-                0x0D,
-                0x09,
-            ]
-            for k in tv_keys:
-                vk_codes.add(k)
-
-            inputs = []
-            for vk in sorted(vk_codes):
-                inp = _IN()
-                bridge_note_key(vk, True)
-                inp.type = INPUT_KEYBOARD
-                inp._.ki.wVk = vk
-                inp._.ki.dwFlags = KEYEVENTF_KEYUP
-                inp._.ki.dwExtraInfo = ctypes.cast(
-                    ctypes.pointer(ctypes.c_ulong(0)), ctypes.POINTER(ctypes.c_ulong))
-                inputs.append(inp)
-
-            if inputs:
-                arr = (_IN * len(inputs))(*inputs)
-                ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(_IN))
-        except Exception as e:
-            log.warning(f"[GAMEDECK] freeze_inputs error: {e}")
-
-    def set_audio_state(self, muted=True, retry_deadline_ms=None):
-        proc = self.deck_process
-        if proc is None or not self.is_process_running():
-            return False
-        pid = proc.pid
-        _deadline = (time.monotonic() + retry_deadline_ms / 1000.0
-                     if retry_deadline_ms is not None else None)
-        while True:
-            try:
-                from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
-                for session in AudioUtilities.GetAllSessions():
-                    if session.Process and session.Process.pid == pid:
-                        vol = session._ctl.QueryInterface(ISimpleAudioVolume)
-                        vol.SetMute(1 if muted else 0, None)
-                        return True
-            except Exception as e:
-                log.warning("pycaw mute attempt failed, falling back to WASAPI: %s", e)
-            ok = _wasapi_set_process_audio(pid, mute=muted)
-            if ok:
-                return True
-            if _deadline is None or time.monotonic() >= _deadline:
-                _log_warn_throttled("audio_mute_session_lookup", f"[GAMEDECK AUDIO] set_audio_state: session not found yet (pid={pid}).")
-                return False
-            time.sleep(0.05)
-
-    def set_audio_volume(self, level_pct, muted=False):
-        proc = self.deck_process
-        if proc is None or not self.is_process_running():
-            return
-        pid = proc.pid
-
-        pct = max(0.0, min(100.0, float(level_pct)))
-        if muted or pct <= 0:
-            curved_pct = 0.0
-        else:
-            frac = pct / 100.0
-            db_level = -40.0 * (1.0 - frac)
-            curved_pct = (10 ** (db_level / 20.0)) * 100.0
-        gain = max(0.0, min(1.0, curved_pct / 100.0))
-
-        with self._audio_vol_lock:
-            self._audio_vol_pending = (pid, curved_pct, gain)
-            if self._audio_vol_worker_running:
-                return
-            self._audio_vol_worker_running = True
-
-        def _worker():
-            try:
-                while True:
-                    with self._audio_vol_lock:
-                        job = self._audio_vol_pending
-                        self._audio_vol_pending = None
-                        if job is None:
-                            self._audio_vol_worker_running = False
-                            return
-                    job_pid, job_curved_pct, job_gain = job
-                    applied = False
-                    try:
-                        from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
-                        for session in AudioUtilities.GetAllSessions():
-                            if session.Process and session.Process.pid == job_pid:
-                                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
-                                vol.SetMasterVolume(job_gain, None)
-                                applied = True
-                                break
-                    except Exception as e:
-                        log.warning("pycaw volume-set attempt failed, falling back to WASAPI: %s", e)
-                    if not applied:
-                        ok = _wasapi_set_process_audio(job_pid, volume_pct=job_curved_pct)
-                        if ok:
-                            pass
-                        else:
-                            _log_warn_throttled("audio_volume_session_lookup", f"[GAMEDECK AUDIO] set_audio_volume: session not found yet (pid={job_pid}).")
-            except Exception as e:
-                log.warning("set_audio_volume worker error: %s", e)
-                with self._audio_vol_lock:
-                    self._audio_vol_worker_running = False
-
-        threading.Thread(target=_worker, daemon=True).start()
-
     def shutdown_deck(self):
-        if self.deck_process:
-            try:
-                self._resume_process()
-                self.deck_process.terminate()
-                start = time.time()
-                while self.deck_process.poll() is None and time.time() - start < 3:
-                    time.sleep(0.1)
-                if self.deck_process.poll() is None:
-                    self.deck_process.kill()
-            except Exception as e:
-                log.warning("Failed to terminate/kill deck_process during shutdown: %s", e)
-        if self.ui_overlay_hwnd and _WIN:
-            try:
-                ctypes.windll.user32.DestroyWindow(self.ui_overlay_hwnd)
-            except Exception as e:
-                log.warning("DestroyWindow for UI overlay child failed during shutdown: %s", e)
-        self.ui_overlay_hwnd = None
-        self.deck_process = None
-        self.game_hwnd    = None
-        self.is_embedded  = False
-        self.is_frozen    = False
         self.active_console = None
         self.mode = "BROWSE"
         self.ready_flag = False
@@ -7847,29 +6995,32 @@ class ExternalGameDeck:
                                  "Enter": ("enter",), "ESC": ("esc",)}
 
     def _draw_legend(self, screen, cx, y, h, groups):
-        """Draws the legend under a game menu: each action's name, then its controller button and its keyboard key as pictures (as text when a picture is missing)."""
+        """Draws the legend under a game menu: one section per action, its name centred above its controller button, a slash, then its keyboard key, as pictures (as text when a picture is missing); the sections sit side by side, centred on cx."""
         import ui as _ui
         f     = self._font_small
-        col_w = 130
         key_h = _gov.GAME_LEGEND_KEY_H_PX
         gap   = _gov.GAME_LEGEND_ROW_GAP_PX
-        total_w = col_w * len(groups)
-        block_x = cx - total_w // 2
-        y_title = y + h - (f.get_height() + 2 * key_h + 2 * gap) - _gov.GAME_LEGEND_BOTTOM_PAD_PX
-        y_ctrl  = y_title + f.get_height() + gap + key_h // 2
-        y_kb    = y_ctrl + key_h + gap
+        section_gap = _gov.GAME_LEGEND_SECTION_GAP_PX
+        y_title = y + h - (f.get_height() + key_h + gap) - _gov.GAME_LEGEND_BOTTOM_PAD_PX
+        y_keys  = y_title + f.get_height() + gap + key_h // 2
         tc = self.list_text_color
         title_col = tc
         key_col   = tuple(max(0, c - _gov.GAME_LEGEND_KEY_DARKEN) for c in tc[:3])
-        for i, (action, ctrl_key, kb_key) in enumerate(groups):
-            col_cx = block_x + i * col_w + col_w // 2
+        sections = []
+        for action, ctrl_key, kb_key in groups:
+            ctrl = self._LEGEND_CONTROLLER_PICTURES.get(ctrl_key) or ctrl_key
+            kb = self._LEGEND_KEYBOARD_PICTURES.get(kb_key) or kb_key
+            parts = [ctrl, ["/"], kb]
             lbl = f.render(action, True, title_col)
-            screen.blit(lbl, (col_cx - lbl.get_width() // 2, y_title))
-            for text, pictures, row_cy in ((ctrl_key, self._LEGEND_CONTROLLER_PICTURES, y_ctrl),
-                                           (kb_key, self._LEGEND_KEYBOARD_PICTURES, y_kb)):
-                keys = pictures.get(text)
-                _ui.draw_key_hint(screen, [keys] if keys else [text], col_cx, row_cy, f, key_col,
-                                  key_h=key_h, center=True)
+            keys_w = _ui.draw_key_hint(None, parts, 0, 0, f, key_col, key_h=key_h)[0]
+            sections.append((lbl, parts, max(lbl.get_width(), keys_w)))
+        total_w = sum(width for _lbl, _parts, width in sections) + section_gap * max(0, len(sections) - 1)
+        left = cx - total_w // 2
+        for lbl, parts, width in sections:
+            sec_cx = left + width // 2
+            screen.blit(lbl, (sec_cx - lbl.get_width() // 2, y_title))
+            _ui.draw_key_hint(screen, parts, sec_cx, y_keys, f, key_col, key_h=key_h, center=True)
+            left += width + section_gap
 
     # ========================================================================
     # SECTION: Rendering: console carousel
@@ -7942,6 +7093,7 @@ class ExternalGameDeck:
 
                 lbl_p = self._font_small.render(f"{display_pct}%", True, _gov.COLOR_GAME_LOADING_PERCENT)
                 screen.blit(lbl_p, (cx - lbl_p.get_width() // 2, by + bh + 10))
+                self._draw_romlist_error_banner(screen, cx, y + 10)
 
             else:
                 screen.fill((0, 0, 0), rect)
@@ -9290,7 +8442,6 @@ class ExternalGameDeck:
         self.mode               = "GAME"
         # WARNING: clear the previous game's source path so a newly-starting ROM never looks like an active reader.
         self._libretro_rom_path = ""
-        self.is_frozen          = False
         self._pause_reasons.clear()
 
         self._console_splash_is_video = False
@@ -10303,6 +9454,8 @@ __all__ = [
     "apply_menu_nav_mapping",
     "border_available_for_console",
     "console_bezel_currently_active",
+    "copy_tool_into",
+    "warp_bezel_available",
     "find_psx_disc_siblings",
     "gamepad_permission_denied_path",
     "get_bios_dir_for_console",
@@ -10312,7 +9465,6 @@ __all__ = [
     "player1_gpstate",
     "player_gpstate",
     "player_is_connected",
-    "pygame_hwnd_ref",
     "is_console_core_key",
     "resolve_active_bios_path",
     "resolve_active_core_path",

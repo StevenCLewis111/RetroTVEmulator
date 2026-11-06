@@ -497,8 +497,8 @@ class TestSeriesDurationGuess(unittest.TestCase):
             {"path": "/tv/Show/Show S01E03.mkv"},
         ]
         cache = {
-            items[0]["path"]: {"duration": 1200},
-            items[1]["path"]: {"duration": 1500},
+            items[0]["path"]: {"duration": 1320},
+            items[1]["path"]: {"duration": 1380},
         }
         _install_cache_hub(cache, self)
         tracks = media.build_raw_tracks(items, lambda _path: True)
@@ -1666,6 +1666,7 @@ def _make_ns(get_cached_return=None, get_cached_raises=None):
         "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
         "PICTURE_BOX_FIT_RETRY_SECONDS": 2.0,
         "_throttled_log_last_ts": {}, "_THROTTLED_LOG_INTERVAL_S": 30.0,
+        "PAN_SCAN_KEY_CACHE_SECONDS": 0.0, "_pan_scan_key_cache": {"path": None, "key": None, "at": 0.0},
     }
     for name in ("_log_warn_throttled", "_log_probe_failure", "_pan_scan_content_key", "_picture_box_set_content", "_apply_picture_box_crop"):
         exec(compile(_seg(_FUNCS[name]), f"<extracted:{name}>", "exec"), ns)
@@ -2661,7 +2662,7 @@ SUB_LAYOUTS = {
 def sub_rows_for(console_key, on, kiosk, psx, bios):
     """Returns the rows get_games_sub_menu_rows gives for one console setup (the same lists as ui.py)."""
     if console_key == "MENU":
-        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores", "menu_bg_select_image",
+        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores", "clear_bios", "menu_bg_select_image",
                 "multitap_toggle", "scroll_style", "text_color", "game_screen_mode"]
     if not on:
         return []
@@ -2699,13 +2700,14 @@ EXPECTED_SUB = {
         "scan_for_roms": "W:scroll_style S:clear_roms A:scan_for_cores D:-",
         "clear_roms": "W:scan_for_roms S:close A:clear_cores D:-",
         "scan_for_cores": "W:game_screen_mode S:clear_cores A:- D:scan_for_roms",
-        "clear_cores": "W:scan_for_cores S:close A:- D:clear_roms",
+        "clear_cores": "W:scan_for_cores S:clear_bios A:- D:clear_roms",
+        "clear_bios": "W:clear_cores S:close A:- D:clear_roms",
         "menu_bg_select_image": "W:controller_map S:game_screen_mode A:- D:multitap_toggle",
         "multitap_toggle": "W:stick_deadzone S:scroll_style A:menu_bg_select_image D:-",
         "scroll_style": "W:multitap_toggle S:scan_for_roms A:game_screen_mode D:text_color",
         "text_color": "W:multitap_toggle S:scan_for_roms A:scroll_style D:-",
         "game_screen_mode": "W:menu_bg_select_image S:scan_for_cores A:- D:scroll_style",
-        "close": "W:clear_cores S:- A:clear_cores D:-",
+        "close": "W:clear_bios S:- A:clear_bios D:-",
     },
     "DVD": {
         "status": "W:- S:dvd_button_mapping A:- D:splash_toggle",
@@ -2906,8 +2908,9 @@ def case_games_sub_way_back():
     check(walk(dvd, "dvd_screen_mode", "D") == "dvd_captions_toggle" and walk(dvd, "dvd_captions_toggle", "A") == "dvd_screen_mode",
           "games sub DVD: Screen Mode and Captions share a row")
     check(walk(dvd, "close", "W") == "dvd_resume_toggle", "games sub DVD: Close up with no memory goes to Resume")
-    check(walk(menu, "clear_roms", "SW") == "clear_roms" and walk(menu, "clear_cores", "SW") == "clear_cores" and walk(menu, "close", "W") == "clear_cores", "games sub MENU: Close way back, default Clear Cores")
-    check(walk(menu, "close", "A") == "clear_cores" and walk(menu, "clear_roms", "SA") == "clear_cores", "games sub MENU: Close left is always Clear Cores")
+    check(walk(menu, "clear_roms", "SW") == "clear_roms" and walk(menu, "clear_cores", "SW") == "clear_cores" and walk(menu, "close", "W") == "clear_bios", "games sub MENU: Close way back, default Clear BIOS")
+    check(walk(menu, "close", "A") == "clear_bios" and walk(menu, "clear_roms", "SA") == "clear_bios", "games sub MENU: Close left is always Clear BIOS")
+    check(walk(menu, "clear_cores", "S") == "clear_bios" and walk(menu, "clear_bios", "W") == "clear_cores" and walk(menu, "clear_bios", "D") == "clear_roms", "games sub MENU: Clear BIOS sits under Clear Cores and its right is Clear Roms")
     check(walk(menu, "scroll_style", "DA") == "scroll_style" and walk(menu, "text_color", "W") == "multitap_toggle" and walk(menu, "text_color", "S") == "scan_for_roms",
           "games sub MENU: the colour swatch hangs off Scroll Style and moves vertically like it")
     check(walk(off, "status", "S") == "close" and walk(off, "close", "W") == "status", "games sub disabled console: Status and Close are neighbours")
@@ -6143,7 +6146,7 @@ def suite_picture_box_before_show():
     check(serial["reason"] == "pillarbox" and abs(serial["picture_aspect"] - 4.0 / 3.0) < 0.01, "a 4:3 picture inside 16:9 must read as a pillarbox of 4:3: %s" % serial)
     check(parallel_s < serial_s * 0.7, "parallel samples must be faster: %.2f vs %.2f" % (parallel_s, serial_s))
 
-    ns = {"os": os, "time": time, "threading": threading, "media": media, "ml_box": None}
+    ns = {"os": os, "time": time, "threading": threading, "media": media, "ml_box": None, "_season_guess_picture_box": lambda p: None}
     log_stub = type("L", (), {"info": staticmethod(lambda *a, **k: None), "warning": staticmethod(lambda *a, **k: None)})()
     store = {}
 
@@ -7429,6 +7432,11 @@ def stick_case_main_script_calls():
     check("menu_panel_rect(" in block and "_overlay_target_for_menu(screen)" in block,
           "the stick screen takes its place from the same surface and rectangle the menu uses")
     check("fit_design_canvas" not in block, "the stick screen does not size itself with a separate canvas")
+    map_start = text.index('app_state.get("menu_layer") == "GAMES_CTRL_MAP" and game_deck is not None')
+    map_block = text[map_start:text.index('app_state.get("menu_layer") == "DVD_BTN_MAP"', map_start)]
+    check("menu_panel_rect(" in map_block and "_overlay_target_for_menu(screen)" in map_block,
+          "the controller mapping screen takes its place from the same surface and rectangle the menu uses")
+    check("fit_design_canvas" not in map_block, "the controller mapping screen does not size itself with a separate canvas")
 
 
 # ============================================================================
@@ -7576,6 +7584,8 @@ def _block_scan_ns(block_mode, now_hour, schedules, scanned=()):
           "_scan_stages_pending": lambda p, g, d, lk: os.path.normpath(p) not in {os.path.normpath(x) for x in scanned},
           "_scan_file_is_done": lambda p, g, d, mo, lk: os.path.normpath(p) in {os.path.normpath(x) for x in scanned},
           "_scan_snapshot_channel": lambda ch: ns["_build_scan_snapshot"]()["channels"].get(ch),
+          "_scan_done_sticky": {},
+          "_scan_file_is_finished": lambda p, mo, lk: os.path.normpath(p) in {os.path.normpath(x) for x in scanned},
           "_front_load_watched_channel": lambda items: items,
           "_gather_holiday_scan_items": lambda: ([], [], [])}
     for name in ("_airing_block_name", "_block_names_after_airing", "_get_block_ordered_content_peek", "_build_scan_snapshot",
@@ -7641,7 +7651,7 @@ def suite_block_scan():
     done, tot = n["_compute_channel_scan_progress"](n["_build_scan_snapshot"](), [400])["05"]
     queued = [it[3] for it in n["_gather_deep_backlog_queue"]()]
     check(tot == 5, "a file reused in two blocks counts once in the bar (got %d)" % tot)
-    ns_order = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch))}
+    ns_order = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch)), "_season_seeds_first": lambda items: items}
     exec(compile(get_function_source("_order_scan_pipeline"), "<extracted:_order_scan_pipeline>", "exec"), ns_order)
     tiers = [[("channel", "05", "Morning", os.path.normpath("/m/Morning_0.mkv"))], [], [], []]
     items = ns_order["_order_scan_pipeline"](tiers, [("channel", "05", it[2], it[3]) for it in n["_gather_deep_backlog_queue"]()])
@@ -7925,7 +7935,7 @@ def suite_lineup_groups():
         clock[0] = moment
         ticks[0] += 10000
         with patch.object(media, "_cached_path_exists", lambda p: True):
-            ns["calculate_slotted_playback_state"]("05")
+            ns["_scheduler_playback_state"]("05")
     check(len(used) >= len(times) and len(built) >= 1, "the scheduler ran on the mixed short-episode channel")
     stray = [i for i, s in enumerate(used) if s not in built]
     check(not stray, "every pass of the scheduler airs a lineup the rotation built, never a re-paired one (passes %s)" % stray[:5])
@@ -8266,7 +8276,7 @@ def suite_block_change_no_skipped_episode():
             clock[0] = start + datetime.timedelta(seconds=i * 300)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                result = ns["calculate_slotted_playback_state"]("05")
+                result = ns["_scheduler_playback_state"]("05")
             plog = channels["05"]["playback_log"]
             path = result.get("file", "")
             if result.get("mode") != "Video" or path not in set(plog.get("sched_cached_tracks") or []):
@@ -8332,7 +8342,7 @@ def suite_catch_up_matches_continuous():
             clock[0] = t0 + datetime.timedelta(seconds=i * 300)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                ns["calculate_slotted_playback_state"]("05")
+                ns["_scheduler_playback_state"]("05")
             plog = channels["05"]["playback_log"]
             if plog.get("sched_block_key") != last_key:
                 last_key = plog.get("sched_block_key")
@@ -8414,7 +8424,7 @@ def suite_overrun_static_when_ledger_lacks_entry():
             clock[0] = t0 + datetime.timedelta(seconds=i * 300)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                ns["calculate_slotted_playback_state"]("05")
+                ns["_scheduler_playback_state"]("05")
             log = channels["05"]["playback_log"]
             layout = {n: h for n, h, _e in media._block_layout(block_mode)}
             for key, anchor in log.get("block_anchors", {}).items():
@@ -8430,10 +8440,10 @@ def suite_overrun_static_when_ledger_lacks_entry():
                 if window[1] + 30 <= now_abs < window[2] - 60:
                     with_ledger = None
                     with patch.object(media, "_cached_path_exists", lambda p: True):
-                        with_ledger = ns["calculate_slotted_playback_state"]("05")
+                        with_ledger = ns["_scheduler_playback_state"]("05")
                     channels["05"]["playback_log"].pop("guide_aired_ledger", None)
                     with patch.object(media, "_cached_path_exists", lambda p: True):
-                        lost = ns["calculate_slotted_playback_state"]("05")
+                        lost = ns["_scheduler_playback_state"]("05")
                     checked += 1
                     if with_ledger.get("mode") not in ("Video", "Commercial"):
                         bad.append("%s: the running show did not air with the ledger kept" % name)
@@ -8460,7 +8470,7 @@ def _long_show_run(epic_seconds, hours=60, step=120, snapshot_at=None, commercia
         clock[0] = t0 + datetime.timedelta(seconds=i * step)
         ticks[0] += 10000
         with patch.object(media, "_cached_path_exists", lambda p: True):
-            states.append(ns["calculate_slotted_playback_state"]("05"))
+            states.append(ns["_scheduler_playback_state"]("05"))
     return t0, step, states, channels, snapshot
 
 
@@ -8500,7 +8510,7 @@ def suite_overrun_longer_than_a_block():
         gap_channels = {"05": copy.deepcopy(snapshot)}
         ns = _sched_record_ns(gap_channels, clock, ticks)
         with patch.object(media, "_cached_path_exists", lambda p: True):
-            got = ns["calculate_slotted_playback_state"]("05")
+            got = ns["_scheduler_playback_state"]("05")
         want = reference[gap_to]
         check(got.get("mode") == want.get("mode") and got.get("file") == want.get("file") and abs(got.get("seek", 0) - want.get("seek", 0)) <= 2.0,
               "a start after a gap %s airs what a station that kept running airs (%s %s vs %s %s)" % (
@@ -8567,7 +8577,7 @@ def suite_gap_with_unscanned_files():
                 clock[0] = t0 + datetime.timedelta(minutes=minute)
                 ticks[0] += 10000
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    ns["calculate_slotted_playback_state"]("05")
+                    ns["_scheduler_playback_state"]("05")
                 if minute % (8 * 60) == 0:
                     snapshots.append((clock[0], copy.deepcopy(channels["05"])))
             layout = media._block_layout(block_mode)
@@ -8607,7 +8617,7 @@ def suite_gap_with_unscanned_files():
                             del gap_ns["db"].config["media_probe_cache"][path]
                         unscan(gap_channels["05"], markers)
                         with patch.object(media, "_cached_path_exists", lambda p: True):
-                            got = gap_ns["calculate_slotted_playback_state"]("05")
+                            got = gap_ns["_scheduler_playback_state"]("05")
                         resumed += 1
                         if got.get("mode") not in ("Video", "Commercial"):
                             statics.append("%s %s %s: %s %s" % (block_mode, markers, resume.isoformat(), got.get("mode"), got.get("reason")))
@@ -8620,7 +8630,7 @@ def suite_gap_with_unscanned_files():
     check("build_raw_tracks(" in catch_up_src and "build_guess_filled_tracks(" not in catch_up_src
           and "build_raw_tracks(" in guide_src and "build_guess_filled_tracks(" not in guide_src,
           "schedule catch-up and guide history use the same track builder as live playback, with no replay-only duration guesses")
-    check("build_raw_tracks(" in get_function_source("calculate_slotted_playback_state"), "the live scheduler uses the shared duration-aware track builder")
+    check("build_raw_tracks(" in get_function_source("_scheduler_playback_state"), "the live scheduler uses the shared duration-aware track builder")
 
 
 class TestGapWithUnscannedFiles(_SectionCase):
@@ -8703,19 +8713,19 @@ def suite_gap_probe_discovers_duration():
             clock[0] = t0 + datetime.timedelta(minutes=minute)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                ns["calculate_slotted_playback_state"]("05")
+                ns["_scheduler_playback_state"]("05")
         snapshot = copy.deepcopy(channels["05"])
         for minutes_after in (65, 190, 600):
             resume = clock[0] + datetime.timedelta(minutes=minutes_after)
             early_ns, early_calls = unscanned_copy(snapshot, resume, full, True)
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                early = early_ns["calculate_slotted_playback_state"]("05")
+                early = early_ns["_scheduler_playback_state"]("05")
             probe_ns, probe_calls = unscanned_copy(snapshot, resume, full, False)
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                got = probe_ns["calculate_slotted_playback_state"]("05")
+                got = probe_ns["_scheduler_playback_state"]("05")
             again_ns, _again_calls = unscanned_copy(snapshot, resume, full, False)
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                again = again_ns["calculate_slotted_playback_state"]("05")
+                again = again_ns["_scheduler_playback_state"]("05")
             compared += 1
             probed_total += len(probe_calls)
             early_probes += len(early_calls)
@@ -8872,7 +8882,7 @@ def suite_guide_past_matches_continuous():
             clock[0] = t0 + datetime.timedelta(seconds=i * 60)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                ns["calculate_slotted_playback_state"]("05")
+                ns["_scheduler_playback_state"]("05")
             for rec in (channels["05"]["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values():
                 truth[rec["start"]] = (rec["total"], paths(rec["timeline"]))
         for stop, resume in gaps:
@@ -8883,7 +8893,7 @@ def suite_guide_past_matches_continuous():
                 clock2[0] = moment
                 ticks2[0] += 10000
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    ns2["calculate_slotted_playback_state"]("05")
+                    ns2["_scheduler_playback_state"]("05")
             plog = fresh["05"]["playback_log"]
             rebuilt = {rec["start"]: (rec["total"], paths(rec["timeline"]))
                        for rec in (plog.get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values()}
@@ -8937,7 +8947,7 @@ def suite_block_change_overrun_continues():
             clock[0] = moment_now
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                results[clock[0]] = ns["calculate_slotted_playback_state"]("05")
+                results[clock[0]] = ns["_scheduler_playback_state"]("05")
             built[clock[0]] = channels["05"]["playback_log"].get("sched_block_key")
         for moment in sorted(results):
             if moment.hour not in hours or moment.minute != 0 or moment.second != 5 or moment == t0:
@@ -9000,7 +9010,7 @@ def suite_full_day_overrun_starts_when_show_ends():
             clock[0] = start + datetime.timedelta(seconds=i * 300)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                results[clock[0]] = ns["calculate_slotted_playback_state"]("05")
+                results[clock[0]] = ns["_scheduler_playback_state"]("05")
             built[clock[0]] = channels["05"]["playback_log"].get("sched_block_key")
         second = start.date() + datetime.timedelta(days=1)
         key = "%d_%d_Full Day" % (second.year, second.timetuple().tm_yday)
@@ -9027,7 +9037,7 @@ def suite_full_day_overrun_starts_when_show_ends():
                 cclock[0] = when
                 cticks[0] += 10000
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    cold = cns["calculate_slotted_playback_state"]("05")
+                    cold = cns["_scheduler_playback_state"]("05")
             cold_checked += 1
             warm = results[moment]
             if cold.get("file") != warm.get("file") or abs(float(cold.get("seek", 0)) - float(warm.get("seek", 0))) > 2:
@@ -9078,7 +9088,7 @@ def suite_reflavor_no_skipped_episode():
                 plog["_sched_rebuild_requested"] = True
                 requested = True
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                result = ns["calculate_slotted_playback_state"]("05")
+                result = ns["_scheduler_playback_state"]("05")
             if requested and i % 150 == 41 and not plog.get("_sched_rebuild_requested"):
                 reflavors += 1
             path = result.get("file", "")
@@ -9137,7 +9147,7 @@ def suite_rebuild_keeps_airing_entry():
                 elif change == "new_file":
                     channels["05"]["schedules"]["Evening"].append({"path": "/m/Show D/Season 1/Show D S01E01.mkv", "duration": 0})
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                out[clock[0]] = (ns["calculate_slotted_playback_state"]("05"), plog.get("sched_cycle_boundary"))
+                out[clock[0]] = (ns["_scheduler_playback_state"]("05"), plog.get("sched_cycle_boundary"))
         return out
 
     plain = run(None)
@@ -9780,14 +9790,29 @@ def suite_v277_quiet_logs():
 def suite_tune_priority():
     import performance_governor as pg
     check(gov.TUNE_BACKGROUND_HOLD_SECONDS == 3.0, "the tune hold is 3 s at most and lives in the governor")
-    pg.release_tune_hold()
+    pg._gate_state["tune_until"] = 0.0
+    pg._gate_state["tune_settling_since"] = None
     check(not pg.tune_in_progress(), "no hold until a channel is tuned")
     pg.hold_background_for_tune()
     check(pg.tune_in_progress(), "tuning a channel holds background work")
-    pg.release_tune_hold()
-    check(not pg.tune_in_progress(), "the first show playing ends the hold")
+    t0 = time.monotonic()
+    pg.release_tune_hold(now=t0)
+    check(pg.tune_in_progress(), "the first show playing keeps the hold until its picture is steady (owner 2026-11-04: playback first)")
+    pg.note_tune_steady(True, t0 + 0.5)
+    pg.note_tune_steady(False, t0 + 1.0)
+    pg.note_tune_steady(True, t0 + 1.5)
+    pg.note_tune_steady(True, t0 + 1.5 + pg.TUNE_STEADY_SECONDS - 0.1)
+    check(pg.tune_in_progress(), "a frame over its time or a lost picture starts the steady count again")
+    pg.note_tune_steady(True, t0 + 1.5 + pg.TUNE_STEADY_SECONDS)
+    check(not pg.tune_in_progress(), "TUNE_STEADY_SECONDS of steady picture end the hold")
+    t1 = time.monotonic()
+    pg.release_tune_hold(now=t1)
+    pg.note_tune_steady(False, t1 + pg.TUNE_STEADY_MAX_SECONDS)
+    check(not pg.tune_in_progress(), "a picture that never steadies holds at most TUNE_STEADY_MAX_SECONDS")
+    check(pg._gate_state["tune_settling_since"] is None, "and the settling ends then")
+    pg._gate_state["tune_until"] = 0.0
     gate_src = read(os.path.join(ROOT, "performance_governor.py"))
-    check("if (not tune_in_progress() and not game_needs_all() and level_allows(level, \"background\")" in gate_src, "a background gate does not admit new work while a tune is in progress")
+    check("return (not tune_in_progress() and scan_throttle_mode() != \"stopped\"" in gate_src, "a background gate does not admit new work while a tune is in progress")
     cc = MAIN_SRC[MAIN_SRC.index("def change_channel("):]
     check(cc.index("performance_governor.hold_background_for_tune()") < cc.index("_mute_guard_log(\"ARM (real channel change)\""),
           "a channel change starts the hold before the show is opened")
@@ -9813,7 +9838,7 @@ def suite_tune_priority():
     ns["_hub_row_sync_wake"].set()
     want_epoch = datetime.datetime(2026, 11, 2, 12, 0, 0).timestamp()
     check(done == [("9", 2.0, want_epoch)], "the save runs on its own thread with the moment it was asked for, and a newer request for the channel replaces the older one (%s)" % done)
-    check(MAIN_SRC[MAIN_SRC.index("def calculate_slotted_playback_state"):].count("_sync_hub_rows_for_block(") == 0, "the scheduler never saves hub rows on the caller's thread")
+    check(MAIN_SRC[MAIN_SRC.index("def _scheduler_playback_state"):].count("_sync_hub_rows_for_block(") == 0, "the scheduler never saves hub rows on the caller's thread")
 
 
 def suite_new_channel_first_show():
@@ -9860,7 +9885,7 @@ def suite_new_channel_first_show():
         ns["_channel_added_order"].setdefault(ch, len(ns["_channel_added_order"]))
     ranked = sorted(["07", "05", "09", "06", "12"], key=ns["_channel_scan_rank"])
     check(ranked == ["05", "12", "09", "06", "07"], "channels from before this run go by number, then channels set up now in the order they were set up (%s)" % ranked)
-    order_ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": ns["_channel_scan_rank"]}
+    order_ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": ns["_channel_scan_rank"], "_season_seeds_first": lambda items: items}
     exec(main_function_code("_order_scan_pipeline"), order_ns)
     out = order_ns["_order_scan_pipeline"]([[("channel", "07", "Full Day", "/7.mkv"), ("channel", "09", "Full Day", "/9.mkv"), ("channel", "06", "Full Day", "/6.mkv")], [], [], []], [])
     check([it[3] for it in out] == ["09", "06", "07"], "the airing shows' loudness, length and picture box scans follow the same order (%s)" % [it[3] for it in out])
@@ -9897,7 +9922,7 @@ def suite_one_scan_order_for_new_files():
     snap = MAIN_SRC[MAIN_SRC.index("def _scan_snapshot_worker"):]
     snap = snap[:snap.index("_logged_missing_probe_paths = set()")]
     check(snap.index("_scan_snapshot = fresh") < snap.index("_scan_work_generation[0] += 1")
-          and "_scan_idle_wait(SCAN_SNAPSHOT_INTERVAL_S, _scan_files_added_generation)" in snap,
+          and "_scan_idle_wait(max(0.0, SCAN_SNAPSHOT_INTERVAL_S - _rest), _scan_files_added_generation)" in snap,
           "the snapshot rebuilds at once when files are added and only then wakes the scans, so they see the new files")
     for waits in ("if _scan_idle_wait(DURATION_PRECACHE_IDLE_SLEEP_SECONDS", "if _scan_idle_wait(PICTURE_BOX_IDLE_SLEEP_SECONDS",
                   "if _scan_idle_wait(_scan_pace(MUSIC_PRECACHE_IDLE_SLEEP_SECONDS)):"):
@@ -9981,12 +10006,12 @@ def suite_scan_turns():
         pg.set_game_active(False)
     check(not pg.game_needs_all() and pg.scan_threads() >= 1, "leaving the game returns to normal")
     gate_src = read(os.path.join(ROOT, "performance_governor.py"))
-    check("and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < affordable_threads())" in gate_src and "not game_needs_all()" in gate_src,
-          "background scan work may not start past the overall cap or while a game falls behind; priority work never waits")
+    check("and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))" in gate_src and "not tune_in_progress()" in gate_src,
+          "background scan work may not start past the overall cap (the PC's peak, narrowed with the level) or during a tune; priority work never waits")
     slot = gate_src[gate_src.index("def scan_thread_slot"):]
     slot = slot[:slot.index("def scan_gpu_decode_allowed")]
-    check(slot.index("if scan_should_yield(kind, rank):\n            start = time.monotonic()") < slot.index("_activity.try_begin(SCAN_THREADS_LANE, scan_threads())")
-          and "scan_note_progress(kind)" in slot, "waiting for a turn never counts as a stuck wait, and a finished file is recorded")
+    check("_slot_active[0] < scan_threads() and ticket == min(_slot_waiting)" in slot and "scan_note_progress(kind)" in slot,
+          "a file takes a place only while one is free and it is the most urgent waiting file, and a finished file is recorded")
     for wiring in ('with _scan_thread_slot("duration", _cls, _tier_idx) as _slot_ok:', 'with _scan_thread_slot("picture_box", _cls, _tier_idx) as _slot_ok:',
                    'with _scan_thread_slot("loudness", _head_cls, _chunk[0][1]) as _slot_ok:', 'with _scan_thread_slot("music", _scan_cls) as _slot_ok:',
                    'with _scan_thread_slot("commercial_check", SCAN_CLASS_COMMERCIAL) as _slot_ok:', 'with _scan_thread_slot("pending", SCAN_CLASS_DEEP) as _slot_ok:'):
@@ -9994,8 +10019,8 @@ def suite_scan_turns():
     check('_scan_report_head("loudness", _pipeline_items[_need_pi][0], _pipeline_items[_need_pi][1])' in MAIN_SRC,
           "loudness reports its next file that still needs loudness, not files already done")
     pause = MAIN_SRC[MAIN_SRC.index("def _background_scan_should_pause"):MAIN_SRC.index("def _background_scan_pace_seconds")]
-    check("performance_governor.game_needs_all()" in pause and "return _background_scan_should_pause() or _is_game_actively_playing()" in pause,
-          "scans stop for a game only when it falls behind; Python-heavy work still waits for the whole game")
+    check('performance_governor.scan_throttle_mode() == "stopped"' in pause and "or _is_game_actively_playing()" in MAIN_SRC[MAIN_SRC.index("def _python_heavy_should_pause"):MAIN_SRC.index("def _background_scan_pace_seconds")],
+          "scans stop for a game only when the governor says stopped; Python-heavy work still waits for the whole game")
     fut = MAIN_SRC[MAIN_SRC.index("def _hub_future_worker"):]
     check("if _python_heavy_should_pause():" in fut[:3000], "the future guide rows wait for the whole game")
     check("performance_governor.set_game_active(_is_game_actively_playing())" in MAIN_SRC
@@ -10476,7 +10501,7 @@ def suite_slot_count_switch():
                 ch["scheduling_mode"] = to
                 ch["_sched_debounce_pending_since"] = ticks[0] - 10 ** 6
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                result = ns["calculate_slotted_playback_state"]("05")
+                result = ns["_scheduler_playback_state"]("05")
             path = result.get("file", "") if result.get("mode") == "Video" else ""
             if path and path != last:
                 aired.append(path)
@@ -10521,11 +10546,11 @@ def suite_catch_up_walks_once():
             t0 = datetime.datetime(2026, 10, 13, 9, 0, 5)
             clock, ticks = [t0], [0]
             ns = _sched_record_ns(channels, clock, ticks)
-            ns["calculate_slotted_playback_state"]("05")
+            ns["_scheduler_playback_state"]("05")
             counts.update(walk=0, guide=0)
             clock[0] = t0 + datetime.timedelta(days=30, hours=3)
             ticks[0] += 10 ** 7
-            result = ns["calculate_slotted_playback_state"]("05")
+            result = ns["_scheduler_playback_state"]("05")
             check(result.get("mode") in ("Video", "Commercial"), "%s: the station airs after a 30 day gap" % block_mode)
             check(counts == {"walk": 1, "guide": 1}, "%s: one resume after a gap walks the gap once for the catch-up and once for the guide's past (%s)" % (block_mode, counts))
         ch = _sched_record_channel("full_day", "interrupt_half_hour", "one_slot", False)
@@ -10603,7 +10628,7 @@ def suite_resolve_part_seek():
     ads = [{"path": "/m/Ads/ad%d.mkv" % i, "duration": 30} for i in range(4)]
     timeline, total, _ = media.build_channel_timeline(show, ads, channel, 7)
     parts = [e for e in timeline if not e.get("is_commercial")]
-    check(len(parts) == 3, "the commercial setup cuts an 80-minute episode into three parts, a break every half hour it runs into (%d)" % len(parts))
+    check(len(parts) == 3, "the commercial setup cuts an 80-minute episode into three parts, at 30 and 60 minutes (%d)" % len(parts))
     wrong = 0
     for entry in parts:
         for into in (0.0, entry["duration"] / 2.0, entry["duration"] - 1.0):
@@ -10617,7 +10642,7 @@ def suite_resolve_part_seek():
 # ============================================================================
 
 def suite_pending_probe_does_not_wait_on_own_flag():
-    check(gov.PENDING_SCHEDULE_PROBE_PARALLEL == 1, "the governor must probe pending files one at a time")
+    check(gov.PENDING_SCHEDULE_PROBE_PARALLEL == 2 and gov.PENDING_PROBE_RESTORE_HOLD_SECONDS == 60.0, "the governor must probe pending files two at a time and hold a just-stored file for a minute")
     check(gov.PENDING_SCHEDULE_PROBE_RETRY_SECONDS == 5.0 and gov.PENDING_SCHEDULE_PROBE_REQUEST_STALE_SECONDS == 30.0,
           "the governor must hold the pending-probe retry and stale seconds")
     check(media._perf_governor is gov, "media must use the same governor module")
@@ -10650,7 +10675,7 @@ def suite_pending_probe_does_not_wait_on_own_flag():
               "_governor_priority_scope": gov.priority_scope,
               "set_live_playback_priority": media.set_live_playback_priority,
               "performance_governor": gov,
-              "_PENDING_SCHEDULE_PROBE_PARALLEL": 1, "_PENDING_PROBE_URGENT_COUNT": 4, "media": media,
+              "_PENDING_SCHEDULE_PROBE_PARALLEL": 1, "_PENDING_PROBE_RESTORE_HOLD_SECONDS": 600.0, "_PENDING_PROBE_URGENT_COUNT": 4, "media": media,
               "_pending_backlog_may_run": lambda state, now_m: True}
         patched = []
         probe_threads = []
@@ -10811,7 +10836,7 @@ def suite_first_start_remaining_scans():
     ns = {"os": os, "time": time, "threading": threading, "media": media, "log": mock.MagicMock(),
           "_cached_path_exists": lambda p: True,
           "_is_drive_degraded": lambda p: False,
-          "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 2.0,
+          "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 2.0, "_season_guess_picture_box": lambda p: None,
           "performance_governor": types.SimpleNamespace(picture_box_pre_show_parallel=lambda: (6, "test PC")),
           "_governor_priority_scope": gov.priority_scope}
     store = {}
@@ -10971,7 +10996,7 @@ def suite_commercial_tracks():
     check(any(t["path"] == "/c/long.mp4" and t["duration"] == 301 for t in uncapped), "with no cap the long commercial is kept")
     check(media.COMMERCIAL_MAX_SECONDS == 300, "the maximum commercial length is 300 seconds")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_commercial_tracks(") == 4, "the main script builds commercial tracks only through the shared function (holiday, main schedule, the block-start overrun check, and the hub's future rows)")
+    check(src.count("build_commercial_tracks(") == 5, "the main script builds commercial tracks only through the shared function (holiday, main schedule, the block-start overrun check, the hub's future rows, and the Marathon plan)")
     check("COMMERCIAL_DEFAULT_DUR" not in src and "_H_COMMERCIAL_MAX_SECONDS" not in src, "the old local copies are gone from the main script")
 
 
@@ -10999,7 +11024,7 @@ def suite_block_seeds():
     check(media.block_day_seed(d, 5, 100) == media.block_day_seed(d, "05", 100), "channel 5 and 05 give the same seed")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
     check("_block_seed_offsets" not in src and "_peek_offsets" not in src, "the main script keeps no offset table of its own")
-    check(src.count("block_day_seed(") == 3, "the scheduler, the catch-up and the add-media block prebuild use the shared seed; the read-only lineup in media.py uses it too")
+    check(src.count("block_day_seed(") == 4, "the scheduler, the catch-up, the add-media block prebuild and the hub's Marathon plan use the shared seed; the read-only lineup in media.py uses it too")
     check("tm_yday + int(target_clean_key) + block_offset" not in src, "the scheduler no longer works out its seed by hand")
 
 
@@ -11552,7 +11577,7 @@ SCHED_RECORD_FUNCS = [
     "_maybe_correct_estimated_target_duration", "_missed_block_day_seeds", "_mixer_seekable_formats",
     "_prime_block_durations_on_cold_start", "_probe_and_persist_duration",
     "_snapshot_track_durations", "_start_order_seed", "_save_file_probe_facts", "_hub_note_measured_duration", "_timeline_whole_episode_durations",
-    "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "calculate_slotted_playback_state",
+    "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "_scheduler_playback_state",
     "_block_overrun_anchor", "_channel_is_server_streamed", "_note_aired_cycle", "_note_missed_blocks", "_priority_probe_pending_schedule", "_pending_probe_worker", "_store_pending_probe_results", "_pending_store_worker", "_pending_backlog_may_run", "_probe_pending_schedule_one", "_set_saved_lineup",
     "_pending_paths_signature", "_stored_pending_signature", "_stored_length_held",
 ]
@@ -11587,7 +11612,7 @@ SCHED_RECORD_GLOBALS = [
     "_duration_precache_inflight", "_intro_seed_lock", "_ondemand_duration_probe_next", "_probe_block_timeline_cache",
     "_probe_library_lock",
     "SCHEDULER_REPEAT_GUARD_SECONDS", "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS", "BLOCK_ROTATION_CACHE_MAX_BLOCKS",
-    "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_PENDING_PROBE_RETRY_SECONDS", "_PENDING_PROBE_REQUEST_STALE_SECONDS", "_PENDING_PROBE_URGENT_COUNT", "_PENDING_PROBE_STORE_BATCH_S", "_app_shutting_down", "_pending_probe_state", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
+    "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_PENDING_PROBE_RESTORE_HOLD_SECONDS", "_PENDING_PROBE_RETRY_SECONDS", "_PENDING_PROBE_REQUEST_STALE_SECONDS", "_PENDING_PROBE_URGENT_COUNT", "_PENDING_PROBE_STORE_BATCH_S", "_app_shutting_down", "_pending_probe_state", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
 ]
 
 SCHED_RECORD_SCENARIOS = [
@@ -11711,7 +11736,7 @@ def _sched_record_run(scenario, kind):
         clock[0] = moment
         ticks[0] += 10000
         with patch.object(media, "_cached_path_exists", lambda p: True):
-            result = _sched_record_round(ns["calculate_slotted_playback_state"]("05"))
+            result = _sched_record_round(ns["_scheduler_playback_state"]("05"))
         plog = _sched_record_round(channels["05"]["playback_log"])
         digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k != "sched_cached_groups"}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         out.append({"at": moment.isoformat(), "result": result, "state_sha": digest,
@@ -11730,7 +11755,7 @@ def suite_scheduler_record():
     import json
     needed = set()
     tops = {n.name: n for n in MAIN_TREE.body if isinstance(n, ast.FunctionDef)}
-    pending = ["calculate_slotted_playback_state"]
+    pending = ["_scheduler_playback_state"]
     while pending:
         current = pending.pop()
         if current in needed or current not in tops:
@@ -11857,7 +11882,7 @@ def _sched_scan_run(scenario):
         clock[0] = moment
         ticks[0] += 10000
         with patch.object(media, "_cached_path_exists", lambda p: True):
-            result = _sched_record_round(ns["calculate_slotted_playback_state"]("05"))
+            result = _sched_record_round(ns["_scheduler_playback_state"]("05"))
         plog = _sched_record_round(channels["05"]["playback_log"])
         digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k != "sched_cached_groups"}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         out.append({"at": moment.isoformat(), "scanned": scanned, "result": result, "state_sha": digest,
@@ -11947,7 +11972,7 @@ def _night_date_run(channels, moments):
             clock[0] = moment
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                ns["calculate_slotted_playback_state"]("05")
+                ns["_scheduler_playback_state"]("05")
     plog = _sched_record_round(channels["05"]["playback_log"])
     state = {key: plog.get(key) for key in NIGHT_STATE_KEYS}
     state["cycle_start_positions"] = (plog.get("sched_cycle_start_pos") or {}).get("positions")
@@ -11965,7 +11990,7 @@ def suite_night_block_date():
 
 def _night_block_date_checks():
     import copy
-    source = main_function_source("calculate_slotted_playback_state")
+    source = main_function_source("_scheduler_playback_state")
     check("_seed_date = block_start_date(now, current_block)" in source, "the scheduler takes its seed date from block_start_date")
     check("block_day_seed(_seed_date, target_clean_key, block_offset)" in source, "the scheduler seeds the block from that date")
     check("media.catch_up_state(" in source and "_prev_sched_block_key, block_key" in source and "block_key = block_key_for(now, current_block)" in source,
@@ -12287,7 +12312,7 @@ def suite_channel_timeline():
     default = media.build_block_timeline(shows, ads, "interrupt_half_hour", 7, interrupt_floor_seconds=900)
     check(media.build_channel_timeline(shows, ads, {}, 7) == default, "a channel with no settings uses interrupt placement and the 15 minute floor")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_channel_timeline(") == 3, "the scheduler builds its three main timelines through the wrapper; the holiday cycles are built by media.build_holiday_cycle")
+    check(src.count("build_channel_timeline(") == 4, "the scheduler builds its three main timelines through the wrapper, and the hub's Marathon plan builds its one pass the same way; the holiday cycles are built by media.build_holiday_cycle")
     check(inspect.getsource(media.build_holiday_cycle).count("build_channel_timeline(") == 1, "a holiday cycle's timeline is built through the wrapper")
     check("build_block_timeline(" not in src, "the main script no longer calls build_block_timeline itself")
     check("INTERRUPT_FLOOR_SECONDS" not in src and "h_commercial_placement" not in src, "the scheduler keeps no floor or placement of its own")
@@ -12354,6 +12379,7 @@ def _surf_ns(active, current="05", game=True, guide=True, music_busy=False, mode
                  "_surf_begin_quiet", "_surf_step", "_surf_digit_typed", "_typed_channel_valid", "_tune_after_flip", "_surf_commit_if_due",
                  "_surf_recover_if_stuck", "_bezel_led_channel_text", "_configured_transition_style"):
         exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    exec(main_assignment_code("_SURF_PRESS_EVENT_TYPES"), {"pygame": pygame, "__builtins__": __builtins__}, ns)
     return ns, state, clock, calls
 
 
@@ -12386,7 +12412,12 @@ def suite_channel_surf():
     check(ns["_bezel_led_channel_text"]() == "07", "the letters show the channel being flipped to")
     ns["_surf_commit_if_due"](last_press + 399)
     check(calls["change"] == [], "still waiting before the hesitation time has passed")
-    ns["_surf_commit_if_due"](last_press + 400)
+    _press_waiting = [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP)]
+    ns["_surf_commit_if_due"](last_press + 1500, _press_waiting)
+    check(calls["change"] == [], "a press read in a slow frame and not handled yet means Up and Down were not left alone, so nothing is tuned (owner 2026-11-04)")
+    ns["_surf_commit_if_due"](last_press + 1500, [pygame.event.Event(pygame.JOYHATMOTION, value=(0, 1))])
+    check(calls["change"] == [], "the same for a controller's d-pad")
+    ns["_surf_commit_if_due"](last_press + 400, [pygame.event.Event(pygame.MOUSEMOTION, pos=(1, 1))])
     check(_tuned(calls) == ["07"], "one channel change to the flipped-to channel once you hesitate (got %s)" % _tuned(calls))
     kw = calls["change"][0][1]
     check(kw["force_reload"] is False and kw["pre_captured_position"] is not None and kw["pre_captured_position"]["pos_ms"] == 61_000,
@@ -12455,7 +12486,7 @@ def suite_channel_surf():
     check("_surf_step(-1)" in down and "change_channel(" not in down and "calculate_slotted_playback_state" not in down, "the Down key only steps the flip; it does not tune or work out the schedule")
     digit_helper = get_function_source("_surf_digit_typed")
     check(digit_helper.index("_surf_cancel()") < digit_helper.index("menu_nav.digit_entry_step("), "typing a digit drops the flipped-to number")
-    check("    _surf_commit_if_due(now_ticks)\n    _surf_recover_if_stuck()\n" in src, "the main loop checks every frame whether the flip is due and whether the shut-down show must come back")
+    check("    _surf_commit_if_due(now_ticks, events)\n    _surf_recover_if_stuck()\n" in src, "the main loop checks every frame whether the flip is due and whether the shut-down show must come back")
     cc = get_function_source("change_channel")
     check(cc.count('app_state["surf_target"] = ""') == 1 and cc.index('app_state["osd_channel_pending"] = False') < cc.index('app_state["surf_target"] = ""')
           and 'app_state["surf_origin"] = ""' in cc, "any real tune clears a flip in progress")
@@ -12628,7 +12659,7 @@ def suite_channel_digits():
     handler = handler[:handler.index("if event.key == pygame.K_n:")]
     check("_surf_digit_typed(pressed_digit, now_ticks)" in handler and "digit_entry_step(" not in handler,
           "the digit key handler only calls the shared digit helper")
-    resolve = src[src.index("if menu_nav.digit_entry_due("):src.index("_surf_commit_if_due(now_ticks)\n    _surf_recover_if_stuck()")]
+    resolve = src[src.index("if menu_nav.digit_entry_due("):src.index("_surf_commit_if_due(now_ticks, events)\n    _surf_recover_if_stuck()")]
     check("if _typed_channel_valid(final_ch):" in resolve and "valid_set" not in resolve and "range(5, 45)" not in resolve,
           "the main loop uses the shared check for which numbers can be tuned")
     check("if _surf_origin_active():\n                _tune_after_flip(final_ch, is_surfing=True)" in resolve,
@@ -13239,7 +13270,7 @@ def suite_scan_lanes_finish():
     check("first_start_scan_plan" in first_start_src and "_picture_box_before_loudness" in first_start_src,
           "the first-start scan of the playing file still follows the together-or-in-sequence plan")
 
-    lock_ns = {"threading": threading, "_picture_box_path_locks": {}, "_picture_box_path_locks_guard": threading.Lock()}
+    lock_ns = {"threading": threading, "performance_governor": None, "_picture_box_path_locks": {}, "_picture_box_path_locks_guard": threading.Lock()}
     exec(compile(_picture_box_lock_source(), "<extracted:_picture_box_path_lock>", "exec"), lock_ns)
     live = {"now": 0, "max": 0, "calls": 0}
     live_guard = threading.Lock()
@@ -13391,28 +13422,28 @@ def suite_duration_hub():
             raw = media.build_raw_tracks(items, exists)
             check(shows[1] not in [t["path"] for t in raw], "with one scanned episode the others stay unplaced")
             check([t["duration"] for t in raw if t["path"] == movie] == [5400], "an unscanned movie is placed at the movie estimate")
-            hub.note_measured(shows[1], 1500)
+            hub.note_measured(shows[1], 1260)
             raw = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
-            check(raw.get(shows[2]) == 1350 and raw.get(shows[3]) == 1350 and raw[shows[0]] == 1201,
-                  "with two scanned episodes the unscanned ones take their average (1200.6 and 1500 give 1350) and a measured one keeps its own length, rounded up (1201)")
+            check(raw.get(shows[2]) == 1230 and raw.get(shows[3]) == 1230 and raw[shows[0]] == 1201,
+                  "with two scanned episodes the unscanned ones take their average (1200.6 and 1260 give 1230) and a measured one keeps its own length, rounded up (1201)")
 
-            hub.note_measured(shows[2], 1000)
+            hub.note_measured(shows[2], 1290)
             again = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
-            check(again[shows[3]] == 1350, "a saved estimate is not recalculated when another episode is scanned later")
+            check(again[shows[3]] == 1250 and again[shows[2]] == 1290, "a saved estimate follows a later scan: the average of the three scanned episodes (1250.2) is now used, and the measured one keeps its own length")
 
             check(hub.flush_estimates(10.0), "the background writer saves every queued estimate")
             hub2 = open_hub()
             media.set_duration_hub(hub2)
             restarted = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
-            check(restarted[shows[3]] == 1350 and restarted[movie] == 5400 and restarted[shows[0]] == 1201,
+            check(restarted[shows[3]] == 1250 and restarted[movie] == 5400 and restarted[shows[0]] == 1201,
                   "after a restart the saved estimates and measured lengths read back the same")
 
             hub2.note_measured(shows[3], 1420)
             after = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
-            check(after[shows[3]] == 1420 and after[movie] == 5400 and after[shows[2]] == 1000,
+            check(after[shows[3]] == 1420 and after[movie] == 5400 and after[shows[2]] == 1290,
                   "a real length replaces only its own estimate")
             row = hub2.probe_library.get_cached(shows[3])
-            check(row["estimated_duration"] == 1350 and row["duration"] == 1420 and row["estimate_basis"] == "series_average" and row["estimated_at"],
+            check(row["estimated_duration"] == 1250 and row["duration"] == 1420 and row["estimate_basis"] == "series_average" and row["estimated_at"],
                   "the estimate, its date and its basis stay in the library after the real length arrives")
 
             cache = {}
@@ -13500,7 +13531,7 @@ def _gain_namespace(fake_db, hub, server_channels=()):
           "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
           "_LEARN_FIELDS": ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db"),
           "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {},
-          "_queue_owner_gain_learning": lambda path, baseline_db, total_db: None}
+          "_queue_owner_gain_learning": lambda path, baseline_db, total_db: None, "_season_guess_gain": lambda p: None}
     ns["_checkpoint_probe_cache"] = lambda: ns["_checkpoints"].append(1)
     for name in _GAIN_EMULATOR_FUNCTIONS:
         exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
@@ -13749,7 +13780,7 @@ _GAIN_CHECK_FUNCTIONS = (
     "_get_library_gain", "_library_gain_first",
     "_learning_read", "_learning_write", "_series_offset_from_changes", "_series_offset_for_key",
     "_learned_series_offset", "_learned_offset_applied",
-    "_apply_offset_once_confirmed", "_take_learned_offset_applied", "_series_offset_from_slider",
+    "_apply_offset_once_confirmed", "_take_learned_offset_applied",
 )
 
 
@@ -14142,7 +14173,7 @@ _LEARNED_OFFSET_FUNCTIONS = (
     "_set_gain_double_checked", "_take_gain_double_checked", "_set_gain_windows", "_take_gain_windows",
     "_gain_bundle_members", "_gain_check_db", "_middle_value", "_store_loudness_gain", "_library_gain_is_current",
     "_get_library_gain", "_learning_read", "_learning_write", "_series_offset_from_changes",
-    "_series_offset_for_key", "_series_offset_from_slider", "_learned_series_offset",
+    "_series_offset_for_key", "_learned_series_offset",
     "_learned_offset_applied", "_season_others_middle_db", "_series_scan_is_outlier", "_apply_learned_series_offset",
     "_apply_offset_once_confirmed", "_take_learned_offset_applied", "_owner_gain_baseline_db",
     "_series_members", "_apply_series_offset_to_scanned", "_learn_from_owner_gain",
@@ -14276,139 +14307,6 @@ _SLIDER_LEARN_FUNCTIONS = _LEARNED_OFFSET_FUNCTIONS + (
     "_slider_comfort_volume", "_slider_volume_db", "_settled_volume",
     "_learn_from_slider_watch", "_owner_set_gain", "_perceptual_volume_pct", "_slider_watch_sample", "_slider_watch_loop",
 )
-
-
-def suite_slider_learning():
-    tmp = tempfile.mkdtemp()
-    libs = []
-    try:
-        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
-        libs.append(lib)
-        hub = ml.GainHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
-
-        def make(folder, name, size):
-            os.makedirs(folder, exist_ok=True)
-            full = os.path.join(folder, name)
-            with open(full, "wb") as handle:
-                handle.write(os.urandom(size))
-            return os.path.normpath(full)
-
-        files = [make(os.path.join(tmp, "Show", "Season 1"), "e%d.mkv" % i, 3000 + i) for i in range(10)]
-        season2 = [make(os.path.join(tmp, "Show", "Season 2"), "f%d.mkv" % i, 4000 + i) for i in range(3)]
-        other = [make(os.path.join(tmp, "Other", "Season 1"), "o%d.mkv" % i, 6000 + i) for i in range(3)]
-
-        def key(p):
-            if os.sep + "Show" + os.sep in p:
-                return "show"
-            if os.sep + "Other" + os.sep in p:
-                return "other"
-            return None
-
-        fake_db = types.SimpleNamespace(config={"global_volume": 72, "is_muted": False}, save_settings_async=lambda **k: None)
-        ns = {"db": fake_db, "media": media, "os": os, "math": math, "time": time, "threading": threading,
-              "log": mock.MagicMock(), "_log_swallowed": lambda where, error: None,
-              "_MUSIC_FILE_EXTS": (".mp3",), "_get_gain_hub": lambda: hub, "_get_show_smoothing_key": key,
-              "_is_drive_degraded": lambda p: False, "_get_part_group_key": lambda p: None,
-              "_gain_double_checked_pending": set(), "_gain_windows_pending": {}, "_gain_check_lock": threading.Lock(),
-              "LOUDNESS_LEARN_MIN_FILES": 3, "LOUDNESS_LEARN_AGREE_DB": 2.0, "LOUDNESS_LEARN_SINGLE_CHANGE_DB": 3.0,
-              "LOUDNESS_LEARN_MAX_OFFSET_DB": 12, "LOUDNESS_LEARN_SETTLE_SECONDS": 3600.0,
-              "LOUDNESS_SLIDER_SAMPLE_SECONDS": 1.0, "LOUDNESS_SLIDER_MIN_WATCH_SECONDS": 600.0, "LOUDNESS_SLIDER_TRIGGER_POINTS": 30,
-              "LOUDNESS_SLIDER_COMFORT_PCT": 72, "LOUDNESS_SLIDER_REFERENCE_FILES": 10, "LOUDNESS_SLIDER_REFERENCE_MIN_FILES": 3,
-              "_LEARN_FIELDS": ("learn_series_key", "learn_change_db", "learn_change_at", "learn_baseline_db", "learn_applied_db"),
-              "_loudness_learning_lock": threading.RLock(), "_learned_offset_pending": {},
-              "_owner_gain_learning_pending": {}, "_owner_gain_learning_worker": {"thread": None},
-              "_app_shutting_down": threading.Event()}
-        for name in _SLIDER_LEARN_FUNCTIONS:
-            exec(compile(get_function_source(name), filename="<extracted:%s>" % name, mode="exec"), ns)
-
-        def scan(path, value_db):
-            hub.note_gain(path, 10 ** (value_db / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION,
-                          media.LOUDNESS_CONVERGENCE_DB)
-
-        def played_db(path):
-            return 20.0 * math.log10(hub.read(path)["gain"])
-
-        def watch(path, seconds_at_volume):
-            ns["_learn_from_slider_watch"](path, dict(seconds_at_volume))
-
-        def offset():
-            return ns["_learned_series_offset"](files[0])
-
-        for i in range(8):
-            scan(files[i], 2.0)
-        scan(files[8], 8.0)
-        for path in season2 + other:
-            scan(path, 2.0)
-
-        check(ns["_settled_volume"]({72: 1800.0, 30: 300.0}) == 72 and ns["_settled_volume"]({40: 1500.0, 72: 600.0}) == 40,
-              "the volume an episode counts at is the one most of its watched time sat at; a short drop for a phone call does not move it")
-        check(ns["_slider_comfort_volume"]() == 72.0, "the comfortable volume is 72 until enough files set by hand have been watched")
-
-        watch(files[0], {72: 1200.0})
-        watch(files[1], {72: 300.0})
-        check(hub.read_file_fields(files[1], ("learn_slider_db",)) == {"learn_slider_db": None},
-              "an episode watched for less than 10 minutes teaches nothing")
-        watch(files[1], {35: 1500.0, 72: 200.0})
-        check(offset() == 0, "one episode turned far down is not enough")
-        watch(files[2], {35: 1500.0})
-        check(offset() == -12, "two of the last three episodes kept more than 30 points under the comfortable volume make the series quieter (held to 12 dB)")
-        check(abs(played_db(files[3]) + 10.0) < 1e-6 and abs(played_db(season2[0]) + 10.0) < 1e-6,
-              "the rest of the series, both seasons, is given the learned offset on its own scan")
-        check(abs(played_db(files[8]) - 8.0) < 1e-6, "an episode whose own scan sits far from its season is left without it")
-        watch(files[3], {72: 1500.0})
-        watch(files[4], {72: 900.0, 100: 300.0, 40: 200.0})
-        check(offset() == -12,
-              "once the series sounds right at the comfortable volume the offset stays: the episodes now ask for what they played with, and the room-noise moves do not count")
-        watch(files[8], {35: 1500.0})
-        check(hub.read_file_fields(files[8], ("learn_slider_db",)) == {"learn_slider_db": None} and offset() == -12,
-              "an episode that scans far from its season is not counted for the series")
-
-        for path in other:
-            hub.note_owner_gain(path, 0)
-            watch(path, {60: 1500.0})
-        check(ns["_slider_comfort_volume"]() == 60.0, "the files the owner set by hand give the comfortable volume once three are watched")
-        check(hub.read_file_fields(other[0], ("learn_slider_db",)) == {"learn_slider_db": None},
-              "a file set by hand only gives the comfortable volume and is never changed by the slider learning")
-
-        baseline = ns["_owner_gain_baseline_db"](files[6], hub)
-        hub.note_owner_gain(files[6], -8)
-        ns["_learn_from_owner_gain"](files[6], baseline, -8)
-        check(offset() == -10 and abs(played_db(files[7]) + 8.0) < 1e-6,
-              "a manual change that sets an offset wins over the volume learning (-10 dB from the episode's own scan)")
-        baseline = ns["_owner_gain_baseline_db"](files[5], hub)
-        hub.note_owner_gain(files[5], 3)
-        ns["_learn_from_owner_gain"](files[5], baseline, 3)
-        check(offset() != 0, "a small manual tweak that sets no offset of its own does not wipe out what was learned")
-
-        samples = iter([(files[9], 72)] * 3 + [(None, None), (season2[2], 72), (files[9], None)])
-        fed = []
-
-        def fake_sample():
-            try:
-                return next(samples)
-            except StopIteration:
-                ns["_app_shutting_down"].set()
-                return None, None
-
-        ns["_slider_watch_sample"] = fake_sample
-        ns["_learn_from_slider_watch"] = lambda path, record: fed.append((path, dict(record)))
-        ns["_app_shutting_down"].wait = lambda timeout=None: ns["_app_shutting_down"].is_set()
-        ns["_slider_watch_loop"]()
-        check(fed == [(files[9], {72: 3.0}), (season2[2], {72: 1.0})],
-              "the watch adds up seconds at each volume for one episode, skips a moment with no series file (a commercial), hands the episode over when another episode starts and adds no time while paused or muted")
-    finally:
-        for opened in libs:
-            opened.close()
-        shutil.rmtree(tmp, ignore_errors=True)
-    check('threading.Thread(target=_slider_watch_loop, daemon=True, name="VolumeWatch").start()' in MAIN_SRC,
-          "the volume watch starts at boot on its own thread")
-
-
-class TestSliderLearning(_SectionCase):
-    """The volume kept while watching a series teaches its loudness without reacting to short moves"""
-
-    def test_slider_learning(self):
-        self.run_section(suite_slider_learning)
 
 
 def suite_static_sound():
@@ -15277,7 +15175,7 @@ def suite_guide_past_replay():
     ns["_note_missed_blocks"](_copy.deepcopy(ch), "05", {}, "a", "b", now, [], None)
     check(True, "a rebuild failure never reaches the scheduler")
 
-    sched_src = get_function_source("calculate_slotted_playback_state")
+    sched_src = get_function_source("_scheduler_playback_state")
     check(sched_src.index("_note_missed_blocks(") < sched_src.index("media.catch_up_state("),
           "the past is rebuilt from the saved positions before the catch-up moves them")
     check("GUIDE_REPLAY_MAX_BLOCKS" in inspect.getsource(__import__("performance_governor")),
@@ -15287,7 +15185,7 @@ def suite_guide_past_replay():
 def suite_scheduler_catch_up():
     import copy as _copy
 
-    sched_src = get_function_source("calculate_slotted_playback_state")
+    sched_src = get_function_source("_scheduler_playback_state")
     items = [{"path": "/m/%s/S01E%02d.mkv" % (show, i), "duration": 1500} for show in ("Alpha", "Beta") for i in range(1, 31)]
     cache = {os.path.normpath(it["path"]): {"duration": 1500} for it in items}
     exists = lambda p: True
@@ -15382,7 +15280,7 @@ def suite_commercial_cycle_state():
         while True:
             try:
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    result = ns["calculate_slotted_playback_state"]("05")
+                    result = ns["_scheduler_playback_state"]("05")
                 return (result.get("mode"), os.path.basename(str(result.get("file", ""))), round(float(result.get("seek", 0) or 0)))
             except NameError as missing:
                 name = str(missing).split("'")[1]
@@ -15461,7 +15359,7 @@ def suite_block_anchor_real_start():
     holiday = {"playback_log": {"sched_block_key": "2026_288_Full Day"}}
     check(anchor_for(holiday, "2026_289_holiday", noon_ish) == 12 * 3600,
           "a caller that gives no clock start gets the old behaviour")
-    sched = get_function_source("calculate_slotted_playback_state")
+    sched = get_function_source("_scheduler_playback_state")
     check(sched.count("real_start_seconds=0,") == 2 and sched.count("real_start_seconds=block_start_hour * 3600,") == 3,
           "every scheduler block passes its real clock start: the Holiday and Full Day days from midnight, the other blocks from their start hour")
     late = {"playback_log": {"sched_block_key": "2026_288_Evening"}}
@@ -15934,7 +15832,7 @@ def suite_timeline_mirrors_to_hub():
         shutil.rmtree(tmp, ignore_errors=True)
 
     src = MAIN_SRC
-    live = src[src.index("def calculate_slotted_playback_state"):]
+    live = src[src.index("def _scheduler_playback_state"):]
     check("_request_hub_row_sync(target_clean_key, block_key, timeline, target_show, position_in_playlist, raw_tracks, _clock_shift_seconds)" in live
           and "_mirror_block_timeline_to_hub" not in src, "the live scheduler keeps the hub's rows in step once the airing entry is known")
     check("_mark_hub_row_static(ch_key, file_path)" in src[src.index("def _register_channel_playback_failure"):], "a file that goes to Static marks its hub row static")
@@ -16185,7 +16083,7 @@ def suite_hub_airing_entry():
         shutil.rmtree(tmp, ignore_errors=True)
 
     src = MAIN_SRC
-    live = src[src.index("def calculate_slotted_playback_state"):]
+    live = src[src.index("def _scheduler_playback_state"):]
     check(live.index("_hub_pick = _hub_airing_entry(") < live.index("_request_hub_row_sync(target_clean_key")
           and "_position_before_guard = position_in_playlist" in live and "target_show = _hub_pick" in live,
           "the live scheduler asks the hub for the airing entry after the repeat guard and before the hub's rows are brought up to date")
@@ -16388,7 +16286,7 @@ def suite_guide_past_after_long_gap():
                 clock[0] = t0 + datetime.timedelta(seconds=i * step)
                 ticks[0] += 10000
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    ns["calculate_slotted_playback_state"]("05")
+                    ns["_scheduler_playback_state"]("05")
                 for rec in (channels["05"]["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values():
                     truth[rec["start"]] = (rec["total"], paths(rec["timeline"]))
             continuous_pos = _sched_record_round(channels["05"]["playback_log"].get("show_pos"))
@@ -16402,7 +16300,7 @@ def suite_guide_past_after_long_gap():
                 clock2[0] = moment
                 ticks2[0] += 10000
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    result = ns2["calculate_slotted_playback_state"]("05")
+                    result = ns2["_scheduler_playback_state"]("05")
             plog = fresh["05"]["playback_log"]
             if result.get("mode") not in ("Video", "Commercial"):
                 statics.append("%s: %s %s" % (label, result.get("mode"), result.get("reason")))
@@ -16575,7 +16473,7 @@ def suite_future_rows_match_continuous_run(hours_ahead=24.0, run_hours=48, step=
                 clock[0] = t0 + datetime.timedelta(seconds=i * step)
                 ticks[0] += 10000
                 with patch.object(media, "_cached_path_exists", lambda p: True):
-                    ns["calculate_slotted_playback_state"]("05")
+                    ns["_scheduler_playback_state"]("05")
                 for rec in (channels["05"]["playback_log"].get(media.GUIDE_AIRED_LEDGER_KEY) or {}).values():
                     truth[rec["start"]] = (rec["total"], [e["path"] for e in rec["timeline"]])
                 if stopped_log is None and clock[0] >= stop:
@@ -16627,7 +16525,7 @@ def suite_hub_future_worker():
             clock[0] = t0 + datetime.timedelta(seconds=i * 600)
             ticks[0] += 10000
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                sns["calculate_slotted_playback_state"]("05")
+                sns["_scheduler_playback_state"]("05")
         warnings, infos = [], []
         mono = {"t": 1000.0}
         ns = {"os": os, "media": media, "datetime": datetime, "copy": copy, "db": sns["db"], "_cached_path_exists": lambda p: True,
@@ -16668,9 +16566,7 @@ def suite_hub_future_worker():
         channels["05"]["playback_log"]["sched_block_key"] = "2026_200_Morning"
         check(run("05", force=True) == 0, "a channel whose block on air is not the last block built is left to the scheduler")
         channels["05"]["playback_log"]["sched_block_key"] = media.block_key_containing("eight_hour", clock[0])
-        channels["05"]["is_visualizer"] = True
-        check(run("05", force=True) == 0, "a visualizer channel has no future rows")
-        channels["05"]["is_visualizer"] = False
+        check("_hub_future_for_loop_channel(" in get_function_source("_hub_future_for_channel"), "a Marathon or Visualizer channel is handed to its own planner, built from its own media")
         broken = types.SimpleNamespace(replace_future_rows=lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
         ml.shared_schedule_hub = lambda: broken
         before = len(warnings)
@@ -16800,6 +16696,236 @@ def suite_guide_future_from_hub():
     finally:
         lib.close()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubPlaybackDoor(unittest.TestCase):
+    """14.10: playback asks the hub; on a miss the hub asks the scheduler and keeps the answer"""
+
+    def _ns(self, calls, clock):
+        import types, time, logging
+        hub = __import__("media_library").ScheduleHub.__new__(__import__("media_library").ScheduleHub)
+        hub._show_facts = {}
+        hub._current_show = {}
+        ml = types.SimpleNamespace(shared_schedule_hub=lambda: hub)
+        def sched(ch, a=False, b=False, c=False):
+            calls.append((ch, a, b, c))
+            return {"mode": "Video", "file": "/m/a.mkv", "seek": 100.0, "duration": 1500.0, "block": "Morning", "interior_cut": False}
+        ns = {"time": time, "log": logging.getLogger("t"), "db": None, "_log_warn_throttled": lambda *a, **k: None,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: clock[0], toordinal=lambda: 1)),
+              "_scheduler_playback_state": sched, "_hub_miss_logged": {}}
+        import sys
+        sys.modules.setdefault("media_library", __import__("media_library"))
+        for name in ("_hub_playback_guard", "calculate_slotted_playback_state", "_hub_miss_log_once", "_hub_remember_state"):
+            exec(get_function_source(name), ns)
+        return ns, hub, ml
+
+    def test_hit_is_clock_math_and_miss_asks_the_scheduler(self):
+        import media_library
+        calls, clock = [], [1000.0]
+        ns, hub, ml = self._ns(calls, clock)
+        orig = media_library.shared_schedule_hub
+        media_library.shared_schedule_hub = lambda: hub
+        try:
+            first = ns["calculate_slotted_playback_state"]("05")
+            self.assertEqual(len(calls), 1)
+            clock[0] = 1030.0
+            second = ns["calculate_slotted_playback_state"]("05")
+            self.assertEqual(len(calls), 1, "the hub answered without the scheduler")
+            self.assertAlmostEqual(second["seek"], 130.0)
+            clock[0] = 1030.0
+            ns["calculate_slotted_playback_state"]("05", snap_internal_advance=True)
+            self.assertEqual(len(calls), 2, "an advance request always reaches the scheduler")
+            clock[0] = 1000.0 + 1500.0
+            ns["calculate_slotted_playback_state"]("05")
+            self.assertEqual(len(calls), 3, "when the show runs out the hub asks the scheduler again")
+        finally:
+            media_library.shared_schedule_hub = orig
+
+    def test_static_answers_are_never_kept(self):
+        import media_library
+        calls, clock = [], [1000.0]
+        ns, hub, ml = self._ns(calls, clock)
+        ns["_scheduler_playback_state"] = lambda ch, *a: (calls.append(ch), {"mode": "Static", "file": "", "seek": 0, "reason": "not_scanned"})[1]
+        orig = media_library.shared_schedule_hub
+        media_library.shared_schedule_hub = lambda: hub
+        try:
+            ns["calculate_slotted_playback_state"]("05")
+            ns["calculate_slotted_playback_state"]("05")
+            self.assertEqual(len(calls), 2)
+        finally:
+            media_library.shared_schedule_hub = orig
+
+
+class TestHubWriterTick(unittest.TestCase):
+    """14.10: the scheduler is the hub's writer on its own beat; readers never have to poke it"""
+
+    def test_writer_worker_shape(self):
+        src = get_function_source("_hub_writer_worker")
+        self.assertIn("_hub_writer_step(_watched)", src)
+        self.assertIn("_python_heavy_should_pause()", src)
+        self.assertIn("_app_shutting_down.wait(_HUB_WRITER_WATCHED_SECONDS)", src)
+        step = get_function_source("_hub_writer_step")
+        self.assertIn("_scheduler_playback_state(channel_key)", step)
+        self.assertIn("_hub_remember_state(", step)
+        self.assertIn('name="HubWriter"', MAIN_SRC)
+
+    def test_writer_step_refreshes_the_hubs_record(self):
+        import types, media_library
+        hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
+        hub._show_facts, hub._current_show = {}, {}
+        calls = []
+        ns = {"broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 500.0, toordinal=lambda: 1)),
+              "_scheduler_playback_state": lambda ch: (calls.append(ch), {"mode": "Video", "file": "/m/a.mkv", "seek": 10.0, "duration": 1500.0})[1],
+              "_hub_playback_guard": lambda ch: ("g",), "_log_warn_throttled": lambda *a, **k: None, "time": __import__("time"), "_hub_writer_checked": {}}
+        for name in ("_hub_remember_state", "_hub_writer_step"):
+            exec(get_function_source(name), ns)
+        orig = media_library.shared_schedule_hub
+        media_library.shared_schedule_hub = lambda: hub
+        try:
+            ns["_hub_writer_step"]("05")
+        finally:
+            media_library.shared_schedule_hub = orig
+        self.assertEqual(calls, ["05"])
+        self.assertAlmostEqual(hub.show_facts("05", 530.0, ("g",))["seek"], 40.0)
+
+
+class TestHubWriterSkipsValidChannels(unittest.TestCase):
+    """The writer's pass over the other channels skips a channel whose kept record is still right"""
+
+    def test_next_stale_skips_valid_and_recently_checked(self):
+        import types, media_library
+        hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
+        hub._show_facts, hub._current_show = {}, {}
+        hub.remember_show_facts("06", {"mode": "Video", "file": "x", "seek": 0.0, "duration": 1500.0}, 100.0, ("g",))
+        import time
+        ns = {"time": time, "db": types.SimpleNamespace(channels_db={c: {"active": True} for c in ("05", "06", "07", "08")}),
+              "broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 200.0)),
+              "_hub_playback_guard": lambda ch: ("g",), "_hub_writer_checked": {"07": time.monotonic()},
+              "_HUB_WRITER_STATIC_RECHECK_SECONDS": 60.0}
+        exec(get_function_source("_hub_writer_next_stale"), ns)
+        orig = media_library.shared_schedule_hub
+        media_library.shared_schedule_hub = lambda: hub
+        try:
+            chans = ["05", "06", "07", "08"]
+            self.assertEqual(ns["_hub_writer_next_stale"](chans, 0), "08", "06 has a valid record and 07 was just checked")
+            hub.remember_show_facts("08", {"mode": "Video", "file": "x", "seek": 0.0, "duration": 1500.0}, 100.0, ("g",))
+            hub.remember_show_facts("05", {"mode": "Video", "file": "x", "seek": 0.0, "duration": 1500.0}, 100.0, ("g",))
+            self.assertIsNone(ns["_hub_writer_next_stale"](chans, 0), "every channel is up to date")
+        finally:
+            media_library.shared_schedule_hub = orig
+
+
+class TestGridFollowsTheHub(unittest.TestCase):
+    """The guide grid reads the hub for Marathon too, and option changes re-plan the hub and refresh the grid"""
+
+    def test_marathon_is_no_longer_left_out_of_the_hub_splices(self):
+        ui_src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+        self.assertNotIn("if _tl_hit is None and not _is_marathon:\n                timeline_entries = _guide_splice_aired(", ui_src)
+        self.assertNotIn("if _tl_hit is None and not _is_holiday_guide and not _is_marathon:", ui_src)
+        self.assertIn('"commercial_placement", "active", "marathon_anchor_epoch")', ui_src)
+
+    def test_option_changes_replan_the_hub(self):
+        self.assertEqual(MAIN_SRC.count("_replan_hub_future_soon(target_ch_str)"), 4)
+        self.assertIn("_replan_hub_future_soon(str(target_ch_str).zfill(2))", MAIN_SRC)
+        src = get_function_source("_replan_hub_future_soon")
+        self.assertLess(src.index("_hub_writer_step(ch_str)"), src.index("_hub_future_for_channel(ch_str, force=True)"))
+        self.assertIn("_guide_dirty_event.set()", src)
+        self.assertIn("_replan_hub_future_soon(ch_str)", get_function_source("_request_schedule_rebuild"))
+
+
+class TestVisualizerTitleFromHub(unittest.TestCase):
+    """The song title comes from the hub and lines up with the channel number"""
+
+    def test_title_y_follows_the_channel_number_and_stays_on_screen(self):
+        ns = {}
+        exec(get_function_source("_title_y_on_screen"), ns)
+        f = ns["_title_y_on_screen"]
+        self.assertEqual(f(40, 30, 20, 1080), 40)
+        self.assertEqual(f(1070, 30, 20, 1080), 1080 - 50 - 2)
+        self.assertEqual(f(-15, 30, 20, 1080), 0)
+
+    def test_title_uses_the_hub_answer(self):
+        ns = {"calculate_slotted_playback_state": lambda ch: {"mode": "Visualizer", "file": "/m/01 Song.mp3"},
+              "_log_warn_throttled": lambda *a, **k: None}
+        exec(get_function_source("_visualizer_title_path"), ns)
+        self.assertEqual(ns["_visualizer_title_path"]("05", "/m/other.mp3"), "/m/01 Song.mp3")
+        ns["calculate_slotted_playback_state"] = lambda ch: {"mode": "Static"}
+        self.assertEqual(ns["_visualizer_title_path"]("05", "/m/other.mp3"), "/m/other.mp3")
+
+    def test_card_reads_the_recorded_channel_number_top(self):
+        self.assertIn('app_state.get("_ch_num_generic_osd_y")', get_function_source("_draw_visualizer_song_card"))
+        self.assertIn("_visualizer_title_path(", MAIN_SRC)
+
+
+class TestHubCurrentShowRecord(unittest.TestCase):
+    """14.8: each station keeps a current-show record in the hub; a channel change is clock math on it"""
+
+    def test_record_is_kept_until_the_clock_leaves_the_show_or_a_write_happens(self):
+        import tempfile, shutil
+        import media_library as ml
+        tmp = tempfile.mkdtemp()
+        try:
+            lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+            hub = ml.ScheduleHub(lib)
+            rows = [{"position": i, "path": os.path.join(tmp, "e%d.mkv" % i), "kind": "episode", "pass_no": 1,
+                     "planned_start": 1000.0 + i * 1800.0, "used_length": 1500.0, "length_source": "measured"} for i in range(3)]
+            hub.put_rows("05", "Morning", rows)
+            first = hub.current_show("05", 1100.0)
+            self.assertEqual(first["position"], 0)
+            self.assertAlmostEqual(first["seek"], 100.0)
+            calls = []
+            real_at = hub.at
+            hub.at = lambda c, e: (calls.append(e), real_at(c, e))[1]
+            again = hub.current_show("05", 1400.0)
+            self.assertEqual(calls, [], "same show: no new lookup, only clock math")
+            self.assertAlmostEqual(again["seek"], 400.0)
+            nxt = hub.current_show("05", 2900.0)
+            self.assertEqual(nxt["position"], 1)
+            self.assertEqual(len(calls), 1, "a new show makes one lookup and keeps the record")
+            hub.put_rows("05", "Morning", rows)
+            hub.current_show("05", 2950.0)
+            self.assertEqual(len(calls), 2, "a hub write drops the kept record")
+            self.assertIsNone(hub.current_show("05", 90000.0))
+        finally:
+            lib.close() if hasattr(lib, "close") else None
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestHubLoopChannelRows(unittest.TestCase):
+    """14.9: Marathon and Visualizer channels get hub future rows built from their own media"""
+
+    def _ns(self):
+        import datetime, types
+        ns = {"media": media, "datetime": datetime, "_HUB_FUTURE_HOURS_AHEAD": 6.0}
+        for name in ("_hub_loop_cycle_timeline", "_hub_loop_plan"):
+            exec(get_function_source(name), ns)
+        return ns
+
+    def test_cycle_timeline_is_the_plain_track_list(self):
+        ns = self._ns()
+        tl, total = ns["_hub_loop_cycle_timeline"]([{"path": "a", "duration": 100}, {"path": "b", "duration": 50}], [], {}, 0, False)
+        self.assertEqual([(e["path"], e["start_time"]) for e in tl], [("a", 0.0), ("b", 100.0)])
+        self.assertEqual(total, 150.0)
+
+    def test_visualizer_plan_follows_the_frozen_lineup_position(self):
+        import datetime
+        ns = self._ns()
+        ns["_visualizer_frozen_lineup"] = lambda ch, info, now: ([{"path": "a", "duration": 600}, {"path": "b", "duration": 600}], 1200, 0.0)
+        now = datetime.datetime(2026, 11, 6, 10, 5, 0)
+        plan = ns["_hub_loop_plan"]("05", {"is_visualizer": True}, now)
+        self.assertTrue(plan)
+        slot, start, timeline = plan[0]
+        self.assertAlmostEqual(now.timestamp() - start, (10 * 3600 + 300) % 1200, delta=1)
+        midnight = datetime.datetime(2026, 11, 7).timestamp()
+        self.assertTrue(all(st < midnight for _s, st, _t in plan))
+
+    def test_marathon_and_visualizer_rows_never_include_what_is_airing(self):
+        src = get_function_source("_hub_future_for_loop_channel")
+        self.assertIn('planned_start"] <= _now_epoch', src)
+        self.assertIn("replace_future_rows", src)
+        plan_src = get_function_source("_hub_loop_plan")
+        self.assertIn("marathon_anchor_epoch", plan_src)
+        self.assertIn('build_ordered_tracks(_raw, "marathon", _marathon_start_seed(ch_info))', plan_src)
 
 
 class TestHubFutureRows(_SectionCase):
@@ -17267,8 +17393,6 @@ def suite_static_effects_wait_for_burst():
     wm = MAIN_SRC.index("_wm_bounds = _watermark_bounds_rect(content_rect)")
     check("and _channel_transition_over()):" in MAIN_SRC[wm - 400:wm], "the watermark waits for the shared transition-over check")
     check("_channel_transition_active = not _channel_transition_over()" in MAIN_SRC, "the bezel channel number stays up through a Static-style burst, not only the black shield")
-    layer = MAIN_SRC.index("_overlay_active = (", MAIN_SRC.index("_now_layer = pygame.time.get_ticks()"))
-    check("or not _channel_transition_over()" in MAIN_SRC[layer:layer + 600], "the game overlay layer counts a running Static-style burst as an overlay")
     check("_now_layer < app_state.get(\"channel_switch_black_until\", 0)" not in MAIN_SRC, "the overlay layer no longer reads the black timer alone")
 
 
@@ -17745,6 +17869,84 @@ class TestGpuCheckServesEveryWindowSize(unittest.TestCase):
             gate_mod.prepare_self_check, gate_mod.run_self_check = real_prepare, real_run
 
 
+class TestStallBannerAndKeepAwake(unittest.TestCase):
+    """Owner 2026-11-05/06 (14.2, 14.3): the 7 s stall Static carries the red banner, and the media drives are kept awake while the app is up"""
+
+    def test_the_stall_static_has_the_banner_and_the_governor_holds_7_s(self):
+        self.assertEqual(gov.STALL_FORCES_STATIC_MS, 7000)
+        i = MAIN_SRC.index("_stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS")
+        self.assertIn('"picture_stalled"', MAIN_SRC[i:i + 900], "the stall Static reports the banner")
+
+    def test_drives_are_woken_again_every_so_often(self):
+        self.assertEqual(gov.DRIVE_KEEP_AWAKE_INTERVAL_SECONDS, 300.0)
+        self.assertGreater(gov.DRIVE_KEEP_AWAKE_READ_TIMEOUT_SECONDS, 0)
+        self.assertIn("_keep_media_drives_awake_loop, daemon=True", MAIN_SRC)
+        loop = get_function_source("_keep_media_drives_awake_loop")
+        self.assertIn("_boot_drive_wake_done.wait()", loop, "the loop starts after the boot wake-up")
+        self.assertIn("_app_shutting_down.wait(_DRIVE_KEEP_AWAKE_INTERVAL_S)", loop, "it stops with the app")
+        once = get_function_source("_keep_media_drives_awake_once")
+        self.assertIn("_unresponsive_drive_roots()", once, "a drive known dead is left alone")
+
+
+class TestNoHoldBetweenMedia(unittest.TestCase):
+    """Owner 2026-11-06 (14.3): a show, a break clip and the return to the show go straight in on the same channel; the mute lifts at the first picture frame, with no extra half second of held picture"""
+
+    def test_the_extra_hold_is_zero(self):
+        self.assertEqual(gov.SAME_CHANNEL_AUDIO_HOLD_MS, 0)
+        self.assertEqual(gov.AUDIO_SYNC_HOLD_MS, 500, "a real channel change keeps its hold, so channel 03's audio never follows the viewer")
+        self.assertIn("SAME_CHANNEL_AUDIO_HOLD_MS = performance_governor.SAME_CHANNEL_AUDIO_HOLD_MS if performance_governor is not None else 0", MAIN_SRC)
+        self.assertIn("(SAME_CHANNEL_AUDIO_HOLD_MS if internal_advance else AUDIO_SYNC_HOLD_MS)", MAIN_SRC)
+        mid = MAIN_SRC.index('"ARM (mid-stream content change)"')
+        self.assertIn("SAME_CHANNEL_AUDIO_HOLD_MS", MAIN_SRC[mid - 400:mid], "break clips and the return to the show use the same-channel hold")
+        self.assertIn("_lift_buffering_mute(ch, \"first-frame\")", MAIN_SRC, "the mute still lifts at the first frame")
+
+
+class TestUnmeasuredEpisodeEstimates(unittest.TestCase):
+    """Owner 2026-11-06 (14.5): an unscanned episode gets the average of the scanned episodes of the same season of the same series once 2 are scanned, and it is updated as more are scanned; a Movies file is 1.5 hours until measured"""
+
+    class _Hub:
+        def __init__(self):
+            self.measured, self.est = {}, {}
+
+        def read(self, p):
+            if p in self.measured:
+                return self.measured[p], media.DURATION_MEASURED
+            if p in self.est:
+                return self.est[p], media.DURATION_ESTIMATED
+            return None, None
+
+        def store_estimate(self, p, sec, basis, replace=False):
+            if p in self.est and not (replace and self.est[p] != sec):
+                return self.est[p]
+            self.est[p] = sec
+            return sec
+
+        def generation(self):
+            return 0
+
+    def _ep(self, season, ep):
+        return "/m/Show A/Season %d/Show A S%02dE%02d.mkv" % (season, season, ep)
+
+    def test_the_average_is_per_season_and_follows_later_scans(self):
+        old_hub = media._duration_hub
+        hub = self._Hub()
+        media._duration_hub = hub
+        try:
+            hub.measured[self._ep(1, 1)] = 1500
+            hub.measured[self._ep(1, 2)] = 1560
+            items = [self._ep(1, 1), self._ep(1, 2), self._ep(1, 3), self._ep(2, 1), "/m/Movies/Big.mkv"]
+            guesses = media._series_duration_guesses(items, lambda p: True)
+            self.assertEqual(guesses[self._ep(1, 3)], 1530, "the average of the two scanned episodes of season 1")
+            self.assertNotIn(self._ep(2, 1), guesses, "season 2 has no scanned episode, so no guess")
+            self.assertEqual(guesses["/m/Movies/Big.mkv"], 5400, "a movie is 1.5 hours until it is measured")
+            hub.measured[self._ep(1, 4)] = 1590
+            items.append(self._ep(1, 4))
+            guesses = media._series_duration_guesses(items, lambda p: True)
+            self.assertEqual(guesses[self._ep(1, 3)], 1550, "the saved estimate follows the new average")
+        finally:
+            media._duration_hub = old_hub
+
+
 class TestResetIsAFreshStart(unittest.TestCase):
     """Reset All Settings restarts the app and the new start wipes every setting and saved fact, never the user's own files or the shipped ones (owner 2026-11-03 08:06 to 08:34)"""
 
@@ -17799,6 +18001,28 @@ class TestResetIsAFreshStart(unittest.TestCase):
             self.assertFalse(os.path.exists(marker), "the wipe runs once")
             self.assertIsNone(ns["_wipe_saved_data_for_fresh_start"](root, logs, main), "no marker, no wipe")
 
+    def test_no_config_file_is_a_fresh_first_boot_with_the_same_wipe(self):
+        """Owner 2026-11-05 (14.1): no retro_config.json beside the exe builds a new default one and clears the old scans, guide, hub, captions and analysis, like Clear All Settings; cores and BIOS stay; no backup is restored."""
+        ns = self._ns()
+        with tempfile.TemporaryDirectory() as root:
+            logs, main = os.path.join(root, "logs"), os.path.join(root, "main")
+            wiped = [os.path.join(logs, "playback_runtime.json"), os.path.join(main, "media_library", "library.sqlite3"),
+                     os.path.join(main, "loudness", "a.wav"), os.path.join(main, "captions", "x.srt"),
+                     os.path.join(main, "visualizer_analysis", "v.npz")]
+            kept = [os.path.join(main, "cores", "NES", "fceumm_libretro.dll"), os.path.join(main, "roms", "SNES", "mario.sfc"),
+                    os.path.join(logs, "retro_config.json.corrupt-1.bak")]
+            for path in wiped + kept:
+                self._make(path)
+            self.assertIsNone(ns["_wipe_saved_data_for_fresh_start"](root, logs, main), "a config that exists and no marker: no wipe")
+            removed, failed = ns["_wipe_saved_data_for_fresh_start"](root, logs, main, config_missing=True)
+            self.assertEqual(failed, [])
+            for path in wiped:
+                self.assertFalse(os.path.exists(path), path)
+            for path in kept:
+                self.assertTrue(os.path.exists(path), path)
+        main_src = MAIN_SRC
+        self.assertIn('config_missing=not os.path.exists(os.path.join(_app_root_dir(), "retro_config.json"))', main_src)
+
     def test_a_failed_delete_is_one_line_and_the_wipe_goes_on(self):
         ns = self._ns()
         with tempfile.TemporaryDirectory() as root:
@@ -17824,7 +18048,7 @@ class TestResetIsAFreshStart(unittest.TestCase):
 
     def test_the_wipe_runs_before_anything_opens_the_saved_data(self):
         guard = MAIN_SRC.index('if not _acquire_single_instance():')
-        wipe = MAIN_SRC.index("_fresh_start_result = _wipe_saved_data_for_fresh_start(_app_root_dir(), _app_logs_dir(), resolve_main_dir())")
+        wipe = MAIN_SRC.index("_fresh_start_result = _wipe_saved_data_for_fresh_start(")
         self.assertLess(guard, wipe, "it runs after the old copy has closed (the single-instance guard waited for it)")
         for reader in ("_BOOT_FULLSCREEN = _read_boot_fullscreen_pref()", "db = RetroDatabase(", "img_path = _boot_loading_image_path(", "game_deck = ExternalGameDeck()"):
             self.assertIn(reader, MAIN_SRC)
@@ -18003,6 +18227,754 @@ class TestSlotsHoldTheWholeFile(unittest.TestCase):
         self.assertEqual(patch.count("media.whole_seconds_up(duration)"), 4)
 
 
+class TestV365FixesFromTheTesterLogs(unittest.TestCase):
+    """Owner 2026-11-05 logs from the second PC: Add BIOS crashed on a missing module; the picture stalled for hundreds of ms; the volume-slider learning is removed and only the owner's gain changes teach a series"""
+
+    def test_copying_a_core_or_bios_needs_no_filecmp_and_every_script_is_free_of_it(self):
+        import game_deck as gd
+        for _folder in (ROOT, os.path.join(ROOT, "assets")):
+            for _name in sorted(os.listdir(_folder)):
+                if _name.endswith(".py") and _name != "test_suite.py":
+                    self.assertNotIn("import filecmp", read(os.path.join(_folder, _name)), _name)
+        _saved = sys.modules.get("filecmp", "absent")
+        sys.modules["filecmp"] = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "in", "scph5501.bin")
+                os.makedirs(os.path.dirname(src))
+                with open(src, "wb") as fh:
+                    fh.write(b"A" * 3000000)
+                dest_dir = os.path.join(tmp, "main", "cores", "PSX", "system")
+                kept, made = gd.copy_tool_into(src, dest_dir)
+                self.assertTrue(made)
+                self.assertEqual(gd.copy_tool_into(src, dest_dir), (kept, False), "the identical file is recognised without filecmp")
+                with open(src, "wb") as fh:
+                    fh.write(b"A" * 2999999 + b"B")
+                self.assertEqual(gd.copy_tool_into(src, dest_dir), (kept, True), "a file that differs in its last byte is copied")
+                self.assertFalse(gd._files_have_same_bytes(src, os.path.join(tmp, "missing.bin")))
+        finally:
+            if _saved == "absent":
+                sys.modules.pop("filecmp", None)
+            else:
+                sys.modules["filecmp"] = _saved
+
+    def test_the_content_key_asks_the_disk_once_per_cache_window(self):
+        clock = [100.0]
+        stats = []
+        fake_os = types.SimpleNamespace(stat=lambda p: (stats.append(p), types.SimpleNamespace(st_size=5, st_mtime=7))[1],
+                                        path=types.SimpleNamespace(abspath=lambda p: p))
+        ns = {"os": fake_os, "time": types.SimpleNamespace(monotonic=lambda: clock[0]), "_log_swallowed": lambda *a: None, "OSError": OSError,
+              "PAN_SCAN_KEY_CACHE_SECONDS": gov.PAN_SCAN_KEY_CACHE_SECONDS, "_pan_scan_key_cache": {"path": None, "key": None, "at": 0.0}}
+        exec(compile(get_function_source("_pan_scan_content_key"), "k", "exec"), ns)
+        for _i in range(300):
+            self.assertEqual(ns["_pan_scan_content_key"]("a.mp4"), "a.mp4|5|7")
+        self.assertEqual(len(stats), 1, "300 pictures of the same file made one disk call")
+        clock[0] += gov.PAN_SCAN_KEY_CACHE_SECONDS + 0.1
+        ns["_pan_scan_content_key"]("a.mp4")
+        self.assertEqual(len(stats), 2, "after the window the disk is asked again")
+        ns["_pan_scan_content_key"]("b.mp4")
+        self.assertEqual(len(stats), 3, "another file is asked at once")
+        self.assertIsNone(ns["_pan_scan_content_key"](""))
+
+    def test_a_letterboxed_picture_is_copied_in_one_call_and_comes_out_the_same(self):
+        import ctypes as _ct
+        import numpy as _np
+        import textwrap
+        tree = ast.parse(MAIN_SRC)
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_composite_letterboxed_frame")
+        code = textwrap.dedent(ast.get_source_segment(MAIN_SRC, node))
+        for _label, canvas_w, canvas_h, fit_w, fit_h, off_x, off_y, expect_calls in (("letterbox", 64, 48, 64, 36, 0, 6, 1), ("pillarbox", 64, 48, 48, 48, 8, 0, 0)):
+            calls = []
+            counting = types.SimpleNamespace(cast=_ct.cast, c_void_p=_ct.c_void_p, memmove=lambda d, s, n: (calls.append(n), _ct.memmove(d, s, n))[1])
+            ns = {"ctypes": counting, "np": _np, "_log_warn_throttled": lambda *a: self.fail("the copy must not fail: %r" % (a,))}
+            exec(compile(code, "c", "exec"), ns)
+            rng = _np.random.RandomState(3)
+            decode = (_ct.c_ubyte * (fit_w * fit_h * 4))()
+            decode_bytes = rng.randint(0, 256, fit_w * fit_h * 4).astype(_np.uint8).tobytes()
+            _ct.memmove(decode, decode_bytes, len(decode_bytes))
+            raw = (_ct.c_ubyte * (canvas_w * canvas_h * 4))()
+            fake = types.SimpleNamespace(_decode_w=fit_w, _decode_h=fit_h, _letterbox_offset_x=off_x, _letterbox_offset_y=off_y, width=canvas_w, height=canvas_h,
+                                         _decode_buffer=decode, raw_buffer=raw)
+            ns["_composite_letterboxed_frame"](fake)
+            expected = _np.zeros((canvas_h, canvas_w * 4), dtype=_np.uint8)
+            src = _np.frombuffer(decode_bytes, dtype=_np.uint8).reshape(fit_h, fit_w * 4)
+            for row in range(fit_h):
+                expected[off_y + row, off_x * 4:off_x * 4 + fit_w * 4] = src[row]
+            self.assertTrue(_np.array_equal(_np.frombuffer(raw, dtype=_np.uint8).reshape(canvas_h, canvas_w * 4), expected), _label + ": same picture as the row-by-row copy")
+            self.assertEqual(len(calls), expect_calls, _label + ": calls that let other threads run")
+
+    def test_volume_slider_learning_is_gone_and_only_gain_changes_teach_a_series(self):
+        for _text, _label in ((MAIN_SRC, "main"), (read(os.path.join(ROOT, "assets", "media_library.py")), "library"), (read(os.path.join(ROOT, "assets", "performance_governor.py")), "governor")):
+            for _name in ("_learn_from_slider_watch", "_slider_watch_loop", "_slider_watch_sample", "_settled_volume", "_slider_comfort_volume", "_slider_volume_db",
+                          "_series_offset_from_slider", "LOUDNESS_SLIDER", "VolumeWatch", "read_series_slider", "read_comfort_volumes", "series_slider_rows", "comfort_watch_volumes"):
+                self.assertNotIn(_name, _text, "%s must not hold %s" % (_label, _name))
+        _src = get_function_source("_series_offset_for_key")
+        self.assertNotIn("slider", _src)
+        for _hub_changes, _want in (([(5.0, 1.0)], 5), ([(1.0, 1.0), (1.5, 2.0), (1.2, 3.0)], 1), ([(1.0, 1.0), (-1.5, 2.0), (1.2, 3.0)], 0), ([], 0)):
+            hub = types.SimpleNamespace(read_series_changes=lambda key, _c=_hub_changes: _c)
+            ns = {"_get_gain_hub": lambda hub=hub: hub, "LOUDNESS_LEARN_MIN_FILES": gov.LOUDNESS_LEARN_MIN_FILES, "LOUDNESS_LEARN_AGREE_DB": gov.LOUDNESS_LEARN_AGREE_DB,
+                  "LOUDNESS_LEARN_SINGLE_CHANGE_DB": gov.LOUDNESS_LEARN_SINGLE_CHANGE_DB, "LOUDNESS_LEARN_MAX_OFFSET_DB": gov.LOUDNESS_LEARN_MAX_OFFSET_DB}
+            for _name in ("_middle_value", "_series_offset_from_changes", "_series_offset_for_key"):
+                exec(compile(get_function_source(_name), _name, "exec"), ns)
+            self.assertEqual(ns["_series_offset_for_key"]("show"), _want, _hub_changes)
+        ns["_get_gain_hub"] = lambda: None
+        self.assertEqual(ns["_series_offset_for_key"]("show"), 0)
+
+    def test_the_scan_snapshot_thread_rests_after_each_rebuild_so_it_cannot_hog_the_python_lock(self):
+        """Owner 2026-11-05 logs: the rebuild of every channel's tracks ran 300 times a minute on the second PC and the picture stalled"""
+        self.assertLess(gov.SCAN_SNAPSHOT_MAX_REST_S, gov.SCAN_SNAPSHOT_STALE_S, "a rest never makes the snapshot stale")
+        clock = [0.0]
+        waits = []
+        idle = []
+
+        class Shutdown:
+            def __init__(self):
+                self.rounds = 0
+            def is_set(self):
+                return self.rounds >= 2
+            def wait(self, seconds):
+                waits.append(round(seconds, 3))
+                clock[0] += seconds
+                self.rounds += 1
+                return False
+        took = [1.5, 0.05]
+
+        def build():
+            clock[0] += took[min(len(waits), 1)]
+            return {"built_at": clock[0], "channels": {}}
+        ns = {"db": object(), "time": types.SimpleNamespace(monotonic=lambda: clock[0]), "_app_shutting_down": Shutdown(), "_scan_files_added_generation": [0], "_scan_work_generation": [0],
+              "_background_activity": lambda name: __import__("contextlib").nullcontext(), "_build_scan_snapshot": build, "_scan_snapshot_lock": __import__("threading").Lock(),
+              "_publish_channel_scan_progress": lambda fresh: None, "log": types.SimpleNamespace(warning=lambda *a: None),
+              "_scan_idle_wait": lambda seconds, generation: (idle.append(round(seconds, 3)), False)[1], "SCAN_SNAPSHOT_INTERVAL_S": gov.SCAN_SNAPSHOT_INTERVAL_S,
+              "SCAN_SNAPSHOT_DUTY_FACTOR": gov.SCAN_SNAPSHOT_DUTY_FACTOR, "SCAN_SNAPSHOT_MAX_REST_S": gov.SCAN_SNAPSHOT_MAX_REST_S, "_scan_snapshot": None}
+        exec(compile(get_function_source("_scan_snapshot_worker"), "w", "exec"), ns)
+        ns["_scan_snapshot_worker"]()
+        self.assertEqual(waits[0], round(min(gov.SCAN_SNAPSHOT_MAX_REST_S, 1.5 * gov.SCAN_SNAPSHOT_DUTY_FACTOR), 3), "a slow rebuild is followed by a long rest, whatever wakes the thread")
+        self.assertEqual(idle[0], round(max(0.0, gov.SCAN_SNAPSHOT_INTERVAL_S - waits[0]), 3))
+        self.assertEqual(waits[1], round(0.05 * gov.SCAN_SNAPSHOT_DUTY_FACTOR, 3), "a quick rebuild keeps the normal rhythm")
+
+    def test_each_locked_screen_incident_gets_its_own_repairs(self):
+        """Owner 2026-11-05 logs: 8 incidents of 100+ locked-screen errors each, because the repairs were used up for the whole run"""
+        clock = [0.0]
+        finds = []
+        errors = []
+        ns = {"time": types.SimpleNamespace(monotonic=lambda: clock[0]), "_SURFACE_LOCK_INCIDENT_GAP_SECONDS": gov.SURFACE_LOCK_INCIDENT_GAP_SECONDS,
+              "_SURFACE_LOCK_SWAPS_MAX": gov.SURFACE_LOCK_SWAPS_MAX, "_surface_lock_events": {}, "_surface_lock_last_at": {}, "_surface_lock_searched": set(),
+              "_surface_lock_find": lambda surface: (finds.append(1), "a holder")[1], "_surface_lock_threads": lambda: "threads", "_main_frame_clock": {"n": 7},
+              "log": types.SimpleNamespace(error=lambda *a: errors.append(a))}
+        exec(compile(get_function_source("_surface_lock_event"), "e", "exec"), ns)
+        event = lambda: ns["_surface_lock_event"](object(), "virtual screen")
+        first_incident = [event() for _ in range(gov.SURFACE_LOCK_SWAPS_MAX + 3)]
+        self.assertEqual(first_incident, [True] * gov.SURFACE_LOCK_SWAPS_MAX + [False] * 3, "within one incident the repairs run out as before")
+        self.assertEqual(len(finds), 1)
+        clock[0] += gov.SURFACE_LOCK_INCIDENT_GAP_SECONDS + 1
+        second_incident = [event() for _ in range(gov.SURFACE_LOCK_SWAPS_MAX)]
+        self.assertTrue(all(second_incident), "after a quiet gap a new incident can be repaired again")
+        self.assertEqual(len(finds), 1, "the slow search for the holder is not repeated for every incident")
+        self.assertIn("a new incident", errors[gov.SURFACE_LOCK_SWAPS_MAX + 3][0])
+
+    def test_the_health_monitor_copies_a_deque_another_thread_is_changing(self):
+        """Owner 2026-11-05 logs: the monitor pass failed twice with deque mutated during iteration"""
+        import collections
+        text = read(os.path.join(ROOT, "assets", "health_monitor.py"))
+        node = next(n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef) and n.name == "_snapshot")
+        ns = {}
+        exec(compile(ast.get_source_segment(text, node), "s", "exec"), ns)
+
+        class Flaky(collections.deque):
+            tries = 0
+            def __iter__(self):
+                Flaky.tries += 1
+                if Flaky.tries <= 2:
+                    raise RuntimeError("deque mutated during iteration")
+                return super().__iter__()
+        self.assertEqual(ns["_snapshot"](Flaky([1, 2, 3])), [1, 2, 3], "tried again until it settled")
+
+        class Never(collections.deque):
+            def __iter__(self):
+                raise RuntimeError("deque mutated during iteration")
+        self.assertEqual(ns["_snapshot"](Never([1])), [], "a deque that never settles gives an empty list, not an error")
+        self.assertIn("_snapshot(self.ring)", text)
+        self.assertIn("_snapshot(_gc_events)", text)
+
+class TestV369ScanThrottle(unittest.TestCase):
+    """Owner 2026-11-05: the throttle works from the PC's hardware and its measured strain, takes each free place for the most urgent file, and never leaves a gap longer than about a second"""
+
+    def _admission_order(self, capacity):
+        order, started = [], threading.Event()
+        gate = threading.Event()
+
+        def holder():
+            with gov.scan_thread_slot("picture_box", rank=(2, 0)):
+                started.set()
+                gate.wait(5)
+
+        def waiter(label, kind, rank):
+            with gov.scan_thread_slot(kind, rank=rank) as ok:
+                order.append((label, ok))
+        with mock.patch.object(gov, "scan_threads", lambda profile=None, mode=None: capacity):
+            t0 = threading.Thread(target=holder)
+            t0.start()
+            started.wait(5)
+            waiters = []
+            for label, kind, rank in (("late-deep", "loudness", (3, 0)), ("early-next", "picture_box", (2, 1))):
+                w = threading.Thread(target=waiter, args=(label, kind, rank))
+                w.start()
+                waiters.append(w)
+                time.sleep(0.15)
+            time.sleep(0.4)
+            before_release = list(order)
+            gate.set()
+            for w in waiters + [t0]:
+                w.join(5)
+        return before_release, order
+
+    def test_a_full_pc_gives_each_free_place_to_the_most_urgent_file_and_never_times_out(self):
+        before, order = self._admission_order(1)
+        self.assertEqual(before, [], "with the only place taken nothing else starts, however long it waits")
+        self.assertEqual([label for label, ok in order], ["early-next", "late-deep"], "the next-3 file goes before the one behind it although it asked later")
+        self.assertTrue(all(ok for label, ok in order))
+        before, order = self._admission_order(3)
+        self.assertEqual(sorted(label for label, ok in before), ["early-next", "late-deep"], "with places to spare both start at once")
+
+    def test_light_scans_priority_files_and_a_closing_app_are_never_held(self):
+        gate, started = threading.Event(), threading.Event()
+        ran = []
+
+        def holder():
+            with gov.scan_thread_slot("picture_box", rank=(2, 0)):
+                started.set()
+                gate.wait(5)
+        with mock.patch.object(gov, "scan_threads", lambda profile=None, mode=None: 1):
+            t0 = threading.Thread(target=holder)
+            t0.start()
+            started.wait(5)
+
+            def run(label, **kw):
+                with gov.scan_thread_slot(**kw) as ok:
+                    ran.append((label, ok))
+            jobs = [threading.Thread(target=run, args=("duration", ), kwargs={"kind": "duration", "rank": (3, 0)}),
+                    threading.Thread(target=run, args=("now", ), kwargs={"kind": "loudness", "priority": True, "rank": (0, 0)})]
+            for j in jobs:
+                j.start()
+            for j in jobs:
+                j.join(2)
+            self.assertEqual(sorted(ran), [("duration", True), ("now", True)], "a length scan and a file airing now start at once while the place is taken")
+            stop = threading.Event()
+            got = []
+
+            def stopped():
+                with gov.scan_thread_slot("music", stop=stop, rank=(3, 0)) as ok:
+                    got.append(ok)
+            t1 = threading.Thread(target=stopped)
+            t1.start()
+            time.sleep(0.4)
+            stop.set()
+            t1.join(3)
+            self.assertEqual(got, [False], "a scan that is waiting gives up when the app closes")
+            gate.set()
+            t0.join(5)
+
+    def test_the_gap_after_a_file_follows_the_strain_and_is_never_long(self):
+        with mock.patch.object(gov, "enforcing", lambda: True), mock.patch.object(gov, "pc_is_quiet", lambda now=None: False):
+            for level, deep in ((0, 0.0), (1, 0.25), (2, 0.5), (3, 1.0), (4, 1.0)):
+                with mock.patch.object(gov, "current_level", lambda l=level: l):
+                    self.assertEqual(gov.scan_gap_seconds("now"), 0.0, "a file airing now never rests")
+                    self.assertAlmostEqual(gov.scan_gap_seconds("deep"), deep)
+                    self.assertAlmostEqual(gov.scan_gap_seconds("next"), deep * gov.SCAN_GAP_NEXT_SHARE)
+                    for cls in ("now", "next", "deep"):
+                        self.assertLessEqual(gov.scan_gap_seconds(cls), 1.0, "no gap is ever longer than a second")
+            with mock.patch.object(gov, "current_level", lambda: 3), mock.patch.object(gov, "pc_is_quiet", lambda now=None: True):
+                self.assertEqual(gov.scan_gap_seconds("deep"), 0.0, "a quiet PC has no gap")
+        src = get_function_source("_scan_class_pace_seconds")
+        self.assertIn("performance_governor.scan_gap_seconds(", src)
+        self.assertNotIn("MULTIPLIER", src)
+
+    def test_the_places_follow_the_hardware_and_shrink_as_the_screen_thread_strains(self):
+        tester = gov.build_profile(4, 0, 4, 15.9, 12.7, cpu_name="Intel(R) Core(TM) i5-4570 CPU @ 3.20GHz")
+        big = gov.build_profile(8, 0, 16, 32.0, 24.0, cpu_name="Intel(R) Core(TM) i7-12700K")
+        places = {}
+        for label, profile in (("tester", tester), ("big", big)):
+            row = []
+            for level in (0, 1, 2, 3):
+                with mock.patch.object(gov, "current_level", lambda l=level: l), mock.patch.object(gov, "enforcing", lambda: True):
+                    row.append(gov.scan_threads(profile))
+            places[label] = row
+        self.assertEqual(places["tester"], [3, 2, 1, 1])
+        self.assertEqual(places["big"], [4, 3, 2, 1])
+        self.assertTrue(all(a >= b for row in places.values() for a, b in zip(row, row[1:])), "more strain never gives more places")
+
+class TestV370SmartThrottle(unittest.TestCase):
+    """Owner 2026-11-05: a scan that waits on another thread gives its place to the next file; scans are throttled before they are stopped; a stop lasts as long as the game took to catch up; no 60 s wait; boot waits for the channel's length and picture shape and only starts its loudness"""
+
+    def test_a_scan_that_waits_on_another_thread_hands_its_place_to_the_next_file(self):
+        entered, release, waiter_in, waiter_out = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+        with mock.patch.object(gov, "scan_threads", lambda profile=None, mode=None: 1):
+            def blocked():
+                with gov.scan_thread_slot("picture_box", rank=(2, 0)):
+                    entered.set()
+                    with gov.scan_slot_idle():
+                        release.wait(5)
+
+            def next_file():
+                with gov.scan_thread_slot("loudness", rank=(3, 0)):
+                    waiter_in.set()
+                    waiter_out.wait(5)
+            t1 = threading.Thread(target=blocked)
+            t1.start()
+            entered.wait(5)
+            t2 = threading.Thread(target=next_file)
+            t2.start()
+            self.assertTrue(waiter_in.wait(2), "the next file starts while the first one is blocked on another thread")
+            release.set()
+            time.sleep(0.2)
+            waiter_out.set()
+            t1.join(5)
+            t2.join(5)
+        self.assertEqual(gov._slot_active[0], 0, "every place is counted back")
+        before = gov._slot_active[0]
+        with gov.scan_slot_idle():
+            pass
+        self.assertEqual(gov._slot_active[0], before, "a thread that holds no place is not changed by waiting")
+
+    def test_the_gate_has_no_time_cap_and_no_load_level_refusal(self):
+        src = get_function_source("gate") if False else inspect.getsource(gov.gate)
+        for gone in ("GATE_MAX_WAIT_SECONDS", "_starved_slots", "level_allows"):
+            self.assertNotIn(gone, src)
+        for gone in ("GATE_MAX_WAIT_SECONDS", "GATE_STARVED_MAX_CONCURRENT", "_starved_slots"):
+            self.assertFalse(hasattr(gov, gone), "%s was removed (V371)" % gone)
+        running = [0]
+        with mock.patch.object(gov, "enforcing", lambda: True), mock.patch.object(gov, "current_level", lambda: 3), \
+                mock.patch.object(gov, "tune_in_progress", lambda: False), mock.patch.object(gov, "scan_throttle_mode", lambda now=None: "free"), \
+                mock.patch.object(gov, "ffmpeg_scans_running", lambda: running[0]), mock.patch.object(gov, "ffmpeg_scans_at_once", lambda level=None: 1):
+            def through_the_gate():
+                started = time.monotonic()
+                with gov.gate("probe_and_duration", label="t") as admitted:
+                    pass
+                return admitted, time.monotonic() - started
+
+            def on_a_worker():
+                box = []
+                worker = threading.Thread(target=lambda: box.append(through_the_gate()))
+                worker.start()
+                worker.join(10)
+                return box[0]
+            admitted, took = on_a_worker()
+            self.assertTrue(admitted)
+            self.assertLess(took, 0.5, "load level 3 does not hold a scan back")
+            running[0] = 1
+            threading.Timer(0.6, lambda: running.__setitem__(0, 0)).start()
+            admitted, took = on_a_worker()
+            self.assertTrue(admitted)
+            self.assertGreaterEqual(took, 0.5, "with every ffmpeg place taken it waits")
+            self.assertLess(took, 3.0, "and goes the moment one is free")
+
+    def test_a_game_that_falls_behind_slows_the_scans_first_and_a_stop_lasts_as_long_as_the_catch_up_took(self):
+        behind = [False]
+        with mock.patch.object(gov, "game_needs_all", lambda now=None: behind[0]):
+            gov._scan_throttle.update({"mode": "free", "slow_since": 0.0, "stop_started": None, "stop_until": 0.0, "catchup": None})
+            self.assertEqual(gov.scan_throttle_mode(0.0), "free")
+            behind[0] = True
+            self.assertEqual(gov.scan_throttle_mode(1.0), "slow", "falling behind first makes the scans creep")
+            self.assertEqual(gov.scan_throttle_mode(1.0 + gov.GAME_THROTTLE_STOP_AFTER_SECONDS - 0.1), "slow")
+            stop_at = 1.0 + gov.GAME_THROTTLE_STOP_AFTER_SECONDS
+            self.assertEqual(gov.scan_throttle_mode(stop_at), "stopped", "still behind after creeping: stop")
+            self.assertEqual(gov.scan_throttle_mode(stop_at + gov.GAME_THROTTLE_STOP_MIN_SECONDS - 0.1), "stopped")
+            self.assertEqual(gov.scan_throttle_mode(stop_at + gov.GAME_THROTTLE_STOP_MIN_SECONDS + 0.1), "slow", "the first stop is short and ends by itself")
+            caught_up_at = stop_at + 20.0
+            behind[0] = False
+            self.assertEqual(gov.scan_throttle_mode(caught_up_at), "free")
+            self.assertAlmostEqual(gov._scan_throttle["catchup"], 20.0, places=3)
+            behind[0] = True
+            gov.scan_throttle_mode(100.0)
+            self.assertEqual(gov.scan_throttle_mode(100.0 + gov.GAME_THROTTLE_STOP_AFTER_SECONDS), "stopped")
+            self.assertEqual(gov.scan_throttle_mode(110.0 + 19.0), "stopped")
+            self.assertEqual(gov.scan_throttle_mode(110.0 + 20.5), "slow", "the next stop lasts as long as the catch up took the last time")
+            gov._scan_throttle.update({"mode": "free", "slow_since": 0.0, "stop_started": None, "stop_until": 0.0, "catchup": None})
+        with mock.patch.object(gov, "enforcing", lambda: True), mock.patch.object(gov, "current_level", lambda: 0), \
+                mock.patch.object(gov, "pc_is_quiet", lambda now=None: False), mock.patch.object(gov, "scan_throttle_mode", lambda now=None: "slow"):
+            self.assertGreaterEqual(gov.scan_gap_seconds("deep"), gov.GAME_THROTTLE_SLOW_GAP_SECONDS)
+            self.assertEqual(gov.scan_gap_seconds("now"), 0.0)
+
+    def test_scans_are_stopped_only_by_a_failed_throttle_and_the_load_level_only_holds_python_work(self):
+        pause = get_function_source("_background_scan_should_pause")
+        self.assertIn("scan_throttle_mode()", pause)
+        self.assertNotIn("level_allows", pause)
+        self.assertNotIn("game_needs_all", pause)
+        self.assertIn("level_allows", get_function_source("_python_heavy_should_pause"))
+
+    def test_boot_waits_for_the_channels_picture_box_and_only_starts_its_loudness(self):
+        src = get_function_source("_prewarm_boot_channel_ready")
+        self.assertIn("_picture_box_before_loudness(norm_p)", src)
+        self.assertIn('name="boot-loudness"', src)
+        outer = src[:src.index("def _boot_channel_loudness")] + src[src.index('threading.Thread(target=_boot_channel_loudness'):]
+        self.assertNotIn("_probe_and_apply_loudness_blocking(", outer, "the boot step never waits for the loudness scan")
+
+class TestV360NoExternalEmulatorCode(unittest.TestCase):
+    """Owner 2026-11-05: Defender's flag began once the game frontend was finished; games run as libretro core .dll files inside this program, so no script starts another program or reaches into another program's window, keys or process"""
+
+    _GONE = ("SendInput", "SetParent", "NtSuspendProcess", "NtResumeProcess", "OpenProcess", "EnumWindows", "DestroyWindow", "SetWindowLongW",
+             "AllowSetForegroundWindow", "STARTUPINFO", "pycaw", "_launch_emulator", "_monitor_emulator", "_controller_exit_watcher",
+             "_patch_mgba_config", "_resolve_emulator_exe", "_find_emulator_hwnd", "_wasapi_set_process_audio", "deck_process",
+             "freeze_inputs", "sync_child_window", "set_viewport_state", "set_audio_state", "set_audio_volume", "bridge_note_key",
+             "bridge_key_is_injected", "is_embedded", "pygame_hwnd_ref", "parent_hwnd", "GAME_CONTROLLER_EXIT_HOLD_MS", "BRIDGE_KEY_GRACE_MS")
+
+    def test_no_script_runs_another_program_or_takes_over_its_window_keys_or_process(self):
+        _own_window_calls = ("SetWindowLongW", "AllowSetForegroundWindow")
+        for _name in ("game_deck.py", "retro_tv_emulator.py", "ui.py"):
+            _text = read(os.path.join(ROOT, _name))
+            for _token in self._GONE:
+                if _name != "game_deck.py" and _token in _own_window_calls:
+                    continue
+                self.assertNotIn(_token, _text, "%s must not contain %s" % (_name, _token))
+        self.assertNotIn("Popen([exe", read(os.path.join(ROOT, "game_deck.py")))
+
+    def test_the_calls_the_main_loop_makes_into_the_deck_are_there_and_the_exe_only_ones_are_gone(self):
+        import game_deck as gd
+        deck = gd.ExternalGameDeck
+        for _name in ("is_process_running", "pre_boot_background_deck", "set_libretro_volume", "set_paused", "shutdown_deck"):
+            self.assertTrue(callable(getattr(deck, _name, None)), _name)
+        for _name in ("set_audio_state", "set_audio_volume", "set_viewport_state", "sync_child_window", "freeze_inputs"):
+            self.assertFalse(hasattr(deck, _name), _name + " belonged to the separate emulator window and is gone")
+        _bare = types.SimpleNamespace(_libretro_core=None)
+        self.assertFalse(deck.is_process_running(_bare), "no core loaded: nothing is running")
+        _loaded = types.SimpleNamespace(_libretro_core=types.SimpleNamespace(is_loaded=True))
+        self.assertTrue(deck.is_process_running(_loaded), "a loaded libretro core is the running game")
+        self.assertTrue(deck.pre_boot_background_deck(_bare))
+        self.assertTrue(_bare.ready_flag)
+
+    def test_launching_a_rom_with_no_core_shows_the_red_banner_and_starts_nothing(self):
+        """Owner 2026-11-05: a rom that is there but has no core yet says so in the red banner, like the other launch warnings"""
+        import game_deck as gd
+        with tempfile.TemporaryDirectory() as tmp:
+            rom = os.path.join(tmp, "Game.bin")
+            with open(rom, "wb") as fh:
+                fh.write(b"x")
+            started = []
+            deck = types.SimpleNamespace(
+                roms=[("Game", rom)], rom_index=0, active_console="PSX", current_browse_dir="", base_dir=tmp, active_bios={"PSX": rom},
+                _has_libretro_core=lambda console: None,
+                _launch_libretro=lambda console, path: started.append((console, path)),
+                _romlist_error_msg="", _romlist_error_until=0)
+            before = pygame.time.get_ticks()
+            gd.ExternalGameDeck._launch_selected_rom(deck)
+            self.assertEqual(started, [], "nothing is started without a core")
+            self.assertEqual(deck._romlist_error_msg, "No core set up for PSX yet \u2014 use Scan For Cores")
+            self.assertGreaterEqual(deck._romlist_error_until - before, 3500, "the banner stays for a few seconds")
+            deck._has_libretro_core = lambda console: os.path.join(tmp, "x_libretro.dll")
+            deck._romlist_error_msg = ""
+            gd.ExternalGameDeck._launch_selected_rom(deck)
+            self.assertEqual(started, [("PSX", rom)], "with a core the game starts and no banner is set")
+            self.assertEqual(deck._romlist_error_msg, "")
+        _draw = inspect.getsource(gd.ExternalGameDeck._draw_romlist_error_banner)
+        self.assertIn("_gov.COLOR_GAME_WARNING_TEXT", _draw, "the banner is drawn in the warning red")
+
+    def test_a_rom_on_a_console_with_no_bios_set_up_shows_the_red_banner(self):
+        """Owner 2026-11-05: make a banner for the BIOS too; a PSX game can start with the core's built-in BIOS, so the banner warns and starts it unless the governor switch says to block"""
+        import game_deck as gd
+        with tempfile.TemporaryDirectory() as tmp:
+            rom = os.path.join(tmp, "Game.bin")
+            bios = os.path.join(tmp, "scph5501.bin")
+            for path in (rom, bios):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+            started = []
+
+            def deck_for(console, active_bios):
+                return types.SimpleNamespace(
+                    roms=[("Game", rom)], rom_index=0, active_console=console, current_browse_dir="", base_dir=tmp, active_bios=active_bios,
+                    _has_libretro_core=lambda c: os.path.join(tmp, "core_libretro.dll"),
+                    _launch_libretro=lambda c, p: started.append((c, p)),
+                    _romlist_error_msg="", _romlist_error_until=0)
+            self.assertFalse(gd._gov.GAME_NO_BIOS_BLOCKS_LAUNCH)
+            deck = deck_for("PSX", {})
+            before = pygame.time.get_ticks()
+            gd.ExternalGameDeck._launch_selected_rom(deck)
+            self.assertEqual(started, [("PSX", rom)], "the core's built-in BIOS lets the game start")
+            self.assertEqual(deck._romlist_error_msg, "No BIOS set up for PSX yet \u2014 using the built-in BIOS, use Add BIOS")
+            self.assertGreaterEqual(deck._romlist_error_until - before, 3500)
+            started.clear()
+            deck = deck_for("PSX", {"PSX": bios})
+            gd.ExternalGameDeck._launch_selected_rom(deck)
+            self.assertEqual(started, [("PSX", rom)])
+            self.assertEqual(deck._romlist_error_msg, "", "a BIOS that is set up and present gives no banner")
+            started.clear()
+            deck = deck_for("PSX", {"PSX": os.path.join(tmp, "gone.bin")})
+            gd.ExternalGameDeck._launch_selected_rom(deck)
+            self.assertIn("No BIOS set up for PSX yet", deck._romlist_error_msg, "a remembered BIOS whose file is gone counts as not set up")
+            started.clear()
+            deck = deck_for("NES", {})
+            gd.ExternalGameDeck._launch_selected_rom(deck)
+            self.assertEqual((started, deck._romlist_error_msg), ([("NES", rom)], ""), "a console that uses no BIOS never gets the banner")
+            started.clear()
+            gd._gov.GAME_NO_BIOS_BLOCKS_LAUNCH = True
+            try:
+                deck = deck_for("PSX", {})
+                gd.ExternalGameDeck._launch_selected_rom(deck)
+            finally:
+                gd._gov.GAME_NO_BIOS_BLOCKS_LAUNCH = False
+            self.assertEqual(started, [], "with the switch on nothing starts without a BIOS")
+            self.assertEqual(deck._romlist_error_msg, "No BIOS set up for PSX yet \u2014 use Add BIOS")
+        self.assertIn("self._draw_romlist_error_banner(screen, cx, y + 10)", inspect.getsource(gd), "a launch banner is also drawn on the loading screen, so it is seen while the game loads")
+
+    def test_every_method_a_game_through_a_core_uses_is_still_there_and_the_exe_only_calls_are_never_reached(self):
+        """Owner 2026-11-05: make sure the core .dll path has the same functions and is not messed with"""
+        import game_deck as gd
+        _names = ['_apply_menu_nav_mapping_from_libretro_map', '_blit_libretro_frame', '_blit_libretro_frame_impl', '_build_default_libretro_xinput_map', '_has_libretro_core', '_launch_libretro', '_launch_libretro_worker', '_libretro_quit_to_romlist', '_libretro_tick_loading', '_libretro_tick_loading_impl', '_load_libretro_xinput_map', '_poll_libretro_input', '_poll_libretro_launch', '_publish_libretro_launch_result', '_reap_abandoned_libretro_launch', '_render_libretro_impl', '_save_libretro_xinput_map', 'libretro_load_from_profile', 'libretro_save_to_profile', 'render_libretro', 'set_libretro_volume', 'set_paused', '_open_game_exit_confirm', '_close_game_exit_confirm', '_poll_game_exit_confirm_input', '_render_game_exit_confirm', 'shutdown_deck', '_launch_selected_rom']
+        for _name in _names:
+            self.assertTrue(callable(getattr(gd.ExternalGameDeck, _name, None)), "core path method missing: " + _name)
+        _main = MAIN_SRC
+        self.assertNotIn("is_embedded", _main)
+        self.assertNotIn("_lr_active", _main)
+        self.assertNotIn("is_embedded", inspect.getsource(gd))
+        _pause = _main[_main.index("game_deck.set_paused(True, hard=True, reason=\"channel\")") - 300:_main.index("game_deck.set_paused(True, hard=True, reason=\"channel\")") + 60]
+        self.assertIn("_lr.is_loaded", _pause, "leaving channel 03 pauses a loaded core through set_paused")
+
+    def test_a_console_with_no_core_says_so_instead_of_looking_for_an_exe(self):
+        import game_deck as gd
+        _src = inspect.getsource(gd.ExternalGameDeck._launch_selected_rom)
+        self.assertIn("No core set up for {console} yet", _src)
+        self.assertIn("self._launch_libretro(console, full_path)", _src)
+        self.assertNotIn("exe", _src.replace("exes", "").replace("Exe", "").split("self._launch_libretro")[1])
+
+class TestV358ServerPathsAndShortcuts(unittest.TestCase):
+    """Owner 2026-11-05: check what a server sends; the shortcut repair was switched off to see whether Defender still flagged the build, and is back on"""
+
+    def test_a_server_item_that_points_at_a_network_is_left_out_and_local_ones_stay(self):
+        for _text, _network in (("C:\\Users\\steve\\a.mp4", False), ("E:\\movies\\a.mkv", False), ("relative/path.mp4", False), ("", False),
+                                ("\\\\NAS\\media\\a.mp4", True), ("//NAS/media/a.mp4", True), ("\\\\?\\UNC\\NAS\\m\\a.mp4", True),
+                                ("\\\\?\\C:\\long\\a.mp4", False), ("http://host/a.mp4", True), ("https://host/a", True)):
+            self.assertEqual(media._is_network_path(_text), _network, _text)
+        _channels = {"05": {"schedules": {"Full Day": [{"path": "C:\\a.mp4", "duration": -1}, {"path": "\\\\NAS\\x.mp4", "duration": -1},
+                                                        {"path": "ok", "extra": {"deep": ["http://evil/x"]}}]},
+                            "holiday_schedules": {"halloween": [{"path": "D:\\b.mp4"}]}}}
+        _kept, _left_out = media._without_network_paths(_channels)
+        self.assertEqual(_left_out, 2)
+        self.assertEqual(_kept["05"]["schedules"]["Full Day"], [{"path": "C:\\a.mp4", "duration": -1}])
+        self.assertEqual(_kept["05"]["holiday_schedules"]["halloween"], [{"path": "D:\\b.mp4"}])
+        self.assertEqual(len(_channels["05"]["schedules"]["Full Day"]), 3, "the server's own data is not edited in place")
+        self.assertTrue(gov.REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS)
+        self.assertTrue(media.REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS)
+        _apply = inspect.getsource(media.RetroDatabase.apply_remote_schedule)
+        self.assertLess(_apply.index("_without_network_paths(normalized)"), _apply.index("_remote_channel_has_content"), "the check comes before anything reads the server's items")
+        self.assertIn("if REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS:", _apply)
+
+    def test_the_shortcut_repair_is_on_again_and_runs_powershell_once(self):
+        """Owner 2026-11-05: switching the repair off did not stop Defender's flag, so it is back on"""
+        helper = _load_updater_script("update_helper")
+        self.assertTrue(helper.UPDATE_REPOINTS_SHORTCUTS)
+        shim = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith("_")})
+        shim.name = "nt"
+        calls = []
+        fake_subprocess = types.SimpleNamespace(
+            run=lambda command, **kwargs: (calls.append(command), types.SimpleNamespace(stdout="UPDATED|C:\\x.lnk\n", stderr="", returncode=0))[1],
+            CREATE_NO_WINDOW=0)
+        old_os, old_sub = helper.os, helper.subprocess
+        helper.os, helper.subprocess = shim, fake_subprocess
+        try:
+            helper._repoint_shortcuts("C:\\a\\Old V1.exe", "C:\\a\\New V2.exe", "C:\\a", "C:\\b")
+        finally:
+            helper.os, helper.subprocess = old_os, old_sub
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "powershell.exe")
+
+class TestV357SecurityHardening(unittest.TestCase):
+    """Owner 2026-11-05: the Windows security review; version.json must not block a build folder from being replaced, and the two Windows programs the app starts are started by full path"""
+
+    def _stamp_flags(self, module):
+        calls = []
+        shim = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith("_")})
+        shim.name = "nt"
+        fake_ctypes = types.SimpleNamespace(windll=types.SimpleNamespace(kernel32=types.SimpleNamespace(SetFileAttributesW=lambda p, a: calls.append(a))))
+        old_os, old_ctypes = module.os, sys.modules.get("ctypes")
+        module.os = shim
+        sys.modules["ctypes"] = fake_ctypes
+        try:
+            module._set_stamp_attributes("version.json", True)
+            module._set_stamp_attributes("version.json", False)
+        finally:
+            module.os = old_os
+            sys.modules["ctypes"] = old_ctypes
+        return calls
+
+    def test_version_json_is_hidden_and_system_but_never_read_only(self):
+        """Owner 2026-11-05 07:30: auto-py-to-exe could not replace a build folder that had been run (Access is denied); a read-only file cannot be deleted by Windows"""
+        for _name in ("auto_updater", "update_helper"):
+            _calls = self._stamp_flags(_load_updater_script(_name))
+            self.assertEqual(_calls, [0x2 | 0x4, 0x80], _name)
+            self.assertFalse(_calls[0] & 0x1, _name + ": the protected flags must not include read-only")
+        _build = read(os.path.join(ROOT, "write_build_info.py"))
+        self.assertNotIn("0x1 | 0x2 | 0x4", _build)
+        self.assertIn("SetFileAttributesW(path, 0x2 | 0x4)", _build)
+
+    def test_explorer_and_shutdown_are_started_by_full_path(self):
+        _saved = {k: os.environ.get(k) for k in ("SystemRoot", "windir")}
+        ns = {"os": os}
+        exec(compile(get_function_source("_windows_system_exe"), "_windows_system_exe", "exec"), ns)
+        try:
+            os.environ["SystemRoot"] = os.path.join("C:", os.sep, "Windows")
+            self.assertEqual(ns["_windows_system_exe"]("explorer.exe"), os.path.join("C:", os.sep, "Windows", "explorer.exe"))
+            self.assertEqual(ns["_windows_system_exe"]("shutdown.exe", "System32"), os.path.join("C:", os.sep, "Windows", "System32", "shutdown.exe"))
+            os.environ.pop("SystemRoot", None)
+            os.environ.pop("windir", None)
+            self.assertEqual(ns["_windows_system_exe"]("explorer.exe"), "explorer.exe", "with no Windows folder known the bare name is the only choice")
+        finally:
+            for _k, _v in _saved.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+        self.assertIn('subprocess.Popen([_windows_system_exe("explorer.exe")])', get_function_source("_launch_explorer_fallback"))
+        self.assertIn('subprocess.Popen([_windows_system_exe("shutdown.exe", "System32"), "/s", "/t", "0"])', MAIN_SRC)
+        self.assertNotIn('subprocess.Popen(["explorer.exe"])', MAIN_SRC)
+        self.assertNotIn('subprocess.Popen(["shutdown", "/s"', MAIN_SRC)
+
+    def test_a_shell_that_stops_relaunching_starts_the_desktop(self):
+        _src = get_function_source("_attempt_self_relaunch")
+        _hold = _src.index("holding off on another auto-relaunch")
+        _fallback = _src.index("_launch_explorer_fallback()")
+        _ret = _src.index("return False", _hold)
+        self.assertTrue(_hold < _fallback < _ret, "the desktop is started between the crash-loop message and giving up")
+        self.assertIn('if "--as-shell" in sys.argv:', _src[_hold:_fallback])
+
+class TestV351WarpScreenNeedsABezel(unittest.TestCase):
+    """Owner 2026-11-05: Warp Screen is greyed out and off while bezels are off, remembers it was on for when a bezel comes back, in the system or in a console's own bezel; handhelds do not count because their bezels do not warp"""
+
+    def _db(self, system_bezel, profiles=None, warp=True):
+        return types.SimpleNamespace(config={"fake_43_border_enabled": system_bezel, "console_profiles": profiles or {}, "warp_screen_enabled": warp})
+
+    def test_a_bezel_that_warps_is_the_system_bezel_or_a_home_consoles_own_bezel(self):
+        import game_deck as gd
+        on = {"active": 1, "profiles": {1: {"border_enabled": True}}}
+        off = {"active": 1, "profiles": {1: {"border_enabled": False}}}
+        self.assertFalse(gd.warp_bezel_available(None))
+        self.assertTrue(gd.warp_bezel_available(self._db(True)), "the CRT TV Bezels switch alone is enough")
+        self.assertFalse(gd.warp_bezel_available(self._db(False)), "no bezel at all")
+        self.assertFalse(gd.warp_bezel_available(self._db(False, {"NES": off})))
+        self.assertTrue(gd.warp_bezel_available(self._db(False, {"NES": on})), "a home console's own bezel")
+        self.assertTrue(gd.warp_bezel_available(self._db(False, {"PSX": {"active": 2, "profiles": {"1": {"border_enabled": False}, "2": {"border_enabled": True}}}})), "the active profile counts, whether its key is a number or text")
+        self.assertTrue(gd.warp_bezel_available(self._db(False, {"NES": {"active": 1, "profiles": {1: {"gb_border": True}}}})), "the older saved key still counts")
+        self.assertFalse(gd.warp_bezel_available(self._db(False, {c: on for c in ("GB", "GBC", "GBA", "GG", "NGP", "NGPC")})), "handheld bezels do not warp, so they do not count")
+        self.assertTrue(gd.warp_bezel_available(self._db(False, {"GBA": on, "SNES": on})), "a handheld next to a home console changes nothing")
+        for _console in gd.BORDER_CONSOLES_HANDHELD:
+            self.assertNotIn(_console, gd.BORDER_CONSOLES_HOME)
+
+    def test_the_saved_warp_choice_is_not_touched_and_the_row_is_greyed_without_a_bezel(self):
+        db = self._db(False, warp=True)
+        self.assertTrue(ui._warp_needs_a_bezel(db), "no bezel on: the row is greyed out and shown off")
+        self.assertTrue(db.config["warp_screen_enabled"], "the saved choice stays on")
+        db.config["fake_43_border_enabled"] = True
+        self.assertFalse(ui._warp_needs_a_bezel(db), "a bezel is back: the row is live again with its saved choice")
+        self.assertTrue(db.config["warp_screen_enabled"])
+        db.config["fake_43_border_enabled"] = False
+        db.config["console_profiles"] = {"N64": {"active": 1, "profiles": {1: {"border_enabled": True}}}}
+        self.assertFalse(ui._warp_needs_a_bezel(db), "a console's own bezel brings it back too")
+        _ui_src = inspect.getsource(ui)
+        self.assertIn('_cs_row_id == "warp_screen" and _warp_needs_a_bezel(db)', _ui_src)
+        _enter = MAIN_SRC.index('elif _cs_row_id == "warp_screen" and (_feature_locked("warp_screen_enabled") or not _warp_bezel_available())')
+        _flip = MAIN_SRC.index('db.config["warp_screen_enabled"] = not db.config.get("warp_screen_enabled", False)')
+        self.assertLess(_enter, _flip, "Enter does nothing on the greyed out row before the setting can flip")
+
+
+class TestV350GuideExplorerReception(unittest.TestCase):
+    """Owner 2026-11-05: the guide preview of ch05 did not load until the channel was left and entered again; the file explorer names its channel; the reception lines are as fine and as fast as the new snow"""
+
+    def test_the_old_loads_are_dropped_before_the_guide_preview_is_started(self):
+        """Owner log 2026-11-05 01:00:52 (ATTEMPT 6): opening the guide asked for the ch05 preview and the next line dropped every load, the preview just asked for included"""
+        _src = get_function_source("change_channel")
+        _drop = _src.index('_drop_channel_loads(f"ch{new_ch} has no video to load")')
+        _start = _src.index("_start_guide_preview_load(")
+        self.assertLess(_drop, _start, "the loads are dropped first, then the guide preview is asked for")
+        self.assertEqual(_src.count('_drop_channel_loads(f"ch{new_ch} has no video to load")'), 1)
+        ns = {"_channel_activation_generation": 0, "app_state": {"current_channel": "04"}, "_activation_slot": __import__("threading").Condition(),
+              "_activation_running": {"token": None}, "log": types.SimpleNamespace(info=lambda *a: None, warning=lambda *a: None)}
+        for _name in ("_drop_channel_loads", "_activation_token_stale"):
+            exec(compile(get_function_source(_name), _name, "exec"), ns)
+        _token = {"generation": 1, "channel": "04", "abandoned": False}
+        ns["_channel_activation_generation"] = 1
+        self.assertFalse(ns["_activation_token_stale"](_token), "a load asked for just now is current")
+        ns["_drop_channel_loads"]("ch04 has no video to load")
+        self.assertTrue(ns["_activation_token_stale"](_token), "a load asked for before the drop is out of date, which is why the order matters")
+
+    def test_a_file_explorer_opened_for_a_channel_names_the_channel(self):
+        """Owner 2026-11-05: carry the channel number into the file explorer's top title so the viewer does not get lost when the titles all say the same"""
+        shown = {}
+        app_state = {"file_explorer_expand_lock": __import__("threading").Lock()}
+        ns = {"app_state": app_state, "os": os, "db": None, "_fe_existing_schedule_paths": lambda c: [], "_fe_context_key": lambda c: None,
+              "pygame": types.SimpleNamespace(mouse=types.SimpleNamespace(set_visible=lambda v: None, set_pos=lambda p: None),
+                                              display=types.SimpleNamespace(get_surface=lambda: None))}
+        exec(compile(get_function_source("_fe_open"), "_fe_open", "exec"), ns)
+
+        def title_for(title, context):
+            ns["_fe_open"](title, {".mp4"}, context)
+            return app_state["file_explorer_title"]
+        self.assertEqual(title_for("Add Morning", {"mode": "schedule", "ch": "05", "block": "Morning"}), "Channel 05 \u2014 Add Morning")
+        self.assertEqual(title_for("Add Morning", {"mode": "schedule", "ch": "12", "block": "Morning"}), "Channel 12 \u2014 Add Morning", "two channels with the same words are told apart")
+        self.assertEqual(title_for("Holiday Override \u2014 Halloween Videos", {"mode": "holiday", "ch": "07", "hkey": "halloween"}), "Channel 07 \u2014 Holiday Override \u2014 Halloween Videos")
+        self.assertEqual(title_for("Add Intros", {"mode": "commercial", "ch": "09", "block": "Intros"}), "Channel 09 \u2014 Add Intros")
+        self.assertEqual(title_for("Select Channel 05 Watermark", {"mode": "watermark_select", "channel": "05"}), "Select Channel 05 Watermark", "a title that already names the channel is not changed")
+        self.assertEqual(title_for("Scan For Roms", {"mode": "scan_for_roms"}), "Scan For Roms", "an explorer that belongs to no channel is not changed")
+        self.assertEqual(title_for("Game Music", None), "Game Music")
+
+    def test_the_reception_lines_are_as_fine_and_as_fast_as_the_snow(self):
+        """Owner 2026-11-05: upgrade the reception lines to look more like the new Static Noise but stay reception lines"""
+        import numpy as _np
+        self.assertEqual(gov.RECEPTION_NOISE_BLOCK_PX, 2)
+        self.assertEqual(gov.RECEPTION_NOISE_REFRESH_MS, 33)
+        _eff = get_function_source("_apply_reception_lines_effect")
+        self.assertNotIn("age // 40", _eff, "the speed is the governor number, not a fixed 40")
+        self.assertIn("RECEPTION_NOISE_REFRESH_MS", _eff)
+        _like = {}
+        for _block in (1, 2, 3):
+            ns = {"pygame": pygame, "np": _np, "db": None, "random": __import__("random"), "_reception_lines_state": {"noise_caches": {}},
+                  "RECEPTION_NOISE_BLOCK_PX": _block, "RECEPTION_NOISE_VISIBLE_SHARE": gov.RECEPTION_NOISE_VISIBLE_SHARE,
+                  "RECEPTION_NOISE_BRIGHT_SHARE": gov.RECEPTION_NOISE_BRIGHT_SHARE, "RECEPTION_NOISE_BRIGHT_ALPHA": gov.RECEPTION_NOISE_BRIGHT_ALPHA,
+                  "RECEPTION_NOISE_DARK_ALPHA": gov.RECEPTION_NOISE_DARK_ALPHA}
+            for _name in ("_tinted_bright_rgb", "_build_tracking_noise_surface"):
+                exec(compile(get_function_source(_name), _name, "exec"), ns)
+            _np.random.seed(5)
+            _alpha = pygame.surfarray.array_alpha(ns["_build_tracking_noise_surface"](600, 60, 1, "white", 1)).astype(_np.int32)
+            _like[_block] = float((_alpha[1:, :] == _alpha[:-1, :]).mean())
+        self.assertGreater(_like[3], _like[2] + 0.04, "a bigger block number gives bigger specks (%r)" % (_like,))
+        self.assertGreater(_like[2], _like[1] + 0.04, "a smaller block number gives finer specks (%r)" % (_like,))
+        built = []
+        ticks = [0]
+
+        class Tex:
+            def copy(self):
+                return self
+            def fill(self, *a, **k):
+                pass
+
+        class Overlay:
+            def blit(self, *a):
+                pass
+
+        class Rect:
+            def __init__(self):
+                self.width, self.height, self.topleft = 400, 300, (0, 0)
+            def clip(self, other):
+                return self
+        line = {"band_h": 20, "y_start": 0, "travel": 100000, "spawn": 0, "duration": 100000, "seed_step": 7, "line_id": 1}
+        ns = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0]), Surface=lambda *a: Overlay(), SRCALPHA=1, BLEND_RGBA_MULT=2),
+              "random": __import__("random"), "log": types.SimpleNamespace(warning=lambda *a: None), "RECEPTION_NOISE_REFRESH_MS": gov.RECEPTION_NOISE_REFRESH_MS,
+              "_reception_lines_state": {"tracking_lines": [line], "next_tracking_spawn": 10 ** 9, "noise_caches": {}},
+              "_current_noise_tint_style": lambda: "white", "_spawn_tracking_line_batch": lambda h, now: [],
+              "_build_tracking_noise_surface": lambda w, band_h, seed_step, tint, lid: (built.append(seed_step), Tex())[1]}
+        exec(compile(_eff, "_eff", "exec"), ns)
+
+        class Screen:
+            def get_rect(self):
+                return Rect()
+            def blit(self, *a):
+                pass
+        for _i in range(120):
+            ticks[0] = 5000 + int(_i * 16.7)
+            ns["_apply_reception_lines_effect"](Screen(), Rect())
+        _changes_per_second = len(set(built)) / ((120 * 16.7) / 1000.0)
+        self.assertGreaterEqual(_changes_per_second, 25.0, "the noise inside a rolling line changes about 30 times a second (%.1f)" % _changes_per_second)
+
+
 class TestStaticNoiseMadeOnce(unittest.TestCase):
     """Owner log 2026-11-03: Static Noise made a new snow picture every 80 ms and at every strength change on the screen thread (50 to 140 ms spikes); now a few are made once per screen size and shown in turn"""
 
@@ -18011,8 +18983,10 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
         ns = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: now[0])), "db": None,
               "log": types.SimpleNamespace(warning=lambda *a: None), "collections": __import__("collections"),
               "_STATIC_NOISE_AMBIENT_REFRESH_MS": 80, "_STATIC_NOISE_POOL_FRAMES": 4, "_STATIC_NOISE_POOL_SIZES": 2,
+              "_STATIC_NOISE_BUILD_GAP_MS": 80, "random": __import__("random").Random(1234),
               "_static_noise_pools": __import__("collections").OrderedDict(), "_current_noise_tint_style": lambda: "white",
-              "_static_noise_severity_at": lambda t: 0.2 + (t % 1000) / 5000.0}
+              "_static_noise_severity_at": lambda t: 0.2 + (t % 1000) / 5000.0, "_STATIC_NOISE_STRENGTH_STEPS": 16,
+              "_static_noise_baked_frame": lambda key, index, frame, step, steps: types.SimpleNamespace(n=frame.n, alpha=step)}
 
         class Frame:
             def __init__(self, n):
@@ -18045,9 +19019,128 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
             now[0] = i * 16
             ns["_apply_static_noise_effect"](Screen(), Rect(0, 0, 400, 300), "05")
         self.assertEqual(len(made), 4, "only the set is made, however often the strength changes")
-        self.assertEqual(len({n for n, _a in shown}), 4, "the pictures are shown in turn")
+        self.assertEqual(len({n for n, _a in shown}), 4, "every picture of the set is shown")
         self.assertTrue(all(a is not None for _n, a in shown))
-        self.assertEqual(gov.STATIC_NOISE_POOL_FRAMES, 8)
+        self.assertEqual(gov.STATIC_NOISE_POOL_FRAMES, 12)
+
+    def test_the_strength_is_baked_into_the_picture_so_it_draws_on_the_fast_path(self):
+        """Owner 2026-11-04 (i5-4570): Static Noise made playback really laggy; a picture with its own see-through values and an overall strength is drawn about 8 times slower, so the strength is baked in"""
+        import collections as _collections
+        import numpy as _np
+        ns = {"pygame": pygame, "np": _np, "_static_noise_baked": _collections.OrderedDict(), "_STATIC_NOISE_BAKED_MAX": 3}
+        exec(compile(get_function_source("_static_noise_baked_frame"), "b", "exec"), ns)
+        frame = pygame.Surface((4, 2), pygame.SRCALPHA)
+        frame.fill((200, 200, 200, 200))
+        baked = ns["_static_noise_baked_frame"]("k", 0, frame, 8, 16)
+        self.assertEqual(baked.get_alpha(), 255, "no overall strength is left on the picture")
+        self.assertTrue(baked.get_flags() & pygame.SRCALPHA, "the picture keeps its own see-through values; set_alpha(None) removes them and the snow is drawn solid")
+        _base = pygame.Surface((4, 2))
+        _base.fill((0, 0, 0))
+        _base.blit(baked, (0, 0))
+        self.assertTrue(70 <= _base.get_at((0, 0))[0] <= 85, "drawn on black the baked snow is see-through, not solid: %r" % (_base.get_at((0, 0)),))
+        self.assertNotIn("baked.set_alpha(None)", get_function_source("_static_noise_baked_frame"), "set_alpha(None) turns the snow into a solid black and white screen")
+        self.assertEqual(baked.get_at((0, 0)).a, 200 * 128 // 255, "the strength is in each pixel's own see-through value")
+        self.assertEqual(frame.get_at((0, 0)).a, 200, "the shared picture is not changed")
+        self.assertIs(ns["_static_noise_baked_frame"]("k", 0, frame, 8, 16), baked, "a baked picture is made once")
+        for step in (1, 2, 3, 4):
+            ns["_static_noise_baked_frame"]("k", 0, frame, step, 16)
+        self.assertEqual(len(ns["_static_noise_baked"]), 3, "at most STATIC_NOISE_BAKED_MAX are kept")
+        self.assertNotIn("frame.set_alpha(", get_function_source("_apply_static_noise_effect"), "the shown picture never gets an overall strength")
+
+    def test_the_snow_filter_leaves_the_picture_visible(self):
+        """Owner 2026-11-04: Static Noise is a light snowy filter over the live picture, never a screen of its own; the real snow functions drawn on a picture must leave that picture showing at every strength"""
+        import collections as _collections
+        import numpy as _np
+        ns = {"pygame": pygame, "np": _np, "db": None, "_STATIC_HEAVY": 0.46, "_static_noise_baked": _collections.OrderedDict(), "_STATIC_NOISE_BAKED_MAX": 24, "_STATIC_NOISE_GRAIN_PX": gov.STATIC_NOISE_GRAIN_PX}
+        for _name in ("_tinted_bright_rgb", "_static_noise_frame", "_static_noise_strength_alpha", "_static_noise_baked_frame"):
+            exec(compile(get_function_source(_name), _name, "exec"), ns)
+        _base_rgb = (40, 120, 200)
+        for _severity in (0.16, 0.30, 0.46):
+            _frame = ns["_static_noise_frame"](200, 120, "white")
+            _step = int(round(ns["_static_noise_strength_alpha"](_severity) * 16 / 255.0))
+            _baked = ns["_static_noise_baked_frame"](("k", _severity), 0, _frame, _step, 16)
+            _screen = pygame.Surface((200, 120))
+            _screen.fill(_base_rgb)
+            _screen.blit(_baked, (0, 0))
+            _shown = pygame.surfarray.array3d(_screen).astype(_np.int32)
+            _diff = _np.abs(_shown - _np.array(_base_rgb, dtype=_np.int32)).max(axis=2)
+            self.assertLess(float(_diff.mean()), 30.0, "the picture must stay visible under the snow at severity %s (mean change %.1f)" % (_severity, float(_diff.mean())))
+            self.assertLess(int(_diff.max()), 110, "no snow speck may be solid at severity %s (largest change %d)" % (_severity, int(_diff.max())))
+
+    def test_the_snow_changes_fast_and_shows_no_repeating_pattern(self):
+        """Owner 2026-11-04: the snow is a fine, fast live-TV snow; the picture changes at the governor's rate, never to the same one twice running, and in no fixed order"""
+        made = []
+        ns = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: now[0])), "db": None,
+              "log": types.SimpleNamespace(warning=lambda *a: None), "collections": __import__("collections"),
+              "_STATIC_NOISE_AMBIENT_REFRESH_MS": gov.STATIC_NOISE_AMBIENT_REFRESH_MS, "_STATIC_NOISE_POOL_FRAMES": gov.STATIC_NOISE_POOL_FRAMES,
+              "_STATIC_NOISE_POOL_SIZES": gov.STATIC_NOISE_POOL_SIZES, "_STATIC_NOISE_BUILD_GAP_MS": gov.STATIC_NOISE_BUILD_GAP_MS,
+              "random": __import__("random").Random(7),
+              "_static_noise_pools": __import__("collections").OrderedDict(), "_current_noise_tint_style": lambda: "white",
+              "_static_noise_severity_at": lambda t: 0.3, "_STATIC_NOISE_STRENGTH_STEPS": 16,
+              "_static_noise_baked_frame": lambda key, index, frame, step, steps: types.SimpleNamespace(n=frame.n, alpha=step)}
+
+        class Frame:
+            def __init__(self, n):
+                self.n = n
+
+        def make(w, h, tint):
+            made.append((w, h))
+            return Frame(len(made))
+        shown = []
+
+        class Screen:
+            def get_rect(self):
+                return Rect(0, 0, 400, 300)
+            def blit(self, surf, pos):
+                shown.append((now[0], surf.n))
+
+        class Rect:
+            def __init__(self, x, y, w, h):
+                self.x, self.y, self.width, self.height = x, y, w, h
+                self.topleft = (x, y)
+            def clip(self, other):
+                return self
+        now = [0]
+        exec(compile(get_function_source("_static_noise_strength_alpha"), "a", "exec"), ns)
+        exec(compile(get_function_source("_apply_static_noise_effect"), "n", "exec"), ns)
+        ns["_static_noise_frame"] = make
+        for i in range(1800):
+            now[0] = int(i * 16.7)
+            ns["_apply_static_noise_effect"](Screen(), Rect(0, 0, 400, 300), "05")
+        self.assertEqual(len(made), gov.STATIC_NOISE_POOL_FRAMES, "only the set is made")
+        _refresh = max(1, int(gov.STATIC_NOISE_AMBIENT_REFRESH_MS))
+        _settled = [(t // _refresh, n) for t, n in shown if t >= 3000]
+        _by_tick = []
+        for _tick, _n in _settled:
+            if not _by_tick or _by_tick[-1][0] != _tick:
+                _by_tick.append((_tick, _n))
+        _seconds = (shown[-1][0] - 3000) / 1000.0
+        _changes = sum(1 for a, b in zip(_by_tick, _by_tick[1:]) if a[1] != b[1])
+        self.assertGreaterEqual(_changes / _seconds, 20.0, "the snow changes at least 20 times a second (%.1f)" % (_changes / _seconds))
+        self.assertTrue(all(a[1] != b[1] for a, b in zip(_by_tick, _by_tick[1:])), "never the same picture twice running")
+        _seq = [n for _t, n in _by_tick]
+        _period = gov.STATIC_NOISE_POOL_FRAMES
+        _same = sum(1 for k in range(len(_seq) - _period) if _seq[k] == _seq[k + _period]) / float(len(_seq) - _period)
+        self.assertLess(_same, 0.4, "the order does not repeat every %d pictures (%.2f)" % (_period, _same))
+        self.assertEqual(gov.STATIC_NOISE_AMBIENT_REFRESH_MS, 33)
+        self.assertEqual(gov.STATIC_NOISE_BUILD_GAP_MS, 80)
+
+    def test_the_snow_grain_is_a_governor_number_and_finer_than_the_old_three_pixels(self):
+        """Owner 2026-11-04: fine snow, not big spaced-out pixels; the size of one speck is STATIC_NOISE_GRAIN_PX and a smaller number is a finer snow"""
+        import collections as _collections
+        import numpy as _np
+        self.assertEqual(gov.STATIC_NOISE_GRAIN_PX, 2)
+        self.assertNotIn("// 3", get_function_source("_static_noise_frame"), "the grain is the governor number, not a fixed 3")
+        _like = {}
+        for _grain in (1, 2, 4):
+            ns = {"pygame": pygame, "np": _np, "db": None, "_STATIC_HEAVY": 0.46, "_STATIC_NOISE_GRAIN_PX": _grain}
+            for _name in ("_tinted_bright_rgb", "_static_noise_frame"):
+                exec(compile(get_function_source(_name), _name, "exec"), ns)
+            _np.random.seed(11)
+            _alpha = pygame.surfarray.array_alpha(ns["_static_noise_frame"](400, 300, "white")).astype(_np.int32)
+            _like[_grain] = float((_alpha[1:, :] == _alpha[:-1, :]).mean())
+        self.assertGreater(_like[4], _like[2] + 0.05, "a bigger grain number gives bigger specks (%r)" % (_like,))
+        self.assertGreater(_like[2], _like[1] + 0.05, "a smaller grain number gives finer specks (%r)" % (_like,))
 
     def test_strength_keeps_the_old_average(self):
         ns = {}
@@ -18056,6 +19149,178 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
         self.assertEqual(f(1.0), 255)
         self.assertEqual(f(0.1), f(0.3), "below 0.31 the old snow sat at its floor alphas")
         self.assertLess(f(0.3), f(0.46))
+
+
+class TestGovernorLearnsThisPC(unittest.TestCase):
+    """Owner 2026-11-04 08:16 and 08:18 (i5-4570 log): narrow the background work by how this PC is actually doing and learn up and down from it, without lowering a weak PC's peak; the level went 1 to 2 and back every 20 s while nothing changed for the scans"""
+
+    @classmethod
+    def setUpClass(cls):
+        import performance_governor as pg
+        cls.pg = pg
+
+    def test_the_ffmpeg_scans_at_once_narrow_with_the_level_and_keep_the_peak(self):
+        pg = self.pg
+        peak = pg.affordable_threads()
+        self.assertEqual(pg.ffmpeg_scans_at_once(0), peak, "level 0 keeps this PC's own peak")
+        counts = [pg.ffmpeg_scans_at_once(level) for level in range(pg.MAX_LEVEL + 1)]
+        self.assertEqual(counts, sorted(counts, reverse=True), "each level allows no more than the one below it")
+        self.assertTrue(all(c >= 1 for c in counts), "never below one, so the scans still move")
+        src = read(os.path.join(ROOT, "performance_governor.py"))
+        self.assertIn("ffmpeg_scans_running() < ffmpeg_scans_at_once(level))", src, "the background gate uses the level's count")
+
+    def test_a_weak_pc_keeps_back_only_what_windows_needs(self):
+        """Owner 2026-11-04 08:34: on a weak PC the app is the one thing running; keep back only enough for Windows, which gives his i5-4570 one more core and one more thread; standard PCs keep their headroom"""
+        pg = self.pg
+        name = "Intel(R) Core(TM) i5-4570 CPU @ 3.20GHz"
+        owner = pg.build_profile(4, 0, 4, 15.9, 12.6, cpu_name=name)
+        self.assertEqual(owner.tier, "WEAK")
+        for mode in ("lite", "standard"):
+            self.assertEqual(pg.affordable_threads(owner, mode), 3, "4 threads less 1 for Windows (was 2)")
+            self.assertEqual(pg.core_budget(owner, mode), 3.0, "3 of its 4 cores, the same 1 kept back for Windows as the threads (was 1)")
+        tiny = pg.build_profile(2, 0, 2, 4.0, 2.0, cpu_name=name)
+        self.assertEqual(pg.affordable_threads(tiny, "lite"), 2, "never below the floor")
+        self.assertEqual(pg.core_budget(tiny, "lite"), 1.0, "and never every core: one stays for Windows")
+        strong = pg.build_profile(6, 0, 12, 32.0, 20.0, cpu_name="12th Gen Intel(R) Core(TM) i5-12400")
+        self.assertNotEqual(strong.tier, "WEAK")
+        self.assertEqual(pg.affordable_threads(strong, "lite"), 12 - max(pg.HEADROOM_MIN_THREADS["lite"], 6), "a standard PC keeps its mode's headroom")
+
+    def test_a_weak_pc_scans_on_its_free_cores_and_the_level_narrows_them(self):
+        """Owner 2026-11-04 09:00: "if those cores are sitting unused, use them"; the smart throttle slows them down"""
+        pg = self.pg
+        owner = pg.build_profile(4, 0, 4, 15.9, 12.6, cpu_name="Intel(R) Core(TM) i5-4570 CPU @ 3.20GHz")
+        saved = pg._gate_state["throttle"]
+        try:
+            counts = []
+            for level in range(pg.MAX_LEVEL + 1):
+                pg._gate_state["throttle"] = types.SimpleNamespace(level=level)
+                counts.append(pg.scan_threads(owner, "lite"))
+        finally:
+            pg._gate_state["throttle"] = saved
+        self.assertEqual(counts[0], 3, "every free core when the picture keeps up (was 1 at every level)")
+        self.assertEqual(counts, sorted(counts, reverse=True))
+        self.assertEqual(counts[-1], 1, "down to one under load")
+
+    def test_a_loudness_scan_measures_no_more_windows_at_once_than_the_pc_affords(self):
+        pg = self.pg
+        self.assertEqual(pg.loudness_parallel_windows(8), min(8, pg.affordable_threads()))
+        self.assertEqual(pg.loudness_parallel_windows(1), 1)
+        self.assertIn("max_workers=_window_workers", read(os.path.join(ROOT, "media.py")))
+
+    def test_the_calm_wait_doubles_on_a_relapse_and_halves_when_a_step_down_holds(self):
+        pg = self.pg
+        t = pg.Throttle(16.67, name="learn test")
+        base = pg.RELAX_COOLDOWN_SECONDS
+        t._set_level(2, "test", 100.0)
+        t._set_level(1, "test", 200.0)
+        t._set_level(2, "test", 200.0 + pg.RELAX_RELAPSE_SECONDS - 1)
+        self.assertEqual(t._relax_cooldown, base * 2, "climbing again soon after a step down doubles the wait")
+        for n in range(10):
+            t._set_level(1, "test", 1000.0 + n * 10)
+            t._set_level(2, "test", 1001.0 + n * 10)
+        self.assertEqual(t._relax_cooldown, pg.RELAX_COOLDOWN_MAX_SECONDS, "never above the most")
+        t._set_level(1, "test", 5000.0)
+        t._set_level(2, "test", 5000.0 + pg.RELAX_RELAPSE_SECONDS + 1)
+        self.assertEqual(t._relax_cooldown, pg.RELAX_COOLDOWN_MAX_SECONDS, "a climb after the step down held is no relapse")
+        t._set_level(1, "test", 6000.0)
+        t.update({}, now=6000.0 + pg.RELAX_RELAPSE_SECONDS + 1)
+        self.assertEqual(t._relax_cooldown, pg.RELAX_COOLDOWN_MAX_SECONDS / 2, "a step down that held halves the wait")
+        src = read(os.path.join(ROOT, "performance_governor.py"))
+        self.assertIn("now - self._last_hold >= self._relax_cooldown", src, "the learned wait is the one used")
+
+    def test_python_heavy_work_waits_during_a_tune_and_a_flipped_channel_starts_no_loudness_scan(self):
+        src = main_function_source("_background_scan_should_pause")
+        self.assertIn("performance_governor.tune_in_progress()", src, "the scans and the Python-heavy work wait while a tune settles")
+        prime = main_function_source("_prime_channel_block_loudness")
+        self.assertIn("performance_governor.tune_loudness_settle_seconds()", prime)
+        self.assertLess(prime.index('!= ch_str'), prime.index("_mark_loudness_priority_active()"),
+                        "the channel is checked after the settle and before the scan starts")
+        self.assertGreater(self.pg.TUNE_LOUDNESS_SETTLE_SECONDS, 0)
+
+
+class TestScreenReadsHeldAnswersWithoutLocks(unittest.TestCase):
+    """Owner log 2026-11-04 07:45 (i5-4570): the screen thread waited for the length hub lock and the path-exists cache lock behind the scans, for most of 2 to 7 s freezes; an answer already held is now read with no lock"""
+
+    def test_a_held_hub_answer_is_read_while_another_thread_holds_the_hub_lock(self):
+        import media_library as ml
+        for cls in (ml.DurationHub,):
+            hub = cls.__new__(cls)
+            ml._PathMemoHub.__init__(hub, None)
+            key = ml._hub_key("/m/show.mkv")
+            hub._memo[key] = [1200.0, None, time.monotonic()]
+            got = []
+            hub._lock.acquire()
+            try:
+                worker = threading.Thread(target=lambda: got.append(hub._lookup(key, "/m/show.mkv")))
+                worker.start()
+                worker.join(2)
+            finally:
+                hub._lock.release()
+            self.assertEqual(got and got[0][0], 1200.0, "the held answer came back while the lock was held elsewhere")
+        src = read(os.path.join(ROOT, "media_library.py"))
+        self.assertEqual(src.count("        held = self._memo.get(key)\n        force = key in self._must_resolve\n        now = time.monotonic()\n"), 3,
+                         "all three hubs read a held answer without the lock")
+
+    def test_the_hub_key_is_worked_out_once_per_path(self):
+        import media_library as ml
+        path = "/m/Some Show/Episode 1.MKV"
+        first = ml._hub_key(path)
+        self.assertEqual(first, os.path.normpath(os.path.abspath(path)).lower())
+        self.assertIs(ml._hub_key(path), first, "the second ask is the remembered key")
+        import pathlib
+        self.assertEqual(ml._hub_key(pathlib.PurePosixPath("/m/a.mkv")), os.path.normpath(os.path.abspath("/m/a.mkv")).lower())
+
+    def test_a_held_path_status_is_read_without_the_cache_lock(self):
+        import media
+        src = read(os.path.join(ROOT, "media.py"))
+        body = src[src.index("def _path_status(p):"):src.index("def queued_path_refreshes")]
+        self.assertIn("    cached = _path_exists_cache.get(p)\n", body, "the held status is read outside the lock")
+        self.assertLess(body.index("_PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS"), body.index("with _path_exists_cache_lock:"),
+                        "the lock is taken only when a sweep is due")
+        media._last_path_exists_cache_sweep_ms = media._now_ms()
+        media._path_exists_cache["/held/path.mkv"] = (media.PATH_PRESENT, media._now_ms())
+        got = []
+        with media._path_exists_cache_lock:
+            worker = threading.Thread(target=lambda: got.append(media._path_status("/held/path.mkv")))
+            worker.start()
+            worker.join(2)
+        media._path_exists_cache.pop("/held/path.mkv", None)
+        self.assertEqual(got, [media.PATH_PRESENT], "the held status came back while the lock was held elsewhere")
+
+
+class TestAutoPlayGuardIsOneLookup(unittest.TestCase):
+    """Owner log 2026-11-04 07:45 (i5-4570): the AutoPlay guard ran Python once for every open window every 0.75 s and was on the CPU in 108 of 138 looks during a 7 s freeze"""
+
+    def test_the_guard_asks_windows_for_the_autoplay_window_by_title(self):
+        src = main_function_source("_start_autoplay_dismisser")
+        self.assertNotIn("EnumWindows", src, "no walk over every window")
+        self.assertNotIn("WINFUNCTYPE", src, "no Python callback per window")
+        self.assertIn('FindWindowExW(None, None, None, "AutoPlay")', src, "Windows finds the exact title itself")
+        self.assertIn('FindWindowExW(None, hwnd, None, "AutoPlay")', src, "and every further window of that title")
+        self.assertIn("IsWindowVisible(hwnd)", src)
+        self.assertIn("PostMessageW(hwnd, WM_CLOSE, 0, 0)", src)
+        self.assertIn("time.sleep(0.75)", src)
+
+
+class TestVisualizerGainOnlyOnScreen(unittest.TestCase):
+    """Owner 2026-11-04 07:49: a visualizer channel's LOUDNESS GAIN row was not greyed while another channel was on screen; it moved between -1 and +1 and did nothing"""
+
+    def test_the_song_is_only_given_for_the_channel_on_screen(self):
+        import ui
+        state = {"current_channel": "4", "_vis_target_filepath": "D:/music/song.mp3"}
+        self.assertEqual(ui.visualizer_gain_file(state, "04"), "D:/music/song.mp3", "the channel on screen gives its playing song")
+        self.assertEqual(ui.visualizer_gain_file(state, "07"), "", "another channel's menu gives no song")
+        self.assertEqual(ui.visualizer_gain_file({"current_channel": "04", "_vis_target_filepath": ""}, "04"), "", "no song playing gives none")
+
+    def test_the_row_is_greyed_and_the_keys_do_nothing_without_a_song(self):
+        ui_src = read(os.path.join(ROOT, "ui.py"))
+        self.assertIn("_vis_gain_path = visualizer_gain_file(app_state, target_ch_str)", ui_src)
+        self.assertIn("_vis_gain_live = _vis_scan_on and bool(_vis_gain_path)", ui_src, "greyed unless the scan is on and a song of this channel plays")
+        self.assertIn('"LOUDNESS GAIN: TUNE TO THIS CHANNEL TO ADJUST"', ui_src)
+        self.assertIn('"LOUDNESS GAIN: NO SONG PLAYING"', ui_src)
+        main_src = read(os.path.join(ROOT, "retro_tv_emulator.py"))
+        self.assertIn("_vis_file = ui.visualizer_gain_file(app_state, target_ch_str)\n                        if not _vis_file:\n                            continue", main_src,
+                      "A and D change nothing while the row is greyed")
 
 
 class TestCrashRelaunchTakesOver(unittest.TestCase):
@@ -18342,6 +19607,39 @@ class TestKeyHintsUseKeyPictures(unittest.TestCase):
             self.assertIn(text, gd.ExternalGameDeck._LEGEND_KEYBOARD_PICTURES)
 
 
+    def test_each_legend_section_is_its_name_over_controller_slash_keyboard(self):
+        """Owner 2026-11-04 09:19: "instead of stacked. i want the game buttons first with a / between them and the word/text centered above each section." """
+        import game_deck as gd
+        import ui as ui_mod
+        fake = types.SimpleNamespace(_font_small=self.font, list_text_color=(230, 230, 230),
+                                     _LEGEND_CONTROLLER_PICTURES=gd.ExternalGameDeck._LEGEND_CONTROLLER_PICTURES,
+                                     _LEGEND_KEYBOARD_PICTURES=gd.ExternalGameDeck._LEGEND_KEYBOARD_PICTURES)
+        drawn, titles = [], []
+        real = ui_mod.draw_key_hint
+
+        def spy(target, parts, x, center_y, font, color, key_h=None, gap=None, center=False):
+            if target is not None:
+                drawn.append((parts, x, center_y, center, titles[-1]))
+            return real(target, parts, x, center_y, font, color, key_h=key_h, gap=gap, center=center)
+
+        class Screen:
+            def blit(self, surf, pos):
+                titles.append((pos[0] + surf.get_width() // 2, pos[1], pos[1] + surf.get_height()))
+        ui_mod.draw_key_hint = spy
+        try:
+            gd.ExternalGameDeck._draw_legend(fake, Screen(), 450, 0, 200, [("Navigate", "\u2190\u2191\u2193\u2192", "W/A/S/D"), ("Select", "A", "Enter"), ("Back", "B", "ESC")])
+        finally:
+            ui_mod.draw_key_hint = real
+        self.assertEqual([d[0] for d in drawn], [[("pad_dpad",), ["/"], ("w", "a", "s", "d")], [("pad_a",), ["/"], ("enter",)], [("pad_b",), ["/"], ("esc",)]],
+                         "one line per section: the controller button first, a slash, then the keyboard key")
+        self.assertTrue(all(d[3] for d in drawn), "each line is centred")
+        self.assertEqual([d[4][0] for d in drawn], [d[1] for d in drawn], "each name is centred above its own section")
+        self.assertTrue(all(d[4][2] <= d[2] for d in drawn), "the name sits above its keys")
+        self.assertEqual(len({d[2] for d in drawn}), 1, "all sections on one row")
+        self.assertEqual(sorted(d[1] for d in drawn), [d[1] for d in drawn], "the sections run left to right in order")
+        self.assertGreater(gov.GAME_LEGEND_SECTION_GAP_PX, 0)
+
+
 class TestSurfaceLockFinder(unittest.TestCase):
     """Owner 2026-11-04: the crash "Surfaces must not be locked during blit" needs the holder named in the log, and the frame must go on, so the real fix is one step"""
 
@@ -18367,7 +19665,7 @@ class TestSurfaceLockFinder(unittest.TestCase):
         ns = {"pygame": types_module.SimpleNamespace(Surface=self.FakeSurface), "time": time, "sys": sys, "os": os,
               "threading": threading, "collections": collections, "gc": gc, "types": types_module,
               "performance_governor": None, "log": logging.getLogger("surface_lock_test"), "_main_frame_clock": {"n": 7}}
-        for name in ("_SURFACE_LOCK_SWAPS_MAX", "_SURFACE_LOCK_FIND_SECONDS", "_surface_lock_events", "_surface_lock_unreadable"):
+        for name in ("_SURFACE_LOCK_SWAPS_MAX", "_SURFACE_LOCK_FIND_SECONDS", "_SURFACE_LOCK_INCIDENT_GAP_SECONDS", "_surface_lock_events", "_surface_lock_last_at", "_surface_lock_searched", "_surface_lock_unreadable"):
             exec(main_assignment_code(name), ns)
         for name in ("_surface_lock_refers", "_surface_lock_targets", "_surface_lock_scan", "_surface_lock_threads", "_surface_lock_find", "_surface_lock_event"):
             exec(main_function_code(name), ns)
@@ -18594,12 +19892,39 @@ class TestHealthMonitor(unittest.TestCase):
         self.assertIs(ns["double"].__health_wrapped__, double)
         with self.assertRaises(ValueError):
             ns["broken"]()
-        rec = hm._work["double"]
+        rows = hm.take_work()
+        rec = rows["double"]
         self.assertEqual(rec[0], 1)
         self.assertEqual(rec[3], 1, "a run on the screen thread is counted as the screen thread's")
-        self.assertEqual(hm._work["broken"][5], 1, "a failed run is counted and the error still reaches the caller")
-        hm._work.pop("double", None)
-        hm._work.pop("broken", None)
+        self.assertEqual(rows["broken"][5], 1, "a failed run is counted and the error still reaches the caller")
+        self.assertNotIn("double", hm.take_work(), "the counts start again after each report")
+
+    def test_counts_from_many_threads_add_up_without_a_shared_lock(self):
+        hm = self.hm
+        hm.take_work()
+        self.assertFalse(hasattr(hm, "_work_lock"), "no lock is shared by every count")
+
+        def count_for_test():
+            for _ in range(1000):
+                hm.note("many threads", 0.001)
+        threads = [threading.Thread(target=count_for_test, name="CountTest") for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        hm.note("many threads", 0.5)
+        row = hm.take_work()["many threads"]
+        self.assertEqual(row[0], 4001, "every count from every thread is there")
+        self.assertAlmostEqual(row[2], 0.5)
+        self.assertEqual(row[3], 1, "only the screen thread's run is the screen thread's")
+        self.assertEqual(row[6]["CountTest"], 4000, "runs by thread family")
+
+    def test_a_lock_keeps_where_it_was_taken_as_code_and_line(self):
+        hm = self.hm
+        lock = hm.WatchedLock(threading.Lock(), "place test lock")
+        with lock:
+            self.assertIsInstance(lock._taken_at, tuple, "no text is made while the lock is taken")
+            self.assertIn("test_a_lock_keeps_where_it_was_taken_as_code_and_line (test_suite.py:", lock.held_now()[2])
 
     def _monitor(self):
         hm = self.hm
@@ -19003,7 +20328,7 @@ class TestChannelLoadsFollowTheScreen(unittest.TestCase):
 
 
 class TestBreakCountRule(unittest.TestCase):
-    """A break every half hour and one at the end: under 15 min unpaired 1 (at the end), under an hour 2, 80 min 3 at 26.7 and 53.3, spaced evenly, and the next show starts on a half-hour mark (owner 2026-11-03 09:55 to 09:59)"""
+    """Under 15 min unpaired 1 break (at the end), up to 75 min 2 (halves), then a cut at every 30 minutes of show time that leaves 15 minutes or more, and one at the end: 80 min 3 at 30 and 60; the next show starts on a half-hour mark (owner 2026-11-06, replacing 2026-11-03)"""
 
     def _layout(self, minutes, count=4):
         old = media.resolve_track_duration
@@ -19033,7 +20358,7 @@ class TestBreakCountRule(unittest.TestCase):
 
     def test_break_counts_and_places(self):
         for minutes, breaks, first_cuts in ((11, 1, []), (22, 2, [660]), (45, 2, [1350]), (55, 2, [1650]), (58, 2, [1740]),
-                                            (61, 3, None), (80, 3, [1600, 3200]), (88, 3, None), (95, 4, None), (118, 4, None)):
+                                            (61, 2, None), (70, 2, None), (80, 3, [1800, 3600]), (88, 3, [1800, 3600]), (95, 3, [1800, 3600]), (118, 4, [1800, 3600, 5400])):
             per_show, starts, cuts = self._layout(minutes)
             self.assertEqual(set(per_show.values()), {breaks}, "%s min: %s" % (minutes, per_show))
             if first_cuts is not None:
@@ -19045,7 +20370,8 @@ class TestBreakCountRule(unittest.TestCase):
         src = read(os.path.join(ROOT, "media.py"))
         self.assertNotIn("_pack_even_interior_breaks", src)
         self.assertNotIn("_ceil_div", src)
-        self.assertIn("return max(2, int(-(-int(show_dur) // HALF_HOUR)))", src)
+        self.assertIn("return max(2, _interior_cut_count(show_dur) + 1)", src)
+        self.assertIn("return max(0, (int(show_dur) - 900) // HALF_HOUR)", src)
 
 
 class TestResetPopupAndButton(unittest.TestCase):
@@ -19134,8 +20460,8 @@ class TestAllSettingsCoversSplashAndBezels(unittest.TestCase):
         self.assertIn("            else:\n                idx = 0", path_fn, "handhelds their own frame")
 
 
-class TestToolsAreRememberedNotCopied(unittest.TestCase):
-    """Cores, BIOS, splash screens, the menu background and watermarks are remembered where they sit; nothing is copied and clears only forget (owner 2026-11-03)"""
+class TestCoresAndBiosAreCopiedIntoConsoleFolders(unittest.TestCase):
+    """Cores and BIOS are copied into each console's own folder and the clear buttons delete only those copies (owner 2026-11-05, reversing 2026-11-03 for these two); splash screens, the menu background and watermarks are still remembered where they sit"""
 
     def _deck_with(self, tmp, cfg):
         import json as _json
@@ -19145,24 +20471,33 @@ class TestToolsAreRememberedNotCopied(unittest.TestCase):
             _json.dump(cfg, fh)
         return gd, types.SimpleNamespace(config_path=cfg_path, cores_dir=os.path.join(tmp, "main", "cores"))
 
-    def test_scan_for_cores_copies_nothing_and_remembers_the_full_path(self):
+    def test_scan_for_cores_copies_each_core_into_its_consoles_folder_and_remembers_the_copy(self):
         import json as _json
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "elsewhere", "cores")
             os.makedirs(src)
-            for name in ("snes9x_libretro.dll", "bsnes_libretro.dll"):
-                open(os.path.join(src, name), "wb").close()
+            for name in ("snes9x_libretro.dll", "bsnes_libretro.dll", "genesis_plus_gx_libretro.dll"):
+                with open(os.path.join(src, name), "wb") as fh:
+                    fh.write(name.encode())
             gd, deck = self._deck_with(tmp, {"NES_mapping": {"A": 1}})
             deck._assign_default_cores_after_scan = lambda found: gd.ExternalGameDeck._assign_default_cores_after_scan(deck, found)
             results, _bad = gd.ExternalGameDeck.bulk_scan_for_cores(deck, os.path.join(tmp, "elsewhere"))
-            self.assertFalse(os.path.exists(deck.cores_dir), "nothing is copied into main\\cores")
+            snes = os.path.join(deck.cores_dir, "SNES")
+            self.assertEqual(sorted(os.listdir(snes)), ["bsnes_libretro.dll", "snes9x_libretro.dll"], "each console's own folder holds its cores")
+            for console in ("GENESIS", "MASTERSYSTEM", "GG"):
+                self.assertTrue(os.path.isfile(os.path.join(deck.cores_dir, console, "genesis_plus_gx_libretro.dll")), "a core that plays several consoles is sorted into each of their folders: " + console)
+            self.assertTrue(os.path.isfile(os.path.join(src, "snes9x_libretro.dll")), "the originals are never touched")
+            self.assertEqual(len(deck.last_scan_copies), 5, deck.last_scan_copies)
             with open(deck.config_path, encoding="utf-8") as fh:
                 cfg = _json.load(fh)
-            self.assertTrue(os.path.isabs(cfg["SNES"]) and os.path.dirname(cfg["SNES"]) == src, cfg)
+            self.assertEqual(cfg["SNES"], os.path.join(snes, "snes9x_libretro.dll"), "the best core is remembered as its copy in the console's folder")
             self.assertEqual(cfg["NES_mapping"], {"A": 1}, "controller maps in the same file are kept")
             self.assertEqual(results["SNES"], (2, 1))
             results, _bad = gd.ExternalGameDeck.bulk_scan_for_cores(deck, os.path.join(tmp, "elsewhere"))
             self.assertEqual(results["SNES"], (2, 0), "a console whose core is still there keeps it")
+            self.assertEqual(deck.last_scan_copies, [], "a second scan copies nothing again")
+            results, _bad = gd.ExternalGameDeck.bulk_scan_for_cores(deck, deck.cores_dir)
+            self.assertEqual(deck.last_scan_copies, [], "scanning the cores folder itself copies nothing")
 
     def test_a_missing_remembered_core_is_replaced_by_the_next_scan(self):
         import json as _json
@@ -19200,17 +20535,195 @@ class TestToolsAreRememberedNotCopied(unittest.TestCase):
         self.assertIn("create_system_dir = False", build, "no folder is made next to the user's BIOS")
         self.assertIn('_bios_choice = os.path.basename(bios_path) if bios_path else "HLE"', build)
 
-    def test_picks_remember_and_never_copy(self):
+    def test_core_and_bios_picks_copy_into_the_console_folder_and_the_rest_are_remembered_where_they_sit(self):
         close = get_function_source("_fe_close")
         self.assertNotIn("copy2", close)
         self.assertNotIn("_fe_delete_old_managed_asset", MAIN_SRC, "a replaced pick is never deleted from disk")
-        self.assertIn("cfg[ck] = os.path.abspath(chosen)", close)
+        self.assertIn("cfg[ck] = os.path.abspath(_copy_tool_for_console(chosen, ck, False))", close)
         self.assertIn('db.config["menu_bg_path"] = dest', close)
         self.assertIn('_wm_channel_info["watermark_path"] = dest', close)
         bios = get_function_source("_fe_apply_bios_selection")
+        self.assertIn("_copy_tool_for_console(os.path.abspath(checked[0]), ck, True)", bios)
         self.assertIn('db.config.setdefault("active_bios", {})[ck] = picked', bios)
-        self.assertNotIn("copy", bios)
+        self.assertIn("_record_tool_copies(_scan_copies)", close)
         self.assertIn('"add_bios"', MAIN_SRC[MAIN_SRC.index("_FE_SINGLE_PICK_MODES = {"):MAIN_SRC.index("}", MAIN_SRC.index("_FE_SINGLE_PICK_MODES = {"))])
+
+    def _tool_ns(self, tmp, config):
+        main = os.path.join(tmp, "main")
+        saved = []
+        db = types.SimpleNamespace(config=config, save_settings=lambda: saved.append(1), save_settings_async=lambda: saved.append(1))
+        ns = {"os": os, "re": re, "log": types.SimpleNamespace(warning=lambda *a: None, info=lambda *a: None), "game_deck": None, "db": db,
+              "_log_swallowed": lambda *a: None, "base_dir": tmp, "resolve_main_dir": lambda: main, "print": lambda *a, **k: None}
+        for name in ("_read_emulator_config", "_write_emulator_config", "_tool_copy_paths", "_tool_copy_is_bios", "_record_tool_copies", "_copy_tool_for_console",
+                     "_delete_tool_copies", "_execute_clear_all_cores", "_execute_clear_all_bios", "_any_cores_exist", "_any_bios_exist"):
+            exec(compile(get_function_source(name), name, "exec"), ns)
+        return ns, db, main, saved
+
+    def test_copy_tool_into_copies_once_and_never_touches_the_original(self):
+        import game_deck as gd
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "mine", "snes9x_libretro.dll")
+            os.makedirs(os.path.dirname(src))
+            with open(src, "wb") as fh:
+                fh.write(b"ONE")
+            dest_dir = os.path.join(tmp, "main", "cores", "SNES")
+            kept, made = gd.copy_tool_into(src, dest_dir)
+            self.assertEqual((kept, made), (os.path.join(dest_dir, "snes9x_libretro.dll"), True))
+            with open(kept, "rb") as fh:
+                self.assertEqual(fh.read(), b"ONE")
+            self.assertTrue(os.path.isfile(src), "the original stays")
+            self.assertEqual(gd.copy_tool_into(src, dest_dir), (kept, False), "the same file is not copied again")
+            self.assertEqual(gd.copy_tool_into(kept, dest_dir), (kept, False), "a file already in the folder is remembered as it is, so picking another file there switches the live one")
+            with open(src, "wb") as fh:
+                fh.write(b"TWO")
+            self.assertEqual(gd.copy_tool_into(src, dest_dir), (kept, True), "a newer file with the same name replaces the copy")
+            with open(kept, "rb") as fh:
+                self.assertEqual(fh.read(), b"TWO")
+            self.assertEqual([n for n in os.listdir(dest_dir) if n.endswith(".copying")], [], "no half-written copy is left behind")
+
+    def test_a_copy_is_never_read_only_and_a_read_only_copy_can_still_be_cleared(self):
+        """Owner 2026-11-05 07:30: a new build could not replace the app folder (Access is denied on a file inside it); copy2 carries a read-only flag over, and Windows will not delete such a file"""
+        import stat
+        import game_deck as gd
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "mine", "scph5501.bin")
+            os.makedirs(os.path.dirname(src))
+            with open(src, "wb") as fh:
+                fh.write(b"BIOS")
+            os.chmod(src, stat.S_IREAD)
+            kept, made = gd.copy_tool_into(src, os.path.join(tmp, "main", "cores", "PSX", "system"))
+            self.assertTrue(made)
+            self.assertTrue(os.stat(kept).st_mode & stat.S_IWRITE, "the copy is writable even when the original is read-only")
+            os.chmod(src, stat.S_IWRITE)
+            ns, db, main, saved = self._tool_ns(tmp, {})
+            old_copy = os.path.join(main, "cores", "PSX", "system", "old.bin")
+            os.makedirs(os.path.dirname(old_copy), exist_ok=True)
+            with open(old_copy, "wb") as fh:
+                fh.write(b"x")
+            os.chmod(old_copy, stat.S_IREAD)
+            db.config["old_tool_copies"] = [old_copy]
+            calls = []
+            fake_os = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith("_")})
+            fake_os.chmod = lambda path, mode: (calls.append((path, mode)), os.chmod(path, mode))[1]
+            ns["os"] = fake_os
+            self.assertEqual(ns["_delete_tool_copies"](True), (1, 0))
+            self.assertEqual(calls, [(os.path.abspath(old_copy), stat.S_IREAD | stat.S_IWRITE)], "the read-only flag is cleared before the file is deleted")
+            self.assertFalse(os.path.exists(old_copy))
+
+    def test_a_picked_core_and_bios_go_into_the_console_folders_and_are_listed_as_the_apps_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns, db, main, saved = self._tool_ns(tmp, {})
+            core = os.path.join(tmp, "elsewhere", "pcsx_rearmed_libretro.dll")
+            bios = os.path.join(tmp, "elsewhere", "scph5501.bin")
+            os.makedirs(os.path.dirname(core))
+            for path in (core, bios):
+                with open(path, "wb") as fh:
+                    fh.write(os.path.basename(path).encode())
+            kept_core = ns["_copy_tool_for_console"](core, "PSX", False)
+            kept_bios = ns["_copy_tool_for_console"](bios, "PSX", True)
+            self.assertEqual(kept_core, os.path.join(main, "cores", "PSX", "pcsx_rearmed_libretro.dll"))
+            self.assertEqual(kept_bios, os.path.join(main, "cores", "PSX", "system", "scph5501.bin"))
+            self.assertEqual(sorted(db.config["old_tool_copies"]), sorted([kept_core, kept_bios]), "the copies are listed, which is the list Reset All Settings deletes")
+            self.assertEqual(ns["_copy_tool_for_console"](kept_core, "PSX", False), kept_core)
+            self.assertEqual(len(db.config["old_tool_copies"]), 2, "picking a file already in the folder adds nothing")
+            self.assertEqual(ns["_copy_tool_for_console"](bios, "NES", True), bios, "a console with no BIOS folder remembers the file where it sits")
+            os.makedirs(os.path.join(main, "cores"), exist_ok=True)
+            with open(os.path.join(main, "cores", "GBA"), "wb") as fh:
+                fh.write(b"in the way")
+            self.assertEqual(ns["_copy_tool_for_console"](core, "GBA", False), core, "a copy that fails is remembered where the file sits")
+
+    def test_clear_cores_forgets_and_deletes_only_the_apps_copies(self):
+        import json as _json
+        import game_deck as gd
+        with tempfile.TemporaryDirectory() as tmp:
+            ns, db, main, saved = self._tool_ns(tmp, {})
+            snes = os.path.join(main, "cores", "SNES")
+            os.makedirs(snes)
+            made = os.path.join(snes, "snes9x_libretro.dll")
+            by_hand = os.path.join(snes, "placed_by_hand_libretro.dll")
+            elsewhere = os.path.join(tmp, "mine", "fceumm_libretro.dll")
+            outside = os.path.join(tmp, "important", "keep.dll")
+            os.makedirs(os.path.dirname(elsewhere))
+            os.makedirs(os.path.dirname(outside))
+            for path in (made, by_hand, elsewhere, outside):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+            db.config["old_tool_copies"] = [made, outside]
+            cfg_path = os.path.join(tmp, "emulator_config.json")
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                _json.dump({"SNES": made, "NES": elsewhere, "SNES_mapping": {"A": 1}, "PSX_xinput_map": {"X": "A"}}, fh)
+            old = gd.resolve_emulator_config_path
+            gd.resolve_emulator_config_path = lambda: cfg_path
+            try:
+                self.assertTrue(ns["_any_cores_exist"]())
+                ns["_execute_clear_all_cores"]()
+                self.assertFalse(ns["_any_cores_exist"]())
+            finally:
+                gd.resolve_emulator_config_path = old
+            self.assertFalse(os.path.exists(made), "the core the app copied is deleted")
+            self.assertTrue(os.path.isfile(by_hand), "a core placed in the folder by hand is not")
+            self.assertTrue(os.path.isfile(elsewhere), "a core kept anywhere else is not")
+            self.assertTrue(os.path.isfile(outside), "a listed file outside main/cores is never deleted")
+            self.assertEqual(db.config["old_tool_copies"], [outside])
+            with open(cfg_path, encoding="utf-8") as fh:
+                self.assertEqual(_json.load(fh), {"SNES_mapping": {"A": 1}, "PSX_xinput_map": {"X": "A"}}, "controller maps survive Clear Cores")
+            self.assertTrue(saved, "the list is saved")
+
+    def test_clear_bios_forgets_and_deletes_only_the_apps_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns, db, main, saved = self._tool_ns(tmp, {})
+            system = os.path.join(main, "cores", "PSX", "system")
+            os.makedirs(system)
+            made = os.path.join(system, "scph5501.bin")
+            by_hand = os.path.join(system, "scph1001.bin")
+            core = os.path.join(main, "cores", "PSX", "pcsx_rearmed_libretro.dll")
+            for path in (made, by_hand, core):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+            db.config["old_tool_copies"] = [made, core]
+            db.config["active_bios"] = {"PSX": made}
+            self.assertTrue(ns["_any_bios_exist"]())
+            ns["_execute_clear_all_bios"]()
+            self.assertFalse(ns["_any_bios_exist"]())
+            self.assertFalse(os.path.exists(made), "the BIOS the app copied is deleted")
+            self.assertTrue(os.path.isfile(by_hand), "a BIOS placed in the folder by hand is not")
+            self.assertTrue(os.path.isfile(core), "Clear BIOS leaves the cores alone")
+            self.assertEqual(db.config["active_bios"], {})
+            self.assertEqual(db.config["old_tool_copies"], [core])
+            real_remove = os.remove
+            locked = os.path.join(system, "locked.bin")
+            with open(locked, "wb") as fh:
+                fh.write(b"x")
+            db.config["old_tool_copies"] = [locked]
+
+            def refuse(path):
+                raise PermissionError("in use")
+            ns["os"] = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith("_")})
+            ns["os"].remove = refuse
+            self.assertEqual(ns["_delete_tool_copies"](True), (0, 1))
+            self.assertEqual(db.config["old_tool_copies"], [locked], "a file that could not be deleted stays on the list")
+            self.assertTrue(os.path.isfile(locked))
+            self.assertIs(os.remove, real_remove)
+
+    def test_reset_all_settings_deletes_the_same_copies_the_clear_buttons_do(self):
+        _reset = get_function_source("_execute_system_reset_all_settings")
+        self.assertIn('"old_tool_copies": list(db.config.get("old_tool_copies", []) or [])', _reset)
+        _wipe = get_function_source("_wipe_saved_data_for_fresh_start")
+        self.assertIn('request.get("old_tool_copies", [])', _wipe)
+        self.assertIn("are ever deleted from this list", _wipe)
+        _fe = get_function_source("_fe_close")
+        self.assertIn("_record_tool_copies(_scan_copies)", _fe)
+
+    def test_clear_bios_is_a_button_next_to_clear_cores(self):
+        rows = ui.get_games_sub_menu_rows(None, {}, "MENU", True)
+        self.assertEqual(rows.index("clear_bios"), rows.index("clear_cores") + 1)
+        _ui = inspect.getsource(ui)
+        self.assertIn('"clear_bios": "CLEAR ALL BIOS?"', _ui)
+        self.assertIn('"clear_bios":   "CLEAR BIOS"', _ui)
+        self.assertIn('getattr(_main, "_any_bios_exist", None)', _ui)
+        self.assertIn('elif row_id == "clear_bios":', MAIN_SRC)
+        self.assertIn('elif _cc_target == "clear_bios":\n                            _execute_clear_all_bios()', MAIN_SRC)
+        self.assertIn("clear_bios", mn.GAMES_SUB_MENU_LEFT)
 
     def test_the_explorer_never_deletes_from_disk(self):
         for gone in ("def _fe_delete_selected_files", "def _fe_managed_delete_dir", "def _fe_in_managed_delete_dir",
@@ -19222,31 +20735,6 @@ class TestToolsAreRememberedNotCopied(unittest.TestCase):
         wm = get_function_source("_channel_watermark_path")
         self.assertLess(wm.index('get("watermark_path", "")'), wm.index("os.listdir(WATERMARK_BASE_DIR)"),
                         "the remembered image comes first; a watermark.png placed in the channel folder by hand still works")
-
-    def test_clear_cores_only_forgets(self):
-        import json as _json
-        import game_deck as gd
-        with tempfile.TemporaryDirectory() as tmp:
-            dll = os.path.join(tmp, "snes9x_libretro.dll")
-            open(dll, "wb").close()
-            cfg_path = os.path.join(tmp, "emulator_config.json")
-            with open(cfg_path, "w", encoding="utf-8") as fh:
-                _json.dump({"SNES": dll, "SNES_mapping": {"A": 1}, "PSX_xinput_map": {"X": "A"}}, fh)
-            ns = {"os": os, "log": types.SimpleNamespace(warning=lambda *a: None), "game_deck": None,
-                  "_log_swallowed": lambda *a: None}
-            for name in ("_read_emulator_config", "_write_emulator_config", "_execute_clear_all_cores", "_any_cores_exist"):
-                exec(compile(get_function_source(name), name, "exec"), ns)
-            old = gd.resolve_emulator_config_path
-            gd.resolve_emulator_config_path = lambda: cfg_path
-            try:
-                self.assertTrue(ns["_any_cores_exist"]())
-                ns["_execute_clear_all_cores"]()
-                self.assertFalse(ns["_any_cores_exist"]())
-            finally:
-                gd.resolve_emulator_config_path = old
-            self.assertTrue(os.path.isfile(dll), "the core file is not deleted")
-            with open(cfg_path, encoding="utf-8") as fh:
-                self.assertEqual(_json.load(fh), {"SNES_mapping": {"A": 1}, "PSX_xinput_map": {"X": "A"}}, "controller maps survive Clear Cores")
 
     def test_old_copies_are_remembered_once_at_boot(self):
         import json as _json
@@ -19724,7 +21212,8 @@ def suite_failure_point_text():
     with tempfile.TemporaryDirectory() as folder:
         reported = []
         report_ns = {
-            "os": os, "sys": sys, "datetime": __import__("datetime"),
+            "os": os, "sys": type("_SysWithTheScriptPath", (), {"argv": [MAIN_SCRIPT], "__getattr__": lambda self, name: getattr(sys, name)})(),
+            "datetime": __import__("datetime"),
             "_log_output_dir": lambda: folder,
             "broadcast_clock": types.SimpleNamespace(now=lambda: __import__("datetime").datetime(2026, 10, 16, 19, 0, 0)),
             "_boot_environment_text": "OS=TestOS | CPU cores=8 | RAM=16.0GB total | Process=64-bit",
@@ -19759,7 +21248,7 @@ def suite_failure_point_text():
               "only the latest warning and error lines are kept, up to the line limit")
         check("=== app_log.txt health report" in text and "[HEALTH CPU] report 3" in text and "[HEALTH CPU] report 2" in text
               and "[HEALTH CPU] report 1" not in text, "the latest health report lines are kept, up to their own limit")
-        check(not reported, "a good report logs no failure of its own")
+        check(not reported, "a good report logs no failure of its own (%r)" % (reported,))
         report_ns["_log_output_dir"] = lambda: os.path.join(folder, "missing", "deeper")
         report_ns["_write_tester_report"]("again")
         check(len(reported) == 1 and "tester_report" in reported[0][0], "a report that cannot be written logs one failure line instead of raising")
@@ -19789,7 +21278,7 @@ class TestFailurePointText(_SectionCase):
 
 
 def suite_failure_point_text_game_deck():
-    converted_handler_checks("game_deck.py", 55)
+    converted_handler_checks("game_deck.py", 54)
     path = os.path.join(ROOT, "game_deck.py")
     module = load_deck_module(path, "game_deck_failure_text")
     check(module._log_swallowed is gov.log_swallowed, "game_deck uses the one shared helper from performance_governor.py")
@@ -19825,7 +21314,7 @@ class TestFailurePointTextGameDeck(_SectionCase):
 
 
 def suite_failure_point_text_other_scripts():
-    for name, expected in (("media.py", 33), ("performance_governor.py", 8), ("ui.py", 11), ("libretro_core.py", 5), ("media_library.py", 32)):
+    for name, expected in (("media.py", 33), ("performance_governor.py", 8), ("ui.py", 12), ("libretro_core.py", 5), ("media_library.py", 30)):
         converted_handler_checks(name, expected)
     check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
 
@@ -19873,7 +21362,7 @@ def suite_schedule_mode_commit_hold():
 
     ns = {"pygame": pg, "app_state": state, "menu_nav": mn, "db": _Db(), "log": _Log(),
           "_SCHEDULE_MODE_COMMIT_HOLD_MS": gov.SCHEDULE_MODE_COMMIT_HOLD_MS,
-          "_apply_scheduling_mode_change": fake_apply}
+          "_apply_scheduling_mode_change": fake_apply, "_replan_hub_future_soon": lambda ch: None}
     request = load_function("_request_scheduling_mode", ns)
     commit = load_function("_commit_requested_scheduling_modes", ns)
     ch = channels["05"]
@@ -19985,7 +21474,7 @@ def suite_schedule_rebuild_in_flight():
     check(gov.SCHEDULE_MODE_STOP_POINTS_KEPT == 3, "the number of stopping points kept per channel is 3 in the governor table")
     check("_SCHEDULE_MODE_STOP_POINTS_KEPT = performance_governor.SCHEDULE_MODE_STOP_POINTS_KEPT if performance_governor is not None else 3" in MAIN_SRC,
           "the main script reads the number from the governor table and its fallback matches")
-    check("@_sched_rebuild_guard\ndef calculate_slotted_playback_state(" in MAIN_SRC, "the scheduler entry point runs inside the in-flight guard")
+    check("@_sched_rebuild_guard\ndef _scheduler_playback_state(" in MAIN_SRC, "the scheduler entry point runs inside the in-flight guard")
     check(MAIN_SRC.count("@_sched_rebuild_guard") == 1, "only the scheduler entry point is guarded")
 
     seen = []
@@ -21413,14 +22902,14 @@ class TestHolidayForceToggle(unittest.TestCase):
             for seconds in (30, 600, 1610):
                 clock[0] = start + datetime.timedelta(seconds=seconds)
                 ticks[0] += 10000
-                seen.append(ns["calculate_slotted_playback_state"]("05"))
+                seen.append(ns["_scheduler_playback_state"]("05"))
             state["value"] = "Ended"
             clock[0] = start + datetime.timedelta(seconds=1622)
             ticks[0] += 10000
-            after = ns["calculate_slotted_playback_state"]("05")
+            after = ns["_scheduler_playback_state"]("05")
             clock[0] = start + datetime.timedelta(seconds=1922)
             ticks[0] += 10000
-            later = ns["calculate_slotted_playback_state"]("05")
+            later = ns["_scheduler_playback_state"]("05")
         return airing, seen, after, later
 
     def test_a_forced_holiday_waits_for_the_airing_show_to_end(self):
@@ -21608,7 +23097,7 @@ class TestHolidayFilesAreScanned(unittest.TestCase):
 
     def test_the_holiday_item_reaches_every_scan_lane_through_the_one_pipeline(self):
         order = {}
-        ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch))}
+        ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch)), "_season_seeds_first": lambda items: items}
         exec(main_function_code("_order_scan_pipeline"), ns)
         out = ns["_order_scan_pipeline"]([[], [], [], []], [("channel", "05", "halloween", "/m/h.mkv")])
         self.assertEqual(out, [(3, 4, "channel", "05", "halloween", "/m/h.mkv")])
@@ -21748,7 +23237,7 @@ def _holiday_run(channel, start, steps, step_seconds, stale_path=None, stale_at=
                 ns["db"].config["holiday_force_channels"] = ["05"] if force else []
                 wire(ns)
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                out.append((clock[0], ns["calculate_slotted_playback_state"]("05")))
+                out.append((clock[0], ns["_scheduler_playback_state"]("05")))
     return channel, out
 
 
@@ -21909,7 +23398,7 @@ def _holiday_truth_run(channel, start, steps, step_seconds, snapshot_at=None):
         for i in range(steps):
             clock[0] = start + datetime.timedelta(seconds=i * step_seconds)
             ticks[0] += 10000
-            ns["calculate_slotted_playback_state"]("05")
+            ns["_scheduler_playback_state"]("05")
             for h_log in (channel.get("holiday_playback_log") or {}).values():
                 block_key = h_log.get("block_key")
                 if block_key and h_log.get("timeline"):
@@ -24056,16 +25545,11 @@ class TestOpenRetryBannerAndGrey(_SectionCase):
 
 def suite_pending_probe_priority_and_pacing():
     """The pending probe takes every channel's next file before any channel's second; the backlog is paced and stands down under load."""
-    check(gov.PENDING_PROBE_URGENT_COUNT == 4 and gov.PENDING_BACKLOG_INTERVAL_SECONDS == 1.5,
-          "the governor holds the urgent count and backlog spacing")
-    check(gov.pending_backlog_interval_seconds() >= gov.PENDING_BACKLOG_INTERVAL_SECONDS,
-          "the backlog spacing is never below the base interval")
-    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True):
-        calm = gov.pending_backlog_interval_seconds()
-        check(gov.pending_backlog_allowed(), "backlog may run when the load level is low")
-    with mock.patch.object(gov, "current_level", lambda: 3), mock.patch.object(gov, "enforcing", lambda: True):
-        check(not gov.pending_backlog_allowed(), "backlog stands down when the PC is under load")
-        check(gov.pending_backlog_interval_seconds() > calm, "backlog spacing stretches under load")
+    check(gov.PENDING_PROBE_URGENT_COUNT == 4, "the governor holds the urgent count")
+    check(not hasattr(gov, "pending_backlog_interval_seconds") and not hasattr(gov, "PENDING_BACKLOG_INTERVAL_SECONDS"),
+          "the unused backlog spacing is gone")
+    check(not hasattr(gov, "pending_backlog_allowed") and not hasattr(gov, "PENDING_BACKLOG_MAX_LEVEL"),
+          "the load-level limit on the backlog is gone")
     src = read(MAIN_SCRIPT)
     check("_pending_backlog_may_run" in src and "rank < _PENDING_PROBE_URGENT_COUNT" in src,
           "the worker ranks files and paces the backlog")
@@ -24073,15 +25557,13 @@ def suite_pending_probe_priority_and_pacing():
           "_scan_rank": lambda c, t=0: (c, t), "SCAN_CLASS_DEEP": 3}
     exec(main_function_code("_pending_backlog_may_run"), ns)
     media._LIVE_PLAYBACK_PRIORITY.clear()
-    with mock.patch.object(gov, "pending_backlog_allowed", lambda: True), \
-            mock.patch.object(gov, "pending_backlog_interval_seconds", lambda mode=None: 2.0):
-        check(ns["_pending_backlog_may_run"]({"last_backlog": 0.0}, 100.0), "backlog runs once the spacing has passed")
-        check(not ns["_pending_backlog_may_run"]({"last_backlog": 99.0}, 100.0), "backlog waits inside the spacing")
-        media._LIVE_PLAYBACK_PRIORITY.set()
-        try:
-            check(not ns["_pending_backlog_may_run"]({"last_backlog": 0.0}, 100.0), "backlog waits while a live open is in flight")
-        finally:
-            media._LIVE_PLAYBACK_PRIORITY.clear()
+    check(ns["_pending_backlog_may_run"]({"last_backlog": 0.0}, 100.0), "backlog runs when nothing is paused")
+    check(ns["_pending_backlog_may_run"]({"last_backlog": 99.0}, 100.0), "backlog never waits for a spacing between files")
+    media._LIVE_PLAYBACK_PRIORITY.set()
+    try:
+        check(not ns["_pending_backlog_may_run"]({"last_backlog": 0.0}, 100.0), "backlog waits while a live open is in flight")
+    finally:
+        media._LIVE_PLAYBACK_PRIORITY.clear()
 
 
 class TestPendingProbePriorityAndPacing(_SectionCase):
@@ -24093,33 +25575,9 @@ class TestPendingProbePriorityAndPacing(_SectionCase):
 
 def suite_shared_scan_pacing():
     """One pacing rule for every scan: airing files run with no pause, the next 3 shows run fast, the files behind them run slower, and the pace follows playback, load, the PC, the mode and a quiet PC."""
-    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True), \
-            mock.patch.object(gov, "pc_is_quiet", lambda now=None: False):
-        check(gov.scan_pace_seconds("now", 1.0, playing=True) == 0.0, "a file airing now is scanned with no pause")
-        nxt = gov.scan_pace_seconds("next", 1.0)
-        deep = gov.scan_pace_seconds("deep", 1.0)
-        check(0 < nxt < deep, "the next shows are scanned faster than the files behind them (%.2f < %.2f)" % (nxt, deep))
-        check(gov.scan_pace_seconds("deep", 1.0, playing=True) > deep, "the deep pace slows while a show plays")
-        check(gov.scan_pace_seconds("next", 1.0, playing=True) < gov.scan_pace_seconds("deep", 1.0, playing=True),
-              "while a show plays the next shows still go faster than the deep files")
-        check(gov.scan_pace_seconds("next", 1.0, guide_open=True) > nxt, "the guide being open slows the scans")
-    with mock.patch.object(gov, "current_level", lambda: 3), mock.patch.object(gov, "enforcing", lambda: True), \
-            mock.patch.object(gov, "pc_is_quiet", lambda now=None: False):
-        check(gov.scan_pace_seconds("deep", 1.0) > deep, "a busy PC stretches the pace")
-    with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True), \
-            mock.patch.object(gov, "pc_is_quiet", lambda now=None: True):
-        check(gov.scan_pace_seconds("deep", 1.0) < deep, "a quiet PC speeds the scans back up")
-    weak = types.SimpleNamespace(tier="WEAK", effective_physical=2, logical_cores=4, gpu_tier="none")
-    strong = gov.build_profile(8, 0, 16, 32.0, 24.0)
-    paces = {}
-    for label, profile in (("weak", weak), ("strong", strong)):
-        with mock.patch.object(gov, "current_level", lambda: 0), mock.patch.object(gov, "enforcing", lambda: True), \
-                mock.patch.object(gov, "pc_is_quiet", lambda now=None: False), mock.patch.object(gov, "get_profile", lambda p=profile: p), \
-                mock.patch.object(gov, "_limit_mode", lambda capability, mode: mode):
-            paces[label] = (gov.scan_pace_seconds("next", 1.0, mode="standard"), gov.scan_pace_seconds("next", 1.0, mode="lite"))
-    check(paces["weak"][0] > paces["strong"][0], "a weak PC waits longer between files")
-    check(paces["strong"][1] > paces["strong"][0], "Lite mode waits longer between files")
-
+    for gone in ("scan_pace_seconds", "SCAN_PACE_CLASS_MULTIPLIER", "SCAN_PACE_WHILE_PLAYING_MULTIPLIER", "SCAN_PACE_GUIDE_MULTIPLIER",
+                 "SCAN_PACE_WEAK_PC_MULTIPLIER", "SCAN_PACE_LITE_MODE_MULTIPLIER"):
+        check(not hasattr(gov, gone), "%s was removed with the owner's yes (V371)" % gone)
     throttle = gov.Throttle(16.6, name="quiet-test")
     calm = {"system_cpu_pct": 10.0, "busy_avg_ms": 4.0, "busy_worst_ms": 6.0}
     for t in range(0, 30):
@@ -24162,7 +25620,7 @@ def suite_shared_scan_threads():
         second = []
 
         def holder():
-            with gov.scan_thread_slot("duration") as ok:
+            with gov.scan_thread_slot("picture_box") as ok:
                 entered.set()
                 release.wait(5)
 
@@ -24176,18 +25634,18 @@ def suite_shared_scan_threads():
         t2 = threading.Thread(target=waiter)
         t2.start()
         time.sleep(0.6)
-        check(not second, "with one scan thread a second scan waits for the first")
+        check(not second, "with one scan place a second picture or sound scan waits for the first")
         released_at = time.monotonic()
         release.set()
         t1.join(5)
         t2.join(5)
-        check(second and second[0] >= released_at, "the waiting scan runs once the thread is free")
+        check(second and second[0] >= released_at, "and takes the place the moment it is free, with no time limit")
 
         hold = threading.Event()
         inside = threading.Event()
 
         def holder2():
-            with gov.scan_thread_slot("duration"):
+            with gov.scan_thread_slot("picture_box"):
                 inside.set()
                 hold.wait(5)
 
@@ -24215,7 +25673,7 @@ def suite_shared_scan_threads():
         t5 = threading.Thread(target=stopped_job)
         t5.start()
         t5.join(2)
-        check(got == [False], "a waiting scan gives up when the app shuts down")
+        check(got == [False], "no scan starts once the app is shutting down")
         hold.set()
         t3.join(5)
 
@@ -24810,7 +26268,7 @@ def suite_pending_signature():
     check(stored({}) == sig([]), "no saved signature means the same as nothing pending, as before")
     check(stored({"sched_pending_signature": []}) == sig([]), "an empty old list means nothing pending")
     check(stored({"sched_pending_signature": sig(paths)}) == sig(paths), "a saved fingerprint is read as it is")
-    body = main_function_source("calculate_slotted_playback_state")
+    body = main_function_source("_scheduler_playback_state")
     check("_stored_pending_signature(playback_log) != _pending_signature" in body and "tuple(sorted(" not in body.split("_pending_changed")[0][-400:],
           "the scheduler compares fingerprints, not full path lists")
 
@@ -24820,7 +26278,7 @@ def suite_pending_probe_once():
     ns = {"os": os, "time": time, "threading": threading, "db": mock.MagicMock(), "log": mock.MagicMock(),
           "_channel_is_server_streamed": lambda ch: False, "initialize_vlc_on_demand": lambda: None,
           "_governor_priority_scope": gov.priority_scope, "set_live_playback_priority": lambda on: None,
-          "performance_governor": gov, "_PENDING_SCHEDULE_PROBE_PARALLEL": 1, "_PENDING_PROBE_URGENT_COUNT": 4,
+          "performance_governor": gov, "_PENDING_SCHEDULE_PROBE_PARALLEL": 1, "_PENDING_PROBE_RESTORE_HOLD_SECONDS": 0.05, "_PENDING_PROBE_URGENT_COUNT": 4,
           "media": media, "_pending_backlog_may_run": lambda state, now_m: True}
     probed = []
     stored = []
@@ -25318,7 +26776,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.2.0", "build_info.py says 1.2.0 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.2.2", "build_info.py says 1.2.2 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -25331,7 +26789,7 @@ def suite_interior_cut_ends_on_clock():
     rows = []
     with patch.object(media, "_cached_path_exists", lambda p: True):
         clock[0] = start
-        first = ns["calculate_slotted_playback_state"]("05")
+        first = ns["_scheduler_playback_state"]("05")
         check(first.get("mode") == "Video" and first.get("interior_cut"), "the test channel opens the day on a cut part (%s)" % first)
         airing = first["file"]
         part_len = float(first["duration"])
@@ -25343,12 +26801,12 @@ def suite_interior_cut_ends_on_clock():
             ns["vlc"], ns["vlc_engine"] = None, None
             ns["app_state"].update({"_live_playback_channel": "", "is_playing_video": False})
             channel["playback_anchor"] = {}
-            on_clock = ns["calculate_slotted_playback_state"]("05")
+            on_clock = ns["_scheduler_playback_state"]("05")
             ns["vlc"], ns["vlc_engine"] = fake_vlc, types.SimpleNamespace(player=player)
             ns["app_state"].update({"_live_playback_channel": "05", "is_playing_video": True})
             channel["playback_anchor"] = {"file": airing, "wall_start": 0.0, "seek_offset": 0.0, "slot_start_seek": 0,
                                           "duration": part_len, "mode": "Video", "block": "Full Day", "interior_cut": True}
-            live = ns["calculate_slotted_playback_state"]("05")
+            live = ns["_scheduler_playback_state"]("05")
             rows.append((sec, on_clock, live))
     for sec, on_clock, live in rows:
         check((live.get("mode"), live.get("file"), round(live.get("seek", 0), 1)) == (on_clock.get("mode"), on_clock.get("file"), round(on_clock.get("seek", 0), 1)),
@@ -25357,7 +26815,7 @@ def suite_interior_cut_ends_on_clock():
                   on_clock.get("mode"), os.path.basename(str(on_clock.get("file"))), on_clock.get("seek", 0)))
     check(rows[2][2].get("mode") == "Commercial", "past the cut point the break airs, not the rest of the episode")
     check(rows[1][2].get("file") == airing and abs(rows[1][2].get("seek", 0) - (part_len - 30)) < 1.0, "before the cut point the part keeps playing")
-    body = get_function_source("calculate_slotted_playback_state")
+    body = get_function_source("_scheduler_playback_state")
     check("_part_ends_at_cut = bool(anchor.get(\"interior_cut\", False))" in body
           and "if (_is_live_ch and not _part_ends_at_cut" in body,
           "only a part that ends at a cut loses the still-playing hold; a whole file still finishes")
@@ -25374,7 +26832,7 @@ def suite_break_resumes_where_it_paused():
         for sec in range(0, 1400, 5):
             clock[0] = start + datetime.timedelta(seconds=sec)
             ticks[0] += 10000
-            st = ns["calculate_slotted_playback_state"]("05")
+            st = ns["_scheduler_playback_state"]("05")
             seen.append((sec, st.get("mode"), st.get("file"), float(st.get("seek", 0)), st.get("seek_slot_offset", 0)))
     episode = seen[0][2]
     part1 = [r for r in seen if r[2] == episode and r[4] == 0]
@@ -25415,8 +26873,8 @@ def suite_track_builds_kept_same_answers():
                 for clock, ticks in ((clock_a, ticks_a), (clock_b, ticks_b)):
                     clock[0] = start + datetime.timedelta(seconds=step)
                     ticks[0] += 10000
-                a = ns_fresh["calculate_slotted_playback_state"]("05")
-                b = ns_kept["calculate_slotted_playback_state"]("05")
+                a = ns_fresh["_scheduler_playback_state"]("05")
+                b = ns_kept["_scheduler_playback_state"]("05")
                 if a != b:
                     check(False, "%s at +%ds: kept build answers %s, a fresh build %s" % (cfg, step, b, a))
                     break
@@ -25525,8 +26983,9 @@ def suite_stages_b_to_f():
     check("[VIDEO DRAW]" in src and "_note_video_draw_timing(" in src, "N6: the TV picture's part times are logged")
     check("scaled.convert_alpha()" in get_function_source("_static_noise_frame"), "N6: the Static Noise pictures are kept in the screen's format")
     _noise = get_function_source("_apply_static_noise_effect")
-    check("len(pool[\"frames\"]) < max(1, int(_STATIC_NOISE_POOL_FRAMES))" in _noise and "frame.set_alpha(_static_noise_strength_alpha(severity))" in _noise,
-          "owner log 2026-11-03: the snow pictures are made once per screen size and only shown after that, the reception strength as their alpha")
+    check("len(pool[\"frames\"]) < max(1, int(_STATIC_NOISE_POOL_FRAMES))" in _noise and "_static_noise_strength_alpha(severity)" in _noise
+          and "_static_noise_baked_frame(" in _noise,
+          "owner log 2026-11-03: the snow pictures are made once per screen size and only shown after that, the reception strength baked into their own alpha (2026-11-04)")
     tl = {"_probe_block_timeline_cache": {"05": {"block_key": "b", "items": [
         {"path": "/c/ad1.mp4", "is_commercial": True, "start_time": 100}, {"path": "/s/E1.mkv", "start_time": 130},
         {"path": "/c/ad1.mp4", "is_commercial": True, "start_time": 900}, {"path": "/c/ad2.mp4", "is_commercial": True, "start_time": 930},
@@ -25722,7 +27181,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.2.0"""
+    """This build is 1.2.2"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -25788,6 +27247,328 @@ class TestBundleFreeze(_SectionCase):
 
     def test_bundle_freeze(self):
         self.run_section(suite_bundle_freeze)
+
+
+class TestCloseButtonMatchesEsc(unittest.TestCase):
+    """The Close row of a sub-menu must leave the highlight where Esc leaves it: on the item the person came from, never the first one."""
+
+    def test_games_sub_menu_close_keeps_the_console_highlighted(self):
+        text = read(MAIN_SCRIPT)
+        start = text.index('elif row_id == "close":\n                            # WARNING: Close must do what Esc does')
+        block = text[start:start + 400]
+        self.assertIn('app_state["menu_layer"] = "GAMES_LIST"', block)
+        self.assertNotIn('menu_selection_index"] = 0', block)
+
+    def test_esc_from_the_games_sub_menu_leaves_the_highlight_alone(self):
+        text = read(MAIN_SCRIPT)
+        start = text.index('"GAMES_SUB_MENU":       "GAMES_LIST"')
+        self.assertNotIn('_layer == "GAMES_SUB_MENU"', text[start:start + 6000].split("print(f\"[SETTINGS ENGINE] ESC: stepped back")[0])
+
+
+class TestTrackingLinesSweepWholeScreen(unittest.TestCase):
+    """Every rolling reception line starts above the top edge and ends below the bottom edge."""
+
+    def test_every_line_makes_one_full_sweep(self):
+        text = read(MAIN_SCRIPT)
+        start = text.index("def _spawn_tracking_line_batch")
+        block = text[start:start + 2600]
+        self.assertIn("y_start_frac = None\n", block)
+        self.assertNotIn("random.uniform(0.05, 0.85)", block)
+
+
+class TestBezelTitleRowAndStyleThree(unittest.TestCase):
+    def test_window_row_converts_to_picture_row(self):
+        import pygame as _pg
+        ns = {}
+        exec(get_function_source("_picture_row_of_window_row"), ns)
+        f = ns["_picture_row_of_window_row"]
+        geom = (_pg.Rect(0, 10, 1000, 800), 0.5, 0.5, 100, 60, 500, 400)
+        self.assertEqual(f(60, geom), 10)
+        self.assertEqual(f(160, geom), 210)
+        self.assertEqual(f(30, geom), -50)
+
+    def test_every_bezel_style_is_offered_and_style_three_has_a_number_window(self):
+        text = read(MAIN_SCRIPT)
+        self.assertNotIn("_real_screen_is_true_169(NATIVE_WIDTH", text)
+        self.assertNotIn('_bezel2_no_video', text)
+        import performance_governor as _pg2
+        self.assertIn("bezel2", _pg2.BEZEL_CHANNEL_LED_FRAC)
+        self.assertIn("bezel2", _pg2.BEZEL_LED_LISTED_ONLY)
+
+
+class TestHubInteriorCutAndRepeatStores(unittest.TestCase):
+    """Owner log 2026-11-06: ch08, ch18 and ch19 (shows cut from inside a longer file) always missed the hub, and the pending probe stored the same files again."""
+
+    def _hub(self):
+        import media_library
+        hub = media_library.shared_schedule_hub()
+        hub._show_facts = {}
+        return hub
+
+    def test_interior_cut_show_is_answered_by_the_hub(self):
+        hub = self._hub()
+        hub.remember_show_facts("08", {"mode": "Video", "file": "x", "seek": 2954.9, "duration": 1800.0,
+                                       "seek_slot_offset": 1800, "interior_cut": True}, 100.0, ("g",))
+        got = hub.show_facts("08", 110.0, ("g",))
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got["seek"], 2964.9)
+
+    def test_interior_cut_show_runs_out_at_the_slot_end(self):
+        hub = self._hub()
+        hub.remember_show_facts("08", {"mode": "Video", "file": "x", "seek": 2954.9, "duration": 1800.0,
+                                       "seek_slot_offset": 1800, "interior_cut": True}, 100.0, ("g",))
+        self.assertIsNone(hub.show_facts("08", 100.0 + 646.0, ("g",)))
+
+    def test_whole_file_show_is_unchanged(self):
+        hub = self._hub()
+        hub.remember_show_facts("06", {"mode": "Video", "file": "x", "seek": 0.0, "duration": 1500.0}, 100.0, ("g",))
+        self.assertIsNotNone(hub.show_facts("06", 200.0, ("g",)))
+        self.assertIsNone(hub.show_facts("06", 100.0 + 1500.0, ("g",)))
+
+    def test_governor_numbers_and_restore_hold_in_script(self):
+        import performance_governor as gov
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        self.assertEqual(gov.PENDING_SCHEDULE_PROBE_PARALLEL, 2)
+        self.assertIn("_PENDING_PROBE_RESTORE_HOLD_SECONDS", src)
+        self.assertIn('_stored_at[item[0]] = _now_store', src)
+
+
+class TestScanBarCountsOnlyRealScans(unittest.TestCase):
+    """Owner rule 2026-11-06: the bar counts a file only when its scans really finished; a guess does not register."""
+
+    def _ns(self, facts, box_known=True, guessed=()):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        i = src.index("def _scan_picture_box_finished")
+        j = src.index("def _scan_stages_pending")
+        ns = {"os": os, "media": media, "_read_file_probe_facts": lambda p: facts,
+              "_picture_box_guessed": set(guessed), "_scan_picture_box_known": lambda p, lk: box_known}
+        exec(compile(src[i:j], "<extracted>", "exec"), ns)
+        return ns
+
+    def test_all_three_real_scans_finish_a_file(self):
+        ns = self._ns({"duration": 1300.0, "gain": 1.2})
+        self.assertTrue(ns["_scan_file_is_finished"]("/m/a.mp4", False, [1]))
+
+    def test_missing_gain_or_length_is_not_finished(self):
+        self.assertFalse(self._ns({"duration": 1300.0})["_scan_file_is_finished"]("/m/a.mp4", False, [1]))
+        self.assertFalse(self._ns({"gain": 1.2})["_scan_file_is_finished"]("/m/a.mp4", False, [1]))
+
+    def test_missing_picture_box_is_not_finished(self):
+        ns = self._ns({"duration": 1300.0, "gain": 1.2}, box_known=False)
+        self.assertFalse(ns["_scan_file_is_finished"]("/m/a.mp4", False, [1]))
+
+    def test_full_frame_label_after_timeouts_is_not_finished(self):
+        ns = self._ns({"duration": 1300.0, "gain": 1.2}, guessed={"/m/a.mp4"})
+        self.assertFalse(ns["_scan_file_is_finished"]("/m/a.mp4", False, [1]))
+
+    def test_a_song_needs_only_length_and_gain(self):
+        ns = self._ns({"duration": 200.0, "gain": 0.9}, box_known=False)
+        self.assertTrue(ns["_scan_file_is_finished"]("/m/a.mp3", True, [1]))
+
+    def test_bar_source_uses_only_the_strict_test(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        i = src.index("def _compute_channel_scan_progress")
+        j = src.index("def _publish_channel_scan_progress")
+        self.assertIn("_scan_file_is_finished(", src[i:j])
+        self.assertNotIn("_scan_file_is_done(", src[i:j])
+
+
+class TestScanBarNeverGoesBack(unittest.TestCase):
+    """Owner rule 2026-11-06: a file that finished its last scan stays counted; rescans never take it off the bar."""
+
+    def test_done_files_stay_done_after_a_rescan(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        scanned = {os.path.normpath("/m/a.mp4")}
+        ns = {"os": os, "_scan_done_sticky": {}, "_paths_from_entry": lambda e: [e["path"]],
+              "_cached_path_exists": lambda p: True,
+              "_scan_file_is_finished": lambda p, mo, lk: os.path.normpath(p) in scanned}
+        i = src.index("def _compute_channel_scan_progress")
+        j = src.index("def _publish_channel_scan_progress")
+        exec(compile(src[i:j], "<extracted>", "exec"), ns)
+        snap = {"channels": {"05": {"ordered": [{"path": "/m/a.mp4"}, {"path": "/m/b.mp4"}], "commercials": [],
+                                    "is_visualizer": False}}}
+        self.assertEqual(ns["_compute_channel_scan_progress"](snap, [1])["05"], (1, 2))
+        scanned.clear()
+        self.assertEqual(ns["_compute_channel_scan_progress"](snap, [1])["05"], (1, 2))
+        scanned.add(os.path.normpath("/m/b.mp4"))
+        self.assertEqual(ns["_compute_channel_scan_progress"](snap, [1])["05"], (2, 2))
+        snap["channels"]["05"]["ordered"] = [{"path": "/m/b.mp4"}]
+        self.assertEqual(ns["_compute_channel_scan_progress"](snap, [1])["05"], (1, 1))
+
+
+class TestQuietPcLoudnessBonus(unittest.TestCase):
+    """Owner request 2026-11-06: while the PC is quiet the loudness lane runs one extra job, and only then."""
+
+    def setUp(self):
+        import performance_governor as gov
+        self.gov = gov
+        self.orig = gov.pc_is_quiet
+
+    def tearDown(self):
+        self.gov.pc_is_quiet = self.orig
+
+    def test_bonus_only_when_quiet_and_level_zero(self):
+        gov = self.gov
+        gov.pc_is_quiet = lambda now=None: False
+        plain = gov.lane_slots("loudness_and_bake", 0, gov.get_profile())
+        self.assertEqual(gov.quiet_lane_bonus("loudness_and_bake", 0), 0)
+        gov.pc_is_quiet = lambda now=None: True
+        self.assertEqual(gov.quiet_lane_bonus("loudness_and_bake", 0), 1)
+        self.assertEqual(gov.lane_slots("loudness_and_bake", 0, gov.get_profile()), plain + 1)
+        self.assertEqual(gov.quiet_lane_bonus("loudness_and_bake", 1), 0)
+        self.assertEqual(gov.lane_slots("loudness_and_bake", 1, gov.get_profile()), gov.lane_slots("loudness_and_bake", 1, gov.get_profile()))
+
+    def test_other_lanes_get_no_bonus(self):
+        gov = self.gov
+        gov.pc_is_quiet = lambda now=None: True
+        self.assertEqual(gov.quiet_lane_bonus("probe_and_duration", 0), 0)
+        self.assertEqual(gov.quiet_lane_bonus("cropdetect_threads", 0), 0)
+
+    def test_dispatch_workers_grow_by_one_when_quiet(self):
+        gov = self.gov
+        gov.pc_is_quiet = lambda now=None: False
+        calm_off = gov.loudness_dispatch_workers(False, 2)
+        gov.pc_is_quiet = lambda now=None: True
+        calm_on = gov.loudness_dispatch_workers(False, 2)
+        self.assertEqual(calm_on, min(2, calm_off + 1))
+        self.assertLessEqual(calm_on, 2)
+
+
+class TestSeasonGuesses(unittest.TestCase):
+    """Owner rule 2026-11-06: the first scanned episodes of a season set the length, loudness and picture box of the rest until each is scanned; a guess never counts as a finished scan."""
+
+    def _src(self):
+        return open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+
+    def _funcs(self, ns, *names):
+        src = self._src()
+        for name in names:
+            i = src.index("def %s(" % name)
+            j = src.index("\ndef ", i + 5)
+            exec(compile(src[i:j], "<extracted:%s>" % name, "exec"), ns)
+        return ns
+
+    def test_values_agree_only_with_enough_close_values(self):
+        self.assertIsNone(media.season_values_agree([1300.0], 90.0, 2))
+        self.assertAlmostEqual(media.season_values_agree([1300.0, 1340.0], 90.0, 2), 1320.0)
+        self.assertIsNone(media.season_values_agree([1300.0, 1500.0], 90.0, 2))
+        self.assertAlmostEqual(media.season_values_agree([-3.0, -1.5], 2.0, 2), -2.25)
+        self.assertIsNone(media.season_values_agree([-3.0, 0.0], 2.0, 2))
+
+    def test_length_guess_needs_two_close_scanned_episodes(self):
+        def run(lengths):
+            items = [{"path": "/tv/Show/Season 1/Show S01E%02d.mkv" % i, "duration": d} for i, d in enumerate(lengths, 1)]
+            items.append({"path": "/tv/Show/Season 1/Show S01E09.mkv", "duration": 0})
+            reads = {os.path.normpath(i["path"]): (i["duration"], media.DURATION_MEASURED) for i in items[:-1]}
+            orig_read, orig_save = media.read_track_duration, media._save_estimate
+            media.read_track_duration = lambda p, stored: reads.get(os.path.normpath(p), (0, media.DURATION_ESTIMATED if hasattr(media, "DURATION_ESTIMATED") else "estimated"))
+            media._save_estimate = lambda path, seconds, basis, replace=False: int(seconds)
+            try:
+                return media._series_duration_guesses(items, lambda p: True)
+            finally:
+                media.read_track_duration, media._save_estimate = orig_read, orig_save
+        close = run([1320, 1380])
+        self.assertEqual(list(close.values()), [1350])
+        self.assertEqual(run([1320, 1800]), {})
+        self.assertEqual(run([1320]), {})
+
+    def test_gain_guess_follows_agreeing_scanned_episodes(self):
+        for dbs, expect in (([-2.0, -3.0], True), ([-2.0, 1.0], False), ([-2.0], False)):
+            members = ["/s/e%d.mkv" % i for i in range(len(dbs) + 1)]
+            table = dict(zip(members[1:], dbs))
+            ns = {"media": media, "time": time, "threading": threading, "math": math,
+                  "SEASON_GUESS_MIN_SCANNED": 2, "SEASON_GUESS_GAIN_SPREAD_DB": 2.0, "SEASON_GUESS_CACHE_SECONDS": 30.0,
+                  "LOUDNESS_GAIN_CEILING": 4.0, "_season_guess_cache": {}, "_season_guess_lock": threading.Lock(),
+                  "_log_swallowed": lambda *a: None, "_get_gain_hub": lambda: object(), "_get_part_group_key": lambda p: None,
+                  "_get_library_gain": lambda p: None, "_gain_bundle_members": lambda p: members,
+                  "_gain_check_db": lambda hub, m: table.get(m), "_learned_series_offset": lambda p: 0}
+            self._funcs(ns, "_season_guess_cached", "_season_guess_gain")
+            got = []
+            worker = threading.Thread(target=lambda: got.append(ns["_season_guess_gain"]("/s/e0.mkv")))
+            worker.start()
+            worker.join()
+            if expect:
+                self.assertAlmostEqual(got[0], 10 ** (sum(dbs) / len(dbs) / 20.0), places=4)
+            else:
+                self.assertIsNone(got[0])
+
+    def test_picture_box_guess_needs_matching_boxes(self):
+        import media_library
+        ver = media_library.PICTURE_BOX_DETECTOR_VERSION
+
+        def box(rect, aspect=1.7778, reason="letterbox"):
+            return {"picture_box": {"reason": reason, "norm": rect, "picture_aspect": aspect, "frame": [640, 480], "pixel_aspect": 1.0}, "picture_box_detector_version": ver}
+
+        def run(boxes):
+            members = ["/s/e0.mkv"] + ["/s/e%d.mkv" % i for i in range(1, len(boxes) + 1)]
+            table = dict(zip(members[1:], boxes))
+
+            class Lib:
+                def get_cached(self, path):
+                    return table.get(path)
+
+            ns = {"media": media, "time": time, "threading": threading, "SEASON_GUESS_MIN_SCANNED": 2,
+                  "SEASON_GUESS_PICTURE_RECT_TOLERANCE": 0.02, "SEASON_GUESS_PICTURE_ASPECT_TOLERANCE": 0.02, "SEASON_GUESS_CACHE_SECONDS": 30.0,
+                  "_season_guess_cache": {}, "_season_guess_boxes": {}, "_season_guess_lock": threading.Lock(),
+                  "_log_swallowed": lambda *a: None, "_get_probe_library": lambda: Lib(), "_gain_bundle_members": lambda p: members}
+            self._funcs(ns, "_season_guess_cached", "_season_guess_picture_box")
+            got = []
+            worker = threading.Thread(target=lambda: got.append(ns["_season_guess_picture_box"]("/s/e0.mkv")))
+            worker.start()
+            worker.join()
+            return got[0], ns
+        same, ns = run([box([0.0, 0.12, 1.0, 0.76]), box([0.0, 0.125, 1.0, 0.755])])
+        self.assertTrue(same["guessed"])
+        self.assertIn("/s/e0.mkv", ns["_season_guess_boxes"])
+        self.assertIsNone(run([box([0.0, 0.12, 1.0, 0.76]), box([0.1, 0.0, 0.8, 1.0], reason="pillarbox")])[0])
+        self.assertIsNone(run([box([0.0, 0.12, 1.0, 0.76])])[0])
+
+    def test_season_seeds_go_first_in_the_backlog(self):
+        ns = {"media": media, "SEASON_GUESS_MIN_SCANNED": 2}
+        self._funcs(ns, "_season_seeds_first")
+        items = [("channel", "05", "Full Day", "/tv/Show/Season 1/Show S01E%02d.mkv" % i) for i in range(1, 6)]
+        items.append(("channel", "05", "Full Day", "/tv/Other/Season 2/Other S02E01.mkv"))
+        out = ns["_season_seeds_first"](items)
+        self.assertEqual([o[3] for o in out[:3]], [items[0][3], items[1][3], items[5][3]])
+        self.assertEqual(len(out), len(items))
+
+    def test_a_guess_never_stands_in_for_a_finished_scan(self):
+        src = self._src()
+        for name in ("_scan_file_is_done", "_scan_duration_reported", "_scan_loudness_reported", "_scan_picture_box_reported",
+                     "_scan_picture_box_known", "_pipeline_loudness_done", "_picture_box_scan_one_locked", "_pending_probe_worker"):
+            i = src.index("def %s(" % name) if ("def %s(" % name) in src else src.index("    def %s(" % name)
+            j = src.index("\ndef ", i + 5) if "\ndef " in src[i + 5:] else len(src)
+            self.assertNotIn("_season_guess", src[i:j], name)
+        i = src.index("_pre_show_box = _decide_picture_box_before_show")
+        self.assertIn('not _pre_show_box.get("guessed")', src[i:i + 300])
+
+    def test_a_guessed_picture_box_starts_the_real_scan(self):
+        src = self._src()
+        i = src.index("guessed = _season_guess_picture_box(norm_p)")
+        j = src.index("return guessed", i)
+        self.assertIn("_picture_box_scan_one_priority", src[i:j])
+
+    def test_a_guessed_length_stays_an_estimate(self):
+        self.assertIn("ESTIMATE_BASIS_SERIES_AVERAGE", open(os.path.join(ROOT, "media.py"), encoding="utf-8").read())
+        reads = {"/tv/Show/Season 1/Show S01E01.mkv": (1320, media.DURATION_MEASURED), "/tv/Show/Season 1/Show S01E02.mkv": (1380, media.DURATION_MEASURED)}
+        kinds = {}
+        orig_read, orig_save = media.read_track_duration, media._save_estimate
+        media.read_track_duration = lambda p, stored: reads.get(p, (0, media.DURATION_ESTIMATED))
+        media._save_estimate = lambda path, seconds, basis, replace=False: kinds.setdefault(path, basis) and int(seconds)
+        try:
+            items = [{"path": p} for p in list(reads) + ["/tv/Show/Season 1/Show S01E03.mkv"]]
+            guesses = media._series_duration_guesses(items, lambda p: True)
+        finally:
+            media.read_track_duration, media._save_estimate = orig_read, orig_save
+        self.assertEqual(guesses["/tv/Show/Season 1/Show S01E03.mkv"], 1350)
+        self.assertEqual(kinds["/tv/Show/Season 1/Show S01E03.mkv"], media.ESTIMATE_BASIS_SERIES_AVERAGE)
+
+    def test_guesses_are_never_what_the_scan_bar_reads(self):
+        src = self._src()
+        i = src.index("def _scan_file_is_finished")
+        j = src.index("def _scan_stages_pending")
+        self.assertNotIn("_season_guess", src[i:j])
+        self.assertNotIn("_season_guess", src[src.index("def _read_file_probe_facts"):src.index("def _save_file_probe_facts")])
 
 
 if __name__ == "__main__":

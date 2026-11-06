@@ -145,6 +145,8 @@ SHELL_WHISPER_THREADS_STANDARD_DIVISOR = 1
 HEADROOM_MIN_THREADS = {"lite": 2, "standard": 3, "performance": 3}
 HEADROOM_FRACTION = {"lite": 0.50, "standard": 0.25, "performance": 0.25}
 AFFORDABLE_THREADS_FLOOR = 2
+# VALUES CHANGE HERE (weak PCs: the app is the one thing such a PC is used for, so it keeps back only what Windows itself needs: this many threads of headroom in every mode instead of the mode's own, and the same number of cores out of the core budget; standard PCs keep their headroom and Performance unlocks theirs)
+WEAK_HEADROOM_THREADS = 1
 
 # VALUES CHANGE HERE (live caption cadence per mode; Standard = the values the captions were tuned on, Lite shares them because Lite has no captions)
 CAPTION_CADENCE = {
@@ -196,6 +198,14 @@ SUSTAIN_SECONDS = 2.0
 RELAX_COOLDOWN_SECONDS = 15.0
 RELAX_STEP_SECONDS = 5.0
 EVENT_WINDOW_SECONDS = 1.5
+# VALUES CHANGE HERE (learning the wait before the level comes down, from how this PC behaves: when the level climbs again within RELAX_RELAPSE_SECONDS of a step down, the calm wait before the next step down doubles, up to RELAX_COOLDOWN_MAX_SECONDS; each step down that holds that long halves it back toward RELAX_COOLDOWN_SECONDS)
+RELAX_RELAPSE_SECONDS = 30.0
+RELAX_COOLDOWN_MAX_SECONDS = 120.0
+# VALUES CHANGE HERE (after a tuned channel's show starts, background work stays held until the picture has run TUNE_STEADY_SECONDS with no frames over their time and no lost pictures, and at most TUNE_STEADY_MAX_SECONDS; a tuned channel's first loudness scan starts only once the channel has stayed on screen TUNE_LOUDNESS_SETTLE_SECONDS, so flipping through channels does not start a scan on each one passed)
+TUNE_STEADY_SECONDS = 3.0
+TUNE_STEADY_MAX_SECONDS = 15.0
+TUNE_LOUDNESS_SETTLE_SECONDS = 1.5
+
 # VALUES CHANGE HERE (event kinds that do NOT restart the calm timer; the frames inside them are already not counted)
 RELAX_NEUTRAL_EVENT_KINDS = ("channel_change", "guide_row_switch", "play_file")
 
@@ -281,6 +291,9 @@ BOOT_FILE_SIZE_WORKERS = 8
 BOOT_FILE_SIZE_TIMEOUT_SECONDS = 1.5
 # VALUES CHANGE HERE (boot drive wake-up: the most seconds boot waits for a sleeping media hard drive to spin up before it carries on without it, 0 = do not wake drives at boot)
 BOOT_DRIVE_WAKE_SECONDS = 15.0
+# VALUES CHANGE HERE (keep-awake: seconds between the reads that keep every media hard drive awake while the app is up, owner 2026-11-06, 0 = off; the most seconds one drive may take to answer before the next round)
+DRIVE_KEEP_AWAKE_INTERVAL_SECONDS = 300.0
+DRIVE_KEEP_AWAKE_READ_TIMEOUT_SECONDS = 10.0
 
 # VALUES CHANGE HERE (Advanced Settings menu: width of every bar in pixels; text padding inside a bar; gap between a bar and its side pill or button; preferred gap between rows, the smallest gap rows may shrink to when the list is tall, gap under the title, space kept free above the Close button; how fast a too-long label scrolls in pixels per second, the pause in seconds at each end of the scroll, and how many times per second the menu is redrawn while one scrolls)
 ADVANCED_MENU_BAR_WIDTH = 360
@@ -294,10 +307,8 @@ ADVANCED_MENU_SCROLL_SPEED_PX = 55
 ADVANCED_MENU_SCROLL_PAUSE_SECONDS = 1.0
 ADVANCED_MENU_SCROLL_STEPS_PER_SECOND = 20
 
-# VALUES CHANGE HERE (Step 8 gates and attribution; a job that has waited GATE_MAX_WAIT_SECONDS runs anyway, at most GATE_STARVED_MAX_CONCURRENT such jobs at a time, and never while a channel tune or a game holds the machine)
+# VALUES CHANGE HERE (Step 8 gates: how often a job waiting at a gate looks again)
 GATE_POLL_SECONDS = 0.25
-GATE_MAX_WAIT_SECONDS = 60.0
-GATE_STARVED_MAX_CONCURRENT = 1
 
 # VALUES CHANGE HERE (tuning to a channel: background work that has not started yet waits up to this many seconds, or until the channel's first show is playing, so the tune gets the PC to itself)
 TUNE_BACKGROUND_HOLD_SECONDS = 3.0
@@ -399,6 +410,14 @@ GUIDE_REPLAY_MAX_BLOCKS = 60
 HUB_SERIES_ESTIMATE_MIN_SCANNED = 2
 HUB_MOVIE_ESTIMATE_SECONDS = 5400
 
+# VALUES CHANGE HERE (season guesses for loudness, picture box and length: scanned episodes of one season needed before its unscanned episodes borrow their values; the scanned episodes must agree within these limits (length in seconds, loudness in dB, picture rectangle and picture shape as shares of the frame) or nothing is guessed; seconds a worked-out guess is kept before it is worked out again)
+SEASON_GUESS_MIN_SCANNED = 2
+SEASON_GUESS_DURATION_SPREAD_SECONDS = 90.0
+SEASON_GUESS_GAIN_SPREAD_DB = 2.0
+SEASON_GUESS_PICTURE_RECT_TOLERANCE = 0.02
+SEASON_GUESS_PICTURE_ASPECT_TOLERANCE = 0.02
+SEASON_GUESS_CACHE_SECONDS = 30.0
+
 # VALUES CHANGE HERE (schedule hub: seconds before the hub asks the library again about a file that has no measured length yet)
 HUB_UNMEASURED_RECHECK_SECONDS = 30.0
 
@@ -446,6 +465,15 @@ HUB_FUTURE_REFRESH_SECONDS = 900.0
 
 # VALUES CHANGE HERE (schedule hub future rows: seconds the background step sleeps when every channel is up to date)
 HUB_FUTURE_IDLE_SECONDS = 30.0
+
+# VALUES CHANGE HERE (hub writer tick: seconds between the scheduler's bookkeeping passes for the channel on screen)
+HUB_WRITER_WATCHED_SECONDS = 0.5
+
+# VALUES CHANGE HERE (hub writer tick: seconds the writer leaves a station alone after a pass that left it with no kept record, such as a Static station)
+HUB_WRITER_STATIC_RECHECK_SECONDS = 60.0
+
+# VALUES CHANGE HERE (hub writer tick: seconds between the scheduler's bookkeeping passes for each other channel, one channel per pass)
+HUB_WRITER_OTHER_CHANNEL_SECONDS = 20.0
 
 # VALUES CHANGE HERE (schedule hub slot-mode switch: seconds a channel's slot mode must stay unchanged before the hub puts its current set of rows aside and opens a new one, so cycling through modes quickly changes nothing in the hub)
 HUB_MODE_SWITCH_SETTLE_SECONDS = 0.5
@@ -569,11 +597,17 @@ PERF_LOG_MAX_SAMPLES = 900
 # VALUES CHANGE HERE
 STATIC_NOISE_REFRESH_MS = 110
 
-# VALUES CHANGE HERE
-STATIC_NOISE_AMBIENT_REFRESH_MS = 80
-# VALUES CHANGE HERE (Static Noise: how many noise pictures are made once per screen size and shown in turn, one per refresh, so none is made while a show plays; how many screen sizes keep their pictures)
-STATIC_NOISE_POOL_FRAMES = 8
+# VALUES CHANGE HERE (Static Noise: how often the snow changes to another picture, in ms; smaller is faster, 33 is 30 changes a second)
+STATIC_NOISE_AMBIENT_REFRESH_MS = 33
+# VALUES CHANGE HERE (Static Noise: how many noise pictures are made once per screen size and shown in random order, never the same one twice running, so the snow shows no repeating pattern; how many screen sizes keep their pictures)
+STATIC_NOISE_POOL_FRAMES = 12
 STATIC_NOISE_POOL_SIZES = 3
+# VALUES CHANGE HERE (Static Noise grain: the size in screen pixels of one speck of snow, 1 is the finest and costs the most to make, 3 is the coarse snow of V347; at most one new picture is made every STATIC_NOISE_BUILD_GAP_MS while the set fills, so the screen thread is never given a burst of them)
+STATIC_NOISE_GRAIN_PX = 2
+STATIC_NOISE_BUILD_GAP_MS = 80
+# VALUES CHANGE HERE (Static Noise: the snow's strength is baked into each picture's own see-through values in this many steps, because a picture with both its own see-through values and an overall strength drew about 8 times slower; how many baked pictures are kept, all sizes and strengths together)
+STATIC_NOISE_STRENGTH_STEPS = 16
+STATIC_NOISE_BAKED_MAX = 24
 
 # VALUES CHANGE HERE
 STATIC_WEAK = 0.16
@@ -659,13 +693,8 @@ LOUDNESS_LEARN_SINGLE_CHANGE_DB = 3.0
 LOUDNESS_LEARN_MAX_OFFSET_DB = 12
 LOUDNESS_LEARN_SETTLE_SECONDS = 5.0
 
-# VALUES CHANGE HERE (series loudness learning from the volume slider: seconds between looks at the volume; seconds of an episode that must be watched before the volume kept on it counts; how many slider points (0 to 100) from the comfortable volume the kept volume must be before the episode counts as too loud or too quiet; the comfortable volume until enough owner-set files are watched (70 to 75 is comfortable, 100 the loudest); how many owner-set files' kept volumes give the comfortable volume, and how few are enough)
-LOUDNESS_SLIDER_SAMPLE_SECONDS = 1.0
-LOUDNESS_SLIDER_MIN_WATCH_SECONDS = 600.0
-LOUDNESS_SLIDER_TRIGGER_POINTS = 30
-LOUDNESS_SLIDER_COMFORT_PCT = 72
-LOUDNESS_SLIDER_REFERENCE_FILES = 10
-LOUDNESS_SLIDER_REFERENCE_MIN_FILES = 3
+# VALUES CHANGE HERE (picture drawing: seconds a video file's size and date are remembered before the disk is asked again, so the disk is not asked for every picture drawn)
+PAN_SCAN_KEY_CACHE_SECONDS = 2.0
 
 # VALUES CHANGE HERE
 GAIN_CHECK_FOLDER_REVISIT_S = 600
@@ -692,6 +721,9 @@ PRIME_DURATIONS_NEAR_TERM_N = 8
 # VALUES CHANGE HERE
 SCAN_SNAPSHOT_INTERVAL_S = 5.0
 SCAN_SNAPSHOT_STALE_S = 15.0
+# VALUES CHANGE HERE (the scan snapshot thread: after each rebuild it rests this many times as long as the rebuild took, so it never uses more than about 1 part in this number plus 1 of a core, however many files are being added; the longest that rest may be in seconds, which must stay below SCAN_SNAPSHOT_STALE_S)
+SCAN_SNAPSHOT_DUTY_FACTOR = 8.0
+SCAN_SNAPSHOT_MAX_REST_S = 10.0
 SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD = 200
 
 # VALUES CHANGE HERE
@@ -724,12 +756,14 @@ TV_BORDER_SCREEN_EXPAND = {
 }
 TV_BORDER_SCREEN_EXPAND_DEFAULT = (1.00, 1.00)
 
-# VALUES CHANGE HERE (reception line noise band: pixel block size; share of blocks drawn; share drawn bright; alpha range of bright and of dark blocks)
-RECEPTION_NOISE_BLOCK_PX = 3
+# VALUES CHANGE HERE (reception line noise band: pixel block size, 2 is as fine as the Static Noise snow and 3 is the coarse look of V349; share of blocks drawn; share drawn bright; alpha range of bright and of dark blocks)
+RECEPTION_NOISE_BLOCK_PX = 2
 RECEPTION_NOISE_VISIBLE_SHARE = 0.55
 RECEPTION_NOISE_BRIGHT_SHARE = 0.30
 RECEPTION_NOISE_BRIGHT_ALPHA = (180, 255)
 RECEPTION_NOISE_DARK_ALPHA = (110, 210)
+# VALUES CHANGE HERE (reception lines: how often the noise inside a rolling line changes, in ms; smaller is faster, 33 is 30 changes a second like the Static Noise snow)
+RECEPTION_NOISE_REFRESH_MS = 33
 
 # VALUES CHANGE HERE (reception lines: height of a big and of a small rolling line as a share of the screen height, and the roll speed in pixels per millisecond)
 RECEPTION_LINE_BIG_FRAC_RANGE = (0.035, 0.09)
@@ -985,6 +1019,8 @@ GUIDE_ROW_CACHE_MAX = 24
 
 # VALUES CHANGE HERE (ui.py, Server Mode toggle: False greys it out in Advanced Settings (the row can still be reached with the keys and controller but cannot be turned on or off); True lets it be switched again)
 SERVER_TOGGLE_ENABLED = False
+# VALUES CHANGE HERE (Server mode: True drops every scheduled entry a server sends that points at a network share (\\host\share) or a web address, so a server on the network can never make this PC reach out to another machine; False accepts them)
+REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS = True
 
 # VALUES CHANGE HERE (ui.py, controls splash: gap between a row's keys, between key columns and between columns, and the extra height of a section title, in pixels)
 CONTROLS_ROW_KEY_GAP_PX = 48
@@ -1035,7 +1071,7 @@ GUIDE_43_HDR_CELL_PAD_PX = 12
 GUIDE_43_CLOCK_PAIR_GAP_PX = 8
 GUIDE_43_HDR_TO_CLOCK_RATIO = 22.0 / 17.0
 
-# VALUES CHANGE HERE (ui.py, settings menu layout in pixels: options toggle box width; remote remap label column, key box width and height, gap between the two columns; channel settings header gap, bottom space and smallest top; Holiday rows spread evenly between the title and the Close button (top and bottom space, smallest and largest row height, row padding, toggle width, gap); Video tab slider row space, largest and smallest slider spacing; Theme tab last block space, largest and smallest block spacing, smallest first gap and its trim)
+# VALUES CHANGE HERE (ui.py, settings menu layout in pixels: options toggle box width; remote remap label column, key box width and height, gap between the two columns; channel settings header gap, bottom space, smallest top and title top; Holiday rows spread evenly between the title and the Close button (top and bottom space, smallest and largest row height, row padding, toggle width, gap); Video tab slider row space, largest and smallest slider spacing; Theme tab last block space, largest and smallest block spacing, smallest first gap and its trim)
 OPTIONS_TOGGLE_BOX_W_PX = 18 + 24
 REMOTE_REMAP_LABEL_COL_W_PX = 195
 REMOTE_REMAP_KEY_BOX_W_PX = 110
@@ -1044,6 +1080,7 @@ REMOTE_REMAP_COL_GAP_PX = 30
 CHANNEL_SETTINGS_HEADER_GAP_PX = 40
 CHANNEL_SETTINGS_BOTTOM_RESERVED_PX = 70
 CHANNEL_SETTINGS_MIN_TOP_PX = 20
+CHANNEL_SETTINGS_TITLE_TOP_PX = 20
 HOLIDAY_ROWS_TOP_PX = 60
 HOLIDAY_ROWS_BOTTOM_PX = 62
 HOLIDAY_ROW_MIN_H_PX = 34
@@ -1141,6 +1178,8 @@ GAME_LEGEND_BOTTOM_PAD_PX = 8
 GAME_LEGEND_KEY_DARKEN = 60
 GAME_LEGEND_KEY_H_PX = 22
 GAME_LEGEND_ROW_GAP_PX = 3
+# VALUES CHANGE HERE (game_deck.py, key legend: pixels between one action's section and the next)
+GAME_LEGEND_SECTION_GAP_PX = 36
 
 # VALUES CHANGE HERE (game_deck.py, console picker and ROM list in pixels: size of the console switch arrows, their space beside the logo, how far past the Back column the ROM list arrows sit, the space under the ROM list and the gap of its arrows from the middle; the ROM list logo box width and height (on the menu canvas, scaled with it), how much taller it is, and its top space)
 GAME_NAV_ARROW_SIZE_PX = 15
@@ -1173,11 +1212,10 @@ GAME_FIRST_FRAME_GIVEUP_MS_DEFAULT = 20000
 GAME_HANDHELD_BEZEL_FIT_MARGIN = 0.90
 GAME_MAX_CATCHUP_FRAMES = 4
 
-# VALUES CHANGE HERE (game_deck.py, game menus: most archives whose contents are remembered, ms between live rescans of the ROM folders, ms a console switch arrow flashes, ms the controller exit buttons are held to leave a game, seconds after one remap capture before the next is taken, and ms a message takes to fade out)
+# VALUES CHANGE HERE (game_deck.py, game menus: most archives whose contents are remembered, ms between live rescans of the ROM folders, ms a console switch arrow flashes, seconds after one remap capture before the next is taken, and ms a message takes to fade out)
 GAME_ARCHIVE_CACHE_MAX_ENTRIES = 5000
 GAME_LIVE_RESCAN_INTERVAL_MS = 1500
 GAME_CONSOLE_ARROW_FLASH_MS = 220
-GAME_CONTROLLER_EXIT_HOLD_MS = 600
 GAME_REMAP_CAPTURE_COOLDOWN_SECONDS = 0.30
 GAME_MESSAGE_FADE_MS = 500
 
@@ -1571,6 +1609,8 @@ def affordable_threads(profile=None, mode=None):
     logical = max(1, int(profile.logical_cores))
     if _shell_boost(mode, profile):
         reserve = max(SHELL_HEADROOM_MIN_THREADS[mode], int(-(-logical * SHELL_HEADROOM_FRACTION[mode] // 1)))
+    elif profile.tier == "WEAK":
+        reserve = WEAK_HEADROOM_THREADS
     else:
         reserve = max(HEADROOM_MIN_THREADS[mode], int(-(-logical * HEADROOM_FRACTION[mode] // 1)))
     return max(AFFORDABLE_THREADS_FLOOR, logical - reserve)
@@ -1579,7 +1619,7 @@ def affordable_threads(profile=None, mode=None):
 def core_budget(profile, mode=None):
     mode = _limit_mode("scan", _resolve_mode(mode))
     if profile.tier == "WEAK":
-        return CORE_BUDGET_MIN
+        return max(CORE_BUDGET_MIN, float(profile.effective_physical - WEAK_HEADROOM_THREADS))
     if profile.tier == "STRONG":
         base = STRONG_BUDGET_HIGH if profile.effective_physical >= STRONG_HIGH_AT_PHYSICAL else CORE_BUDGET_BY_TIER["STRONG"]
     else:
@@ -1671,11 +1711,20 @@ def effective_factor(level, profile, mode=None):
     return min(LEVEL_FACTOR[level], MODE_FACTOR_CAP[mode], TIER_FACTOR_CAP[profile.tier])
 
 
+def quiet_lane_bonus(lane, level=0):
+    """Extra jobs a lane may run while the PC is quiet at load level 0, else 0."""
+    # WARNING: the bonus is read when a job is admitted, so a job already running is never stopped; the quiet test (SCAN_QUIET_MAX_SYSTEM_CPU_PCT for SCAN_QUIET_AFTER_SECONDS) is what keeps the extra job from adding to a busy PC.
+    bonus = QUIET_LANE_BONUS.get(lane, 0)
+    if bonus <= 0 or int(level) != 0:
+        return 0
+    return bonus if pc_is_quiet() else 0
+
+
 def lane_slots(lane, level, profile, mode=None):
     factor = effective_factor(level, profile, mode)
     if factor <= 0.0:
         return 0
-    return max(1, int(lane_ceiling(lane, mode) * factor))
+    return max(1, int(lane_ceiling(lane, mode) * factor)) + quiet_lane_bonus(lane, level)
 
 
 def duration_workers(playing=False, mode=None):
@@ -1690,49 +1739,11 @@ def duration_workers(playing=False, mode=None):
 def loudness_dispatch_workers(spare=False, cap=None, mode=None):
     """Returns how many loudness probes one round may run: the base or spare count, held to the loudness lane's ceiling and to cap when given, never below 1."""
     value = LOUDNESS_DISPATCH_WORKERS_SPARE if spare else LOUDNESS_DISPATCH_WORKERS_BASE
-    value = min(value, lane_ceiling("loudness_and_bake", mode))
+    bonus = quiet_lane_bonus("loudness_and_bake", current_level() if enforcing() else 0)
+    value = min(value + bonus, lane_ceiling("loudness_and_bake", mode) + bonus)
     if cap is not None:
         value = min(value, int(cap))
     return max(1, value)
-
-
-def pending_backlog_allowed(mode=None):
-    """True when a backlog (not-needed-soon) pending file may be probed now: the governor's load level is within PENDING_BACKLOG_MAX_LEVEL."""
-    level = current_level() if enforcing() else 0
-    return level <= PENDING_BACKLOG_MAX_LEVEL
-
-
-def pending_backlog_interval_seconds(mode=None):
-    """Seconds between two backlog probes: the base interval stretched by this PC's tier (a weak PC waits longer), the performance mode (lite waits longer) and the current load level."""
-    profile = get_profile()
-    level = current_level() if enforcing() else 0
-    value = PENDING_BACKLOG_INTERVAL_SECONDS * (1.0 + PENDING_BACKLOG_PER_LEVEL_MULTIPLIER * level)
-    if profile.tier == "WEAK":
-        value *= PENDING_BACKLOG_WEAK_PC_MULTIPLIER
-    if _limit_mode("scan", _resolve_mode(mode)) == "lite":
-        value *= PENDING_BACKLOG_LITE_MODE_MULTIPLIER
-    return value
-
-
-def scan_pace_seconds(scan_class, base_seconds, playing=False, guide_open=False, mode=None):
-    """Seconds a scan waits after one file: 0 for a file airing now ("now"), otherwise the base pause stretched by the class ("next" or "deep"), the playback state, the load level, the PC's tier and the mode, and shortened while the PC is quiet."""
-    if scan_class == "now":
-        return 0.0
-    cls = "deep" if scan_class == "deep" else "next"
-    pace = float(base_seconds) * SCAN_PACE_CLASS_MULTIPLIER[cls]
-    if playing:
-        pace *= SCAN_PACE_WHILE_PLAYING_MULTIPLIER[cls]
-    elif guide_open:
-        pace *= SCAN_PACE_GUIDE_MULTIPLIER
-    level = current_level() if enforcing() else 0
-    pace /= max(PACE_FACTOR_FLOOR, LEVEL_FACTOR[max(0, min(MAX_LEVEL, int(level)))])
-    if get_profile().tier == "WEAK":
-        pace *= SCAN_PACE_WEAK_PC_MULTIPLIER
-    if _limit_mode("scan", _resolve_mode(mode)) == "lite":
-        pace *= SCAN_PACE_LITE_MODE_MULTIPLIER
-    if pc_is_quiet():
-        pace *= SCAN_QUIET_PACE_MULTIPLIER
-    return pace
 
 
 def quiet_seconds(now=None):
@@ -1857,50 +1868,148 @@ def ffmpeg_scans_running():
 def scan_threads(profile=None, mode=None):
     """How many of the scans (duration, picture box, loudness, visualizer music) may work on a not-airing-now file at the same time on this PC, in this mode, at this load level; 1 means they share one thread."""
     profile = profile or get_profile()
-    if profile.tier == "WEAK":
-        return 1
     count = int(core_budget(profile, mode) // max(0.1, SCAN_THREADS_CORES_PER_THREAD))
     count = min(count, affordable_threads(profile, mode), SCAN_THREADS_MAX)
     level = current_level() if enforcing() else 0
-    count = int(count * effective_factor(level, profile, mode))
+    if profile.tier == "WEAK":
+        # WARNING: a weak PC uses the cores the boot scan found free (owner 2026-11-04: "if those cores are sitting unused, use them"); only the load level narrows them, not the weak and Lite caps, so it runs on every free core while the picture keeps up and drops to one as soon as it does not.
+        count = int(count * LEVEL_FACTOR[max(0, min(MAX_LEVEL, int(level)))])
+    else:
+        count = int(count * effective_factor(level, profile, mode))
     if game_active():
         count = min(count, GAME_SCAN_THREADS)
     return max(1, count)
 
 
+# VALUES CHANGE HERE (scan throttle: the scans that decode video or audio and so share the PC's scan capacity, scan_threads(); every other scan only counts; the longest pause after a file in seconds; the pause after a file at each load level 0 to 4, for the files behind the next 3 shows; the share of that pause the next 3 shows get)
+SCAN_HEAVY_KINDS = ("picture_box", "loudness", "music")
+SCAN_GAP_MAX_SECONDS = 1.0
+SCAN_GAP_BY_LEVEL = (0.0, 0.25, 0.5, 1.0, 1.0)
+SCAN_GAP_NEXT_SHARE = 0.5
+
+_slot_cv = threading.Condition()
+_slot_active = [0]
+_slot_waiting = []
+_slot_seq = [0]
+_slot_tls = threading.local()
+
+
+@contextlib.contextmanager
+def scan_slot_idle():
+    """For a scan that holds one of the PC's scan places and has to wait on another thread (a lock, a semaphore, the gate): gives the place to the next file while it waits and takes it back afterwards without waiting for it; does nothing when the thread holds no place."""
+    # WARNING: a scan that sits blocked behind another thread is not using the PC, so its place must not stay taken; without this a waiting scan kept a place and the next file could not start (owner 2026-11-05: "how do they jump to that free thread"). The place is taken back at once on return, so the PC may carry one scan more than its places for a moment, never waiting.
+    if not getattr(_slot_tls, "held", False):
+        yield
+        return
+    with _slot_cv:
+        _slot_active[0] -= 1
+        _slot_tls.held = False
+        _slot_cv.notify_all()
+    try:
+        yield
+    finally:
+        with _slot_cv:
+            _slot_active[0] += 1
+            _slot_tls.held = True
+
+
+_scan_throttle = {"mode": "free", "slow_since": 0.0, "stop_started": None, "stop_until": 0.0, "catchup": None}
+_scan_throttle_lock = threading.Lock()
+
+
+def scan_throttle_mode(now=None):
+    """\"free\" while no game is falling behind, \"slow\" while one is and the scans creep, \"stopped\" when creeping was not enough; a stop lasts as long as the game took to catch up the last time."""
+    # WARNING: owner order 2026-11-05: throttle before stopping, and a stop never lasts a fixed time (not 60 s): its length is how long the game took to catch up after the previous stop (at least GAME_THROTTLE_STOP_MIN_SECONDS, at most GAME_THROTTLE_STOP_MAX_SECONDS), measured here.
+    now = time.monotonic() if now is None else now
+    behind = bool(game_needs_all(now))
+    with _scan_throttle_lock:
+        state = _scan_throttle
+        if not behind:
+            if state["stop_started"] is not None:
+                took = now - state["stop_started"]
+                state["catchup"] = max(GAME_THROTTLE_STOP_MIN_SECONDS, min(GAME_THROTTLE_STOP_MAX_SECONDS, took))
+            state["mode"] = "free"
+            state["stop_started"] = None
+        elif state["mode"] == "free":
+            state["mode"] = "slow"
+            state["slow_since"] = now
+        elif state["mode"] == "slow" and now - state["slow_since"] >= GAME_THROTTLE_STOP_AFTER_SECONDS:
+            length = state["catchup"] if state["catchup"] is not None else GAME_THROTTLE_STOP_MIN_SECONDS
+            state["mode"] = "stopped"
+            if state["stop_started"] is None:
+                state["stop_started"] = now
+            state["stop_until"] = now + length
+        elif state["mode"] == "stopped" and now >= state["stop_until"]:
+            state["mode"] = "slow"
+            state["slow_since"] = now
+        return state["mode"]
+
+
+def scan_gap_seconds(scan_class, mode=None):
+    """Seconds a scan rests after one file: 0 for a file airing now and on a quiet PC, otherwise the pause for the current load level (0 at level 0, up to SCAN_GAP_MAX_SECONDS), half of it for the next 3 shows."""
+    # WARNING: the load level is how strained the screen thread is (frame time, busy share, lost pictures), so this pause follows the strain on this PC; it is never longer than SCAN_GAP_MAX_SECONDS, because a long pause only makes the scans fall behind the schedule.
+    if scan_class == "now":
+        return 0.0
+    level = current_level() if enforcing() else 0
+    gap = float(SCAN_GAP_BY_LEVEL[max(0, min(len(SCAN_GAP_BY_LEVEL) - 1, int(level)))])
+    if scan_class != "deep":
+        gap *= SCAN_GAP_NEXT_SHARE
+    if gap > 0 and pc_is_quiet():
+        return 0.0
+    gap = min(float(SCAN_GAP_MAX_SECONDS), gap)
+    if scan_throttle_mode() == "slow":
+        gap = max(gap, float(GAME_THROTTLE_SLOW_GAP_SECONDS))
+    return gap
+
+
 @contextlib.contextmanager
 def scan_thread_slot(kind, priority=False, stop=None, rank=None):
-    """Holds one of the shared scan threads around one file of non-airing scan work; yields True when admitted, False when stop was set while waiting. Airing-now work, priority scopes and the UI thread never wait."""
+    """Holds one place of the PC's scan capacity (scan_threads(): the cores, the RAM and the load level) around one file of a scan that decodes video or audio; the most urgent waiting file takes each place as it frees; yields False only when stop is set while it waits."""
+    # WARNING: there is no time limit and no yielding to another kind: a file waits only while every place is taken, and the most urgent file (the lowest rank, then the one that has waited longest) gets the next free place whatever its kind; a file airing now and a priority scope never wait, and the scans that only read a length or a header just count.
     if priority or _is_priority_context():
         yield True
         return
-    start = time.monotonic()
-    admitted = True
-    while True:
-        # WARNING: waiting for its turn behind a more urgent scan is not a stuck wait, so it never counts toward the wait cap; only waiting for a free scan thread does.
-        if scan_should_yield(kind, rank):
-            start = time.monotonic()
-        elif _activity.try_begin(SCAN_THREADS_LANE, scan_threads()):
-            break
+    if kind not in SCAN_HEAVY_KINDS:
         if stop is not None and stop.is_set():
-            admitted = False
-            break
-        if time.monotonic() - start >= GATE_MAX_WAIT_SECONDS:
-            _activity.begin(SCAN_THREADS_LANE)
-            log.info("[GOVERNOR] scan thread wait cap %.0fs reached, running anyway: kind=%s threads=%d",
-                     GATE_MAX_WAIT_SECONDS, kind, scan_threads())
-            break
-        if stop is not None:
-            stop.wait(GATE_POLL_SECONDS)
-        else:
-            time.sleep(GATE_POLL_SECONDS)
+            yield False
+            return
+        _activity.begin(SCAN_THREADS_LANE)
+        try:
+            yield True
+        finally:
+            _activity.end(SCAN_THREADS_LANE)
+            scan_note_progress(kind)
+        return
+    with _slot_cv:
+        _slot_seq[0] += 1
+        ticket = (tuple(rank) if rank is not None else (99, 0), _slot_seq[0])
+        _slot_waiting.append(ticket)
+        admitted = False
+        while True:
+            if stop is not None and stop.is_set():
+                break
+            if _slot_active[0] < scan_threads() and ticket == min(_slot_waiting):
+                admitted = True
+                break
+            _slot_cv.wait(GATE_POLL_SECONDS)
+        _slot_waiting.remove(ticket)
+        if admitted:
+            _slot_active[0] += 1
+        _slot_cv.notify_all()
     if not admitted:
         yield False
         return
+    _slot_tls.held = True
+    _activity.begin(SCAN_THREADS_LANE)
     try:
         yield True
     finally:
         _activity.end(SCAN_THREADS_LANE)
+        with _slot_cv:
+            if getattr(_slot_tls, "held", False):
+                _slot_active[0] -= 1
+            _slot_tls.held = False
+            _slot_cv.notify_all()
         scan_note_progress(kind)
 
 
@@ -1988,8 +2097,6 @@ STICK_MENU_AXIS_THRESHOLD = 0.6
 # ============================================================================
 # VALUES CHANGE HERE (trigger travel, 0 to 255, that counts as a button press in the Controller Map and the DVD button map; trigger travel for the in-game hotkey; milliseconds before that hotkey can fire again; how far, in raw DirectInput units, an axis must move to show a pad is alive)
 TRIGGER_PRESS_THRESHOLD = 30
-# VALUES CHANGE HERE (controller keystroke guard: ms after a controller-sent key is released during which the TV still ignores that key)
-BRIDGE_KEY_GRACE_MS = 250
 GAME_HOTKEY_TRIGGER_THRESHOLD = 128
 GAME_HOTKEY_COOLDOWN_MS = 2000
 DINPUT_AXIS_LIVENESS_THRESHOLD = 1500
@@ -2180,6 +2287,8 @@ ACTIVATION_WATCH_CHECK_SECONDS = 0.5
 # VALUES CHANGE HERE (main script, locked picture finder: how many times a frame may step around a locked picture before the error goes through; seconds the first search for what holds the lock may take on the screen thread)
 SURFACE_LOCK_SWAPS_MAX = 5
 SURFACE_LOCK_FIND_SECONDS = 4.0
+# VALUES CHANGE HERE (surface lock recovery: seconds without a locked-screen error after which the next one counts as a new incident with its own SURFACE_LOCK_SWAPS_MAX repairs)
+SURFACE_LOCK_INCIDENT_GAP_SECONDS = 10.0
 
 # VALUES CHANGE HERE (health_monitor.py, the app's health report: on or off; ms between looks at what every thread is doing; seconds between report blocks in app_log.txt; seconds of looks kept to explain a stall; a screen-thread gap this long or longer is explained; how many gaps are explained per minute at most)
 HEALTH_MONITOR_ENABLED = True
@@ -2207,7 +2316,10 @@ GUIDE_PREVIEW_SETTLE_MS = 500
 GUIDE_PREVIEW_LOAD_TIMEOUT_MS = 2500
 PLAYBACK_STALL_TIMEOUT_MS = 10000
 PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = 20000
+# VALUES CHANGE HERE (extra milliseconds the last picture is held and the sound stays muted after a CHANNEL CHANGE; it stays at 500 so the audio of the old channel, channel 03's second VLC player above all, never follows the viewer to the new one)
 AUDIO_SYNC_HOLD_MS = 500
+# VALUES CHANGE HERE (extra milliseconds the last picture is held and the sound stays muted when a show, a break clip or the return to the show changes media on the SAME channel; 0 = none, the new media goes in at once and the mute lifts at its first picture frame; owner 2026-11-06, 14.3)
+SAME_CHANNEL_AUDIO_HOLD_MS = 0
 END_PROXIMITY_MS = 2000
 WEDGED_STOP_TIMEOUT_SECONDS = 5
 PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS = 0.05
@@ -2249,7 +2361,10 @@ MENU_WARP_OFF_EXTRA_SHRINK = 0.97
 BEZEL_CHANNEL_LED_FRAC = {
     "bezel":  (0.7010, 0.2402, 0.0676, 0.0776),
     "bezel1": (0.7801, 0.1191, 0.1263, 0.1282),
+    "bezel2": (0.6954, 0.1303, 0.0231, 0.0354),
 }
+# VALUES CHANGE HERE (bezel number windows that are not measured from the picture because their glass is grey, not near-black; their listed numbers above are used)
+BEZEL_LED_LISTED_ONLY = ("bezel2",)
 BEZEL_CHANNEL_LED_GAP_FRAC = {
     "bezel":  0.28,
     "bezel1": 0.28,
@@ -2359,7 +2474,17 @@ SHUTDOWN_PROBE_GRACE_SECONDS = 0.4
 FILE_EXPLORER_TITLE_H = 44
 FILE_EXPLORER_TOOLBAR_H = 40
 FILE_EXPLORER_LEFT_ITEMS_TTL_MS = 2000
+# VALUES CHANGE HERE (file explorer sizes: the UP button's width, height and letter size inside the toolbar bar (the bar is 40 high, so the button stays under that), the folder and file name letter size in the list, and the folder name letter size in the left panels; the rows keep their heights)
+FILE_EXPLORER_UP_W = 84
+FILE_EXPLORER_UP_H = 36
+FILE_EXPLORER_UP_FONT = 20
+FILE_EXPLORER_ITEM_FONT = 25
+FILE_EXPLORER_LEFT_ITEM_FONT = 21
 GUIDE_TIME_STEP_MAX_SHIFTS = 8
+# VALUES CHANGE HERE (guide highlight: how many seconds apart two drawings of the same show's start may be and still count as the same stop, so the highlight does not jump back when a start time drifts a fraction of a second)
+GUIDE_STOP_MATCH_SECONDS = 2.0
+# VALUES CHANGE HERE (guide highlight: the seconds the drawn highlight time is nudged forward so a show start that drifted just past it still holds the highlight)
+GUIDE_HIGHLIGHT_NUDGE_SECONDS = 0.75
 KEY_CAPTURE_SAME_PRESS_MS = 250
 KEY_CAPTURE_SECOND_PATH_MS = 600
 
@@ -2469,6 +2594,8 @@ COLOR_GAME_REMAP_HINT = (120, 120, 60)
 
 # VALUES CHANGE HERE (game_deck.py, ROM list and loading screens: warning text, the loading message, bar track and percentage, a console arrow that cannot switch, the no-files line, a missing ROM selected and not selected, the busy dim, the popup help line, the in-game message text and the controller-disconnected banner fill)
 COLOR_GAME_WARNING_TEXT = (255, 90, 90)
+# VALUES CHANGE HERE (Games: a console that can use a BIOS (PSX) launched with no BIOS set up shows a red banner; False still starts the game with the core's built-in BIOS, True shows the banner and does not start it)
+GAME_NO_BIOS_BLOCKS_LAUNCH = False
 COLOR_GAME_LOADING_TEXT = (150, 150, 150)
 COLOR_GAME_LOADING_BAR_TRACK = (22, 22, 22)
 COLOR_GAME_LOADING_PERCENT = (80, 80, 80)
@@ -2674,34 +2801,26 @@ LIBRARY_GROWING_FILE_CHECK_DELAY_S = 0.05
 # SECTION: First-start probe of pending scheduled files
 # ============================================================================
 # VALUES CHANGE HERE (pending scheduled files are probed in the background, this many at a time; a file whose probe found nothing is tried again after the retry seconds; a channel's request is dropped when its schedule has not asked again for the stale seconds)
-PENDING_SCHEDULE_PROBE_PARALLEL = 1
+PENDING_SCHEDULE_PROBE_PARALLEL = 2
+# VALUES CHANGE HERE (pending-file probe: a file whose length was just stored is not probed and stored again for this many seconds)
+PENDING_PROBE_RESTORE_HOLD_SECONDS = 60.0
 PENDING_SCHEDULE_PROBE_RETRY_SECONDS = 5.0
 PENDING_SCHEDULE_PROBE_REQUEST_STALE_SECONDS = 30.0
 
-# VALUES CHANGE HERE (pending-file probe priority: the first this-many files of a channel's request are needed soon and probe at priority, every channel's next file before any channel's second; every file after them is backlog, probed one per interval, only while the load level is at or below the max level; the interval is stretched by the load level and by the weak-PC and lite-mode multipliers)
+# VALUES CHANGE HERE (pending-file probe priority: the first this-many files of a channel's request are needed soon and probe at priority, every channel's next file before any channel's second; every file after them is backlog, probed whenever background scans are not paused and no live open is in flight)
 PENDING_PROBE_URGENT_COUNT = 4
 # VALUES CHANGE HERE (pending-file probe: seconds between stores of one block's backlog lengths; each store makes that block's lineup be built again, so they are stored together; a length needed soon is stored at once)
 PENDING_PROBE_STORE_BATCH_SECONDS = 15.0
-PENDING_BACKLOG_INTERVAL_SECONDS = 1.5
-PENDING_BACKLOG_MAX_LEVEL = 1
-PENDING_BACKLOG_WEAK_PC_MULTIPLIER = 2.0
-PENDING_BACKLOG_LITE_MODE_MULTIPLIER = 1.5
-PENDING_BACKLOG_PER_LEVEL_MULTIPLIER = 1.0
-
-# VALUES CHANGE HERE (scan pacing shared by the duration, picture-box, loudness and visualizer music scans: files airing now run with no pause; the next 3 shows per channel are "next" and the files behind them are "deep"; the pause after one file = the scan's base pause x the class multiplier x the while-playing multiplier (or the guide multiplier while the guide is open) / the load-level factor, then x the weak-PC and lite-mode multipliers)
-SCAN_PACE_CLASS_MULTIPLIER = {"next": 1.0, "deep": 2.0}
-SCAN_PACE_WHILE_PLAYING_MULTIPLIER = {"next": 2.0, "deep": 6.0}
-SCAN_PACE_GUIDE_MULTIPLIER = 2.0
-SCAN_PACE_WEAK_PC_MULTIPLIER = 2.0
-SCAN_PACE_LITE_MODE_MULTIPLIER = 1.5
 
 # VALUES CHANGE HERE (quiet PC: when the load level is 0, the whole PC's CPU use is at or below the percent and the app's frame time is at or below the share of its frame budget for the seconds given, the scans speed back up; their pause is multiplied by the quiet multiplier until the PC is busy again)
 SCAN_QUIET_MAX_SYSTEM_CPU_PCT = 40.0
 SCAN_QUIET_MAX_BUSY_RATIO = 0.6
 SCAN_QUIET_AFTER_SECONDS = 20.0
 SCAN_QUIET_PACE_MULTIPLIER = 0.5
+# VALUES CHANGE HERE (quiet PC: extra jobs a lane may run at the same time while the PC is quiet and the load level is 0; the extra job is not started when the PC is busy, and the lane falls back to its normal count as soon as the quiet ends)
+QUIET_LANE_BONUS = {"loudness_and_bake": 1}
 
-# VALUES CHANGE HERE (scan threads: the duration, picture-box, loudness and visualizer music scans each have their own thread, but only this many of them may work on a not-airing-now file at the same time: the scan cores of this PC and mode divided by the cores per thread, never above the PC's affordable threads or the maximum, cut by the load-level factor, never below 1; 1 means the scans take turns on one shared thread; a scan never waits longer than the gate wait cap)
+# VALUES CHANGE HERE (scan threads: the duration, picture-box, loudness and visualizer music scans each have their own thread, but only this many of them may work on a not-airing-now file at the same time: the scan cores of this PC and mode divided by the cores per thread, never above the PC's affordable threads or the maximum, cut by the load-level factor, never below 1; 1 means the scans take turns on one shared thread)
 SCAN_THREADS_CORES_PER_THREAD = 1.0
 SCAN_THREADS_MAX = 4
 SCAN_THREADS_LANE = "scan_threads"
@@ -2718,6 +2837,11 @@ GAME_SCAN_THREADS = 1
 GAME_BEHIND_WINDOW_SECONDS = 5.0
 GAME_BEHIND_CATCHUP_SHARE = 0.10
 GAME_STEADY_SECONDS = 10.0
+# VALUES CHANGE HERE (scan throttle while a game falls behind: the pause after each scanned file while the scans creep, in seconds; how long the scans creep before they stop; the shortest and the longest a stop may last, a stop lasts as long as the game took to catch up the last time)
+GAME_THROTTLE_SLOW_GAP_SECONDS = 2.0
+GAME_THROTTLE_STOP_AFTER_SECONDS = 10.0
+GAME_THROTTLE_STOP_MIN_SECONDS = 3.0
+GAME_THROTTLE_STOP_MAX_SECONDS = 30.0
 
 # VALUES CHANGE HERE (GPU help for scans: when the PC has a real GPU of a listed tier, the picture-box scan decodes its video on the GPU with this ffmpeg hwaccel, which takes the decode work off the CPU; seconds allowed for the one-time check that this ffmpeg has the hwaccel; GPU decodes that may fail in a run before the scan goes back to CPU decoding for the rest of the run; the loudness, duration and music scans read audio or file headers only and have nothing for the GPU to do)
 SCAN_GPU_DECODE_ENABLED = True
@@ -2791,6 +2915,8 @@ class Throttle:
         self._last_ratio = None
         self._last_own_note = 0.0
         self._own_note = ""
+        self._relax_cooldown = RELAX_COOLDOWN_SECONDS
+        self._last_step_down = None
         self._lock = threading.Lock()
 
     def note_event(self, kind, now=None):
@@ -2924,6 +3050,14 @@ class Throttle:
                 self._learn_own_load(signals, now)
             self._last_ratio = self._busy_ratios(signals)[0]
             target, reason, immediate = self._target(signals)
+            note_tune_steady(now >= self._event_until and self._last_ratio is not None
+                             and self._last_ratio < BUSY_RATIO_LEVELS[0][0] and not signals.get("lost_pictures"), now)
+            if (self._last_step_down is not None and now - self._last_step_down >= RELAX_RELAPSE_SECONDS):
+                self._last_step_down = None
+                if self._relax_cooldown > RELAX_COOLDOWN_SECONDS:
+                    self._relax_cooldown = max(RELAX_COOLDOWN_SECONDS, self._relax_cooldown / 2.0)
+                    log.info("[GOVERNOR] the last step down held %.0fs; calm wait before a step down now %.0fs",
+                             RELAX_RELAPSE_SECONDS, self._relax_cooldown)
             self._note_quiet(signals, target, now)
             if (self._own_note and signals.get("background_active")
                     and now - self._last_own_note >= ATTRIBUTION_LOG_INTERVAL_SECONDS):
@@ -2957,7 +3091,7 @@ class Throttle:
                     self._over_since = now
             else:
                 self._over_since = None
-                if (target < self.level and now - self._last_hold >= RELAX_COOLDOWN_SECONDS
+                if (target < self.level and now - self._last_hold >= self._relax_cooldown
                         and now - self._last_change >= RELAX_STEP_SECONDS):
                     self._set_level(self.level - 1, "relax: calm for %.0fs" % (now - self._last_hold), now)
             return self.level
@@ -3004,6 +3138,13 @@ class Throttle:
             self._step_check = None
         if self.level > old:
             self._last_hold = now
+            if self._last_step_down is not None and now - self._last_step_down <= RELAX_RELAPSE_SECONDS:
+                self._relax_cooldown = min(RELAX_COOLDOWN_MAX_SECONDS, self._relax_cooldown * 2.0)
+                log.info("[GOVERNOR] climbed again %.0fs after a step down; calm wait before a step down now %.0fs",
+                         now - self._last_step_down, self._relax_cooldown)
+            self._last_step_down = None
+        elif self.level < old:
+            self._last_step_down = now
         if self.level != old:
             log.info("[GOVERNOR] level %d->%d reason=%s%s", old, self.level, reason,
                      " (shadow)" if SHADOW_MODE else "")
@@ -3213,8 +3354,7 @@ class ActivityTracker:
 
 _activity = ActivityTracker()
 _gate_tls = threading.local()
-_starved_slots = threading.BoundedSemaphore(GATE_STARVED_MAX_CONCURRENT)
-_gate_state = {"throttle": None, "enabled": True, "waits": 0, "starved": 0, "last_wait_log": 0.0, "tune_until": 0.0}
+_gate_state = {"throttle": None, "enabled": True, "waits": 0, "last_wait_log": 0.0, "tune_until": 0.0}
 
 
 @contextlib.contextmanager
@@ -3230,11 +3370,54 @@ def background_activity(lane):
 def hold_background_for_tune():
     """Holds every background gate that has not admitted its work yet while a channel is being tuned, for at most TUNE_BACKGROUND_HOLD_SECONDS."""
     _gate_state["tune_until"] = time.monotonic() + TUNE_BACKGROUND_HOLD_SECONDS
+    _gate_state["tune_settling_since"] = None
 
 
-def release_tune_hold():
-    """Ends the tune hold once the new channel's show is playing."""
-    _gate_state["tune_until"] = 0.0
+def release_tune_hold(now=None):
+    """The new channel's show is playing: background work stays held until the picture has been steady TUNE_STEADY_SECONDS (as the throttle measures it on this PC), or TUNE_STEADY_MAX_SECONDS at most."""
+    now = time.monotonic() if now is None else now
+    _gate_state["tune_until"] = now + TUNE_STEADY_MAX_SECONDS
+    _gate_state["tune_settling_since"] = now
+    _gate_state["tune_steady_since"] = None
+
+
+def note_tune_steady(steady, now=None):
+    """Called by the throttle on each update after a tune: steady is true when this update saw no frames over their time and no lost pictures; TUNE_STEADY_SECONDS of steady updates end the hold."""
+    started = _gate_state.get("tune_settling_since")
+    if started is None:
+        return
+    now = time.monotonic() if now is None else now
+    if now >= _gate_state["tune_until"]:
+        _gate_state["tune_until"] = 0.0
+        _gate_state["tune_settling_since"] = None
+        log.info("[GOVERNOR] tune hold ended after %.0fs without %.0fs of steady picture; background work goes on", now - started, TUNE_STEADY_SECONDS)
+        return
+    if not steady:
+        _gate_state["tune_steady_since"] = None
+        return
+    if _gate_state.get("tune_steady_since") is None:
+        _gate_state["tune_steady_since"] = now
+    elif now - _gate_state["tune_steady_since"] >= TUNE_STEADY_SECONDS:
+        _gate_state["tune_until"] = 0.0
+        _gate_state["tune_settling_since"] = None
+        log.info("[GOVERNOR] picture steady for %.0fs after the tune (%.1fs after the show started); background work goes on", TUNE_STEADY_SECONDS, now - started)
+
+
+def ffmpeg_scans_at_once(level=None):
+    """How many ffmpeg scans the background gates let run at once: this PC's peak (the threads its mode affords) at load level 0, narrowed with the level by LEVEL_FACTOR, never below 1."""
+    level = current_level() if level is None else level
+    level = max(0, min(MAX_LEVEL, int(level)))
+    return max(1, int(affordable_threads() * LEVEL_FACTOR[level]))
+
+
+def tune_loudness_settle_seconds():
+    """Seconds a tuned channel must stay on screen before its first loudness scan starts."""
+    return TUNE_LOUDNESS_SETTLE_SECONDS
+
+
+def loudness_parallel_windows(windows):
+    """How many of one loudness scan's sample windows are measured at once: never more than the threads this PC's mode affords."""
+    return max(1, min(max(1, int(windows)), affordable_threads()))
 
 
 def tune_in_progress():
@@ -3266,9 +3449,9 @@ def health_snapshot():
         lanes = {lane: n for lane, n in _activity._inflight.items() if n}
     with _scan_turns_lock:
         waiting = sorted(kind for kind, entry in _scan_turns.items() if entry.get("rank") is not None)
-    return "level %d, running %s, gate waits %d, starved %d, scans with work waiting %s" % (
+    return "level %d, running %s, gate waits %d, scans with work waiting %s" % (
         current_level(), ", ".join("%s %d" % kv for kv in sorted(lanes.items())) or "nothing",
-        _gate_state["waits"], _gate_state["starved"], ", ".join(waiting) or "none")
+        _gate_state["waits"], ", ".join(waiting) or "none")
 
 
 def background_active(now=None):
@@ -3346,7 +3529,8 @@ def _lane_limit(lane, level):
 
 @contextlib.contextmanager
 def gate(lane, priority=False, timeout=None, label=""):
-    """Context manager around one unit of background work; yields True when admitted, False when the caller's timeout expired."""
+    """Context manager around one unit of background work; yields True when admitted, False when the caller's own timeout expired."""
+    # WARNING: owner order 2026-11-05: no time cap and no load-level refusal. A job waits only while the PC's capacity is full (the lane's limit, the ffmpeg scans allowed at once for this PC and load level, never fewer than 1), during the short tune hold, or while the scan throttle has stopped the scans because a game could not catch up; the load level narrows the capacity, it never stops the work. While it waits it hands back the scan place it holds.
     held = getattr(_gate_tls, "held", None)
     if held is None:
         held = _gate_tls.held = set()
@@ -3355,39 +3539,31 @@ def gate(lane, priority=False, timeout=None, label=""):
         return
     priority = bool(priority) or _is_priority_context()
     admitted = False
-    starved_slot = False
     if priority or not enforcing():
         _activity.begin(lane)
         admitted = True
     else:
         start = time.monotonic()
-        wait_cap = GATE_MAX_WAIT_SECONDS if timeout is None else timeout
-        deadline = start + wait_cap
+        deadline = None if timeout is None else start + timeout
         waited = False
-        while True:
+
+        def _may_start():
             level = current_level()
-            if (not tune_in_progress() and not game_needs_all() and level_allows(level, "background")
-                    and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < affordable_threads())
-                    and _activity.try_begin(lane, _lane_limit(lane, level))):
-                admitted = True
-                break
+            return (not tune_in_progress() and scan_throttle_mode() != "stopped"
+                    and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))
+                    and _activity.try_begin(lane, _lane_limit(lane, level)))
+        admitted = _may_start()
+        if not admitted:
             waited = True
-            if time.monotonic() >= deadline:
-                if timeout is not None:
-                    _gate_state["waits"] += 1
-                    break
-                # WARNING: releasing every capped waiter at once stalled the whole app on weak PCs; let one through at a time and never during a tune or a game.
-                if tune_in_progress() or game_needs_all() or not _starved_slots.acquire(blocking=False):
-                    deadline = time.monotonic() + GATE_POLL_SECONDS * 8
-                else:
-                    starved_slot = True
-                    _gate_state["starved"] += 1
-                    _activity.begin(lane)
-                    admitted = True
-                    log.info("[GOVERNOR] gate wait cap %.0fs reached, running anyway (one at a time): lane=%s %s level=%d",
-                             GATE_MAX_WAIT_SECONDS, lane, label, level)
-                    break
-            time.sleep(GATE_POLL_SECONDS)
+            with scan_slot_idle():
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        _gate_state["waits"] += 1
+                        break
+                    time.sleep(GATE_POLL_SECONDS)
+                    if _may_start():
+                        admitted = True
+                        break
         if waited and admitted:
             now = time.monotonic()
             if now - _gate_state["last_wait_log"] >= 5.0:
@@ -3402,8 +3578,6 @@ def gate(lane, priority=False, timeout=None, label=""):
         if admitted:
             held.discard(lane)
             _activity.end(lane)
-        if starved_slot:
-            _starved_slots.release()
 
 
 # ============================================================================
@@ -3889,6 +4063,7 @@ __all__ = [
     "MachineProfile", "Throttle", "MODE_TABLE", "MODE_NAMES", "SHADOW_MODE",
     "get_profile", "start", "set_mode", "get_mode", "normalize_mode", "core_budget", "whisper_threads",
     "feature_locked", "menu_fps", "lane_ceiling", "lane_slots", "effective_factor", "level_allows", "new_throttle",
+    "ffmpeg_scans_at_once", "tune_loudness_settle_seconds", "loudness_parallel_windows", "note_tune_steady",
     "make_fingerprint",
     "build_profile", "classify_tier", "BusyWindow", "LossTracker", "SystemCpuSampler", "format_status",
     "gate", "activity", "priority_scope", "in_priority_scope", "first_start_scan_plan", "first_start_scans_concurrent", "background_active", "enforcing", "set_enabled",
@@ -3896,6 +4071,6 @@ __all__ = [
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
     "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
-    "scan_pace_seconds", "quiet_seconds", "pc_is_quiet", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
+    "quiet_seconds", "pc_is_quiet", "quiet_lane_bonus", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
     "music_scan_class", "music_scan_falling_behind",
 ]

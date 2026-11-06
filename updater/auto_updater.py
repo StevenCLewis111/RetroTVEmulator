@@ -171,11 +171,12 @@ def current_build_type(base_dir):
 
 
 def _set_stamp_attributes(path, protected):
-    """Marks version.json hidden, system and read-only (protected) or plain; does nothing off Windows."""
+    """Marks version.json hidden and system (protected) or plain; does nothing off Windows."""
+    # WARNING: never add the read-only flag (0x1) here: Windows refuses to delete a read-only file, so a build folder that had been run could not be replaced by the next build (auto-py-to-exe stopped with Access is denied on version.json); hidden and system already keep it out of sight and out of accidental deletes.
     if os.name != "nt":
         return
     import ctypes
-    ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x1 | 0x2 | 0x4 if protected else 0x80)
+    ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2 | 0x4 if protected else 0x80)
 
 
 def write_version_stamp(base_dir, version, build=""):

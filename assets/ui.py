@@ -59,6 +59,8 @@ COLOR_BUTTON_TOGGLE_ADD = performance_governor.COLOR_BUTTON_TOGGLE_ADD if perfor
 COLOR_BUTTON_AUDIO_TRACK = performance_governor.COLOR_BUTTON_AUDIO_TRACK if performance_governor is not None else (230, 190, 40)
 COLOR_BUTTON_AUDIO_TRACK_TEXT = performance_governor.COLOR_BUTTON_AUDIO_TRACK_TEXT if performance_governor is not None else (20, 20, 20)
 MENU_CLOSE_BUTTON_PLACE = performance_governor.MENU_CLOSE_BUTTON_PLACE if performance_governor is not None else (25, 52, 110, 40)
+# WARNING: the fallback number below must match GUIDE_HIGHLIGHT_NUDGE_SECONDS in performance_governor.py; it is used only when that module fails to import.
+_GUIDE_HIGHLIGHT_NUDGE_SECONDS = performance_governor.GUIDE_HIGHLIGHT_NUDGE_SECONDS if performance_governor is not None else 0.75
 MENU_CLEAR_BUTTON_PLACE = performance_governor.MENU_CLEAR_BUTTON_PLACE if performance_governor is not None else (25, 52, 240, 40)
 POPUP_YES_NO_OFFSET = performance_governor.POPUP_YES_NO_OFFSET if performance_governor is not None else 100
 POPUP_YES_NO_SIZE = performance_governor.POPUP_YES_NO_SIZE if performance_governor is not None else (110, 36)
@@ -687,6 +689,21 @@ def _guide_merge_cells(timeline_entries):
 _guide_hub_past_cache = {}
 
 
+def _same_channel_number(a, b):
+    """True when two channel labels name the same channel number (4 and 04 are the same)."""
+    try:
+        return int(str(a)) == int(str(b))
+    except (TypeError, ValueError):
+        return str(a) == str(b)
+
+
+def visualizer_gain_file(state, channel_key):
+    """The song whose loudness gain the music menu may change: the one playing on this channel, only while this channel is the one on screen, else an empty string."""
+    if not _same_channel_number(state.get("current_channel", ""), channel_key):
+        return ""
+    return state.get("_vis_target_filepath", "") or ""
+
+
 def _guide_hub_past_signature(ch_str, now_dt, hub=None):
     """A small value that changes when the hub's aired, airing or Static rows of the channel change, for the guide's timeline cache key; None when the hub cannot be read."""
     try:
@@ -1022,6 +1039,16 @@ def _gpu_render_mode_label(db):
     return f"GPU/CPU: {by_value[saved]}"
 
 
+def _warp_needs_a_bezel(db):
+    """True while no bezel that warps is on (CRT TV Bezels off and no home console's own bezel on): Warp Screen is greyed out and shown off, and its saved choice is kept."""
+    try:
+        from game_deck import warp_bezel_available
+        return not warp_bezel_available(db)
+    except Exception as _swallowed_error:
+        _log_swallowed("_warp_needs_a_bezel: from game_deck import warp_bezel_available", _swallowed_error)
+        return False
+
+
 def _mode_locks(config_key):
     """True while the current performance mode greys out and switches off this setting."""
     try:
@@ -1137,7 +1164,7 @@ def get_channels_settings_menu_rows(db, app_state):
 
 def get_games_sub_menu_rows(db, app_state, console_key, is_on):
     if console_key == "MENU":
-        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores",
+        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores", "clear_bios",
                 "menu_bg_select_image", "multitap_toggle", "scroll_style", "text_color",
                 "game_screen_mode"]
 
@@ -2242,6 +2269,9 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
     _guide_target_abs = app_state.get("guide_selected_abs_time")
     if _guide_target_abs is None:
         _guide_target_abs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second
+    else:
+        # WARNING: a show's start can move a fraction of a second between two drawings; the highlight time is nudged forward by that much so a start that drifted just past it still holds the highlight instead of handing it to the cell on its left.
+        _guide_target_abs = _guide_target_abs + _GUIDE_HIGHLIGHT_NUDGE_SECONDS
 
     # ========================================================================
     # SECTION: Channel rows (selected row drawn first)
@@ -2585,6 +2615,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                        app_state.get("guide_refresh_token", 0),
                        (app_state.get("guide_channel_stamps") or {}).get(ch_str, 0),
                        _guide_schedule_signature,
+                       tuple(ch_info.get(_opt) for _opt in ("scheduling_mode", "block_mode", "pair_threshold_minutes", "commercials_enabled",
+                                                            "commercial_placement", "active", "marathon_anchor_epoch")),
                        _guide_hub_past_signature(ch_str, now_dt),
                        _guide_hub_future_signature(ch_str, now_dt))
             _tl_hit = _guide_timeline_cache.get(_tl_key)
@@ -2881,13 +2913,13 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                       _day_start += _real_day_len
                       _day_num += 1
 
-            if _tl_hit is None and not _is_marathon:
+            if _tl_hit is None:
                 timeline_entries = _guide_splice_aired(
                     timeline_entries,
                     _guide_aired_rows_in_view(
                         _guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end),
                         viewport_adjusted_start, viewport_adjusted_end))
-            if _tl_hit is None and not _is_holiday_guide and not _is_marathon:
+            if _tl_hit is None and not _is_holiday_guide:
                 timeline_entries = _guide_splice_aired(
                     timeline_entries,
                     _guide_aired_rows_in_view(
@@ -3568,7 +3600,7 @@ def render_settings_overlay_menu(surface, theme, app_state, db):
     surface.blit(stamp, pos)
 
 
-# WARNING: the fallback numbers below must match OPTIONS_TOGGLE_BOX_W_PX, REMOTE_REMAP_LABEL_COL_W_PX, REMOTE_REMAP_KEY_BOX_W_PX, REMOTE_REMAP_KEY_BOX_H_PX, REMOTE_REMAP_COL_GAP_PX, CHANNEL_SETTINGS_HEADER_GAP_PX, CHANNEL_SETTINGS_BOTTOM_RESERVED_PX, CHANNEL_SETTINGS_MIN_TOP_PX, HOLIDAY_ROWS_TOP_PX, HOLIDAY_ROWS_BOTTOM_PX, HOLIDAY_ROW_MIN_H_PX, HOLIDAY_ROW_MAX_H_PX, HOLIDAY_ROW_SLOT_PAD_PX, HOLIDAY_TOGGLE_W_PX, HOLIDAY_TOGGLE_GAP_PX, SUB_MENU_ROW_WIDTH_SHARE, SUB_MENU_ROW_GAP_PX, VIDEO_SLIDER_ROW_RESERVE_PX, VIDEO_SLIDER_SPACING_MAX_PX, VIDEO_SLIDER_SPACING_MIN_PX, THEME_SLIDER_LAST_BLOCK_RESERVE_PX, THEME_SLIDER_SPACING_MAX_PX, THEME_SLIDER_SPACING_MIN_PX, THEME_SLIDER_FIRST_GAP_MIN_PX, THEME_SLIDER_FIRST_GAP_TRIM_PX in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match OPTIONS_TOGGLE_BOX_W_PX, REMOTE_REMAP_LABEL_COL_W_PX, REMOTE_REMAP_KEY_BOX_W_PX, REMOTE_REMAP_KEY_BOX_H_PX, REMOTE_REMAP_COL_GAP_PX, CHANNEL_SETTINGS_HEADER_GAP_PX, CHANNEL_SETTINGS_BOTTOM_RESERVED_PX, CHANNEL_SETTINGS_MIN_TOP_PX, CHANNEL_SETTINGS_TITLE_TOP_PX, HOLIDAY_ROWS_TOP_PX, HOLIDAY_ROWS_BOTTOM_PX, HOLIDAY_ROW_MIN_H_PX, HOLIDAY_ROW_MAX_H_PX, HOLIDAY_ROW_SLOT_PAD_PX, HOLIDAY_TOGGLE_W_PX, HOLIDAY_TOGGLE_GAP_PX, SUB_MENU_ROW_WIDTH_SHARE, SUB_MENU_ROW_GAP_PX, VIDEO_SLIDER_ROW_RESERVE_PX, VIDEO_SLIDER_SPACING_MAX_PX, VIDEO_SLIDER_SPACING_MIN_PX, THEME_SLIDER_LAST_BLOCK_RESERVE_PX, THEME_SLIDER_SPACING_MAX_PX, THEME_SLIDER_SPACING_MIN_PX, THEME_SLIDER_FIRST_GAP_MIN_PX, THEME_SLIDER_FIRST_GAP_TRIM_PX in performance_governor.py; they are used only when that module fails to import.
 OPTIONS_TOGGLE_BOX_W_PX = performance_governor.OPTIONS_TOGGLE_BOX_W_PX if performance_governor is not None else 18 + 24
 REMOTE_REMAP_LABEL_COL_W_PX = performance_governor.REMOTE_REMAP_LABEL_COL_W_PX if performance_governor is not None else 195
 REMOTE_REMAP_KEY_BOX_W_PX = performance_governor.REMOTE_REMAP_KEY_BOX_W_PX if performance_governor is not None else 110
@@ -3577,6 +3609,7 @@ REMOTE_REMAP_COL_GAP_PX = performance_governor.REMOTE_REMAP_COL_GAP_PX if perfor
 CHANNEL_SETTINGS_HEADER_GAP_PX = performance_governor.CHANNEL_SETTINGS_HEADER_GAP_PX if performance_governor is not None else 40
 CHANNEL_SETTINGS_BOTTOM_RESERVED_PX = performance_governor.CHANNEL_SETTINGS_BOTTOM_RESERVED_PX if performance_governor is not None else 70
 CHANNEL_SETTINGS_MIN_TOP_PX = performance_governor.CHANNEL_SETTINGS_MIN_TOP_PX if performance_governor is not None else 20
+CHANNEL_SETTINGS_TITLE_TOP_PX = performance_governor.CHANNEL_SETTINGS_TITLE_TOP_PX if performance_governor is not None else 20
 HOLIDAY_ROWS_TOP_PX = performance_governor.HOLIDAY_ROWS_TOP_PX if performance_governor is not None else 60
 HOLIDAY_ROWS_BOTTOM_PX = performance_governor.HOLIDAY_ROWS_BOTTOM_PX if performance_governor is not None else 62
 HOLIDAY_ROW_MIN_H_PX = performance_governor.HOLIDAY_ROW_MIN_H_PX if performance_governor is not None else 34
@@ -4823,7 +4856,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _cs_bottom_reserved = CHANNEL_SETTINGS_BOTTOM_RESERVED_PX
         _cs_block_top = content_y + max(CHANNEL_SETTINGS_MIN_TOP_PX, (content_h - _cs_bottom_reserved - _cs_block_h) // 2)
 
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, _cs_block_top))
+        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + CHANNEL_SETTINGS_TITLE_TOP_PX))
         _cs_top_y = _cs_block_top + lbl_hdr.get_height() + _cs_header_gap
 
         for _cs_col_idx, _cs_col_entries in enumerate(_cs_columns):
@@ -4859,7 +4892,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     "boot_anim": "boot_anim_enabled",
                 }.get(_cs_row_id)
                 _cs_on = bool(db.config.get(_cs_config_key, False)) if (db is not None and _cs_config_key) else False
-                _cs_disabled = _cs_config_key is not None and _mode_locks(_cs_config_key)
+                _cs_disabled = _cs_config_key is not None and (_mode_locks(_cs_config_key) or (_cs_row_id == "warp_screen" and _warp_needs_a_bezel(db)))
                 if _cs_disabled:
                     _cs_on = False
                 _pill_y = _cs_bar_y + (box_h_43 - pill_h) // 2
@@ -5101,17 +5134,22 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _draw_menu_clear(menu_canvas, cx, content_y, content_h, is_clear_focused, _has_music_content, f_ch_btn, NEON_GREEN)
 
             _vis_gain_db = int(app_state.get("visualizer_gain_db", 0))
-            _vis_gain_path = app_state.get("_vis_target_filepath", "")
+            _vis_gain_path = visualizer_gain_file(app_state, target_ch_str)
             if _vis_gain_path and hasattr(__import__("__main__"), "_get_audio_gain_db"):
                 _vis_gain_db = __import__("__main__")._get_audio_gain_db(_vis_gain_path)
             gain_h = 40
             is_gain_focused = (sub_r == _gain_row_idx)
-            # WARNING: with Loudness Scan off no gain is played, so the row is drawn greyed (reachable, not adjustable), like the other greyed rows.
-            _vis_gain_live = db.config.get("loudness_scan_enabled", True)
+            # WARNING: the row is live only with Loudness Scan on and a song of THIS channel playing; otherwise it is drawn greyed and A and D change nothing.
+            _vis_scan_on = db.config.get("loudness_scan_enabled", True)
+            _vis_gain_live = _vis_scan_on and bool(_vis_gain_path)
             if _vis_gain_live:
                 gain_label = f_ch_label.render(f"LOUDNESS GAIN: {_vis_gain_db:+d} dB", True, NEON_GREEN if is_gain_focused else TEXT_WHITE)
-            else:
+            elif not _vis_scan_on:
                 gain_label = f_ch_label.render("LOUDNESS GAIN: LOUDNESS SCAN IS OFF", True, COLOR_MENU_TEXT_GREYED)
+            elif not _same_channel_number(app_state.get("current_channel", ""), target_ch_str):
+                gain_label = f_ch_label.render("LOUDNESS GAIN: TUNE TO THIS CHANNEL TO ADJUST", True, COLOR_MENU_TEXT_GREYED)
+            else:
+                gain_label = f_ch_label.render("LOUDNESS GAIN: NO SONG PLAYING", True, COLOR_MENU_TEXT_GREYED)
             pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON if _vis_gain_live else COLOR_MENU_BUTTON_GREYED, (row_x, gain_y, row_w, gain_h), border_radius=6)
             if is_gain_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (row_x, gain_y, row_w, gain_h), SELECTION_BORDER_WIDTH, border_radius=6)
@@ -6368,7 +6406,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             grid_row_ids = [r for r in sub_rows if r in ("core_select", "controller_map", "stick_deadzone", "multitap_toggle",
                                                            "menu_bg_select_image", "scroll_style", "text_color",
                                                            "scan_for_roms", "scan_for_cores", "clear_roms",
-                                                           "clear_cores", "game_screen_mode")]
+                                                           "clear_cores", "clear_bios", "game_screen_mode")]
             has_disc = "disc" in sub_rows
 
             grid_y = top_y + cell_h + y_gap
@@ -6394,12 +6432,13 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 "scan_for_cores": "SCAN FOR CORES",
                 "clear_roms":   "CLEAR ROMS",
                 "clear_cores":  "CLEAR CORES",
+                "clear_bios":   "CLEAR BIOS",
                 "game_screen_mode":  f"GAME SCREEN MODE:  {_game_mode_labels.get(_cur_game_mode, _cur_game_mode).upper()}",
             }
 
             if console_key == "MENU":
                 _menu_left_order  = ["controller_map", "menu_bg_select_image", "game_screen_mode",
-                                      "scan_for_cores", "clear_cores"]
+                                      "scan_for_cores", "clear_cores", "clear_bios"]
                 _menu_right_order = ["stick_deadzone", "multitap_toggle", "scroll_style",
                                      "scan_for_roms", "clear_roms"]
                 _left_ids  = [r for r in _menu_left_order if r in grid_row_ids]
@@ -6410,7 +6449,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _right_col_x  = row_x + _menu_col_w + _menu_col_gap
 
                 _menu_n_rows   = max(len(_left_ids), len(_right_ids))
-                _menu_block_h  = _menu_n_rows * cell_h + (_menu_n_rows - 1) * y_gap
+                _menu_row_gap  = y_gap if _menu_n_rows <= 5 else 10
+                _menu_block_h  = _menu_n_rows * cell_h + (_menu_n_rows - 1) * _menu_row_gap
                 _menu_top_bound    = header_box_y + header_box_h
                 _menu_bottom_bound = content_y + content_h - 52
                 _menu_even_gap = max(14, (_menu_bottom_bound - _menu_top_bound - _menu_block_h) // 2)
@@ -6418,9 +6458,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
                 row_positions = {}
                 for i, rid in enumerate(_left_ids):
-                    row_positions[rid] = (_left_col_x, grid_y + i * (cell_h + y_gap), _menu_col_w)
+                    row_positions[rid] = (_left_col_x, grid_y + i * (cell_h + _menu_row_gap), _menu_col_w)
                 for i, rid in enumerate(_right_ids):
-                    row_positions[rid] = (_right_col_x, grid_y + i * (cell_h + y_gap), _menu_col_w)
+                    row_positions[rid] = (_right_col_x, grid_y + i * (cell_h + _menu_row_gap), _menu_col_w)
             else:
                 row_positions = {rid: (row_x, grid_y + i * (cell_h + y_gap), short_row_w)
                                   for i, rid in enumerate(grid_row_ids)}
@@ -6429,9 +6469,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _main = _sys.modules.get("__main__")
             _any_manual_roms_fn = getattr(_main, "_any_manual_roms_exist", None) if _main else None
             _any_cores_fn       = getattr(_main, "_any_cores_exist", None) if _main else None
+            _any_bios_fn        = getattr(_main, "_any_bios_exist", None) if _main else None
             _menu_clear_has_content = {
                 "clear_roms":  bool(_any_manual_roms_fn()) if _any_manual_roms_fn else True,
                 "clear_cores": bool(_any_cores_fn()) if _any_cores_fn else True,
+                "clear_bios":  bool(_any_bios_fn()) if _any_bios_fn else True,
             }
 
             for row_id in grid_row_ids:
@@ -6444,7 +6486,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     rw = rw - _ss_swatch_w - _ss_gap
                 row_idx = full_rows.index(row_id)
                 is_focused = (sub_row == row_idx)
-                if row_id in ("clear_roms", "clear_cores"):
+                if row_id in ("clear_roms", "clear_cores", "clear_bios"):
                     _has_content = _menu_clear_has_content[row_id]
                     _row_bg = COLOR_BUTTON_CLEAR if _has_content else COLOR_MENU_BUTTON_GREYED
                     _row_txt_col = (NEON_GREEN if is_focused else TEXT_WHITE) if _has_content else COLOR_MENU_TEXT_GREYED
@@ -7083,6 +7125,7 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         "reset_settings": "RESET ALL SETTINGS?",
         "clear_roms": "CLEAR ALL ADDED ROMS?",
         "clear_cores": "CLEAR ALL CORES?",
+        "clear_bios": "CLEAR ALL BIOS?",
         "poweroff": "TURN OFF COMPUTER?",
         "boot_on_start": "REPLACE WINDOWS SHELL?",
         "app_update": "UPDATE AND RESTART?",

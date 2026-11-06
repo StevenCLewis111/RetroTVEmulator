@@ -38,7 +38,8 @@ def main(argv=None):
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({"version": args.version, "build": args.build_type}, handle)
         if os.name == "nt":
-            ctypes.windll.kernel32.SetFileAttributesW(path, 0x1 | 0x2 | 0x4)
+            # WARNING: never add the read-only flag (0x1): Windows refuses to delete a read-only file, so the next build could not replace this folder.
+            ctypes.windll.kernel32.SetFileAttributesW(path, 0x2 | 0x4)
         print(f"version.json written and protected in {args.stamp_dir}")
     return 0
 

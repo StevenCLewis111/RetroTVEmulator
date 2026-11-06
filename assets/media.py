@@ -57,10 +57,58 @@ except Exception as _governor_import_error:
 
 # WARNING: the fallback number below must match SELECTION_BORDER_WIDTH in performance_governor.py; it is used only when that module fails to import.
 SELECTION_BORDER_WIDTH = _perf_governor.SELECTION_BORDER_WIDTH if _perf_governor is not None else 3
+# WARNING: the fallback below must match REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS in performance_governor.py; it is used only when that module fails to import.
+REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS = _perf_governor.REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS if _perf_governor is not None else True
 
 def _media_warning(_key, message, *args):
     """Write one inexpensive line for a recoverable media failure."""
     log.warning(message, *args)
+
+
+def _is_network_path(text):
+    """True for a network share (\\\\host\\share, //host/share, \\\\?\\UNC\\...) or a web address (anything with ://); a local drive path, including the \\\\?\\C:\\ long form, is not."""
+    value = str(text or "").strip()
+    if "://" in value:
+        return True
+    backslashed = value.replace("/", "\\")
+    if backslashed.lower().startswith("\\\\?\\unc\\"):
+        return True
+    if backslashed.startswith("\\\\?\\") or backslashed.startswith("\\\\.\\"):
+        return False
+    return backslashed.startswith("\\\\")
+
+
+def _item_has_network_path(value, depth=0):
+    """True when any text inside one scheduled item (looked at three levels deep) is a network path."""
+    if isinstance(value, str):
+        return _is_network_path(value)
+    if depth >= 3:
+        return False
+    if isinstance(value, dict):
+        return any(_item_has_network_path(v, depth + 1) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_item_has_network_path(v, depth + 1) for v in value)
+    return False
+
+
+def _without_network_paths(channels):
+    """Returns (a copy of a server's channels without every scheduled item that points at a network share or web address, how many items were left out)."""
+    # WARNING: server mode takes its schedule from another machine on the network; an item that names a network share would make this PC try to sign in to that machine (and a web address would make the player fetch it), so such items never reach the scheduler.
+    dropped = [0]
+
+    def clean(value):
+        if isinstance(value, list):
+            kept = []
+            for item in value:
+                if isinstance(item, dict) and _item_has_network_path(item):
+                    dropped[0] += 1
+                    continue
+                kept.append(clean(item))
+            return kept
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        return value
+    return clean(channels), dropped[0]
 
 
 # ============================================================================
@@ -826,6 +874,16 @@ def _yield_to_live_playback(label=""):
             break
         time.sleep(0.02)
 
+def _acquire_idle(semaphore, timeout=None):
+    """Takes a semaphore; when it is taken by another thread the scan place this thread holds is handed back while it waits. True when it was taken."""
+    if semaphore.acquire(blocking=False):
+        return True
+    if _perf_governor is not None:
+        with _perf_governor.scan_slot_idle():
+            return semaphore.acquire() if timeout is None else semaphore.acquire(timeout=timeout)
+    return semaphore.acquire() if timeout is None else semaphore.acquire(timeout=timeout)
+
+
 @contextlib.contextmanager
 def _gov_gate(lane, priority=False, timeout=None, label=""):
     """Asks the performance governor to admit one unit of background work; True when admitted, False if the caller's timeout expired; admits everything if the governor is missing or errors."""
@@ -862,12 +920,18 @@ def _fast_disk_io_slot(label=""):
             and _perf_governor.first_start_scans_concurrent()):
         _semaphore = _FAST_DISK_IO_PRIORITY_SEMAPHORE
     if _lane is None:
-        with _semaphore:
+        _acquire_idle(_semaphore)
+        try:
             yield
+        finally:
+            _semaphore.release()
         return
     with _gov_gate(_lane, label=label):
-        with _semaphore:
+        _acquire_idle(_semaphore)
+        try:
             yield
+        finally:
+            _semaphore.release()
 
 
 def _sweep_path_exists_cache(now_ms):
@@ -970,9 +1034,12 @@ def _path_status(p):
     if not p:
         return PATH_MISSING
     now_ms = _now_ms()
-    with _path_exists_cache_lock:
-        _maybe_sweep_path_exists_cache(now_ms)
-        cached = _path_exists_cache.get(p)
+    # WARNING: a held status is read without the cache lock (one dict read, whole under Python's own lock); the lock is taken only when a sweep is due. The screen thread waited for this lock behind the scans on a 4-core PC.
+    if ((now_ms - _last_path_exists_cache_sweep_ms) >= _PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS
+            or len(_path_exists_cache) > _PATH_EXISTS_CACHE_MAX_ENTRIES):
+        with _path_exists_cache_lock:
+            _maybe_sweep_path_exists_cache(now_ms)
+    cached = _path_exists_cache.get(p)
     if cached is not None:
         _cached_status, _cached_at = cached
         if now_ms - _cached_at < _path_status_ttl_ms(_cached_status):
@@ -2011,6 +2078,21 @@ SIX_HOUR_BLOCK_NAMES = [b[0] for b in SIX_HOUR_BLOCKS]
 # WARNING: the fallback numbers must match HUB_* in performance_governor.py; they are used only when that module fails to import.
 HUB_SERIES_ESTIMATE_MIN_SCANNED = _perf_governor.HUB_SERIES_ESTIMATE_MIN_SCANNED if _perf_governor is not None else 2
 HUB_MOVIE_ESTIMATE_SECONDS = _perf_governor.HUB_MOVIE_ESTIMATE_SECONDS if _perf_governor is not None else 5400
+# WARNING: the fallback numbers must match SEASON_GUESS_* in performance_governor.py; they are used only when that module fails to import.
+SEASON_GUESS_MIN_SCANNED = _perf_governor.SEASON_GUESS_MIN_SCANNED if _perf_governor is not None else 2
+SEASON_GUESS_DURATION_SPREAD_SECONDS = _perf_governor.SEASON_GUESS_DURATION_SPREAD_SECONDS if _perf_governor is not None else 90.0
+SEASON_GUESS_GAIN_SPREAD_DB = _perf_governor.SEASON_GUESS_GAIN_SPREAD_DB if _perf_governor is not None else 2.0
+
+
+def season_values_agree(values, spread, minimum=None):
+    """The average of the scanned values of one season when there are enough of them and they sit within the spread of each other, else None: an unscanned episode may borrow the season's value only when the scanned ones agree."""
+    needed = SEASON_GUESS_MIN_SCANNED if minimum is None else minimum
+    values = [float(v) for v in values]
+    if len(values) < max(1, needed):
+        return None
+    if max(values) - min(values) > spread:
+        return None
+    return sum(values) / len(values)
 
 # WARNING: these two words are also what media_library.DurationHub returns; changing one without the other makes every saved length read as unknown.
 DURATION_MEASURED = "measured"
@@ -2094,16 +2176,17 @@ def _guess_class_uncached(path):
     title, _season, _episode = _flex_series_and_season({"path": path})
     if not title or _flex_is_non_episode_track({"path": path}):
         return "other", None
-    return "episode", _normalize_show_key(title)
+    # WARNING: an unscanned episode's length is the average of the scanned episodes of the same season of the same series (owner 2026-11-06, 14.5), so the season is part of the key.
+    return "episode", "%s|s%s" % (_normalize_show_key(title), _season if _season is not None else "")
 
 
-def _save_estimate(path, seconds, basis):
+def _save_estimate(path, seconds, basis, replace=False):
     """Saves an estimate in the hub and returns the estimate on record; without a hub the number is used for this call only."""
     hub = _duration_hub
     if hub is None:
         return int(seconds)
     try:
-        saved = hub.store_estimate(path, seconds, basis)
+        saved = hub.store_estimate(path, seconds, basis, replace=replace) if replace else hub.store_estimate(path, seconds, basis)
     except Exception as _swallowed_error:
         _log_swallowed("_save_estimate: hub.store_estimate(path, seconds, basis)", _swallowed_error)
         return int(seconds)
@@ -2128,15 +2211,17 @@ def _series_duration_guesses(items, path_exists):
             pending.append((p, guess_class, series_key, seconds))
     guesses = {}
     for path, guess_class, series_key, saved in pending:
-        if saved:
+        durations = known_by_series.get(series_key, []) if guess_class == "episode" else []
+        enough = season_values_agree(durations, SEASON_GUESS_DURATION_SPREAD_SECONDS, HUB_SERIES_ESTIMATE_MIN_SCANNED) is not None
+        if saved and not (guess_class == "episode" and enough):
             guesses[path] = saved
         elif guess_class == "movie":
             guesses[path] = _save_estimate(path, HUB_MOVIE_ESTIMATE_SECONDS, ESTIMATE_BASIS_MOVIE_DEFAULT)
-        else:
-            durations = known_by_series.get(series_key, [])
-            if len(durations) >= HUB_SERIES_ESTIMATE_MIN_SCANNED:
-                guesses[path] = _save_estimate(path, int(round(sum(durations) / float(len(durations)))),
-                                               ESTIMATE_BASIS_SERIES_AVERAGE)
+        elif enough:
+            guesses[path] = _save_estimate(path, int(round(sum(durations) / float(len(durations)))),
+                                           ESTIMATE_BASIS_SERIES_AVERAGE, replace=bool(saved))
+        elif saved:
+            guesses[path] = saved
     return guesses
 
 
@@ -5163,9 +5248,14 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             _deferred_fill += leftover
         return t
 
+    def _interior_cut_count(show_dur):
+        """How many cuts at 30, 60, 90 ... minutes of show time a show gets: a cut only where at least 15 minutes of the show are still left after it (owner 2026-11-06, 14.6)."""
+        # WARNING: an 80-minute show cuts at 30 and 60 and its third break is at its end; a 70-minute show cuts at 30 only, because 10 minutes is too short a last part to cut again.
+        return max(0, (int(show_dur) - 900) // HALF_HOUR)
+
     def _breaks_for_show(show_dur):
-        """How many breaks a show of 30 minutes or more gets: one for every half hour it runs into, and never fewer than 2; the last one is at its end (owner 2026-11-03)."""
-        return max(2, int(-(-int(show_dur) // HALF_HOUR)))
+        """How many breaks a show of 30 minutes or more gets: one at every 30 minutes of show time that leaves at least 15 minutes after it, plus one at its end, and never fewer than 2 (owner 2026-11-06; before that, one for every half hour it ran into, 2026-11-03)."""
+        return max(2, _interior_cut_count(show_dur) + 1)
 
     def _pack_even_breaks(show, show_dur, num_breaks, t_block_content, next_mark, first_cut=None):
         """Cuts the show into num_breaks equal parts (a pair at its seam) with a break after each, the last one at its end; the ad time up to next_mark is shared evenly so the next show starts on its mark."""
@@ -5180,6 +5270,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 seg = show_dur - seek_offset
             elif i == 0 and first_cut:
                 seg = int(first_cut)
+            elif _interior_cut_count(show_dur) >= 2:
+                seg = (i + 1) * HALF_HOUR - seek_offset
             else:
                 seg = (int(show_dur) * (i + 1)) // num_breaks - seek_offset
             timeline.append(_show_entry(show, seg, t_block_content, seek_offset,
@@ -8703,7 +8795,7 @@ def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec
     _probe_t0 = time.time()
     _sem = semaphore or _LOUDNESS_PROBE_SEMAPHORE
     if semaphore_timeout is not None:
-        if not _sem.acquire(timeout=semaphore_timeout):
+        if not _acquire_idle(_sem, timeout=semaphore_timeout):
             _elapsed = time.time() - _probe_t0
             _media_warning(
                 "loudness_semaphore_timeout",
@@ -8713,7 +8805,7 @@ def _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=None, length_sec
             )
             return None, None, None, "", True
     else:
-        _sem.acquire()
+        _acquire_idle(_sem)
     try:
         _yield_to_live_playback("loudness probe")
         _probe_t0 = time.time()
@@ -9291,8 +9383,10 @@ def _sample_lufs_readings(file_path, target_lufs, semaphore=None, chunk_timeout=
         return _full, (_spoken_out.get("i") if dialogue is not None else None)
 
     if parallel_windows:
+        # WARNING: at most as many windows at once as the PC's mode affords threads; all at once ran 8 ffmpeg seeks on a 4-core PC.
+        _window_workers = _perf_governor.loudness_parallel_windows(len(windows)) if _perf_governor is not None else len(windows)
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(windows), thread_name_prefix="loud-win") as pool:
+                max_workers=_window_workers, thread_name_prefix="loud-win") as pool:
             results = list(enumerate(pool.map(_one, windows)))
     elif centers is None and len(windows) > LOUDNESS_SCAN_EARLY_STOP_WINDOWS:
         results = []
@@ -10355,6 +10449,11 @@ class RetroDatabase:
             if 5 <= channel_num <= 44 and isinstance(value, dict):
                 normalized[str(channel_num).zfill(2)] = value
 
+        if REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS:
+            normalized, _left_out = _without_network_paths(normalized)
+            if _left_out:
+                _media_warning("remote_network_paths", "[SERVER] left out %d scheduled item(s) from the server that point at a network share or a web address", _left_out)
+
         with self._remote_schedule_lock:
             if not self._remote_schedule_active:
                 self._remote_local_channels_snapshot = copy.deepcopy(self.channels_db)
@@ -11055,5 +11154,5 @@ __all__ = [
     "resolve_whisper_model_dir", "set_caption_memory_refusal_handler", "set_live_playback_priority", "split_movies_and_series",
     "stable_series_id", "strip_shortcut_display_suffix", "track_duration_is_estimated",
     "read_track_duration", "set_duration_hub", "get_duration_hub", "DURATION_MEASURED", "DURATION_ESTIMATED",
-    "HUB_SERIES_ESTIMATE_MIN_SCANNED", "HUB_MOVIE_ESTIMATE_SECONDS",
+    "HUB_SERIES_ESTIMATE_MIN_SCANNED", "HUB_MOVIE_ESTIMATE_SECONDS", "season_values_agree",
 ]

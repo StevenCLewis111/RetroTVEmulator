@@ -826,7 +826,7 @@ def _build_games_table(page, total, kiosk):
 # ============================================================================
 
 # WARNING: these lists must match the column split in the Games sub-menu drawing in ui.py (_menu_left_order, _menu_right_order, and the splash panel that fills the right column), or the table and the picture disagree about which cell is where.
-GAMES_SUB_MENU_LEFT = ("controller_map", "menu_bg_select_image", "game_screen_mode", "scan_for_cores", "clear_cores")
+GAMES_SUB_MENU_LEFT = ("controller_map", "menu_bg_select_image", "game_screen_mode", "scan_for_cores", "clear_cores", "clear_bios")
 GAMES_SUB_MENU_RIGHT = ("stick_deadzone", "multitap_toggle", "scroll_style", "scan_for_roms", "clear_roms")
 GAMES_SUB_RIGHT_COLUMN = ("dvd_captions_toggle", "dvd_resume_toggle", "splash_toggle", "splash_select_image", "splash_select_video",
                           "add_bios", "relocate_roms_folder", "clear_console_roms")
@@ -2115,27 +2115,6 @@ def joystick_action(event):
 
 
 # ============================================================================
-# SECTION: Controller bridge keys
-# ============================================================================
-
-_BRIDGE_VK_KEYS = {}
-
-
-def bridge_vk_to_key(vk):
-    """Returns the pygame key a Windows virtual-key code sent by the controller bridge arrives as, or None when it has no pygame key here."""
-    import pygame
-    if not _BRIDGE_VK_KEYS:
-        _BRIDGE_VK_KEYS.update({
-            0x08: pygame.K_BACKSPACE, 0x09: pygame.K_TAB, 0x0D: pygame.K_RETURN, 0x1B: pygame.K_ESCAPE,
-            0x20: pygame.K_SPACE, 0x25: pygame.K_LEFT, 0x26: pygame.K_UP, 0x27: pygame.K_RIGHT, 0x28: pygame.K_DOWN,
-        })
-        _BRIDGE_VK_KEYS.update({0x30 + i: pygame.K_0 + i for i in range(10)})
-        _BRIDGE_VK_KEYS.update({0x41 + i: pygame.K_a + i for i in range(26)})
-        _BRIDGE_VK_KEYS.update({0x70 + i: pygame.K_F1 + i for i in range(12)})
-    return _BRIDGE_VK_KEYS.get(vk)
-
-
-# ============================================================================
 # SECTION: Channel number entry
 # ============================================================================
 
@@ -2363,7 +2342,7 @@ __all__ = [
     "EXPLORER_THUMB_MIN_H", "EXPLORER_SB_WIDTH", "EXPLORER_SB_PAD", "explorer_hit", "explorer_in_band", "explorer_visible_rows", "explorer_row", "explorer_row_at", "explorer_list_pick",
     "explorer_in_remove_zone", "explorer_wheel", "explorer_wheel_button", "explorer_thumb", "explorer_scroll_from_thumb", "explorer_scrollbar_track", "explorer_scrollbar_press",
     "explorer_scrollbar_drag", "explorer_modifiers", "explorer_select", "explorer_double_click", "explorer_drag_moved", "explorer_drag_step", "explorer_button_at",
-    "bridge_vk_to_key", "JOY_AXIS_THRESHOLD", "JOY_VERTICAL_AXIS", "JOY_HORIZONTAL_AXIS", "JOY_ACCEPT_BUTTONS", "JOY_BACK_BUTTONS", "joystick_action",
+    "JOY_AXIS_THRESHOLD", "JOY_VERTICAL_AXIS", "JOY_HORIZONTAL_AXIS", "JOY_ACCEPT_BUTTONS", "JOY_BACK_BUTTONS", "joystick_action",
     "DIGIT_ENTRY_MAX", "DIGIT_ENTRY_SINGLE_MS", "DIGIT_ENTRY_CONFIRM_MS", "key_to_digit", "digit_entry_step", "digit_entry_due", "digit_entry_channel",
     "NAME_SAVE", "NAME_CANCEL", "NAME_EDIT", "NAME_ENTRY_CHANNEL_MAX_DEFAULT", "NAME_ENTRY_SLOT_MAX", "name_entry_step",
     "DVD_PLAY_PAUSE", "DVD_REWIND", "DVD_FAST_FORWARD", "DVD_RETURN_MENU", "DVD_ACTIONS", "DVD_RETURN_IGNORE", "DVD_RETURN_REISSUE", "DVD_RETURN_CONFIRM",

@@ -290,22 +290,6 @@ class MediaLibrary:
                 "ORDER BY learn_change_at", (series_key,)).fetchall()
         return [(float(r[0]), float(r[1] or 0.0)) for r in rows]
 
-    def series_slider_rows(self, series_key: str):
-        """(wanted offset dB, watch time) of every file of one series the volume kept while watching was learned from, oldest first."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT learn_slider_db, learn_slider_at FROM library WHERE learn_series_key=? AND learn_slider_db IS NOT NULL "
-                "ORDER BY learn_slider_at", (series_key,)).fetchall()
-        return [(float(r[0]), float(r[1] or 0.0)) for r in rows]
-
-    def comfort_watch_volumes(self, limit: int):
-        """The volume kept on the most recently watched files whose gain the owner set by hand, newest first."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT learn_watch_volume FROM library WHERE gain_scan_version=? AND learn_watch_volume IS NOT NULL "
-                "ORDER BY learn_watch_at DESC LIMIT ?", (_OWNER_GAIN_SCAN_VERSION, int(limit))).fetchall()
-        return [float(r[0]) for r in rows]
-
     def _ensure_schedule_row_columns(self):
         """Adds the bundle, row_files and guide_entry columns to a hub_schedule_row table an older database file lacks, keeping every row."""
         # WARNING: the table must keep every existing row (R26); old rows read as having no bundle and no guide entry.
@@ -1416,6 +1400,10 @@ class ProbeLibrary:
         if entry is None or not entry.get("header_probed_at"):
             entry = self.get_or_probe_sync(file_path)
         duration = (entry or {}).get("duration")
+        # WARNING: a file is scanned once and decided from the saved hub data afterwards (owner 2026-11-05, 14.4); a scan of a file that already has a saved picture box is written down with its reason so a second scan can never go unnoticed.
+        if entry and entry.get("picture_box"):
+            log.warning("[SCAN AGAIN] picture box of %s is scanned a second time: the saved result is from detector version %s and the current one is %s",
+                        os.path.basename(str(file_path)), entry.get("picture_box_detector_version") or 0, PICTURE_BOX_DETECTOR_VERSION)
         box = detect_picture_box(file_path, duration=duration, ffmpeg_path=self.ffmpeg_path, diag=diag, parallel=parallel)
         if box is None:
             return None
@@ -1682,8 +1670,21 @@ ESTIMATE_BASIS_SERIES_AVERAGE = "series_average"
 ESTIMATE_BASIS_MOVIE_DEFAULT = "movie_default"
 
 
+_hub_key_cache = {}
+
+
 def _hub_key(path) -> str:
-    return os.path.normpath(os.path.abspath(str(path))).lower()
+    """The hub's key for a path: its full, normalised, lower-case form, worked out once per path text and remembered."""
+    try:
+        key = _hub_key_cache.get(path)
+    except TypeError:
+        return os.path.normpath(os.path.abspath(str(path))).lower()
+    if key is None:
+        key = os.path.normpath(os.path.abspath(str(path))).lower()
+        if len(_hub_key_cache) > 200000:
+            _hub_key_cache.clear()
+        _hub_key_cache[path] = key
+    return key
 
 
 # WARNING: the fallback must match HUB_UNMEASURED_RECHECK_SECONDS in performance_governor.py; it is used only when that module fails to import.
@@ -1780,9 +1781,9 @@ class DurationHub(_PathMemoHub):
 
     def _lookup(self, key, path, background=False):
         """Returns [measured, estimate, looked-up-at] for a path, asking the library once and remembering the answer; a path with no measured length is asked again after the recheck time (on the screen thread the answer held is used and the ask is queued for a background thread), and a path the library has no length for gets its old settings values carried in first."""
-        with self._lock:
-            held = self._memo.get(key)
-            force = key in self._must_resolve
+        # WARNING: an answer already held is read without the hub's lock (one dict read and one set check, each whole under Python's own lock); the screen thread took this lock thousands of times a second and waited for it behind the scans on a 4-core PC (owner log 2026-11-04). Writes still take the lock.
+        held = self._memo.get(key)
+        force = key in self._must_resolve
         now = time.monotonic()
         if held is not None and not force and (held[0] or now - held[2] < _UNMEASURED_RECHECK_SECONDS):
             return held
@@ -1840,7 +1841,7 @@ class DurationHub(_PathMemoHub):
             self._set_memo(key, [recorded, held[1] if held else None, time.monotonic()])
         return saved
 
-    def store_estimate(self, path, seconds, basis):
+    def store_estimate(self, path, seconds, basis, replace=False):
         """Saves an estimate for a file with no measured length; a file that already has an estimate keeps it. Returns the estimate on record, or None for a measured file or a length that is not positive. The answer is held in memory at once and the library row is written by one background thread, so nothing on the asking thread ever opens a file."""
         # WARNING: this is called while the schedule is built, on the main thread too; keying a new file here (a disk read behind the governor gate) froze the app for a minute when hundreds of files were added.
         if not seconds or seconds <= 0:
@@ -1849,13 +1850,14 @@ class DurationHub(_PathMemoHub):
         measured, existing, _at = self._lookup(key, path)
         if measured:
             return None
-        if existing:
+        # WARNING: replace=True is only for a series-average estimate that a later scan of the same season has moved (owner 2026-11-06, 14.5: "updated as they get scanned later"); every other estimate is kept as saved.
+        if existing and not (replace and int(existing) != int(round(seconds))):
             return int(existing)
         saved = float(int(round(seconds)))
         with self._lock:
             held = self._memo.get(key)
             self._set_memo(key, [held[0] if held else None, saved, time.monotonic()])
-            self._pending_estimates[key] = (str(path), saved, basis)
+            self._pending_estimates[key] = (str(path), saved, basis, bool(replace))
             self._estimate_idle.clear()
             if self._estimate_thread is None or not self._estimate_thread.is_alive():
                 self._estimate_thread = threading.Thread(target=self._estimate_writer, name="EstimateWriter", daemon=True)
@@ -1890,7 +1892,7 @@ class DurationHub(_PathMemoHub):
             except Exception as _swallowed_error:
                 _log_swallowed("DurationHub._estimate_writer: saving a queued estimate", _swallowed_error)
 
-    def _write_estimate(self, key, path, saved, basis):
+    def _write_estimate(self, key, path, saved, basis, replace=False):
         """Background thread: keys the file and saves its estimate in the library, unless the library already holds a length or an older estimate for that content."""
         content_key = self.probe_library.keys.resolve(path)
         if content_key is None:
@@ -1900,7 +1902,8 @@ class DurationHub(_PathMemoHub):
             with self._lock:
                 self._set_memo(key, [float(entry["duration"]), entry.get("estimated_duration"), time.monotonic()])
             return
-        if entry.get("estimated_duration") and entry["estimated_duration"] > 0:
+        if (entry.get("estimated_duration") and entry["estimated_duration"] > 0
+                and not (replace and entry.get("estimate_basis") == ESTIMATE_BASIS_SERIES_AVERAGE)):
             with self._lock:
                 held = self._memo.get(key)
                 self._set_memo(key, [held[0] if held else None, float(entry["estimated_duration"]), time.monotonic()])
@@ -1940,9 +1943,9 @@ class GainHub(_PathMemoHub):
 
     def _lookup(self, key, path):
         """Returns the remembered record for a path, asking the library once; a path with no scanned gain on record is asked again after the recheck time, and a path the library has no gain or picture size for gets its old settings values carried in first."""
-        with self._lock:
-            held = self._memo.get(key)
-            force = key in self._must_resolve
+        # WARNING: an answer already held is read without the hub's lock (one dict read and one set check, each whole under Python's own lock); the screen thread took this lock thousands of times a second and waited for it behind the scans on a 4-core PC (owner log 2026-11-04). Writes still take the lock.
+        held = self._memo.get(key)
+        force = key in self._must_resolve
         now = time.monotonic()
         if held is not None and not force and ((held["gain"] is not None and held["width"] is not None) or now - held["at"] < _GAIN_MISS_RECHECK_SECONDS):
             return held
@@ -2080,22 +2083,6 @@ class GainHub(_PathMemoHub):
             _log_swallowed("GainHub.read_series_changes: reading the series' loudness changes from the library", _swallowed_error)
             return []
 
-    def read_series_slider(self, series_key):
-        """(wanted offset dB, watch time) of every watched episode of one series the volume slider was learned from, oldest first; [] when none or unreadable."""
-        try:
-            return self.probe_library.library.series_slider_rows(series_key)
-        except Exception as _swallowed_error:
-            _log_swallowed("GainHub.read_series_slider: reading the series' watched volumes from the library", _swallowed_error)
-            return []
-
-    def read_comfort_volumes(self, limit):
-        """The volume kept on the most recently watched owner-set files, newest first; [] when none or unreadable."""
-        try:
-            return self.probe_library.library.comfort_watch_volumes(limit)
-        except Exception as _swallowed_error:
-            _log_swallowed("GainHub.read_comfort_volumes: reading the owner's comfortable volumes from the library", _swallowed_error)
-            return []
-
     def note_track_gains(self, path, primary, gains, scan_version=None):
         """Saves the scanned gain of every audio track of a file; False when the library cannot hold it."""
         try:
@@ -2183,9 +2170,9 @@ class FileFactsHub(_PathMemoHub):
     def _lookup(self, key, path):
         """Returns the remembered record for a path, asking the library once; a path with nothing on record is asked again after the recheck time. Only a file the hub was told changed (forget) is re-keyed from disk; every other read goes by the saved path row and never opens the file."""
         # WARNING: this is called for every pending file by the scheduler, the guide and the preloader, on the main thread too; hashing a file here made 500 new files stall the whole app for a minute. A path nobody has keyed yet has no facts on record, so it reads as blank.
-        with self._lock:
-            held = self._memo.get(key)
-            force = key in self._must_resolve
+        # WARNING: an answer already held is read without the hub's lock (one dict read and one set check, each whole under Python's own lock); the screen thread took this lock thousands of times a second and waited for it behind the scans on a 4-core PC (owner log 2026-11-04). Writes still take the lock.
+        held = self._memo.get(key)
+        force = key in self._must_resolve
         now = time.monotonic()
         if held is not None and not force:
             if any(held[name] is not None for name in FILE_FACT_COLUMNS) or now - held["at"] < _GAIN_MISS_RECHECK_SECONDS:
@@ -2419,17 +2406,55 @@ _SCHEDULE_STATE_RANK = {"planned": 0, "airing": 1, "aired": 2, "static": 2}
 _SCHEDULE_ROW_FIELDS = ("channel", "slot_key", "position", "path", "kind", "pass_no", "planned_start", "used_length", "length_source", "state")
 
 
+def _forgets_show_facts(method):
+    """Makes a hub write that changes what is scheduled throw away the station's remembered playback facts, so the scheduler is asked again."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            channel = args[0] if args else kwargs.get("channel")
+            if channel is None:
+                self._show_facts.clear()
+            else:
+                self._show_facts.pop(channel, None)
+    return wrapper
+
+
+def _forgets_current_show(method):
+    """Makes a hub write throw away the station's cached current-show record, so the next read looks at the rows again."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            channel = args[0] if args else kwargs.get("channel")
+            if channel is None:
+                self._current_show.clear()
+            else:
+                self._current_show.pop(channel, None)
+    return wrapper
+
+
 class ScheduleHub:
     """Keeps each channel's ordered rows in the library: what is meant to play, when, for how long, and what has played."""
     # WARNING: a row that is airing, aired or static is history; no call here may change or remove it except mark() moving it forward, or aired rows and pass records are lost (R26) and a past slot moves (R18).
 
     def __init__(self, library: "MediaLibrary"):
+        self._current_show = {}
+        self._show_facts = {}
         self.library = library
 
     @staticmethod
     def _as_dict(row):
         return dict(zip(_SCHEDULE_ROW_FIELDS, row))
 
+    @_forgets_show_facts
+    @_forgets_current_show
     def put_rows(self, channel, slot_key, rows):
         """Replaces the slot's planned rows with the given ones; rows already airing, aired or static stay as they are and a new row for their position is skipped. A row without a pass number gets one more than the highest pass of that file already on air in this channel, and a continuation of a split show keeps its first part's pass. Returns (written, skipped)."""
         with self.library._lock:
@@ -2543,6 +2568,8 @@ class ScheduleHub:
                 result.append(dict(info, slot_key=found[generation], generation=generation))
         return result
 
+    @_forgets_show_facts
+    @_forgets_current_show
     def place_rows(self, channel, block_key, rows, airing_position=None, now_epoch=None, start_tolerance=None, mode=None):
         """Writes a block's planned rows into its newest set. When the plan holds other files, or other start times, at positions that already airing, aired or static rows hold, or when the slot mode changed, it opens a new set: the old set is put aside with its unaired rows kept, its airing row is closed at the clock moment and the stopping point is recorded, and the new set gets the rows from the airing position on, the first starting at the clock moment, all in one saved change. Returns (slot_key, written, skipped, new_generation)."""
         # WARNING: rows already airing, aired or static are history (R26) and the old set's unaired rows are kept, never deleted (owner answer to Q1); only a clear of the whole app or one channel may delete. The close, the labels and the new rows are one transaction, so a failure leaves the old set exactly as it was.
@@ -2616,6 +2643,8 @@ class ScheduleHub:
                 written, skipped = self._put_rows_in(conn, channel, slot_key, rows)
         return slot_key, written, skipped, new_generation
 
+    @_forgets_show_facts
+    @_forgets_current_show
     def put_aired_rows(self, channel, slot_key, rows, mode=None):
         """Saves rows of a stretch that has already passed, such as a block the station missed while it was off, as aired rows in a set of their own, in one saved change. Returns how many rows were written."""
         # WARNING: the rows go through the same round numbering as planned rows and are marked aired in the same transaction; a slot that already holds rows keeps them (R26).
@@ -2683,6 +2712,8 @@ class ScheduleHub:
             return None
         return value if isinstance(value, dict) else None
 
+    @_forgets_show_facts
+    @_forgets_current_show
     def clear_all_schedule_data(self):
         """Empties every channel's schedule: the planned, airing and aired rows, the future rows, the slot records and the play orders; returns {table: rows removed}."""
         # WARNING: only for a fresh start (no retro_config.json at boot, owner order 2026-11-02); everywhere else aired rows are history and stay (R26).
@@ -2736,6 +2767,51 @@ class ScheduleHub:
                 "SELECT COUNT(*), MAX(updated_at) FROM hub_schedule_row WHERE channel = ? AND state != 'planned'", (channel,)).fetchone()
         return (int(count or 0), float(newest or 0.0))
 
+    def remember_show_facts(self, channel, facts, epoch, guard=None):
+        """Records the playback facts the scheduler worked out for the show on air (file, length, block, seek at that moment); guard is a small value that must still match for the facts to be trusted."""
+        # WARNING: only the scheduler's door writes these; readers use show_facts().
+        self._show_facts[channel] = {"facts": dict(facts), "epoch": float(epoch), "guard": guard}
+
+    def forget_show_facts(self, channel=None):
+        """Drops the remembered playback facts of one station, or of all stations."""
+        if channel is None:
+            self._show_facts.clear()
+        else:
+            self._show_facts.pop(channel, None)
+
+    def show_facts(self, channel, epoch, guard=None):
+        """The remembered playback facts for the show on air with the seek moved forward by the clock, or None when nothing is remembered, the guard changed, or the show has run out; the caller then asks the scheduler through the hub's miss path."""
+        kept = self._show_facts.get(channel)
+        if kept is None or kept["guard"] != guard:
+            return None
+        elapsed = float(epoch) - kept["epoch"]
+        if elapsed < 0:
+            return None
+        facts = dict(kept["facts"])
+        seek = float(facts.get("seek", 0) or 0) + elapsed
+        duration = float(facts.get("duration", 0) or 0)
+        # WARNING: for a show cut out of the inside of a longer file the seek is a place in the whole file and the duration is only the slot, so the slot's own start is taken off before asking whether the show has run out (owner log 2026-11-06: ch08, ch18 and ch19 always missed the hub).
+        slot_start = float(facts.get("seek_slot_offset", 0) or 0) if facts.get("interior_cut") else 0.0
+        if duration <= 0 or seek - slot_start >= duration - 1.0:
+            return None
+        facts["seek"] = seek
+        return facts
+
+    def current_show(self, channel, epoch):
+        """The station's current-show record at one clock moment: the row airing then plus how far into it the clock is. The record is kept per station and only looked up again when the clock leaves the show or a hub write changes the rows, so a channel change is clock math on the kept record."""
+        # WARNING: this only reads; the scheduler and the scans stay the writers, and every hub write drops the kept record.
+        kept = self._current_show.get(channel)
+        if kept is not None and kept["start"] <= epoch < kept["end"]:
+            return dict(kept["row"], seek=epoch - kept["start"])
+        row = self.at(channel, epoch)
+        if row is None:
+            self._current_show.pop(channel, None)
+            return None
+        start = float(row["planned_start"])
+        end = start + float(row.get("used_length") or 0)
+        self._current_show[channel] = {"row": row, "start": start, "end": end}
+        return dict(row, seek=epoch - start)
+
     def at(self, channel, epoch):
         """The channel's row that covers one clock moment (planned start up to planned start plus length), or None; a row that has aired, is airing or went to Static is preferred over a planned one, then the latest start."""
         sql = ("SELECT channel, slot_key, position, path, kind, pass_no, planned_start, used_length, length_source, state "
@@ -2748,6 +2824,7 @@ class ScheduleHub:
             found = self.library._conn.execute(sql, (channel, float(epoch), float(epoch))).fetchone()
         return self._as_dict(found) if found else None
 
+    @_forgets_current_show
     def mark(self, channel, slot_key, position, state, used_length=None, length_source=None):
         """Moves a row forward (planned, airing, aired or static); a row never moves back. Returns whether it changed."""
         if state not in _SCHEDULE_STATE_RANK:
@@ -2766,6 +2843,7 @@ class ScheduleHub:
             return True
 
 
+    @_forgets_current_show
     def mark_airing_static(self, channel, path):
         """Marks the channel's newest airing row for this file as static, the slot that went to Static because the file would not play. Returns how many rows changed."""
         # WARNING: only the newest airing row of the file changes; an older row of the same file that was left airing by an earlier block is history and must not become Static.
@@ -2779,6 +2857,7 @@ class ScheduleHub:
                     (time.time(), channel, key, channel, key))
             return cur.rowcount
 
+    @_forgets_current_show
     def close_passed_rows(self, channel, now_epoch, current_slot, current_position):
         """Marks as aired every row of the channel that the clock has left behind in another block: a row still airing that is not the one airing now, and a planned row of an active set whose start and length ended before now_epoch. Rows of a set that was put aside and rows without a start time stay as they are. Returns (rows closed that were airing, rows closed that were planned)."""
         # WARNING: nothing is deleted and no row moves back (R26); a row of the block on air is left to the caller's own marking, and a set that was put aside keeps its unaired rows (owner answer to Q1).
