@@ -901,11 +901,14 @@ def _gov_gate(lane, priority=False, timeout=None, label=""):
 
 
 def _fast_disk_lane(label):
-    """Map a job kind to its governor lane: picture_box to cropdetect, asr_extract to none, everything else to probe_and_duration."""
+    """Map a job kind to its governor lane: picture_box to cropdetect, asr_extract to none, dialogue_probe to loudness, everything else to probe_and_duration."""
     if label.startswith("asr_extract"):
         return None
     if label.startswith("picture_box"):
         return "cropdetect_threads"
+    # WARNING: the audio-track listing is loudness work; filed under the length-probe lane it waited behind every length probe while its loudness window held a place (owner log 2026-11-06).
+    if label.startswith("dialogue_probe"):
+        return "loudness_and_bake"
     return "probe_and_duration"
 
 

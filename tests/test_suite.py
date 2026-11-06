@@ -7471,20 +7471,21 @@ def guide_highlight_case():
 
     def stops_for(ch, time_idx):
         vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
-        stops, cursor = [], vs
+        stops, cursor, prev_end = [], vs, vs
         for a, b in scheds[ch]:
             if b <= vs:
+                prev_end = b
                 continue
             if a >= ve:
                 break
             cs = max(vs, a)
             if cs > cursor:
-                for c in range(int((cursor - vs) / 1800.0), int((cs - vs - 1) / 1800.0) + 1):
-                    stops.append({"col": c, "abs": vs + c * 1800, "key": ("offair", c)})
+                stops.append({"col": int((cursor - vs) / 1800.0), "abs": prev_end, "key": ("offair", round(prev_end))})
             stops.append({"col": int((cs - vs) / 1800.0 + 1e-6), "abs": a, "key": ("show", round(a))})
             cursor = min(ve, b)
-        for c in range(int((cursor - vs) / 1800.0) if cursor < ve else cols, cols):
-            stops.append({"col": c, "abs": vs + c * 1800, "key": ("offair", c)})
+            prev_end = b
+        if cursor < ve:
+            stops.append({"col": int((cursor - vs) / 1800.0), "abs": prev_end, "key": ("offair", round(prev_end))})
         return stops
 
     state = {}
@@ -17317,7 +17318,7 @@ def suite_stall_static_threshold():
           and "PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = performance_governor.PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS if performance_governor is not None else %d" % initial in MAIN_SRC,
           "the main script reads both stall limits from the governor table and its fallbacks match")
     check(gov.STALL_FORCES_STATIC_MS < recovery <= initial, "Static still comes before the stall recovery, which is unchanged")
-    check("_stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS" in MAIN_SRC, "the main loop still decides Static from the time without a new picture")
+    check("_stall_is_now_static = _stalled_ms >= _stall_static_ms" in MAIN_SRC, "the main loop still decides Static from the time without a new picture")
 
 
 class TestStallStaticThreshold(_SectionCase):
@@ -17874,7 +17875,7 @@ class TestStallBannerAndKeepAwake(unittest.TestCase):
 
     def test_the_stall_static_has_the_banner_and_the_governor_holds_7_s(self):
         self.assertEqual(gov.STALL_FORCES_STATIC_MS, 7000)
-        i = MAIN_SRC.index("_stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS")
+        i = MAIN_SRC.index("_stall_is_now_static = _stalled_ms >= _stall_static_ms")
         self.assertIn('"picture_stalled"', MAIN_SRC[i:i + 900], "the stall Static reports the banner")
 
     def test_drives_are_woken_again_every_so_often(self):
@@ -19129,7 +19130,7 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
         """Owner 2026-11-04: fine snow, not big spaced-out pixels; the size of one speck is STATIC_NOISE_GRAIN_PX and a smaller number is a finer snow"""
         import collections as _collections
         import numpy as _np
-        self.assertEqual(gov.STATIC_NOISE_GRAIN_PX, 2)
+        self.assertEqual(gov.STATIC_NOISE_GRAIN_PX, 3)
         self.assertNotIn("// 3", get_function_source("_static_noise_frame"), "the grain is the governor number, not a fixed 3")
         _like = {}
         for _grain in (1, 2, 4):
@@ -25689,9 +25690,11 @@ def suite_music_scan_window():
     """Visualizer and menu music: the first 3 songs scan with no pause, scans stay fast until 10 songs ahead are scanned, then slow down, and go fast again when fewer than 5 are left."""
     check(gov.MUSIC_SCAN_QUICK_SONGS == 3 and gov.MUSIC_SCAN_FAST_AHEAD_SONGS == 10 and gov.MUSIC_SCAN_FALL_BEHIND_SONGS == 5,
           "the governor holds 3 quick songs, 10 songs ahead and the 5-song fall-behind mark")
-    check([gov.music_scan_class(d, False) for d in (0, 2, 3, 9, 10, 40)] == ["now", "now", "next", "next", "deep", "deep"],
-          "songs 1 to 3 are quick, up to 10 ahead fast, further ones slow")
-    check(gov.music_scan_class(30, True) == "next", "a falling-behind playlist scans its far songs fast")
+    check([gov.music_scan_class(d, False) for d in (0, 2, 3, 9, 19, 20, 40)] == ["now", "now", "next", "next", "next", "deep", "deep"],
+          "songs 1 to 3 are quick, the first wave of 10 and the 10 after it are next, further ones deep")
+    check(gov.music_scan_class(30, True) == "deep", "a falling-behind playlist no longer scans its far songs as next")
+    check([gov.music_analysis_class(d, False) for d in (0, 2, 3, 9, 10, 40)] == ["now", "now", "next", "next", "deep", "deep"]
+          and gov.music_analysis_class(30, True) == "next", "the visualizer analysis keeps the old fast window")
     check(gov.music_scan_falling_behind(False, 4) is True, "fewer than 5 scanned songs ahead is falling behind")
     check(gov.music_scan_falling_behind(True, 7) is True, "a falling-behind scan stays fast until 10 are scanned")
     check(gov.music_scan_falling_behind(True, 10) is False, "10 songs ahead ends the fast scan")
@@ -25706,12 +25709,12 @@ def suite_music_scan_window():
     items = ns["_music_scan_source_items"]("ch07", songs)
     check(items[0][1] == 6 and ns["_music_scan_behind"]["ch07"] is False,
           "a slow playlist with 5 next songs scanned stays slow, the first unscanned song is listed first")
-    check({it[0] for it in items if it[1] >= 10} == {"deep"} and {it[0] for it in items if it[1] < 10} == {"next"},
-          "songs inside 10 ahead are fast, the rest slow")
+    check({it[0] for it in items if it[1] >= 20} == {"deep"} and {it[0] for it in items if it[1] < 20} == {"next"},
+          "songs inside 20 ahead are next, the rest deep")
     songs = [("channel", "07", "Music Tracks", "/s/%02d.mp3" % k, k < 3) for k in range(30)]
     items = ns["_music_scan_source_items"]("ch07", songs)
-    check(ns["_music_scan_behind"]["ch07"] is True and all(it[0] in ("now", "next") for it in items),
-          "only 2 next songs scanned is falling behind: every song is scanned fast")
+    check(ns["_music_scan_behind"]["ch07"] is True and {it[0] for it in items if it[1] >= 20} == {"deep"},
+          "falling behind speeds the near songs only; songs beyond 20 stay deep")
     src = get_function_source("_gather_music_probe_queue")
     check("ranked.sort(key=lambda it: (_MUSIC_SCAN_CLASS_RANK.get(it[0], 2), it[1]))" in src,
           "every playlist's near songs are scanned before any playlist's far songs")
@@ -26516,7 +26519,7 @@ def suite_next_item_prep():
            "PICTURE_BOX_PAUSE_RECHECK_SECONDS": 0.05, "_LOUDNESS_PRIORITY_PENDING": pending,
            "performance_governor": types.SimpleNamespace(first_start_scan_plan=lambda: (False, "weak PC")),
            "_log_swallowed": lambda where, error: None, "_picture_box_done": {norm("/tv/done.mkv")}, "_scan_pb_has_box": set(),
-           "_cached_path_exists": lambda p: True,
+           "_cached_path_exists": lambda p: True, "_season_guess_warm": lambda p: None,
            "_next_item_prep_plan": lambda ch, f: ([norm("/ads/a.mp4"), norm("/tv/done.mkv"), norm("/tv/next.mkv")], ns2.get("_break_near_for_test", False)),
            "_picture_box_before_loudness": lambda p: scanned.append((p, threading.current_thread().name)),
            "log": types.SimpleNamespace(info=lambda msg, *a: infos.append(msg % a), warning=lambda msg, *a: infos.append(msg % a))}
@@ -26776,7 +26779,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.2.2", "build_info.py says 1.2.2 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.2.3", "build_info.py says 1.2.3 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27181,7 +27184,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.2.2"""
+    """This build is 1.2.3"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -27448,6 +27451,13 @@ class TestSeasonGuesses(unittest.TestCase):
             exec(compile(src[i:j], "<extracted:%s>" % name, "exec"), ns)
         return ns
 
+    def _settled(self, ns, name, path):
+        first = ns[name](path)
+        worker = ns["_season_guess_worker"][0]
+        if worker is not None:
+            worker.join(5)
+        return first, ns[name](path)
+
     def test_values_agree_only_with_enough_close_values(self):
         self.assertIsNone(media.season_values_agree([1300.0], 90.0, 2))
         self.assertAlmostEqual(media.season_values_agree([1300.0, 1340.0], 90.0, 2), 1320.0)
@@ -27479,14 +27489,14 @@ class TestSeasonGuesses(unittest.TestCase):
             ns = {"media": media, "time": time, "threading": threading, "math": math,
                   "SEASON_GUESS_MIN_SCANNED": 2, "SEASON_GUESS_GAIN_SPREAD_DB": 2.0, "SEASON_GUESS_CACHE_SECONDS": 30.0,
                   "LOUDNESS_GAIN_CEILING": 4.0, "_season_guess_cache": {}, "_season_guess_lock": threading.Lock(),
+                  "_season_guess_pending": {}, "_season_guess_worker": [None],
                   "_log_swallowed": lambda *a: None, "_get_gain_hub": lambda: object(), "_get_part_group_key": lambda p: None,
                   "_get_library_gain": lambda p: None, "_gain_bundle_members": lambda p: members,
                   "_gain_check_db": lambda hub, m: table.get(m), "_learned_series_offset": lambda p: 0}
-            self._funcs(ns, "_season_guess_cached", "_season_guess_gain")
-            got = []
-            worker = threading.Thread(target=lambda: got.append(ns["_season_guess_gain"]("/s/e0.mkv")))
-            worker.start()
-            worker.join()
+            self._funcs(ns, "_season_guess_cached", "_season_guess_run_pending", "_season_guess_gain")
+            first, later = self._settled(ns, "_season_guess_gain", "/s/e0.mkv")
+            self.assertIsNone(first, "the first call answers at once with nothing and leaves the work to the SeasonGuess thread")
+            got = [later]
             if expect:
                 self.assertAlmostEqual(got[0], 10 ** (sum(dbs) / len(dbs) / 20.0), places=4)
             else:
@@ -27505,18 +27515,19 @@ class TestSeasonGuesses(unittest.TestCase):
 
             class Lib:
                 def get_cached(self, path):
+                    raise AssertionError("a season guess must not hash a file")
+
+                def get_cached_known(self, path):
                     return table.get(path)
 
             ns = {"media": media, "time": time, "threading": threading, "SEASON_GUESS_MIN_SCANNED": 2,
                   "SEASON_GUESS_PICTURE_RECT_TOLERANCE": 0.02, "SEASON_GUESS_PICTURE_ASPECT_TOLERANCE": 0.02, "SEASON_GUESS_CACHE_SECONDS": 30.0,
                   "_season_guess_cache": {}, "_season_guess_boxes": {}, "_season_guess_lock": threading.Lock(),
+                  "_season_guess_pending": {}, "_season_guess_worker": [None],
                   "_log_swallowed": lambda *a: None, "_get_probe_library": lambda: Lib(), "_gain_bundle_members": lambda p: members}
-            self._funcs(ns, "_season_guess_cached", "_season_guess_picture_box")
-            got = []
-            worker = threading.Thread(target=lambda: got.append(ns["_season_guess_picture_box"]("/s/e0.mkv")))
-            worker.start()
-            worker.join()
-            return got[0], ns
+            self._funcs(ns, "_season_guess_cached", "_season_guess_run_pending", "_season_guess_picture_box")
+            _first, later = self._settled(ns, "_season_guess_picture_box", "/s/e0.mkv")
+            return later, ns
         same, ns = run([box([0.0, 0.12, 1.0, 0.76]), box([0.0, 0.125, 1.0, 0.755])])
         self.assertTrue(same["guessed"])
         self.assertIn("/s/e0.mkv", ns["_season_guess_boxes"])
@@ -27569,6 +27580,287 @@ class TestSeasonGuesses(unittest.TestCase):
         j = src.index("def _scan_stages_pending")
         self.assertNotIn("_season_guess", src[i:j])
         self.assertNotIn("_season_guess", src[src.index("def _read_file_probe_facts"):src.index("def _save_file_probe_facts")])
+
+
+class TestFirstLoadAllowance(unittest.TestCase):
+    """Owner 2026-11-06: the channel you just tuned to gets 10 s for its first picture before Static and the banner"""
+
+    def test_first_load_number_sits_between_the_two_limits(self):
+        self.assertEqual(gov.STALL_FORCES_STATIC_FIRST_LOAD_MS, 10000)
+        self.assertGreater(gov.STALL_FORCES_STATIC_FIRST_LOAD_MS, gov.STALL_FORCES_STATIC_MS)
+        self.assertLess(gov.STALL_FORCES_STATIC_FIRST_LOAD_MS, gov.PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS)
+        self.assertIn("STALL_FORCES_STATIC_FIRST_LOAD_MS = performance_governor.STALL_FORCES_STATIC_FIRST_LOAD_MS if performance_governor is not None else 10000", MAIN_SRC)
+
+    def test_main_loop_uses_it_only_before_the_first_picture(self):
+        i = MAIN_SRC.index("_stall_static_ms = (STALL_FORCES_STATIC_MS")
+        block = MAIN_SRC[i:i + 400]
+        self.assertIn('_had_first_frame_this_tune", False)', block)
+        self.assertIn("else STALL_FORCES_STATIC_FIRST_LOAD_MS", block)
+        self.assertIn("_stall_is_now_static = _stalled_ms >= _stall_static_ms", block)
+
+
+class TestScanBarAlwaysVisible(unittest.TestCase):
+    """Owner 2026-11-06: a music station's bar was under a pixel wide and never seen"""
+
+    def test_bar_has_a_minimum_width(self):
+        self.assertEqual(gov.CHANNEL_SCAN_BAR_MIN_PX, 12)
+        ui_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8").read()
+        self.assertIn("CHANNEL_SCAN_BAR_MIN_PX = performance_governor.CHANNEL_SCAN_BAR_MIN_PX if performance_governor is not None else 12", ui_src)
+        self.assertIn("_bar_w = min(_bar_max_w, max(CHANNEL_SCAN_BAR_MIN_PX, int(_bar_max_w * _scan_done / _scan_total)))", ui_src)
+
+
+class TestGuideBlockIsOnePress(unittest.TestCase):
+    """Owner 2026-11-06: an off-air stretch of three half hours is one block, one press crosses it, and the way back works"""
+
+    def test_one_stop_per_gap_keyed_by_time(self):
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8").read()
+        self.assertEqual(src.count('"key": ("offair", _oa_col)'), 0)
+        self.assertEqual(src.count('"key": ("offair", _tr_col)'), 0)
+        self.assertGreaterEqual(src.count('"key": ("offair", round(_last_show_end_abs))'), 3)
+        self.assertIn("if not _oa_stop_done:", src)
+        self.assertIn("if not _tr_stop_done:", src)
+        self.assertIn('"key": ("col", round(_viz_block_abs))', src)
+
+    def test_pressing_right_then_left_crosses_a_gap_in_one_press(self):
+        cols = 4
+        scheds = {"05": [(0, 1800), (1800 * 5, 1800 * 6)]}
+        clock = {"t": datetime.datetime(2026, 10, 12, 0, 10, 0)}
+
+        class _Clock:
+            @staticmethod
+            def now():
+                return clock["t"]
+
+        def clamp(raw, n):
+            return max(0, min(raw, 336 - n))
+
+        def stops_for(time_idx):
+            vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
+            out, cursor, prev_end = [], vs, vs
+            for a, b in scheds["05"]:
+                if b <= vs:
+                    prev_end = b
+                    continue
+                if a >= ve:
+                    break
+                cs = max(vs, a)
+                if cs > cursor:
+                    out.append({"col": int((cursor - vs) / 1800), "abs": prev_end, "key": ("offair", round(prev_end))})
+                out.append({"col": int((cs - vs) / 1800), "abs": a, "key": ("show", round(a))})
+                cursor, prev_end = min(ve, b), b
+            if cursor < ve:
+                out.append({"col": int((cursor - vs) / 1800), "abs": prev_end, "key": ("offair", round(prev_end))})
+            return out
+
+        state = {"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0}
+
+        def view_idx():
+            return clamp(0 * 2 + state["selected_guide_time_idx"], cols)
+
+        def refresh():
+            state["guide_current_row_stops"] = stops_for(view_idx())
+
+        log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
+        ns = dict(app_state=state, log=log, broadcast_clock=_Clock, db=object(), str=str, performance_governor=gov,
+                  get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
+                  _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh)
+        exec(compile(get_function_source("_guide_jump_col"), "<extracted>", "exec"), ns)
+        refresh()
+        state["guide_selected_stop_key"] = ("show", 0)
+        state["guide_selected_abs_time"] = 0
+        ns["_guide_jump_col"](1)
+        self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "one press from the show lands on the gap")
+        ns["_guide_jump_col"](1)
+        self.assertEqual(state["guide_selected_stop_key"], ("show", 1800 * 5), "one press crosses the three-slot gap")
+        ns["_guide_jump_col"](-1)
+        self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "one press back lands on the gap")
+        ns["_guide_jump_col"](-1)
+        self.assertEqual(state["guide_selected_stop_key"], ("show", 0), "and one more reaches the first show")
+        ns["_guide_jump_col"](1)
+        self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "going right again is not stuck")
+
+
+class TestMusicScanOwnLane(unittest.TestCase):
+    """Owner 2026-11-06: music scans take turns after the live shows and do not wait behind the TV length workers"""
+
+    def test_song_length_uses_the_music_lane(self):
+        one = get_function_source("_music_precache_worker")
+        self.assertIn('_scan_store_duration(kind, ch_key, block_key, norm_p, lane="music_loudness")', one)
+        ns = {"media": MagicMock(), "os": os}
+        exec(main_function_code("_probe_duration_gated"), ns)
+        ns["_probe_duration_guarded"] = lambda p: 7
+        self.assertEqual(ns["_probe_duration_gated"]("/s/a.mp3", "music_loudness"), 7)
+        self.assertEqual(ns["media"]._gov_gate.call_args[0][0], "music_loudness")
+        ns["_probe_duration_gated"]("/s/a.mp3")
+        self.assertEqual(ns["media"]._gov_gate.call_args[0][0], "probe_and_duration")
+
+    def test_queue_note_counts_classes_once_a_minute(self):
+        log = MagicMock()
+        ns = {"time": time, "log": log, "MUSIC_SCAN_LOG_SECONDS": 60.0}
+        exec(main_function_code("_note_music_queue"), ns)
+        ns["_music_queue_note"] = {"at": 0.0}
+        q = [("channel", "20", "b", "/s/%d.mp3" % k, "next" if k < 2 else "deep") for k in range(5)]
+        ns["_note_music_queue"](q)
+        ns["_note_music_queue"](q)
+        self.assertEqual(log.info.call_count, 1)
+        self.assertIn("deep 3", log.info.call_args[0][0] % log.info.call_args[0][1:])
+
+
+class TestScansNeverBlockThemselves(unittest.TestCase):
+    """Owner log 2026-11-06: loudness windows waiting for a second scan place filled the scan cap, so no other scan could start; and the season guess waited on the disk gate during a channel change."""
+
+    def setUp(self):
+        import performance_governor as gov
+        self.gov = gov
+
+    def _gated(self, running, at_once, body):
+        gov = self.gov
+        with mock.patch.object(gov, "enforcing", lambda: True), mock.patch.object(gov, "current_level", lambda: 0), \
+                mock.patch.object(gov, "tune_in_progress", lambda: False), mock.patch.object(gov, "scan_throttle_mode", lambda now=None: "free"), \
+                mock.patch.object(gov, "ffmpeg_scans_running", lambda: running), mock.patch.object(gov, "ffmpeg_scans_at_once", lambda level=None: at_once):
+            box = []
+            worker = threading.Thread(target=lambda: box.append(body()))
+            worker.start()
+            worker.join(10)
+            return box[0] if box else None
+
+    def test_a_step_inside_a_loudness_window_takes_no_second_place(self):
+        gov = self.gov
+
+        def body():
+            with gov.gate("loudness_and_bake", priority=True, label="window"):
+                started = time.monotonic()
+                with gov.gate("probe_and_duration", timeout=3.0, label="dialogue_probe") as admitted:
+                    return admitted, time.monotonic() - started
+        admitted, took = self._gated(5, 1, body)
+        self.assertTrue(admitted)
+        self.assertLess(took, 0.5, "the cap is full of the windows themselves; a step inside one must not wait for it")
+
+    def test_a_thread_that_holds_no_scan_place_still_waits_for_the_cap(self):
+        gov = self.gov
+
+        def body():
+            started = time.monotonic()
+            with gov.gate("probe_and_duration", timeout=0.4, label="t") as admitted:
+                return admitted, time.monotonic() - started
+        admitted, took = self._gated(5, 1, body)
+        self.assertFalse(admitted)
+        self.assertGreaterEqual(took, 0.35)
+
+    def test_lane_held_names_the_lanes_the_thread_is_inside(self):
+        gov = self.gov
+        seen = []
+
+        def body():
+            seen.append(gov.lane_held("loudness_and_bake"))
+            with gov.gate("loudness_and_bake", priority=True):
+                seen.append(gov.lane_held("loudness_and_bake"))
+                seen.append(gov.lane_held("probe_and_duration"))
+            seen.append(gov.lane_held("loudness_and_bake"))
+            return True
+        self._gated(0, 3, body)
+        self.assertEqual(seen, [False, True, False, False])
+
+    def test_the_audio_track_listing_is_loudness_work(self):
+        self.assertEqual(media._fast_disk_lane("dialogue_probe(a.mkv)"), "loudness_and_bake")
+        self.assertEqual(media._fast_disk_lane("picture_box(a.mkv)"), "cropdetect_threads")
+        self.assertEqual(media._fast_disk_lane("identity_key(a.mkv)"), "probe_and_duration")
+        self.assertIsNone(media._fast_disk_lane("asr_extract(a.mkv)"))
+
+    def test_a_season_guess_never_makes_the_caller_wait(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        ns = {"time": time, "threading": threading, "SEASON_GUESS_CACHE_SECONDS": 30.0, "_season_guess_cache": {},
+              "_season_guess_lock": threading.Lock(), "_season_guess_pending": {}, "_season_guess_worker": [None],
+              "_log_swallowed": lambda *a: None}
+        for name in ("_season_guess_run_pending", "_season_guess_cached"):
+            i = src.index("def %s(" % name)
+            j = src.index("\ndef ", i + 5)
+            exec(compile(src[i:j], "<extracted:%s>" % name, "exec"), ns)
+        release = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            release.wait(5)
+            return "box"
+        started = time.monotonic()
+        first = ns["_season_guess_cached"]("box", "/s/e1.mkv", slow)
+        self.assertIsNone(first)
+        self.assertLess(time.monotonic() - started, 0.5, "a slow guess (a gate or a disk) must not hold up the caller")
+        self.assertIsNone(ns["_season_guess_cached"]("box", "/s/e1.mkv", slow))
+        release.set()
+        worker = ns["_season_guess_worker"][0]
+        if worker is not None:
+            worker.join(5)
+        self.assertEqual(ns["_season_guess_cached"]("box", "/s/e1.mkv", slow), "box")
+        self.assertEqual(len(calls), 1, "asking again while it is being worked out or fresh does not work it out twice")
+
+    def test_a_season_guess_reads_the_library_without_hashing_files(self):
+        import media_library as ml
+        resolver = ml.PathKeyResolver.__new__(ml.PathKeyResolver)
+
+        class Library:
+            def lookup_path_key(self, norm_path, size, mtime):
+                return None
+        resolver.library = Library()
+        orig = ml.compute_identity_key
+        ml.compute_identity_key = lambda *a, **k: self.fail("peek must not hash a file")
+        try:
+            tmp = os.path.join(tempfile.gettempdir(), "peek_probe_%d.bin" % os.getpid())
+            with open(tmp, "wb") as f:
+                f.write(b"x" * 100)
+            try:
+                self.assertIsNone(resolver.peek(tmp))
+            finally:
+                os.remove(tmp)
+            self.assertIsNone(resolver.peek(tmp + ".missing"))
+        finally:
+            ml.compute_identity_key = orig
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        i = src.index("def _season_guess_picture_box(")
+        j = src.index("def _season_seeds_first(")
+        self.assertIn("get_cached_known", src[i:j])
+        self.assertNotIn("lib.get_cached(", src[i:j])
+
+    def test_the_next_shows_guesses_are_worked_out_ahead_of_the_tune(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        i = src.index("def _next_item_prep_worker(")
+        j = src.index("\ndef ", i + 5)
+        self.assertIn("_season_guess_warm(norm_p)", src[i:j])
+        queued = []
+        ns = {"os": os, "_season_guess_gain": lambda p: queued.append(("gain", p)),
+              "_season_guess_picture_box": lambda p: queued.append(("box", p))}
+        k = src.index("def _season_guess_warm(")
+        exec(compile(src[k:src.index("\ndef ", k + 5)], "<warm>", "exec"), ns)
+        ns["_season_guess_warm"]("/s/e3.mkv")
+        self.assertEqual(sorted(kind for kind, _p in queued), ["box", "gain"])
+        queued.clear()
+        ns["_season_guess_warm"]("")
+        self.assertEqual(queued, [])
+
+    def test_tune_in_loudness_scans_take_turns_and_drop_when_the_viewer_leaves(self):
+        prime = main_function_source("_prime_channel_block_loudness")
+        self.assertIn("_loudness_prime_turns.acquire(timeout=1.0)", prime)
+        self.assertIn("_loudness_prime_turns.release()", prime)
+        self.assertLess(prime.index("_loudness_prime_turns.acquire"), prime.index("_mark_loudness_priority_active()"))
+        self.assertGreaterEqual(prime.count('!= ch_str'), 2, "left while settling, left while waiting")
+        self.assertEqual(self.gov.LOUDNESS_PRIME_AT_ONCE, 2)
+
+    def test_a_visualizer_bar_covers_the_songs_still_waiting_for_a_length(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        scanned = {os.path.normpath("/m/a.mp3")}
+        ns = {"os": os, "_scan_done_sticky": {}, "_paths_from_entry": lambda e: [e["path"]],
+              "_cached_path_exists": lambda p: True,
+              "_scan_file_is_finished": lambda p, mo, lk: os.path.normpath(p) in scanned}
+        i = src.index("def _compute_channel_scan_progress")
+        j = src.index("def _publish_channel_scan_progress")
+        exec(compile(src[i:j], "<extracted>", "exec"), ns)
+        snap = {"channels": {"20": {"ordered": [{"path": "/m/a.mp3"}, {"path": "/m/b.mp3"}], "commercials": [],
+                                    "is_visualizer": True, "pending": ["/m/c.mp3", "/m/d.mp3", "/m/a.mp3"]}}}
+        self.assertEqual(ns["_compute_channel_scan_progress"](snap, [1])["20"], (1, 4),
+                         "the whole music list counts, not just the few songs that already have a length")
+        snap["channels"]["20"]["is_visualizer"] = False
+        self.assertEqual(ns["_compute_channel_scan_progress"](snap, [1])["20"], (1, 2), "a video channel's pending list is not added")
 
 
 if __name__ == "__main__":

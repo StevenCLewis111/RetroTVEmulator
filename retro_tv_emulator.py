@@ -5343,7 +5343,7 @@ _STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REF
 _STATIC_NOISE_POOL_FRAMES = performance_governor.STATIC_NOISE_POOL_FRAMES if performance_governor is not None else 12
 _STATIC_NOISE_POOL_SIZES = performance_governor.STATIC_NOISE_POOL_SIZES if performance_governor is not None else 3
 # WARNING: the fallback numbers below must match STATIC_NOISE_GRAIN_PX and STATIC_NOISE_BUILD_GAP_MS in performance_governor.py; they are used only when that module fails to import.
-_STATIC_NOISE_GRAIN_PX = performance_governor.STATIC_NOISE_GRAIN_PX if performance_governor is not None else 2
+_STATIC_NOISE_GRAIN_PX = performance_governor.STATIC_NOISE_GRAIN_PX if performance_governor is not None else 3
 _STATIC_NOISE_BUILD_GAP_MS = performance_governor.STATIC_NOISE_BUILD_GAP_MS if performance_governor is not None else 80
 # WARNING: the fallback numbers below must match STATIC_NOISE_STRENGTH_STEPS and STATIC_NOISE_BAKED_MAX in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_STRENGTH_STEPS = performance_governor.STATIC_NOISE_STRENGTH_STEPS if performance_governor is not None else 16
@@ -7556,6 +7556,8 @@ PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = performance_governor.PLAYBACK_INITIAL_BUFFE
 
 # WARNING: the 7000 fallback must match STALL_FORCES_STATIC_MS in performance_governor.py; it is used only when that module fails to import.
 STALL_FORCES_STATIC_MS = performance_governor.STALL_FORCES_STATIC_MS if performance_governor is not None else 7000
+# WARNING: the 10000 fallback must match STALL_FORCES_STATIC_FIRST_LOAD_MS in performance_governor.py; it is used only when that module fails to import.
+STALL_FORCES_STATIC_FIRST_LOAD_MS = performance_governor.STALL_FORCES_STATIC_FIRST_LOAD_MS if performance_governor is not None else 10000
 
 # WARNING: the fallback numbers below must match AUDIO_SYNC_HOLD_MS in performance_governor.py; they are used only when that module fails to import.
 AUDIO_SYNC_HOLD_MS = performance_governor.AUDIO_SYNC_HOLD_MS if performance_governor is not None else 500
@@ -7807,7 +7809,7 @@ def _visualizer_analysis_prefetch():
         return
     items.sort(key=lambda it: it[0])
     analyzer.analyze_ahead([
-        (p, _scan_class_pace_seconds(performance_governor.music_scan_class(distance, True), MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS))
+        (p, _scan_class_pace_seconds(performance_governor.music_analysis_class(distance, True), MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS))
         for distance, p in items])
 
 
@@ -10042,9 +10044,9 @@ def _probe_duration_guarded(norm_p):
         _release_probe(norm_p, "duration")
 
 
-def _probe_duration_gated(norm_p):
-    """Background batch duration probe, admitted by the governor's probe lane."""
-    with media._gov_gate("probe_and_duration", label="header_duration(%s)" % os.path.basename(norm_p)):
+def _probe_duration_gated(norm_p, lane="probe_and_duration"):
+    """Background batch duration probe, admitted by the governor's probe lane (a music scan passes the music lane)."""
+    with media._gov_gate(lane, label="header_duration(%s)" % os.path.basename(norm_p)):
         return _probe_duration_guarded(norm_p)
 
 
@@ -10487,29 +10489,59 @@ _season_guess_boxes = {}
 _season_guess_lock = threading.Lock()
 
 
+_season_guess_pending = {}
+_season_guess_worker = [None]
+
+
+def _season_guess_run_pending():
+    """Works out every queued season guess, the newest request first, and stores each answer; runs on the SeasonGuess thread and ends when the queue is empty."""
+    while True:
+        with _season_guess_lock:
+            if not _season_guess_pending:
+                _season_guess_worker[0] = None
+                return
+            key = next(reversed(_season_guess_pending))
+            compute = _season_guess_pending.pop(key)
+            _before = _season_guess_cache.get(key)
+            _season_guess_cache[key] = (time.monotonic(), _before[1] if _before is not None else None)
+        try:
+            value = compute()
+        except Exception as _swallowed_error:
+            _log_swallowed("_season_guess_run_pending: working out a season guess", _swallowed_error)
+            value = None
+        with _season_guess_lock:
+            if len(_season_guess_cache) > 2000:
+                _season_guess_cache.clear()
+            _season_guess_cache[key] = (time.monotonic(), value)
+
+
 def _season_guess_cached(kind, norm_path, compute):
-    """A season guess for one file, worked out at most once per SEASON_GUESS_CACHE_SECONDS. On the main thread nothing is worked out (it would list a folder): the work is handed to a short thread and the guess arrives on a later call."""
-    now = time.monotonic()
+    """The season guess worked out for one file, or None until it is. It never works anything out on the calling thread (it would list a folder and read the library on a channel change): a guess older than SEASON_GUESS_CACHE_SECONDS, or none yet, is queued for the SeasonGuess thread and the last answer is returned meanwhile."""
+    # WARNING: this is called on the tune path; it must stay free of disk reads and gate waits (owner log 2026-11-06: hashing the season's files here waited 20 s behind the scans and the load was set aside).
     key = (kind, norm_path)
     with _season_guess_lock:
         held = _season_guess_cache.get(key)
-        if held is not None and now - held[0] < SEASON_GUESS_CACHE_SECONDS:
+        if held is not None and time.monotonic() - held[0] < SEASON_GUESS_CACHE_SECONDS:
             return held[1]
-    if threading.current_thread() is threading.main_thread():
-        with _season_guess_lock:
-            _season_guess_cache[key] = (now, held[1] if held is not None else None)
-        threading.Thread(target=lambda: _season_guess_cached(kind, norm_path, compute), daemon=True, name="SeasonGuess").start()
-        return held[1] if held is not None else None
-    try:
-        value = compute()
-    except Exception as _swallowed_error:
-        _log_swallowed("_season_guess_cached: working out a season guess", _swallowed_error)
-        value = None
-    with _season_guess_lock:
-        if len(_season_guess_cache) > 2000:
-            _season_guess_cache.clear()
-        _season_guess_cache[key] = (time.monotonic(), value)
-    return value
+        _season_guess_pending.pop(key, None)
+        _season_guess_pending[key] = compute
+        _worker = _season_guess_worker[0]
+        if _worker is None:
+            _worker = _season_guess_worker[0] = threading.Thread(target=_season_guess_run_pending, daemon=True, name="SeasonGuess")
+            _start = True
+        else:
+            _start = False
+    if _start:
+        _worker.start()
+    return held[1] if held is not None else None
+
+
+def _season_guess_warm(norm_path):
+    """Queues the season guesses (loudness and picture box) of a file that is about to air, so they are ready when its channel opens it."""
+    if norm_path:
+        norm = os.path.normpath(str(norm_path))
+        _season_guess_gain(norm)
+        _season_guess_picture_box(norm)
 
 
 def _season_guess_gain(norm_path):
@@ -10542,7 +10574,7 @@ def _season_guess_picture_box(norm_path):
         for member in _gain_bundle_members(norm_path):
             if member == norm_path:
                 continue
-            entry = lib.get_cached(member)
+            entry = lib.get_cached_known(member)
             box = entry.get("picture_box") if entry else None
             if (box and (entry.get("picture_box_detector_version") or 0) >= _ml.PICTURE_BOX_DETECTOR_VERSION
                     and box.get("reason") and box.get("norm") and box.get("picture_aspect")):
@@ -16111,6 +16143,9 @@ def _prime_channel_block_durations(ch_key, synchronous=False):
 
 _loudness_priming_inflight = set()
 _loudness_priming_lock = threading.Lock()
+# WARNING: the fallback number must match LOUDNESS_PRIME_AT_ONCE in performance_governor.py; it is used only when that module fails to import.
+_LOUDNESS_PRIME_AT_ONCE = performance_governor.LOUDNESS_PRIME_AT_ONCE if performance_governor is not None else 2
+_loudness_prime_turns = threading.BoundedSemaphore(_LOUDNESS_PRIME_AT_ONCE)
 
 _loudness_priority_count = 0
 _loudness_priority_lock = threading.Lock()
@@ -16172,15 +16207,24 @@ def _prime_channel_block_loudness(ch_key, current_file, current_block):
                 _loudness_priming_inflight.discard(_prime_key)
             log.info("[TUNE PRIME] ch%s: left within %.1fs, its first loudness scan is not started", ch_str, _settle)
             return
+        # WARNING: tune-in loudness scans run at priority and are never held by the governor, so they take turns: at most _LOUDNESS_PRIME_AT_ONCE at once (the channel on screen plus one it just left), and a scan still waiting its turn when the viewer leaves is dropped. Owner log 2026-11-06 had 8 of them standing at once, 24 ffmpeg windows on a 4-core PC.
+        while not _loudness_prime_turns.acquire(timeout=1.0):
+            if _app_shutting_down.is_set() or str(app_state.get("current_channel", "")).zfill(2) != ch_str:
+                with _loudness_priming_lock:
+                    _loudness_priming_inflight.discard(_prime_key)
+                log.info("[TUNE PRIME] ch%s: left while waiting its turn, its first loudness scan is not started", ch_str)
+                return
         _mark_loudness_priority_active()
         try:
-            _probe_and_apply_loudness_blocking(
-                "channel", ch_str, current_block or "Full Day", norm_p,
-                "tune-in priority scan", priority=True)
+            if str(app_state.get("current_channel", "")).zfill(2) == ch_str:
+                _probe_and_apply_loudness_blocking(
+                    "channel", ch_str, current_block or "Full Day", norm_p,
+                    "tune-in priority scan", priority=True)
         finally:
             with _loudness_priming_lock:
                 _loudness_priming_inflight.discard(_prime_key)
             _mark_loudness_priority_done()
+            _loudness_prime_turns.release()
 
     threading.Thread(target=_worker, daemon=True, name=f"prime-gain-ch{ch_str}").start()
 
@@ -16779,6 +16823,11 @@ def _compute_channel_scan_progress(snap, lookups_left):
                 c_dur = isinstance(casset, dict) and casset.get("duration", -1) not in (-1, 0, None)
                 prev = seen.get(norm_c, (False, False))
                 seen[norm_c] = (prev[0] or c_gain, prev[1] or c_dur)
+        # WARNING: a Visualizer channel's lineup holds only the songs that already have a length, so its bar was 2/2 or 3/3 and left at once; the songs still waiting for their length count as not done, so the bar covers the whole music list (owner log 2026-11-06).
+        if rec.get("is_visualizer"):
+            for p in rec.get("pending", []):
+                if p and _cached_path_exists(p):
+                    seen.setdefault(os.path.normpath(p), (False, False))
         total = len(seen)
         if total == 0:
             continue
@@ -17067,6 +17116,22 @@ def _note_music_scan(scan_class, seconds):
         st.update(songs=0, priority=0, seconds=0.0, since=now)
 
 
+_music_queue_note = {"at": 0.0}
+
+
+def _note_music_queue(queue):
+    """Writes one [MUSIC QUEUE] line a minute: how many songs wait in each scan class, so a music scan that sits idle or crawls can be told from one with nothing to do."""
+    now = time.monotonic()
+    if now - _music_queue_note["at"] < MUSIC_SCAN_LOG_SECONDS:
+        return
+    _music_queue_note["at"] = now
+    counts = {}
+    for item in queue:
+        counts[item[4]] = counts.get(item[4], 0) + 1
+    log.info("[MUSIC QUEUE] %d song(s) waiting for a scan: %s", len(queue),
+             ", ".join("%s %d" % (k, counts[k]) for k in sorted(counts)) or "none")
+
+
 def _music_precache_worker():
     """Runs separate duration and loudness scans for ch03 menu music and Visualizer playlists: the next 3 songs of every playlist with no pause, fast until 10 songs ahead are scanned, slower after that, and fast again once fewer than 5 of the next songs are scanned."""
     if db is None:
@@ -17102,7 +17167,8 @@ def _music_precache_worker():
         if not _duration and norm_p not in _music_duration_scan_attempted:
             _ran = True
             try:
-                _duration = _scan_store_duration(kind, ch_key, block_key, norm_p)
+                # WARNING: a song's length is read on the music lane, not the TV length lane; behind five TV length workers a song waited 110 s for one header read (owner log 2026-11-06 08:46).
+                _duration = _scan_store_duration(kind, ch_key, block_key, norm_p, lane="music_loudness")
             except Exception as e:
                 log.warning("[MUSIC PRECACHE] duration scan failed for %s: %s", norm_p, e)
             _music_duration_scan_attempted.add(norm_p)
@@ -17150,6 +17216,7 @@ def _music_precache_worker():
             except Exception as e:
                 _log_warn_throttled("vis_analysis_prefetch", "[VISUALIZER ANALYSIS] prefetch of the next songs failed: %s" % e)
             queue = _gather_music_probe_queue()
+            _note_music_queue(queue)
             if not queue:
                 _flush()
                 _scan_report_head("music")
@@ -20446,10 +20513,10 @@ def _scan_retries_exhausted(norm_p, stage):
     return _scan_retry_counts.get((norm_p, stage), 0) >= SCAN_RETRY_LIMIT
 
 
-def _scan_store_duration(kind, ch_key, block_key, norm_p):
+def _scan_store_duration(kind, ch_key, block_key, norm_p, lane="probe_and_duration"):
     """Probes one file's duration and stores it everywhere the schedule and guide read it; returns the duration, or 0 when there is none."""
     try:
-        _dur = _probe_duration_gated(norm_p) or 0
+        _dur = _probe_duration_gated(norm_p, lane) or 0
     except Exception as e:
         log.warning("[DURATION SCAN] duration probe of %s crashed: %s", os.path.basename(norm_p), e)
         return 0
@@ -21270,6 +21337,8 @@ def _next_item_prep_worker():
             continue
         started = time.monotonic()
         made = []
+        for norm_p in paths:
+            _season_guess_warm(norm_p)
         for norm_p in paths:
             if _stale():
                 break
@@ -31792,7 +31861,11 @@ while True:
                 continue
 
             _transition_style_wait = _configured_transition_style()
-            _stall_is_now_static = _stalled_ms >= STALL_FORCES_STATIC_MS
+            # WARNING: the channel you just tuned to gets the longer first-load allowance until its first picture arrives (owner 2026-11-06); once a picture has played, the shorter rule applies.
+            _stall_static_ms = (STALL_FORCES_STATIC_MS
+                                if app_state.get("_had_first_frame_this_tune", False)
+                                else STALL_FORCES_STATIC_FIRST_LOAD_MS)
+            _stall_is_now_static = _stalled_ms >= _stall_static_ms
             app_state["_stall_is_now_static"] = _stall_is_now_static
             if _stall_is_now_static:
                 # WARNING: the stall Static is the fallback static of owner 2026-11-05 (14.2): it carries the same red banner so the viewer knows the picture is not frozen, only not ready, and the retry goes on under it.

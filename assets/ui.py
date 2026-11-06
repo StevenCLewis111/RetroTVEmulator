@@ -162,6 +162,8 @@ SELECTION_BORDER_WIDTH = media.SELECTION_BORDER_WIDTH
 CHANNEL_SCAN_BAR_HEIGHT_PX = performance_governor.CHANNEL_SCAN_BAR_HEIGHT_PX if performance_governor is not None else 3
 CHANNEL_SCAN_BAR_HEAD_PX = performance_governor.CHANNEL_SCAN_BAR_HEAD_PX if performance_governor is not None else 6
 CHANNEL_SCAN_BAR_HALO_MIX = performance_governor.CHANNEL_SCAN_BAR_HALO_MIX if performance_governor is not None else 0.35
+# WARNING: the 12 fallback must match CHANNEL_SCAN_BAR_MIN_PX in performance_governor.py; it is used only when that module fails to import.
+CHANNEL_SCAN_BAR_MIN_PX = performance_governor.CHANNEL_SCAN_BAR_MIN_PX if performance_governor is not None else 12
 
 
 def _menu_close_rect(cx, content_w, content_y, content_h):
@@ -2366,7 +2368,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             for col in range(num_cols):
                 _viz_block_abs = viewport_start_seconds + col * 1800
                 current_row_blocks_list.append(col)
-                current_row_stops_list.append({"col": col, "abs": _viz_block_abs, "key": ("col", col)})
+                current_row_stops_list.append({"col": col, "abs": _viz_block_abs, "key": ("col", round(_viz_block_abs))})
                 is_selected_cell = (is_highlighted_row and
                                      _viz_block_abs <= _guide_target_abs < _viz_block_abs + 1800)
                 cell_bg = HIGHLIGHT_BG if is_selected_cell else UNSELECTED_BLUE
@@ -3192,6 +3194,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 ]
                 timeline_entries = _gated_g
 
+            # WARNING: owner 2026-11-06: an off-air stretch is one block however many half hours it covers, so it gets one stop at the true start of the stretch (the end of the show before it, even when that is left of the screen) and its key is that time, never a column number, which means something else once the guide scrolls.
+            _last_show_end_abs = viewport_adjusted_start
+            for _pre_show, _pre_start, _pre_end, _pre_block in timeline_entries:
+                if _pre_show is not None and _pre_end <= viewport_adjusted_start:
+                    _last_show_end_abs = _pre_end
             for show, show_abs_start, show_abs_end, block_name in timeline_entries:
                 if show is None:
                     continue
@@ -3236,6 +3243,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     _gap_abs_start = last_drawn_abs_time
                     _oa_x = last_drawn_pixel_x
                     _oa_abs_cursor = _gap_abs_start
+                    _oa_stop_done = False
                     while _oa_x < cell_x and _oa_x < w:
                         # WARNING: keep the +1e-6 float-truncation guard identical to rounded_start_block_col.
                         _oa_col  = max(0, int(float(_oa_x - col_width) / col_width + 1e-6))
@@ -3246,11 +3254,13 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             break
                         if _oa_col not in current_row_blocks_list:
                             current_row_blocks_list.append(_oa_col)
-                        current_row_stops_list.append({
-                            "col": _oa_col,
-                            "abs": viewport_adjusted_start + _oa_col * 1800,
-                            "key": ("offair", _oa_col),
-                        })
+                        if not _oa_stop_done:
+                            _oa_stop_done = True
+                            current_row_stops_list.append({
+                                "col": _oa_col,
+                                "abs": _last_show_end_abs,
+                                "key": ("offair", round(_last_show_end_abs)),
+                            })
                         _oa_abs_start = _oa_abs_cursor
                         _oa_col_boundary_abs = viewport_adjusted_start + (_oa_col + 1) * 1800
                         if _oa_end == cell_x:
@@ -3258,7 +3268,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         else:
                             _oa_abs_end = _oa_col_boundary_abs
                         _oa_sel = (is_highlighted_row and
-                                   _oa_abs_start <= _guide_target_abs < _oa_abs_end)
+                                   _last_show_end_abs <= _guide_target_abs < show_abs_start)
                         _oa_bg  = HIGHLIGHT_BG if _oa_sel else UNSELECTED_BLUE
                         _oa_tc  = (0, 0, 0) if _oa_sel else TEXT_WHITE
                         pygame.draw.rect(surface, _oa_bg, (_oa_x, start_y, _oa_bw, row_height))
@@ -3311,12 +3321,14 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 
                 last_drawn_pixel_x = cell_x + pixel_cell_width
                 last_drawn_abs_time = clip_end
+                _last_show_end_abs = show_abs_end
                 
             viewport_absolute_max_pixel_x = col_width + (num_cols * col_width)
             if last_drawn_pixel_x < viewport_absolute_max_pixel_x and has_rendered_any_video:
                 _gap_abs_start = last_drawn_abs_time
                 _tr_x = last_drawn_pixel_x
                 _tr_abs_cursor = _gap_abs_start
+                _tr_stop_done = False
                 while _tr_x < viewport_absolute_max_pixel_x and _tr_x < w:
                     _tr_col  = max(0, int(float(_tr_x - col_width) / col_width))
                     _tr_next = col_width + (_tr_col + 1) * col_width
@@ -3326,15 +3338,17 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         break
                     if _tr_col not in current_row_blocks_list:
                         current_row_blocks_list.append(_tr_col)
-                    current_row_stops_list.append({
-                        "col": _tr_col,
-                        "abs": viewport_adjusted_start + _tr_col * 1800,
-                        "key": ("offair", _tr_col),
-                    })
+                    if not _tr_stop_done:
+                        _tr_stop_done = True
+                        current_row_stops_list.append({
+                            "col": _tr_col,
+                            "abs": _last_show_end_abs,
+                            "key": ("offair", round(_last_show_end_abs)),
+                        })
                     _tr_abs_start = _tr_abs_cursor
                     _tr_abs_end = viewport_adjusted_start + (_tr_col + 1) * 1800
                     _tr_sel = (is_highlighted_row and
-                               _tr_abs_start <= _guide_target_abs < _tr_abs_end)
+                               _last_show_end_abs <= _guide_target_abs)
                     _tr_bg  = HIGHLIGHT_BG if _tr_sel else UNSELECTED_BLUE
                     _tr_tc  = (0, 0, 0) if _tr_sel else TEXT_WHITE
                     pygame.draw.rect(surface, _tr_bg, (_tr_x, start_y, _tr_bw, row_height))
@@ -3347,14 +3361,15 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 for fallback_col in range(num_cols):
                     if fallback_col not in current_row_blocks_list:
                         current_row_blocks_list.append(fallback_col)
-                    current_row_stops_list.append({
-                        "col": fallback_col,
-                        "abs": viewport_adjusted_start + fallback_col * 1800,
-                        "key": ("col", fallback_col),
-                    })
+                    if fallback_col == 0:
+                        current_row_stops_list.append({
+                            "col": 0,
+                            "abs": _last_show_end_abs,
+                            "key": ("offair", round(_last_show_end_abs)),
+                        })
                     _fb_abs = viewport_adjusted_start + fallback_col * 1800
                     is_selected_cell = (is_highlighted_row and
-                                        _fb_abs <= _guide_target_abs < _fb_abs + 1800)
+                                        _last_show_end_abs <= _guide_target_abs)
                     cell_bg = HIGHLIGHT_BG if is_selected_cell else UNSELECTED_BLUE
                     cell_txt_col = (0, 0, 0) if is_selected_cell else TEXT_WHITE
                     cell_x = col_width + (fallback_col * col_width)
@@ -4751,7 +4766,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _scan_done, _scan_total = _scan_progress
                 if _scan_total > 0 and _scan_done < _scan_total:
                     _bar_max_w = cell_w - 2 * cell_radius
-                    _bar_w = max(1, int(_bar_max_w * _scan_done / _scan_total))
+                    _bar_w = min(_bar_max_w, max(CHANNEL_SCAN_BAR_MIN_PX, int(_bar_max_w * _scan_done / _scan_total)))
                     _bar_x = cell_x + cell_radius
                     _bar_y = cell_y + cell_h - CHANNEL_SCAN_BAR_HEIGHT_PX
                     _halo_color = tuple(int(cell_bg[_c] + (NEON_GREEN[_c] - cell_bg[_c]) * CHANNEL_SCAN_BAR_HALO_MIX)

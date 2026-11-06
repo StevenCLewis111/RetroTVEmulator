@@ -481,6 +481,9 @@ HUB_MODE_SWITCH_SETTLE_SECONDS = 0.5
 # VALUES CHANGE HERE (fall back to Static: milliseconds a playing channel may go without a new picture before the screen shows Static; it must stay below the stall recovery time in retro_tv_emulator.py, PLAYBACK_STALL_TIMEOUT_MS)
 STALL_FORCES_STATIC_MS = 7000
 
+# VALUES CHANGE HERE (fall back to Static on a channel's first load: milliseconds the channel you just tuned to may go without its first picture before the screen shows Static and the red banner; longer than STALL_FORCES_STATIC_MS because the first show is still being measured and opened (owner log 2026-11-06 08:31: ch05 first picture took about 8 s on a cold start); it must stay below PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS)
+STALL_FORCES_STATIC_FIRST_LOAD_MS = 10000
+
 # VALUES CHANGE HERE (loudness scan sampling: each sample window is this many seconds of audio (how many windows a file gets is LOUDNESS_SCAN_WINDOW_COUNTS below); a file up to the whole-file length is scanned whole)
 LOUDNESS_SCAN_WINDOW_SECONDS = 60.0
 LOUDNESS_SCAN_WHOLE_FILE_MAX_SECONDS = 180.0
@@ -603,7 +606,7 @@ STATIC_NOISE_AMBIENT_REFRESH_MS = 33
 STATIC_NOISE_POOL_FRAMES = 12
 STATIC_NOISE_POOL_SIZES = 3
 # VALUES CHANGE HERE (Static Noise grain: the size in screen pixels of one speck of snow, 1 is the finest and costs the most to make, 3 is the coarse snow of V347; at most one new picture is made every STATIC_NOISE_BUILD_GAP_MS while the set fills, so the screen thread is never given a burst of them)
-STATIC_NOISE_GRAIN_PX = 2
+STATIC_NOISE_GRAIN_PX = 3
 STATIC_NOISE_BUILD_GAP_MS = 80
 # VALUES CHANGE HERE (Static Noise: the snow's strength is baked into each picture's own see-through values in this many steps, because a picture with both its own see-through values and an overall strength drew about 8 times slower; how many baked pictures are kept, all sizes and strengths together)
 STATIC_NOISE_STRENGTH_STEPS = 16
@@ -1004,6 +1007,8 @@ SETTINGS_SAVE_PIECE_ENTRIES = 500
 CHANNEL_SCAN_BAR_HEIGHT_PX = 3
 CHANNEL_SCAN_BAR_HEAD_PX = 6
 CHANNEL_SCAN_BAR_HALO_MIX = 0.35
+# VALUES CHANGE HERE (Channels-tab scan bar: narrowest the bar is drawn while its channel still has files to scan, in pixels; a music station lists hundreds of songs and few are scanned, so its true share is under one pixel (owner log 2026-11-06))
+CHANNEL_SCAN_BAR_MIN_PX = 12
 
 # VALUES CHANGE HERE (ui.py, menus: shrink of every menu while bezel style 1 or 2 is on; the menu canvas width and height in pixels)
 MENU_FIT_SHRINK_FACTOR = 0.94
@@ -2022,7 +2027,17 @@ def scan_gpu_decode_allowed(profile=None):
 
 
 def music_scan_class(distance, falling_behind):
-    """The pace class of a visualizer song distance songs ahead of the one playing (0 = playing): "now" for the quick songs, "next" while inside the fast window or while the scan is falling behind, "deep" after that."""
+    """The scan class of a music song distance songs ahead of the one playing (0 = playing): "now" for the quick songs, "next" for the rest of the first wave and the wave after it, "deep" for every song beyond them, whether or not the scan is falling behind."""
+    # WARNING: owner order 2026-11-06: a music station's first wave (10 songs) and the 10 after it come with the live shows; the rest of the list scans alongside at a slower rate and never ahead of a TV show that is still unscanned. Songs beyond the two waves stay "deep" even when the scan is falling behind, so 560 songs are never level with the TV shows.
+    if distance < MUSIC_SCAN_QUICK_SONGS:
+        return "now"
+    if distance < MUSIC_SCAN_FIRST_WAVE_SONGS + MUSIC_SCAN_NEXT_WAVE_SONGS:
+        return "next"
+    return "deep"
+
+
+def music_analysis_class(distance, falling_behind):
+    """The pace class of a song's visualizer analysis: "now" for the quick songs, "next" while inside the fast window or while the analysis is falling behind, "deep" after that."""
     if distance < MUSIC_SCAN_QUICK_SONGS:
         return "now"
     if falling_behind or distance < MUSIC_SCAN_FAST_AHEAD_SONGS:
@@ -2801,6 +2816,8 @@ LIBRARY_GROWING_FILE_CHECK_DELAY_S = 0.05
 # SECTION: First-start probe of pending scheduled files
 # ============================================================================
 # VALUES CHANGE HERE (pending scheduled files are probed in the background, this many at a time; a file whose probe found nothing is tried again after the retry seconds; a channel's request is dropped when its schedule has not asked again for the stale seconds)
+# VALUES CHANGE HERE (tune-in loudness scans run at priority; this many may run at once, the channel on screen plus one it just left)
+LOUDNESS_PRIME_AT_ONCE = 2
 PENDING_SCHEDULE_PROBE_PARALLEL = 2
 # VALUES CHANGE HERE (pending-file probe: a file whose length was just stored is not probed and stored again for this many seconds)
 PENDING_PROBE_RESTORE_HOLD_SECONDS = 60.0
@@ -2854,6 +2871,9 @@ SCAN_GPU_DECODE_FAILURE_LIMIT = 3
 MUSIC_SCAN_QUICK_SONGS = 3
 MUSIC_SCAN_FAST_AHEAD_SONGS = 10
 MUSIC_SCAN_FALL_BEHIND_SONGS = 5
+# VALUES CHANGE HERE (music scan classes: a music station's first wave of songs, then the wave after it, are scanned as "next" with the TV shows coming up; every song beyond them is "deep" and scans alongside at the slower deep pace)
+MUSIC_SCAN_FIRST_WAVE_SONGS = 10
+MUSIC_SCAN_NEXT_WAVE_SONGS = 10
 
 # VALUES CHANGE HERE (audio tracks: languages picked first, in order, when a file has no saved track choice (matched against the track's language name or code); milliseconds the track list must stay unchanged after a file starts before the pick is made, and the most milliseconds to wait for that; seconds the Audio Track menu keeps re-reading the track list while it is open, and how often)
 AUDIO_TRACK_PREFERRED_LANGUAGES = ("english", "eng", "en")
@@ -3506,6 +3526,11 @@ def in_priority_scope():
     return getattr(_gate_tls, "depth", 0) > 0
 
 
+def lane_held(lane):
+    """True when the calling thread is inside an admitted gate of this lane."""
+    return lane in (getattr(_gate_tls, "held", None) or ())
+
+
 def _is_priority_context():
     # WARNING: the UI thread must never wait on a gate; it must count as priority.
     return getattr(_gate_tls, "depth", 0) > 0 or threading.current_thread() is threading.main_thread()
@@ -3534,7 +3559,8 @@ def gate(lane, priority=False, timeout=None, label=""):
     held = getattr(_gate_tls, "held", None)
     if held is None:
         held = _gate_tls.held = set()
-    if lane in held:
+    # WARNING: a thread that already holds one ffmpeg scan lane is one scan; a step inside it (the audio-track listing of a loudness window, a file key) takes no second place in another ffmpeg lane. Owner log 2026-11-06: loudness windows admitted as priority waited for the length-probe lane, were counted as running scans, and filled the cap that lane waits on; 28 of them stood stuck and no background scan, picture boxes of airing shows included, could start.
+    if lane in held or (lane in FFMPEG_SCAN_LANES and not held.isdisjoint(FFMPEG_SCAN_LANES)):
         yield True
         return
     priority = bool(priority) or _is_priority_context()
@@ -4066,11 +4092,11 @@ __all__ = [
     "ffmpeg_scans_at_once", "tune_loudness_settle_seconds", "loudness_parallel_windows", "note_tune_steady",
     "make_fingerprint",
     "build_profile", "classify_tier", "BusyWindow", "LossTracker", "SystemCpuSampler", "format_status",
-    "gate", "activity", "priority_scope", "in_priority_scope", "first_start_scan_plan", "first_start_scans_concurrent", "background_active", "enforcing", "set_enabled",
+    "gate", "activity", "priority_scope", "in_priority_scope", "lane_held", "first_start_scan_plan", "first_start_scans_concurrent", "background_active", "enforcing", "set_enabled",
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
     "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
     "quiet_seconds", "pc_is_quiet", "quiet_lane_bonus", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
-    "music_scan_class", "music_scan_falling_behind",
+    "music_scan_class", "music_analysis_class", "music_scan_falling_behind",
 ]

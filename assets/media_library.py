@@ -547,6 +547,16 @@ class PathKeyResolver:
         self.library.store_path_key(norm_path, st.st_size, st.st_mtime, content_key)
         return content_key
 
+    def peek(self, file_path: str) -> Optional[str]:
+        """The saved content_key for a path whose size and mtime still match, or None; never hashes a file and never queues one, so it is safe on any thread."""
+        norm_path = os.path.normpath(os.path.abspath(file_path)).lower()
+        try:
+            st = os.stat(file_path)
+        except OSError as _swallowed_error:
+            _log_swallowed("PathKeyResolver.peek: st = os.stat(file_path)", _swallowed_error)
+            return None
+        return self.library.lookup_path_key(norm_path, st.st_size, st.st_mtime)
+
     def _queue_background_key(self, norm_path, file_path):
         """Hands a path to the one background keyer thread; never blocks."""
         with self._key_lock:
@@ -1338,6 +1348,13 @@ class ProbeLibrary:
     def get_cached(self, file_path: str) -> Optional[dict]:
         """Read-only: returns the library entry if one already exists for this path's current content, else None."""
         content_key = self.keys.resolve(file_path)
+        if content_key is None:
+            return None
+        return self.library.get_entry(content_key)
+
+    def get_cached_known(self, file_path: str) -> Optional[dict]:
+        """Like get_cached, but a file whose key is not saved yet reads as None instead of being hashed, so it never waits for a disk slot."""
+        content_key = self.keys.peek(file_path)
         if content_key is None:
             return None
         return self.library.get_entry(content_key)
