@@ -211,19 +211,21 @@ def _payload_files(staged_path, install_dir=None):
     return files
 
 
-def _backup_targets(install_dir, files):
+def _backup_targets(install_dir, files, on_file=None):
     backup_dir = tempfile.mkdtemp(prefix="retro-tv-rollback-")
     copied = []
     absent = []
-    for _source, relative in files:
+    for number, (_source, relative) in enumerate(files, 1):
         target = os.path.join(install_dir, relative)
         if not os.path.isfile(_long(target)):
             absent.append(relative)
-            continue
-        backup = os.path.join(backup_dir, relative)
-        os.makedirs(_long(os.path.dirname(backup)), exist_ok=True)
-        shutil.copy2(_long(target), _long(backup))
-        copied.append(relative)
+        else:
+            backup = os.path.join(backup_dir, relative)
+            os.makedirs(_long(os.path.dirname(backup)), exist_ok=True)
+            shutil.copy2(_long(target), _long(backup))
+            copied.append(relative)
+        if on_file is not None:
+            on_file(number, len(files))
     return backup_dir, copied, absent
 
 
@@ -519,8 +521,8 @@ PROGRESS_CAPTION_RGB = (190, 200, 215)
 PROGRESS_CAPTION = "The app closes, installs and reopens by itself. This takes about a minute."
 PROGRESS_REFRESH_MS = 50
 PROGRESS_WAIT_BAR = 0.05
-PROGRESS_PREPARE_BAR = 0.15
-PROGRESS_COPY_BAR = (0.20, 0.60)
+PROGRESS_PREPARE_BAR = (0.08, 0.30)
+PROGRESS_COPY_BAR = (0.30, 0.60)
 PROGRESS_START_BAR = 0.65
 PROGRESS_HOLD_BAR = 0.99
 PROGRESS_START_EASE_SECONDS = 30.0
@@ -668,7 +670,7 @@ def preview_progress_bar(seconds=20.0):
     window = _ProgressWindow()
     if not window._ok:
         return 1
-    steps = (("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR), ("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR),
+    steps = (("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR), ("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR[1]),
              ("INSTALLING UPDATE...", PROGRESS_COPY_BAR[1]), ("STARTING THE UPDATED APP...", PROGRESS_START_BAR))
     for label, fraction in steps:
         window.update(label, fraction)
@@ -837,8 +839,11 @@ def apply_update(metadata_path):
     new_version = str(metadata.get("version", "") or "").strip()
     previous_stamp = _read_stamp(install_dir)
     previous_files = _read_installed_files(install_dir)
-    progress.update("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR)
-    backup_dir, copied, absent = _backup_targets(install_dir, files)
+    prepare_from, prepare_to = PROGRESS_PREPARE_BAR
+    progress.update("PREPARING THE UPDATE...", prepare_from)
+    # WARNING: owner 2026-11-07: the backup is the slow part of preparing, so the bar moves with every file backed up instead of sitting at one number.
+    backup_dir, copied, absent = _backup_targets(install_dir, files, lambda done, total: progress.update(
+        "PREPARING THE UPDATE...", prepare_from + (prepare_to - prepare_from) * done / max(1, total)))
     where = install_dir
     try:
         copy_from, copy_to = PROGRESS_COPY_BAR
@@ -885,22 +890,23 @@ def apply_update(metadata_path):
         )
         # NOTE: a spawn that dies immediately is usually a bad executable or
         # path. Give normal startup a little time, then restore the old files.
-        deadline = time.monotonic() + HEALTH_CHECK_SECONDS
+        # WARNING: owner 2026-11-07: the bar finishes the moment the app's first window (its boot loading page) shows, then closes; it no longer waits out the whole health check first. The app dying early still restores the old version.
+        started = time.monotonic()
+        waits = getattr(progress, "waits_for_app", False)
+        deadline = started + (APP_WINDOW_MAX_WAIT_SECONDS if waits else HEALTH_CHECK_SECONDS)
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError("Updated application exited during startup")
+                if time.monotonic() - started < HEALTH_CHECK_SECONDS:
+                    raise RuntimeError("Updated application exited during startup")
+                break
             progress.creep("STARTING THE UPDATED APP...")
+            if waits and _app_window_is_up():
+                break
             time.sleep(0.25)
         _repoint_shortcuts(old_exe_path or command[0], launch_command[0], install_dir, where)
         if old_exe_path and not _remove_with_retry(_rebase(old_exe_path, install_dir, where)):
             log.warning("[UPDATE DIAG] Could not delete the old exe %s; the new version is running",
                         old_exe_path)
-        # WARNING: the bar stays up until the app's own window shows (or the app dies, or the wait runs out), so the whole restart is covered.
-        window_deadline = time.monotonic() + APP_WINDOW_MAX_WAIT_SECONDS
-        while (getattr(progress, "waits_for_app", False) and process.poll() is None
-               and not _app_window_is_up() and time.monotonic() < window_deadline):
-            progress.creep("STARTING THE UPDATED APP...")
-            time.sleep(0.25)
         progress.finish()
     except Exception as exc:
         progress.fail("UPDATE FAILED - RESTORING THE OLD VERSION")

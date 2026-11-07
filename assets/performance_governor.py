@@ -238,6 +238,10 @@ MEDIA_START_GRACE_SECONDS = 3.0
 # VALUES CHANGE HERE (burn-in idle close: seconds with no input before the controls splash, the settings menu with every sub-menu in it, the file explorer and the TV guide close (the guide goes to the channel it was previewing); seconds before every popup closes by itself as if No or Cancel was picked: Quit, the shared Yes/No popup (clear media, reset, burn-in warnings, update), Restart, DVD exit, DVD back to menu, game exit, the controller Pick Layout popup and the wait for a controller button)
 MENU_IDLE_CLOSE_SECONDS = 60.0
 CONFIRM_POPUP_IDLE_CLOSE_SECONDS = 30.0
+# VALUES CHANGE HERE
+UPDATE_POPUP_MAX_OPEN_SECONDS = 60.0
+# VALUES CHANGE HERE (Channel Static colour button: the shortest gap between two steps, in seconds, so one press cannot jump over White)
+STATIC_COLOR_CYCLE_MIN_SECONDS = 0.25
 
 # VALUES CHANGE HERE (held W/A/S/D key: milliseconds before a hold in a menu or the guide starts repeating)
 MENU_NAV_REPEAT_DELAY_MS = 400
@@ -613,8 +617,8 @@ PERF_LOG_MAX_SAMPLES = 900
 # VALUES CHANGE HERE
 STATIC_NOISE_REFRESH_MS = 110
 
-# VALUES CHANGE HERE (Static Noise: how often the snow changes to another picture, in ms; smaller is faster, 33 is 16 is 60 changes a second, one on every frame of a 60 Hz screen)
-STATIC_NOISE_AMBIENT_REFRESH_MS = 16
+# VALUES CHANGE HERE (Static Noise: how often the snow changes to another picture, in ms; smaller is faster, 40 is 25 changes a second; 25 was 40 changes a second, 16 is one on every frame of a 60 Hz screen)
+STATIC_NOISE_AMBIENT_REFRESH_MS = 40
 # VALUES CHANGE HERE (Static Noise: how many noise pictures are made once per screen size and shown in random order, never the same one twice running, so the snow shows no repeating pattern; how many screen sizes keep their pictures)
 STATIC_NOISE_POOL_FRAMES = 12
 STATIC_NOISE_POOL_SIZES = 3
@@ -631,7 +635,7 @@ STATIC_NOISE_FIXED_SEVERITY = 0.30
 STATIC_GREY_GRAIN_LEVEL = 150
 # VALUES CHANGE HERE (Static Noise Color Rainbow and Theme: how see-through the coloured specks of the snow are, from 0 (not there) to 255 (solid), picked at random in this range per speck; the reception lines use 180 to 255, and the snow's own strength is applied on top)
 STATIC_NOISE_TINT_SPECK_ALPHA = (180, 255)
-STATIC_HEAVY = 0.80
+STATIC_HEAVY = 0.62
 
 # VALUES CHANGE HERE
 WATERMARK_JUMP_TOLERANCE_PX = 2
@@ -1166,7 +1170,8 @@ HOLD_RULES = {
     "gamepad": (400, 180, True),
     "volume": (100, 160),
 }
-HOLD_STUCK_MS = {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}
+HOLD_STUCK_MS = {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500, "slider": 15000}
+SLIDER_HOLD_LAYERS = ("VIDEO_ROWS", "THEME_ROWS", "CHANNEL_SUB_MENU")
 VOLUME_STEP = 5
 
 # VALUES CHANGE HERE (menu_nav.py, file explorer mouse: rows one wheel step scrolls, double-click time in ms, pixels before a drag starts, edge zone in pixels where a drag scrolls, slow and fast drag scroll steps in ms, smallest scrollbar thumb, scrollbar width and padding in pixels)
@@ -2125,7 +2130,7 @@ def gpu_gate_values():
 # ============================================================================
 # VALUES CHANGE HERE
 STICK_DZ_ENABLED_KEY = "stick_deadzone_enabled"
-STICK_DZ_ENABLED_DEFAULT = True
+STICK_DZ_ENABLED_DEFAULT = False
 STICK_DZ_SPECS = {
     "deadzone": ("stick_deadzone_percent", 0, 0, 95, 1),
     "sensitivity": ("stick_sensitivity_percent", 100, 10, 200, 5),
@@ -2159,6 +2164,9 @@ GAME_AUTOSAVE_RETRY_SECONDS = 15
 GAME_AUTOSAVE_WRITE_ATTEMPTS = 8
 GAME_AUTOSAVE_WRITE_RETRY_SECONDS = 0.5
 DINPUT_AXIS_LIVENESS_THRESHOLD = 1500
+
+# VALUES CHANGE HERE (seconds the screen waits for a fresh controller identity scan before using the last answer; the scan runs on its own thread so a controller that does not answer cannot freeze the app)
+HID_SCAN_WAIT_SECONDS = 0.1
 
 # VALUES CHANGE HERE (seconds a pad identity scan is reused; seconds a DirectInput read is reused within one frame; seconds a Linux joystick may stay silent before it is dropped; menu pad polls per second; seconds between polls with no pad; polls with no pad before the slow rate)
 HID_IDENTITY_CACHE_TTL_SECONDS = 2.0

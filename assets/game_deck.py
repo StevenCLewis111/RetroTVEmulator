@@ -1036,6 +1036,9 @@ if _WIN:
 
 _hid_identity_cache = None
 _HID_IDENTITY_CACHE_TTL = _gov.HID_IDENTITY_CACHE_TTL_SECONDS
+_HID_SCAN_WAIT = _gov.HID_SCAN_WAIT_SECONDS
+_hid_scan_thread = None
+_hid_scan_lock = threading.Lock()
 _hid_api_cache = None
 
 
@@ -1172,17 +1175,43 @@ def _scan_hid_identities():
     return out
 
 
-def _get_hid_identities():
+def _hid_scan_worker():
+    """Reads the controller identities from Windows on its own thread and stores them in the cache."""
     global _hid_identity_cache
-    now = time.monotonic()
-    if _hid_identity_cache is not None and now - _hid_identity_cache[0] < _HID_IDENTITY_CACHE_TTL:
-        return _hid_identity_cache[1]
     _hid_t0 = time.perf_counter()
     identities = _scan_hid_identities()
     _hid_identity_cache = (time.monotonic(), identities)
     _PAD_COUNTERS["hid_scans"] += 1
     _PAD_COUNTERS["hid_ms"] += (time.perf_counter() - _hid_t0) * 1000.0
-    return identities
+
+
+def _get_hid_identities():
+    """The controller identities, never waiting on Windows for long: the scan runs on its own thread, the caller waits at most _HID_SCAN_WAIT for a fresh one and otherwise gets the last answer (or none)."""
+    # WARNING: this is called from the screen thread; a device that never answers the scan once froze the whole app for 20 seconds, so the scan must never run on the calling thread.
+    global _hid_scan_thread
+    now = time.monotonic()
+    if _hid_identity_cache is not None and now - _hid_identity_cache[0] < _HID_IDENTITY_CACHE_TTL:
+        return _hid_identity_cache[1]
+    started = None
+    with _hid_scan_lock:
+        if _hid_scan_thread is None or not _hid_scan_thread.is_alive():
+            started = threading.Thread(target=_hid_scan_worker, daemon=True, name="HidIdentityScan")
+            _hid_scan_thread = started
+            started.start()
+    if started is not None:
+        started.join(_HID_SCAN_WAIT)
+    if _hid_identity_cache is not None:
+        return _hid_identity_cache[1]
+    return []
+
+
+def precache_controller_info():
+    """Starts the controller identity scan during boot, without waiting, so the answer is already cached when a game or the controller menu asks for it."""
+    global _hid_scan_thread
+    with _hid_scan_lock:
+        if _hid_scan_thread is None or not _hid_scan_thread.is_alive():
+            _hid_scan_thread = threading.Thread(target=_hid_scan_worker, daemon=True, name="HidIdentityScan")
+            _hid_scan_thread.start()
 
 
 def _enrich_signature_with_hid_identity(jid, vid, pid, base_sig):
@@ -7319,21 +7348,24 @@ class ExternalGameDeck:
     # ========================================================================
 
     def _draw_romlist_error_banner(self, screen, cx, top_y):
+        """Sends the game menu's warning (no core, no BIOS, drive trouble) to the shared banner bar at the bottom of the screen instead of drawing it in the middle of the page."""
+        # WARNING: a game warning must never be drawn inside the page; the banner bar is where every warning lives, so the text is handed over once per message.
         if not self._romlist_error_msg:
             return
         now = pygame.time.get_ticks()
-        remaining = self._romlist_error_until - now
-        if remaining <= 0:
+        if self._romlist_error_until - now <= 0:
             self._romlist_error_msg = ""
             return
+        key = (self._romlist_error_msg, self._romlist_error_until)
+        if getattr(self, "_romlist_error_posted", None) == key:
+            return
+        self._romlist_error_posted = key
         try:
-            FADE_MS = _gov.GAME_MESSAGE_FADE_MS
-            alpha = 255 if remaining > FADE_MS else int(255 * remaining / FADE_MS)
-            lbl = self._font_mid.render(self._romlist_error_msg, True, _gov.COLOR_GAME_WARNING_TEXT)
-            lbl.set_alpha(alpha)
-            screen.blit(lbl, (cx - lbl.get_width() // 2, top_y + 6))
+            _main = sys.modules.get("__main__")
+            if _main is not None and hasattr(_main, "post_status_notice"):
+                _main.post_status_notice(str(self._romlist_error_msg).upper())
         except Exception as _swallowed_error:
-            _log_swallowed("ExternalGameDeck._draw_romlist_error_banner: FADE_MS = 500", _swallowed_error)
+            _log_swallowed("ExternalGameDeck._draw_romlist_error_banner: post_status_notice", _swallowed_error)
 
     def _draw_romlist_console_arrows(self, screen, x, y, w, h, list_top_offset, groups=None):
         cx = x + w // 2

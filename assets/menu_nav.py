@@ -1785,7 +1785,16 @@ HOLD_RULES = {_name: HoldRule(*_rule) for _name, _rule in (_governor.HOLD_RULES 
     "gamepad": (400, 180, True),
     "volume": (100, 160),
 }).items()}
-HOLD_STUCK_MS = _governor.HOLD_STUCK_MS if _governor is not None else {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}
+HOLD_STUCK_MS = _governor.HOLD_STUCK_MS if _governor is not None else {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500, "slider": 15000}
+SLIDER_HOLD_LAYERS = _governor.SLIDER_HOLD_LAYERS if _governor is not None else ("VIDEO_ROWS", "THEME_ROWS", "CHANNEL_SUB_MENU")
+
+
+def hold_stuck_limit(layer, key):
+    """Returns how long a held W/A/S/D may count as held with no key down on the keyboard before it is called stuck: the long slider limit for A or D on a menu with a slider, so a remote or gamepad button (which sets no key-down state) slides the whole bar, else the menu limit."""
+    import pygame
+    if layer in SLIDER_HOLD_LAYERS and key in (pygame.K_a, pygame.K_d):
+        return HOLD_STUCK_MS["slider"]
+    return HOLD_STUCK_MS["menu"]
 VOLUME_STEP = _governor.VOLUME_STEP if _governor is not None else 5
 
 
@@ -2337,7 +2346,7 @@ __all__ = [
     "DECK_PREV", "DECK_NEXT", "DECK_TO_ARROWS", "DECK_TO_LIST", "DECK_ACTIVATE", "DECK_SELECT_UP", "DECK_SELECT_DOWN",
     "deck_browse_step", "deck_list_step", "deck_arrows_step", "deck_confirm_choice",
     "HOLD_STARTED", "HOLD_WAIT", "HOLD_REPEAT", "HOLD_STUCK", "DROP_FIRST", "DROP_SECOND", "DROP_BOTH", "DROP_OLDER",
-    "HoldRule", "HOLD_RULES", "HOLD_STUCK_MS", "VOLUME_STEP", "volume_direction", "volume_next", "HoldState", "hold_rule", "hold_due", "hold_stuck", "hold_step", "hold_pick", "hold_released", "hold_conflict",
+    "HoldRule", "HOLD_RULES", "HOLD_STUCK_MS", "SLIDER_HOLD_LAYERS", "hold_stuck_limit", "VOLUME_STEP", "volume_direction", "volume_next", "HoldState", "hold_rule", "hold_due", "hold_stuck", "hold_step", "hold_pick", "hold_released", "hold_conflict",
     "PARENT", "EXPLORER_WHEEL_ROWS", "EXPLORER_DOUBLE_CLICK_MS", "EXPLORER_DRAG_START_PX", "EXPLORER_DRAG_EDGE_ZONE_PX", "EXPLORER_DRAG_SCROLL_SLOW_MS", "EXPLORER_DRAG_SCROLL_FAST_MS",
     "EXPLORER_THUMB_MIN_H", "EXPLORER_SB_WIDTH", "EXPLORER_SB_PAD", "explorer_hit", "explorer_in_band", "explorer_visible_rows", "explorer_row", "explorer_row_at", "explorer_list_pick",
     "explorer_in_remove_zone", "explorer_wheel", "explorer_wheel_button", "explorer_thumb", "explorer_scroll_from_thumb", "explorer_scrollbar_track", "explorer_scrollbar_press",

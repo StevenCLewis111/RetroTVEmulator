@@ -1608,9 +1608,11 @@ log.info(
 # ============================================================================
 
 _last_frame_gap_ms = None
-# WARNING: the fallback numbers below must match MENU_IDLE_CLOSE_SECONDS, CONFIRM_POPUP_IDLE_CLOSE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match MENU_IDLE_CLOSE_SECONDS, CONFIRM_POPUP_IDLE_CLOSE_SECONDS, UPDATE_POPUP_MAX_OPEN_SECONDS, STATIC_COLOR_CYCLE_MIN_SECONDS in performance_governor.py; they are used only when that module fails to import.
 MENU_IDLE_CLOSE_MS = int(performance_governor.MENU_IDLE_CLOSE_SECONDS * 1000) if performance_governor is not None else 60000
 CONFIRM_POPUP_IDLE_CLOSE_MS = int(performance_governor.CONFIRM_POPUP_IDLE_CLOSE_SECONDS * 1000) if performance_governor is not None else 30000
+UPDATE_POPUP_MAX_OPEN_MS = int(performance_governor.UPDATE_POPUP_MAX_OPEN_SECONDS * 1000) if performance_governor is not None else 60000
+STATIC_COLOR_CYCLE_MIN_MS = int(performance_governor.STATIC_COLOR_CYCLE_MIN_SECONDS * 1000) if performance_governor is not None else 250
 
 # WARNING: the fallback numbers below must match BETWEEN_LOUDNESS_PROBES_SECONDS in performance_governor.py; they are used only when that module fails to import.
 BETWEEN_LOUDNESS_PROBES_SECONDS = performance_governor.BETWEEN_LOUDNESS_PROBES_SECONDS if performance_governor is not None else 0.5
@@ -5542,7 +5544,7 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
 # WARNING: the fallback numbers below must match STATIC_NOISE_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_REFRESH_MS = performance_governor.STATIC_NOISE_REFRESH_MS if performance_governor is not None else 110
 # WARNING: the fallback numbers below must match STATIC_NOISE_AMBIENT_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
-_STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REFRESH_MS if performance_governor is not None else 16
+_STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REFRESH_MS if performance_governor is not None else 40
 # WARNING: the fallback numbers below must match STATIC_NOISE_POOL_FRAMES and STATIC_NOISE_POOL_SIZES in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_POOL_FRAMES = performance_governor.STATIC_NOISE_POOL_FRAMES if performance_governor is not None else 12
 _STATIC_NOISE_POOL_SIZES = performance_governor.STATIC_NOISE_POOL_SIZES if performance_governor is not None else 3
@@ -5598,7 +5600,7 @@ def _get_dvd_audio_track_count(dvd_engine):
 
 # WARNING: the fallback numbers below must match STATIC_NOISE_FIXED_SEVERITY and STATIC_HEAVY in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_FIXED_SEVERITY = performance_governor.STATIC_NOISE_FIXED_SEVERITY if performance_governor is not None else 0.30
-_STATIC_HEAVY = performance_governor.STATIC_HEAVY if performance_governor is not None else 0.80
+_STATIC_HEAVY = performance_governor.STATIC_HEAVY if performance_governor is not None else 0.62
 # WARNING: the fallback numbers below must match STATIC_NOISE_TINT_SPECK_ALPHA in performance_governor.py; they are used only when that module fails to import.
 STATIC_NOISE_TINT_SPECK_ALPHA = performance_governor.STATIC_NOISE_TINT_SPECK_ALPHA if performance_governor is not None else (180, 255)
 # WARNING: the fallback number below must match STATIC_GREY_GRAIN_LEVEL in performance_governor.py; it is used only when that module fails to import.
@@ -7045,12 +7047,7 @@ def _draw_visualizer_song_card(screen):
     if not text:
         return
 
-    if (app_state.get("show_splash", False)
-            or app_state.get("show_quit_confirm", False)
-            or app_state.get("show_restart_confirm", False)
-            or app_state.get("file_explorer_active", False)):
-        return
-
+    # WARNING: no menu, popup (Minimize Program?, restart), splash or file explorer may hide the card; only its own burn-in timer (vis_card_timer) ends it.
     line1, line2 = text
 
     sw, sh = screen.get_size()
@@ -19774,6 +19771,11 @@ def _background_subsystem_worker():
     try:
         from game_deck import ExternalGameDeck
         game_deck = ExternalGameDeck()
+        try:
+            import game_deck as _gd_pre
+            _gd_pre.precache_controller_info()
+        except Exception as _pre_err:
+            log.warning("[CONTROLLERS] boot pre-scan could not start: %s", _pre_err)
         print("Game frontend deck ready.")
         if db is not None:
             if game_deck.refresh_from_config(db.config):
@@ -27506,7 +27508,7 @@ while True:
             _mnav_since = now_ticks - _mnav_hold.last if _mnav_hold.key == _mnav_key else 0
             _mnav_step = menu_nav.hold_step(
                 menu_nav.hold_rule(_mnav_key), _mnav_hold, _mnav_key, now_ticks, bool(_mnav_matrix[_mnav_key]),
-                _mnav_released, menu_nav.HOLD_STUCK_MS["menu"], _MENU_NAV_REPEAT_DELAY_MS)
+                _mnav_released, menu_nav.hold_stuck_limit(app_state.get("menu_layer"), _mnav_key), _MENU_NAV_REPEAT_DELAY_MS)
             if _mnav_step == menu_nav.HOLD_STUCK:
                 log.warning("[MENU NAV DEBUG] SUSPECTED STUCK KEY: key=%s has been "
                             "'held' for %sms via _held_keys only (SDL pressed_keys_matrix "
@@ -30822,6 +30824,9 @@ while True:
                             continue
                         if cur_row == 0:
                             if _th_col == 1:
+                                # WARNING: one press moves one step only; a doubled press (key plus pad, or a repeat) would jump over White.
+                                if not menu_nav.step_ready(app_state.setdefault("_step_gate", {}), "static_color_cycle", now_ticks, STATIC_COLOR_CYCLE_MIN_MS):
+                                    continue
                                 current_snc = db.config.get("static_noise_color", "white")
                                 _snc_cycle = {"grey": "rainbow", "rainbow": "theme", "theme": "white", "white": "grey"}
                                 db.config["static_noise_color"] = _snc_cycle.get(current_snc, "white")
@@ -32713,6 +32718,13 @@ while True:
         app_state["show_quit_confirm"] = False
         app_state["quit_confirm_shown_at"] = 0
 
+    if (app_state.get("show_clear_confirm", False) and app_state.get("clear_confirm_target") == "app_update"
+            and not app_state.get("update_install_active", False)):
+        _upd_shown_at = app_state.get("clear_confirm_shown_at", 0) or now_ticks_ms
+        if now_ticks_ms - _upd_shown_at >= UPDATE_POPUP_MAX_OPEN_MS or now_ticks_ms - max(last_input, _upd_shown_at) >= CONFIRM_POPUP_IDLE_CLOSE_MS:
+            log.warning("[ANTI-BURN-IN SHIELD] Update popup timed out. Closing it.")
+            app_state["update_prompt_version"] = ""
+            _close_update_popup()
     if (app_state.get("show_clear_confirm", False) and elapsed_ms >= CONFIRM_POPUP_IDLE_CLOSE_MS
             and not app_state.get("update_install_active", False)):
         log.warning("[ANTI-BURN-IN SHIELD] Clear-confirm popup timed out. Cancelling.")

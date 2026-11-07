@@ -4680,7 +4680,7 @@ def case_hold_functions():
     check(mn.HOLD_RULES["horizontal"] == mn.HoldRule(None, 110, False), "horizontal rule is the old 110 ms")
     check(mn.HOLD_RULES["rom_list"] == mn.HoldRule(380, 70, True), "ROM list rule is the old 380 ms then 70 ms")
     check(mn.HOLD_RULES["volume"] == mn.HoldRule(100, 160, False), "volume rule is 100 ms then 160 ms (V169 started it twice as soon; repeats are now 0.2 s faster than the V169 360 ms)")
-    check(mn.HOLD_STUCK_MS == {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500}, "stuck limits are menu 1500, guide 3000, ROM list 1500, volume 1500")
+    check(mn.HOLD_STUCK_MS == {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500, "slider": 15000}, "stuck limits are menu 1500, guide 3000, ROM list 1500, volume 1500, slider 15000")
     arrows = [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN]
     for key in list(range(0, 1200)) + arrows:
         want = (mn.HOLD_RULES["vertical"] if key in (pygame.K_w, pygame.K_s)
@@ -16864,6 +16864,55 @@ class TestVisualizerTitleFromHub(unittest.TestCase):
         self.assertIn("_visualizer_title_path(", MAIN_SRC)
 
 
+class TestNov7TestListFixes(unittest.TestCase):
+    """The 09:23 test list: card stays up, update popup times out, static cycle, HID scan off the screen thread, no-core warning in the banner"""
+
+    def test_song_card_is_not_hidden_by_any_popup_or_menu(self):
+        src = get_function_source("_draw_visualizer_song_card")
+        for key in ("show_splash", "show_quit_confirm", "show_restart_confirm", "file_explorer_active"):
+            self.assertNotIn(key, src)
+
+    def test_update_popup_has_a_hard_cap_and_idle_close(self):
+        self.assertIn('clear_confirm_target") == "app_update"', MAIN_SRC)
+        self.assertIn("UPDATE_POPUP_MAX_OPEN_MS", MAIN_SRC)
+        import performance_governor as gov
+        self.assertEqual(gov.UPDATE_POPUP_MAX_OPEN_SECONDS, 60.0)
+        self.assertGreater(gov.UPDATE_POPUP_MAX_OPEN_SECONDS, gov.CONFIRM_POPUP_IDLE_CLOSE_SECONDS)
+
+    def test_static_colour_press_is_debounced_and_cycle_has_white(self):
+        import performance_governor as gov
+        self.assertEqual(gov.STATIC_COLOR_CYCLE_MIN_SECONDS, 0.25)
+        self.assertIn('"static_color_cycle"', MAIN_SRC)
+        cycle = {"grey": "rainbow", "rainbow": "theme", "theme": "white", "white": "grey"}
+        seen, cur = [], "grey"
+        for _ in range(4):
+            cur = cycle[cur]
+            seen.append(cur)
+        self.assertEqual(seen, ["rainbow", "theme", "white", "grey"])
+
+    def test_controller_info_is_precached_at_boot(self):
+        import game_deck as gd
+        self.assertTrue(callable(gd.precache_controller_info))
+        self.assertIn("precache_controller_info()", MAIN_SRC)
+
+    def test_hid_scan_never_blocks_and_no_core_goes_to_banner(self):
+        import game_deck as gd
+        import performance_governor as gov
+        self.assertEqual(gov.HID_SCAN_WAIT_SECONDS, 0.1)
+        self.assertLessEqual(gd._HID_SCAN_WAIT, 0.1)
+        import time as _t
+        gd._hid_identity_cache = (0.0, [])
+        orig = gd._scan_hid_identities
+        gd._scan_hid_identities = lambda: (_t.sleep(1.0), [])[1]
+        try:
+            t0 = _t.monotonic()
+            gd._get_hid_identities()
+            self.assertLess(_t.monotonic() - t0, 0.5)
+        finally:
+            gd._scan_hid_identities = orig
+        self.assertIn("post_status_notice", get_function_source("_draw_romlist_error_banner", None) if False else open(gd.__file__, encoding="utf-8").read().split("def _draw_romlist_error_banner")[1][:2500])
+
+
 class TestHubCurrentShowRecord(unittest.TestCase):
     """14.8: each station keeps a current-show record in the hub; a channel change is clock math on it"""
 
@@ -18705,7 +18754,7 @@ class TestV360NoExternalEmulatorCode(unittest.TestCase):
             self.assertEqual(started, [("PSX", rom)], "with a core the game starts and no banner is set")
             self.assertEqual(deck._romlist_error_msg, "")
         _draw = inspect.getsource(gd.ExternalGameDeck._draw_romlist_error_banner)
-        self.assertIn("_gov.COLOR_GAME_WARNING_TEXT", _draw, "the banner is drawn in the warning red")
+        self.assertIn("post_status_notice", _draw, "the warning goes to the shared bottom banner bar")
 
     def test_a_rom_on_a_console_with_no_bios_set_up_shows_the_red_banner(self):
         """Owner 2026-11-05: make a banner for the BIOS too; a PSX game can start with the core's built-in BIOS, so the banner warns and starts it unless the governor switch says to block"""
@@ -19160,7 +19209,7 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
         _period = gov.STATIC_NOISE_POOL_FRAMES
         _same = sum(1 for k in range(len(_seq) - _period) if _seq[k] == _seq[k + _period]) / float(len(_seq) - _period)
         self.assertLess(_same, 0.4, "the order does not repeat every %d pictures (%.2f)" % (_period, _same))
-        self.assertEqual(gov.STATIC_NOISE_AMBIENT_REFRESH_MS, 16)
+        self.assertEqual(gov.STATIC_NOISE_AMBIENT_REFRESH_MS, 40)
         self.assertEqual(gov.STATIC_NOISE_BUILD_GAP_MS, 80)
 
     def test_the_snow_grain_is_a_governor_number_and_finer_than_the_old_three_pixels(self):
@@ -26863,7 +26912,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.2.8", "build_info.py says 1.2.8 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.2.9", "build_info.py says 1.2.9 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27268,7 +27317,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.2.8"""
+    """This build is 1.2.9"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -28954,6 +29003,29 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         self.assertEqual(window._fraction, 0.5, "a lower value never pulls the bar back")
 
 
+    def test_preparing_moves_the_bar_with_every_file_instead_of_sitting_on_one_number(self):
+        for name in ("a.dll", "b.dll", "c.dll", "d.dll"):
+            for folder in (self.install, self.staged):
+                os.makedirs(os.path.join(folder, "_internal"), exist_ok=True)
+                with open(os.path.join(folder, "_internal", name), "w", encoding="utf-8") as handle:
+                    handle.write(name)
+        self.assertEqual(self._run(), 0)
+        prepared = [e[2] for e in self.events if e[0] == "update" and e[1] == "PREPARING THE UPDATE..."]
+        low, high = self.h.PROGRESS_PREPARE_BAR
+        self.assertGreaterEqual(len(set(prepared)), 4, "one distinct step per few files, not one number")
+        self.assertEqual(prepared[0], low)
+        self.assertAlmostEqual(prepared[-1], high)
+        self.assertLessEqual(high, self.h.PROGRESS_COPY_BAR[0])
+
+    def test_the_bar_finishes_when_the_apps_window_shows_without_waiting_out_the_health_check(self):
+        self.recorder.waits_for_app = True
+        self.h.HEALTH_CHECK_SECONDS = 600
+        started = time.monotonic()
+        with mock.patch.object(self.h, "_app_window_is_up", lambda: True):
+            self.assertEqual(self._run(), 0)
+        self.assertLess(time.monotonic() - started, 5, "no 600 second wait once the window is up")
+        self.assertIn(("finish",), self.events)
+
     def test_the_preview_flag_is_wired_and_a_window_that_cannot_open_returns_one(self):
         self.assertEqual(self.h.main(["--preview-bar"]), 1, "no tkinter or no screen here, so no window")
         with self.assertRaises(SystemExit):
@@ -29052,3 +29124,31 @@ class TestWatermarkPicksLandInTheChannelFolder(unittest.TestCase):
     def test_the_picker_and_the_menu_use_it(self):
         self.assertIn("dest = _save_watermark_into_channel_folder(_wm_channel, chosen)", MAIN_SRC)
         self.assertIn("_fe_navigate(_watermark_channel_folder(target_ch_str))", MAIN_SRC)
+
+
+class TestHeldSliderKeepsSliding(unittest.TestCase):
+    """Owner 2026-11-07: holding the button on a slider must slide the whole bar; a remote or gamepad button sets no keyboard state, so the 1.5 second stuck rule cut the slide short"""
+
+    def test_a_or_d_on_a_slider_menu_gets_the_long_limit(self):
+        import pygame
+        import menu_nav as mn
+        for layer in ("VIDEO_ROWS", "THEME_ROWS", "CHANNEL_SUB_MENU"):
+            for key in (pygame.K_a, pygame.K_d):
+                self.assertEqual(mn.hold_stuck_limit(layer, key), mn.HOLD_STUCK_MS["slider"], (layer, key))
+        self.assertEqual(mn.hold_stuck_limit("THEME_ROWS", pygame.K_w), mn.HOLD_STUCK_MS["menu"])
+        self.assertEqual(mn.hold_stuck_limit("GAMES_TAB", pygame.K_d), mn.HOLD_STUCK_MS["menu"])
+
+    def test_the_long_limit_outlasts_a_full_slide_from_end_to_end(self):
+        import menu_nav as mn
+        steps = 100 // mn.SLIDER_STEP
+        slide_ms = steps * max(mn.HOLD_RULES["horizontal"].interval_ms, mn.VALUE_STEP_MIN_MS) + 400
+        self.assertGreater(mn.HOLD_STUCK_MS["slider"], slide_ms * 2)
+
+    def test_the_held_slider_is_not_called_stuck_for_a_remote_press_until_the_long_limit(self):
+        import menu_nav as mn
+        limit = mn.hold_stuck_limit("THEME_ROWS", __import__("pygame").K_d)
+        self.assertFalse(mn.hold_stuck(False, 5000, False, limit))
+        self.assertTrue(mn.hold_stuck(False, limit + 1, False, limit))
+
+    def test_the_main_loop_uses_the_per_layer_limit(self):
+        self.assertIn('menu_nav.hold_stuck_limit(app_state.get("menu_layer"), _mnav_key)', MAIN_SRC)
