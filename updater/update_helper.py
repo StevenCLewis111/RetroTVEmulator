@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import shutil
@@ -264,12 +265,80 @@ def _copy_with_retry(source, target, attempts=40, delay=0.25):
             time.sleep(delay)
 
 
-def _apply_payload(install_dir, files):
-    for source, relative in files:
+def _apply_payload(install_dir, files, on_file=None):
+    for index, (source, relative) in enumerate(files):
         target = os.path.join(install_dir, relative)
         os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
         _move_running_helper_aside(target)
         _copy_with_retry(source, target)
+        if on_file is not None:
+            on_file(index + 1, len(files))
+
+
+# ============================================================================
+# SECTION: Files the build removed
+# ============================================================================
+# The helper writes the list of files each update installed. The next update removes the files that were on the old list and are not in the new zip, so a file taken out of the build is taken out of the installs too.
+
+INSTALLED_FILES_NAME = "installed_files.json"
+
+
+def _read_installed_files(install_dir):
+    """The list of relative paths the last update installed, or None when there is no readable list (an install from before the list existed)."""
+    try:
+        with open(os.path.join(install_dir, INSTALLED_FILES_NAME), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        files = data.get("files") if isinstance(data, dict) else None
+        return [str(item) for item in files] if isinstance(files, list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_installed_files(install_dir, relatives):
+    path = os.path.join(install_dir, INSTALLED_FILES_NAME)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"files": sorted(relatives)}, handle)
+
+
+def _stale_files(install_dir, previous, files):
+    """The files the old build shipped that the new zip does not: only below the top of the install folder, only inside the update area, never protected folders or saved setup, and only files that are really there."""
+    if previous is None:
+        return []
+    shipped = {relative.replace("\\", "/").lower() for _source, relative in files}
+    stale = []
+    for relative in previous:
+        normalized = relative.replace("\\", "/")
+        if "/" not in normalized or normalized.lower() in shipped:
+            continue
+        if not _in_update_area(normalized) or _is_protected(normalized) or _is_user_state(normalized):
+            continue
+        if os.path.isfile(_long(os.path.join(install_dir, normalized))):
+            stale.append(normalized)
+    return stale
+
+
+def _remove_stale_files(install_dir, stale, backup_dir, copied):
+    """Deletes the stale files after copying each into the rollback folder, so a failed update puts them back; empty folders left behind inside the update area are removed too."""
+    for relative in stale:
+        target = os.path.join(install_dir, relative)
+        backup = os.path.join(backup_dir, relative)
+        os.makedirs(_long(os.path.dirname(backup)), exist_ok=True)
+        shutil.copy2(_long(target), _long(backup))
+        copied.append(relative)
+        try:
+            os.unlink(_long(target))
+            log.info("[UPDATE DIAG] Removed %s (the new build no longer ships it)", relative)
+        except OSError as exc:
+            log.warning("[UPDATE DIAG] Could not remove %s: %s", relative, exc)
+            continue
+        folder = os.path.dirname(target)
+        stop = os.path.join(install_dir, relative.replace("\\", "/").split("/", 1)[0])
+        while folder and os.path.normcase(folder) != os.path.normcase(stop):
+            try:
+                os.rmdir(_long(folder))
+            except OSError:
+                break
+            folder = os.path.dirname(folder)
 
 
 # ============================================================================
@@ -435,6 +504,199 @@ def _restore_stamp(install_dir, previous):
 
 
 # ============================================================================
+# SECTION: Install progress window
+# ============================================================================
+# The bar the owner sees between the app closing and the app coming back: a small dark box like the update bar inside the app, so the minute or so of installing and restarting never looks like nothing is happening.
+
+PROGRESS_WINDOW_TITLE = "Retro TV Emulator Update"
+APP_WINDOW_TITLE = "Retro TV Emulator"
+PROGRESS_WINDOW_SIZE = (440, 150)
+PROGRESS_PANEL_RGB = (20, 28, 46)
+PROGRESS_TRACK_RGB = (10, 15, 30)
+PROGRESS_ACCENT_RGB = (0, 255, 128)
+PROGRESS_FAIL_RGB = (255, 90, 90)
+PROGRESS_CAPTION_RGB = (190, 200, 215)
+PROGRESS_CAPTION = "The app closes, installs and reopens by itself. This takes about a minute."
+PROGRESS_REFRESH_MS = 50
+PROGRESS_WAIT_BAR = 0.05
+PROGRESS_PREPARE_BAR = 0.15
+PROGRESS_COPY_BAR = (0.20, 0.60)
+PROGRESS_START_BAR = 0.65
+PROGRESS_HOLD_BAR = 0.99
+PROGRESS_START_EASE_SECONDS = 30.0
+APP_WINDOW_MAX_WAIT_SECONDS = 150
+PROGRESS_DONE_HOLD_SECONDS = 0.7
+PROGRESS_ERROR_SHOW_SECONDS = 4.0
+
+
+def _app_window_is_up():
+    """True once the app's own window is on screen (a visible top-level window titled like the app)."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        handle = user32.FindWindowW(None, APP_WINDOW_TITLE)
+        return bool(handle) and bool(user32.IsWindowVisible(handle))
+    except Exception:
+        return False
+
+
+class _NullProgress:
+    """Stands in for the progress window when there is none (not the packaged exe, or no screen): every call does nothing."""
+
+    def update(self, label, fraction):
+        pass
+
+    def start_stage(self):
+        pass
+
+    def creep(self, label):
+        pass
+
+    def finish(self):
+        pass
+
+    def fail(self, label):
+        pass
+
+    def close(self):
+        pass
+
+
+class _ProgressWindow(_NullProgress):
+    """A borderless always-on-top box with a title and a fill bar, drawn by tkinter in its own thread; the helper just sets its label and fraction."""
+
+    waits_for_app = True
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._label = ""
+        self._fraction = 0.0
+        self._failed = False
+        self._closing = False
+        self._started_at = None
+        self._ready = threading.Event()
+        self._ok = False
+        self._thread = threading.Thread(target=self._run, name="UpdateProgressWindow", daemon=True)
+        self._thread.start()
+        self._ready.wait(3.0)
+
+    def _run(self):
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.title(PROGRESS_WINDOW_TITLE)
+            root.overrideredirect(True)
+            root.attributes("-topmost", True)
+            w, h = PROGRESS_WINDOW_SIZE
+            root.geometry("%dx%d+%d+%d" % (w, h, (root.winfo_screenwidth() - w) // 2, (root.winfo_screenheight() - h) // 2))
+            canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=self._hex(PROGRESS_PANEL_RGB))
+            canvas.pack()
+            self._ok = True
+        except Exception as exc:
+            log.warning("[UPDATE DIAG] Progress window not shown: %s", exc)
+            self._ready.set()
+            return
+        self._ready.set()
+
+        def tick():
+            with self._lock:
+                label, fraction, failed, closing = self._label, self._fraction, self._failed, self._closing
+            if closing:
+                root.destroy()
+                return
+            accent = self._hex(PROGRESS_FAIL_RGB if failed else PROGRESS_ACCENT_RGB)
+            canvas.delete("all")
+            canvas.create_rectangle(1, 1, w - 2, h - 2, outline=accent, width=2)
+            text = label if failed else "%s %d%%" % (label, int(max(0.0, min(1.0, fraction)) * 100))
+            canvas.create_text(w // 2, 34, text=text, fill=accent, font=("Courier New", 13, "bold"))
+            track = (20, 62, w - 20, 76)
+            canvas.create_rectangle(*track, fill=self._hex(PROGRESS_TRACK_RGB), outline=accent)
+            fill_w = int((track[2] - track[0]) * max(0.0, min(1.0, fraction)))
+            if fill_w > 0:
+                canvas.create_rectangle(track[0], track[1], track[0] + fill_w, track[3], fill=accent, outline=accent)
+            canvas.create_text(w // 2, 108, text=PROGRESS_CAPTION, fill=self._hex(PROGRESS_CAPTION_RGB), font=("Courier New", 9), width=w - 40)
+            root.after(PROGRESS_REFRESH_MS, tick)
+
+        tick()
+        try:
+            root.mainloop()
+        except Exception as exc:
+            log.warning("[UPDATE DIAG] Progress window stopped: %s", exc)
+
+    @staticmethod
+    def _hex(rgb):
+        return "#%02x%02x%02x" % rgb
+
+    def update(self, label, fraction):
+        with self._lock:
+            self._label = label
+            self._fraction = max(self._fraction if not self._failed else 0.0, fraction)
+
+    def start_stage(self):
+        self._started_at = time.monotonic()
+
+    def creep(self, label):
+        """Moves the bar on its own from where the install left it toward just short of full, the longer the app takes to start."""
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        elapsed = time.monotonic() - self._started_at
+        left = PROGRESS_HOLD_BAR - PROGRESS_START_BAR
+        self.update(label, PROGRESS_START_BAR + left * (1.0 - math.exp(-elapsed / PROGRESS_START_EASE_SECONDS)))
+
+    def finish(self):
+        self.update("READY", 1.0)
+        time.sleep(PROGRESS_DONE_HOLD_SECONDS)
+
+    def fail(self, label):
+        with self._lock:
+            self._label = label
+            self._failed = True
+
+    def close(self):
+        with self._lock:
+            failed = self._failed
+        if failed:
+            time.sleep(PROGRESS_ERROR_SHOW_SECONDS)
+        with self._lock:
+            self._closing = True
+        self._thread.join(2.0)
+
+
+def preview_progress_bar(seconds=20.0):
+    """Shows the installing bar by itself for a few seconds, walking through the same stages as a real update, so the window can be checked on a PC without installing anything; returns 0 when a window showed, 1 when it could not open."""
+    window = _ProgressWindow()
+    if not window._ok:
+        return 1
+    steps = (("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR), ("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR),
+             ("INSTALLING UPDATE...", PROGRESS_COPY_BAR[1]), ("STARTING THE UPDATED APP...", PROGRESS_START_BAR))
+    for label, fraction in steps:
+        window.update(label, fraction)
+        time.sleep(seconds / (len(steps) * 2))
+    window.start_stage()
+    end = time.monotonic() + seconds / 2
+    while time.monotonic() < end:
+        window.creep("STARTING THE UPDATED APP...")
+        time.sleep(0.1)
+    window.finish()
+    window.close()
+    return 0
+
+
+def _open_progress():
+    """Returns the progress window when this is the packaged helper exe and a screen is there, else one that does nothing; a window that fails to open never stops the update."""
+    if not getattr(sys, "frozen", False):
+        return _NullProgress()
+    try:
+        window = _ProgressWindow()
+        log.info("[UPDATE DIAG] Progress window %s", "opened" if window._ok else "could not open (see the line above)")
+        return window if window._ok else _NullProgress()
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] Progress window not shown: %s", exc)
+        return _NullProgress()
+
+
+# ============================================================================
 # SECTION: Apply update
 # ============================================================================
 
@@ -548,6 +810,8 @@ def apply_update(metadata_path):
     if not isinstance(command, list) or not command:
         raise RuntimeError("Update relaunch command is missing")
 
+    progress = _open_progress()
+    progress.update("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR)
     deadline = time.monotonic() + WAIT_FOR_PARENT_SECONDS
     while _pid_alive(parent_pid) and time.monotonic() < deadline:
         time.sleep(0.25)
@@ -557,6 +821,8 @@ def apply_update(metadata_path):
             "[UPDATE DIAG] Timed out waiting for pid=%s to exit", parent_pid,
             interval=0.0,
         )
+        progress.fail("UPDATE FAILED - THE APP WOULD NOT CLOSE")
+        progress.close()
         raise RuntimeError("Timed out waiting for the old application to exit")
 
     files = _payload_files(staged_path, install_dir)
@@ -570,10 +836,21 @@ def apply_update(metadata_path):
                  new_exe_name, os.path.basename(old_exe_path))
     new_version = str(metadata.get("version", "") or "").strip()
     previous_stamp = _read_stamp(install_dir)
+    previous_files = _read_installed_files(install_dir)
+    progress.update("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR)
     backup_dir, copied, absent = _backup_targets(install_dir, files)
     where = install_dir
     try:
-        _apply_payload(install_dir, files)
+        copy_from, copy_to = PROGRESS_COPY_BAR
+        _apply_payload(install_dir, files, lambda done, total: progress.update(
+            "INSTALLING UPDATE...", copy_from + (copy_to - copy_from) * done / max(1, total)))
+        stale = _stale_files(install_dir, previous_files, files)
+        if stale:
+            _remove_stale_files(install_dir, stale, backup_dir, copied)
+        try:
+            _write_installed_files(install_dir, [relative for _source, relative in files])
+        except OSError as list_exc:
+            log.warning("[UPDATE DIAG] Could not write %s: %s", INSTALLED_FILES_NAME, list_exc)
         if new_version:
             try:
                 _write_stamp(install_dir, new_version)
@@ -595,6 +872,8 @@ def apply_update(metadata_path):
             else:
                 log.info("[UPDATE DIAG] Install folder renamed: %s -> %s", install_dir, where)
                 launch_command[0] = _rebase(launch_command[0], install_dir, where)
+        progress.update("STARTING THE UPDATED APP...", PROGRESS_START_BAR)
+        progress.start_stage()
         process = subprocess.Popen(
             launch_command,
             cwd=where,
@@ -610,12 +889,21 @@ def apply_update(metadata_path):
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError("Updated application exited during startup")
+            progress.creep("STARTING THE UPDATED APP...")
             time.sleep(0.25)
         _repoint_shortcuts(old_exe_path or command[0], launch_command[0], install_dir, where)
         if old_exe_path and not _remove_with_retry(_rebase(old_exe_path, install_dir, where)):
             log.warning("[UPDATE DIAG] Could not delete the old exe %s; the new version is running",
                         old_exe_path)
+        # WARNING: the bar stays up until the app's own window shows (or the app dies, or the wait runs out), so the whole restart is covered.
+        window_deadline = time.monotonic() + APP_WINDOW_MAX_WAIT_SECONDS
+        while (getattr(progress, "waits_for_app", False) and process.poll() is None
+               and not _app_window_is_up() and time.monotonic() < window_deadline):
+            progress.creep("STARTING THE UPDATED APP...")
+            time.sleep(0.25)
+        progress.finish()
     except Exception as exc:
+        progress.fail("UPDATE FAILED - RESTORING THE OLD VERSION")
         _server_breadcrumb(
             log, logging.ERROR, "update-apply-failed",
             "[UPDATE DIAG] Update apply failed, restoring backup: %s", exc,
@@ -628,6 +916,13 @@ def apply_update(metadata_path):
             _configure_logging(where)
         _restore(where, backup_dir, copied, absent)
         _restore_stamp(where, previous_stamp)
+        try:
+            if previous_files is None:
+                os.unlink(os.path.join(where, INSTALLED_FILES_NAME))
+            else:
+                _write_installed_files(where, previous_files)
+        except OSError:
+            pass
         try:
             subprocess.Popen(
                 [_rebase(command[0], install_dir, where)] + list(command[1:]),
@@ -642,6 +937,7 @@ def apply_update(metadata_path):
             pass
         raise
     finally:
+        progress.close()
         shutil.rmtree(_long(backup_dir), ignore_errors=True)
         shutil.rmtree(_long(os.path.dirname(_rebase(staged_path, install_dir, where))), ignore_errors=True)
         try:
@@ -660,8 +956,13 @@ def apply_update(metadata_path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", required=True, dest="metadata_path")
+    parser.add_argument("--apply", dest="metadata_path")
+    parser.add_argument("--preview-bar", action="store_true", dest="preview_bar")
     args = parser.parse_args(argv)
+    if args.preview_bar:
+        return preview_progress_bar()
+    if not args.metadata_path:
+        parser.error("--apply is required")
     try:
         return apply_update(args.metadata_path)
     except Exception as exc:

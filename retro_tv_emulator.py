@@ -2656,7 +2656,7 @@ def _tv_border_osd_offset(stem):
 # WARNING: the fallback numbers below must match CH_NUM_TOP_ALIGN_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
 _CH_NUM_TOP_ALIGN_NUDGE_PX = performance_governor.CH_NUM_TOP_ALIGN_NUDGE_PX if performance_governor is not None else -20
 
-# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_NOISE_REFRESH_MS, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, FRAME_COPY_LOG_EVERY_FRAMES, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_NOISE_REFRESH_MS, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_MEDIUM_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, RECEPTION_LINE_COUNT_WEIGHTS, RECEPTION_LINE_BIG_CHANCE, RECEPTION_LINE_MEDIUM_CHANCE, RECEPTION_LINE_GAP_FRAC_RANGE, RECEPTION_LINE_GAP_MIN_DIFF_FRAC, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, FRAME_COPY_LOG_EVERY_FRAMES, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
 _TV_BORDER_SCREEN_EXPAND = performance_governor.TV_BORDER_SCREEN_EXPAND if performance_governor is not None else {"bezel": (1.00, 1.00), "bezel1": (1.00, 1.00), "bezel2": (1.00, 1.00)}
 _TV_BORDER_SCREEN_EXPAND_DEFAULT = performance_governor.TV_BORDER_SCREEN_EXPAND_DEFAULT if performance_governor is not None else (1.00, 1.00)
 RECEPTION_NOISE_BLOCK_PX = performance_governor.RECEPTION_NOISE_BLOCK_PX if performance_governor is not None else 2
@@ -2665,9 +2665,15 @@ RECEPTION_NOISE_BRIGHT_SHARE = performance_governor.RECEPTION_NOISE_BRIGHT_SHARE
 RECEPTION_NOISE_BRIGHT_ALPHA = performance_governor.RECEPTION_NOISE_BRIGHT_ALPHA if performance_governor is not None else (180, 255)
 RECEPTION_NOISE_DARK_ALPHA = performance_governor.RECEPTION_NOISE_DARK_ALPHA if performance_governor is not None else (110, 210)
 RECEPTION_NOISE_REFRESH_MS = performance_governor.RECEPTION_NOISE_REFRESH_MS if performance_governor is not None else 33
-RECEPTION_LINE_BIG_FRAC_RANGE = performance_governor.RECEPTION_LINE_BIG_FRAC_RANGE if performance_governor is not None else (0.035, 0.09)
+RECEPTION_LINE_BIG_FRAC_RANGE = performance_governor.RECEPTION_LINE_BIG_FRAC_RANGE if performance_governor is not None else (0.06, 0.10)
+RECEPTION_LINE_MEDIUM_FRAC_RANGE = performance_governor.RECEPTION_LINE_MEDIUM_FRAC_RANGE if performance_governor is not None else (0.03, 0.055)
 RECEPTION_LINE_SMALL_FRAC_RANGE = performance_governor.RECEPTION_LINE_SMALL_FRAC_RANGE if performance_governor is not None else (0.012, 0.03)
 RECEPTION_LINE_SPEED_PX_MS = performance_governor.RECEPTION_LINE_SPEED_PX_MS if performance_governor is not None else 0.85
+RECEPTION_LINE_COUNT_WEIGHTS = performance_governor.RECEPTION_LINE_COUNT_WEIGHTS if performance_governor is not None else (35, 40, 25)
+RECEPTION_LINE_BIG_CHANCE = performance_governor.RECEPTION_LINE_BIG_CHANCE if performance_governor is not None else 0.35
+RECEPTION_LINE_MEDIUM_CHANCE = performance_governor.RECEPTION_LINE_MEDIUM_CHANCE if performance_governor is not None else 0.40
+RECEPTION_LINE_GAP_FRAC_RANGE = performance_governor.RECEPTION_LINE_GAP_FRAC_RANGE if performance_governor is not None else (0.12, 0.45)
+RECEPTION_LINE_GAP_MIN_DIFF_FRAC = performance_governor.RECEPTION_LINE_GAP_MIN_DIFF_FRAC if performance_governor is not None else 0.06
 FILE_EXPLORER_EXPAND_TIMEOUT_MS = performance_governor.FILE_EXPLORER_EXPAND_TIMEOUT_MS if performance_governor is not None else 6000
 SEEK_RETRY_INTERVAL_MS = performance_governor.SEEK_RETRY_INTERVAL_MS if performance_governor is not None else 1500
 FRAME_COPY_LOG_EVERY_FRAMES = performance_governor.FRAME_COPY_LOG_EVERY_FRAMES if performance_governor is not None else 600
@@ -5536,7 +5542,7 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
 # WARNING: the fallback numbers below must match STATIC_NOISE_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_REFRESH_MS = performance_governor.STATIC_NOISE_REFRESH_MS if performance_governor is not None else 110
 # WARNING: the fallback numbers below must match STATIC_NOISE_AMBIENT_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
-_STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REFRESH_MS if performance_governor is not None else 33
+_STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REFRESH_MS if performance_governor is not None else 16
 # WARNING: the fallback numbers below must match STATIC_NOISE_POOL_FRAMES and STATIC_NOISE_POOL_SIZES in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_POOL_FRAMES = performance_governor.STATIC_NOISE_POOL_FRAMES if performance_governor is not None else 12
 _STATIC_NOISE_POOL_SIZES = performance_governor.STATIC_NOISE_POOL_SIZES if performance_governor is not None else 3
@@ -5548,7 +5554,6 @@ _STATIC_NOISE_STRENGTH_STEPS = performance_governor.STATIC_NOISE_STRENGTH_STEPS 
 _STATIC_NOISE_BAKED_MAX = performance_governor.STATIC_NOISE_BAKED_MAX if performance_governor is not None else 24
 _static_noise_baked = collections.OrderedDict()
 _static_noise_pools = collections.OrderedDict()
-_static_noise_cycle_started = None
 
 _last_screen_mode_picture_rect = None
 
@@ -5591,18 +5596,13 @@ def _get_dvd_audio_track_count(dvd_engine):
     cache["ts"] = now
     return count
 
-# WARNING: _STATIC_WEAK is the floor; the cycle must never dip below it or the picture reads as clean.
-# WARNING: the fallback numbers below must match STATIC_WEAK, STATIC_MEDIUM, STATIC_HEAVY in performance_governor.py; they are used only when that module fails to import.
-_STATIC_WEAK = performance_governor.STATIC_WEAK if performance_governor is not None else 0.16
-_STATIC_MEDIUM = performance_governor.STATIC_MEDIUM if performance_governor is not None else 0.30
-_STATIC_HEAVY = performance_governor.STATIC_HEAVY if performance_governor is not None else 0.46
-
-# WARNING: the fallback numbers below must match STATIC_WEAK_HOLD_MS, STATIC_MEDIUM_HOLD_MS, STATIC_HEAVY_HOLD_MS, STATIC_RAMP_MS, STATIC_SUDDEN_RAMP_MS in performance_governor.py; they are used only when that module fails to import.
-_STATIC_WEAK_HOLD_MS = performance_governor.STATIC_WEAK_HOLD_MS if performance_governor is not None else 10000
-_STATIC_MEDIUM_HOLD_MS = performance_governor.STATIC_MEDIUM_HOLD_MS if performance_governor is not None else 6500
-_STATIC_HEAVY_HOLD_MS = performance_governor.STATIC_HEAVY_HOLD_MS if performance_governor is not None else 7000
-_STATIC_RAMP_MS = performance_governor.STATIC_RAMP_MS if performance_governor is not None else 1200
-_STATIC_SUDDEN_RAMP_MS = performance_governor.STATIC_SUDDEN_RAMP_MS if performance_governor is not None else 220
+# WARNING: the fallback numbers below must match STATIC_NOISE_FIXED_SEVERITY and STATIC_HEAVY in performance_governor.py; they are used only when that module fails to import.
+_STATIC_NOISE_FIXED_SEVERITY = performance_governor.STATIC_NOISE_FIXED_SEVERITY if performance_governor is not None else 0.30
+_STATIC_HEAVY = performance_governor.STATIC_HEAVY if performance_governor is not None else 0.80
+# WARNING: the fallback numbers below must match STATIC_NOISE_TINT_SPECK_ALPHA in performance_governor.py; they are used only when that module fails to import.
+STATIC_NOISE_TINT_SPECK_ALPHA = performance_governor.STATIC_NOISE_TINT_SPECK_ALPHA if performance_governor is not None else (180, 255)
+# WARNING: the fallback number below must match STATIC_GREY_GRAIN_LEVEL in performance_governor.py; it is used only when that module fails to import.
+_STATIC_GREY_GRAIN_LEVEL = performance_governor.STATIC_GREY_GRAIN_LEVEL if performance_governor is not None else 150
 
 
 # ============================================================================
@@ -5611,33 +5611,9 @@ _STATIC_SUDDEN_RAMP_MS = performance_governor.STATIC_SUDDEN_RAMP_MS if performan
 
 
 def _static_noise_severity_at(now_ms):
-    """Return a slow reception-quality cycle for live-channel snow."""
-    global _static_noise_cycle_started
-    if _static_noise_cycle_started is None:
-        _static_noise_cycle_started = now_ms
-
-    phases = (
-        (_STATIC_WEAK_HOLD_MS, _STATIC_WEAK, _STATIC_WEAK),
-        (_STATIC_RAMP_MS, _STATIC_WEAK, _STATIC_HEAVY),
-        (_STATIC_HEAVY_HOLD_MS, _STATIC_HEAVY, _STATIC_HEAVY),
-        (_STATIC_RAMP_MS, _STATIC_HEAVY, _STATIC_WEAK),
-        (_STATIC_WEAK_HOLD_MS, _STATIC_WEAK, _STATIC_WEAK),
-        (_STATIC_RAMP_MS, _STATIC_WEAK, _STATIC_MEDIUM),
-        (_STATIC_MEDIUM_HOLD_MS, _STATIC_MEDIUM, _STATIC_MEDIUM),
-        (_STATIC_RAMP_MS, _STATIC_MEDIUM, _STATIC_WEAK),
-        (_STATIC_WEAK_HOLD_MS, _STATIC_WEAK, _STATIC_WEAK),
-        (_STATIC_SUDDEN_RAMP_MS, _STATIC_WEAK, _STATIC_HEAVY),
-        (_STATIC_HEAVY_HOLD_MS, _STATIC_HEAVY, _STATIC_HEAVY),
-        (_STATIC_RAMP_MS, _STATIC_HEAVY, _STATIC_WEAK),
-    )
-    cycle_ms = sum(duration for duration, _start, _end in phases)
-    elapsed = (now_ms - _static_noise_cycle_started) % cycle_ms
-    for duration, start, end in phases:
-        if elapsed < duration:
-            frac = elapsed / float(duration)
-            return start + (end - start) * frac
-        elapsed -= duration
-    return _STATIC_WEAK
+    """Return the one steady thickness of the live-channel snow."""
+    # WARNING: owner 2026-11-07: the snow keeps one speed and one thickness; a thickness that changes over time makes the snow flicker (and every new level needed new pictures made on the screen thread).
+    return _STATIC_NOISE_FIXED_SEVERITY
 
 
 def _current_noise_tint_style():
@@ -5646,7 +5622,7 @@ def _current_noise_tint_style():
 
 
 def _tinted_bright_rgb(count, style, saturation=0.42):
-    """Return a (count, 3) uint8 array of grain colors for the 'rainbow' and 'theme' noise tints."""
+    """Return a (count, 3) uint8 array of grain colors for the four Static Noise Color settings: white grains, grey grains, rainbow (a random colour each) or the theme colour."""
     # WARNING: saturation 0.42 is tuned; much lower reads grey, much higher reads as coloured fog instead of snow.
     if count <= 0:
         return np.zeros((0, 3), dtype=np.uint8)
@@ -5655,6 +5631,8 @@ def _tinted_bright_rgb(count, style, saturation=0.42):
     elif style == "theme":
         hue = (db.config.get("theme_bg_hue", 220) / 360.0) if db is not None else (220 / 360.0)
         hues = np.full(count, hue, dtype=np.float64)
+    elif style == "grey":
+        return np.full((count, 3), _STATIC_GREY_GRAIN_LEVEL, dtype=np.uint8)
     else:
         return np.full((count, 3), 255, dtype=np.uint8)
 
@@ -5682,6 +5660,10 @@ def _static_noise_frame(w, h, tint_style):
     rgb = np.zeros((sw, sh, 3), dtype=np.uint8)
     bright = np.random.random((sw, sh)) >= 0.5
     rgb[bright] = _tinted_bright_rgb(int(bright.sum()), tint_style)
+    if tint_style in ("rainbow", "theme"):
+        # WARNING: owner 2026-11-07: a coloured grain of the snow shows its colour as strongly as a reception-line grain does, so the colour speck uses the line grain's see-through range; the plain dark specks keep the old one.
+        coloured = bright & speckle
+        alpha[coloured] = np.random.randint(STATIC_NOISE_TINT_SPECK_ALPHA[0], STATIC_NOISE_TINT_SPECK_ALPHA[1], size=int(coloured.sum()))
     overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
     overlay_rgb = pygame.surfarray.pixels3d(overlay)
     overlay_rgb[:] = rgb
@@ -5807,30 +5789,33 @@ def _build_tracking_noise_surface(w, band_h, seed_step, tint_style="white", line
 
 
 def _spawn_tracking_line_batch(h, now):
-    """Build one batch of rolling tracking-line entries for a spawn event: one to three lines of random sizes, some starting at the top and some part way down, that all roll at one speed and never touch each other."""
-    BIG_FRAC_RANGE = RECEPTION_LINE_BIG_FRAC_RANGE
-    SMALL_FRAC_RANGE = RECEPTION_LINE_SMALL_FRAC_RANGE
-    # WARNING: owner 2026-11-06: lines have random sizes and counts and may start part way down the screen, but they never stack on or roll into each other. Every line of a batch rolls at the same speed and is placed with a gap from its neighbours, so the gaps cannot close.
+    """Build one batch of rolling tracking-line entries for a spawn event: one to three lines of random sizes (at most one big), spaced by random and uneven gaps, the lowest one starting anywhere from just above the top to well down the screen; all roll at one speed, so they never touch or catch up."""
+    # WARNING: owner 2026-11-07: no more than 3 lines, random sizes and counts, random uneven gaps, random place on the screen; lines move as one and never touch. Every line of a batch rolls at the same speed, so the gap each one is given stays the gap it keeps.
     speed = RECEPTION_LINE_SPEED_PX_MS * random.uniform(0.9, 1.1)
-    gap = max(8, int(h * 0.04))
-
-    count = random.randint(1, 3)
-    include_big = random.random() < 0.30
-    bands = []
+    count = random.choices(range(1, len(RECEPTION_LINE_COUNT_WEIGHTS) + 1), weights=RECEPTION_LINE_COUNT_WEIGHTS)[0]
+    big_at = random.randrange(count) if random.random() < RECEPTION_LINE_BIG_CHANCE else None
+    heights = []
     for i in range(count):
-        is_big = include_big and i == 0
-        frac_range = BIG_FRAC_RANGE if is_big else SMALL_FRAC_RANGE
-        band_h = max(4, int(h * random.uniform(*frac_range)))
-        starts_mid = random.random() < 0.40
-        y_start = int(h * random.uniform(0.05, 0.65)) if starts_mid else -band_h
-        bands.append([band_h, y_start])
+        if i == big_at:
+            frac_range = RECEPTION_LINE_BIG_FRAC_RANGE
+        elif random.random() < RECEPTION_LINE_MEDIUM_CHANCE:
+            frac_range = RECEPTION_LINE_MEDIUM_FRAC_RANGE
+        else:
+            frac_range = RECEPTION_LINE_SMALL_FRAC_RANGE
+        heights.append(max(4, int(h * random.uniform(*frac_range))))
 
-    # WARNING: placed lowest first; a line that would sit on the one below it is moved up until it clears it, so it arrives from above the top later instead of overlapping.
-    bands.sort(key=lambda bd: bd[1], reverse=True)
-    for k in range(1, len(bands)):
-        lower_top = bands[k - 1][1]
-        if bands[k][1] + bands[k][0] + gap > lower_top:
-            bands[k][1] = lower_top - bands[k][0] - gap
+    gaps = []
+    for _ in range(count - 1):
+        for _try in range(10):
+            gap = int(h * random.uniform(*RECEPTION_LINE_GAP_FRAC_RANGE))
+            if all(abs(gap - other) >= h * RECEPTION_LINE_GAP_MIN_DIFF_FRAC for other in gaps):
+                break
+        gaps.append(gap)
+
+    # WARNING: heights[0] is the lowest line; each next line sits above the one below it by its own gap.
+    bands = [[heights[0], int(random.uniform(-heights[0], h * 0.65))]]
+    for k in range(1, count):
+        bands.append([heights[k], bands[k - 1][1] - gaps[k - 1] - heights[k]])
 
     lines = []
     for band_h, y_start in bands:
@@ -5926,6 +5911,55 @@ def _is_live_tv_broadcast_channel(ch):
     except (TypeError, ValueError) as _swallowed_error:
         _log_swallowed("_is_live_tv_broadcast_channel: return ch not in ('03', '04') and 5 <= int(ch) <= 44", _swallowed_error)
         return False
+
+
+def _watermark_channel_folder(channel):
+    """The channel's folder inside the WATERMARK folder (found without regard to capital letters), made when it is not there yet."""
+    name = f"Channel {str(channel or '').zfill(2)}"
+    try:
+        os.makedirs(WATERMARK_BASE_DIR, exist_ok=True)
+        for entry in os.listdir(WATERMARK_BASE_DIR):
+            if entry.lower() == name.lower() and os.path.isdir(os.path.join(WATERMARK_BASE_DIR, entry)):
+                return os.path.join(WATERMARK_BASE_DIR, entry)
+    except OSError as _swallowed_error:
+        _log_swallowed("_watermark_channel_folder: listing the WATERMARK folder", _swallowed_error)
+    folder = os.path.join(WATERMARK_BASE_DIR, name)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _same_file_bytes(a, b):
+    """True when two files hold exactly the same bytes."""
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
+def _save_watermark_into_channel_folder(channel, chosen):
+    """Keeps a picked watermark in the channel's own folder so it can be picked again later: an image already there is used where it is; any other is copied in (a different file with the same name gets a number) and the copy's path is returned; the picked path comes back unchanged if the copy cannot be made."""
+    import shutil
+    chosen = os.path.abspath(chosen)
+    try:
+        folder = os.path.abspath(_watermark_channel_folder(channel))
+        if os.path.normcase(os.path.dirname(chosen)) == os.path.normcase(folder):
+            return chosen
+        stem, ext = os.path.splitext(os.path.basename(chosen))
+        dest = os.path.join(folder, stem + ext)
+        number = 2
+        while os.path.exists(dest) and not _same_file_bytes(chosen, dest):
+            dest = os.path.join(folder, f"{stem} ({number}){ext}")
+            number += 1
+        if not os.path.exists(dest):
+            shutil.copy2(chosen, dest)
+            log.info("[WATERMARK] Channel %s: copied %s into %s", channel, chosen, folder)
+        return dest
+    except OSError as e:
+        log.warning("[WATERMARK] Channel %s: could not copy %s into its folder, using it where it is: %s", channel, chosen, e)
+        return chosen
 
 
 def _channel_watermark_path(channel):
@@ -12200,7 +12234,7 @@ def _fe_close(commit):
                 chosen = checked[0] if checked else ""
                 if chosen:
                     _wm_channel = str(context.get("channel", app_state.get("current_channel", "05"))).zfill(2)
-                    dest = os.path.abspath(chosen)
+                    dest = _save_watermark_into_channel_folder(_wm_channel, chosen)
                     _wm_channel_info = db.channels_db.setdefault(_wm_channel, {})
                     _wm_channel_info["watermark_enabled"] = True
                     _wm_channel_info["watermark_path"] = dest
@@ -26132,10 +26166,22 @@ def _launch_staged_update():
 # SECTION: Update install (popup Yes)
 # ============================================================================
 
-# WARNING: the 700, 4000 and 0.97 fallbacks must match UPDATE_INSTALL_HOLD_AT_100_MS, UPDATE_INSTALL_ERROR_SHOW_MS and UPDATE_INSTALL_DOWNLOAD_CAP in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the 700, 4000, 0.80, 2500 and 0.99 fallbacks must match UPDATE_INSTALL_HOLD_AT_100_MS, UPDATE_INSTALL_ERROR_SHOW_MS, UPDATE_INSTALL_DOWNLOAD_CAP, UPDATE_INSTALL_UNPACK_EASE_MS and UPDATE_INSTALL_UNPACK_HOLD_FRACTION in performance_governor.py; they are used only when that module fails to import.
 UPDATE_INSTALL_HOLD_AT_100_MS = performance_governor.UPDATE_INSTALL_HOLD_AT_100_MS if performance_governor is not None else 700
 UPDATE_INSTALL_ERROR_SHOW_MS = performance_governor.UPDATE_INSTALL_ERROR_SHOW_MS if performance_governor is not None else 4000
-UPDATE_INSTALL_DOWNLOAD_CAP = performance_governor.UPDATE_INSTALL_DOWNLOAD_CAP if performance_governor is not None else 0.97
+UPDATE_INSTALL_DOWNLOAD_CAP = performance_governor.UPDATE_INSTALL_DOWNLOAD_CAP if performance_governor is not None else 0.80
+UPDATE_INSTALL_UNPACK_EASE_MS = performance_governor.UPDATE_INSTALL_UNPACK_EASE_MS if performance_governor is not None else 2500
+UPDATE_INSTALL_UNPACK_HOLD_FRACTION = performance_governor.UPDATE_INSTALL_UNPACK_HOLD_FRACTION if performance_governor is not None else 0.99
+
+
+def _update_bar_fraction(now_ms):
+    """The fraction the update bar shows: the download fills it up to the cap; once the download is in, it keeps moving toward just short of full while the file is unpacked, so it never looks stuck; None when the size is not known."""
+    fraction = app_state.get("update_download_progress")
+    unpack_at = app_state.get("update_unpack_started_at", 0)
+    if fraction is None or not unpack_at:
+        return fraction
+    left = UPDATE_INSTALL_UNPACK_HOLD_FRACTION - UPDATE_INSTALL_DOWNLOAD_CAP
+    return UPDATE_INSTALL_DOWNLOAD_CAP + left * (1.0 - math.exp(-max(0, now_ms - unpack_at) / UPDATE_INSTALL_UNPACK_EASE_MS))
 
 
 def _remember_update_prompt_skip(skip=True):
@@ -26158,11 +26204,24 @@ def _close_update_popup():
     app_state["update_install_error"] = ""
     app_state["update_install_done_at"] = 0
     app_state["update_install_error_at"] = 0
+    app_state["update_unpack_started_at"] = 0
     app_state["show_clear_confirm"] = False
     app_state["clear_confirm_target"] = None
     app_state["clear_confirm_shown_at"] = 0
     app_state["clear_confirm_dont_show_again"] = False
     app_state["clear_confirm_focus"] = "buttons"
+
+
+def _close_menus_behind_update_popup():
+    """Closes the Settings menu and the Controls splash that sit behind the update popup, so only the popup and its bar stay on screen while the update installs."""
+    app_state["show_menu"] = False
+    app_state["menu_shown_at"] = 0
+    app_state["menu_layer"] = "TAB_SELECTION"
+    app_state["games_tab_page"] = 0
+    app_state["show_splash"] = False
+    app_state["splash_shown_at"] = 0
+    app_state["controls_splash_page"] = 0
+    app_state["controls_splash_focus"] = 1
 
 
 def _begin_update_install():
@@ -26173,10 +26232,13 @@ def _begin_update_install():
     if not record:
         return False
     already_staged = bool(record.get("staged_path"))
+    # WARNING: Yes closes every menu behind the popup; the Yes/No popup and the load bar stay up until the update is done.
+    _close_menus_behind_update_popup()
     app_state["update_install_active"] = True
     app_state["update_install_launched"] = False
     app_state["update_install_error"] = ""
     app_state["update_install_error_at"] = 0
+    app_state["update_unpack_started_at"] = 0
     app_state["update_download_progress"] = 1.0 if already_staged else 0.0
     app_state["update_install_done_at"] = pygame.time.get_ticks() if already_staged else 0
 
@@ -26186,7 +26248,9 @@ def _begin_update_install():
             if not already_staged:
                 def _progress(done, total):
                     app_state["update_download_progress"] = (
-                        min(UPDATE_INSTALL_DOWNLOAD_CAP, done / total) if total else None)
+                        min(1.0, done / total) * UPDATE_INSTALL_DOWNLOAD_CAP if total else None)
+                    if total and done >= total:
+                        app_state["update_unpack_started_at"] = pygame.time.get_ticks()
                 staged = auto_updater.stage_update(_update_base_dir(), record, progress_callback=_progress)
             app_state["_update_record"] = staged
             app_state["update_download_progress"] = 1.0
@@ -26235,7 +26299,7 @@ def _draw_update_install_overlay(target):
     elif app_state.get("update_install_done_at", 0):
         label, fraction = "RESTARTING...", 1.0
     else:
-        fraction = app_state.get("update_download_progress")
+        fraction = _update_bar_fraction(pygame.time.get_ticks())
         label = "DOWNLOADING UPDATE..." if fraction is None else f"DOWNLOADING UPDATE... {int(fraction * 100)}%"
     w, h = target.get_size()
     _fe_draw_busy_overlay(target, 0, 0, w, h, ui_c, panel_c, bg_c, label, progress_fraction=fraction)
@@ -29649,13 +29713,19 @@ while True:
                         if sub_row == 4 and sub_col == 2 and not is_music_mode and ch_info.get("active", True):
                             from game_deck import DVD_SPLASH_IMAGE_EXTS
                             os.makedirs(WATERMARK_BASE_DIR, exist_ok=True)
+                            # WARNING: the picker always opens in this channel's own folder, and a watermark remembered from somewhere else is copied in first, so every image this channel has used is there to pick again.
                             _wm_now = _channel_watermark_path(target_ch_str)
+                            if _wm_now:
+                                _wm_kept = _save_watermark_into_channel_folder(target_ch_str, _wm_now)
+                                if _wm_kept != _wm_now:
+                                    ch_info["watermark_path"] = _wm_kept
+                                    _mark_settings_dirty()
                             _fe_open(
                                 f"Select Channel {target_ch_str} Watermark",
                                 DVD_SPLASH_IMAGE_EXTS,
                                 {"mode": "watermark_select", "channel": target_ch_str}
                             )
-                            _fe_navigate(os.path.dirname(_wm_now) if _wm_now else os.path.join(WATERMARK_BASE_DIR, f"Channel {target_ch_str}"))
+                            _fe_navigate(_watermark_channel_folder(target_ch_str))
                             continue
                         # WARNING: on a TV channel that is on, the bottom row holds two buttons: column 0 is Clear All Scheduled Media (handled further down) and column 3 is Close; a music or off channel has only Close there.
                         if sub_row == max_close_row and not ((not is_music_mode) and ch_info.get("active", True) and sub_col == 0):

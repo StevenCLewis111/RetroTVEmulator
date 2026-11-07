@@ -451,8 +451,14 @@ UPDATE_INSTALL_HOLD_AT_100_MS = 700
 # VALUES CHANGE HERE (update install: milliseconds an update error stays up before the popup closes)
 UPDATE_INSTALL_ERROR_SHOW_MS = 4000
 
-# VALUES CHANGE HERE (update install: the download bar reads at most this fraction until the file is checked and unpacked)
-UPDATE_INSTALL_DOWNLOAD_CAP = 0.97
+# VALUES CHANGE HERE (update install: the download fills the bar up to this fraction; the rest of the bar moves on its own while the file is checked and unpacked, so the bar never looks stuck)
+UPDATE_INSTALL_DOWNLOAD_CAP = 0.80
+
+# VALUES CHANGE HERE (update install: milliseconds the bar takes to cover about two thirds of what is left of it while the file is checked and unpacked; it stops just short of full until the unpacking is done)
+UPDATE_INSTALL_UNPACK_EASE_MS = 2500
+
+# VALUES CHANGE HERE (update install: the fraction the bar stops at while the unpacking is still running)
+UPDATE_INSTALL_UNPACK_HOLD_FRACTION = 0.99
 
 # VALUES CHANGE HERE (schedule hub future rows: seconds the background step waits after working out one channel, before the next channel, so playback is never crowded)
 HUB_FUTURE_BETWEEN_CHANNELS_SECONDS = 4.0
@@ -607,8 +613,8 @@ PERF_LOG_MAX_SAMPLES = 900
 # VALUES CHANGE HERE
 STATIC_NOISE_REFRESH_MS = 110
 
-# VALUES CHANGE HERE (Static Noise: how often the snow changes to another picture, in ms; smaller is faster, 33 is 30 changes a second)
-STATIC_NOISE_AMBIENT_REFRESH_MS = 33
+# VALUES CHANGE HERE (Static Noise: how often the snow changes to another picture, in ms; smaller is faster, 33 is 16 is 60 changes a second, one on every frame of a 60 Hz screen)
+STATIC_NOISE_AMBIENT_REFRESH_MS = 16
 # VALUES CHANGE HERE (Static Noise: how many noise pictures are made once per screen size and shown in random order, never the same one twice running, so the snow shows no repeating pattern; how many screen sizes keep their pictures)
 STATIC_NOISE_POOL_FRAMES = 12
 STATIC_NOISE_POOL_SIZES = 3
@@ -619,17 +625,13 @@ STATIC_NOISE_BUILD_GAP_MS = 80
 STATIC_NOISE_STRENGTH_STEPS = 16
 STATIC_NOISE_BAKED_MAX = 24
 
-# VALUES CHANGE HERE
-STATIC_WEAK = 0.16
-STATIC_MEDIUM = 0.30
-STATIC_HEAVY = 0.46
-
-# VALUES CHANGE HERE
-STATIC_WEAK_HOLD_MS = 10000
-STATIC_MEDIUM_HOLD_MS = 6500
-STATIC_HEAVY_HOLD_MS = 7000
-STATIC_RAMP_MS = 1200
-STATIC_SUDDEN_RAMP_MS = 220
+# VALUES CHANGE HERE (Static Noise snow: how thick the snow is, as a share of full strength; it stays at this one level, so its speed and thickness never change; the speck count of each snow picture follows STATIC_HEAVY)
+STATIC_NOISE_FIXED_SEVERITY = 0.30
+# VALUES CHANGE HERE (Static Noise Color Grey: the grey level, 0 to 255, of the grains of the snow and the reception lines; White uses full white)
+STATIC_GREY_GRAIN_LEVEL = 150
+# VALUES CHANGE HERE (Static Noise Color Rainbow and Theme: how see-through the coloured specks of the snow are, from 0 (not there) to 255 (solid), picked at random in this range per speck; the reception lines use 180 to 255, and the snow's own strength is applied on top)
+STATIC_NOISE_TINT_SPECK_ALPHA = (180, 255)
+STATIC_HEAVY = 0.80
 
 # VALUES CHANGE HERE
 WATERMARK_JUMP_TOLERANCE_PX = 2
@@ -788,10 +790,21 @@ RECEPTION_NOISE_DARK_ALPHA = (110, 210)
 # VALUES CHANGE HERE (reception lines: how often the noise inside a rolling line changes, in ms; smaller is faster, 33 is 30 changes a second like the Static Noise snow)
 RECEPTION_NOISE_REFRESH_MS = 33
 
-# VALUES CHANGE HERE (reception lines: height of a big and of a small rolling line as a share of the screen height, and the roll speed in pixels per millisecond)
-RECEPTION_LINE_BIG_FRAC_RANGE = (0.035, 0.09)
+# VALUES CHANGE HERE (reception lines: height of a big, a medium and a small rolling line as a share of the screen height, and the roll speed in pixels per millisecond)
+RECEPTION_LINE_BIG_FRAC_RANGE = (0.06, 0.10)
+RECEPTION_LINE_MEDIUM_FRAC_RANGE = (0.03, 0.055)
 RECEPTION_LINE_SMALL_FRAC_RANGE = (0.012, 0.03)
 RECEPTION_LINE_SPEED_PX_MS = 0.85
+
+# VALUES CHANGE HERE (reception lines: how likely a batch holds 1, 2 or 3 lines (relative weights), the chance a batch has one big line, the chance each other line is medium rather than small)
+RECEPTION_LINE_COUNT_WEIGHTS = (35, 40, 25)
+RECEPTION_LINE_BIG_CHANCE = 0.35
+RECEPTION_LINE_MEDIUM_CHANCE = 0.40
+
+# VALUES CHANGE HERE (reception lines: the empty space between two lines of one batch, as a share of the screen height, is picked at random inside this range; two gaps of one batch differ by at least the second number so the spacing is never even)
+RECEPTION_LINE_GAP_FRAC_RANGE = (0.12, 0.45)
+RECEPTION_LINE_GAP_MIN_DIFF_FRAC = 0.06
+
 
 # VALUES CHANGE HERE (file explorer: milliseconds a folder walk may go without reaching a new folder or file before it is given up as a drive that stopped answering)
 FILE_EXPLORER_EXPAND_TIMEOUT_MS = 6000

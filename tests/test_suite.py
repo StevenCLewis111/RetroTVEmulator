@@ -19160,7 +19160,7 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
         _period = gov.STATIC_NOISE_POOL_FRAMES
         _same = sum(1 for k in range(len(_seq) - _period) if _seq[k] == _seq[k + _period]) / float(len(_seq) - _period)
         self.assertLess(_same, 0.4, "the order does not repeat every %d pictures (%.2f)" % (_period, _same))
-        self.assertEqual(gov.STATIC_NOISE_AMBIENT_REFRESH_MS, 33)
+        self.assertEqual(gov.STATIC_NOISE_AMBIENT_REFRESH_MS, 16)
         self.assertEqual(gov.STATIC_NOISE_BUILD_GAP_MS, 80)
 
     def test_the_snow_grain_is_a_governor_number_and_finer_than_the_old_three_pixels(self):
@@ -24292,7 +24292,7 @@ class TestUpdateOnlyTouchesItsArea(unittest.TestCase):
         found = {}
         for root, _dirs, names in os.walk(self.install):
             for name in names:
-                if name == "update_helper.log":
+                if name in ("update_helper.log", "installed_files.json"):
                     continue
                 path = os.path.join(root, name)
                 with open(path, "rb") as handle:
@@ -24336,6 +24336,44 @@ class TestUpdateOnlyTouchesItsArea(unittest.TestCase):
         expected = {self.EXE, "RetroTVUpdateHelper.exe", os.path.join("_internal", "lib.dll"),
                     os.path.join("_internal", "newfile.dll"), os.path.join("_internal", "assets", "menu_nav.py")}
         self.assertEqual(changed, expected)
+
+    def test_a_file_the_new_build_dropped_is_removed_but_only_when_the_old_build_shipped_it(self):
+        self._ship_everything()
+        shipped_before = [self.EXE, "RetroTVUpdateHelper.exe", os.path.join("_internal", "lib.dll"), os.path.join("_internal", "dropped.dll"),
+                          os.path.join("_internal", "old_dir", "deep", "dropped_too.dll"), os.path.join("_internal", "main", "scans", "mine.json"),
+                          os.path.join("_internal", "retro_config.json")]
+        for name in ("dropped.dll", os.path.join("old_dir", "deep", "dropped_too.dll")):
+            self._write(self.install, os.path.join("_internal", name), "old build file")
+        self._write(self.install, os.path.join("_internal", "not_listed.dll"), "not from any build list")
+        with open(os.path.join(self.install, "installed_files.json"), "w", encoding="utf-8") as handle:
+            json.dump({"files": [p.replace(os.sep, "/") for p in shipped_before]}, handle)
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.install, "_internal", "dropped.dll")), "a dropped file is removed")
+        self.assertFalse(os.path.exists(os.path.join(self.install, "_internal", "old_dir")), "and so are the empty folders it leaves")
+        self.assertTrue(os.path.exists(os.path.join(self.install, "_internal", "not_listed.dll")), "a file no build list names stays")
+        self.assertFalse(os.path.exists(os.path.join(self.install, "_internal", "main", "scans", "mine.json")), "never listed, never touched")
+        self.assertEqual(self._read(self.install, "retro_config.json"), "owner config")
+        listed = json.load(open(os.path.join(self.install, "installed_files.json"), encoding="utf-8"))["files"]
+        self.assertIn("_internal/lib.dll", listed)
+        self.assertNotIn("_internal/dropped.dll", listed)
+
+    def test_the_first_update_with_no_list_removes_nothing_and_writes_the_list(self):
+        self._ship_everything()
+        before = self._snapshot()
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(set(before) - set(self._snapshot()), set())
+        self.assertTrue(os.path.isfile(os.path.join(self.install, "installed_files.json")))
+
+    def test_a_failed_update_puts_a_dropped_file_and_the_old_list_back(self):
+        self._ship_everything()
+        self._write(self.install, os.path.join("_internal", "dropped.dll"), "old build file")
+        old_list = {"files": ["_internal/dropped.dll", "_internal/lib.dll"]}
+        with open(os.path.join(self.install, "installed_files.json"), "w", encoding="utf-8") as handle:
+            json.dump(old_list, handle)
+        with self.assertRaises(RuntimeError):
+            self._run(exit_codes=(1, None))
+        self.assertEqual(self._read(self.install, os.path.join("_internal", "dropped.dll")), "old build file")
+        self.assertEqual(json.load(open(os.path.join(self.install, "installed_files.json"), encoding="utf-8")), old_list)
 
     def test_nothing_is_deleted(self):
         before = self._snapshot()
@@ -24532,12 +24570,13 @@ class TestUpdatePopupAndInstallBar(unittest.TestCase):
                 QUIT=256, time=types.SimpleNamespace(get_ticks=lambda: self.ticks[0]),
                 event=types.SimpleNamespace(post=self.posted.append, Event=lambda t: ("event", t))),
             "db": types.SimpleNamespace(config={}, save_settings=lambda: self.saved.append(True)),
-            "UPDATE_INSTALL_HOLD_AT_100_MS": 700, "UPDATE_INSTALL_ERROR_SHOW_MS": 4000, "UPDATE_INSTALL_DOWNLOAD_CAP": 0.97,
+            "UPDATE_INSTALL_HOLD_AT_100_MS": 700, "UPDATE_INSTALL_ERROR_SHOW_MS": 4000, "UPDATE_INSTALL_DOWNLOAD_CAP": 0.80,
+            "UPDATE_INSTALL_UNPACK_EASE_MS": 2500, "UPDATE_INSTALL_UNPACK_HOLD_FRACTION": 0.99, "math": math,
             "_update_base_dir": lambda: "/base",
             "_build_relaunch_command": lambda after_update=False: ["app.exe"] if after_update else ["app.exe", "--relaunched"],
         }
         for name in ("_open_update_popup", "_remember_update_prompt_skip", "_close_update_popup",
-                     "_begin_update_install", "_update_install_tick", "_launch_staged_update"):
+                     "_close_menus_behind_update_popup", "_update_bar_fraction", "_begin_update_install", "_update_install_tick", "_launch_staged_update"):
             exec(get_function_source(name), self.ns)
         self.state = self.ns["app_state"]
 
@@ -24592,8 +24631,16 @@ class TestUpdatePopupAndInstallBar(unittest.TestCase):
         self.ns["_open_update_popup"](self.state["_update_record"], True)
         self.assertTrue(self.ns["_begin_update_install"]())
         self._wait_staged()
-        self.assertAlmostEqual(self.ns["_seen_mid"], 0.5)
-        self.assertAlmostEqual(self.ns["_seen_end"], 0.97)
+        self.assertAlmostEqual(self.ns["_seen_mid"], 0.4)
+        self.assertAlmostEqual(self.ns["_seen_end"], 0.8)
+        self.assertTrue(self.state["update_unpack_started_at"], "the bar's last stretch starts when the download is in")
+        start = self.state["update_unpack_started_at"]
+        shown = [self.ns["_update_bar_fraction"](start + ms) for ms in (0, 500, 2500, 10000, 60000)]
+        self.assertAlmostEqual(shown[0], 0.8)
+        self.assertEqual(shown, sorted(shown), "the bar only ever moves forward")
+        self.assertGreater(shown[1], 0.8)
+        self.assertLess(shown[-1], 1.0)
+        self.assertLessEqual(shown[-1], 0.99)
         self.assertEqual(self.state["update_download_progress"], 1.0)
         self.assertTrue(self.state["update_install_active"])
         self.assertEqual(self.state["_update_record"]["staged_path"], "/staged")
@@ -24662,7 +24709,7 @@ class TestUpdatePopupAndInstallBar(unittest.TestCase):
     def test_the_leftovers_are_gone_and_the_numbers_live_in_the_governor_table(self):
         for name in ("render_update_download_progress", "show_update_confirm", "update_confirm_shown_at", "update_download_active"):
             self.assertNotIn(name, MAIN_SRC)
-        for name in ("UPDATE_INSTALL_HOLD_AT_100_MS", "UPDATE_INSTALL_ERROR_SHOW_MS", "UPDATE_INSTALL_DOWNLOAD_CAP"):
+        for name in ("UPDATE_INSTALL_HOLD_AT_100_MS", "UPDATE_INSTALL_ERROR_SHOW_MS", "UPDATE_INSTALL_DOWNLOAD_CAP", "UPDATE_INSTALL_UNPACK_EASE_MS", "UPDATE_INSTALL_UNPACK_HOLD_FRACTION"):
             match = re.search(r"^%s = performance_governor\.%s if performance_governor is not None else (\S+)$" % (name, name), MAIN_SRC, re.M)
             self.assertIsNotNone(match, name)
             self.assertEqual(float(match.group(1)), float(getattr(gov, name)))
@@ -26816,7 +26863,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.2.5", "build_info.py says 1.2.5 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.2.8", "build_info.py says 1.2.8 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27221,7 +27268,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.2.5"""
+    """This build is 1.2.8"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -27311,7 +27358,11 @@ class TestTrackingLinesNeverOverlap(unittest.TestCase):
     def _batches(self):
         rng = random.Random(5)
         ns = {"random": rng, "RECEPTION_LINE_BIG_FRAC_RANGE": gov.RECEPTION_LINE_BIG_FRAC_RANGE,
+              "RECEPTION_LINE_MEDIUM_FRAC_RANGE": gov.RECEPTION_LINE_MEDIUM_FRAC_RANGE,
               "RECEPTION_LINE_SMALL_FRAC_RANGE": gov.RECEPTION_LINE_SMALL_FRAC_RANGE,
+              "RECEPTION_LINE_COUNT_WEIGHTS": gov.RECEPTION_LINE_COUNT_WEIGHTS, "RECEPTION_LINE_BIG_CHANCE": gov.RECEPTION_LINE_BIG_CHANCE,
+              "RECEPTION_LINE_MEDIUM_CHANCE": gov.RECEPTION_LINE_MEDIUM_CHANCE, "RECEPTION_LINE_GAP_FRAC_RANGE": gov.RECEPTION_LINE_GAP_FRAC_RANGE,
+              "RECEPTION_LINE_GAP_MIN_DIFF_FRAC": gov.RECEPTION_LINE_GAP_MIN_DIFF_FRAC,
               "RECEPTION_LINE_SPEED_PX_MS": gov.RECEPTION_LINE_SPEED_PX_MS,
               "_tracking_line_id_counter": itertools.count()}
         exec(main_function_code("_spawn_tracking_line_batch"), ns)
@@ -27336,6 +27387,29 @@ class TestTrackingLinesNeverOverlap(unittest.TestCase):
         self.assertTrue(any(ln["y_start"] > 0 for b in batches for ln in b), "some lines start part way down")
         self.assertTrue(any(ln["y_start"] < 0 for b in batches for ln in b), "some lines start above the top")
         self.assertGreater(len({ln["band_h"] for b in batches for ln in b}), 20)
+
+    def test_batches_follow_the_owner_rules_for_count_size_and_gaps(self):
+        big_min = gov.RECEPTION_LINE_BIG_FRAC_RANGE[0] * 1080
+        medium_seen = small_seen = big_seen = False
+        uneven = 0
+        for lines in self._batches():
+            self.assertLessEqual(len(lines), 3)
+            bigs = [ln for ln in lines if ln["band_h"] >= big_min - 1]
+            self.assertLessEqual(len(bigs), 1, "at most one big line in a batch")
+            big_seen = big_seen or bool(bigs)
+            for ln in lines:
+                frac = ln["band_h"] / 1080.0
+                medium_seen = medium_seen or gov.RECEPTION_LINE_MEDIUM_FRAC_RANGE[0] - 0.002 <= frac < gov.RECEPTION_LINE_BIG_FRAC_RANGE[0]
+                small_seen = small_seen or frac < gov.RECEPTION_LINE_SMALL_FRAC_RANGE[1] + 0.002
+            ordered = sorted(lines, key=lambda ln: ln["y_start"])
+            gaps = [b["y_start"] - (a["y_start"] + a["band_h"]) for a, b in zip(ordered, ordered[1:])]
+            for gap in gaps:
+                self.assertGreaterEqual(gap, int(1080 * gov.RECEPTION_LINE_GAP_FRAC_RANGE[0]) - 1, "lines are never close together")
+                self.assertLessEqual(gap, 1080 * gov.RECEPTION_LINE_GAP_FRAC_RANGE[1])
+            if len(gaps) == 2 and abs(gaps[0] - gaps[1]) >= 1080 * gov.RECEPTION_LINE_GAP_MIN_DIFF_FRAC - 1:
+                uneven += 1
+        self.assertTrue(big_seen and medium_seen and small_seen)
+        self.assertGreater(uneven, 100, "two gaps in one batch are not the same")
 
 
 class TestBezelTitleRowAndStyleThree(unittest.TestCase):
@@ -28724,3 +28798,257 @@ class TestAllSettingsTurnsOnSticksAndSyncsProfiles(unittest.TestCase):
     def test_a_profile_pick_goes_to_every_console_while_all_settings_is_on(self):
         self.assertIn("_targets = [c for c in CONSOLE_ORDER if c != \"MENU\"] if db.config.get(\"all_profiles_sync\", False) else [con]", MAIN_SRC)
         self.assertIn("game_deck.sync_profile_from_db(_target, db.config)", MAIN_SRC)
+
+
+class TestUpdateYesClosesMenusBehind(unittest.TestCase):
+    """Owner 2026-11-07: Yes on the update popup closes the menus behind it and leaves the popup and load bar up"""
+
+    def test_yes_closes_the_menu_and_the_controls_splash_but_not_the_popup(self):
+        class _Ticks:
+            @staticmethod
+            def get_ticks():
+                return 1234
+        class _Pg:
+            time = _Ticks
+        class _Thread:
+            def __init__(self, *a, **k):
+                pass
+            def start(self):
+                pass
+        class _Thr:
+            Thread = _Thread
+        class _Log:
+            @staticmethod
+            def info(*a, **k):
+                pass
+        state = {"show_menu": True, "show_splash": True, "show_clear_confirm": True, "clear_confirm_target": "app_update", "menu_layer": "SYSTEM_ADVANCED_SUB_MENU",
+                 "_update_record": {"version": "9.9.9"}, "games_tab_page": 2, "controls_splash_page": 3}
+        ns = {"app_state": state, "pygame": _Pg, "threading": _Thr, "log": _Log, "auto_updater": None, "_update_base_dir": lambda: ".",
+              "UPDATE_INSTALL_DOWNLOAD_CAP": 0.80}
+        exec(main_function_code("_close_menus_behind_update_popup"), ns)
+        exec(main_function_code("_begin_update_install"), ns)
+        self.assertTrue(ns["_begin_update_install"]())
+        self.assertFalse(state["show_menu"])
+        self.assertFalse(state["show_splash"])
+        self.assertEqual(state["menu_layer"], "TAB_SELECTION")
+        self.assertTrue(state["show_clear_confirm"], "the Yes/No popup stays up")
+        self.assertEqual(state["clear_confirm_target"], "app_update")
+        self.assertTrue(state["update_install_active"], "the load bar is on")
+        blocked = {"show_menu": True, "show_splash": True, "_update_record": None}
+        ns["app_state"] = blocked
+        self.assertFalse(ns["_begin_update_install"]())
+        self.assertTrue(blocked["show_menu"], "with no update package nothing is closed")
+
+
+class TestTransitionStaticFollowsTheNoiseColorSetting(unittest.TestCase):
+    """Owner 2026-11-07: the Static burst between channels is the full grey, white, rainbow or theme static, not a tint; the snow's coloured specks show their colour like a reception line's"""
+
+    def test_the_burst_keeps_its_own_full_colour_static(self):
+        self.assertIn("noise = np.random.randint(30, 170, (sw, sh, 3), dtype=np.uint8)", MAIN_SRC)
+        self.assertIn("intensity = np.random.randint(20, 86, (sw, sh, 1)).astype(np.float32)", MAIN_SRC)
+        self.assertNotIn("_line_tint", MAIN_SRC)
+
+    def test_the_snows_coloured_specks_use_the_stronger_range(self):
+        self.assertEqual(gov.STATIC_NOISE_TINT_SPECK_ALPHA, gov.RECEPTION_NOISE_BRIGHT_ALPHA)
+        import pygame as _pg
+        import numpy as _np
+        ns = {"pygame": _pg, "np": _np, "db": types.SimpleNamespace(config={"theme_bg_hue": 220}), "_STATIC_NOISE_GRAIN_PX": 4, "_STATIC_HEAVY": gov.STATIC_HEAVY,
+              "STATIC_NOISE_TINT_SPECK_ALPHA": gov.STATIC_NOISE_TINT_SPECK_ALPHA, "_STATIC_GREY_GRAIN_LEVEL": gov.STATIC_GREY_GRAIN_LEVEL}
+        exec(main_function_code("_tinted_bright_rgb"), ns)
+        exec(main_function_code("_static_noise_frame"), ns)
+        def strongest(style):
+            frame = ns["_static_noise_frame"](400, 400, style)
+            return int(_pg.surfarray.array_alpha(frame).max())
+        self.assertGreaterEqual(strongest("theme"), 180, "a coloured speck is as solid as a line grain")
+        self.assertLess(strongest("white"), 120, "white and grey snow keep the old light specks")
+
+
+class TestUpdateHelperProgressBar(unittest.TestCase):
+    """Owner 2026-11-07: the helper shows an installing bar between the app closing and the app coming back"""
+
+    EXE = "Retro TV Emulator Alpha.exe"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.h = _load_updater_script("update_helper")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rtv-upd-bar-")
+        self.install = os.path.join(self.tmp, "install")
+        self.staged = os.path.join(self.tmp, "work", "payload")
+        for folder in (self.install, self.staged):
+            os.makedirs(folder)
+        for folder, text in ((self.install, "old"), (self.staged, "new")):
+            with open(os.path.join(folder, self.EXE), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        self.h.HEALTH_CHECK_SECONDS = 0.6
+        self.h.PROGRESS_DONE_HOLD_SECONDS = 0
+        self.h.PROGRESS_ERROR_SHOW_SECONDS = 0
+        self.events = []
+        outer = self
+
+        class Recorder:
+            def update(self, label, fraction):
+                outer.events.append(("update", label, fraction))
+            def start_stage(self):
+                outer.events.append(("start_stage",))
+            def creep(self, label):
+                outer.events.append(("creep", label))
+            def finish(self):
+                outer.events.append(("finish",))
+            def fail(self, label):
+                outer.events.append(("fail", label))
+            def close(self):
+                outer.events.append(("close",))
+        self.recorder = Recorder()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, exit_codes=(None,)):
+        codes = list(exit_codes)
+        path = os.path.join(self.tmp, "pending_update.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"install_dir": self.install, "staged_path": self.staged, "parent_pid": 0, "version": "",
+                       "relaunch_command": [os.path.join(self.install, self.EXE), "--relaunched"]}, handle)
+        with mock.patch.object(self.h.subprocess, "Popen", lambda command, **kwargs: _FakeProcess(codes.pop(0) if codes else None)), \
+                mock.patch.object(self.h, "_open_progress", lambda: self.recorder):
+            return self.h.apply_update(path)
+
+    def test_a_good_update_walks_the_bar_through_every_stage_and_finishes(self):
+        self.assertEqual(self._run(), 0)
+        labels = [e[1] for e in self.events if e[0] == "update"]
+        self.assertEqual(labels[0], "WAITING FOR THE APP TO CLOSE...")
+        for wanted in ("PREPARING THE UPDATE...", "INSTALLING UPDATE...", "STARTING THE UPDATED APP..."):
+            self.assertIn(wanted, labels)
+        fractions = [e[2] for e in self.events if e[0] == "update"]
+        self.assertEqual(fractions, sorted(fractions), "the bar only moves forward")
+        self.assertIn(("finish",), self.events)
+        self.assertEqual(self.events[-1], ("close",))
+        self.assertNotIn("fail", [e[0] for e in self.events])
+
+    def test_a_failed_start_shows_the_failure_and_still_closes_the_bar(self):
+        with self.assertRaises(RuntimeError):
+            self._run(exit_codes=(1, None))
+        kinds = [e[0] for e in self.events]
+        self.assertIn("fail", kinds)
+        self.assertEqual(self.events[-1], ("close",))
+        self.assertNotIn("finish", kinds)
+
+    def test_there_is_no_window_unless_this_is_the_packaged_helper(self):
+        self.assertIsInstance(self.h._open_progress(), self.h._NullProgress)
+
+    def test_the_bar_creeps_toward_but_never_reaches_full_before_the_app_is_up(self):
+        window = self.h._ProgressWindow.__new__(self.h._ProgressWindow)
+        import threading as _thr
+        window._lock = _thr.Lock()
+        window._label, window._fraction, window._failed = "", 0.0, False
+        window._started_at = time.monotonic() - 10000
+        window.creep("STARTING THE UPDATED APP...")
+        self.assertLess(window._fraction, 1.0)
+        self.assertGreater(window._fraction, self.h.PROGRESS_START_BAR)
+        self.assertLessEqual(window._fraction, self.h.PROGRESS_HOLD_BAR)
+        window._fraction = 0.0
+        window.update("X", 0.5)
+        window.update("Y", 0.2)
+        self.assertEqual(window._fraction, 0.5, "a lower value never pulls the bar back")
+
+
+    def test_the_preview_flag_is_wired_and_a_window_that_cannot_open_returns_one(self):
+        self.assertEqual(self.h.main(["--preview-bar"]), 1, "no tkinter or no screen here, so no window")
+        with self.assertRaises(SystemExit):
+            self.h.main([])
+
+
+class TestStaticNoiseStaysSteady(unittest.TestCase):
+    """Owner 2026-11-07: the snow keeps one speed and one thickness, a changing level made it flicker"""
+
+    def test_the_thickness_never_changes_over_time(self):
+        ns = {"_STATIC_NOISE_FIXED_SEVERITY": gov.STATIC_NOISE_FIXED_SEVERITY}
+        exec(main_function_code("_static_noise_severity_at"), ns)
+        seen = {ns["_static_noise_severity_at"](t) for t in range(0, 600000, 997)}
+        self.assertEqual(seen, {gov.STATIC_NOISE_FIXED_SEVERITY})
+        for gone in ("STATIC_WEAK_HOLD_MS", "STATIC_RAMP_MS", "STATIC_SUDDEN_RAMP_MS", "STATIC_MEDIUM_HOLD_MS", "STATIC_HEAVY_HOLD_MS"):
+            self.assertFalse(hasattr(gov, gone), gone)
+        self.assertNotIn("_static_noise_cycle_started", MAIN_SRC)
+
+
+
+class TestNoiseGrainFollowsTheFourColorSettings(unittest.TestCase):
+    """Owner 2026-11-07: Static Noise Color white, grey, rainbow and theme must each show in the snow and the reception lines"""
+
+    def _grains(self, style, hue=220):
+        import numpy as _np
+        ns = {"np": _np, "db": types.SimpleNamespace(config={"theme_bg_hue": hue}), "_STATIC_GREY_GRAIN_LEVEL": gov.STATIC_GREY_GRAIN_LEVEL}
+        exec(main_function_code("_tinted_bright_rgb"), ns)
+        return ns["_tinted_bright_rgb"](400, style).astype(int)
+
+    def test_white_is_white_and_grey_is_grey(self):
+        white = self._grains("white")
+        grey = self._grains("grey")
+        self.assertTrue((white == 255).all())
+        self.assertTrue((grey == gov.STATIC_GREY_GRAIN_LEVEL).all())
+        self.assertLess(gov.STATIC_GREY_GRAIN_LEVEL, 255)
+
+    def test_rainbow_varies_in_colour_and_theme_follows_the_chosen_hue(self):
+        rainbow = self._grains("rainbow")
+        self.assertGreater(len({tuple(row) for row in rainbow}), 20)
+        blue = self._grains("theme", 220)
+        red = self._grains("theme", 0)
+        self.assertGreater(blue[:, 2].mean(), blue[:, 0].mean() + 40)
+        self.assertGreater(red[:, 0].mean(), red[:, 2].mean() + 40)
+        self.assertEqual(len({tuple(row) for row in blue}), 1, "one theme colour")
+
+
+class TestWatermarkPicksLandInTheChannelFolder(unittest.TestCase):
+    """Owner 2026-11-07: a picked watermark is kept in that channel's folder so the folder holds every image to choose from"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rtv-wm-")
+        self.base = os.path.join(self.tmp, "WATERMARK")
+        self.elsewhere = os.path.join(self.tmp, "Pictures")
+        os.makedirs(self.elsewhere)
+        self.ns = {"os": os, "WATERMARK_BASE_DIR": self.base, "_log_swallowed": lambda *a: None,
+                   "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)}
+        exec(main_function_code("_watermark_channel_folder"), self.ns)
+        exec(main_function_code("_same_file_bytes"), self.ns)
+        exec(main_function_code("_save_watermark_into_channel_folder"), self.ns)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make(self, folder, name, data):
+        path = os.path.join(folder, name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def test_a_pick_from_anywhere_is_copied_into_the_channels_folder(self):
+        picked = self._make(self.elsewhere, "logo.png", b"one")
+        kept = self.ns["_save_watermark_into_channel_folder"]("7", picked)
+        self.assertEqual(os.path.dirname(kept), os.path.join(self.base, "Channel 07"))
+        self.assertEqual(open(kept, "rb").read(), b"one")
+        self.assertTrue(os.path.isfile(picked), "the original stays where it was")
+
+    def test_a_pick_already_in_the_folder_is_used_where_it_is_and_the_folder_name_is_found_in_any_case(self):
+        os.makedirs(os.path.join(self.base, "channel 07"))
+        inside = self._make(os.path.join(self.base, "channel 07"), "a.png", b"a")
+        self.assertEqual(self.ns["_save_watermark_into_channel_folder"]("07", inside), os.path.abspath(inside))
+        self.assertEqual(os.listdir(self.base), ["channel 07"], "no second folder is made")
+
+    def test_the_same_picture_again_is_not_copied_twice_and_a_different_one_with_the_same_name_gets_a_number(self):
+        first = self._make(self.elsewhere, "logo.png", b"one")
+        kept = self.ns["_save_watermark_into_channel_folder"]("07", first)
+        again = self.ns["_save_watermark_into_channel_folder"]("07", first)
+        self.assertEqual(kept, again)
+        other_dir = os.path.join(self.tmp, "Other")
+        os.makedirs(other_dir)
+        different = self._make(other_dir, "logo.png", b"two")
+        second = self.ns["_save_watermark_into_channel_folder"]("07", different)
+        self.assertNotEqual(second, kept)
+        self.assertTrue(second.endswith("logo (2).png"))
+        self.assertEqual(len(os.listdir(os.path.join(self.base, "Channel 07"))), 2)
+
+    def test_the_picker_and_the_menu_use_it(self):
+        self.assertIn("dest = _save_watermark_into_channel_folder(_wm_channel, chosen)", MAIN_SRC)
+        self.assertIn("_fe_navigate(_watermark_channel_folder(target_ch_str))", MAIN_SRC)
