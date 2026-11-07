@@ -240,6 +240,71 @@ def _write_file_safely(path, data):
         raise
 
 
+_state_write_lock = threading.Lock()
+
+
+class _BackgroundStateWriter:
+    """Writes save states on one background thread: the newest bytes for a path win, a failed write is tried again a few times (a virus scanner or a busy disk often lets go a moment later), and a save made in the foreground cancels whatever is waiting for the same file."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = {}
+        self._thread = None
+
+    def submit(self, path, data, attempts, retry_seconds, on_fail):
+        with self._lock:
+            self._pending[path] = (data, max(1, int(attempts)), float(retry_seconds), on_fail)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, daemon=True, name="StateWriter")
+                self._thread.start()
+
+    def cancel(self, path):
+        with self._lock:
+            self._pending.pop(path, None)
+
+    def is_pending(self, path):
+        with self._lock:
+            return path in self._pending
+
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._thread = None
+                    return
+                path = next(iter(self._pending))
+                data, attempts, retry_seconds, on_fail = self._pending[path]
+            written = False
+            superseded = False
+            for attempt in range(attempts):
+                with self._lock:
+                    current = self._pending.get(path)
+                if current is None or current[0] is not data:
+                    superseded = True
+                    break
+                try:
+                    with _state_write_lock:
+                        _write_file_safely(path, data)
+                    written = True
+                    break
+                except OSError as e:
+                    log.warning("[LIBRETRO] background state write %d of %d failed: %s", attempt + 1, attempts, e)
+                    if attempt + 1 < attempts:
+                        time.sleep(retry_seconds)
+            with self._lock:
+                current = self._pending.get(path)
+                if current is not None and current[0] is data:
+                    self._pending.pop(path, None)
+            if not written and not superseded and on_fail is not None:
+                try:
+                    on_fail(path)
+                except Exception as e:
+                    log.warning("[LIBRETRO] state write failure callback raised: %s", e)
+
+
+_state_writer = _BackgroundStateWriter()
+
+
 def _free_dll_handle(dll):
     """Release a loaded core .dll's OS module handle (FreeLibrary)."""
     if sys.platform != "win32" or dll is None:
@@ -1836,26 +1901,68 @@ class LibretroCore:
         except Exception as e:
             log.warning("_migrate_stray_save_file failed for %s: %s", rom_path, e)
 
+    def _serialize_state(self):
+        """The core's state as bytes, or None when the core cannot give one."""
+        sz = self._dll.retro_serialize_size()
+        if sz == 0:
+            return None
+        buf = (ctypes.c_uint8 * sz)()
+        if not self._dll.retro_serialize(ctypes.cast(buf, ctypes.c_void_p), sz):
+            return None
+        return bytes(buf)
+
     def save_state(self, slot=0):
         if not self._loaded: return False
         try:
-            sz = self._dll.retro_serialize_size()
-            if sz == 0: return False
-            buf = (ctypes.c_uint8 * sz)()
-            ok  = self._dll.retro_serialize(ctypes.cast(buf, ctypes.c_void_p), sz)
-            if not ok: return False
+            data = self._serialize_state()
+            if data is None: return False
             path = self._state_path(slot)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            _write_file_safely(path, bytes(buf))
+            # WARNING: a save made now is the newest; a background save still waiting for this file is dropped and one being written finishes first.
+            _state_writer.cancel(path)
+            with _state_write_lock:
+                _write_file_safely(path, data)
             print(f"[LIBRETRO] State saved → {os.path.basename(path)}")
             return True
         except Exception as e:
             log.warning(f"[LIBRETRO] save_state: {e}")
             return False
 
+    def save_state_background(self, slot=0, attempts=8, retry_seconds=0.5, on_fail=None):
+        """Takes the state now (the only part that must run on the thread that runs the core) and hands the writing to a background thread that tries again if the disk is busy; True when the state was taken."""
+        if not self._loaded: return False
+        try:
+            data = self._serialize_state()
+            if data is None: return False
+            path = self._state_path(slot)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _state_writer.submit(path, data, attempts, retry_seconds, on_fail)
+            return True
+        except Exception as e:
+            log.warning(f"[LIBRETRO] save_state_background: {e}")
+            return False
+
+    def _promote_leftover_state(self, path):
+        """A complete temporary state left by a crash between its write and its rename becomes the state; an incomplete one is removed."""
+        tmp_path = path + ".tmp"
+        try:
+            if not os.path.exists(tmp_path) or _state_writer.is_pending(path):
+                return
+            size = os.path.getsize(tmp_path)
+            if (size > 0 and size == self._dll.retro_serialize_size()
+                    and (not os.path.exists(path) or os.path.getmtime(tmp_path) >= os.path.getmtime(path))):
+                with _state_write_lock:
+                    os.replace(tmp_path, path)
+                log.info("[LIBRETRO] recovered an unfinished state write: %s", os.path.basename(path))
+            else:
+                os.remove(tmp_path)
+        except OSError as e:
+            log.warning("[LIBRETRO] leftover state check failed: %s", e)
+
     def load_state(self, slot=0):
         if not self._loaded: return False
         path = self._state_path(slot)
+        self._promote_leftover_state(path)
         if not os.path.exists(path): return False
         try:
             with open(path, "rb") as f: data = f.read()
@@ -1868,7 +1975,10 @@ class LibretroCore:
             return False
 
     def has_state(self, slot=0):
-        return self._loaded and os.path.exists(self._state_path(slot))
+        if not self._loaded: return False
+        path = self._state_path(slot)
+        self._promote_leftover_state(path)
+        return os.path.exists(path)
 
     # ========================================================================
     # SECTION: Audio pass-through & core variables

@@ -1666,9 +1666,9 @@ def _make_ns(get_cached_return=None, get_cached_raises=None):
         "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
         "PICTURE_BOX_FIT_RETRY_SECONDS": 2.0,
         "_throttled_log_last_ts": {}, "_THROTTLED_LOG_INTERVAL_S": 30.0,
-        "PAN_SCAN_KEY_CACHE_SECONDS": 0.0, "_pan_scan_key_cache": {"path": None, "key": None, "at": 0.0},
+        "FILE_IDENTITY_KEY_RETRY_SECONDS": 0.0, "_file_identity_key_cache": {}, "FILE_IDENTITY_KEY_CACHE_MAX": 32,
     }
-    for name in ("_log_warn_throttled", "_log_probe_failure", "_pan_scan_content_key", "_picture_box_set_content", "_apply_picture_box_crop"):
+    for name in ("_log_warn_throttled", "_log_probe_failure", "_file_identity_key", "_picture_box_set_content", "_apply_picture_box_crop"):
         exec(compile(_seg(_FUNCS[name]), f"<extracted:{name}>", "exec"), ns)
     ns["_picture_box_fit_state"] = {"content_key": None, "norm_rect": None, "picture_aspect": None, "retry_at": 0.0}
     return ns, log, calls
@@ -5905,7 +5905,9 @@ def build_main_namespace(config, stem, warp_on, orbiter, channel, console_inner)
     ns = {"pygame": pygame, "menu_panel_rect": ui.menu_panel_rect, "fit_menu_envelope": ui.fit_menu_envelope, "performance_governor": gov,
           "db": FakeDbConfig(config), "app_state": {"current_channel": channel},
           "game_deck": FakeGameDeck(console_inner) if console_inner is not None else FakeGameDeck(None),
-          "_active_bezel_stem": lambda: stem, "_setting_on": lambda key, default=False: warp_on,
+          "_active_bezel_stem": lambda: stem, "_bezel_led_stem": lambda: stem, "_setting_on": lambda key, default=False: warp_on,
+          "_TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS": (), "_TV_BORDER_SCREEN_EXPAND": {}, "_TV_BORDER_SCREEN_EXPAND_DEFAULT": (1.0, 1.0),
+          "_full_tv_border_geometry": lambda w, h: None, "_bezel_right_grow": lambda stem: 1.0,
           "_package_pillarbox_active": lambda w, h: False,
           "_log_warn_throttled": lambda *a, **k: None,
           "log": type("L", (), {"info": staticmethod(lambda *a, **k: None), "warning": staticmethod(lambda *a, **k: None)})()}
@@ -15665,10 +15667,10 @@ class TestFailedFileBannerShowsFileName(_SectionCase):
 
 def suite_list_leaves_failed_drive():
     module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_list_drive")
-    module._gd_drive_root_of = lambda path: (str(path)[:2] + "\\\\") if path and ":" in str(path) else None
+    module._gd_drive_root_of = lambda path: (str(path)[:2] + "\\") if path and ":" in str(path) else None
     calls = []
 
-    def make(mode="ROMLIST", console="DVD", browse="D:\\\\Movies", roms=None):
+    def make(mode="ROMLIST", console="DVD", browse="D:\\Movies", roms=None):
         deck = object.__new__(module.ExternalGameDeck)
         deck.mode = mode
         deck.active_console = console
@@ -15677,15 +15679,15 @@ def suite_list_leaves_failed_drive():
         deck._drive_launch_failed = {}
         deck._romlist_error_msg = ""
         deck._romlist_error_until = 0
-        deck._get_console_rom_dir = lambda c: "C:\\\\roms\\\\" + c
+        deck._get_console_rom_dir = lambda c: "C:\\roms\\" + c
         deck._scan_roms = lambda c: calls.append(("scan", c))
         deck._snap_rom_cursor_if_scan_landed = lambda: None
         return deck
 
-    D, C = "D:\\\\", "C:\\\\"
+    D, C = "D:\\", "C:\\"
     deck = make()
-    check(deck.leave_list_of_failed_drive(set()) is False and deck.current_browse_dir == "D:\\\\Movies", "no failed drive, the list stays where it is")
-    check(deck.leave_list_of_failed_drive({C}) is False and deck.current_browse_dir == "D:\\\\Movies", "a failed drive that is not the one being browsed leaves the list alone")
+    check(deck.leave_list_of_failed_drive(set()) is False and deck.current_browse_dir == "D:\\Movies", "no failed drive, the list stays where it is")
+    check(deck.leave_list_of_failed_drive({C}) is False and deck.current_browse_dir == "D:\\Movies", "a failed drive that is not the one being browsed leaves the list alone")
     check(deck.leave_list_of_failed_drive({D}) is True and deck.current_browse_dir == "" and set(deck.drive_launch_failures()) == {D},
           "browsing a folder on a drive that failed leaves that folder, notes the drive for the banner and rescans")
     check(("scan", "DVD") in calls and "Drive not responding" in deck._romlist_error_msg, "the list is rescanned and says why")
@@ -15694,21 +15696,25 @@ def suite_list_leaves_failed_drive():
 
     for mode in ("GAME", "DVD_PLAYER", "LOADING"):
         running = make(mode=mode)
-        check(running.leave_list_of_failed_drive({D}) is False and running.current_browse_dir == "D:\\\\Movies" and not running.drive_launch_failures(),
+        check(running.leave_list_of_failed_drive({D}) is False and running.current_browse_dir == "D:\\Movies" and not running.drive_launch_failures(),
               "a running game or DVD is never touched by a drive that fails (%s)" % mode)
 
-    top = make(browse="", roms=[("[DRIVE] C:\\\\", C), ("[DRIVE] D:\\\\", D)])
+    top = make(browse="", roms=[("[DRIVE] C:\\", C), ("[DRIVE] D:\\", D)])
     check(top.leave_list_of_failed_drive({D}) is True and set(top.drive_launch_failures()) == {D},
           "a drive that fails while the list of drives is on screen is noted and the list is rebuilt")
 
-    console = make(console="SNES", browse="D:\\\\roms\\\\SNES")
-    check(console.leave_list_of_failed_drive({D}) is True and console.current_browse_dir == "C:\\\\roms\\\\SNES" and set(console.drive_launch_failures()) == {D},
+    console = make(console="SNES", browse="D:\\roms\\SNES")
+    check(console.leave_list_of_failed_drive({D}) is True and console.current_browse_dir == "C:\\roms\\SNES" and set(console.drive_launch_failures()) == {D},
           "a game list on a failed drive goes back to the console's own folder and notes the drive")
 
-    mixed = make(roms=[("[.. BACK TO THIS PC]", ""), ("[DRIVE] C:\\\\", C), ("[DRIVE] D:\\\\", D), ("[.. BACK TO PREVIOUS FOLDER]", "D:\\\\")])
+    module._media_listing = types.SimpleNamespace(held_drive_roots=lambda: [])
+    mixed = make(roms=[("[.. BACK TO THIS PC]", ""), ("[DRIVE] C:\\", C), ("[DRIVE] D:\\", D), ("[.. BACK TO PREVIOUS FOLDER]", "D:\\")])
     mixed.note_drive_launch_failure(D)
     shown = [n for n, _p in mixed._without_failed_drives(mixed.roms)]
-    check(shown == ["[.. BACK TO THIS PC]", "[DRIVE] C:\\\\", "[.. BACK TO PREVIOUS FOLDER]"], "the failed drive is hidden from view and the back entries stay")
+    check(shown == ["[.. BACK TO THIS PC]", "[DRIVE] C:\\", "[.. BACK TO PREVIOUS FOLDER]"], "the failed drive is hidden from the drive picker and the back entries stay")
+    files = make(roms=[("Game One", "D:\\roms\\one.sfc"), ("Game Two", "C:\\roms\\two.sfc")])
+    files.note_drive_launch_failure(D)
+    check(len(files._without_failed_drives(files.roms)) == 2, "a game file on a failed drive stays listed (owner 2026-11-06: the banner says what is wrong, the file stays)")
     mixed.clear_drive_launch_failure(D)
     check(len(mixed._without_failed_drives(mixed.roms)) == 4, "once the drive is cleared it is listed again")
 
@@ -15717,7 +15723,7 @@ def suite_list_leaves_failed_drive():
 
 
 class TestListLeavesFailedDrive(_SectionCase):
-    """A drive that fails while its list is on screen takes the screen off that list, hides the drive, shows the banner, and lists it again when it returns"""
+    """A drive that fails while its list is on screen takes the screen off that list back to the drive picker, hides the drive entry, shows the banner, and lists it again when it returns; files stay listed"""
 
     def test_list_leaves_failed_drive(self):
         self.run_section(suite_list_leaves_failed_drive)
@@ -18263,19 +18269,50 @@ class TestV365FixesFromTheTesterLogs(unittest.TestCase):
         clock = [100.0]
         stats = []
         fake_os = types.SimpleNamespace(stat=lambda p: (stats.append(p), types.SimpleNamespace(st_size=5, st_mtime=7))[1],
-                                        path=types.SimpleNamespace(abspath=lambda p: p))
+                                        path=types.SimpleNamespace(abspath=lambda p: p, normpath=lambda p: p))
         ns = {"os": fake_os, "time": types.SimpleNamespace(monotonic=lambda: clock[0]), "_log_swallowed": lambda *a: None, "OSError": OSError,
-              "PAN_SCAN_KEY_CACHE_SECONDS": gov.PAN_SCAN_KEY_CACHE_SECONDS, "_pan_scan_key_cache": {"path": None, "key": None, "at": 0.0}}
-        exec(compile(get_function_source("_pan_scan_content_key"), "k", "exec"), ns)
+              "FILE_IDENTITY_KEY_RETRY_SECONDS": gov.FILE_IDENTITY_KEY_RETRY_SECONDS, "_file_identity_key_cache": {}, "FILE_IDENTITY_KEY_CACHE_MAX": 32}
+        exec(compile(get_function_source("_file_identity_key"), "k", "exec"), ns)
         for _i in range(300):
-            self.assertEqual(ns["_pan_scan_content_key"]("a.mp4"), "a.mp4|5|7")
+            self.assertEqual(ns["_file_identity_key"]("a.mp4"), "a.mp4|5|7")
         self.assertEqual(len(stats), 1, "300 pictures of the same file made one disk call")
-        clock[0] += gov.PAN_SCAN_KEY_CACHE_SECONDS + 0.1
-        ns["_pan_scan_content_key"]("a.mp4")
-        self.assertEqual(len(stats), 2, "after the window the disk is asked again")
-        ns["_pan_scan_content_key"]("b.mp4")
-        self.assertEqual(len(stats), 3, "another file is asked at once")
-        self.assertIsNone(ns["_pan_scan_content_key"](""))
+        clock[0] += gov.FILE_IDENTITY_KEY_RETRY_SECONDS + 0.1
+        ns["_file_identity_key"]("a.mp4")
+        self.assertEqual(len(stats), 1, "a key that was read is kept while the same file plays: no disk call on the screen thread mid-show")
+        ns["_file_identity_key"]("b.mp4")
+        self.assertEqual(len(stats), 2, "another file is asked at once")
+        fake_os.stat = lambda p: (stats.append(p), (_ for _ in ()).throw(OSError("gone")))[1]
+        self.assertIsNone(ns["_file_identity_key"]("c.mp4"))
+        self.assertIsNone(ns["_file_identity_key"]("c.mp4"))
+        self.assertEqual(len(stats), 3, "a failed look is not repeated inside the window")
+        clock[0] += gov.FILE_IDENTITY_KEY_RETRY_SECONDS + 0.1
+        ns["_file_identity_key"]("c.mp4")
+        self.assertEqual(len(stats), 4, "a failed look is repeated after the window")
+        self.assertIsNone(ns["_file_identity_key"](""))
+
+    def test_the_upcoming_files_identity_is_read_ahead_and_ch03_is_warmed_at_boot(self):
+        prep = get_function_source("_next_item_prep_worker")
+        self.assertIn("_file_identity_key(norm_p)", prep)
+        warm = get_function_source("_warm_ch03_entry_assets")
+        self.assertIn("_load_ch03_music_sound(_track)", warm)
+        self.assertIn("ui._control_key_trimmed(_name)", warm)
+        self.assertIn("ui._control_key_raw.pop(_name, None)", warm)
+        self.assertIn('target=_warm_ch03_entry_assets', MAIN_SRC)
+        self.assertNotIn("_pan_scan_content_key", MAIN_SRC)
+
+    def test_a_read_key_serves_every_spelling_of_the_path_and_the_cache_stays_small(self):
+        stats = []
+        fake_os = types.SimpleNamespace(stat=lambda p: (stats.append(p), types.SimpleNamespace(st_size=5, st_mtime=7))[1],
+                                        path=types.SimpleNamespace(abspath=lambda p: p, normpath=lambda p: p.replace("/", "\\")))
+        ns = {"os": fake_os, "time": types.SimpleNamespace(monotonic=lambda: 1.0), "_log_swallowed": lambda *a: None, "OSError": OSError,
+              "FILE_IDENTITY_KEY_RETRY_SECONDS": 2.0, "_file_identity_key_cache": {}, "FILE_IDENTITY_KEY_CACHE_MAX": 4}
+        exec(compile(get_function_source("_file_identity_key"), "k", "exec"), ns)
+        ns["_file_identity_key"]("D:/a/x.mp4")
+        ns["_file_identity_key"]("D:\\a\\x.mp4")
+        self.assertEqual(len(stats), 1, "the prep thread's spelling and the screen's spelling share one read")
+        for _i in range(10):
+            ns["_file_identity_key"]("D:\\f%d.mp4" % _i)
+        self.assertLessEqual(len(ns["_file_identity_key_cache"]), 4)
 
     def test_a_letterboxed_picture_is_copied_in_one_call_and_comes_out_the_same(self):
         import ctypes as _ct
@@ -19130,7 +19167,7 @@ class TestStaticNoiseMadeOnce(unittest.TestCase):
         """Owner 2026-11-04: fine snow, not big spaced-out pixels; the size of one speck is STATIC_NOISE_GRAIN_PX and a smaller number is a finer snow"""
         import collections as _collections
         import numpy as _np
-        self.assertEqual(gov.STATIC_NOISE_GRAIN_PX, 3)
+        self.assertEqual(gov.STATIC_NOISE_GRAIN_PX, 4)
         self.assertNotIn("// 3", get_function_source("_static_noise_frame"), "the grain is the governor number, not a fixed 3")
         _like = {}
         for _grain in (1, 2, 4):
@@ -21315,7 +21352,7 @@ class TestFailurePointTextGameDeck(_SectionCase):
 
 
 def suite_failure_point_text_other_scripts():
-    for name, expected in (("media.py", 33), ("performance_governor.py", 8), ("ui.py", 12), ("libretro_core.py", 5), ("media_library.py", 30)):
+    for name, expected in (("media.py", 33), ("performance_governor.py", 8), ("ui.py", 12), ("libretro_core.py", 5), ("media_library.py", 31)):
         converted_handler_checks(name, expected)
     check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
 
@@ -21880,11 +21917,6 @@ class TestFailedDriveWaitsBeforeFailing(unittest.TestCase):
         finally:
             self.m.os.path.exists = orig
         self.assertIsNone(self.m._drive_health[root]["unresponsive_since"])
-
-    def test_the_list_screen_leaves_only_drives_that_are_failed(self):
-        src = open(MAIN_SCRIPT, encoding="utf-8").read()
-        self.assertIn("leave_list_of_failed_drive(set(_failed_drive_roots()))", src)
-        self.assertNotIn("leave_list_of_failed_drive(set(_unresponsive_drive_roots()))", src)
 
 
 # ============================================================================
@@ -22501,7 +22533,7 @@ class TestGuidePreviewBoxHold(unittest.TestCase):
         fake_time = types.SimpleNamespace(monotonic=lambda: clock["t"])
         ns = {"os": os, "time": fake_time, "media": media, "math": math, "pygame": MagicMock(), "log": MagicMock(),
               "performance_governor": gov, "_get_probe_library": lambda: FakeLib(),
-              "_pan_scan_content_key": lambda p: p, "_log_probe_failure": lambda *a, **k: None,
+              "_file_identity_key": lambda p: p, "_log_probe_failure": lambda *a, **k: None,
               "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
               "PICTURE_BOX_FIT_RETRY_SECONDS": 2.0,
               "_picture_box_fit_state": {"content_key": None, "norm_rect": None, "picture_aspect": None, "retry_at": 0.0},
@@ -23787,6 +23819,11 @@ class TestFolderListingCacheAndPushOut(unittest.TestCase):
         out = deck._without_failed_drives([("[.. BACK]", ""), ("[DRIVE] E:\\", "E:\\"), ("[DRIVE] C:\\", "C:\\")])
         self.assertEqual([p for _n, p in out], ["", "C:\\"])
 
+    def test_the_list_screen_leaves_only_drives_that_are_failed(self):
+        src = open(MAIN_SCRIPT, encoding="utf-8").read()
+        self.assertIn("leave_list_of_failed_drive(set(_failed_drive_roots()))", src)
+        self.assertNotIn("leave_list_of_failed_drive(set(_unresponsive_drive_roots()))", src)
+
     def test_scan_for_roms_back_cancels_and_adds_nothing(self):
         module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_cancel")
         deck = object.__new__(module.ExternalGameDeck)
@@ -24867,7 +24904,7 @@ class TestShellModeStaysOff(unittest.TestCase):
 
 
 class TestUpdateFromGitHub(unittest.TestCase):
-    """auto_updater: the update source is the project's GitHub Releases (pre-releases included); the zip with the highest V1.2.3 number in its name is offered when it is newer than the installed build, and the download is checked against the SHA-256 GitHub reports for that file."""
+    """auto_updater: the update source is the project's GitHub Releases (pre-releases included); the zip with the highest V1.2.4 number in its name is offered when it is newer than the installed build, and the download is checked against the SHA-256 GitHub reports for that file."""
 
     REPO = "StevenCLewis111/RetroTVEmulator"
 
@@ -25083,7 +25120,7 @@ class TestUpdateFromGitHub(unittest.TestCase):
         self.assertEqual(v("Retro TV Emulator Alpha V1.0.1.zip"), "1.0.1")
         self.assertEqual(v("Retro.TV.Emulator.Alpha.V1.0.1.zip"), "1.0.1")
         self.assertEqual(v("retro tv emulator v1.10.0.ZIP"), "1.10.0")
-        self.assertIsNone(v("Retro TV Emulator V1.2.3.rar"))
+        self.assertIsNone(v("Retro TV Emulator V1.2.4.rar"))
         self.assertIsNone(v("notes.zip"))
         self.assertIsNone(v(""))
 
@@ -26779,7 +26816,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.2.3", "build_info.py says 1.2.3 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.2.5", "build_info.py says 1.2.5 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27184,7 +27221,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.2.3"""
+    """This build is 1.2.5"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -27317,8 +27354,8 @@ class TestBezelTitleRowAndStyleThree(unittest.TestCase):
         self.assertNotIn("_real_screen_is_true_169(NATIVE_WIDTH", text)
         self.assertNotIn('_bezel2_no_video', text)
         import performance_governor as _pg2
-        self.assertIn("bezel2", _pg2.BEZEL_CHANNEL_LED_FRAC)
-        self.assertIn("bezel2", _pg2.BEZEL_LED_LISTED_ONLY)
+        self.assertNotIn("bezel2", _pg2.BEZEL_CHANNEL_LED_FRAC)
+        self.assertNotIn("bezel2", _pg2.BEZEL_LED_LISTED_ONLY)
 
 
 class TestHubInteriorCutAndRepeatStores(unittest.TestCase):
@@ -27705,18 +27742,761 @@ class TestGuideBlockIsOnePress(unittest.TestCase):
 class TestBezelThreeNumberPlace(unittest.TestCase):
     """Owner 2026-11-06: on bezel 3 the channel number and the song title come in from the rounded glass corner"""
 
-    def test_bezel3_offset_is_further_in_than_the_default(self):
-        right, top = gov.TV_BORDER_OSD_OFFSET_BY_STEM["bezel3"]
-        self.assertGreater(right, gov.TV_BORDER_OSD_OFFSET[0])
-        self.assertGreater(top, gov.TV_BORDER_OSD_OFFSET[1])
+
+    def test_a_holiday_picture_finds_its_own_glass_square_for_the_power_light(self):
+        import numpy as _np
+        import pygame as _pgm
+        ns = {"pygame": _pgm, "np": _np, "_log_swallowed": lambda *a: None, "_BEZEL_POWER_LIGHT_FRAC": gov.BEZEL_POWER_LIGHT_FRAC, "_BEZEL_POWER_LIGHT_ADD_RGB": gov.BEZEL_POWER_LIGHT_ADD_RGB, "_BEZEL_POWER_LIGHT_MULT_RGB": gov.BEZEL_POWER_LIGHT_MULT_RGB, "_BEZEL_POWER_LIGHT_BULB_RGB": gov.BEZEL_POWER_LIGHT_BULB_RGB, "_BEZEL_POWER_LIGHT_BULB_FRAC": gov.BEZEL_POWER_LIGHT_BULB_FRAC, "_BEZEL_POWER_LIGHT_HALO_RGB": gov.BEZEL_POWER_LIGHT_HALO_RGB, "_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX": gov.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX, "_BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX": gov.BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX, "_BEZEL_GLASS_REFERENCE_FRAC": gov.BEZEL_GLASS_REFERENCE_FRAC, "_BEZEL_GLASS_REFERENCE_WIDTH": gov.BEZEL_GLASS_REFERENCE_WIDTH, "_BEZEL_GLASS_COLOR_LIMITS": gov.BEZEL_GLASS_COLOR_LIMITS, "_BEZEL_GLASS_SEARCH_MARGIN_FRAC": gov.BEZEL_GLASS_SEARCH_MARGIN_FRAC}
+        exec(main_function_code("_find_bezel_glass_rect"), ns)
+        exec(main_function_code("_tint_bezel_power_light"), ns)
+        surf = _pgm.Surface((1671, 941), _pgm.SRCALPHA)
+        surf.fill((150, 90, 40, 255))
+        glass = _pgm.Rect(1160, 130, 34, 23)
+        surf.fill((80, 80, 80, 255), glass)
+        found = ns["_find_bezel_glass_rect"](surf, "bezel2")
+        self.assertEqual(tuple(found), tuple(glass))
+        self.assertIsNone(ns["_find_bezel_glass_rect"](surf, "bezel1"))
+        ns["_tint_bezel_power_light"](surf, "bezel2", "christmas")
+        self.assertEqual(tuple(surf.get_at((glass.centerx, glass.centery)))[:3], gov.BEZEL_POWER_LIGHT_BULB_RGB)
+        plain = _pgm.Surface((1671, 941), _pgm.SRCALPHA)
+        plain.fill((150, 90, 40, 255))
+        ns["_tint_bezel_power_light"](plain, "bezel2", "halloween")
+        fx, fy, fw, fh = gov.BEZEL_POWER_LIGHT_FRAC["bezel2"]
+        self.assertEqual(tuple(plain.get_at((round(1671 * (fx + fw / 2)), round(941 * (fy + fh / 2)))))[:3], gov.BEZEL_POWER_LIGHT_BULB_RGB, "no glass found: the table spot is used")
+        self.assertEqual(gov.BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX, {"christmas": (0.0, 0.0, -0.4, 0.0), "thanksgiving": (0.0, 0.0, -0.4, 0.0), "halloween": (0.0, -1.1, -0.9, 0.0)})
+        self.assertIn("_BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX", MAIN_SRC)
+
+    def test_the_square_on_the_third_bezel_gets_a_red_filter_and_other_bezels_are_untouched(self):
+        import pygame as _pgm
+        ns = {"pygame": _pgm, "_BEZEL_POWER_LIGHT_FRAC": gov.BEZEL_POWER_LIGHT_FRAC, "_BEZEL_POWER_LIGHT_ADD_RGB": gov.BEZEL_POWER_LIGHT_ADD_RGB, "_BEZEL_POWER_LIGHT_MULT_RGB": gov.BEZEL_POWER_LIGHT_MULT_RGB, "_BEZEL_POWER_LIGHT_BULB_RGB": gov.BEZEL_POWER_LIGHT_BULB_RGB, "_BEZEL_POWER_LIGHT_BULB_FRAC": gov.BEZEL_POWER_LIGHT_BULB_FRAC, "_BEZEL_POWER_LIGHT_HALO_RGB": gov.BEZEL_POWER_LIGHT_HALO_RGB, "_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX": gov.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX}
+        exec(main_function_code("_tint_bezel_power_light"), ns)
+        surf = _pgm.Surface((1000, 700), _pgm.SRCALPHA)
+        surf.fill((40, 40, 40, 255))
+        ns["_tint_bezel_power_light"](surf, "bezel2")
+        fx, fy, fw, fh = gov.BEZEL_POWER_LIGHT_FRAC["bezel2"]
+        inside = surf.get_at((int(1000 * (fx + fw / 2)), int(700 * (fy + fh / 2))))
+        self.assertEqual(tuple(inside)[:3], gov.BEZEL_POWER_LIGHT_BULB_RGB)
+        self.assertEqual(inside.a, 255)
+        edge = surf.get_at((round(1000 * fx) + 3, int(700 * (fy + fh / 2))))
+        self.assertGreater(edge.r, 150)
+        self.assertLess(edge.g, 60)
+        self.assertLess(edge.g, inside.g, "the bulb in the middle is brighter than the square around it")
+        self.assertEqual(tuple(surf.get_at((10, 10))), (40, 40, 40, 255))
+        other = _pgm.Surface((1000, 700), _pgm.SRCALPHA)
+        other.fill((40, 40, 40, 255))
+        ns["_tint_bezel_power_light"](other, "bezel1")
+        self.assertEqual(tuple(other.get_at((int(1000 * (fx + fw / 2)), int(700 * (fy + fh / 2))))), (40, 40, 40, 255))
+        self.assertIn("_tint_bezel_power_light(raw_surf,", MAIN_SRC)
+        self.assertIn("_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX", MAIN_SRC)
+        self.assertEqual(gov.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX, (-2.0, 0.2, 0.2, -0.8))
+        grown = _pgm.Surface((1000, 700), _pgm.SRCALPHA)
+        grown.fill((40, 40, 40, 255))
+        ns["_tint_bezel_power_light"](grown, "bezel2")
+        rx = round(1000 * fx)
+        ry = round(700 * fy)
+        rw = round(1000 * fw)
+        rh = round(700 * fh)
+        side = grown.get_at((rx + rw, ry + rh // 2))
+        top = grown.get_at((rx + rw // 2, ry - 1))
+        self.assertTrue(40 < side.r < 150 and 40 < top.r < 150, "the grown edge is a light tint, not the full red")
+        inner_px = grown.get_at((rx + 2, ry + rh // 2 + 2))
+        left_edge = grown.get_at((rx, ry + rh // 2 + 2))
+        self.assertEqual(tuple(left_edge)[:3], (40, 40, 40), "the first column is out of the light: the left edge is 2.0 pixels in")
+        second = grown.get_at((rx + 1, ry + rh // 2 + 2))
+        self.assertEqual(tuple(second)[:3], (40, 40, 40), "the second column is out of the light too: the left edge is 2.0 pixels in")
+        self.assertEqual(tuple(grown.get_at((rx - 1, ry + rh // 2))), (40, 40, 40, 255), "nothing is tinted outside the left edge")
+        bottom_edge = grown.get_at((rx + 2, ry + rh - 1))
+        inner_low = grown.get_at((rx + 2, ry + rh - 3))
+        self.assertTrue(40 < bottom_edge.r < inner_low.r + 1, "the bottom edge row is tinted 0.4 pixel less")
+        self.assertEqual(tuple(grown.get_at((rx + rw // 2, ry + rh))), (40, 40, 40, 255), "nothing is tinted below the bottom edge")
+        self.assertIn("_osd_anisotropic_correct(_osd_surf, w_w, w_h", MAIN_SRC)
+        self.assertIn("_surf1 = _osd_anisotropic_correct(_surf1, sw, sh", MAIN_SRC)
+
+    def test_bezel_three_uses_the_same_picture_pixel_spot_as_bezel_off(self):
+        self.assertNotIn("bezel2", gov.TV_BORDER_OSD_OFFSET_BY_STEM)
+        self.assertIn("bezel2", gov.TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS)
+        self.assertIn("_bezel_led_stem() if _ch_geom is not None else None", MAIN_SRC)
 
     def test_main_script_picks_the_offset_by_bezel(self):
-        ns = {"_TV_BORDER_OSD_OFFSET": (48, 64), "_TV_BORDER_OSD_OFFSET_BY_STEM": {"bezel3": (160, 105)}}
+        ns = {"_TV_BORDER_OSD_OFFSET": (48, 64), "_TV_BORDER_OSD_OFFSET_BY_STEM": {"bezelX": (160, 105)}}
         exec(main_function_code("_tv_border_osd_offset"), ns)
-        self.assertEqual(ns["_tv_border_osd_offset"]("bezel3"), (160, 105))
+        self.assertEqual(ns["_tv_border_osd_offset"]("bezelX"), (160, 105))
         self.assertEqual(ns["_tv_border_osd_offset"]("bezel1"), (48, 64))
         self.assertEqual(ns["_tv_border_osd_offset"](None), (48, 64))
-        self.assertIn("_osd_right_off, _osd_top_off = _tv_border_osd_offset(_bezel_led_stem())", MAIN_SRC)
+        self.assertIn("_osd_right_off, _osd_top_off = _tv_border_osd_offset(_osd_stem)", MAIN_SRC)
+        self.assertIn("_osd_stem in _TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS", MAIN_SRC)
+        self.assertIn("round(_osd_top_off * _off_scale)", MAIN_SRC)
+        self.assertIn("_win_unit_x = w_w / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[0])", MAIN_SRC)
+        self.assertIn("                _ch_scale = _win_unit_y\n", MAIN_SRC)
+        self.assertIn("_MARGIN_X_PX * sw / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[0])", MAIN_SRC)
+        self.assertEqual(gov.TV_BORDER_OSD_REFERENCE_WINDOW, (1276, 717))
+        self.assertEqual(gov.TV_BORDER_SCREEN_EXPAND["bezel2"], (1.0, 1.0), "the picture fits the glass; widening it hid the right edge of the video")
+        self.assertEqual(gov.TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS, ())
+        self.assertEqual(gov.TV_BORDER_PICTURE_BLEED_FRAC, {"bezel2": (0.0019, 0.0, 0.0050, 0.0)})
+        self.assertIn("_TV_BORDER_PICTURE_BLEED_FRAC.get(_active_bezel_stem())", MAIN_SRC)
+        self.assertIn("dest_x = inner.x\n", MAIN_SRC)
+        self.assertIn("min(shrink_x, 1.0) / _grow", MAIN_SRC)
+        ns = {"_TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS": ("bezel2",)}
+        exec(main_function_code("_menu_content_region"), ns)
+        f = ns["_menu_content_region"]
+        self.assertEqual(f(0, 0, 1036, 680, "bezel1"), (20, 138, 996, 525))
+        self.assertEqual(f(0, 0, 1036, 680, None), (20, 138, 996, 525))
+        for stem in ("bezel", "bezel1", "bezel2"):
+            wide = f(10, 10, 1111, 649, stem)
+            self.assertLessEqual(wide[1] + wide[3], 10 + 649, "inside a bezel the controller area stays inside the panel's bottom")
+            self.assertGreaterEqual(wide[0] + wide[2], 10 + 1111 - 25, "and reaches the panel's right side")
+        flat = f(10, 10, 1111, 649, None)
+        self.assertGreater(flat[1] + flat[3], 10 + 649, "with no bezel the width-only sizing is unchanged")
+        self.assertIn("_menu_content_region(_cm_x, _cm_y, _cm_w, _cm_h,", MAIN_SRC)
+        self.assertIn("_menu_content_region(_sz_x, _sz_y, _sz_w, _sz_h2,", MAIN_SRC)
+        self.assertIn("int(tw / (2 * _grow)) - new_w // 2", MAIN_SRC)
+        self.assertEqual(gov.BEZEL_VOLUME_BAR_SHIFT_PX, {"bezel2": -2})
+        self.assertIn("_vol_cx += round(_vol_shift /", MAIN_SRC)
+        self.assertIn("_ch_rect.x + _bezel_visible_picture_width(_ch_rect.width, _osd_stem)", MAIN_SRC)
+        self.assertIn("_picture_right = picture_rect.x + _visible_w", MAIN_SRC)
+        for warp, shown in ((True, 1000), (False, 1060)):
+            ns = {"_TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS": ("bezel2",), "_TV_BORDER_SCREEN_EXPAND": {"bezel2": (1.06, 1.0)}, "_TV_BORDER_SCREEN_EXPAND_DEFAULT": (1.0, 1.0),
+                  "db": object(), "_setting_on": lambda key, default=False, _w=warp: _w}
+            exec(main_function_code("_bezel_right_grow"), ns)
+            exec(main_function_code("_bezel_visible_picture_width"), ns)
+            self.assertEqual(ns["_bezel_visible_picture_width"](1060, "bezel2"), shown, "the growth only applies with Warp Screen on")
+            self.assertEqual(ns["_bezel_visible_picture_width"](1060, "bezel1"), 1060)
+            self.assertEqual(ns["_bezel_visible_picture_width"](1060, None), 1060)
+        self.assertIn("if _bezel_right_grow(_active_bezel_stem()) > 1.0:", MAIN_SRC)
+        self.assertIn("round(_osd_right_off * _off_scale_x)", MAIN_SRC)
+        self.assertEqual(gov.TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS, ("bezel2",))
+
+
+class TestUpdaterTrustsBundledRoots(unittest.TestCase):
+    """Owner log 2026-11-06 12:10: a PC on a dongle failed every update check with CERTIFICATE_VERIFY_FAILED"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.u = _load_updater_script("auto_updater")
+
+    def _cert_error(self):
+        import ssl as _ssl
+        import urllib.error as _ue
+        return _ue.URLError(_ssl.SSLCertVerificationError("certificate verify failed: unable to get local issuer certificate"))
+
+    def test_retries_with_bundled_roots_and_still_verifies(self):
+        calls = []
+
+        def fake(request, timeout=None, context=None):
+            calls.append(context)
+            if context is None:
+                raise self._cert_error()
+            return "RESPONSE"
+
+        with mock.patch.object(self.u.urllib.request, "urlopen", fake):
+            self.assertEqual(self.u._urlopen("req", 5), "RESPONSE")
+        self.assertIsNone(calls[0])
+        import ssl as _ssl
+        self.assertEqual(calls[1].verify_mode, _ssl.CERT_REQUIRED)
+        self.assertTrue(calls[1].check_hostname)
+
+    def test_a_network_failure_is_not_retried(self):
+        import urllib.error as _ue
+        calls = []
+
+        def fake(request, timeout=None, context=None):
+            calls.append(context)
+            raise _ue.URLError("no route to host")
+
+        with mock.patch.object(self.u.urllib.request, "urlopen", fake):
+            with self.assertRaises(_ue.URLError):
+                self.u._urlopen("req", 5)
+        self.assertEqual(len(calls), 1)
+
+    def test_when_every_root_set_fails_the_first_error_is_raised(self):
+        import urllib.error as _ue
+
+        def fake(request, timeout=None, context=None):
+            raise self._cert_error()
+
+        with mock.patch.object(self.u.urllib.request, "urlopen", fake):
+            with self.assertRaises(_ue.URLError):
+                self.u._urlopen("req", 5)
+
+    def test_bundled_file_loads_and_both_fetches_use_the_helper(self):
+        import ssl as _ssl
+        path = os.path.join(ROOT, "updater", "cacert.pem")
+        self.assertTrue(os.path.isfile(path))
+        self.assertGreater(len(_ssl.create_default_context(cafile=path).get_ca_certs()), 50)
+        src = open(os.path.join(ROOT, "updater", "auto_updater.py"), encoding="utf-8").read()
+        self.assertEqual(src.count("with _urlopen(request, timeout) as response"), 2)
+        self.assertNotIn("with urllib.request.urlopen(request", src)
+
+
+class TestSettingsLoadBackupAndLog(unittest.TestCase):
+    """Owner 2026-11-06: settings came back at their defaults after a restore; the app now says what it loaded and keeps dated copies"""
+
+    def _db(self, tmp, config):
+        db = media.RetroDatabase.__new__(media.RetroDatabase)
+        db.config_path = os.path.join(tmp, "retro_config.json")
+        db.logs_dir = os.path.join(tmp, "logs")
+        db.config = dict(config)
+        with open(db.config_path, "w") as f:
+            json.dump({"config": config, "channels": {}}, f)
+        return db
+
+    def test_load_line_names_the_saved_values_and_marks_missing_ones(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp, {"screen_mode": "stretch", "brightness": 70})
+            with self.assertLogs("media", level="INFO") as cap:
+                db._log_settings_loaded({"screen_mode": "stretch", "brightness": 70})
+            text = cap.output[0]
+            self.assertIn("[SETTINGS LOAD]", text)
+            self.assertIn("screen_mode=stretch", text)
+            self.assertIn("brightness=70", text)
+            self.assertIn("menu_opacity=MISSING", text)
+
+    def test_backup_is_made_and_only_the_newest_are_kept(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._db(tmp, {"screen_mode": "stretch"})
+            folder = os.path.join(tmp, "logs", "config_backups")
+            os.makedirs(folder)
+            for k in range(8):
+                open(os.path.join(folder, "retro_config_2026010%d-000000.json" % (k + 1)), "w").write("{}")
+            db._back_up_loaded_settings()
+            names = sorted(os.listdir(folder))
+            self.assertEqual(len(names), media.CONFIG_BACKUPS_KEPT)
+            self.assertTrue(names[-1] > "retro_config_20260108-000000.json", "the new copy is the newest")
+            self.assertEqual(json.load(open(os.path.join(folder, names[-1])))["config"]["screen_mode"], "stretch")
+
+    def test_load_calls_both_and_the_count_lives_in_the_governor(self):
+        src = inspect.getsource(media.RetroDatabase.load_settings_async)
+        self.assertIn("self._log_settings_loaded(data.get(\"config\", {}))", src)
+        self.assertIn("self._back_up_loaded_settings()", src)
+        self.assertEqual(gov.CONFIG_BACKUPS_KEPT, 5)
+
+
+PICTURE_ENDS_EARLY_STDERR = """Input #0, matroska,webm, from 'Gone In Sixty Seconds.mkv':
+  Metadata:
+    ENCODER         : Lavf63.3.100
+  Duration: 01:57:56.81, start: 0.000000, bitrate: 849 kb/s
+  Stream #0:0: Video: h264 (High), yuv420p(progressive), 1280x544 [SAR 1:1 DAR 40:17], 23.98 fps, 23.98 tbr, 1k tbn
+    Metadata:
+      DURATION        : 01:51:53.456000000
+  Stream #0:1(eng): Audio: aac (LC), 96000 Hz, stereo, fltp
+    Metadata:
+      DURATION        : 01:57:56.811000000
+  Stream #0:2(eng): Subtitle: subrip
+    Metadata:
+      DURATION        : 01:51:53.640000000
+"""
+
+
+class TestPictureEndsEarly(unittest.TestCase):
+    """Owner log 2026-11-06 16:40: Gone In Sixty Seconds.mkv has a picture that stops at 1:51:53 and sound that runs to 1:57:56; a channel put in the last six minutes had sound and no picture, went to Static, and the re-tune landed in the same place."""
+
+    def _probe(self, stderr_text):
+        fake_result = mock.Mock(stderr=stderr_text, stdout="", returncode=0)
+        with mock.patch.object(media, "_cached_path_exists", return_value=True), \
+             mock.patch.object(ml.subprocess, "run", return_value=fake_result):
+            return ml.combined_header_probe("movie.mkv", ffmpeg_path="ffmpeg")
+
+    def test_picture_length_read_from_the_video_stream_only(self):
+        self.assertAlmostEqual(ml.picture_length_from_header(PICTURE_ENDS_EARLY_STDERR), 6713.456, places=3)
+
+    def test_probe_takes_the_picture_length_when_the_sound_runs_on(self):
+        result = self._probe(PICTURE_ENDS_EARLY_STDERR)
+        self.assertTrue(result.picture_ends_early)
+        self.assertAlmostEqual(result.duration, 6713.456, places=3)
+
+    def test_normal_file_keeps_its_whole_length(self):
+        result = self._probe(SAMPLE_FFMPEG_STDERR)
+        self.assertFalse(result.picture_ends_early)
+        self.assertAlmostEqual(result.duration, 1 * 3600 + 19 * 60 + 35.40, places=2)
+
+    def test_a_small_gap_between_picture_and_sound_is_left_alone(self):
+        close = PICTURE_ENDS_EARLY_STDERR.replace("01:51:53.456000000", "01:57:40.000000000")
+        result = self._probe(close)
+        self.assertFalse(result.picture_ends_early)
+        self.assertAlmostEqual(result.duration, 1 * 3600 + 57 * 60 + 56.81, places=2)
+
+    def test_cover_art_is_not_a_picture_that_ends(self):
+        music = """Input #0, mp3, from 'song.mp3':
+  Duration: 00:03:30.00, start: 0.025057, bitrate: 320 kb/s
+  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 320 kb/s
+  Stream #0:1: Video: mjpeg (Baseline), yuvj420p(pc), 500x500, 90k tbr, 90k tbn (attached pic)
+    Metadata:
+      DURATION        : 00:00:01.000000000
+"""
+        self.assertIsNone(ml.picture_length_from_header(music))
+        result = self._probe(music)
+        self.assertFalse(result.picture_ends_early)
+        self.assertAlmostEqual(result.duration, 210.0, places=2)
+
+    def test_header_without_stream_lengths_is_unchanged(self):
+        self.assertIsNone(ml.picture_length_from_header(SAMPLE_FFMPEG_STDERR))
+
+    def test_governor_number_and_fallback(self):
+        self.assertEqual(gov.PICTURE_ENDS_EARLY_MIN_SECONDS, 30)
+        ml_src = inspect.getsource(ml)
+        self.assertIn("_PICTURE_ENDS_EARLY_MIN_S = _governor.PICTURE_ENDS_EARLY_MIN_SECONDS if _governor is not None else 30", ml_src)
+
+    def test_hub_correction_only_makes_a_length_shorter(self):
+        tmp = tempfile.mkdtemp()
+        lib = None
+        try:
+            lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+            hub = ml.DurationHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+            movie = os.path.join(tmp, "Big.mkv")
+            with open(movie, "wb") as handle:
+                handle.write(os.urandom(3000))
+            self.assertTrue(hub.note_measured(movie, 7077.0))
+            self.assertEqual(hub.read(movie), (7077, ml.DURATION_KIND_MEASURED))
+            self.assertFalse(hub.correct_measured(movie, 7500.0))
+            self.assertEqual(hub.read(movie)[0], 7077)
+            self.assertTrue(hub.correct_measured(movie, 6713.456))
+            self.assertEqual(hub.read(movie), (6714, ml.DURATION_KIND_MEASURED))
+            hub2 = ml.DurationHub(ml.ProbeLibrary(lib, use_vlc_fallback=False))
+            self.assertEqual(hub2.read(movie)[0], 6714)
+        finally:
+            if lib is not None:
+                try:
+                    lib.close()
+                except Exception:
+                    pass
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_stall_starts_the_check_once_per_file_and_forces_a_retune(self):
+        src = get_function_source("_recover_from_playback_stall")
+        self.assertIn("_start_picture_end_check(stalled_str)", src)
+        start_src = get_function_source("_start_picture_end_check")
+        self.assertIn("_picture_end_checked", start_src)
+        self.assertIn('name="PictureEndCheck"', start_src)
+        check_src = get_function_source("_check_picture_end_after_stall")
+        self.assertIn("hub.correct_measured(norm_path, result.picture_seconds", check_src)
+        self.assertIn('app_state["_last_new_frame_ticks"] = 0', check_src)
+        self.assertIn("[PICTURE ENDS EARLY]", check_src)
+
+
+class TestQuietLogLines(unittest.TestCase):
+    """Owner 2026-11-06: thin the logs of what is not needed; repeating status lines and VLC's per-picture blending lines are left out, warnings and failure-point lines are always written."""
+
+    def _filter(self):
+        start = MAIN_SRC.index("    class _QuietLinesFilter(logging.Filter):")
+        end = MAIN_SRC.index("    _app_log_handler.addFilter(_QuietLinesFilter())")
+        ns = {"logging": logging,
+              "_LOG_QUIET_APP_PREFIXES": tuple(gov.LOG_QUIET_APP_PREFIXES),
+              "_LOG_QUIET_SCHEDULER_PIECES": tuple(gov.LOG_QUIET_SCHEDULER_PIECES)}
+        exec(textwrap.dedent(MAIN_SRC[start:end]), ns)
+        return ns["_QuietLinesFilter"]()
+
+    def _passes(self, level, text):
+        record = logging.LogRecord("__main__", level, __file__, 1, text, None, None)
+        return self._filter().filter(record)
+
+    def test_repeating_status_lines_are_left_out(self):
+        for text in ("[FRAME TIME] avg=16.7ms fps=59.8", "[GPU FRAME] path=gpu frames=600",
+                     "[GOVERNOR] status ch=07 level=3", "[HEALTH QUEUES] station 18 channel(s) on",
+                     "[LOUDNESS DEBUG] x.mp3 target=-24.0", "[MUTE GUARD] ARM (real channel change)",
+                     "[SCHEDULER] ch11 Full Day: background probe stored x.mkv (1251s long)",
+                     "[SCHEDULER] ch26 is inactive (disabled) -- Static is expected."):
+            self.assertFalse(self._passes(logging.INFO, text), text)
+
+    def test_failure_points_and_decisions_are_kept(self):
+        for text in ("[STALL WATCHDOG] Channel 09 produced no new frame", "[PICTURE ENDS EARLY] x.mkv",
+                     "[GOVERNOR] level 1->3 reason=tighten", "[MUSIC QUEUE] 0 song(s) waiting",
+                     "[MUSIC SCAN] last 72s", "[ATTEMPT 31] OPENED: file=x", "[SEEK VERIFY] landed close enough",
+                     "[SETTINGS LOAD] file=retro_config.json", "[SCHEDULER] ch05 block=Full Day no saved start"):
+            self.assertTrue(self._passes(logging.INFO, text), text)
+
+    def test_a_warning_is_always_written(self):
+        self.assertTrue(self._passes(logging.WARNING, "[FRAME TIME] avg=90ms"))
+        self.assertTrue(self._passes(logging.ERROR, "[HEARTBEAT] stuck"))
+
+    def test_vlc_blending_lines_are_left_out_and_errors_kept(self):
+        pieces = tuple(gov.LOG_QUIET_VLC_PIECES)
+        quiet = ("[16:39:57.755] main debug: blending YUVA to DXN failed",
+                 "[16:39:57.755] blend debug: no matching alpha blending routine (chroma: YUVA -> DXN)",
+                 "[16:39:57.755] main debug: looking for video blending module matching \"any\": 24 candidates",
+                 "[16:39:57.755] main debug: no video blending modules matched")
+        kept = ("[16:39:58.565] mkv error: EOF", "[16:39:58.565] main debug: EOF reached",
+                "[16:40:00.034] main error: picture is too late to be displayed (missing 20 ms)",
+                "[16:39:57.724] main debug: starting at time: 6991s")
+        for line in quiet:
+            self.assertTrue(any(piece in line for piece in pieces), line)
+        for line in kept:
+            self.assertFalse(any(piece in line for piece in pieces), line)
+
+    def test_wiring(self):
+        self.assertIn("_app_log_handler.addFilter(_QuietLinesFilter())", MAIN_SRC)
+        self.assertIn("record.levelno >= logging.WARNING", MAIN_SRC)
+        writer = get_function_source("_vlc_log_writer_loop")
+        self.assertLess(writer.index("_note_vlc_decode_line(line_text)"), writer.index("_VLC_QUIET_PIECES"))
+        self.assertIn("_VLC_QUIET_PIECES = tuple(performance_governor.LOG_QUIET_VLC_PIECES) if performance_governor is not None else ()", MAIN_SRC)
+
+
+class TestChannel03Audit(unittest.TestCase):
+    """Channel 03 audit 2026-11-06: four things found off and fixed."""
+
+    def _deck(self):
+        import game_deck as gd
+        deck = gd.ExternalGameDeck.__new__(gd.ExternalGameDeck)
+        deck._console_splash_is_video = True
+        deck._console_splash_video_last_frame = object()
+        deck.vlc_engine = mock.Mock()
+        return deck
+
+    def test_splash_video_is_stopped_once(self):
+        deck = self._deck()
+        engine = deck.vlc_engine
+        deck._stop_console_splash_video()
+        engine.stop.assert_called_once()
+        self.assertFalse(deck._console_splash_is_video)
+        self.assertIsNone(deck._console_splash_video_last_frame)
+        deck._stop_console_splash_video()
+        engine.stop.assert_called_once()
+
+    def test_splash_video_is_stopped_on_every_way_out_of_loading(self):
+        import game_deck as gd
+        src = inspect.getsource(gd.ExternalGameDeck)
+        for name in ("_poll_libretro_launch", "_libretro_tick_loading_impl", "_libretro_quit_to_romlist"):
+            body = inspect.getsource(getattr(gd.ExternalGameDeck, name))
+            self.assertIn("self._stop_console_splash_video()", body, name)
+        self.assertEqual(src.count("self._stop_console_splash_video()"), 4)
+
+    def test_media_player_gives_up_on_a_file_that_never_plays(self):
+        import game_deck as gd
+        body = inspect.getsource(gd.ExternalGameDeck._render_dvd_player)
+        self.assertIn("not self.dvd_is_disc_image and not getattr(self, \"_dvd_main_ever_played\", False)", body)
+        self.assertIn("self.MEDIA_PLAYER_OPEN_TIMEOUT_MS", body)
+        self.assertIn('Could not play: {_bad_name}', body)
+        i = body.index('Could not play: {_bad_name}')
+        self.assertNotIn('_scan_roms', body[i:i + 120])
+        self.assertEqual(gd.ExternalGameDeck.MEDIA_PLAYER_OPEN_TIMEOUT_MS, 20000)
+        self.assertEqual(gov.MEDIA_PLAYER_OPEN_TIMEOUT_MS, 20000)
+
+    def test_missing_video_player_says_so(self):
+        import game_deck as gd
+        body = inspect.getsource(gd.ExternalGameDeck._start_dvd_playback)
+        self.assertIn("The video player is not ready yet", body)
+
+    def test_leaving_channel_03_lifts_the_screensaver_freeze(self):
+        self.assertIn('game_deck.set_paused(False, reason="screensaver", muted=True)', MAIN_SRC)
+        i = MAIN_SRC.index('elif app_state.get("current_channel") != "03":\n        if app_state.get("ch03_screensaver_active", False):')
+        self.assertIn("set_paused(False, reason=\"screensaver\"", MAIN_SRC[i:i + 900])
+
+    def test_dead_menu_music_stall_check_is_gone(self):
+        self.assertNotIn("_ch03_music_is_stalled", MAIN_SRC)
+        self.assertNotIn("forcing restart", MAIN_SRC)
+
+
+class TestChannel03MenuAudit(unittest.TestCase):
+    """Channel 03 menu audit 2026-11-06: All-OFF keeps a console, profile Save/Load say what is wrong on their own screen, quitting returns to the game just played"""
+
+    def _deck(self):
+        module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_menu_audit")
+        deck = object.__new__(module.ExternalGameDeck)
+        deck._libretro_core = None
+        deck._libretro_console = None
+        deck._libretro_active_profile = 1
+        return module, deck
+
+    def test_all_off_keeps_a_console_when_the_dvd_player_is_off(self):
+        fake_gd = types.SimpleNamespace(CONSOLE_ORDER=["NES", "SNES", "DVD"])
+        saved = []
+        fake_db = types.SimpleNamespace(config={"consoles_enabled": {"NES": True, "SNES": True, "DVD": False}}, save_settings=lambda: saved.append(1))
+        ns = {"db": fake_db, "game_deck": None}
+        with unittest.mock.patch.dict(sys.modules, {"game_deck": fake_gd}):
+            exec(compile(get_function_source("_toggle_all_consoles"), "t", "exec"), ns)
+            ns["_toggle_all_consoles"]()
+        enabled = fake_db.config["consoles_enabled"]
+        self.assertFalse(enabled["NES"] or enabled["SNES"])
+        self.assertTrue(enabled["DVD"], "with every other console off the DVD player is switched back on so one console is left")
+
+    def test_all_off_leaves_the_dvd_player_alone_when_it_is_on(self):
+        fake_gd = types.SimpleNamespace(CONSOLE_ORDER=["NES", "DVD"])
+        fake_db = types.SimpleNamespace(config={"consoles_enabled": {"NES": True}}, save_settings=lambda: None)
+        ns = {"db": fake_db, "game_deck": None}
+        with unittest.mock.patch.dict(sys.modules, {"game_deck": fake_gd}):
+            exec(compile(get_function_source("_toggle_all_consoles"), "t", "exec"), ns)
+            ns["_toggle_all_consoles"]()
+        self.assertFalse(fake_db.config["consoles_enabled"]["NES"])
+        self.assertNotIn("DVD", fake_db.config["consoles_enabled"])
+
+    def test_profile_save_and_load_say_why_they_cannot_run(self):
+        module, deck = self._deck()
+        self.assertEqual(deck.profile_action_block_reason("NES"), "NO GAME IS RUNNING")
+        self.assertFalse(deck.libretro_save_to_profile("NES", 1))
+        self.assertFalse(deck.libretro_load_from_profile("NES", 1))
+        calls = []
+        deck._libretro_core = types.SimpleNamespace(save_state=lambda slot: calls.append(("save", slot)) or True,
+                                                    has_state=lambda slot: True,
+                                                    load_state=lambda slot: calls.append(("load", slot)) or True)
+        deck._libretro_console = "SNES"
+        self.assertEqual(deck.profile_action_block_reason("NES"), "THE RUNNING GAME IS SNES, NOT NES")
+        self.assertFalse(deck.libretro_save_to_profile("NES", 2))
+        self.assertEqual(calls, [], "a profile screen of another console never touches the running game's state")
+        self.assertEqual(deck.profile_action_block_reason("SNES"), "")
+        self.assertTrue(deck.libretro_save_to_profile("SNES", 2))
+        self.assertTrue(deck.libretro_load_from_profile("SNES", 2))
+        self.assertEqual(calls, [("save", 2), ("load", 2)])
+
+    def test_profile_save_and_load_are_silent_when_they_work_and_use_the_banner_bar_when_not(self):
+        """Owner 2026-11-06: no 'you just saved' message; the banner bar speaks only when something is wrong"""
+        src = MAIN_SRC
+        self.assertNotIn("games_profile_notice", src)
+        self.assertNotIn("SAVED TO PROFILE", src)
+        self.assertNotIn("LOADED PROFILE", src)
+        self.assertIn("post_status_notice(_why)", src)
+        self.assertIn('post_status_notice("SAVE TO PROFILE %d FAILED" % profile_num)', src)
+        self.assertIn('post_status_notice("NO SAVE FOUND IN PROFILE %d" % profile_num)', src)
+        ui_src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+        self.assertNotIn("games_profile_notice", ui_src)
+        self.assertNotIn("COLOR_MENU_NOTICE_TEXT", ui_src)
+
+    def test_the_notice_banner_shows_once_for_the_governor_time_and_a_newer_one_replaces_it(self):
+        ns = {"_notice_banner_text": None, "_notice_banner_fresh": False}
+        exec(compile(get_function_source("post_status_notice"), "p", "exec"), ns)
+        ns["post_status_notice"]("A")
+        self.assertEqual((ns["_notice_banner_text"], ns["_notice_banner_fresh"]), ("A", True))
+        ns["post_status_notice"]("B")
+        self.assertEqual(ns["_notice_banner_text"], "B")
+        self.assertIn('if name == "notice":\n        return NOTICE_BANNER_MS', MAIN_SRC)
+        self.assertGreater(gov.NOTICE_BANNER_SECONDS, 0)
+
+    def test_multitap_not_supported_goes_to_the_banner_bar(self):
+        self.assertIn('post_status_notice("MULTITAP NOT SUPPORTED THIS SESSION")', MAIN_SRC)
+        self.assertNotIn('game_deck._libretro_osd_msg   = "MULTITAP NOT SUPPORTED THIS SESSION"', MAIN_SRC)
+
+    def test_menu_music_with_every_track_missing_plays_the_default_and_says_so(self):
+        src = get_function_source("_start_ch03_menu_music")
+        self.assertIn('post_status_notice("GAME MUSIC NOT FOUND, PLAYING DEFAULT")', src)
+        self.assertIn('"audio", "Game Music", "gamemusic.mp3"', src)
+        self.assertIn('app_state.get("ch03_menu_music_track") != _default_track', src)
+
+    def test_dvd_places_are_kept_whether_or_not_resume_is_on(self):
+        deck_src = open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read()
+        self.assertNotIn("if (self.dvd_resume_enabled and self.dvd_file_path", deck_src)
+        self.assertNotIn("if self.dvd_resume_enabled and self.dvd_file_path:\n                            self._dvd_clear_resume_position", deck_src)
+        self.assertIn('self._scan_is_background = True\n                        self._scan_roms("DVD")', deck_src)
+        self.assertNotIn('db.config["dvd_resume_positions"] = {}', MAIN_SRC)
+        module, deck = self._deck()
+        deck.dvd_resume_enabled = False
+        deck.dvd_resume_positions = {"a.mp4": 300.0}
+        self.assertEqual(deck._dvd_get_resume_seconds("a.mp4"), 0, "with Resume off a file starts at the beginning")
+        deck.dvd_resume_enabled = True
+        self.assertEqual(deck._dvd_get_resume_seconds("a.mp4"), 300.0, "switching Resume on finds the place that was kept")
+
+    def test_quitting_a_game_keeps_the_highlight_and_reports_a_failed_auto_save(self):
+        module, deck = self._deck()
+        scans = []
+        deck._libretro_auto_save = True
+        deck._libretro_active_profile = 1
+        deck._libretro_rom_path = "x"
+        deck._libretro_loading = False
+        deck.emulator_loading = False
+        deck._pause_reasons = {"channel"}
+        deck.active_console = "SNES"
+        deck.roms = [("A", "a"), ("B", "b"), ("C", "c")]
+        deck.rom_index = 2
+        deck.rom_scroll = 1
+        deck._scan_is_background = False
+        deck._romlist_error_msg = ""
+        deck._romlist_error_until = 0
+        deck._stop_console_splash_video = lambda: None
+        deck._scan_roms = lambda c: scans.append((c, deck._scan_is_background))
+        module.pad_poller_stop = lambda: None
+        core = types.SimpleNamespace(save_state=lambda slot: False, unload=lambda: None)
+        deck._libretro_quit_to_romlist(core)
+        self.assertEqual(deck.mode, "ROMLIST")
+        self.assertEqual(deck.rom_index, 2, "back in the list the highlight stays on the game just played")
+        self.assertEqual(scans, [("SNES", True)], "the rescan is a background one, which keeps the cursor on the same file")
+        self.assertEqual(deck._romlist_error_msg, "Auto-save failed")
+        self.assertGreater(deck._romlist_error_until, 0)
+
+    def test_quitting_the_dvd_player_rescans_in_the_background(self):
+        src = open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read()
+        self.assertIn('self.mode = "ROMLIST"\n                    self._scan_is_background = True\n                    self._scan_roms("DVD")', src)
+
+
+class TestAutoSaveWhilePlaying(unittest.TestCase):
+    """Owner 2026-11-06: with Auto Save on, the state is also saved every so often and when the exit prompt or a menu opens, so a failed exit still leaves a recent save; the file is written in the background and tried again when the disk is busy"""
+
+    def _core(self, tmp, size=8):
+        import libretro_core as lc
+
+        class _Dll:
+            def retro_serialize_size(self):
+                return size
+
+            def retro_serialize(self, ptr, sz):
+                import ctypes as _c
+                _c.memmove(ptr, b"S" * sz, sz)
+                return True
+
+        core = lc.LibretroCore(os.path.join(tmp, "core.dll"), os.path.join(tmp, "system"), os.path.join(tmp, "saves"), create_system_dir=False)
+        core._dll = _Dll()
+        core._loaded = True
+        core.set_active_profile(2)
+        return lc, core
+
+    def _wait(self, lc, path, timeout=3.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline and lc._state_writer.is_pending(path):
+            time.sleep(0.02)
+
+    def test_a_background_save_lands_in_the_active_profile_folder(self):
+        tmp = tempfile.mkdtemp(prefix="auto_save_")
+        try:
+            lc, core = self._core(tmp)
+            self.assertTrue(core.save_state_background(slot=2))
+            path = core._state_path(2)
+            self._wait(lc, path)
+            self.assertIn("profile2", path)
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"S" * 8)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_write_the_disk_refuses_is_tried_again_then_reported(self):
+        tmp = tempfile.mkdtemp(prefix="auto_save_")
+        try:
+            lc, core = self._core(tmp)
+            real = lc._write_file_safely
+            tries = []
+
+            def flaky(path, data):
+                tries.append(1)
+                if len(tries) < 3:
+                    raise OSError("busy")
+                real(path, data)
+
+            lc._write_file_safely = flaky
+            try:
+                self.assertTrue(core.save_state_background(slot=1, attempts=5, retry_seconds=0.01))
+                path = core._state_path(1)
+                self._wait(lc, path)
+                self.assertEqual(len(tries), 3, "two refusals then the write landed")
+                self.assertTrue(os.path.exists(path))
+                failed = []
+                lc._write_file_safely = lambda path, data: (_ for _ in ()).throw(OSError("locked"))
+                self.assertTrue(core.save_state_background(slot=3, attempts=2, retry_seconds=0.01, on_fail=failed.append))
+                self._wait(lc, core._state_path(3))
+                time.sleep(0.1)
+                self.assertEqual(failed, [core._state_path(3)], "when every try fails the caller is told once")
+            finally:
+                lc._write_file_safely = real
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_save_made_in_the_foreground_wins_over_one_waiting_in_the_background(self):
+        tmp = tempfile.mkdtemp(prefix="auto_save_")
+        try:
+            lc, core = self._core(tmp)
+            path = core._state_path(1)
+            lc._state_writer.submit(path, b"OLD", 1, 0.0, None)
+            lc._state_writer.cancel(path)
+            self.assertTrue(core.save_state(slot=1))
+            self._wait(lc, path)
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"S" * 8)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_complete_leftover_temporary_state_is_recovered_and_a_partial_one_removed(self):
+        tmp = tempfile.mkdtemp(prefix="auto_save_")
+        try:
+            lc, core = self._core(tmp)
+            path = core._state_path(1)
+            with open(path + ".tmp", "wb") as fh:
+                fh.write(b"N" * 8)
+            self.assertTrue(core.has_state(slot=1))
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"N" * 8)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            with open(path + ".tmp", "wb") as fh:
+                fh.write(b"half")
+            core.has_state(slot=1)
+            self.assertFalse(os.path.exists(path + ".tmp"))
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"N" * 8, "a partial leftover never replaces a good state")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _deck(self):
+        module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_auto_save")
+        deck = object.__new__(module.ExternalGameDeck)
+        deck._libretro_auto_save = True
+        deck._libretro_active_profile = 1
+        deck._libretro_core = None
+        deck._auto_save_core_id = None
+        deck._auto_save_next = 0.0
+        deck._auto_save_interval = 0.0
+        deck._auto_save_write_failed_flag = False
+        return module, deck
+
+    def test_the_timer_saves_in_the_background_and_slows_down_when_taking_the_state_is_slow(self):
+        module, deck = self._deck()
+        taken = []
+        core = types.SimpleNamespace(save_state_background=lambda **kw: taken.append(kw) or True)
+        clock = [1000.0]
+        module.time = types.SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter)
+        deck._auto_save_tick(core)
+        self.assertEqual(taken, [], "the first look only starts the timer")
+        clock[0] += gov.GAME_AUTOSAVE_INTERVAL_SECONDS - 1
+        deck._auto_save_tick(core)
+        self.assertEqual(taken, [])
+        clock[0] += 2
+        deck._auto_save_tick(core)
+        self.assertEqual(len(taken), 1)
+        self.assertEqual(taken[0]["slot"], 1)
+        self.assertEqual(taken[0]["attempts"], gov.GAME_AUTOSAVE_WRITE_ATTEMPTS)
+        self.assertEqual(deck._auto_save_interval, gov.GAME_AUTOSAVE_INTERVAL_SECONDS)
+        deck._libretro_auto_save = False
+        clock[0] += 10 * gov.GAME_AUTOSAVE_INTERVAL_SECONDS
+        deck._auto_save_tick(core)
+        self.assertEqual(len(taken), 1, "nothing is saved while Auto Save is off")
+
+    def test_a_slow_state_doubles_the_gap_up_to_the_maximum_and_a_core_with_no_state_is_tried_again_soon(self):
+        module, deck = self._deck()
+        clock = [50.0]
+        perf = [0.0]
+
+        def _perf():
+            perf[0] += 0.2
+            return perf[0]
+
+        module.time = types.SimpleNamespace(monotonic=lambda: clock[0], perf_counter=_perf)
+        core = types.SimpleNamespace(save_state_background=lambda **kw: True)
+        deck._auto_save_interval = float(gov.GAME_AUTOSAVE_INTERVAL_SECONDS)
+        for _ in range(6):
+            deck._background_auto_save(core, "test")
+        self.assertEqual(deck._auto_save_interval, float(gov.GAME_AUTOSAVE_MAX_INTERVAL_SECONDS))
+        none_core = types.SimpleNamespace(save_state_background=lambda **kw: False)
+        deck._background_auto_save(none_core, "test")
+        self.assertEqual(deck._auto_save_next, clock[0] + gov.GAME_AUTOSAVE_RETRY_SECONDS)
+
+    def test_the_exit_prompt_and_an_opening_menu_save_and_a_failed_write_reaches_the_banner_bar(self):
+        module, deck = self._deck()
+        taken = []
+        core = types.SimpleNamespace(save_state_background=lambda **kw: taken.append(kw) or True)
+        deck._libretro_core = core
+        deck._auto_save_core_id = id(core)
+        deck._auto_save_interval = 120.0
+        deck._auto_save_on_event("exit prompt")
+        self.assertEqual(len(taken), 1)
+        deck._libretro_auto_save = False
+        deck._auto_save_on_event("menu opened")
+        self.assertEqual(len(taken), 1)
+        posted = []
+        fake_main = types.SimpleNamespace(post_status_notice=posted.append)
+        deck._libretro_auto_save = True
+        deck._auto_save_write_failed(core)
+        with unittest.mock.patch.dict(sys.modules, {"__main__": fake_main}):
+            deck._auto_save_tick(core)
+        self.assertEqual(posted, ["AUTO-SAVE FAILED"])
+        src = open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read()
+        self.assertIn('self._auto_save_on_event("exit prompt")', src)
+        self.assertIn('self._auto_save_on_event("menu opened")', src)
+        self.assertIn("self._auto_save_tick(core)", src)
 
 
 class TestMusicScanOwnLane(unittest.TestCase):
@@ -27904,3 +28684,43 @@ class TestScansNeverBlockThemselves(unittest.TestCase):
 
 if __name__ == "__main__":
     run_logged(__file__, lambda: unittest.main(verbosity=2))
+
+
+class TestAllSettingsTurnsOnSticksAndSyncsProfiles(unittest.TestCase):
+    """Owner 2026-11-07: turning All Settings on turns every L-STICK AS D-PAD switch on, and with it on a profile pick goes to every console"""
+
+    def test_all_settings_turns_on_every_stick_switch(self):
+        import json
+        import tempfile
+        import game_deck as gd
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "emulator_config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"SNES_mapping": {"stick_as_dpad": False}, "SNES_mapping_p2": {"stick_as_dpad": False}}, handle)
+            deck = gd.ExternalGameDeck.__new__(gd.ExternalGameDeck)
+            deck._gameplay_ctrl_mapping_cache = {"SNES": {1: object()}}
+            deck.ctrl_mapping = {"stick_as_dpad": False}
+            deck._active_mapping_console = "SNES"
+            original = gd.resolve_emulator_config_path
+            gd.resolve_emulator_config_path = lambda: path
+            try:
+                deck.turn_on_stick_as_dpad_everywhere()
+            finally:
+                gd.resolve_emulator_config_path = original
+            with open(path, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+        for console in gd.CONSOLE_ORDER:
+            if console in ("DVD", "N64"):
+                self.assertNotIn(gd.ExternalGameDeck._mapping_key(console, 1), saved if console == "DVD" else {}, console)
+                continue
+            for player in range(1, gd.CONSOLE_MAX_PLAYERS.get(console, 4) + 1):
+                self.assertTrue(saved[gd.ExternalGameDeck._mapping_key(console, player)]["stick_as_dpad"], (console, player))
+        self.assertNotIn("N64_mapping", saved, "N64 has no such switch")
+        self.assertTrue(saved["GBA_mapping"]["stick_as_dpad"])
+        self.assertTrue(deck.ctrl_mapping["stick_as_dpad"])
+        self.assertEqual(deck._gameplay_ctrl_mapping_cache, {})
+        self.assertIn("game_deck.turn_on_stick_as_dpad_everywhere()", MAIN_SRC)
+
+    def test_a_profile_pick_goes_to_every_console_while_all_settings_is_on(self):
+        self.assertIn("_targets = [c for c in CONSOLE_ORDER if c != \"MENU\"] if db.config.get(\"all_profiles_sync\", False) else [con]", MAIN_SRC)
+        self.assertIn("game_deck.sync_profile_from_db(_target, db.config)", MAIN_SRC)

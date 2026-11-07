@@ -43,6 +43,8 @@ COLOR_SCREEN_BLACK = performance_governor.COLOR_SCREEN_BLACK if performance_gove
 COLOR_MENU_BUTTON = performance_governor.COLOR_MENU_BUTTON if performance_governor is not None else (40, 78, 145)
 COLOR_MENU_BUTTON_GREYED = performance_governor.COLOR_MENU_BUTTON_GREYED if performance_governor is not None else (32, 32, 40)
 COLOR_MENU_TEXT_GREYED = performance_governor.COLOR_MENU_TEXT_GREYED if performance_governor is not None else (105, 105, 115)
+# WARNING: the fallback colour below must match COLOR_GAME_WARNING_TEXT in performance_governor.py; it is used only when that module fails to import.
+COLOR_MENU_NOTICE_TEXT = performance_governor.COLOR_GAME_WARNING_TEXT if performance_governor is not None else (255, 90, 90)
 COLOR_MENU_BUTTON_BLUE = performance_governor.COLOR_MENU_BUTTON_BLUE if performance_governor is not None else (40, 78, 145)
 COLOR_MENU_BUTTON_BLUE_DIM = performance_governor.COLOR_MENU_BUTTON_BLUE_DIM if performance_governor is not None else (32, 58, 105)
 COLOR_MENU_ON_BLUE = performance_governor.COLOR_MENU_ON_BLUE if performance_governor is not None else (40, 100, 180)
@@ -6761,6 +6763,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         banner_y = title_y + title_h + equal_gap
         rows_top = banner_y + banner_h + equal_gap
         close_y  = rows_top + grid_h + equal_gap
+
+        _prof_notice = app_state.get("games_profile_notice")
+        if _prof_notice and pygame.time.get_ticks() < _prof_notice[1]:
+            _notice_lbl = _get_font("Courier New", 14, bold=True).render(_prof_notice[0], True, COLOR_MENU_NOTICE_TEXT)
+            menu_canvas.blit(_notice_lbl, (cx + content_w // 2 - _notice_lbl.get_width() // 2,
+                                           rows_top + grid_h + (equal_gap - _notice_lbl.get_height()) // 2))
 
         def _draw_prof_row(idx, label, x_pos, y_pos, width, toggle_val=None, greyed=False, value_text=None,
                             active_square=None, stepper_value=None, stepper_focused=False):

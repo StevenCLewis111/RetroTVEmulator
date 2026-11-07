@@ -478,6 +478,23 @@ try:
     _app_log_handler.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 
+    # WARNING: the quiet lists come from performance_governor.py; when that module fails to import nothing is left out. A WARNING or ERROR line is always written.
+    _LOG_QUIET_APP_PREFIXES = tuple(performance_governor.LOG_QUIET_APP_PREFIXES) if performance_governor is not None else ()
+    _LOG_QUIET_SCHEDULER_PIECES = tuple(performance_governor.LOG_QUIET_SCHEDULER_PIECES) if performance_governor is not None else ()
+
+    class _QuietLinesFilter(logging.Filter):
+        def filter(self, record):
+            if record.levelno >= logging.WARNING:
+                return True
+            text = record.getMessage()
+            if text.startswith(_LOG_QUIET_APP_PREFIXES):
+                return False
+            if text.startswith("[SCHEDULER]") and any(piece in text for piece in _LOG_QUIET_SCHEDULER_PIECES):
+                return False
+            return True
+
+    _app_log_handler.addFilter(_QuietLinesFilter())
+
     _log_queue = queue.Queue(maxsize=10000)
     _queue_handler = logging.handlers.QueueHandler(_log_queue)
 
@@ -2396,8 +2413,126 @@ def _load_bezel_surface_from_path(path):
         _tv_border_cache.pop(path, None)
         return None
 
+    _file_stem = os.path.splitext(os.path.basename(path))[0]
+    _tint_bezel_power_light(raw_surf, _bezel_style_stem(_file_stem), (re.search(r"halloween|christmas|thanksgiving", _file_stem.lower()) or [None])[0])
     _tv_border_cache[path] = (cache_key, raw_surf)
     return raw_surf
+
+
+# WARNING: the fallback numbers below must match BEZEL_POWER_LIGHT_FRAC, BEZEL_POWER_LIGHT_ADD_RGB, BEZEL_POWER_LIGHT_MULT_RGB in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_POWER_LIGHT_FRAC = performance_governor.BEZEL_POWER_LIGHT_FRAC if performance_governor is not None else {"bezel2": (0.69495, 0.13173, 0.0231, 0.0354)}
+_BEZEL_POWER_LIGHT_ADD_RGB = performance_governor.BEZEL_POWER_LIGHT_ADD_RGB if performance_governor is not None else (170, 0, 0)
+_BEZEL_POWER_LIGHT_MULT_RGB = performance_governor.BEZEL_POWER_LIGHT_MULT_RGB if performance_governor is not None else (255, 70, 70)
+# WARNING: the fallback numbers below must match BEZEL_POWER_LIGHT_BULB_RGB, BEZEL_POWER_LIGHT_BULB_FRAC, BEZEL_POWER_LIGHT_HALO_RGB in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_POWER_LIGHT_BULB_RGB = performance_governor.BEZEL_POWER_LIGHT_BULB_RGB if performance_governor is not None else (255, 95, 80)
+_BEZEL_POWER_LIGHT_BULB_FRAC = performance_governor.BEZEL_POWER_LIGHT_BULB_FRAC if performance_governor is not None else 0.34
+_BEZEL_POWER_LIGHT_HALO_RGB = performance_governor.BEZEL_POWER_LIGHT_HALO_RGB if performance_governor is not None else (230, 25, 20)
+# WARNING: the fallback below must match BEZEL_POWER_LIGHT_EDGE_ADJUST_PX in performance_governor.py; it is used only when that module fails to import.
+_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX = performance_governor.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX if performance_governor is not None else (-2.0, 0.2, 0.2, -0.8)
+# WARNING: the fallback below must match BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX in performance_governor.py; it is used only when that module fails to import.
+_BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX = performance_governor.BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX if performance_governor is not None else {"christmas": (0.0, 0.0, -0.4, 0.0), "thanksgiving": (0.0, 0.0, -0.4, 0.0), "halloween": (0.0, -1.1, -0.9, 0.0)}
+# WARNING: the fallback numbers below must match BEZEL_GLASS_REFERENCE_FRAC, BEZEL_GLASS_REFERENCE_WIDTH, BEZEL_GLASS_COLOR_LIMITS, BEZEL_GLASS_SEARCH_MARGIN_FRAC in performance_governor.py; they are used only when that module fails to import.
+_BEZEL_GLASS_REFERENCE_FRAC = performance_governor.BEZEL_GLASS_REFERENCE_FRAC if performance_governor is not None else {"bezel2": (0.69537, 0.13031, 0.02313, 0.03824)}
+_BEZEL_GLASS_REFERENCE_WIDTH = performance_governor.BEZEL_GLASS_REFERENCE_WIDTH if performance_governor is not None else 1254
+_BEZEL_GLASS_COLOR_LIMITS = performance_governor.BEZEL_GLASS_COLOR_LIMITS if performance_governor is not None else (50, -1, 130)
+_BEZEL_GLASS_SEARCH_MARGIN_FRAC = performance_governor.BEZEL_GLASS_SEARCH_MARGIN_FRAC if performance_governor is not None else (0.03, 0.05)
+
+
+def _find_bezel_glass_rect(surf, stem):
+    """Returns the pygame.Rect of the low-colour glass square near where the style's base picture has it, or None when no such square is found."""
+    ref = _BEZEL_GLASS_REFERENCE_FRAC.get(stem)
+    if ref is None:
+        return None
+    try:
+        w, h = surf.get_size()
+        gx, gy, gw, gh = ref
+        x0 = max(0, int(w * (gx - _BEZEL_GLASS_SEARCH_MARGIN_FRAC[0])))
+        x1 = min(w, int(w * (gx + gw + _BEZEL_GLASS_SEARCH_MARGIN_FRAC[0])))
+        y0 = max(0, int(h * (gy - _BEZEL_GLASS_SEARCH_MARGIN_FRAC[1])))
+        y1 = min(h, int(h * (gy + gh + _BEZEL_GLASS_SEARCH_MARGIN_FRAC[1])))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None
+        area = pygame.surfarray.array3d(surf.subsurface(pygame.Rect(x0, y0, x1 - x0, y1 - y0))).astype(np.int16)
+        spread = area.max(axis=2) - area.min(axis=2)
+        level = area.mean(axis=2)
+        hit = (spread < _BEZEL_GLASS_COLOR_LIMITS[0]) & (level > _BEZEL_GLASS_COLOR_LIMITS[1]) & (level < _BEZEL_GLASS_COLOR_LIMITS[2])
+        probe = pygame.Surface(hit.shape, pygame.SRCALPHA)
+        pygame.surfarray.pixels_alpha(probe)[:, :] = (hit * 255).astype(np.uint8)
+        mask = pygame.mask.from_surface(probe, 128)
+        want = max(1, int(0.4 * gw * w * gh * h))
+        best = None
+        for part in mask.connected_components():
+            if part.count() < want:
+                continue
+            # WARNING: the smallest big-enough patch is the glass; the black ring around the gold frame is a larger patch with nearly the same middle.
+            if best is None or part.count() < best[0]:
+                # WARNING: only columns and rows at least half as full as the fullest one count, so a thin smear of shadow at one edge does not stretch the box.
+                filled = pygame.surfarray.array3d(part.to_surface())[:, :, 0] > 0
+                cols = np.nonzero(filled.sum(axis=1) >= 0.5 * filled.sum(axis=1).max())[0]
+                rows = np.nonzero(filled.sum(axis=0) >= 0.5 * filled.sum(axis=0).max())[0]
+                best = (part.count(), pygame.Rect(int(cols[0]) + x0, int(rows[0]) + y0, int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)))
+        return None if best is None else best[1]
+    except Exception as _swallowed_error:
+        _log_swallowed("_find_bezel_glass_rect", _swallowed_error)
+        return None
+
+
+def _tint_bezel_power_light(surf, stem, holiday=None):
+    """Lays a red filter over the small square of a bezel that has a power light there and lights a brighter round bulb in its middle; a holiday picture (holiday is its name, such as halloween) finds its own glass square first so the light sits the same on every picture."""
+    frac = _BEZEL_POWER_LIGHT_FRAC.get(stem)
+    if frac is None:
+        return
+    w, h = surf.get_size()
+    rect = pygame.Rect(round(w * frac[0]), round(h * frac[1]), max(1, round(w * frac[2])), max(1, round(h * frac[3])))
+    edge_scale = 1.0
+    glass = _find_bezel_glass_rect(surf, stem) if holiday else None
+    if glass is not None:
+        gx, gy, gw, gh = _BEZEL_GLASS_REFERENCE_FRAC[stem]
+        light_w = max(1, round(w * frac[2]))
+        light_h = max(1, round(h * frac[3]))
+        # WARNING: the light is placed by the middle of the glass, so a patch that comes out a pixel or two bigger on one picture does not push it off centre.
+        mid_x = glass.centerx + (frac[0] + frac[2] / 2 - gx - gw / 2) * w
+        mid_y = glass.centery + (frac[1] + frac[3] / 2 - gy - gh / 2) * h
+        rect = pygame.Rect(round(mid_x - light_w / 2), round(mid_y - light_h / 2), light_w, light_h)
+        rect = rect.clip(surf.get_rect())
+        edge_scale = w / _BEZEL_GLASS_REFERENCE_WIDTH
+    untinted = surf.subsurface(rect).copy()
+    part = surf.subsurface(rect)
+    part.fill(_BEZEL_POWER_LIGHT_ADD_RGB, special_flags=pygame.BLEND_RGB_ADD)
+    part.fill(_BEZEL_POWER_LIGHT_MULT_RGB, special_flags=pygame.BLEND_RGB_MULT)
+    extra = _BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX.get(holiday, (0.0, 0.0, 0.0, 0.0)) if glass is not None else (0.0, 0.0, 0.0, 0.0)
+    adj_left, adj_top, adj_right, adj_bottom = ((v + e) * edge_scale for v, e in zip(_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX, extra))
+    outside = []
+    inside = []
+    for amount, out_strip, in_strip in (
+            (adj_left, pygame.Rect(rect.left - 1, rect.top, 1, rect.height), pygame.Rect(rect.left, rect.top, 1, rect.height)),
+            (adj_top, pygame.Rect(rect.left, rect.top - 1, rect.width, 1), pygame.Rect(rect.left, rect.top, rect.width, 1)),
+            (adj_right, pygame.Rect(rect.right, rect.top, 1, rect.height), pygame.Rect(rect.right - 1, rect.top, 1, rect.height)),
+            (adj_bottom, pygame.Rect(rect.left, rect.bottom, rect.width, 1), pygame.Rect(rect.left, rect.bottom - 1, rect.width, 1))):
+        if amount > 0 and surf.get_rect().contains(out_strip):
+            outside.append((out_strip, amount))
+        elif amount < 0:
+            step = (in_strip.x - out_strip.x, in_strip.y - out_strip.y)
+            left_to_cover = -amount
+            while left_to_cover > 0 and rect.contains(in_strip):
+                inside.append((in_strip, min(1.0, left_to_cover)))
+                in_strip = in_strip.move(step)
+                left_to_cover -= 1.0
+    for strip, share in outside:
+        lit = surf.subsurface(strip).copy()
+        lit.fill(_BEZEL_POWER_LIGHT_ADD_RGB, special_flags=pygame.BLEND_RGB_ADD)
+        lit.fill(_BEZEL_POWER_LIGHT_MULT_RGB, special_flags=pygame.BLEND_RGB_MULT)
+        lit.set_alpha(round(255 * min(1.0, share)))
+        surf.blit(lit, strip.topleft)
+    for strip, share in inside:
+        # WARNING: the edge row or column goes back toward the bezel's own pixels by `share`, so it is tinted that much less.
+        piece = untinted.subsurface(strip.move(-rect.x, -rect.y)).copy()
+        piece.set_alpha(round(255 * min(1.0, share)))
+        surf.blit(piece, strip.topleft)
+    centre = (rect.width // 2, rect.height // 2)
+    radius = max(2, int(min(rect.width, rect.height) * _BEZEL_POWER_LIGHT_BULB_FRAC))
+    pygame.draw.circle(part, _BEZEL_POWER_LIGHT_HALO_RGB, centre, radius + max(1, radius // 3))
+    pygame.draw.circle(part, _BEZEL_POWER_LIGHT_BULB_RGB, centre, radius)
 
 
 def _preload_games_tab_logos():
@@ -2486,7 +2621,31 @@ _TV_BORDER_KNOWN_CUTOUTS = performance_governor.TV_BORDER_KNOWN_CUTOUTS if perfo
 # WARNING: the fallback numbers below must match TV_BORDER_OSD_OFFSET in performance_governor.py; they are used only when that module fails to import.
 _TV_BORDER_OSD_OFFSET = performance_governor.TV_BORDER_OSD_OFFSET if performance_governor is not None else (48, 64)
 # WARNING: the fallback below must match TV_BORDER_OSD_OFFSET_BY_STEM in performance_governor.py; it is used only when that module fails to import.
-_TV_BORDER_OSD_OFFSET_BY_STEM = performance_governor.TV_BORDER_OSD_OFFSET_BY_STEM if performance_governor is not None else {"bezel3": (160, 105)}
+_TV_BORDER_OSD_OFFSET_BY_STEM = performance_governor.TV_BORDER_OSD_OFFSET_BY_STEM if performance_governor is not None else {}
+# WARNING: the fallback below must match TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS in performance_governor.py; it is used only when that module fails to import.
+_TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS = performance_governor.TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS if performance_governor is not None else ("bezel2",)
+# WARNING: the fallback below must match TV_BORDER_OSD_REFERENCE_WINDOW in performance_governor.py; it is used only when that module fails to import.
+_TV_BORDER_OSD_REFERENCE_WINDOW = performance_governor.TV_BORDER_OSD_REFERENCE_WINDOW if performance_governor is not None else (1276, 717)
+# WARNING: the fallback below must match TV_BORDER_PICTURE_BLEED_FRAC in performance_governor.py; it is used only when that module fails to import.
+_TV_BORDER_PICTURE_BLEED_FRAC = performance_governor.TV_BORDER_PICTURE_BLEED_FRAC if performance_governor is not None else {"bezel2": (0.0019, 0.0, 0.0050, 0.0)}
+# WARNING: the fallback below must match TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS in performance_governor.py; it is used only when that module fails to import.
+_TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS = performance_governor.TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS if performance_governor is not None else ()
+# WARNING: the fallback below must match BEZEL_VOLUME_BAR_SHIFT_PX in performance_governor.py; it is used only when that module fails to import.
+_BEZEL_VOLUME_BAR_SHIFT_PX = performance_governor.BEZEL_VOLUME_BAR_SHIFT_PX if performance_governor is not None else {"bezel2": -2}
+
+
+def _menu_content_region(panel_x, panel_y, panel_w, panel_h, stem):
+    """The (x, y, w, h) of the 996 by 525 area of the menu's 1036 by 680 canvas that the controller screens draw into: with no bezel it is sized by the panel's width alone; inside a bezel the panel is stretched to its own width and height, so the area follows it on each side and fills exactly the part of the menu it belongs to."""
+    scale_x = panel_w / 1036.0
+    scale_y = panel_h / 680.0
+    if stem is None:
+        return (panel_x + int(20 * scale_x), panel_y + int(138 * scale_x), int(996 * scale_x), int(525 * scale_x))
+    return (panel_x + int(20 * scale_x), panel_y + int(138 * scale_y), int(996 * scale_x), int(525 * scale_y))
+
+
+def _bezel_visible_picture_width(width, stem):
+    """The part of a picture `width` pixels wide that shows inside the glass: a bezel whose picture grows right from the glass's left edge hides the extra on the right."""
+    return max(1, round(width / _bezel_right_grow(stem)))
 
 
 def _tv_border_osd_offset(stem):
@@ -2519,12 +2678,23 @@ SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS = performance_governor.SCHEDULER_REPEAT_GU
 BLOCK_ROTATION_CACHE_MAX_BLOCKS = performance_governor.BLOCK_ROTATION_CACHE_MAX_BLOCKS if performance_governor is not None else 12
 
 
+def _bezel_right_grow(stem):
+    """How much wider than the glass's fit the picture is drawn on a bezel that grows its picture right: the listed growth while the Warp Screen setting is on (the curve pulls the picture in from the glass), 1.0 with Warp off (the flat picture already fills the glass, so growing it would hide the right edge of the video under the bezel)."""
+    if stem not in _TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS:
+        return 1.0
+    if db is not None and not _setting_on("warp_screen_enabled"):
+        return 1.0
+    return max(1.0, _TV_BORDER_SCREEN_EXPAND.get(stem, _TV_BORDER_SCREEN_EXPAND_DEFAULT)[0])
+
+
 def _active_tv_border_screen_expand():
     """(expand_x, expand_y) for the currently-active Bezel style."""
     stem = _active_bezel_stem()
     if stem is not None:
         hit = _TV_BORDER_SCREEN_EXPAND.get(stem)
         if hit is not None:
+            if stem in _TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS:
+                return (_bezel_right_grow(stem), hit[1])
             return hit
     return _TV_BORDER_SCREEN_EXPAND_DEFAULT
 
@@ -2555,12 +2725,12 @@ def _active_menu_bezel_shrink():
 
 
 # WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_FRAC in performance_governor.py; they are used only when that module fails to import.
-_BEZEL_CHANNEL_LED_FRAC = performance_governor.BEZEL_CHANNEL_LED_FRAC if performance_governor is not None else { "bezel": (0.7010, 0.2402, 0.0676, 0.0776), "bezel1": (0.7801, 0.1191, 0.1263, 0.1282), "bezel2": (0.6954, 0.1303, 0.0231, 0.0354), }
+_BEZEL_CHANNEL_LED_FRAC = performance_governor.BEZEL_CHANNEL_LED_FRAC if performance_governor is not None else { "bezel": (0.7010, 0.2402, 0.0676, 0.0776), "bezel1": (0.7801, 0.1191, 0.1263, 0.1282) }
 
 
 # WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_GAP_FRAC in performance_governor.py; they are used only when that module fails to import.
 # WARNING: the fallback value below must match BEZEL_LED_LISTED_ONLY in performance_governor.py; it is used only when that module fails to import.
-_BEZEL_LED_LISTED_ONLY = performance_governor.BEZEL_LED_LISTED_ONLY if performance_governor is not None else ("bezel2",)
+_BEZEL_LED_LISTED_ONLY = performance_governor.BEZEL_LED_LISTED_ONLY if performance_governor is not None else ()
 _BEZEL_CHANNEL_LED_GAP_FRAC = performance_governor.BEZEL_CHANNEL_LED_GAP_FRAC if performance_governor is not None else { "bezel": 0.28, "bezel1": 0.28, }
 # WARNING: the fallback numbers below must match BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT in performance_governor.py; they are used only when that module fails to import.
 _BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT = performance_governor.BEZEL_CHANNEL_LED_GAP_FRAC_DEFAULT if performance_governor is not None else 0.28
@@ -3469,33 +3639,41 @@ def _reset_pan_scan_state(keep_shot_memory=False):
     }
 
 
-# WARNING: the fallback number below must match PAN_SCAN_KEY_CACHE_SECONDS in performance_governor.py; it is used only when that module fails to import.
-PAN_SCAN_KEY_CACHE_SECONDS = performance_governor.PAN_SCAN_KEY_CACHE_SECONDS if performance_governor is not None else 2.0
-_pan_scan_key_cache = {"path": None, "key": None, "at": 0.0}
+# WARNING: the fallback numbers below must match FILE_IDENTITY_KEY_RETRY_SECONDS and FILE_IDENTITY_KEY_CACHE_MAX in performance_governor.py; it is used only when that module fails to import.
+FILE_IDENTITY_KEY_RETRY_SECONDS = performance_governor.FILE_IDENTITY_KEY_RETRY_SECONDS if performance_governor is not None else 2.0
+_file_identity_key_cache = {}
+FILE_IDENTITY_KEY_CACHE_MAX = performance_governor.FILE_IDENTITY_KEY_CACHE_MAX if performance_governor is not None else 32
 
 
-def _pan_scan_content_key(path):
-    """Cheap, stable identity for a video file: path + size + mtime."""
-    # WARNING: this is asked once for every picture drawn; the file is looked at on the disk at most once every PAN_SCAN_KEY_CACHE_SECONDS for the same path, because a disk call on the screen thread stalled the picture for hundreds of ms when the drive was busy.
+def _file_identity_key(path):
+    """Cheap, stable identity for a video file: path + size + mtime; used to look up the file's saved picture box and Pan & Scan shots."""
+    # WARNING: this is asked once for every picture drawn; a key that was read is kept for as long as the file is wanted and the disk is asked again only for a path not seen yet, or after FILE_IDENTITY_KEY_RETRY_SECONDS when the last look failed. A disk call on the screen thread stalled the picture for 0.8-2.8 s when the drive was busy (owner log 2026-11-06: audio cut out and the picture broke up). The next-item prep thread asks for the upcoming file ahead of time so its first picture finds the key already read.
     if not path:
         return None
     _now = time.monotonic()
-    _cache = _pan_scan_key_cache
-    if _cache["path"] == path and _now - _cache["at"] < PAN_SCAN_KEY_CACHE_SECONDS:
-        return _cache["key"]
+    _cache = _file_identity_key_cache
+    _slot = os.path.normpath(str(path))
+    _hit = _cache.get(_slot)
+    if _hit is not None and (_hit[0] is not None or _now - _hit[1] < FILE_IDENTITY_KEY_RETRY_SECONDS):
+        return _hit[0]
     try:
         st = os.stat(path)
         _key = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
     except OSError as _swallowed_error:
-        _log_swallowed("_pan_scan_content_key: st = os.stat(path)", _swallowed_error)
+        _log_swallowed("_file_identity_key: st = os.stat(path)", _swallowed_error)
         _key = None
-    _cache["path"], _cache["key"], _cache["at"] = path, _key, _now
+    _cache[_slot] = (_key, _now)
+    if len(_cache) > FILE_IDENTITY_KEY_CACHE_MAX:
+        try:
+            _cache.pop(next(iter(_cache)))
+        except (RuntimeError, StopIteration, KeyError):
+            pass
     return _key
 
 
 def _pan_scan_set_content(path):
     """Tells Pan & Scan what's currently on screen, for keying the persisted shot library."""
-    _pan_scan_state["content_key"] = _pan_scan_content_key(path)
+    _pan_scan_state["content_key"] = _file_identity_key(path)
     _pan_scan_state["path"] = path
 
 
@@ -3522,7 +3700,7 @@ def _snap_standard_aspect(aspect):
 def _picture_box_set_content(path):
     """Companion to _pan_scan_set_content(); call once per frame with the same path before _apply_picture_box_crop(), re-reading the cached scan result only when content_key changes."""
     global _picture_box_fit_state
-    key = _pan_scan_content_key(path)
+    key = _file_identity_key(path)
     _now = time.monotonic()
     if key == _picture_box_fit_state["content_key"]:
         _retry_at = _picture_box_fit_state["retry_at"]
@@ -4131,9 +4309,14 @@ def _overlay_target_for_menu(screen):
     if shrink_x >= 1.0 and shrink_y >= 1.0:
         return target
     tw, th = target.get_size()
-    new_w = max(1, int(tw * min(shrink_x, 1.0)))
+    _stem = _bezel_led_stem()
+    _grow = 1.0
+    if _full_tv_border_geometry(*screen.get_size()) is not None:
+        # WARNING: on a bezel whose picture grows right past the glass, the menu is laid out in the part that shows and its width is cut by the same growth, so it lands where it did before the picture was widened.
+        _grow = _bezel_right_grow(_stem)
+    new_w = max(1, int(tw * min(shrink_x, 1.0) / _grow))
     new_h = max(1, int(th * min(shrink_y, 1.0)))
-    rect = pygame.Rect((tw - new_w) // 2, (th - new_h) // 2, new_w, new_h)
+    rect = pygame.Rect(int(tw / (2 * _grow)) - new_w // 2, (th - new_h) // 2, new_w, new_h)
     try:
         return target.subsurface(rect)
     except Exception as e:
@@ -4196,9 +4379,15 @@ def _bezel_composite_inner_rect(win_w, win_h):
         return None
     new_w = max(1, int(inner.width * _BEZEL_PICTURE_FIT_MARGIN))
     new_h = max(1, int(inner.height * _BEZEL_PICTURE_FIT_MARGIN))
-    return pygame.Rect(inner.x + (inner.width - new_w) // 2,
-                        inner.y + (inner.height - new_h) // 2,
-                        new_w, new_h)
+    fitted = pygame.Rect(inner.x + (inner.width - new_w) // 2,
+                          inner.y + (inner.height - new_h) // 2,
+                          new_w, new_h)
+    bleed = _TV_BORDER_PICTURE_BLEED_FRAC.get(_active_bezel_stem())
+    if bleed is not None:
+        left, top, right, bottom = (round(fitted.width * bleed[0]), round(fitted.height * bleed[1]),
+                                    round(fitted.width * bleed[2]), round(fitted.height * bleed[3]))
+        fitted = pygame.Rect(fitted.x - left, fitted.y - top, fitted.width + left + right, fitted.height + top + bottom)
+    return fitted
 
 
 def _osd_anisotropic_correct(surf, win_w, win_h, ignore_package_aspect=False):
@@ -4267,6 +4456,8 @@ def _bezel_composite_geometry(win_w, win_h, ignore_package_aspect=False):
     draw_w = max(1, round(sw * scale_x))
     draw_h = max(1, round(sh * scale_y))
     dest_x = inner.x + (inner.width - draw_w) // 2
+    if _bezel_right_grow(_active_bezel_stem()) > 1.0:
+        dest_x = inner.x
     dest_y = inner.y + (inner.height - draw_h) // 2
     _dbg["draw_overflows_inner"] = (draw_w > inner.width, draw_h > inner.height)
     _bezel_composite_geometry_debug.clear()
@@ -5350,7 +5541,7 @@ _STATIC_NOISE_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_AMBIENT_REF
 _STATIC_NOISE_POOL_FRAMES = performance_governor.STATIC_NOISE_POOL_FRAMES if performance_governor is not None else 12
 _STATIC_NOISE_POOL_SIZES = performance_governor.STATIC_NOISE_POOL_SIZES if performance_governor is not None else 3
 # WARNING: the fallback numbers below must match STATIC_NOISE_GRAIN_PX and STATIC_NOISE_BUILD_GAP_MS in performance_governor.py; they are used only when that module fails to import.
-_STATIC_NOISE_GRAIN_PX = performance_governor.STATIC_NOISE_GRAIN_PX if performance_governor is not None else 3
+_STATIC_NOISE_GRAIN_PX = performance_governor.STATIC_NOISE_GRAIN_PX if performance_governor is not None else 4
 _STATIC_NOISE_BUILD_GAP_MS = performance_governor.STATIC_NOISE_BUILD_GAP_MS if performance_governor is not None else 80
 # WARNING: the fallback numbers below must match STATIC_NOISE_STRENGTH_STEPS and STATIC_NOISE_BAKED_MAX in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_STRENGTH_STEPS = performance_governor.STATIC_NOISE_STRENGTH_STEPS if performance_governor is not None else 16
@@ -6073,6 +6264,8 @@ STATUS_BANNER_DURATION_MS = performance_governor.STATUS_BANNER_DURATION_MS if pe
 # WARNING: the 5000 fallback must match CAPTION_MEMORY_BANNER_SECONDS in performance_governor.py; it is used only when that module fails to import.
 CAPTION_MEMORY_BANNER_MS = int(performance_governor.CAPTION_MEMORY_BANNER_SECONDS * 1000) if performance_governor is not None else 5000
 CAPTION_MEMORY_BANNER_LABEL = performance_governor.CAPTION_MEMORY_BANNER_LABEL if performance_governor is not None else "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
+# WARNING: the 6000 fallback must match NOTICE_BANNER_SECONDS in performance_governor.py; it is used only when that module fails to import.
+NOTICE_BANNER_MS = int(performance_governor.NOTICE_BANNER_SECONDS * 1000) if performance_governor is not None else 6000
 
 _drive_streak_signature = None
 _drive_streak_consumed  = False
@@ -6115,6 +6308,15 @@ _status_banner_current    = None
 _status_banner_started_at = None
 _caption_memory_refusal_pending = False
 _caption_memory_banner_pending = False
+_notice_banner_text = None
+_notice_banner_fresh = False
+
+
+def post_status_notice(text):
+    """Puts a one-line warning in the shared banner bar (any thread); a newer one replaces the one showing."""
+    global _notice_banner_text, _notice_banner_fresh
+    _notice_banner_text = str(text)
+    _notice_banner_fresh = True
 
 
 def _on_caption_memory_refused(total_gb, available_gb, needed_gb):
@@ -6298,6 +6500,8 @@ def _advance_status_banner_streaks():
 
 
 def _status_banner_is_active(name):
+    if name == "notice":
+        return _notice_banner_text is not None
     if name == "captions_memory":
         return _caption_memory_banner_pending
     if name == "server":
@@ -6312,7 +6516,7 @@ def _status_banner_is_active(name):
 
 
 def _status_banner_is_consumed(name):
-    if name == "captions_memory":
+    if name in ("captions_memory", "notice"):
         return False
     if name == "server":
         return _server_streak_consumed
@@ -6329,7 +6533,10 @@ def _mark_status_banner_consumed(name):
     global _drive_streak_consumed, _drive_streak_consumed_at, _gamepad_streak_consumed
     global _missing_media_streak_consumed, _missing_media_streak_consumed_at
     global _server_streak_consumed, _server_streak_consumed_at, _caption_memory_banner_pending
-    if name == "captions_memory":
+    global _notice_banner_text
+    if name == "notice":
+        _notice_banner_text = None
+    elif name == "captions_memory":
         _caption_memory_banner_pending = False
     elif name == "server":
         _server_streak_consumed = True
@@ -6351,10 +6558,14 @@ def _drive_banner_label(roots):
 
 def _status_banner_duration_ms(name):
     """How long a shared status banner stays up."""
+    if name == "notice":
+        return NOTICE_BANNER_MS
     return CAPTION_MEMORY_BANNER_MS if name == "captions_memory" else STATUS_BANNER_DURATION_MS
 
 
 def _status_banner_label(name):
+    if name == "notice":
+        return _notice_banner_text
     if name == "captions_memory":
         return CAPTION_MEMORY_BANNER_LABEL
     if name == "server" and _server_streak_signature is not None:
@@ -6394,11 +6605,16 @@ def _draw_status_banner_bar(screen, label):
 
 
 def _draw_status_banners(screen):
-    global _status_banner_current, _status_banner_started_at
+    global _status_banner_current, _status_banner_started_at, _notice_banner_fresh
     try:
         _advance_status_banner_streaks()
         now = pygame.time.get_ticks()
-        order = ("captions_memory", "server", "drive", "gamepad", "missing_media")
+        order = ("notice", "captions_memory", "server", "drive", "gamepad", "missing_media")
+
+        if _notice_banner_fresh and _notice_banner_text is not None:
+            _notice_banner_fresh = False
+            _status_banner_current = "notice"
+            _status_banner_started_at = now
 
         if _caption_memory_banner_pending and _status_banner_current != "captions_memory":
             _status_banner_current = "captions_memory"
@@ -6821,13 +7037,17 @@ def _draw_visualizer_song_card(screen):
 
     _MARGIN_X_PX = max(1, round(48 * _inv_scale_x))
     _MARGIN_Y_PX = max(1, round(64 * _inv_scale_y))
+    if geom is not None and _bezel_led_stem() in _TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS:
+        _MARGIN_X_PX = max(1, round(_MARGIN_X_PX * sw / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[0])))
+        _MARGIN_Y_PX = max(1, round(_MARGIN_Y_PX * sh / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[1])))
 
     import colorsys as _card_colorsys
     _hue = (db.config.get("theme_ui_hue", 140) / 360.0) if db is not None else (140 / 360.0)
     _hr, _hg, _hb = _card_colorsys.hsv_to_rgb(_hue, 0.9, 1.0)
     theme_green_color = (int(_hr * 255), int(_hg * 255), int(_hb * 255))
 
-    max_text_width = max(10, picture_rect.width - _MARGIN_X_PX * 2)
+    _visible_w = _bezel_visible_picture_width(picture_rect.width, _bezel_led_stem() if geom is not None else None)
+    max_text_width = max(10, _visible_w - _MARGIN_X_PX * 2)
     font, _fitted_size = _vis_card_font_that_fits((line1, line2), base_font_size, max_text_width)
     line1 = _vis_card_truncate_to_width(font, line1, max_text_width)
     line2 = _vis_card_truncate_to_width(font, line2, max_text_width)
@@ -6835,9 +7055,12 @@ def _draw_visualizer_song_card(screen):
     line1_y = picture_rect.y + _MARGIN_Y_PX
     line1_x = picture_rect.x + _MARGIN_X_PX
 
-    _picture_right = picture_rect.x + picture_rect.width
+    _picture_right = picture_rect.x + _visible_w
     _surf1 = font.render(line1, True, theme_green_color)
     _surf2 = font.render(line2, True, theme_green_color)
+    if geom is not None and _bezel_led_stem() in _TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS:
+        _surf1 = _osd_anisotropic_correct(_surf1, sw, sh, ignore_package_aspect=_vis_ignores_package_aspect(sw, sh))
+        _surf2 = _osd_anisotropic_correct(_surf2, sw, sh, ignore_package_aspect=_vis_ignores_package_aspect(sw, sh))
     # WARNING: the title lines up with the channel number's top (the bezel LED readout or the on-picture number, whichever is drawn), which sits in a different place on each bezel; it is pulled up or down only as far as needed to keep both lines on the screen.
     _aligned_y = app_state.get("_ch_num_generic_osd_y")
     if isinstance(_aligned_y, (int, float)):
@@ -8975,13 +9198,33 @@ def _load_ch03_music_sound(path):
         return None
 
 
+def _warm_ch03_entry_assets():
+    """Background thread: decodes the menu-music track that plays next and loads the on-screen key pictures, so the first visit to channel 03 does not freeze the screen for a second."""
+    # WARNING: the first visit to channel 03 stalled the screen 1.26 s (owner log 2026-11-06 15:04): 245 ms decoding the menu track and about 500 ms loading the key pictures, both on the screen thread.
+    try:
+        if db is not None and db.config.get("ch03_menu_music_enabled", True):
+            _playlist = db.config.get("ch03_menu_music", []) or []
+            if _playlist:
+                _entry = _playlist[app_state.get("ch03_menu_music_idx", 0) % len(_playlist)]
+                _track = _entry.get("path", "") if isinstance(_entry, dict) else str(_entry)
+                if _track and os.path.isfile(_track):
+                    _load_ch03_music_sound(_track)
+    except Exception as _swallowed_error:
+        _log_swallowed("_warm_ch03_entry_assets: menu music", _swallowed_error)
+    try:
+        for _name in list(ui.CONTROL_KEY_FILES):
+            if _app_shutting_down.is_set():
+                return
+            if ui._control_key_trimmed(_name) is None:
+                # WARNING: a picture that failed to load here is forgotten, so the screen thread tries once more and the key is not shown as text for the rest of the run.
+                ui._control_key_raw.pop(_name, None)
+    except Exception as _swallowed_error:
+        _log_swallowed("_warm_ch03_entry_assets: key pictures", _swallowed_error)
+
+
 def _ch03_music_is_playing():
     """True if the dedicated ch03 music channel is actively playing."""
     return _get_ch03_music_channel().get_busy()
-
-
-def _ch03_music_is_stalled():
-    return False
 
 
 def _set_ch03_menu_music_volume(raw_vol, muted=False):
@@ -9254,7 +9497,13 @@ def _start_ch03_menu_music():
     picked = _ch03_next_playlist_entry(playlist)
     if picked is None:
         log.warning("[CH03 MUSIC] No playable tracks found in playlist -- all files missing.")
-        return
+        # WARNING: with Menu Music on the list never stays silent (owner 2026-11-06): when no track can be found the shipped track plays and the banner bar says so, once per visit.
+        _default_track = os.path.join(resolve_main_dir(), "audio", "Game Music", "gamemusic.mp3")
+        if not os.path.isfile(_default_track):
+            return
+        if app_state.get("ch03_menu_music_track") != _default_track:
+            post_status_notice("GAME MUSIC NOT FOUND, PLAYING DEFAULT")
+        picked = (0, _default_track, {"path": _default_track})
     idx, track, candidate = picked
     track_gain = _ch03_track_gain(track, candidate)
     sound = _load_ch03_music_sound(track)
@@ -9333,6 +9582,9 @@ def _toggle_all_consoles():
     new_state = not all_on
     for c in others:
         enabled_map[c] = new_state
+    # WARNING: at least one console must stay on; with every other console off and the DVD player switched off too, nothing would be left to browse, so the DVD player is switched back on.
+    if not new_state and not enabled_map.get("DVD", True):
+        enabled_map["DVD"] = True
     db.save_settings()
     if game_deck is not None:
         game_deck.refresh_from_config(db.config)
@@ -9341,6 +9593,8 @@ def _toggle_all_consoles():
 
 def _toggle_all_profiles():
     db.config["all_profiles_sync"] = not db.config.get("all_profiles_sync", False)
+    if db.config["all_profiles_sync"] and game_deck is not None:
+        game_deck.turn_on_stick_as_dpad_everywhere()
     _mark_settings_dirty()
     print(f"[GAMES] all_profiles_sync (All Settings) = {db.config['all_profiles_sync']}")
 
@@ -19531,6 +19785,8 @@ def _background_subsystem_worker():
 
     threading.Thread(target=_music_precache_worker, daemon=True, name="MusicPrecache").start()
 
+    threading.Thread(target=_warm_ch03_entry_assets, daemon=True, name="Ch03Warm").start()
+
     threading.Thread(target=_caption_precache_worker, daemon=True, name="CaptionPrecache").start()
 
     # WARNING: duration has its own scan thread in the same order as the chain in _probe_upcoming_media; adding another precache thread would scan files out of priority order.
@@ -21350,6 +21606,11 @@ def _next_item_prep_worker():
         made = []
         for norm_p in paths:
             _season_guess_warm(norm_p)
+            # WARNING: reads the upcoming file's identity here, off the screen thread, so the first picture of the next show never waits on the disk for it.
+            try:
+                _file_identity_key(norm_p)
+            except Exception as _swallowed_error:
+                _log_swallowed("_next_item_prep_worker: _file_identity_key(norm_p)", _swallowed_error)
         for norm_p in paths:
             if _stale():
                 break
@@ -25412,9 +25673,49 @@ _wedged_engine_replacement_inflight = False
 _dvd_engine_rebuild_deferred = False
 
 
+_picture_end_checked = set()
+_picture_end_checked_lock = threading.Lock()
+
+
+def _check_picture_end_after_stall(stalled_str, norm_path):
+    """Off the screen thread: re-reads the header of the file that stalled; when its picture ends before its saved length, the saved length is corrected and the channel is re-tuned at once from the schedule."""
+    try:
+        import media_library as _ml
+        result = _ml.combined_header_probe(norm_path)
+        if not result.ok or not result.picture_ends_early:
+            return False
+        hub = media.get_duration_hub()
+        if hub is None or not hub.correct_measured(norm_path, result.picture_seconds, source="ffmpeg_picture"):
+            return False
+        log.warning("[PICTURE ENDS EARLY] ch%s %s: the picture ends at %.0fs while the saved length was longer; the saved length is now the picture's, and the channel is re-tuned from the schedule",
+                    stalled_str, os.path.basename(norm_path), result.picture_seconds or 0.0)
+        if str(app_state.get("current_channel", "")).zfill(2) == stalled_str:
+            # WARNING: zero makes the stall check fire again on its next pass, and the re-tune then reads the corrected length from the schedule.
+            app_state["_last_new_frame_ticks"] = 0
+        return True
+    except Exception as e:
+        log.warning("[PICTURE ENDS EARLY] could not check %s: %s", os.path.basename(str(norm_path)), e)
+        return False
+
+
+def _start_picture_end_check(stalled_str):
+    """Starts the one-time picture-end check for the file that just stalled; each file is checked once per run."""
+    engine_file = getattr(vlc_engine, "current_filepath", "") if vlc_engine is not None else ""
+    if not engine_file or stalled_str == "03":
+        return
+    norm_path = os.path.normpath(os.path.abspath(str(engine_file)))
+    with _picture_end_checked_lock:
+        if norm_path in _picture_end_checked:
+            return
+        _picture_end_checked.add(norm_path)
+    threading.Thread(target=_check_picture_end_after_stall, args=(stalled_str, norm_path),
+                     daemon=True, name="PictureEndCheck").start()
+
+
 def _recover_from_playback_stall(stalled_ch, stalled_ms):
     """Re-tunes the stalled channel in place from the clock; it never moves the viewer to another channel."""
     stalled_str = str(stalled_ch).zfill(2)
+    _start_picture_end_check(stalled_str)
     print(f"[STALL WATCHDOG] Channel {stalled_str} produced no new frame for "
           f"{stalled_ms}ms (>= {PLAYBACK_STALL_TIMEOUT_MS}ms threshold) — "
           f"re-tuning the same channel from the schedule.")
@@ -26042,6 +26343,8 @@ def _vlc_log_writer_loop():
             path = VLC_DEBUG_LOG_PATH
             if not path:
                 continue
+            if _VLC_QUIET_PIECES and any(piece in line_text for piece in _VLC_QUIET_PIECES):
+                continue
             if f is None:
                 f = open(path, "a", encoding="utf-8", errors="ignore")
             f.write(line_text + "\n")
@@ -26053,6 +26356,10 @@ def _vlc_log_writer_loop():
             except Exception as _swallowed_error:
                 _log_swallowed("_vlc_log_writer_loop: if f is not None:", _swallowed_error)
             f = None
+
+
+# WARNING: the quiet list comes from performance_governor.py; when that module fails to import nothing is left out.
+_VLC_QUIET_PIECES = tuple(performance_governor.LOG_QUIET_VLC_PIECES) if performance_governor is not None else ()
 
 
 def _vlc_log_size_probe_worker(path, result_box):
@@ -29855,9 +30162,8 @@ while True:
                                     and getattr(game_deck, "_libretro_console", None) in MULTITAP_CONSOLES
                                     and hasattr(game_deck, "toggle_multitap_live")):
                                 status = game_deck.toggle_multitap_live(enabled)
-                                if status == "UNSUPPORTED" and hasattr(game_deck, "_libretro_osd_msg"):
-                                    game_deck._libretro_osd_msg   = "MULTITAP NOT SUPPORTED THIS SESSION"
-                                    game_deck._libretro_osd_until = pygame.time.get_ticks() + 2500
+                                if status == "UNSUPPORTED":
+                                    post_status_notice("MULTITAP NOT SUPPORTED THIS SESSION")
                             print(f"[GAMES] Multitap (all consoles) = {enabled}")
                         elif row_id == "stick_deadzone":
                             app_state["menu_layer"] = "GAMES_STICK_DZ"
@@ -29910,8 +30216,7 @@ while True:
                         elif row_id == "dvd_resume_toggle":
                             enabled = not db.config.get("dvd_resume_enabled", False)
                             db.config["dvd_resume_enabled"] = enabled
-                            if not enabled:
-                                db.config["dvd_resume_positions"] = {}
+                            # WARNING: switching Resume off keeps every saved place (owner 2026-11-06); the places are written whether or not it is on.
                             db.save_settings()
                             if game_deck is not None: game_deck.refresh_from_config(db.config)
                             print(f"[GAMES] DVD resume-from-last-played enabled = {enabled}")
@@ -30228,12 +30533,19 @@ while True:
                                    .get("active", 1))
 
                     def _set_active_prof(con, pnum):
-                        db.config.setdefault("console_profiles", {}) \
-                                 .setdefault(con, {"active": 1, "profiles": {}}) \
-                                 ["active"] = pnum
+                        from game_deck import CONSOLE_ORDER
+                        # WARNING: with All Settings on, picking a profile on one console picks it on every console.
+                        _targets = [c for c in CONSOLE_ORDER if c != "MENU"] if db.config.get("all_profiles_sync", False) else [con]
+                        if con not in _targets:
+                            _targets.append(con)
+                        for _target in _targets:
+                            db.config.setdefault("console_profiles", {}) \
+                                     .setdefault(_target, {"active": 1, "profiles": {}}) \
+                                     ["active"] = pnum
                         db.save_settings()
                         if game_deck is not None and hasattr(game_deck, "sync_profile_from_db"):
-                            game_deck.sync_profile_from_db(con, db.config)
+                            for _target in _targets:
+                                game_deck.sync_profile_from_db(_target, db.config)
 
                     def _is_live_target(con, pnum):
                         return (game_deck is not None
@@ -30282,18 +30594,19 @@ while True:
                             print(f"[GAMES] Profile {profile_num} now active for {console_key}")
                         elif profile_row == SAVE_ROW and is_active:
                             if game_deck is not None and hasattr(game_deck, "libretro_save_to_profile"):
-                                ok = game_deck.libretro_save_to_profile(console_key, profile_num)
-                                msg = f"SAVED TO PROFILE {profile_num}" if ok else "SAVE FAILED"
-                                if hasattr(game_deck, "_libretro_osd_msg"):
-                                    game_deck._libretro_osd_msg   = msg
-                                    game_deck._libretro_osd_until = pygame.time.get_ticks() + 2000
+                                # WARNING: a save that worked says nothing (owner 2026-11-06); the banner bar speaks only when something is wrong.
+                                _why = game_deck.profile_action_block_reason(console_key)
+                                if _why:
+                                    post_status_notice(_why)
+                                elif not game_deck.libretro_save_to_profile(console_key, profile_num):
+                                    post_status_notice("SAVE TO PROFILE %d FAILED" % profile_num)
                         elif profile_row == LOAD_ROW and is_active:
                             if game_deck is not None and hasattr(game_deck, "libretro_load_from_profile"):
-                                ok = game_deck.libretro_load_from_profile(console_key, profile_num)
-                                msg = f"LOADED PROFILE {profile_num}" if ok else "NO SAVE / FAILED"
-                                if hasattr(game_deck, "_libretro_osd_msg"):
-                                    game_deck._libretro_osd_msg   = msg
-                                    game_deck._libretro_osd_until = pygame.time.get_ticks() + 2000
+                                _why = game_deck.profile_action_block_reason(console_key)
+                                if _why:
+                                    post_status_notice(_why)
+                                elif not game_deck.libretro_load_from_profile(console_key, profile_num):
+                                    post_status_notice("NO SAVE FOUND IN PROFILE %d" % profile_num)
                         elif profile_row == AUTO_SAVE_ROW and is_active:
                             cfg = _get_prof_cfg(console_key, profile_num)
                             cfg["auto_save"] = not cfg.get("auto_save", False)
@@ -32475,7 +32788,18 @@ while True:
                 _ch_scale_x = 1.0 / _ch_geom[1]
             else:
                 _ch_scale_x = 1.0
-            _osd_right_off, _osd_top_off = _tv_border_osd_offset(_bezel_led_stem())
+            # WARNING: with Bezel off the last bezel's file name is still remembered, so the style only counts while a bezel is really drawn.
+            _osd_stem = _bezel_led_stem() if _ch_geom is not None else None
+            _osd_right_off, _osd_top_off = _tv_border_osd_offset(_osd_stem)
+            if _osd_stem in _TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS:
+                # WARNING: these offsets are in the picture's own pixels (the spot the number has with Bezel off), so they are used as they are and shrink with the picture inside the bezel.
+                _win_unit_x = w_w / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[0])
+                _win_unit_y = w_h / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[1])
+                _off_scale, _off_scale_x = _win_unit_y, _win_unit_x
+                # WARNING: the number's size is in the picture's own pixels too, so the bezel's composite shrinks it with the picture; it is not scaled up first to come out at a fixed size.
+                _ch_scale = _win_unit_y
+            else:
+                _off_scale, _off_scale_x = _ch_scale, _ch_scale_x
             def _cs(px):
                 return max(1, round(px * _ch_scale))
             def _cs_x(px):
@@ -32484,19 +32808,22 @@ while True:
                 # WARNING: do not apply _cs()'s max(1, ...) floor to a signed offset; a negative value would silently clamp up to +1.
                 return round(px * _ch_scale)
 
-            _true_top_y = _ch_rect.y + _cs_signed(_osd_top_off)
+            _true_top_y = _ch_rect.y + round(_osd_top_off * _off_scale)
             app_state["_ch_num_generic_osd_y"] = _true_top_y
             app_state["_ch_num_osd_in_window"] = False
 
-            _generic_osd_y = _true_top_y + _cs_signed(_CH_NUM_TOP_ALIGN_NUDGE_PX)
+            _generic_osd_y = _true_top_y + round(_CH_NUM_TOP_ALIGN_NUDGE_PX * _off_scale)
 
             if (_channel_transition_active
                     or now < app_state.get("osd_channel_timer", 0)):
                 f_osd = _cached_sys_font("Arial Black", _cs(54), bold=False)
                 display_txt = _bezel_led_channel_text()
                 _osd_surf = f_osd.render(display_txt, True, OSD_COLOR)
+                if _osd_stem in _TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS:
+                    # WARNING: this bezel's picture is stretched wider than tall, so the number is drawn narrower by the same ratio to come out in the font's own shape.
+                    _osd_surf = _osd_anisotropic_correct(_osd_surf, w_w, w_h, ignore_package_aspect=_content_ignores_package_aspect(w_w, w_h))
                 _osd_y = _generic_osd_y
-                _osd_x = _ch_rect.right - _cs_x(_osd_right_off) - _osd_surf.get_width()
+                _osd_x = _ch_rect.x + _bezel_visible_picture_width(_ch_rect.width, _osd_stem) - max(1, round(_osd_right_off * _off_scale_x)) - _osd_surf.get_width()
                 if _osd_x < _ch_rect.x:
                     _osd_x = _ch_rect.x
                 screen.blit(_osd_surf, (_osd_x, _osd_y))
@@ -32513,6 +32840,11 @@ while True:
                 return max(1, round(px * _vol_scale))
 
             _vol_cx  = _vol_rect.centerx
+            _vol_stem = _bezel_led_stem() if _bezel_composite_geometry(w_w, w_h, ignore_package_aspect=True) is not None else None
+            _vol_shift = _BEZEL_VOLUME_BAR_SHIFT_PX.get(_vol_stem, 0)
+            if _vol_shift:
+                _vol_geom = _bezel_composite_geometry(w_w, w_h, ignore_package_aspect=True)
+                _vol_cx += round(_vol_shift / (_vol_geom[1] if _vol_geom[1] > 0 else 1.0))
             _vol_bot = _vol_rect.bottom - _vs(120)
             f_vol_text = _cached_sys_font("Courier New", _vs(30), bold=True)
             f_vol_bar  = _cached_sys_font("Courier New", _vs(64), bold=True)
@@ -32702,14 +33034,14 @@ while True:
             _sz_r, _sz_g, _sz_b = _szcs.hsv_to_rgb(_sz_h, 0.88, 1.0)
             _sz_surf = _overlay_target_for_menu(screen)
             _sz_x, _sz_y, _sz_w, _sz_h2 = menu_panel_rect(_sz_surf.get_width(), _sz_surf.get_height(), db)
-            _sz_scale = _sz_w / 1036.0
+            _sz_region = _menu_content_region(_sz_x, _sz_y, _sz_w, _sz_h2, _bezel_led_stem() if _full_tv_border_geometry(*screen.get_size()) is not None else None)
             import game_deck as _sz_mod
             _sz_player = app_state.get("stick_dz_player", 1)
             _sz_rows = menu_nav.stick_dz_rows(_sz_mod.stick_switch_on(db.config, _sz_player))
             _sz_mod.mark_stick_test_open()
             _sz_mod.render_stick_deadzone_ui(
                 _sz_surf,
-                (_sz_x + int(20 * _sz_scale), _sz_y + int(138 * _sz_scale), int(996 * _sz_scale), int(525 * _sz_scale)),
+                _sz_region,
                 (int(_sz_r * 255), int(_sz_g * 255), int(_sz_b * 255)), db, app_state.get("stick_dz_cursor", 0), _sz_rows,
                 _sz_mod.stick_test_sticks(_sz_player), _sz_player)
 
@@ -32725,11 +33057,7 @@ while True:
             _ui_col = (int(_cr * 255), int(_cg * 255), int(_cb * 255))
             _cm_surf = _overlay_target_for_menu(screen)
             _cm_x, _cm_y, _cm_w, _cm_h = menu_panel_rect(_cm_surf.get_width(), _cm_surf.get_height(), db)
-            _content_scale = _cm_w / 1036.0
-            _ctrl_x = _cm_x + int(20 * _content_scale)
-            _ctrl_y = _cm_y + int(138 * _content_scale)
-            _ctrl_w = int(996 * _content_scale)
-            _ctrl_h = int(525 * _content_scale)
+            _ctrl_x, _ctrl_y, _ctrl_w, _ctrl_h = _menu_content_region(_cm_x, _cm_y, _cm_w, _cm_h, _bezel_led_stem() if _full_tv_border_geometry(*screen.get_size()) is not None else None)
             game_deck.render_controller_mapping_ui(_cm_surf, (_ctrl_x, _ctrl_y, _ctrl_w, _ctrl_h), _ui_col, db, console=app_state.get("games_ctrl_console", "GBA"))
             game_deck.poll_xinput_for_remap()
             game_deck.poll_controller_test_lights(app_state.get("games_ctrl_console", "GBA"))
@@ -32877,12 +33205,6 @@ while True:
               and not _ch03_music_is_playing()
               and db is not None and db.config.get("ch03_menu_music")):
             _start_ch03_menu_music()
-        elif (_mm_browsing and not _mm_dvd and not _mm_shield_active
-              and db is not None and db.config.get("ch03_menu_music_enabled", True)
-              and _ch03_music_is_stalled()):
-            print("[CH03 MUSIC] Playback stalled in Opening/Buffering — forcing restart.")
-            _stop_ch03_menu_music()
-            _start_ch03_menu_music()
         app_state["_ch03_mm_last_mode"] = _mm_mode if not _mm_dvd else "DVD_PLAYER"
 
     if app_state.get("current_channel") == "03" and not app_state.get("is_loading", False):
@@ -32993,6 +33315,10 @@ while True:
     elif app_state.get("current_channel") != "03":
         if app_state.get("ch03_screensaver_active", False):
             app_state["ch03_screensaver_active"] = False
+            # WARNING: leaving Channel 03 while the screen saver is up must lift the screen saver's own freeze; the freeze reason stayed on the game and it came back frozen (Channel 03 audit 2026-11-06).
+            if app_state.get("ch03_ss_was_game_running", False) and game_deck is not None:
+                game_deck.set_paused(False, reason="screensaver", muted=True)
+            app_state["ch03_ss_was_game_running"] = False
         app_state["ch03_screensaver_last_input"] = 0
         app_state["ch03_ss_x"] = None
         app_state["ch03_ss_y"] = None

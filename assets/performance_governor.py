@@ -548,8 +548,11 @@ TV_BORDER_KNOWN_CUTOUTS = {
 TV_BORDER_OSD_OFFSET = (48, 64)
 # VALUES CHANGE HERE (bezels whose number and song title sit further in from the picture's top right corner than the others, in picture pixels (from the right edge, from the top edge); bezel3's glass has deep rounded corners that hid the number and cut the title off at the top, so both come in to the spot the owner marked on 2026-11-06)
 TV_BORDER_OSD_OFFSET_BY_STEM = {
-    "bezel3": (160, 105),
 }
+# VALUES CHANGE HERE (bezels whose on-picture channel number and song title offsets above are in the picture's own pixels, the same spot the number has with Bezel off, so inside the bezel they shrink with the picture; on the others the offsets are in finished screen pixels)
+TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS = ("bezel2",)
+# VALUES CHANGE HERE (the windowed-mode window size, in pixels, that the on-picture channel number and song title spots were set in; on the bezels above they scale with the window so full screen shows them in the same place)
+TV_BORDER_OSD_REFERENCE_WINDOW = (1276, 717)
 
 # VALUES CHANGE HERE
 PIXEL_ORBITER_MARGIN_PX = 3
@@ -609,8 +612,8 @@ STATIC_NOISE_AMBIENT_REFRESH_MS = 33
 # VALUES CHANGE HERE (Static Noise: how many noise pictures are made once per screen size and shown in random order, never the same one twice running, so the snow shows no repeating pattern; how many screen sizes keep their pictures)
 STATIC_NOISE_POOL_FRAMES = 12
 STATIC_NOISE_POOL_SIZES = 3
-# VALUES CHANGE HERE (Static Noise grain: the size in screen pixels of one speck of snow, 1 is the finest and costs the most to make, 3 is the coarse snow of V347; at most one new picture is made every STATIC_NOISE_BUILD_GAP_MS while the set fills, so the screen thread is never given a burst of them)
-STATIC_NOISE_GRAIN_PX = 3
+# VALUES CHANGE HERE (Static Noise grain: the size in screen pixels of one speck of snow, 1 is the finest and costs the most to make, 3 was the snow until 2026-11-06, 4 is a little bigger so it can be seen; at most one new picture is made every STATIC_NOISE_BUILD_GAP_MS while the set fills, so the screen thread is never given a burst of them)
+STATIC_NOISE_GRAIN_PX = 4
 STATIC_NOISE_BUILD_GAP_MS = 80
 # VALUES CHANGE HERE (Static Noise: the snow's strength is baked into each picture's own see-through values in this many steps, because a picture with both its own see-through values and an overall strength drew about 8 times slower; how many baked pictures are kept, all sizes and strengths together)
 STATIC_NOISE_STRENGTH_STEPS = 16
@@ -643,6 +646,8 @@ UI_COMPOSITOR_FPS = 60.0
 # VALUES CHANGE HERE
 STATUS_BANNER_DURATION_MS = 30000
 CAPTION_MEMORY_BANNER_LABEL = "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
+# VALUES CHANGE HERE (one-line warnings in the shared banner bar, such as Game Music Not Found: seconds the bar stays up)
+NOTICE_BANNER_SECONDS = 6.0
 
 # VALUES CHANGE HERE
 DRIVE_BANNER_REARM_MS = 5 * 60 * 1000
@@ -700,8 +705,9 @@ LOUDNESS_LEARN_SINGLE_CHANGE_DB = 3.0
 LOUDNESS_LEARN_MAX_OFFSET_DB = 12
 LOUDNESS_LEARN_SETTLE_SECONDS = 5.0
 
-# VALUES CHANGE HERE (picture drawing: seconds a video file's size and date are remembered before the disk is asked again, so the disk is not asked for every picture drawn)
-PAN_SCAN_KEY_CACHE_SECONDS = 2.0
+# VALUES CHANGE HERE (picture drawing: a video file's size and date are kept while it plays; after a failed look the disk is asked again after this many seconds; the number of files kept at once is the second row)
+FILE_IDENTITY_KEY_RETRY_SECONDS = 2.0
+FILE_IDENTITY_KEY_CACHE_MAX = 32
 
 # VALUES CHANGE HERE
 GAIN_CHECK_FOLDER_REVISIT_S = 600
@@ -762,6 +768,16 @@ TV_BORDER_SCREEN_EXPAND = {
     "bezel2": (1.00, 1.00),
 }
 TV_BORDER_SCREEN_EXPAND_DEFAULT = (1.00, 1.00)
+# VALUES CHANGE HERE (bezels whose picture grows to the right from the glass's left edge instead of from the middle; none now, because the picture fits the glass on every bezel, and growing it hid the right edge of the video under the bezel)
+TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS = ()
+# VALUES CHANGE HERE (bezels whose picture is drawn this much past the glass's cut-out on each side, as shares of the cut-out's width (left, right) and height (top, bottom); the bezel's own frame is drawn over the picture, so the extra hides under it and only closes the thin black gap where the whole-pixel cut-out falls short of the real hole. Measured on bezel 3 in the 1280 x 720 window on 2026-11-07: the static started flush at the left and stopped about 3 pixels short at the right)
+TV_BORDER_PICTURE_BLEED_FRAC = {
+    "bezel2": (0.0019, 0.0, 0.0050, 0.0),
+}
+# VALUES CHANGE HERE (bezels whose volume bar sits this many finished screen pixels to the left (negative) or right (positive) of the middle of the picture)
+BEZEL_VOLUME_BAR_SHIFT_PX = {
+    "bezel2": -2,
+}
 
 # VALUES CHANGE HERE (reception line noise band: pixel block size, 2 is as fine as the Static Noise snow and 3 is the coarse look of V349; share of blocks drawn; share drawn bright; alpha range of bright and of dark blocks)
 RECEPTION_NOISE_BLOCK_PX = 2
@@ -999,6 +1015,8 @@ BREAK_MAX_PER_HALF_HOUR = 2
 
 # VALUES CHANGE HERE (media.py, settings save: a change to retro_config.json is written by the settings writer thread at most this many seconds after it was asked for, and every change asked for in that time goes into the same write (owner 2026-11-02: 2 seconds); one [SETTINGS SAVE] summary line is written at most once per report seconds)
 SETTINGS_SAVE_DELAY_SECONDS = 2.0
+# VALUES CHANGE HERE (how many dated copies of retro_config.json the app keeps in logs/config_backups, one made each time the app starts with a file that loaded)
+CONFIG_BACKUPS_KEPT = 5
 SETTINGS_SAVE_REPORT_SECONDS = 60.0
 # VALUES CHANGE HERE (media.py, N13 owner 2026-11-03: the settings text is made in pieces of at most this many schedule entries, and the screen gets a turn between pieces, so a big library never holds the picture for the whole save)
 SETTINGS_SAVE_PIECE_ENTRIES = 500
@@ -1241,6 +1259,8 @@ DVD_ISO_OPEN_TIMEOUT_MS = 9000
 DVD_ISO_OPEN_FAIL_GRACE_MS = 700
 DVD_MENU_FLIP_DEBOUNCE_MS = 400
 DVD_END_STATE_GRACE_MS = 2500
+# VALUES CHANGE HERE (game_deck.py, media player: ms a plain video file may go without ever playing, after its splash, before the player gives up and returns to the list with a message; a disc image has its own limit above; owner 2026-11-06, Channel 03 audit)
+MEDIA_PLAYER_OPEN_TIMEOUT_MS = 20000
 
 # ============================================================================
 # SECTION: Values read by the smaller scripts (visualizers.py, libretro_core.py, media_library.py, audio_analysis.py)
@@ -2118,6 +2138,13 @@ STICK_MENU_AXIS_THRESHOLD = 0.6
 TRIGGER_PRESS_THRESHOLD = 30
 GAME_HOTKEY_TRIGGER_THRESHOLD = 128
 GAME_HOTKEY_COOLDOWN_MS = 2000
+# VALUES CHANGE HERE (Auto Save while a game plays: seconds between background saves; the state is taken on the screen thread, the file is written on a background thread; if taking the state is slow the gap doubles up to the maximum; a failed save is tried again after the retry gap; a file write that fails is tried again WRITE_ATTEMPTS times, WRITE_RETRY_SECONDS apart, before the banner bar says Auto-Save Failed)
+GAME_AUTOSAVE_INTERVAL_SECONDS = 120
+GAME_AUTOSAVE_MAX_INTERVAL_SECONDS = 480
+GAME_AUTOSAVE_SLOW_STATE_MS = 40
+GAME_AUTOSAVE_RETRY_SECONDS = 15
+GAME_AUTOSAVE_WRITE_ATTEMPTS = 8
+GAME_AUTOSAVE_WRITE_RETRY_SECONDS = 0.5
 DINPUT_AXIS_LIVENESS_THRESHOLD = 1500
 
 # VALUES CHANGE HERE (seconds a pad identity scan is reused; seconds a DirectInput read is reused within one frame; seconds a Linux joystick may stay silent before it is dropped; menu pad polls per second; seconds between polls with no pad; polls with no pad before the slow rate)
@@ -2335,6 +2362,27 @@ GUIDE_PREVIEW_SETTLE_MS = 500
 GUIDE_PREVIEW_LOAD_TIMEOUT_MS = 2500
 PLAYBACK_STALL_TIMEOUT_MS = 10000
 PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = 20000
+# VALUES CHANGE HERE (media_library.py, header probe: seconds the file's whole length may run past the length of its picture before the picture's length is taken as the file's length; the sound of a file whose picture stops early plays on over nothing, and the schedule must not put a channel in that part; owner log 2026-11-06 16:40, Gone In Sixty Seconds.mkv)
+PICTURE_ENDS_EARLY_MIN_SECONDS = 30
+# VALUES CHANGE HERE (app_log.txt: an INFO line whose text starts with one of these is not written; a WARNING or ERROR line is always written. Status reports that repeat every few seconds and success lines of scans. Remove a name from the list to get that line back. owner 2026-11-06, thin the logs)
+LOG_QUIET_APP_PREFIXES = (
+    "[FRAME TIME]", "[LOOP PROFILE]", "[GPU FRAME]", "[FRAME COPY]", "[VIDEO DRAW]", "[HEARTBEAT]",
+    "[REAL VIDEO BLIT]", "[BLIT VIDEO SCREEN MODE]", "[MENU NAV TRACE]", "[MENU NAV FRAME]",
+    "[LOUDNESS DEBUG]", "[LOUDNESS CHECK]", "[LOUDNESS WINDOW TIMING]",
+    "[HEALTH THREADS]", "[HEALTH QUEUES]", "[HEALTH PROFILE]", "[HEALTH MEMORY]", "[HEALTH LOCKS]",
+    "[HEALTH CPU]", "[HEALTH WORK]", "[HEALTH STALL]",
+    "[GOVERNOR] status", "[GOVERNOR] gate held back", "[GOVERNOR] screen's own load",
+    "[GOVERNOR] picture steady", "[GOVERNOR] frames over their time", "[GOVERNOR] stall gap",
+    "[HUB CLOCK]", "[HUB MISS]", "[MUTE GUARD]", "[PICTURE BOX]", "[CHANNEL READY]", "[SETTINGS SAVE]",
+)
+# VALUES CHANGE HERE (app_log.txt: an INFO line of the scheduler that starts with [SCHEDULER] and holds one of these pieces of text is not written)
+LOG_QUIET_SCHEDULER_PIECES = ("background probe stored", "is inactive (disabled)")
+# VALUES CHANGE HERE (vlc-debug.log: a line holding one of these pieces of text is not written; VLC prints the blending lines for every picture it draws and they were nine tenths of the file; VLC error lines other than these are always written)
+LOG_QUIET_VLC_PIECES = (
+    "blend debug:", "video blending module", "blending YUVA to DXN failed", "blending RGBA to DXN failed",
+    "picture might be displayed late", "auto hiding mouse cursor", "waiting decoder fifos to empty",
+    "freetype debug:",
+)
 # VALUES CHANGE HERE (extra milliseconds the last picture is held and the sound stays muted after a CHANNEL CHANGE; it stays at 500 so the audio of the old channel, channel 03's second VLC player above all, never follows the viewer to the new one)
 AUDIO_SYNC_HOLD_MS = 500
 # VALUES CHANGE HERE (extra milliseconds the last picture is held and the sound stays muted when a show, a break clip or the return to the show changes media on the SAME channel; 0 = none, the new media goes in at once and the mute lifts at its first picture frame; owner 2026-11-06, 14.3)
@@ -2380,10 +2428,35 @@ MENU_WARP_OFF_EXTRA_SHRINK = 0.97
 BEZEL_CHANNEL_LED_FRAC = {
     "bezel":  (0.7010, 0.2402, 0.0676, 0.0776),
     "bezel1": (0.7801, 0.1191, 0.1263, 0.1282),
-    "bezel2": (0.6954, 0.1303, 0.0231, 0.0354),
 }
 # VALUES CHANGE HERE (bezel number windows that are not measured from the picture because their glass is grey, not near-black; their listed numbers above are used)
-BEZEL_LED_LISTED_ONLY = ("bezel2",)
+BEZEL_LED_LISTED_ONLY = ()
+
+# VALUES CHANGE HERE (the small square on the third bezel is a power light, not a number window: where it sits as fractions of the bezel image (left, top, width, height), and the red filter laid over it: (red, green, blue) added then multiplied)
+BEZEL_POWER_LIGHT_FRAC = {
+    "bezel2": (0.69495, 0.13173, 0.0231, 0.0354),
+}
+BEZEL_POWER_LIGHT_ADD_RGB = (170, 0, 0)
+BEZEL_POWER_LIGHT_MULT_RGB = (255, 70, 70)
+# VALUES CHANGE HERE (the lit bulb in the middle of the power light: its middle colour, its size as a share of the square's shorter side, and the dimmer ring colour around it)
+BEZEL_POWER_LIGHT_BULB_RGB = (255, 95, 80)
+BEZEL_POWER_LIGHT_BULB_FRAC = 0.34
+BEZEL_POWER_LIGHT_HALO_RGB = (230, 25, 20)
+# VALUES CHANGE HERE (how far each edge of the power light moves out past its square (positive) or in from it (negative), in image pixels: left, top, right, bottom; a part of a pixel tints the next row or column that part as strongly, or tints the edge row or column that much less)
+BEZEL_POWER_LIGHT_EDGE_ADJUST_PX = (-2.0, 0.2, 0.2, -0.8)
+# VALUES CHANGE HERE (extra edge moves for the power light on a holiday picture, added to the ones above, in base-picture pixels: left, top, right, bottom; negative shrinks that edge in)
+BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX = {
+    "christmas": (0.0, 0.0, -0.4, 0.0),
+    "thanksgiving": (0.0, 0.0, -0.4, 0.0),
+    "halloween": (0.0, -1.1, -0.9, 0.0),
+}
+# VALUES CHANGE HERE (holiday pictures of the third bezel are bigger and their little glass square sits a little differently: the base picture's measured glass square as fractions (left, top, width, height) and the base picture's width in pixels; a holiday picture's own glass square is found near that spot and the power light keeps the same place relative to it; the glass is low-colour and mid-dark: most colour spread allowed, darkest and brightest average level (the glass is dark at the top, so it starts below zero), and how far from the base spot to search as fractions of the picture's width and height)
+BEZEL_GLASS_REFERENCE_FRAC = {
+    "bezel2": (0.69537, 0.13031, 0.02313, 0.03824),
+}
+BEZEL_GLASS_REFERENCE_WIDTH = 1254
+BEZEL_GLASS_COLOR_LIMITS = (50, -1, 130)
+BEZEL_GLASS_SEARCH_MARGIN_FRAC = (0.03, 0.05)
 BEZEL_CHANNEL_LED_GAP_FRAC = {
     "bezel":  0.28,
     "bezel1": 0.28,

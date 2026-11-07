@@ -598,6 +598,11 @@ _DAR_RE = _re.compile(r"DAR\s+(\d+):(\d+)")
 _SUBTITLE_STREAM_RE = _re.compile(r"Stream #\d+:(\d+)(?:\((\w+)\))?[^\n]*:\s*Subtitle:\s*(\w+)")
 _AUDIO_STREAM_RE = _re.compile(r"Stream #\d+:(\d+)(?:\((\w+)\))?[^\n]*:\s*Audio:\s*(\w+)")
 _TEXT_SUBTITLE_CODECS = ("subrip", "ass", "ssa", "webvtt", "mov_text", "text")
+_STREAM_START_RE = _re.compile(r"(?m)^\s*Stream #\d+:\d+")
+_STREAM_DURATION_RE = _re.compile(r"(?m)^\s*DURATION\s*:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+_STILL_PICTURE_CODECS = ("mjpeg", "png", "bmp", "gif", "webp", "tiff")
+# WARNING: the fallback number below must match PICTURE_ENDS_EARLY_MIN_SECONDS in performance_governor.py; it is used only when that module fails to import.
+_PICTURE_ENDS_EARLY_MIN_S = _governor.PICTURE_ENDS_EARLY_MIN_SECONDS if _governor is not None else 30
 
 
 @dataclass
@@ -610,6 +615,8 @@ class HeaderProbeResult:
     audio_streams: list = field(default_factory=list)
     subtitle_streams: list = field(default_factory=list)
     has_audio: bool = False
+    picture_seconds: Optional[float] = None
+    picture_ends_early: bool = False
     error: Optional[str] = None
     stderr: Optional[str] = None
 
@@ -619,6 +626,26 @@ def _resolve_ffmpeg(ffmpeg_path: Optional[str]) -> str:
         return ffmpeg_path
     import media as _media
     return _media._resolve_ffmpeg_path()
+
+
+def picture_length_from_header(err: str) -> Optional[float]:
+    """The length in seconds that the header gives for the first real video stream's own DURATION tag; None when the header carries no such tag. A cover-art picture is not a video stream."""
+    starts = [m.start() for m in _STREAM_START_RE.finditer(err or "")]
+    for i, begin in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(err)
+        block = err[begin:end]
+        first_line = block.split("\n", 1)[0]
+        if "Video:" not in first_line or "attached pic" in block:
+            continue
+        codec = first_line.split("Video:", 1)[1].strip().split(" ", 1)[0].strip(",").lower()
+        if codec in _STILL_PICTURE_CODECS:
+            continue
+        m = _STREAM_DURATION_RE.search(block)
+        if m:
+            total = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            return total if total > 0 else None
+        return None
+    return None
 
 
 def combined_header_probe(file_path: str, ffmpeg_path: Optional[str] = None,
@@ -655,6 +682,12 @@ def combined_header_probe(file_path: str, ffmpeg_path: Optional[str] = None,
         hh, mm, ss = m.groups()
         total = int(hh) * 3600 + int(mm) * 60 + float(ss)
         out.duration = total if total > 0 else None
+
+    out.picture_seconds = picture_length_from_header(err)
+    if out.duration and out.picture_seconds and out.duration - out.picture_seconds >= _PICTURE_ENDS_EARLY_MIN_S:
+        # WARNING: a file whose picture stops before its sound gets the length of its picture; a channel put in the part after it shows nothing while the sound plays (owner log 2026-11-06 16:40, Gone In Sixty Seconds.mkv: picture 6713 s, sound 7077 s).
+        out.picture_ends_early = True
+        out.duration = out.picture_seconds
 
     vm = _VIDEO_DIMS_RE.search(err)
     if vm:
@@ -1389,6 +1422,10 @@ class ProbeLibrary:
             duration, source = probe_duration_with_fallback(file_path, result)
         else:
             duration, source = result.duration, "ffmpeg"
+        if result.picture_ends_early and source == "ffmpeg":
+            source = "ffmpeg_picture"
+            log.warning("[PICTURE ENDS EARLY] %s: the picture is %.0fs long and the sound runs on, so %.0fs is the length the schedule uses",
+                        os.path.basename(file_path), result.picture_seconds or 0.0, duration or 0.0)
         self.library.upsert_fields(
             content_key,
             size=size,
@@ -1857,6 +1894,28 @@ class DurationHub(_PathMemoHub):
             held = self._memo.get(key)
             self._set_memo(key, [recorded, held[1] if held else None, time.monotonic()])
         return saved
+
+    def correct_measured(self, path, seconds, source="picture_end"):
+        """Replaces a file's saved measured length with a shorter one that was proven (its picture ends early); the one case where a length on record changes. Returns False when the library cannot key the file or the new length is not shorter."""
+        if not seconds or seconds <= 0:
+            return False
+        try:
+            content_key = self.probe_library.keys.resolve(path)
+            if content_key is None:
+                return False
+            entry = self.probe_library.library.get_entry(content_key)
+            held = float((entry or {}).get("duration") or 0.0)
+            if held and float(seconds) >= held:
+                return False
+            self.probe_library.library.upsert_fields(content_key, duration=float(seconds), duration_source=source)
+        except Exception as _swallowed_error:
+            _log_swallowed("DurationHub.correct_measured: saving the shorter length to the library", _swallowed_error)
+            return False
+        key = _hub_key(path)
+        with self._lock:
+            held_memo = self._memo.get(key)
+            self._set_memo(key, [float(seconds), held_memo[1] if held_memo else None, time.monotonic()])
+        return True
 
     def store_estimate(self, path, seconds, basis, replace=False):
         """Saves an estimate for a file with no measured length; a file that already has an estimate keeps it. Returns the estimate on record, or None for a measured file or a length that is not positive. The answer is held in memory at once and the library row is written by one background thread, so nothing on the asking thread ever opens a file."""

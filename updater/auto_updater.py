@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -296,6 +297,55 @@ def _validate_url(url, label="URL"):
     return str(url)
 
 
+
+# ============================================================================
+# SECTION: HTTPS with a fallback set of trusted roots
+# ============================================================================
+
+
+def _is_certificate_failure(exc):
+    """True when `exc` is a failed check of the server's certificate (a missing or unknown issuer), not a network failure."""
+    reason = getattr(exc, "reason", exc)
+    return isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc)
+
+
+def _fallback_ssl_contexts():
+    """Contexts that still check the server's certificate but trust a bundled set of public roots (certifi's, when installed, then cacert.pem next to this file); used only after Windows' own list failed."""
+    contexts = []
+    try:
+        import certifi
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cacert.pem")
+    if os.path.isfile(bundled):
+        try:
+            contexts.append(ssl.create_default_context(cafile=bundled))
+        except Exception as exc:
+            log.warning("[UPDATE DIAG] the bundled certificate file could not be read: %s", exc)
+    return contexts
+
+
+def _urlopen(request, timeout):
+    """urllib's urlopen; when the server's certificate is not accepted (a PC whose Windows root list is out of date, as on a weak PC that rarely updates) it retries with the bundled public roots. The check is never switched off."""
+    # WARNING: owner log 2026-11-06 12:10: a PC online through a dongle failed every update check with CERTIFICATE_VERIFY_FAILED (unable to get local issuer certificate); certificates stay verified, only the set of trusted roots grows.
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except (urllib.error.URLError, OSError) as exc:
+        if not _is_certificate_failure(exc):
+            raise
+        first = exc
+    for context in _fallback_ssl_contexts():
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout, context=context)
+            log.info("[UPDATE DIAG] the update server's certificate was accepted with the bundled public roots (Windows' own list rejected it: %s)", first)
+            return response
+        except (urllib.error.URLError, OSError) as exc:
+            if not _is_certificate_failure(exc):
+                raise
+    raise first
+
+
 def _fetch_json(url, timeout=DEFAULT_TIMEOUT_SECONDS, what="GitHub releases list", expect_list=False):
     _validate_url(url, "Update source URL")
     request = urllib.request.Request(
@@ -306,7 +356,7 @@ def _fetch_json(url, timeout=DEFAULT_TIMEOUT_SECONDS, what="GitHub releases list
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout) as response:
             raw = response.read(2 * 1024 * 1024 + 1)
     except (urllib.error.URLError, OSError) as exc:
         _server_breadcrumb(
@@ -445,7 +495,7 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progres
     total = 0
     digest = hashlib.sha256()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout) as response:
             with open(destination, "wb") as output:
                 while True:
                     block = response.read(1024 * 1024)

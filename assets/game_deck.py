@@ -3322,6 +3322,10 @@ class ExternalGameDeck:
         self._exit_key_event_at = -1
         self.game_exit_confirm_shown_at = 0
         self._prev_overlay_open = False
+        self._auto_save_core_id = None
+        self._auto_save_next = 0.0
+        self._auto_save_interval = 0.0
+        self._auto_save_write_failed_flag = False
         self._libretro_suppress_start_select = False
 
         self._active_mapping_console = "GBA"
@@ -4070,8 +4074,16 @@ class ExternalGameDeck:
     # SECTION: Libretro profile save/load & PSX discs
     # ========================================================================
 
-    def libretro_save_to_profile(self, console=None, profile=None):
+    def profile_action_block_reason(self, console):
+        """Why a profile Save or Load cannot run for this console's profile screen: "" when it can, else the sentence for the screen."""
         if self._libretro_core is None:
+            return "NO GAME IS RUNNING"
+        if console and self._libretro_console and self._libretro_console != console:
+            return "THE RUNNING GAME IS %s, NOT %s" % (self._libretro_console, console)
+        return ""
+
+    def libretro_save_to_profile(self, console=None, profile=None):
+        if self.profile_action_block_reason(console):
             return False
         if profile is None:
             profile = self._libretro_active_profile
@@ -4083,7 +4095,7 @@ class ExternalGameDeck:
         return ok
 
     def libretro_load_from_profile(self, console=None, profile=None):
-        if self._libretro_core is None:
+        if self.profile_action_block_reason(console):
             return False
         if profile is None:
             profile = self._libretro_active_profile
@@ -4185,6 +4197,8 @@ class ExternalGameDeck:
     DVD_MENU_FLIP_DEBOUNCE_MS = _gov.DVD_MENU_FLIP_DEBOUNCE_MS
 
     DVD_END_STATE_GRACE_MS = _gov.DVD_END_STATE_GRACE_MS
+
+    MEDIA_PLAYER_OPEN_TIMEOUT_MS = _gov.MEDIA_PLAYER_OPEN_TIMEOUT_MS
 
     # ========================================================================
     # SECTION: Input: key translation, config refresh & events
@@ -4561,7 +4575,8 @@ class ExternalGameDeck:
                 if self.dvd_exit_selection == "Yes":
                     if vlc:
                         try:
-                            if (self.dvd_resume_enabled and self.dvd_file_path
+                            # WARNING: the place is kept whether or not Resume is switched on (owner 2026-11-06), so switching Resume on later finds the last spot; the Resume switch only decides whether a file starts from it.
+                            if (self.dvd_file_path
                                     and not self.dvd_in_menu and not self.dvd_splash_playing):
                                 _t_ms = vlc.player.get_time()
                                 if _t_ms is not None and _t_ms > 0:
@@ -4579,6 +4594,7 @@ class ExternalGameDeck:
                     self.dvd_paused_frame = None
                     self.dvd_in_menu = False
                     self.mode = "ROMLIST"
+                    self._scan_is_background = True
                     self._scan_roms("DVD")
                 else:
                     self.dvd_exit_confirm = False
@@ -5789,6 +5805,8 @@ class ExternalGameDeck:
 
         if vlc is None:
             log.warning("[GAMEDECK BUG ERROR] Playback blocked: dvd_engine link is currently None!")
+            self._romlist_error_msg   = "The video player is not ready yet -- try again in a moment"
+            self._romlist_error_until = pygame.time.get_ticks() + 4000
             return
 
         self.vlc_engine = vlc
@@ -5958,6 +5976,38 @@ class ExternalGameDeck:
             log.warning(f"[GAMEDECK MAPPING] Load failed for {console} player {player} (using defaults): {e}")
         return default
 
+    @staticmethod
+    def _serialise_mapping(mapping):
+        """Returns a controller mapping as it is written to the config file: button codes by name, the stick switch as it is."""
+        return {k: (v if k == "stick_as_dpad" else VK_NAMES.get(v, v)) for k, v in mapping.items()}
+
+    def turn_on_stick_as_dpad_everywhere(self):
+        """Turns the L-STICK AS D-PAD switch on for every console that has one, for every player slot of that console, in one write of the config file."""
+        try:
+            cfg_path = resolve_emulator_config_path()
+            data = {}
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            for console in CONSOLE_ORDER:
+                if console in ("DVD", "N64") or "stick_as_dpad" not in _get_console_def(console)["default_map"]:
+                    continue
+                for player in range(1, CONSOLE_MAX_PLAYERS.get(console, 4) + 1):
+                    mapping = self._load_controller_mapping(console, player)
+                    mapping["stick_as_dpad"] = True
+                    serialised = self._serialise_mapping(mapping)
+                    data[self._mapping_key(console, player)] = serialised
+                    if console == "GBA" and player == 1:
+                        data["GBA_mapping"] = serialised
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            self._gameplay_ctrl_mapping_cache.clear()
+            if getattr(self, "_active_mapping_console", None) and "stick_as_dpad" in self.ctrl_mapping:
+                self.ctrl_mapping["stick_as_dpad"] = True
+            log.info("[GAMEDECK MAPPING] L-stick as D-pad turned on for every console")
+        except Exception as e:
+            log.warning(f"[GAMEDECK MAPPING] Turning on L-stick as D-pad everywhere failed: {e}")
+
     def _save_controller_mapping(self, console=None, player=None):
         if console is None:
             console = getattr(self, "_active_mapping_console", "GBA") or "GBA"
@@ -5969,12 +6019,7 @@ class ExternalGameDeck:
             if os.path.exists(cfg_path):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            serialised = {}
-            for k, v in self.ctrl_mapping.items():
-                if k == "stick_as_dpad":
-                    serialised[k] = v
-                else:
-                    serialised[k] = VK_NAMES.get(v, v)
+            serialised = self._serialise_mapping(self.ctrl_mapping)
             data[self._mapping_key(console, player)] = serialised
             if console == "GBA" and (not player or player <= 1):
                 data["GBA_mapping"] = serialised
@@ -7880,6 +7925,27 @@ class ExternalGameDeck:
                 state = vlc.player.get_state()
                 if state == raw_vlc.State.Playing:
                     self._dvd_main_ever_played = True
+                if (not self.dvd_is_disc_image and not getattr(self, "_dvd_main_ever_played", False)
+                        and not getattr(self, "dvd_resume_pending", False)):
+                    _open_wait = now - getattr(self, "_dvd_main_start_time", now)
+                    _open_failed = (state == raw_vlc.State.Error and _open_wait >= self.DVD_ISO_OPEN_FAIL_GRACE_MS) \
+                        or _open_wait >= self.MEDIA_PLAYER_OPEN_TIMEOUT_MS
+                    if _open_failed:
+                        _bad_name = os.path.basename(self.dvd_file_path)
+                        log.warning(f"[DVD] The media player never started {_bad_name!r}: state={state} after {_open_wait}ms -- back to the list.")
+                        try: vlc.stop()
+                        except Exception as e:
+                            log.warning("VLC stop after a media player open failure failed: %s", e)
+                        self.dvd_playback_active = False
+                        self.dvd_splash_done     = False
+                        self.dvd_paused_frame    = None
+                        self.dvd_in_menu         = False
+                        self.mode = "ROMLIST"
+                        if not _gd_is_drive_responsive(self.dvd_file_path):
+                            self.note_drive_launch_failure(self.dvd_file_path)
+                        self._romlist_error_msg   = f"Could not play: {_bad_name}"
+                        self._romlist_error_until = pygame.time.get_ticks() + 4000
+                        return
                 if state not in (raw_vlc.State.Ended, raw_vlc.State.Stopped):
                     self._dvd_end_state_since = None
                 if (state in (raw_vlc.State.Ended, raw_vlc.State.Stopped)
@@ -7906,9 +7972,10 @@ class ExternalGameDeck:
                         self.dvd_splash_done     = False
                         self.dvd_paused_frame    = None
                         self.dvd_in_menu         = False
-                        if self.dvd_resume_enabled and self.dvd_file_path:
+                        if self.dvd_file_path:
                             self._dvd_clear_resume_position(self.dvd_file_path)
                         self.mode = "ROMLIST"
+                        self._scan_is_background = True
                         self._scan_roms("DVD")
                         return
             except Exception as e:
@@ -8498,6 +8565,18 @@ class ExternalGameDeck:
         )
         self._libretro_launch_thread.start()
 
+    def _stop_console_splash_video(self):
+        """Stops a console splash video that is still playing on the video engine, so its sound never runs on over the game or the ROM list."""
+        if not self._console_splash_is_video:
+            return
+        self._console_splash_is_video = False
+        self._console_splash_video_last_frame = None
+        try:
+            if self.vlc_engine is not None:
+                self.vlc_engine.stop()
+        except Exception as e:
+            log.warning("Stopping the console splash video failed: %s", e)
+
     def _launch_libretro_worker(self, req_id, console, rom_path, display_name, reuse_core):
         result = {"req_id": req_id, "console": console, "display_name": display_name}
         _owned_core = None
@@ -8595,6 +8674,7 @@ class ExternalGameDeck:
 
         if "error" in result:
             log.warning(f"[LIBRETRO] {result['error']}")
+            self._stop_console_splash_video()
             self.emulator_loading = False; self._libretro_loading = False
             self._libretro_rom_path = ""
             self.mode = "ROMLIST"
@@ -8687,6 +8767,7 @@ class ExternalGameDeck:
                       f"drive; abandoning the launch.")
                 _abandoned_req_id = self._libretro_launch_request_id
                 self.note_drive_launch_failure(getattr(self, "_libretro_launch_path", "") or self._libretro_rom_path)
+                self._stop_console_splash_video()
                 self._libretro_launch_request_id += 1
                 self._libretro_launch_pending = False
                 self.emulator_loading  = False
@@ -8743,6 +8824,7 @@ class ExternalGameDeck:
             self._libretro_100_reached_at = None
 
         if _ready and (now - self._libretro_100_reached_at) >= _LIBRETRO_HOLD_AT_100_MS:
+            self._stop_console_splash_video()
             self._libretro_loading = False
             self.emulator_loading  = False
             try:
@@ -8946,6 +9028,8 @@ class ExternalGameDeck:
             dest_rect = (dx + (dw - new_w) // 2, dy + (dh - new_h) // 2, new_w, new_h)
 
         if overlay_open:
+            if not self._prev_overlay_open:
+                self._auto_save_on_event("menu opened")
             if self.game_exit_confirm:
                 self.game_exit_confirm = False
                 self.set_paused(False, reason="exit_confirm")
@@ -9027,6 +9111,7 @@ class ExternalGameDeck:
             surf = core.run_frame(crt_cfg=crt_cfg, pixel_cfg=pixel_cfg)
         if surf:
             self._blit_libretro_frame(screen, surf, dest_rect)
+        self._auto_save_tick(core)
         now = pygame.time.get_ticks()
         if self._libretro_osd_msg and now < self._libretro_osd_until:
             _gft_t0 = time.perf_counter()
@@ -9070,6 +9155,56 @@ class ExternalGameDeck:
                      esc_held, ss_held, _event_press, self.game_exit_confirm)
         return _fired
 
+    def _auto_save_write_failed(self, path):
+        """Called from the writer thread when every try to write an auto save failed; the screen thread says so."""
+        self._auto_save_write_failed_flag = True
+
+    def _background_auto_save(self, core, why):
+        """Auto Save without waiting for the disk: the state is taken here, the file is written in the background and tried again if the disk is busy."""
+        _t0 = time.perf_counter()
+        _ok = core.save_state_background(slot=self._libretro_active_profile,
+                                         attempts=_gov.GAME_AUTOSAVE_WRITE_ATTEMPTS,
+                                         retry_seconds=_gov.GAME_AUTOSAVE_WRITE_RETRY_SECONDS,
+                                         on_fail=self._auto_save_write_failed)
+        _took_ms = (time.perf_counter() - _t0) * 1000.0
+        _now = time.monotonic()
+        _base = float(_gov.GAME_AUTOSAVE_INTERVAL_SECONDS)
+        if _ok:
+            if _took_ms > _gov.GAME_AUTOSAVE_SLOW_STATE_MS:
+                self._auto_save_interval = min(float(_gov.GAME_AUTOSAVE_MAX_INTERVAL_SECONDS), max(_base, self._auto_save_interval) * 2.0)
+            else:
+                self._auto_save_interval = _base
+            self._auto_save_next = _now + self._auto_save_interval
+            log.info("[AUTO SAVE] %s: state taken in %.0f ms, next in %.0f s", why, _took_ms, self._auto_save_interval)
+        else:
+            self._auto_save_next = _now + float(_gov.GAME_AUTOSAVE_RETRY_SECONDS)
+            log.warning("[AUTO SAVE] %s: the core gave no state, trying again in %.0f s", why, float(_gov.GAME_AUTOSAVE_RETRY_SECONDS))
+        return _ok
+
+    def _auto_save_tick(self, core):
+        """Once per frame while a game runs: saves every GAME_AUTOSAVE_INTERVAL_SECONDS when Auto Save is on, so a failed exit still leaves a recent save."""
+        if getattr(self, "_auto_save_write_failed_flag", False):
+            self._auto_save_write_failed_flag = False
+            _main = sys.modules.get("__main__")
+            if _main is not None and hasattr(_main, "post_status_notice"):
+                _main.post_status_notice("AUTO-SAVE FAILED")
+        if not self._libretro_auto_save:
+            return
+        _now = time.monotonic()
+        if getattr(self, "_auto_save_core_id", None) != id(core):
+            self._auto_save_core_id = id(core)
+            self._auto_save_interval = float(_gov.GAME_AUTOSAVE_INTERVAL_SECONDS)
+            self._auto_save_next = _now + self._auto_save_interval
+            return
+        if _now >= self._auto_save_next:
+            self._background_auto_save(core, "timer")
+
+    def _auto_save_on_event(self, why):
+        """Auto Save at a moment the game is paused anyway (the exit prompt opens, a menu opens), so the cost cannot be felt."""
+        core = self._libretro_core
+        if core is not None and self._libretro_auto_save and getattr(self, "_auto_save_core_id", None) == id(core):
+            self._background_auto_save(core, why)
+
     def _open_game_exit_confirm(self):
         if self.game_exit_confirm:
             return
@@ -9079,6 +9214,7 @@ class ExternalGameDeck:
         self.game_exit_confirm_shown_at = pygame.time.get_ticks()
         self._game_exit_prev_buttons = frozenset()
         self.set_paused(True, reason="exit_confirm")
+        self._auto_save_on_event("exit prompt")
 
     def _close_game_exit_confirm(self):
         """Cancel out of the exit-confirm prompt and resume the game."""
@@ -9191,14 +9327,20 @@ class ExternalGameDeck:
     def _libretro_quit_to_romlist(self, core):
         log.info("[LIBRETRO] Start+Select: quitting to ROM list")
         pad_poller_stop()
+        _auto_save_failed = False
         if self._libretro_auto_save:
-            core.save_state(slot=self._libretro_active_profile)
+            try:
+                _auto_save_failed = not core.save_state(slot=self._libretro_active_profile)
+            except Exception as e:
+                log.warning("Auto-save on quit raised: %s", e)
+                _auto_save_failed = True
         try:
             core.unload()
         except Exception as e:
             log.warning("core.unload() failed while quitting to ROM list: %s", e)
         self._libretro_core    = None
         self._libretro_rom_path = ""
+        self._stop_console_splash_video()
         self._libretro_loading = False
         self.emulator_loading  = False
         self.mode              = "ROMLIST"
@@ -9206,8 +9348,16 @@ class ExternalGameDeck:
         import pygame as _pg
         _pg.event.clear(_pg.KEYDOWN)
         if self.active_console:
+            # WARNING: back in the list the highlight stays on the game just played (owner 2026-11-06: you return to where you came from); a background rescan keeps the cursor on the same path and only moves it if that file is gone.
+            self._scan_is_background = True
             self._scan_roms(self.active_console)
-        self.rom_index = 0; self.rom_scroll = 0
+        if self.roms:
+            self.rom_index = min(self.rom_index, len(self.roms) - 1)
+        else:
+            self.rom_index = 0
+        if _auto_save_failed:
+            self._romlist_error_msg = "Auto-save failed"
+            self._romlist_error_until = pygame.time.get_ticks() + 4000
 
     def note_drive_launch_failure(self, path):
         """Records that a launch or a running game from this path's drive failed and went back to the list."""
@@ -9224,17 +9374,19 @@ class ExternalGameDeck:
         self._drive_launch_failed.pop(root, None)
 
     def _without_failed_drives(self, roms):
-        """Hides the entries that sit on a drive that failed; the back entries stay."""
+        """Hides the drive entries of a drive that failed or is being held, so the drive picker does not offer it until it is found again; the files and folders of every list stay."""
+        # WARNING: only the drive entries go (owner 2026-11-06: the banner says what is wrong and the files stay); a file on a failed drive stays listed and a launch from it stops with the banner.
         _failed = self._drive_launch_failed
         _held = set(_media_listing.held_drive_roots())
         if not _failed and not _held:
             return roms
         return [(n, p) for (n, p) in roms
-                if str(n).startswith("[..") or not p
+                if not (str(n).startswith("[DRIVE] ") or str(n).startswith("[DVD] "))
+                or not p
                 or (_gd_drive_root_of(p) not in _failed and _gd_drive_root_of(p) not in _held)]
 
     def leave_list_of_failed_drive(self, failed_roots):
-        """Takes the list screen off a drive that failed, hides that drive and notes the failure for the banner."""
+        """Takes the list screen off a drive that failed back to the drive picker (or the console's own folder), hides that drive and notes the failure for the banner."""
         # WARNING: acts only in the ROM and DVD list; a running game or DVD is never touched, and a drive that returns is listed again by the live rescan once the failure is cleared.
         if self.mode != "ROMLIST" or not self.active_console or not failed_roots:
             return False
@@ -9245,7 +9397,8 @@ class ExternalGameDeck:
         _bad = None
         if _browse:
             _root = _gd_drive_root_of(_browse)
-            if _root in failed_roots and _root not in self._drive_launch_failed:
+            # WARNING: no 'already noted' test here; a drive noted by a failed launch must still take the screen off its folder, and changing the folder below is what stops it repeating.
+            if _root in failed_roots:
                 _bad = (_root, _browse)
         else:
             for _n, _p in self.roms:
