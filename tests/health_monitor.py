@@ -4,9 +4,12 @@ import collections
 import dis
 import functools
 import gc
+import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -43,10 +46,14 @@ _JOB_WAIT_WARN_S = _governor.HEALTH_JOB_WAIT_WARN_SECONDS if _governor is not No
 _DUMP_MIN_GAP_S = _governor.HEALTH_DUMP_MIN_GAP_SECONDS if _governor is not None else 60.0
 _LOCK_HOLD_WARN_S = (_governor.HEALTH_LOCK_HOLD_WARN_MS if _governor is not None else 500) / 1000.0
 _PROFILE_TOP = _governor.HEALTH_PROFILE_TOP if _governor is not None else 5
+_VITALS_TIMEOUT_S = _governor.HEALTH_VITALS_QUERY_TIMEOUT_SECONDS if _governor is not None else 10.0
+_VITALS_RETRY_S = _governor.HEALTH_VITALS_RETRY_SECONDS if _governor is not None else 600.0
+_VITALS_TOP_PROGRAMS = _governor.HEALTH_VITALS_TOP_PROGRAMS if _governor is not None else 3
+_SHUTDOWN_EVENTS_READ = _governor.HEALTH_SHUTDOWN_EVENTS_READ if _governor is not None else 6
 _NEVER_STUCK = tuple(_governor.HEALTH_NEVER_STUCK_THREADS) if _governor is not None else (
-    "OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport")
+    "OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep")
 _JOB_STARTS = tuple(_governor.HEALTH_JOB_THREAD_STARTS) if _governor is not None else (
-    "content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "NextItemPrep", "HubRowSync",
+    "content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "HubRowSync",
     "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
 
 _APP_MODULES = frozenset((
@@ -478,6 +485,11 @@ class _Monitor:
         self.thread_cpu_last = {}
         self.process = _psutil.Process() if _psutil is not None else None
         self.rss_last = None
+        self.sys_times_last = None
+        self.program_times_last = {}
+        self.sensor_retry_at = 0.0
+        self.sensor_note_made = False
+        self.gpu_tool = shutil.which("nvidia-smi")
 
     def refresh_names(self):
         threads = threading.enumerate()
@@ -640,6 +652,7 @@ class _Monitor:
         self.report_cpu(span, threads)
         self.report_profile(snap["profile"], snap["totals"])
         self.report_memory(span)
+        self.report_vitals(span)
         self.report_locks()
         self.report_work()
         self.report_values()
@@ -656,7 +669,7 @@ class _Monitor:
             times = self.process.cpu_times()
             used = times.user + times.system
             per_thread = {t.id: t.user_time + t.system_time for t in self.process.threads()}
-            system = _psutil.cpu_percent(None)
+            system = self.system_cpu_pct()
         except Exception as error:
             log.warning("[HEALTH] reading the CPU use failed: %s", error)
             return
@@ -673,6 +686,123 @@ class _Monitor:
             log.info("[HEALTH CPU] the app used %.0f%% of one core (%d cores), the whole PC %.0f%%; by thread: %s",
                      app, _psutil.cpu_count() or 0, system, top or "nothing measurable")
         self.cpu_last = used
+
+    def system_cpu_pct(self):
+        """The whole PC's busy percent since the last call, from this monitor's own counters, so another caller of psutil.cpu_percent can not reset what this reads."""
+        # WARNING: psutil.cpu_percent(None) measures since the last call by anyone, and the governor calls it too, so this line read 0% in 946 of 960 reports; the counters are kept here instead.
+        times = _psutil.cpu_times()
+        total = sum(times)
+        idle = times.idle
+        before, self.sys_times_last = self.sys_times_last, (total, idle)
+        if before is None or total <= before[0]:
+            return 0.0
+        return max(0.0, min(100.0, 100.0 * (1.0 - (idle - before[1]) / (total - before[0]))))
+
+    def read_windows_sensors(self):
+        """Temperatures and the CPU clock Windows reports without administrator rights, as text parts; empty when it reports none."""
+        if os.name != "nt":
+            return []
+        script = ("$ErrorActionPreference='SilentlyContinue';$o=@{};"
+                  "$o.thermal=@(Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation | Select-Object Name,Temperature);"
+                  "$o.cpu=@(Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter \"Name='_Total'\" | Select-Object PercentofMaximumFrequency,PercentProcessorPerformance);"
+                  "$o.acpi=@(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature | Select-Object InstanceName,CurrentTemperature);"
+                  "$o | ConvertTo-Json -Depth 4 -Compress")
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True,
+                             timeout=_VITALS_TIMEOUT_S, creationflags=0x08000000).stdout.strip()
+        if not out:
+            return []
+        data = json.loads(out)
+        parts, hottest = [], 0.0
+        for zone in data.get("thermal") or []:
+            kelvin = zone.get("Temperature")
+            if kelvin:
+                celsius = float(kelvin) - 273.15
+                hottest = max(hottest, celsius)
+                parts.append("thermal zone %s %.0f C" % (str(zone.get("Name", "?")).split("\\")[-1], celsius))
+        for zone in data.get("acpi") or []:
+            tenths = zone.get("CurrentTemperature")
+            if tenths:
+                celsius = float(tenths) / 10.0 - 273.15
+                hottest = max(hottest, celsius)
+                parts.append("ACPI zone %s %.0f C" % (str(zone.get("InstanceName", "?")).split("\\")[-1][-8:], celsius))
+        for cpu in data.get("cpu") or []:
+            clock = cpu.get("PercentofMaximumFrequency")
+            if clock is not None:
+                parts.append("CPU clock %s%% of its maximum%s" % (clock, " (SLOWED DOWN)" if float(clock) < 70.0 else ""))
+        self.hottest = hottest
+        return parts
+
+    def read_gpu(self):
+        """The NVIDIA graphics card's temperature, load and power through nvidia-smi, or ''."""
+        if not self.gpu_tool:
+            return ""
+        out = subprocess.run([self.gpu_tool, "--query-gpu=name,temperature.gpu,utilization.gpu,clocks.sm,power.draw", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=_VITALS_TIMEOUT_S, creationflags=0x08000000 if os.name == "nt" else 0).stdout.strip()
+        fields = [f.strip() for f in out.splitlines()[0].split(",")] if out else []
+        if len(fields) < 5:
+            return ""
+        try:
+            if float(fields[1]) >= 85.0:
+                self.hottest = max(getattr(self, "hottest", 0.0), float(fields[1]))
+        except ValueError:
+            pass
+        return "graphics card %s %s C, %s%% busy, %s MHz, %s W" % (fields[0], fields[1], fields[2], fields[3], fields[4])
+
+    def busiest_programs(self, span):
+        """The busiest other programs on the PC since the last look, as 'name percent-of-one-core'."""
+        mine = os.getpid()
+        now, rows = {}, []
+        for proc in _psutil.process_iter(["pid", "name", "cpu_times"]):
+            info = proc.info
+            times = info.get("cpu_times")
+            if times is None or info["pid"] in (0, mine):
+                continue
+            used = times.user + times.system
+            now[info["pid"]] = used
+            before = self.program_times_last.get(info["pid"])
+            if before is not None and used > before:
+                rows.append(((used - before) / span * 100.0, info.get("name") or "?"))
+        self.program_times_last = now
+        merged = collections.Counter()
+        for percent, name in rows:
+            merged[name] += percent
+        return ", ".join("%s %.0f%%" % (n, v) for n, v in merged.most_common(_VITALS_TOP_PROGRAMS) if v >= 3.0)
+
+    def report_vitals(self, span):
+        """One [HEALTH VITALS] line a minute: the PC's CPU load, clock and temperatures, graphics card, memory, free disk and the busiest other programs; the log is then written through to the disk so the last minutes survive a power cut."""
+        # WARNING: this runs on the HealthReport thread only; the Windows questions are slow (a second or more) and are never asked from the screen thread. The log is forced to the disk here because a PC that loses power or freezes loses the lines still held in Windows' write cache (the log ended 3 minutes before a 2026-11-08 shutdown).
+        if _psutil is None:
+            return
+        parts = []
+        self.hottest = 0.0
+        try:
+            memory = _psutil.virtual_memory()
+            swap = _psutil.swap_memory()
+            parts.append("memory %.0f%% used, %.1f GB free, page file %.0f%% used" % (memory.percent, memory.available / 1073741824.0, swap.percent))
+            parts.append("busiest other programs: %s" % (self.busiest_programs(span) or "none above 3%"))
+            root = os.path.abspath(os.sep) if os.name != "nt" else os.path.splitdrive(os.path.abspath(sys.argv[0]))[0] + "\\"
+            disk = _psutil.disk_usage(root)
+            parts.append("app drive %.0f%% free" % (100.0 - disk.percent))
+        except Exception as error:
+            log.warning("[HEALTH] reading the memory and programs for the vitals line failed: %s", error)
+        if time.monotonic() >= self.sensor_retry_at:
+            try:
+                sensors = self.read_windows_sensors()
+                gpu = self.read_gpu()
+                if gpu:
+                    sensors.append(gpu)
+                if not sensors:
+                    self.sensor_retry_at = time.monotonic() + _VITALS_RETRY_S
+                    if not self.sensor_note_made:
+                        self.sensor_note_made = True
+                        log.info("[HEALTH VITALS] this PC gives no temperature or clock readings without administrator rights; the other readings go on, and Windows' own event log is the place to look for a heat shutdown")
+                parts = sensors + parts
+            except Exception as error:
+                self.sensor_retry_at = time.monotonic() + _VITALS_RETRY_S
+                log.warning("[HEALTH] reading the temperature and clock failed (asked again in %.0f s): %s", _VITALS_RETRY_S, error)
+        hot = self.hottest >= 85.0
+        log.log(logging.WARNING if hot else logging.INFO, "[HEALTH VITALS]%s %s", " HOT:" if hot else "", "; ".join(parts))
+        sync_logs()
 
     def report_profile(self, profile, totals):
         if not totals:
@@ -776,6 +906,54 @@ class _Monitor:
                 failed = True
             if failed:
                 time.sleep(1.0)
+
+# ============================================================================
+# SECTION: Written through to the disk, and Windows' own shutdown record
+# ============================================================================
+
+def sync_logs():
+    """Forces every log file to the disk, so the last lines survive a power cut or a freeze."""
+    for handler in list(logging.getLogger().handlers):
+        stream = getattr(handler, "stream", None)
+        try:
+            handler.flush()
+            if stream is not None and hasattr(stream, "fileno"):
+                os.fsync(stream.fileno())
+        except Exception as error:
+            _sync_failures.append(error)
+            if len(_sync_failures) == 1:
+                log.warning("[HEALTH] writing the log through to the disk failed (not repeated): %s", error)
+
+
+_sync_failures = []
+
+
+def log_previous_shutdown_events():
+    """After an unclean exit: reads Windows' own record of how the PC went down (power loss or freeze, a restart, a blue screen) and logs it, so the cause shows next to the app's own log."""
+    if os.name != "nt":
+        return
+    query = "*[System[(EventID=41 or EventID=6008 or EventID=1074 or EventID=1001 or EventID=6006 or EventID=6005)]]"
+    try:
+        out = subprocess.run(["wevtutil", "qe", "System", "/q:" + query, "/c:%d" % _SHUTDOWN_EVENTS_READ, "/rd:true", "/f:xml"],
+                             capture_output=True, text=True, timeout=_VITALS_TIMEOUT_S, creationflags=0x08000000).stdout
+    except Exception as error:
+        log.warning("[BOOT EVENTS] could not read Windows' event log: %s", error)
+        return
+    meaning = {"41": "the PC restarted without a clean shutdown (power cut, freeze, heat shutdown or the power button held)",
+               "6008": "the previous shutdown was unexpected", "1074": "a restart or shutdown was asked for",
+               "1001": "Windows recorded a crash (blue screen)", "6006": "the event log stopped (a clean shutdown)", "6005": "the event log started (Windows booted)"}
+    events = re.findall(r"<Event .*?</Event>", out, re.S)
+    if not events:
+        log.info("[BOOT EVENTS] Windows' event log showed no recent shutdown events (it may need the app run as administrator to read them)")
+        return
+    for event in events:
+        number = re.search(r"<EventID[^>]*>(\d+)<", event)
+        when = re.search(r"SystemTime='([^']+)'", event)
+        data = re.findall(r"<Data Name='(BugcheckCode|PowerButtonTimestamp|SleepInProgress|Reason|ShutdownReason|param1|param2|param5)'>([^<]*)<", event)
+        code = number.group(1) if number else "?"
+        log.warning("[BOOT EVENTS] Windows event %s at %s UTC: %s%s", code, (when.group(1)[:19] if when else "?"), meaning.get(code, "see Event Viewer"),
+                    ("; " + ", ".join("%s=%s" % kv for kv in data if kv[1] not in ("", "0"))) if data else "")
+
 
 # ============================================================================
 # SECTION: Public calls

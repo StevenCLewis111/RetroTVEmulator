@@ -643,7 +643,8 @@ _FRESH_START_WAIT_FOR_OLD_APP_S = performance_governor.FRESH_START_WAIT_FOR_OLD_
 FRESH_START_MARKER_NAME = "fresh_start_pending.json"
 _FRESH_START_ROOT_FILES = ("retro_config.json", "emulator_config.json")
 _FRESH_START_LOGS_FILES = ("playback_runtime.json", "playback_runtime.json.tmp", "_probe_inflight.json",
-                           "retro_config.json.tmp", os.path.join("controllers", "emulator_config.json"))
+                           "retro_config.json.tmp", os.path.join("controllers", "emulator_config.json"),
+                           os.path.join("controllers", "emulator_config.json.bak"), os.path.join("controllers", "emulator_config.json.tmp"))
 _FRESH_START_MAIN_FILES = (os.path.join("media_library", "library.sqlite3"), os.path.join("media_library", "library.sqlite3-wal"),
                            os.path.join("media_library", "library.sqlite3-shm"), os.path.join("media_library", "library.sqlite3-journal"))
 _FRESH_START_MAIN_FOLDERS = ("loudness", "captions", "visualizer_analysis")
@@ -793,6 +794,17 @@ def _run_marker_path():
 _previous_run_unclean = False
 
 
+def _start_shutdown_events_reader():
+    """After an unclean exit, reads Windows' own shutdown record on its own thread and logs it, so the log shows whether the PC lost power, froze or crashed."""
+    def _read():
+        try:
+            from tests import health_monitor as _hm
+            _hm.log_previous_shutdown_events()
+        except Exception as _events_error:
+            log.warning("[BOOT EVENTS] could not read Windows' shutdown events: %s", _events_error)
+    threading.Thread(target=_read, daemon=True, name="ShutdownEvents").start()
+
+
 def _check_previous_run_exit():
     """Logs when the previous run left its running marker behind, then writes the marker for this run."""
     global _previous_run_unclean
@@ -809,6 +821,7 @@ def _check_previous_run_exit():
             log.warning("[BOOT] The previous run (started %s) did not exit cleanly: it ended by a crash, a task kill, a power loss or a forced exit, not by a quit. "
                         "Look in %s: crash_log.txt (kept when the app relaunched itself) or crash_log_previous.txt (moved there when the app was started by hand), "
                         "and vlc-debug_previous.log.", _started, _log_output_dir())
+            _start_shutdown_events_reader()
         with open(_path, "w", encoding="utf-8") as _f:
             _f.write(broadcast_clock.now().replace(tzinfo=None).isoformat())
     except Exception as _marker_err:
@@ -9624,8 +9637,6 @@ def _toggle_all_consoles():
 
 def _toggle_all_profiles():
     db.config["all_profiles_sync"] = not db.config.get("all_profiles_sync", False)
-    if db.config["all_profiles_sync"] and game_deck is not None:
-        game_deck.turn_on_stick_as_dpad_everywhere()
     _mark_settings_dirty()
     print(f"[GAMES] all_profiles_sync (All Settings) = {db.config['all_profiles_sync']}")
 
@@ -27016,21 +27027,34 @@ def _resync_guide_stop_after_row_switch():
 
 
 def _guide_jump_col(direction, _source="unknown"):
+    """Moves the guide highlight one grid spot right (+1) or left (-1); a grid spot is one drawn block of the row (a show, a pair, a movie with its breaks, or one off-air stretch), however short or long, and one press is always one spot. The window scrolls only when the next spot is not in it, and then it moves to that spot."""
+    # WARNING: never skip a spot because it starts in the same half-hour column as the current one, and never spend a press on moving to the edge of the window; a press either lands on the next spot or leaves the highlight where it is.
     _guide_dirty_event.set()
     curr_col = app_state.get("guide_col_pos", 0)
+    # WARNING: the fallback number below must match GUIDE_STOP_MATCH_SECONDS in performance_governor.py; it is used only when that module fails to import.
+    _tol = performance_governor.GUIDE_STOP_MATCH_SECONDS if performance_governor is not None else 2.0
     _guide_last_col = get_guide_num_cols(db) - 1
-    stops = sorted(
-        (app_state.get("guide_current_row_stops", []) or
-         [{"col": 0, "abs": 0, "key": ("col", 0)}]),
-        key=lambda s: s.get("abs", 0),
-    )
+
+    def _sorted_stops():
+        return sorted(
+            (app_state.get("guide_current_row_stops", []) or
+             [{"col": 0, "abs": 0, "key": ("col", 0)}]),
+            key=lambda s: s.get("abs", 0),
+        )
+
+    stops = _sorted_stops()
 
     def _resolve_curr_abs():
+        _target_abs = app_state.get("guide_selected_abs_time")
         _key = app_state.get("guide_selected_stop_key")
         if _key is not None:
             for _s in stops:
                 if _s.get("key") == _key:
                     return _s.get("abs", 0)
+        if _target_abs is not None:
+            _near = [s for s in stops if abs(s.get("abs", 0) - _target_abs) <= _tol]
+            if _near:
+                return min(_near, key=lambda s: abs(s.get("abs", 0) - _target_abs)).get("abs", 0)
         _preceding = [s for s in stops if s.get("col", 0) <= curr_col]
         if _preceding:
             return max(_preceding, key=lambda s: (s.get("col", 0), s.get("abs", 0))).get("abs", 0)
@@ -27038,127 +27062,48 @@ def _guide_jump_col(direction, _source="unknown"):
 
     curr_abs = _resolve_curr_abs()
 
-    def _sync_to_edge_stop(edge_col):
-        _owning = [s for s in stops if s.get("col", 0) <= edge_col]
-        if _owning:
-            _owner = max(_owning, key=lambda s: (s.get("col", 0), s.get("abs", 0)))
-            app_state["guide_selected_stop_key"] = _owner.get("key")
-            app_state["guide_selected_abs_time"] = _owner.get("abs")
-            app_state["guide_col_anchor_abs"] = _owner.get("abs")
-        else:
-            log.warning("[GUIDE] sync_to_edge edge_col=%s: no owning stop found "
-                         "(highlight left unchanged -- this is a desync condition "
-                         "if it ever shows up)", edge_col)
+    def _find(_stops):
+        if direction > 0:
+            return next((s for s in _stops if s.get("abs", 0) > curr_abs + _tol), None)
+        return next((s for s in reversed(_stops) if s.get("abs", 0) < curr_abs - _tol), None)
 
-    if direction > 0:
-        target = next((s for s in stops
-                       if s.get("abs", 0) > curr_abs
-                       and s.get("col", 0) > curr_col), None)
-        if target is None:
-            target = next((s for s in stops if s.get("abs", 0) > curr_abs), None)
-        if target is not None:
-            app_state["guide_col_pos"] = min(target.get("col", 0), _guide_last_col)
-            app_state["guide_selected_stop_key"] = target.get("key")
-            app_state["guide_selected_abs_time"] = target.get("abs")
-            app_state["guide_col_anchor_abs"] = target.get("abs")
-            return
-        if curr_col < _guide_last_col:
-            _edge_owning = [s for s in stops if s.get("col", 0) <= _guide_last_col]
-            _edge_owner = max(_edge_owning, key=lambda s: (s.get("col", 0), s.get("abs", 0))) if _edge_owning else None
-            if _edge_owner is not None and _edge_owner.get("key") == app_state.get("guide_selected_stop_key"):
-                app_state["guide_col_pos"] = _guide_last_col
-            else:
-                app_state["guide_col_pos"] = _guide_last_col
-                _sync_to_edge_stop(_guide_last_col)
-                return
-        _num_cols = get_guide_num_cols(db)
-        _now_dt = broadcast_clock.now().replace(tzinfo=None)
-        _sys_live_c_idx = (_now_dt.hour * 2) + (1 if _now_dt.minute >= 30 else 0)
-        _old_shift = app_state.get("selected_guide_time_idx", 0)
-        # WARNING: the fallback numbers below must match GUIDE_TIME_STEP_MAX_SHIFTS in performance_governor.py; they are used only when that module fails to import.
-        _MAX_STEP3_SHIFTS = performance_governor.GUIDE_TIME_STEP_MAX_SHIFTS if performance_governor is not None else 8
-        _prev_clamped_idx = _sys_live_c_idx + _old_shift
-        _next_target = None
-        _new_stops = []
-        for _step in range(1, _MAX_STEP3_SHIFTS + 1):
-            _raw_shift = _old_shift + _step
-            _clamped_idx = clamp_guide_time_idx(_sys_live_c_idx + _raw_shift, _num_cols)
-            app_state["selected_guide_time_idx"] = _clamped_idx - _sys_live_c_idx
-            _refresh_guide_row_stops_offscreen()
-            _new_stops = sorted(app_state.get("guide_current_row_stops", []) or [],
-                                 key=lambda s: s.get("abs", 0))
-            _next_target = next((s for s in _new_stops if s.get("abs", 0) > curr_abs), None)
-            if _next_target is not None:
-                break
-            if _clamped_idx == _prev_clamped_idx:
-                break
-            _prev_clamped_idx = _clamped_idx
-        if _next_target is not None:
-            app_state["guide_col_pos"] = min(_next_target.get("col", 0), _guide_last_col)
-            app_state["guide_selected_stop_key"] = _next_target.get("key")
-            app_state["guide_selected_abs_time"] = _next_target.get("abs")
-            app_state["guide_col_anchor_abs"] = _next_target.get("abs")
-        elif _new_stops:
-            app_state["guide_col_pos"] = _guide_last_col
-            app_state["guide_selected_stop_key"] = _new_stops[-1].get("key")
-            app_state["guide_selected_abs_time"] = _new_stops[-1].get("abs")
-            app_state["guide_col_anchor_abs"] = _new_stops[-1].get("abs")
-        else:
-            log.warning("[GUIDE] jump_col forward: render produced no stops at all "
-                         "(curr_abs=%s) -- highlight state left untouched", curr_abs)
+    def _land_on(_target):
+        app_state["guide_col_pos"] = max(0, min(_target.get("col", 0), _guide_last_col))
+        app_state["guide_selected_stop_key"] = _target.get("key")
+        app_state["guide_selected_abs_time"] = _target.get("abs")
+        app_state["guide_col_anchor_abs"] = _target.get("abs")
 
-    else:
-        target = next((s for s in reversed(stops) if s.get("abs", 0) < curr_abs), None)
+    target = _find(stops)
+    if target is not None:
+        _land_on(target)
+        return
+
+    _num_cols = get_guide_num_cols(db)
+    _now_dt = broadcast_clock.now().replace(tzinfo=None)
+    _sys_live_c_idx = (_now_dt.hour * 2) + (1 if _now_dt.minute >= 30 else 0)
+    _old_shift = app_state.get("selected_guide_time_idx", 0)
+    # WARNING: the fallback numbers below must match GUIDE_TIME_STEP_MAX_SHIFTS in performance_governor.py; they are used only when that module fails to import.
+    _MAX_STEP3_SHIFTS = performance_governor.GUIDE_TIME_STEP_MAX_SHIFTS if performance_governor is not None else 8
+    # WARNING: the guide scrolls by the spot, never by a fixed half hour: the windows next to this one are searched a whole window at a time (so no spot can be missed), and once the next spot is found the window is moved so that spot is the first block on the left.
+    _prev_clamped_idx = _sys_live_c_idx + _old_shift
+    for _step in range(1, _MAX_STEP3_SHIFTS + 1):
+        _raw_shift = _old_shift + (_step if direction > 0 else -_step) * _num_cols
+        _clamped_idx = clamp_guide_time_idx(_sys_live_c_idx + _raw_shift, _num_cols)
+        if _clamped_idx == _prev_clamped_idx:
+            break
+        _prev_clamped_idx = _clamped_idx
+        app_state["selected_guide_time_idx"] = _clamped_idx - _sys_live_c_idx
+        _refresh_guide_row_stops_offscreen()
+        target = _find(sorted(app_state.get("guide_current_row_stops", []) or [], key=lambda s: s.get("abs", 0)))
         if target is not None:
-            app_state["guide_col_pos"] = max(target.get("col", 0), 0)
-            app_state["guide_selected_stop_key"] = target.get("key")
-            app_state["guide_selected_abs_time"] = target.get("abs")
-            app_state["guide_col_anchor_abs"] = target.get("abs")
-            return
-        if curr_col > 0:
-            _edge_owning0 = [s for s in stops if s.get("col", 0) <= 0]
-            _edge_owner0 = max(_edge_owning0, key=lambda s: (s.get("col", 0), s.get("abs", 0))) if _edge_owning0 else None
-            if _edge_owner0 is not None and _edge_owner0.get("key") == app_state.get("guide_selected_stop_key"):
-                app_state["guide_col_pos"] = 0
-            else:
-                app_state["guide_col_pos"] = 0
-                _sync_to_edge_stop(0)
-                return
-        _num_cols = get_guide_num_cols(db)
-        _now_dt = broadcast_clock.now().replace(tzinfo=None)
-        _sys_live_c_idx = (_now_dt.hour * 2) + (1 if _now_dt.minute >= 30 else 0)
-        _old_shift = app_state.get("selected_guide_time_idx", 0)
-        # WARNING: the fallback numbers below must match GUIDE_TIME_STEP_MAX_SHIFTS in performance_governor.py; they are used only when that module fails to import.
-        _MAX_STEP3_SHIFTS = performance_governor.GUIDE_TIME_STEP_MAX_SHIFTS if performance_governor is not None else 8
-        _prev_clamped_idx = _sys_live_c_idx + _old_shift
-        _prev_target = None
-        _new_stops = []
-        for _step in range(1, _MAX_STEP3_SHIFTS + 1):
-            _raw_shift = _old_shift - _step
-            _clamped_idx = clamp_guide_time_idx(_sys_live_c_idx + _raw_shift, _num_cols)
-            app_state["selected_guide_time_idx"] = _clamped_idx - _sys_live_c_idx
+            _aligned_idx = clamp_guide_time_idx(int(target.get("abs", 0) // 1800), _num_cols)
+            app_state["selected_guide_time_idx"] = _aligned_idx - _sys_live_c_idx
             _refresh_guide_row_stops_offscreen()
-            _new_stops = sorted(app_state.get("guide_current_row_stops", []) or [],
-                                 key=lambda s: s.get("abs", 0))
-            _prev_target = next((s for s in reversed(_new_stops) if s.get("abs", 0) < curr_abs), None)
-            if _prev_target is not None:
-                break
-            if _clamped_idx == _prev_clamped_idx:
-                break
-            _prev_clamped_idx = _clamped_idx
-        if _prev_target is not None:
-            app_state["guide_col_pos"] = max(_prev_target.get("col", 0), 0)
-            app_state["guide_selected_stop_key"] = _prev_target.get("key")
-            app_state["guide_selected_abs_time"] = _prev_target.get("abs")
-            app_state["guide_col_anchor_abs"] = _prev_target.get("abs")
-        elif _new_stops:
-            app_state["guide_col_pos"] = 0
-            app_state["guide_selected_stop_key"] = _new_stops[0].get("key")
-            app_state["guide_selected_abs_time"] = _new_stops[0].get("abs")
-            app_state["guide_col_anchor_abs"] = _new_stops[0].get("abs")
-        else:
-            log.warning("[GUIDE] jump_col backward: render produced no stops at all "
-                         "(curr_abs=%s) -- highlight state left untouched", curr_abs)
+            _land_on(target)
+            return
+    # WARNING: nothing further this way (the end of the guide) leaves the window and the highlight exactly as they were.
+    app_state["selected_guide_time_idx"] = _old_shift
+    _refresh_guide_row_stops_offscreen()
 
 
 def _guide_step_row(step, resync_stop):
@@ -28200,7 +28145,8 @@ while True:
                     if menu_nav.is_back(event.key):
                         game_deck.ctrl_mapping_active_btn = None
                         game_deck._seq_remap_active = False
-                    elif menu_nav.key_to_action(event.key, parent=True) == menu_nav.PARENT:
+                    # WARNING: Enter (the Select action) skips a controller button, never Backspace, because Backspace can be a mapped key (the DVD return-to-menu key) and Back can be remapped to it.
+                    elif menu_nav.is_accept(event.key):
                         game_deck.skip_current_remap_button()
                         continue
                     else:
@@ -28260,6 +28206,9 @@ while True:
                     elif _cm_stick_idx is not None and _ci == _cm_stick_idx:
                         game_deck.ctrl_mapping["stick_as_dpad"] = not game_deck.ctrl_mapping.get("stick_as_dpad", False)
                         game_deck._save_controller_mapping()
+                        # WARNING: with All Settings on, a change to this switch goes to every console and player; turning All Settings on changes nothing by itself.
+                        if globals().get("db") is not None and db.config.get("all_profiles_sync", False):
+                            game_deck.set_stick_as_dpad_everywhere(game_deck.ctrl_mapping["stick_as_dpad"])
                     elif _ci == _cm_close_idx:
                         game_deck._mapping_close_requested = True
                     continue

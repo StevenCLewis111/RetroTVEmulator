@@ -71,10 +71,11 @@ SHADOW_MODE = False
 ACTIVE_MODE_DEFAULT = "standard"
 TARGET_FPS = 60.0
 
-# VALUES CHANGE HERE (hardware tiers: the boot scan rates the CPU model first; physical = effective physical cores, see weights below)
+# VALUES CHANGE HERE (hardware tiers: the boot scan rates the CPU model first; physical = effective physical cores, see weights below; the memory limits: under the first number of GB a PC is WEAK, under the second it can not be STRONG)
 TIER_WEAK_MAX_PHYSICAL = 2
 TIER_WEAK_MAX_LOGICAL = 4
 TIER_WEAK_MIN_RAM_GB = 8.0
+TIER_STRONG_MIN_RAM_GB = 16.0
 # VALUES CHANGE HERE (minimum effective physical cores per CPU class for LOW / REFERENCE / STRONG; None = that class never reaches the tier; below LOW = WEAK)
 TIER_MIN_EFFECTIVE_BY_CLASS = {"A": (6, None, None), "B": (4, 8, 10), "C": (3, 5, 8)}
 EFFICIENCY_CORE_WEIGHT = 0.5
@@ -148,7 +149,7 @@ AFFORDABLE_THREADS_FLOOR = 2
 # VALUES CHANGE HERE (weak PCs: the app is the one thing such a PC is used for, so it keeps back only what Windows itself needs: this many threads of headroom in every mode instead of the mode's own, and the same number of cores out of the core budget; standard PCs keep their headroom and Performance unlocks theirs)
 WEAK_HEADROOM_THREADS = 1
 
-# VALUES CHANGE HERE (live caption cadence per mode; Standard = the values the captions were tuned on, Lite shares them because Lite has no captions)
+# VALUES CHANGE HERE (live caption cadence per mode; Standard = the values the captions were tuned on, Lite shares them)
 CAPTION_CADENCE = {
     "lite": {"first_chunk_sec": 5.0, "first_overlap_sec": 3.0, "startup_chunk_sec": 10.0},
     "standard": {"first_chunk_sec": 5.0, "first_overlap_sec": 3.0, "startup_chunk_sec": 10.0},
@@ -1408,8 +1409,7 @@ MODE_TABLE = {
     "lite": {
         "label": "Lite",
         "active": True,
-        "locked_config_keys": ("warp_screen_enabled", "fake_43_scanlines_enabled",
-                               "tv_captions_enabled", "dvd_captions_enabled"),
+        "locked_config_keys": ("warp_screen_enabled", "fake_43_scanlines_enabled"),
         "menu_fps": 30.0,
         "extra_rules": None,
     },
@@ -1439,7 +1439,9 @@ def normalize_mode(value):
 
 
 def feature_locked(config_key, mode=None):
-    """True when `config_key` is greyed out and switched off in the given (default: current) mode."""
+    """True when `config_key` is greyed out and switched off: by the given (default: current) mode, or for the two Captions switches by the boot memory scan."""
+    if config_key in CAPTION_LOCK_KEYS and caption_memory_locked():
+        return True
     return config_key in MODE_TABLE[_resolve_mode(mode)].get("locked_config_keys", ())
 
 
@@ -1587,6 +1589,11 @@ def _read_ram_gb():
     return 0.0, 0.0
 
 
+def strong_ram_enough(ram_total_gb):
+    """True when the PC has the memory a STRONG PC needs; memory that could not be read never holds a PC back."""
+    return ram_total_gb <= 0.0 or ram_total_gb >= TIER_STRONG_MIN_RAM_GB
+
+
 def classify_tier(effective_physical, logical, ram_total_gb, cpu_class=None):
     """One tier label (WEAK / LOW / REFERENCE / STRONG) from the boot scan's CPU class plus cores, threads and RAM."""
     ram_known = ram_total_gb > 0.0
@@ -1595,7 +1602,7 @@ def classify_tier(effective_physical, logical, ram_total_gb, cpu_class=None):
         return "WEAK"
     low_min, reference_min, strong_min = TIER_MIN_EFFECTIVE_BY_CLASS.get(
         cpu_class or BOOT_SCAN_FALLBACK_CLASS, TIER_MIN_EFFECTIVE_BY_CLASS[BOOT_SCAN_FALLBACK_CLASS])
-    if strong_min is not None and effective_physical >= strong_min:
+    if strong_min is not None and effective_physical >= strong_min and strong_ram_enough(ram_total_gb):
         return "STRONG"
     if reference_min is not None and effective_physical >= reference_min:
         return "REFERENCE"
@@ -2373,9 +2380,15 @@ HEALTH_DUMP_MIN_GAP_SECONDS = 60.0
 HEALTH_LOCK_HOLD_WARN_MS = 500
 HEALTH_PROFILE_TOP = 5
 
+# VALUES CHANGE HERE (health_monitor.py, the PC vitals line: seconds a Windows sensor or event-log question may take before it is given up; seconds before the sensor question is asked again after it came back with nothing; how many of the busiest other programs are named; how many Windows shutdown events are read at the start after an unclean exit)
+HEALTH_VITALS_QUERY_TIMEOUT_SECONDS = 10.0
+HEALTH_VITALS_RETRY_SECONDS = 600.0
+HEALTH_VITALS_TOP_PROGRAMS = 3
+HEALTH_SHUTDOWN_EVENTS_READ = 6
+
 # VALUES CHANGE HERE (health_monitor.py: threads whose long waits are normal and are never reported stuck; name starts of short job threads, which are reported when they wait too long)
-HEALTH_NEVER_STUCK_THREADS = ("OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport")
-HEALTH_JOB_THREAD_STARTS = ("content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "NextItemPrep", "HubRowSync", "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
+HEALTH_NEVER_STUCK_THREADS = ("OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep")
+HEALTH_JOB_THREAD_STARTS = ("content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "HubRowSync", "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
 
 # VALUES CHANGE HERE (main script, playback: ms of Static between channels; ms of black while a guide preview settles; ms a guide preview may take to load; ms a playing file may stall before it is called stalled, and the longer limit for its first buffering; ms the sound is held after a seek; ms from the end that counts as ending; seconds a stuck stop may take; seconds of the short wait for a quick stop; seconds the picture-size probe may hold up an open; ms of grace for the first frame after a seek; seconds from the end a seek is kept away from; seconds an open is checked for an error, the longer window when it may be retried, seconds Stopped must last to count as a failed open, and the seconds before each retry; failed plays on one drive before that drive is held; seconds the sound is muted while stereo or mono is switched; failures before a file is set aside as unplayable; ms a channel's failure message stays; ms between sweeps for dead drives; seconds a DVD's audio track count is kept)
 STATIC_TRANSITION_MS = 1500
@@ -2993,6 +3006,33 @@ FIRST_START_PRIORITY_DISK_SLOTS = 3
 # VALUES CHANGE HERE (free RAM in GB the caption model needs before it may load; seconds the red "no memory" banner stays up)
 CAPTION_MODEL_MIN_AVAILABLE_RAM_GB = 1.5
 CAPTION_MEMORY_BANNER_SECONDS = 5.0
+
+
+CAPTION_LOCK_KEYS = ("tv_captions_enabled", "dvd_captions_enabled")
+
+
+def scan_caption_memory():
+    """Boot memory scan for live captions: reads the memory once per run, keeps the answer and logs it; the two Captions switches are greyed out for the whole run when the caption model could not load."""
+    known = _state.get("captions_memory_ok")
+    if known is not None:
+        return known
+    ok, total_gb, avail_gb, needed_gb = caption_memory_check()
+    with _state_lock:
+        if _state.get("captions_memory_ok") is None:
+            _state["captions_memory_ok"] = bool(ok)
+            first = True
+        else:
+            first = False
+        result = _state["captions_memory_ok"]
+    if first:
+        log.info("[GOVERNOR BOOT SCAN] memory total=%.1fGB available=%.1fGB captions need %.1fGB free -> live captions %s",
+                 total_gb, avail_gb, needed_gb, "available" if result else "greyed out (not enough memory)")
+    return result
+
+
+def caption_memory_locked():
+    """True when the boot memory scan says the caption model cannot load on this PC this run."""
+    return scan_caption_memory() is False
 
 
 def caption_memory_check():
@@ -3905,7 +3945,8 @@ def run_boot_scan(profile, cpu_name=None, avx2=None):
     reasons = list(rating["reasons"])
     tier = classify_tier(profile.effective_physical, profile.logical_cores, profile.ram_total_gb, label)
     start_mode = BOOT_SCAN_CLASS_START_MODE[label]
-    top = tier == "STRONG" or (label == "C" and (profile.physical_cores >= BOOT_SCAN_TOP_MIN_PHYSICAL or profile.hybrid))
+    top = tier == "STRONG" or (label == "C" and (profile.physical_cores >= BOOT_SCAN_TOP_MIN_PHYSICAL or profile.hybrid)
+                               and strong_ram_enough(profile.ram_total_gb))
     if tier == "WEAK":
         start_mode = "lite"
     elif top:
@@ -4029,6 +4070,7 @@ _state = {
     "started": False,
     "boot_scan": None,
     "boot_scan_failed": False,
+    "captions_memory_ok": None,
 }
 _state_lock = threading.Lock()
 
@@ -4065,10 +4107,17 @@ def is_weak(profile=None):
     return profile.tier == "WEAK"
 
 
+def has_graphics(profile=None):
+    """False only when the boot scan found no graphics hardware at all (a CPU-only PC); true while the scan has not run yet."""
+    profile = profile or get_profile()
+    return str(getattr(profile, "gpu_tier", "none")) != "none"
+
+
 def allowed_modes(profile=None):
-    """Modes the user may select on this machine, in menu order."""
+    """Modes the user may select on this machine, in menu order; Performance needs a PC that is not WEAK and has graphics hardware."""
     weak = is_weak(profile)
-    return tuple(name for name in MODE_NAMES if not (weak and name == "performance"))
+    no_graphics = not has_graphics(profile)
+    return tuple(name for name in MODE_NAMES if not ((weak or no_graphics) and name == "performance"))
 
 
 def next_mode(current=None, profile=None):
@@ -4162,6 +4211,7 @@ def start(gpu_tier="none", gpu_names=(), vlc_version="", app_version="", pygame_
             _state["boot_scan_failed"] = False
     if first:
         _log_boot_scan(profile)
+        scan_caption_memory()
         # WARNING: the start mode (lite, standard or performance) is picked a moment later by apply_boot_mode; nothing that depends on the mode is logged here, or the boot log names the wrong mode (L16).
         apply_cv2_threads(_state["mode"])
         log.info(
@@ -4194,7 +4244,7 @@ __all__ = [
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
-    "set_shell_mode", "is_shell_mode", "is_weak", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
+    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
     "quiet_seconds", "pc_is_quiet", "quiet_lane_bonus", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
     "music_scan_class", "music_analysis_class", "music_scan_falling_behind",
 ]

@@ -43,8 +43,6 @@ COLOR_SCREEN_BLACK = performance_governor.COLOR_SCREEN_BLACK if performance_gove
 COLOR_MENU_BUTTON = performance_governor.COLOR_MENU_BUTTON if performance_governor is not None else (40, 78, 145)
 COLOR_MENU_BUTTON_GREYED = performance_governor.COLOR_MENU_BUTTON_GREYED if performance_governor is not None else (32, 32, 40)
 COLOR_MENU_TEXT_GREYED = performance_governor.COLOR_MENU_TEXT_GREYED if performance_governor is not None else (105, 105, 115)
-# WARNING: the fallback colour below must match COLOR_GAME_WARNING_TEXT in performance_governor.py; it is used only when that module fails to import.
-COLOR_MENU_NOTICE_TEXT = performance_governor.COLOR_GAME_WARNING_TEXT if performance_governor is not None else (255, 90, 90)
 COLOR_MENU_BUTTON_BLUE = performance_governor.COLOR_MENU_BUTTON_BLUE if performance_governor is not None else (40, 78, 145)
 COLOR_MENU_BUTTON_BLUE_DIM = performance_governor.COLOR_MENU_BUTTON_BLUE_DIM if performance_governor is not None else (32, 58, 105)
 COLOR_MENU_ON_BLUE = performance_governor.COLOR_MENU_ON_BLUE if performance_governor is not None else (40, 100, 180)
@@ -1612,7 +1610,7 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
         (("w", "s"), "W / S",  "NAVIGATE UP / DOWN"),
         (("a", "d"), "A / D",  "NAVIGATE LEFT / RIGHT"),
         (("enter",), "ENTER",  "SELECT / CONFIRM"),
-        (("esc",),   "ESCAPE", "BACK / MINIMIZE"),
+        (("esc",),   "ESCAPE", "BACK / QUIT"),
         (None,       "MOUSE",  "FILE EXPLORER  (MOUSE ONLY)"),
     ]
     game_controls_kb = [
@@ -3196,7 +3194,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 ]
                 timeline_entries = _gated_g
 
-            # WARNING: owner 2026-11-06: an off-air stretch is one block however many half hours it covers, so it gets one stop at the true start of the stretch (the end of the show before it, even when that is left of the screen) and its key is that time, never a column number, which means something else once the guide scrolls.
+            # WARNING: owner 2026-11-07: every half-hour grid of an off-air stretch is its own spot and its own stop; a stop's time is the start of that grid (or the end of the show before it when that falls inside the grid) and its key is that time, never a column number, which means something else once the guide scrolls.
             _last_show_end_abs = viewport_adjusted_start
             for _pre_show, _pre_start, _pre_end, _pre_block in timeline_entries:
                 if _pre_show is not None and _pre_end <= viewport_adjusted_start:
@@ -3245,7 +3243,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     _gap_abs_start = last_drawn_abs_time
                     _oa_x = last_drawn_pixel_x
                     _oa_abs_cursor = _gap_abs_start
-                    _oa_stop_done = False
                     while _oa_x < cell_x and _oa_x < w:
                         # WARNING: keep the +1e-6 float-truncation guard identical to rounded_start_block_col.
                         _oa_col  = max(0, int(float(_oa_x - col_width) / col_width + 1e-6))
@@ -3256,13 +3253,13 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             break
                         if _oa_col not in current_row_blocks_list:
                             current_row_blocks_list.append(_oa_col)
-                        if not _oa_stop_done:
-                            _oa_stop_done = True
-                            current_row_stops_list.append({
-                                "col": _oa_col,
-                                "abs": _last_show_end_abs,
-                                "key": ("offair", round(_last_show_end_abs)),
-                            })
+                        _oa_seg_abs = max(_last_show_end_abs, viewport_adjusted_start + _oa_col * 1800)
+                        _oa_seg_end = min(show_abs_start, viewport_adjusted_start + (_oa_col + 1) * 1800)
+                        current_row_stops_list.append({
+                            "col": _oa_col,
+                            "abs": _oa_seg_abs,
+                            "key": ("offair", round(_oa_seg_abs)),
+                        })
                         _oa_abs_start = _oa_abs_cursor
                         _oa_col_boundary_abs = viewport_adjusted_start + (_oa_col + 1) * 1800
                         if _oa_end == cell_x:
@@ -3270,7 +3267,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         else:
                             _oa_abs_end = _oa_col_boundary_abs
                         _oa_sel = (is_highlighted_row and
-                                   _last_show_end_abs <= _guide_target_abs < show_abs_start)
+                                   _oa_seg_abs <= _guide_target_abs < _oa_seg_end)
                         _oa_bg  = HIGHLIGHT_BG if _oa_sel else UNSELECTED_BLUE
                         _oa_tc  = (0, 0, 0) if _oa_sel else TEXT_WHITE
                         pygame.draw.rect(surface, _oa_bg, (_oa_x, start_y, _oa_bw, row_height))
@@ -3330,7 +3327,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 _gap_abs_start = last_drawn_abs_time
                 _tr_x = last_drawn_pixel_x
                 _tr_abs_cursor = _gap_abs_start
-                _tr_stop_done = False
                 while _tr_x < viewport_absolute_max_pixel_x and _tr_x < w:
                     _tr_col  = max(0, int(float(_tr_x - col_width) / col_width))
                     _tr_next = col_width + (_tr_col + 1) * col_width
@@ -3340,17 +3336,17 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         break
                     if _tr_col not in current_row_blocks_list:
                         current_row_blocks_list.append(_tr_col)
-                    if not _tr_stop_done:
-                        _tr_stop_done = True
-                        current_row_stops_list.append({
-                            "col": _tr_col,
-                            "abs": _last_show_end_abs,
-                            "key": ("offair", round(_last_show_end_abs)),
-                        })
+                    _tr_seg_abs = max(_last_show_end_abs, viewport_adjusted_start + _tr_col * 1800)
+                    _tr_seg_end = viewport_adjusted_start + (_tr_col + 1) * 1800
+                    current_row_stops_list.append({
+                        "col": _tr_col,
+                        "abs": _tr_seg_abs,
+                        "key": ("offair", round(_tr_seg_abs)),
+                    })
                     _tr_abs_start = _tr_abs_cursor
                     _tr_abs_end = viewport_adjusted_start + (_tr_col + 1) * 1800
                     _tr_sel = (is_highlighted_row and
-                               _last_show_end_abs <= _guide_target_abs)
+                               _tr_seg_abs <= _guide_target_abs < _tr_seg_end)
                     _tr_bg  = HIGHLIGHT_BG if _tr_sel else UNSELECTED_BLUE
                     _tr_tc  = (0, 0, 0) if _tr_sel else TEXT_WHITE
                     pygame.draw.rect(surface, _tr_bg, (_tr_x, start_y, _tr_bw, row_height))
@@ -3363,15 +3359,15 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 for fallback_col in range(num_cols):
                     if fallback_col not in current_row_blocks_list:
                         current_row_blocks_list.append(fallback_col)
-                    if fallback_col == 0:
-                        current_row_stops_list.append({
-                            "col": 0,
-                            "abs": _last_show_end_abs,
-                            "key": ("offair", round(_last_show_end_abs)),
-                        })
-                    _fb_abs = viewport_adjusted_start + fallback_col * 1800
+                    _fb_abs = max(_last_show_end_abs, viewport_adjusted_start + fallback_col * 1800)
+                    _fb_end = viewport_adjusted_start + (fallback_col + 1) * 1800
+                    current_row_stops_list.append({
+                        "col": fallback_col,
+                        "abs": _fb_abs,
+                        "key": ("offair", round(_fb_abs)),
+                    })
                     is_selected_cell = (is_highlighted_row and
-                                        _last_show_end_abs <= _guide_target_abs)
+                                        _fb_abs <= _guide_target_abs < _fb_end)
                     cell_bg = HIGHLIGHT_BG if is_selected_cell else UNSELECTED_BLUE
                     cell_txt_col = (0, 0, 0) if is_selected_cell else TEXT_WHITE
                     cell_x = col_width + (fallback_col * col_width)
@@ -4845,14 +4841,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _bezel_on = bool(db.config.get("fake_43_border_enabled", False)) if db is not None else False
         _bezel_style_n = media.bezel_style_count() if db is not None else 1
 
-        _cs_row_h = 44
-        _cs_row_gap = 36
-        _cs_pitch = _cs_row_h + _cs_row_gap
-
         _cs_bar_pad = 36
         _cs_bar_w = max(f_ch_label.size(_lbl)[0] for _lbl in _cs_row_labels.values()) + _cs_bar_pad
         _cs_row_content_w = _cs_bar_w + 20 + pill_w
-        _cs_bstyle_box_w = 18 + 24
+        _cs_bstyle_box_w = 18 + max(f_ch_btn.size("Option %d" % _n)[0] for _n in range(1, max(_bezel_style_n, 1) + 1))
         _cs_bezel_row_w = _cs_row_content_w + 20 + _cs_bstyle_box_w
 
         _cs_bezel_style_select_idx = _cs_rows.index("bezel_style_select") if "bezel_style_select" in _cs_rows else None
@@ -4866,30 +4858,36 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
         _cs_grid_rows_tall = max((len(_c) for _c in _cs_columns), default=0)
         _cs_total_rows = _cs_grid_rows_tall
-        _cs_header_gap = CHANNEL_SETTINGS_HEADER_GAP_PX
-        _cs_block_h = lbl_hdr.get_height() + _cs_header_gap
-        if _cs_total_rows > 0:
-            _cs_block_h += (_cs_total_rows - 1) * _cs_pitch + _cs_row_h
-        _cs_bottom_reserved = CHANNEL_SETTINGS_BOTTOM_RESERVED_PX
-        _cs_block_top = content_y + max(CHANNEL_SETTINGS_MIN_TOP_PX, (content_h - _cs_bottom_reserved - _cs_block_h) // 2)
+        _cs_title_y = content_y + CHANNEL_SETTINGS_TITLE_TOP_PX
+        _cs_area_top = _cs_title_y + lbl_hdr.get_height()
+        _cs_area_bottom = content_y + content_h - CHANNEL_SETTINGS_BOTTOM_RESERVED_PX
+        _cs_even_gap = (_cs_area_bottom - _cs_area_top - _cs_total_rows * box_h_43) // (_cs_total_rows + 1)
+        _cs_gap = max(CHANNEL_SETTINGS_HEADER_GAP_PX // 2, _cs_even_gap)
 
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + CHANNEL_SETTINGS_TITLE_TOP_PX))
-        _cs_top_y = _cs_block_top + lbl_hdr.get_height() + _cs_header_gap
+        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, _cs_title_y))
+        _cs_top_y = _cs_area_top + _cs_gap
+
+        _cs_block_ws = [
+            max(((_cs_bezel_row_w if (_rid == "bezel_toggle" and _cs_bezel_style_select_idx is not None) else _cs_row_content_w)
+                 for _i, _rid in _col), default=0)
+            for _col in _cs_columns
+        ]
+        _cs_col_gap = 90
+        _cs_side_margin = (content_w - sum(_cs_block_ws) - _cs_col_gap) // 2
 
         for _cs_col_idx, _cs_col_entries in enumerate(_cs_columns):
             if not _cs_col_entries:
                 continue
-            _cs_block_w = max(
-                (_cs_bezel_row_w if _rid == "bezel_toggle" else _cs_row_content_w)
-                for _i, _rid in _cs_col_entries
-            )
-            _cs_col_x = _cs_col_centers[_cs_col_idx] - _cs_block_w // 2
+            _cs_block_w = _cs_block_ws[_cs_col_idx]
+            if _cs_col_idx == 0:
+                _cs_col_x = cx + _cs_side_margin
+            else:
+                _cs_col_x = cx + _cs_side_margin + _cs_block_ws[0] + _cs_col_gap
             _cs_pill_x = _cs_col_x + _cs_bar_w + 20
 
             for _cs_pos, (_cs_idx, _cs_row_id) in enumerate(_cs_col_entries):
-                _cs_y = _cs_top_y + _cs_pos * (_cs_row_h + _cs_row_gap)
                 _cs_focused = _cs_cur_row == _cs_idx
-                _cs_bar_y = _cs_y + (_cs_row_h - box_h_43) // 2
+                _cs_bar_y = _cs_top_y + _cs_pos * (box_h_43 + _cs_gap)
 
                 pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON, (_cs_col_x, _cs_bar_y, _cs_bar_w, box_h_43), border_radius=6)
                 if _cs_focused:
@@ -4932,7 +4930,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                         _bezel_style_val = 1
                     _bezel_style_val = max(1, min(_bezel_style_val, _bezel_style_n))
                     _cs_bstyle_txt_col = TEXT_WHITE if _bezel_on else COLOR_MENU_TEXT_GREYED
-                    _cs_bstyle_lbl = f_ch_btn.render(str(_bezel_style_val), True, _cs_bstyle_txt_col)
+                    _cs_bstyle_lbl = f_ch_btn.render("Option %d" % _bezel_style_val, True, _cs_bstyle_txt_col)
                     _cs_bstyle_x = _cs_pill_x + pill_w + 20
                     _cs_bstyle_bg = COLOR_MENU_BUTTON_BLUE if _bezel_on else COLOR_MENU_BUTTON_GREYED
                     pygame.draw.rect(menu_canvas, _cs_bstyle_bg,
@@ -5526,7 +5524,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             f_sub_title = f_ch_label
             _ch_name = ch_info.get("name", f"STATION {target_ch_str}").upper()
             lbl_hdr = f_sub_title.render(
-                f"Channel {target_ch_str} — {_ch_name}: Audio Track", True, TEXT_WHITE
+                f"Channel {target_ch_str} — {_ch_name}", True, TEXT_WHITE
             )
         menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
 
@@ -6763,12 +6761,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         banner_y = title_y + title_h + equal_gap
         rows_top = banner_y + banner_h + equal_gap
         close_y  = rows_top + grid_h + equal_gap
-
-        _prof_notice = app_state.get("games_profile_notice")
-        if _prof_notice and pygame.time.get_ticks() < _prof_notice[1]:
-            _notice_lbl = _get_font("Courier New", 14, bold=True).render(_prof_notice[0], True, COLOR_MENU_NOTICE_TEXT)
-            menu_canvas.blit(_notice_lbl, (cx + content_w // 2 - _notice_lbl.get_width() // 2,
-                                           rows_top + grid_h + (equal_gap - _notice_lbl.get_height()) // 2))
 
         def _draw_prof_row(idx, label, x_pos, y_pos, width, toggle_val=None, greyed=False, value_text=None,
                             active_square=None, stepper_value=None, stepper_focused=False):

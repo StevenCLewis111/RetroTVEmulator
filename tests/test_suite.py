@@ -16864,6 +16864,71 @@ class TestVisualizerTitleFromHub(unittest.TestCase):
         self.assertIn("_visualizer_title_path(", MAIN_SRC)
 
 
+class TestNov8BootMemoryAndGraphics(unittest.TestCase):
+    """Boot memory scan greys out captions (not Lite mode), memory places weak vs strong PCs, CPU-only PCs never get Performance"""
+
+    def _gov(self):
+        import performance_governor as gov
+        return gov
+
+    def test_lite_mode_no_longer_locks_captions(self):
+        gov = self._gov()
+        with mock.patch.dict(gov._state, {"captions_memory_ok": True}):
+            for key in gov.CAPTION_LOCK_KEYS:
+                self.assertFalse(gov.feature_locked(key, "lite"))
+            self.assertTrue(gov.feature_locked("warp_screen_enabled", "lite"))
+            self.assertTrue(gov.feature_locked("fake_43_scanlines_enabled", "lite"))
+
+    def test_boot_memory_scan_locks_captions_in_every_mode_and_runs_once(self):
+        gov = self._gov()
+        calls = []
+
+        def fake_check():
+            calls.append(1)
+            return False, 6.0, 1.0, 1.5
+        with mock.patch.dict(gov._state, {"captions_memory_ok": None}), mock.patch.object(gov, "caption_memory_check", fake_check):
+            for mode in ("lite", "standard", "performance"):
+                for key in gov.CAPTION_LOCK_KEYS:
+                    self.assertTrue(gov.feature_locked(key, mode), (mode, key))
+            self.assertFalse(gov.feature_locked("boot_anim_enabled", "standard"))
+            self.assertEqual(len(calls), 1)
+
+    def test_enough_or_unreadable_memory_never_locks_captions(self):
+        gov = self._gov()
+        for answer in ((True, 16.0, 8.0, 1.5), (True, 0.0, 0.0, 1.5)):
+            with mock.patch.dict(gov._state, {"captions_memory_ok": None}), mock.patch.object(gov, "caption_memory_check", lambda a=answer: a):
+                self.assertFalse(gov.feature_locked("tv_captions_enabled", "standard"))
+                self.assertFalse(gov.feature_locked("dvd_captions_enabled", "lite"))
+
+    def test_start_runs_the_caption_memory_scan_with_the_boot_scan(self):
+        self.assertIn("scan_caption_memory()", inspect.getsource(self._gov().start))
+
+    def test_cpu_only_pc_is_never_offered_performance(self):
+        gov = self._gov()
+        profile = gov.build_profile(8, 0, 16, 32.0, 20.0, cpu_name="AMD Ryzen 7 5700X")
+        self.assertEqual(profile.tier, "STRONG")
+        profile.gpu_tier = "none"
+        self.assertEqual(gov.allowed_modes(profile), ("lite", "standard"))
+        self.assertEqual(gov.next_mode("standard", profile), "lite")
+        for tier in ("onboard", "dedicated", "pending"):
+            profile.gpu_tier = tier
+            self.assertIn("performance", gov.allowed_modes(profile))
+        weak = gov.build_profile(2, 0, 4, 4.0, 2.0, cpu_name="Intel Core i3-4130")
+        weak.gpu_tier = "dedicated"
+        self.assertNotIn("performance", gov.allowed_modes(weak))
+
+    def test_memory_places_a_pc_between_weak_and_strong(self):
+        gov = self._gov()
+        self.assertEqual(gov.classify_tier(8, 16, 4.0, "C"), "WEAK")
+        self.assertEqual(gov.classify_tier(8, 16, 12.0, "C"), "REFERENCE")
+        self.assertEqual(gov.classify_tier(8, 16, 16.0, "C"), "STRONG")
+        self.assertEqual(gov.classify_tier(8, 16, 0.0, "C"), "STRONG")
+        profile = gov.build_profile(8, 0, 16, 12.0, 6.0, cpu_name="AMD Ryzen 7 5700X")
+        self.assertNotEqual(gov.run_boot_scan(profile, "AMD Ryzen 7 5700X", True)["start_mode"], "performance")
+        profile = gov.build_profile(8, 0, 16, 32.0, 20.0, cpu_name="AMD Ryzen 7 5700X")
+        self.assertEqual(gov.run_boot_scan(profile, "AMD Ryzen 7 5700X", True)["start_mode"], "performance")
+
+
 class TestNov7TestListFixes(unittest.TestCase):
     """The 09:23 test list: card stays up, update popup times out, static cycle, HID scan off the screen thread, no-core warning in the banner"""
 
@@ -16911,6 +16976,108 @@ class TestNov7TestListFixes(unittest.TestCase):
         finally:
             gd._scan_hid_identities = orig
         self.assertIn("post_status_notice", get_function_source("_draw_romlist_error_banner", None) if False else open(gd.__file__, encoding="utf-8").read().split("def _draw_romlist_error_banner")[1][:2500])
+
+
+class TestGuideLeftRightOneSpotPerPress(unittest.TestCase):
+    """Owner 2026-11-07: one D or A press is one grid spot (short, long, paired or with breaks), nothing is skipped, and the highlight stays on a block in view"""
+
+    COLS = 5
+
+    def _world(self, spots):
+        cols = self.COLS
+        clock = datetime.datetime(2026, 10, 12, 14, 10, 0)
+        state = {"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0}
+
+        def clamp(raw, n):
+            return max(0, min(raw, 336 - n))
+
+        def live_idx():
+            return clock.hour * 2 + (1 if clock.minute >= 30 else 0)
+
+        def view_idx():
+            return clamp(live_idx() + state.get("selected_guide_time_idx", 0), cols)
+
+        def stops_for(time_idx):
+            vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
+            out = []
+            for a, b, kind in spots:
+                if b <= vs or a >= ve:
+                    continue
+                out.append({"col": int((max(vs, a) - vs) / 1800.0 + 1e-6), "abs": a, "key": (kind, round(a))})
+            return out
+
+        def refresh():
+            state["guide_current_row_stops"] = stops_for(view_idx())
+
+        log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
+        ns = dict(app_state=state, log=log, broadcast_clock=types.SimpleNamespace(now=lambda: clock), db=object(),
+                  performance_governor=gov, get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
+                  _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh)
+        exec(compile(get_function_source("_guide_jump_col"), "<extracted>", "exec"), ns)
+        refresh()
+        return state, ns, view_idx, refresh
+
+    def _spots(self, rng):
+        spots, t = [], 12 * 3600
+        while t < 80 * 3600:
+            d = rng.choice([300, 600, 900, 1200, 1500, 1800, 1800, 3600, 5400, 7200, 12000])
+            spots.append((t, t + d, "show"))
+            t += d
+            if rng.random() < 0.2:
+                gap_end = t + rng.choice([600, 1800, 5400])
+                while t < gap_end:
+                    piece_end = min(gap_end, (t // 1800 + 1) * 1800)
+                    spots.append((t, piece_end, "offair"))
+                    t = piece_end
+        return spots
+
+    def test_each_press_is_exactly_the_next_spot_and_stays_in_view(self):
+        for seed in range(60):
+            rng = random.Random(seed)
+            spots = self._spots(rng)
+            state, ns, view_idx, refresh = self._world(spots)
+            first = next(i for i, sp in enumerate(spots) if sp[1] > view_idx() * 1800)
+            state["guide_selected_stop_key"] = (spots[first][2], round(spots[first][0]))
+            state["guide_selected_abs_time"] = spots[first][0]
+            order = list(range(first, min(first + 40, len(spots))))
+            for i in order[1:]:
+                ns["_guide_jump_col"](1)
+                self.assertEqual(state["guide_selected_abs_time"], spots[i][0], "seed %d: one D press is the next spot" % seed)
+                vs, ve = view_idx() * 1800, view_idx() * 1800 + self.COLS * 1800
+                self.assertTrue(spots[i][1] > vs and spots[i][0] < ve, "seed %d: the highlighted spot is in the window" % seed)
+            for i in reversed(order[:-1]):
+                ns["_guide_jump_col"](-1)
+                self.assertEqual(state["guide_selected_abs_time"], spots[i][0], "seed %d: one A press is the previous spot" % seed)
+                vs, ve = view_idx() * 1800, view_idx() * 1800 + self.COLS * 1800
+                self.assertTrue(spots[i][1] > vs and spots[i][0] < ve, "seed %d: the highlighted spot is in the window" % seed)
+
+    def test_scrolling_moves_the_window_to_the_spot_not_by_half_hours(self):
+        for seed in range(30):
+            rng = random.Random(seed)
+            spots = self._spots(rng)
+            state, ns, view_idx, refresh = self._world(spots)
+            first = next(i for i, sp in enumerate(spots) if sp[1] > view_idx() * 1800)
+            state["guide_selected_stop_key"] = (spots[first][2], round(spots[first][0]))
+            state["guide_selected_abs_time"] = spots[first][0]
+            for i in range(first + 1, min(first + 30, len(spots))):
+                before = view_idx()
+                ns["_guide_jump_col"](1)
+                if view_idx() != before:
+                    self.assertEqual(view_idx(), int(spots[i][0] // 1800), "seed %d: after a scroll the new spot is the first block on the left" % seed)
+
+    def test_a_press_with_nothing_further_leaves_everything_as_it_was(self):
+        spots = [(12 * 3600, 20 * 3600, "show")]
+        state, ns, view_idx, refresh = self._world(spots)
+        state["guide_selected_stop_key"] = ("show", 12 * 3600)
+        state["guide_selected_abs_time"] = 12 * 3600
+        before = (state["selected_guide_time_idx"], state["guide_selected_abs_time"])
+        ns["_guide_jump_col"](-1)
+        self.assertEqual((state["selected_guide_time_idx"], state["guide_selected_abs_time"]), before)
+
+    def test_same_column_spots_are_not_skipped_and_there_is_no_edge_step(self):
+        src = get_function_source("_guide_jump_col")
+        self.assertNotIn("_sync_to_edge_stop", src)
+        self.assertNotIn('s.get("col", 0) > curr_col', src)
 
 
 class TestHubCurrentShowRecord(unittest.TestCase):
@@ -19471,7 +19638,8 @@ class TestFileExplorerEscapeOnly(unittest.TestCase):
     def test_the_up_button_still_goes_up_and_backspace_keeps_its_other_jobs(self):
         src = read(os.path.join(ROOT, "retro_tv_emulator.py"))
         self.assertIn("if menu_nav.explorer_hit(up_rect, mx, my):\n            _fe_go_up()", src, "the toolbar's up button is unchanged")
-        self.assertEqual(src.count("menu_nav.key_to_action(event.key, parent=True)"), 1, "only the controller remap skip asks for Backspace in the main script")
+        self.assertEqual(src.count("menu_nav.key_to_action(event.key, parent=True)"), 0, "no controller screen asks for Backspace; the controller remap skips with Enter")
+        self.assertIn("elif menu_nav.is_accept(event.key):\n                        game_deck.skip_current_remap_button()", src, "Enter skips a controller button")
         self.assertIn("action = key_to_action(key, parent=True)", read(os.path.join(ROOT, "menu_nav.py")), "name boxes still delete with Backspace")
 
 
@@ -19673,7 +19841,8 @@ class TestKeyHintsUseKeyPictures(unittest.TestCase):
             self.assertNotIn(old, deck_src, old)
         self.assertGreaterEqual(ui_src.count("draw_key_hint("), 8, "the controls footer, both loudness rows, the disc row, the minimize popup and three popups")
         self.assertEqual(deck_src.count("draw_key_hint_fitted("), 3, "the two DVD prompts and the game exit prompt")
-        self.assertIn("_ui.draw_key_hint(surface, [(\"backspace\",)", deck_src, "the remap screen")
+        self.assertIn("_ui.draw_key_hint(surface, [(_skip_name,), \"to skip button\"", deck_src, "the remap screen")
+        self.assertIn("_ui._get_remote_binding(db, \"enter\")", deck_src, "the skip hint shows the remapped Select key")
         for page_row in ("((\"pad_dpad\",),", "((\"pad_start\", \"pad_select\"),", "((\"pad_y\",),", "((\"pad_down\",),"):
             self.assertIn(page_row, ui_src, "the controller pages use the controller buttons")
 
@@ -21059,6 +21228,7 @@ def suite_crash_log_and_exit_notice():
         warnings = []
         ns = {
             "os": os, "sys": sys,
+            "_start_shutdown_events_reader": lambda: None,
             "_log_output_dir": lambda: folder,
             "broadcast_clock": types.SimpleNamespace(now=lambda: _dt.datetime(2026, 10, 16, 18, 0, 0)),
             "log": types.SimpleNamespace(warning=lambda msg, *a: warnings.append(msg % a if a else msg),
@@ -21365,7 +21535,7 @@ class TestFailurePointText(_SectionCase):
 
 
 def suite_failure_point_text_game_deck():
-    converted_handler_checks("game_deck.py", 54)
+    converted_handler_checks("game_deck.py", 53)
     path = os.path.join(ROOT, "game_deck.py")
     module = load_deck_module(path, "game_deck_failure_text")
     check(module._log_swallowed is gov.log_swallowed, "game_deck uses the one shared helper from performance_governor.py")
@@ -26912,7 +27082,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.2.9", "build_info.py says 1.2.9 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.3.2", "build_info.py says 1.3.2 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27317,7 +27487,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.2.9"""
+    """This build is 1.3.2"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -27792,18 +27962,20 @@ class TestScanBarAlwaysVisible(unittest.TestCase):
 
 
 class TestGuideBlockIsOnePress(unittest.TestCase):
-    """Owner 2026-11-06: an off-air stretch of three half hours is one block, one press crosses it, and the way back works"""
+    """Owner 2026-11-07: every half-hour grid of an off-air stretch is its own spot, one press each, and the way back works"""
 
-    def test_one_stop_per_gap_keyed_by_time(self):
+    def test_one_stop_per_off_air_grid_keyed_by_time(self):
         src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8").read()
         self.assertEqual(src.count('"key": ("offair", _oa_col)'), 0)
         self.assertEqual(src.count('"key": ("offair", _tr_col)'), 0)
-        self.assertGreaterEqual(src.count('"key": ("offair", round(_last_show_end_abs))'), 3)
-        self.assertIn("if not _oa_stop_done:", src)
-        self.assertIn("if not _tr_stop_done:", src)
+        self.assertEqual(src.count('"key": ("offair", round(_last_show_end_abs))'), 0)
+        for _name in ("_oa_seg_abs", "_tr_seg_abs", "_fb_abs"):
+            self.assertIn('"key": ("offair", round(%s))' % _name, src)
+        self.assertNotIn("_oa_stop_done", src)
+        self.assertNotIn("_tr_stop_done", src)
         self.assertIn('"key": ("col", round(_viz_block_abs))', src)
 
-    def test_pressing_right_then_left_crosses_a_gap_in_one_press(self):
+    def test_pressing_right_then_left_steps_through_every_off_air_grid(self):
         cols = 4
         scheds = {"05": [(0, 1800), (1800 * 5, 1800 * 6)]}
         clock = {"t": datetime.datetime(2026, 10, 12, 0, 10, 0)}
@@ -27827,11 +27999,18 @@ class TestGuideBlockIsOnePress(unittest.TestCase):
                     break
                 cs = max(vs, a)
                 if cs > cursor:
-                    out.append({"col": int((cursor - vs) / 1800), "abs": prev_end, "key": ("offair", round(prev_end))})
+                    g = cursor
+                    while g < cs:
+                        seg = max(prev_end, (g // 1800) * 1800)
+                        out.append({"col": int((seg - vs) / 1800), "abs": seg, "key": ("offair", round(seg))})
+                        g = (g // 1800 + 1) * 1800
                 out.append({"col": int((cs - vs) / 1800), "abs": a, "key": ("show", round(a))})
                 cursor, prev_end = min(ve, b), b
-            if cursor < ve:
-                out.append({"col": int((cursor - vs) / 1800), "abs": prev_end, "key": ("offair", round(prev_end))})
+            g = cursor
+            while g < ve:
+                seg = max(prev_end, (g // 1800) * 1800)
+                out.append({"col": int((seg - vs) / 1800), "abs": seg, "key": ("offair", round(seg))})
+                g = (g // 1800 + 1) * 1800
             return out
 
         state = {"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0}
@@ -27850,16 +28029,15 @@ class TestGuideBlockIsOnePress(unittest.TestCase):
         refresh()
         state["guide_selected_stop_key"] = ("show", 0)
         state["guide_selected_abs_time"] = 0
-        ns["_guide_jump_col"](1)
-        self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "one press from the show lands on the gap")
-        ns["_guide_jump_col"](1)
-        self.assertEqual(state["guide_selected_stop_key"], ("show", 1800 * 5), "one press crosses the three-slot gap")
-        ns["_guide_jump_col"](-1)
-        self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "one press back lands on the gap")
+        walk = [("offair", 1800), ("offair", 3600), ("offair", 5400), ("offair", 7200), ("show", 1800 * 5)]
+        for key in walk:
+            ns["_guide_jump_col"](1)
+            self.assertEqual(state["guide_selected_stop_key"], key, "one press right is the next grid")
+        for key in reversed(walk[:-1] + [("show", 0)][:0]):
+            ns["_guide_jump_col"](-1)
+            self.assertEqual(state["guide_selected_stop_key"], key, "one press left is the previous grid")
         ns["_guide_jump_col"](-1)
         self.assertEqual(state["guide_selected_stop_key"], ("show", 0), "and one more reaches the first show")
-        ns["_guide_jump_col"](1)
-        self.assertEqual(state["guide_selected_stop_key"], ("offair", 1800), "going right again is not stuck")
 
 
 class TestBezelThreeNumberPlace(unittest.TestCase):
@@ -28810,9 +28988,9 @@ if __name__ == "__main__":
 
 
 class TestAllSettingsTurnsOnSticksAndSyncsProfiles(unittest.TestCase):
-    """Owner 2026-11-07: turning All Settings on turns every L-STICK AS D-PAD switch on, and with it on a profile pick goes to every console"""
+    """Owner 2026-11-07: with All Settings on, changing the L-STICK AS D-PAD switch changes it on every console (turning All Settings on changes nothing by itself), and a profile pick goes to every console"""
 
-    def test_all_settings_turns_on_every_stick_switch(self):
+    def test_all_settings_applies_a_stick_change_to_every_console(self):
         import json
         import tempfile
         import game_deck as gd
@@ -28827,7 +29005,7 @@ class TestAllSettingsTurnsOnSticksAndSyncsProfiles(unittest.TestCase):
             original = gd.resolve_emulator_config_path
             gd.resolve_emulator_config_path = lambda: path
             try:
-                deck.turn_on_stick_as_dpad_everywhere()
+                deck.set_stick_as_dpad_everywhere(True)
             finally:
                 gd.resolve_emulator_config_path = original
             with open(path, "r", encoding="utf-8") as handle:
@@ -28842,7 +29020,10 @@ class TestAllSettingsTurnsOnSticksAndSyncsProfiles(unittest.TestCase):
         self.assertTrue(saved["GBA_mapping"]["stick_as_dpad"])
         self.assertTrue(deck.ctrl_mapping["stick_as_dpad"])
         self.assertEqual(deck._gameplay_ctrl_mapping_cache, {})
-        self.assertIn("game_deck.turn_on_stick_as_dpad_everywhere()", MAIN_SRC)
+        self.assertIn("game_deck.set_stick_as_dpad_everywhere(", MAIN_SRC)
+        self.assertNotIn("turn_on_stick_as_dpad_everywhere", MAIN_SRC)
+        _toggle = get_function_source("_toggle_all_profiles")
+        self.assertNotIn("stick_as_dpad", _toggle, "switching All Settings on changes no stick switch by itself")
 
     def test_a_profile_pick_goes_to_every_console_while_all_settings_is_on(self):
         self.assertIn("_targets = [c for c in CONSOLE_ORDER if c != \"MENU\"] if db.config.get(\"all_profiles_sync\", False) else [con]", MAIN_SRC)

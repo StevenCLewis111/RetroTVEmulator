@@ -3204,6 +3204,44 @@ def resolve_emulator_config_path():
     return new_path
 
 
+def read_emulator_config_file(path):
+    """The parsed emulator_config.json; when the file is empty or cut short (a power loss in the middle of a write), the last good copy beside it (.bak) is read instead; raises when neither can be read."""
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("emulator_config.json is not a settings object")
+    except Exception as first_error:
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            with open(bak, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            if isinstance(data, dict):
+                log.warning("[CONFIG] emulator_config.json could not be read (%s); using the last good copy %s", first_error, bak)
+                return data
+        raise
+
+
+def write_emulator_config_file(path, data):
+    """Writes emulator_config.json all at once (temp file, flush to disk, rename) and keeps the previous good file as .bak, so a power loss or crash can never leave it empty or cut short."""
+    # WARNING: this file holds every console's controller remap and core path; writing it in place (open(path, "w") then dump) left it empty after a hard shutdown and lost all of them (owner 2026-11-08).
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, indent=2)
+        fp.flush()
+        os.fsync(fp.fileno())
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 2:
+            shutil.copy2(path, path + ".bak")
+    except Exception as bak_error:
+        log.warning("[CONFIG] could not keep a backup of %s: %s", path, bak_error)
+    os.replace(tmp, path)
+
+
 # ============================================================================
 # SECTION: External game deck
 # ============================================================================
@@ -3435,8 +3473,7 @@ class ExternalGameDeck:
     def _load_emulator_config(self):
         try:
             if os.path.exists(self.config_path):
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                return read_emulator_config_file(self.config_path)
         except Exception as e:
             log.warning("Failed to load emulator_config.json, using defaults: %s", e)
         return {}
@@ -5015,14 +5052,14 @@ class ExternalGameDeck:
     def _assign_default_cores_after_scan(self, found):
         """Give each console whose remembered core is missing the best core the scan found (PREFERRED_CORE_ORDER), remembered where it sits; returns the consoles set."""
         try:
-            with open(self.config_path, "r", encoding="utf-8") as fp:
-                cfg = json.load(fp)
+            cfg = read_emulator_config_file(self.config_path)
         except FileNotFoundError:
             # WARNING: no emulator_config.json yet is normal on a first start; it is written below (owner 2026-11-02: no warning for it).
             cfg = {}
-        except Exception as _swallowed_error:
-            _log_swallowed("ExternalGameDeck._assign_default_cores_after_scan: with open(self.config_path, 'r', encoding='utf-8') as fp:", _swallowed_error)
-            cfg = {}
+        except Exception as _read_error:
+            # WARNING: an unreadable emulator_config.json is never treated as empty here; writing the cores into an empty object replaced every saved controller remap with nothing (owner 2026-11-08).
+            log.warning("[CORES] emulator_config.json could not be read, so no core was saved this time: %s", _read_error)
+            return set()
         set_now = set()
         for console, paths in found.items():
             if resolve_active_core_path(console, cfg.get(console), self.cores_dir):
@@ -5040,8 +5077,7 @@ class ExternalGameDeck:
         if changed:
             try:
                 os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-                with open(self.config_path, "w", encoding="utf-8") as fp:
-                    json.dump(cfg, fp, indent=2)
+                write_emulator_config_file(self.config_path, cfg)
             except Exception as e:
                 log.warning(f"[CORES] Could not save {self.config_path}: {e}")
         return set_now
@@ -5983,8 +6019,7 @@ class ExternalGameDeck:
         try:
             cfg_path = resolve_emulator_config_path()
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_emulator_config_file(cfg_path)
                 saved = {}
                 if player and player > 1:
                     saved = data.get(self._mapping_key(console, player), {})
@@ -6010,32 +6045,30 @@ class ExternalGameDeck:
         """Returns a controller mapping as it is written to the config file: button codes by name, the stick switch as it is."""
         return {k: (v if k == "stick_as_dpad" else VK_NAMES.get(v, v)) for k, v in mapping.items()}
 
-    def turn_on_stick_as_dpad_everywhere(self):
-        """Turns the L-STICK AS D-PAD switch on for every console that has one, for every player slot of that console, in one write of the config file."""
+    def set_stick_as_dpad_everywhere(self, value):
+        """Sets the L-STICK AS D-PAD switch to value for every console that has one, for every player slot of that console, in one write of the config file; used when All Settings is on and the switch is changed."""
         try:
             cfg_path = resolve_emulator_config_path()
             data = {}
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_emulator_config_file(cfg_path)
             for console in CONSOLE_ORDER:
                 if console in ("DVD", "N64") or "stick_as_dpad" not in _get_console_def(console)["default_map"]:
                     continue
                 for player in range(1, CONSOLE_MAX_PLAYERS.get(console, 4) + 1):
                     mapping = self._load_controller_mapping(console, player)
-                    mapping["stick_as_dpad"] = True
+                    mapping["stick_as_dpad"] = bool(value)
                     serialised = self._serialise_mapping(mapping)
                     data[self._mapping_key(console, player)] = serialised
                     if console == "GBA" and player == 1:
                         data["GBA_mapping"] = serialised
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            write_emulator_config_file(cfg_path, data)
             self._gameplay_ctrl_mapping_cache.clear()
             if getattr(self, "_active_mapping_console", None) and "stick_as_dpad" in self.ctrl_mapping:
-                self.ctrl_mapping["stick_as_dpad"] = True
-            log.info("[GAMEDECK MAPPING] L-stick as D-pad turned on for every console")
+                self.ctrl_mapping["stick_as_dpad"] = bool(value)
+            log.info("[GAMEDECK MAPPING] L-stick as D-pad set to %s for every console", bool(value))
         except Exception as e:
-            log.warning(f"[GAMEDECK MAPPING] Turning on L-stick as D-pad everywhere failed: {e}")
+            log.warning(f"[GAMEDECK MAPPING] Setting L-stick as D-pad everywhere failed: {e}")
 
     def _save_controller_mapping(self, console=None, player=None):
         if console is None:
@@ -6046,14 +6079,12 @@ class ExternalGameDeck:
             cfg_path = resolve_emulator_config_path()
             data = {}
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_emulator_config_file(cfg_path)
             serialised = self._serialise_mapping(self.ctrl_mapping)
             data[self._mapping_key(console, player)] = serialised
             if console == "GBA" and (not player or player <= 1):
                 data["GBA_mapping"] = serialised
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            write_emulator_config_file(cfg_path, data)
             log.info(f"[GAMEDECK MAPPING] Saved {console} (player {player or 1}): {serialised}")
             self._gameplay_ctrl_mapping_cache.get(console, {}).pop(player or 1, None)
         except Exception as e:
@@ -6797,7 +6828,10 @@ class ExternalGameDeck:
         if seq_running and active_btn:
             ctrl_bottom = y + h - 6
             import ui as _ui
-            _ui.draw_key_hint(surface, [("backspace",), "to skip button", ("esc",), "to cancel remap"], center_x,
+            # WARNING: the skip key is the Select action, so the hint shows whatever key Select is remapped to (its picture when it is Enter, its name otherwise).
+            _skip_bound = _ui._get_remote_binding(db, "enter")
+            _skip_name = "enter" if _skip_bound == pygame.K_RETURN else _ui._remote_key_label(_skip_bound).lower()
+            _ui.draw_key_hint(surface, [(_skip_name,), "to skip button", ("esc",), "to cancel remap"], center_x,
                               ctrl_bottom - 14 + f_small.get_height() // 2, f_small, _gov.COLOR_GAME_REMAP_HINT, center=True)
 
         if _target_w > 0 and _target_h > 0:
@@ -8307,8 +8341,7 @@ class ExternalGameDeck:
         try:
             cfg_path = resolve_emulator_config_path()
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_emulator_config_file(cfg_path)
                 saved = data.get(self._xi_map_key(console, player), {})
                 out = {}
                 for btn_name, xi_label in saved.items():
@@ -8327,8 +8360,7 @@ class ExternalGameDeck:
             cfg_path = resolve_emulator_config_path()
             data = {}
             if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                data = read_emulator_config_file(cfg_path)
             console_map = self._libretro_xinput_map.get(console, {}).get(player, {})
             key = self._xi_map_key(console, player)
             data[key] = {
@@ -8336,8 +8368,7 @@ class ExternalGameDeck:
                 for btn_name, xi_bit in console_map.items()
                 if xi_bit in _XI_LABELS
             }
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            write_emulator_config_file(cfg_path, data)
             log.info(f"[GAMEDECK MAPPING] Saved {console} player {player} gamepad map: {data[key]}")
         except Exception as e:
             log.warning(f"[GAMEDECK MAPPING] Gamepad-map save failed for {console} player {player}: {e}")
