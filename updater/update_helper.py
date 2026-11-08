@@ -578,6 +578,7 @@ def _theme_progress_colors(install_dir):
     try:
         import colorsys
         config = _read_json(os.path.join(install_dir, "retro_config.json"))
+        config = config.get("config", config)
         ui_hue = float(config[PROGRESS_THEME_UI_HUE_KEY]) / 360.0
         bg_hue = float(config[PROGRESS_THEME_BG_HUE_KEY]) / 360.0
 

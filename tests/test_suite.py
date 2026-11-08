@@ -27082,7 +27082,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.3.3", "build_info.py says 1.3.3 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.3.4", "build_info.py says 1.3.4 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27487,7 +27487,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.3.3"""
+    """This build is 1.3.4"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -29168,7 +29168,7 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
     def test_the_bar_takes_the_saved_theme_colours_and_keeps_the_defaults_without_them(self):
         import colorsys
         with open(os.path.join(self.install, "retro_config.json"), "w", encoding="utf-8") as handle:
-            json.dump({"theme_ui_hue": 300, "theme_bg_hue": 20}, handle)
+            json.dump({"config": {"theme_ui_hue": 300, "theme_bg_hue": 20}}, handle)
         accent, panel, track = self.h._theme_progress_colors(self.install)
         self.assertEqual(accent, tuple(int(c * 255) for c in colorsys.hsv_to_rgb(300 / 360.0, 0.9, 1.0)))
         self.assertNotEqual(accent, self.h.PROGRESS_ACCENT_RGB)
