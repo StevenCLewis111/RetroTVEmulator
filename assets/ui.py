@@ -5519,12 +5519,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             lbl_hdr = f_sub_title.render("DVD \u2014 Change Audio Selection", True, TEXT_WHITE)
         else:
             target_ch_str = str(app_state.get("audio_track_source_channel", app_state.get("selected_channel_row", 5))).zfill(2)
-            ch_info = db.channels_db.get(target_ch_str, {"name": f"STATION {target_ch_str}"})
-
             f_sub_title = f_ch_label
-            _ch_name = ch_info.get("name", f"STATION {target_ch_str}").upper()
             lbl_hdr = f_sub_title.render(
-                f"Channel {target_ch_str} — {_ch_name}", True, TEXT_WHITE
+                f"Channel {target_ch_str} \u2014 Audio Settings", True, TEXT_WHITE
             )
         menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
 

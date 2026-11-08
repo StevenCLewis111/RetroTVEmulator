@@ -27082,7 +27082,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.3.2", "build_info.py says 1.3.2 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.3.3", "build_info.py says 1.3.3 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27487,7 +27487,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.3.2"""
+    """This build is 1.3.3"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -29142,7 +29142,7 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
             json.dump({"install_dir": self.install, "staged_path": self.staged, "parent_pid": 0, "version": "",
                        "relaunch_command": [os.path.join(self.install, self.EXE), "--relaunched"]}, handle)
         with mock.patch.object(self.h.subprocess, "Popen", lambda command, **kwargs: _FakeProcess(codes.pop(0) if codes else None)), \
-                mock.patch.object(self.h, "_open_progress", lambda: self.recorder):
+                mock.patch.object(self.h, "_open_progress", lambda *a: self.recorder):
             return self.h.apply_update(path)
 
     def test_a_good_update_walks_the_bar_through_every_stage_and_finishes(self):
@@ -29164,6 +29164,20 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         self.assertIn("fail", kinds)
         self.assertEqual(self.events[-1], ("close",))
         self.assertNotIn("finish", kinds)
+
+    def test_the_bar_takes_the_saved_theme_colours_and_keeps_the_defaults_without_them(self):
+        import colorsys
+        with open(os.path.join(self.install, "retro_config.json"), "w", encoding="utf-8") as handle:
+            json.dump({"theme_ui_hue": 300, "theme_bg_hue": 20}, handle)
+        accent, panel, track = self.h._theme_progress_colors(self.install)
+        self.assertEqual(accent, tuple(int(c * 255) for c in colorsys.hsv_to_rgb(300 / 360.0, 0.9, 1.0)))
+        self.assertNotEqual(accent, self.h.PROGRESS_ACCENT_RGB)
+        self.assertNotEqual(panel, self.h.PROGRESS_PANEL_RGB)
+        with open(os.path.join(self.install, "retro_config.json"), "w", encoding="utf-8") as handle:
+            handle.write("{ not json")
+        self.assertIsNone(self.h._theme_progress_colors(self.install))
+        self.assertIsNone(self.h._theme_progress_colors(os.path.join(self.tmp, "nowhere")))
+        self.assertIsNone(self.h._theme_progress_colors(None))
 
     def test_there_is_no_window_unless_this_is_the_packaged_helper(self):
         self.assertIsInstance(self.h._open_progress(), self.h._NullProgress)

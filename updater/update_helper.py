@@ -517,6 +517,13 @@ PROGRESS_PANEL_RGB = (20, 28, 46)
 PROGRESS_TRACK_RGB = (10, 15, 30)
 PROGRESS_ACCENT_RGB = (0, 255, 128)
 PROGRESS_FAIL_RGB = (255, 90, 90)
+# VALUES CHANGE HERE: the bar takes the owner's saved theme colours from retro_config.json (the same two hues and the same saturation and brightness the app's own loading screen uses); a missing or unreadable file keeps the default colours above.
+PROGRESS_THEME_UI_HUE_KEY = "theme_ui_hue"
+PROGRESS_THEME_BG_HUE_KEY = "theme_bg_hue"
+PROGRESS_THEME_UI_SV = (0.9, 1.0)
+PROGRESS_THEME_BG_S = 0.6
+PROGRESS_THEME_PANEL_V = 0.18
+PROGRESS_THEME_TRACK_V = 0.12
 PROGRESS_CAPTION_RGB = (190, 200, 215)
 PROGRESS_CAPTION = "The app closes, installs and reopens by itself. This takes about a minute."
 PROGRESS_REFRESH_MS = 50
@@ -564,13 +571,34 @@ class _NullProgress:
         pass
 
 
+def _theme_progress_colors(install_dir):
+    """Returns (accent, panel, track) colours from the saved theme hues in install_dir/retro_config.json, or None when the file or the hues are not there, so the bar keeps its default colours."""
+    if not install_dir:
+        return None
+    try:
+        import colorsys
+        config = _read_json(os.path.join(install_dir, "retro_config.json"))
+        ui_hue = float(config[PROGRESS_THEME_UI_HUE_KEY]) / 360.0
+        bg_hue = float(config[PROGRESS_THEME_BG_HUE_KEY]) / 360.0
+
+        def rgb(hue, sat, val):
+            return tuple(int(c * 255) for c in colorsys.hsv_to_rgb(hue % 1.0, sat, val))
+        return (rgb(ui_hue, *PROGRESS_THEME_UI_SV), rgb(bg_hue, PROGRESS_THEME_BG_S, PROGRESS_THEME_PANEL_V),
+                rgb(bg_hue, PROGRESS_THEME_BG_S, PROGRESS_THEME_TRACK_V))
+    except Exception as exc:
+        log.info("[UPDATE DIAG] Theme colours not read, using the default colours: %s", exc)
+        return None
+
+
 class _ProgressWindow(_NullProgress):
     """A borderless always-on-top box with a title and a fill bar, drawn by tkinter in its own thread; the helper just sets its label and fraction."""
 
     waits_for_app = True
 
-    def __init__(self):
+    def __init__(self, install_dir=None):
         import threading
+        self._accent_rgb, self._panel_rgb, self._track_rgb = (
+            _theme_progress_colors(install_dir) or (PROGRESS_ACCENT_RGB, PROGRESS_PANEL_RGB, PROGRESS_TRACK_RGB))
         self._lock = threading.Lock()
         self._label = ""
         self._fraction = 0.0
@@ -592,7 +620,7 @@ class _ProgressWindow(_NullProgress):
             root.attributes("-topmost", True)
             w, h = PROGRESS_WINDOW_SIZE
             root.geometry("%dx%d+%d+%d" % (w, h, (root.winfo_screenwidth() - w) // 2, (root.winfo_screenheight() - h) // 2))
-            canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=self._hex(PROGRESS_PANEL_RGB))
+            canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=self._hex(self._panel_rgb))
             canvas.pack()
             self._ok = True
         except Exception as exc:
@@ -607,13 +635,13 @@ class _ProgressWindow(_NullProgress):
             if closing:
                 root.destroy()
                 return
-            accent = self._hex(PROGRESS_FAIL_RGB if failed else PROGRESS_ACCENT_RGB)
+            accent = self._hex(PROGRESS_FAIL_RGB if failed else self._accent_rgb)
             canvas.delete("all")
             canvas.create_rectangle(1, 1, w - 2, h - 2, outline=accent, width=2)
             text = label if failed else "%s %d%%" % (label, int(max(0.0, min(1.0, fraction)) * 100))
             canvas.create_text(w // 2, 34, text=text, fill=accent, font=("Courier New", 13, "bold"))
             track = (20, 62, w - 20, 76)
-            canvas.create_rectangle(*track, fill=self._hex(PROGRESS_TRACK_RGB), outline=accent)
+            canvas.create_rectangle(*track, fill=self._hex(self._track_rgb), outline=accent)
             fill_w = int((track[2] - track[0]) * max(0.0, min(1.0, fraction)))
             if fill_w > 0:
                 canvas.create_rectangle(track[0], track[1], track[0] + fill_w, track[3], fill=accent, outline=accent)
@@ -665,9 +693,9 @@ class _ProgressWindow(_NullProgress):
         self._thread.join(2.0)
 
 
-def preview_progress_bar(seconds=20.0):
+def preview_progress_bar(seconds=20.0, install_dir=None):
     """Shows the installing bar by itself for a few seconds, walking through the same stages as a real update, so the window can be checked on a PC without installing anything; returns 0 when a window showed, 1 when it could not open."""
-    window = _ProgressWindow()
+    window = _ProgressWindow(install_dir)
     if not window._ok:
         return 1
     steps = (("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR), ("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR[1]),
@@ -685,12 +713,12 @@ def preview_progress_bar(seconds=20.0):
     return 0
 
 
-def _open_progress():
+def _open_progress(install_dir=None):
     """Returns the progress window when this is the packaged helper exe and a screen is there, else one that does nothing; a window that fails to open never stops the update."""
     if not getattr(sys, "frozen", False):
         return _NullProgress()
     try:
-        window = _ProgressWindow()
+        window = _ProgressWindow(install_dir)
         log.info("[UPDATE DIAG] Progress window %s", "opened" if window._ok else "could not open (see the line above)")
         return window if window._ok else _NullProgress()
     except Exception as exc:
@@ -812,7 +840,7 @@ def apply_update(metadata_path):
     if not isinstance(command, list) or not command:
         raise RuntimeError("Update relaunch command is missing")
 
-    progress = _open_progress()
+    progress = _open_progress(install_dir)
     progress.update("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR)
     deadline = time.monotonic() + WAIT_FOR_PARENT_SECONDS
     while _pid_alive(parent_pid) and time.monotonic() < deadline:
@@ -966,7 +994,7 @@ def main(argv=None):
     parser.add_argument("--preview-bar", action="store_true", dest="preview_bar")
     args = parser.parse_args(argv)
     if args.preview_bar:
-        return preview_progress_bar()
+        return preview_progress_bar(install_dir=os.path.dirname(os.path.abspath(sys.argv[0])))
     if not args.metadata_path:
         parser.error("--apply is required")
     try:

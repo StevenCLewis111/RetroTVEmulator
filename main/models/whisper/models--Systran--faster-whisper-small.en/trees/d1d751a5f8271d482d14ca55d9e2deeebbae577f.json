@@ -1,0 +1,32 @@
+{
+ "format_version": 1,
+ "files": {
+  ".gitattributes": {
+   "size": 1477,
+   "blob_id": "c7d9f3332a950355d5a77d85000f05e6f45435ea"
+  },
+  "README.md": {
+   "size": 1330,
+   "blob_id": "22c0743ac43946fd981ad42117140a871e916bc7"
+  },
+  "config.json": {
+   "size": 2657,
+   "blob_id": "ced3fd5bbb3e9f7664658065d2d36164712cf1d5"
+  },
+  "model.bin": {
+   "size": 483545366,
+   "blob_id": "8ebf0973579cfb13f4536b674d0ba3c6aecbc169",
+   "lfs_sha256": "62b2a45b05ee59acb4a5341b33ee35e041395d378d418a18acfe4c9e768ee37a",
+   "lfs_size": 483545366,
+   "xet_hash": "e69fec6e40a2e2d94f4aa4d57d93cd238f81300502d7d86a9180621d75c2567b"
+  },
+  "tokenizer.json": {
+   "size": 2128466,
+   "blob_id": "15d7bdf9ba25718ca2504eec6a8f02bc55af0a6a"
+  },
+  "vocabulary.txt": {
+   "size": 422309,
+   "blob_id": "ee695b8d3e3c10d488304e04468efec4ca27554a"
+  }
+ }
+}
