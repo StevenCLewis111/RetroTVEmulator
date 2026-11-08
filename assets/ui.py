@@ -1002,6 +1002,12 @@ SYSTEM_ROW_META = {
     "bezel_toggle":       {"kind": "toggle", "label": "CRT TV Bezels:"},
     "captions_toggle":    {"kind": "toggle", "label": "Closed Captions:"},
     "mono_stereo_toggle": {"kind": "toggle", "label": "Mono Audio:"},
+    "warp_screen":        {"kind": "toggle", "label": "Warp Screen:"},
+    "boot_anim":          {"kind": "toggle", "label": "Boot Anim:"},
+    "static_noise":       {"kind": "toggle", "label": "Static Noise:"},
+    "reception_lines":    {"kind": "toggle", "label": "Reception Lines:"},
+    "scan_lines":         {"kind": "toggle", "label": "Scan Lines:"},
+    "bezel_style_select": {"kind": "button", "label": "Bezel Style: Option 1", "color": COLOR_MENU_BUTTON_BLUE},
     "update_check":       {"kind": "button", "label": "Look for Updates", "color": COLOR_MENU_BUTTON_BLUE},
     "remote_remap":       {"kind": "button", "label": "Remote Remapping", "color": COLOR_MENU_BUTTON_BLUE},
     "gpu_render_mode":    {"kind": "button", "label": "GPU/CPU: Disabled (CPU Only)", "color": COLOR_MENU_BUTTON_BLUE},
@@ -1129,13 +1135,30 @@ def get_server_picker_selectable_count(entries):
 # ============================================================================
 
 
+# VALUES CHANGE HERE: the config key each Channels > Settings option writes; the System tab shows these options while Kiosk is on.
+SYSTEM_KIOSK_SETTING_KEYS = {
+    "bezel_toggle": "fake_43_border_enabled",
+    "warp_screen": "warp_screen_enabled",
+    "boot_anim": "boot_anim_enabled",
+    "static_noise": "fake_static_noise_enabled",
+    "reception_lines": "fake_reception_lines_enabled",
+    "scan_lines": "fake_43_scanlines_enabled",
+}
+
+
 def get_system_menu_rows(db, app_state):
     kiosk_on = db.config.get("kiosk_mode_enabled", False) if db is not None else False
 
     poweroff_visible = app_state.get("shell_takeover_active", False) if app_state is not None else False
 
     if kiosk_on:
-        return ["kiosk_mode", "poweroff" if poweroff_visible else "exit_program"]
+        # WARNING: with Kiosk on the Channels tab is hidden, so its Settings options (and Look for Updates) are shown here instead; the toggles must stay in SYSTEM_KIOSK_SETTING_KEYS and the same two column groups as menu_nav.SYSTEM_LEFT_TOGGLES / SYSTEM_RIGHT_TOGGLES.
+        kiosk_rows = ["kiosk_mode", "bezel_toggle", "warp_screen", "boot_anim",
+                      "static_noise", "reception_lines", "scan_lines", "update_check"]
+        if media.bezel_style_count() > 1:
+            kiosk_rows.append("bezel_style_select")
+        kiosk_rows.append("poweroff" if poweroff_visible else "exit_program")
+        return kiosk_rows
 
     rows = ["game_ch", "guide", "controls_on_start", "kiosk_mode",
             "loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle"]
@@ -3780,8 +3803,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         toggle_rows = [r for r in sys_rows if SYSTEM_ROW_META[r]["kind"] == "toggle"]
         button_rows = [r for r in sys_rows if SYSTEM_ROW_META[r]["kind"] == "button"]
 
-        LEFT_TOGGLE_IDS  = ("game_ch", "guide", "controls_on_start", "kiosk_mode")
-        RIGHT_TOGGLE_IDS = ("loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle")
+        LEFT_TOGGLE_IDS  = ("game_ch", "guide", "controls_on_start", "kiosk_mode", "bezel_toggle", "warp_screen", "boot_anim")
+        RIGHT_TOGGLE_IDS = ("loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle", "static_noise", "reception_lines", "scan_lines")
         left_toggle_rows  = [r for r in toggle_rows if r in LEFT_TOGGLE_IDS]
         right_toggle_rows = [r for r in toggle_rows if r in RIGHT_TOGGLE_IDS]
 
@@ -3803,6 +3826,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             "captions_toggle":   (db.config.get("tv_captions_enabled", False) and not _mode_locks("tv_captions_enabled")) if db is not None else False,
             "mono_stereo_toggle": (not db.config.get("audio_stereo", True)) if db is not None else False,
         }
+        for _kiosk_row, _kiosk_key in SYSTEM_KIOSK_SETTING_KEYS.items():
+            current_values[_kiosk_row] = bool(db.config.get(_kiosk_key, False)) if db is not None else False
 
         _opt_box_w = OPTIONS_TOGGLE_BOX_W_PX
 
@@ -3826,7 +3851,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     cur_sel == CAPTIONS_COLOR_BOX_SEL:
                 is_focused = False
 
-            _mode_locked_row = (row_id == "captions_toggle" and _mode_locks("tv_captions_enabled"))
+            _kiosk_key = SYSTEM_KIOSK_SETTING_KEYS.get(row_id)
+            _mode_locked_row = (row_id == "captions_toggle" and _mode_locks("tv_captions_enabled")) or bool(
+                _kiosk_key and (_mode_locks(_kiosk_key) or (row_id == "warp_screen" and _warp_needs_a_bezel(db))))
+            if _mode_locked_row and _kiosk_key:
+                row_enabled = False
             _row_label_col = COLOR_MENU_TEXT_GREYED if ((row_id == "server_option"
                               and not UPDATER_AND_SERVER_FEATURES_ENABLED) or _mode_locked_row) else TEXT_WHITE
             row_label = f_ch_label.render(SYSTEM_ROW_META[row_id]["label"], True, _row_label_col)
@@ -3938,10 +3967,20 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     btn_txt = "Retry Updates"
                 else:
                     btn_txt = SYSTEM_ROW_META[row_id]["label"]
+            elif row_id == "bezel_style_select":
+                try:
+                    _bs_val = max(1, min(int(db.config.get("bezel_style", 1)), media.bezel_style_count()))
+                except (TypeError, ValueError, AttributeError) as _swallowed_error:
+                    _log_swallowed("render_settings_overlay_menu: bezel style button number", _swallowed_error)
+                    _bs_val = 1
+                btn_txt = "Bezel Style: Option %d" % _bs_val
             else:
                 btn_txt = SYSTEM_ROW_META[row_id]["label"]
 
-            if row_id == "reset_settings" and not _reset_has_content:
+            if row_id == "bezel_style_select" and not (db is not None and db.config.get("fake_43_border_enabled", False)):
+                b_color = COLOR_MENU_BUTTON_GREYED
+                btn_txt_col = COLOR_MENU_TEXT_GREYED
+            elif row_id == "reset_settings" and not _reset_has_content:
                 b_color = COLOR_MENU_BUTTON_GREYED
                 btn_txt_col = COLOR_MENU_TEXT_GREYED
             elif row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED:

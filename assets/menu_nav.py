@@ -193,8 +193,8 @@ def navigate(app_state, layer, table, cell, direction):
 # ============================================================================
 
 # WARNING: these two groups must match LEFT_TOGGLE_IDS and RIGHT_TOGGLE_IDS in the System tab drawing in ui.py, or the table and the picture disagree about which column a row is in.
-SYSTEM_LEFT_TOGGLES = ("game_ch", "guide", "controls_on_start", "kiosk_mode")
-SYSTEM_RIGHT_TOGGLES = ("loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle")
+SYSTEM_LEFT_TOGGLES = ("game_ch", "guide", "controls_on_start", "kiosk_mode", "bezel_toggle", "warp_screen", "boot_anim")
+SYSTEM_RIGHT_TOGGLES = ("loudness_scan", "pixel_orbiter", "captions_toggle", "mono_stereo_toggle", "static_noise", "reception_lines", "scan_lines")
 
 SYSTEM_SERVER_BUTTON_SELECTION = 500
 SYSTEM_CAPTIONS_COLOR_SELECTION = 502

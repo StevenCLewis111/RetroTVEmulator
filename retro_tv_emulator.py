@@ -29306,6 +29306,64 @@ while True:
                                 _log_warn_throttled("mono_toggle_mixer_reinit",
                                                      "[SETTINGS] Mono Audio pygame.mixer reinit "
                                                      "failed: %s", _mixer_err)
+                        elif row_id in ("scan_lines", "static_noise", "warp_screen", "reception_lines", "boot_anim", "bezel_toggle", "bezel_style_select", "update_check"):
+                            # WARNING: with Kiosk on, the Channels tab is hidden and its Settings options plus Look for Updates are shown on the System tab; keep this in step with the CHANNEL_SETTINGS_SUB_MENU and SYSTEM_ADVANCED_SUB_MENU handlers.
+                            if row_id != "update_check" and row_id != "bezel_style_select":
+                                _now_tk  = pygame.time.get_ticks()
+                                _tgl_deb = app_state.setdefault("_menu_toggle_debounce", {})
+                                if _now_tk - _tgl_deb.get(row_id, -10000) < 300:
+                                    pygame.event.clear(pygame.KEYDOWN)
+                                    continue
+                                _tgl_deb[row_id] = _now_tk
+                            _kiosk_cfg_key = ui.SYSTEM_KIOSK_SETTING_KEYS.get(row_id)
+                            if row_id == "scan_lines" and _feature_locked("fake_43_scanlines_enabled"):
+                                pass
+                            elif row_id == "warp_screen" and (_feature_locked("warp_screen_enabled") or not _warp_bezel_available()):
+                                pass
+                            elif row_id == "bezel_toggle":
+                                _bz_turning_on = not db.config.get("fake_43_border_enabled", False)
+                                if _bz_turning_on:
+                                    if db.config.get("program_bezel_skip_confirm", False):
+                                        db.config["fake_43_border_enabled"] = True
+                                        db.save_settings()
+                                        print("[SETTINGS] Bezel = True (confirmation skipped by user preference).")
+                                    else:
+                                        app_state["show_clear_confirm"]      = True
+                                        app_state["clear_confirm_selection"]  = "No"
+                                        app_state["clear_confirm_target"]     = "program_bezel_toggle"
+                                        app_state["clear_confirm_shown_at"]   = now_ticks
+                                        app_state["clear_confirm_burnin_new_value"] = True
+                                        app_state["clear_confirm_dont_show_again"]  = False
+                                else:
+                                    db.config["fake_43_border_enabled"] = False
+                                    db.save_settings()
+                                    print("[SETTINGS] Bezel = False")
+                            elif row_id == "bezel_style_select":
+                                _n_styles = _effective_bezel_style_count(*screen.get_size())
+                                if _n_styles > 1 and db.config.get("fake_43_border_enabled", False):
+                                    try:
+                                        _cur_style = int(db.config.get("bezel_style", 1))
+                                    except (TypeError, ValueError) as _swallowed_error:
+                                        _log_swallowed("module: kiosk bezel style number", _swallowed_error)
+                                        _cur_style = 1
+                                    db.config["bezel_style"] = (_cur_style % _n_styles) + 1
+                                    db.save_settings()
+                                    print(f"[SETTINGS] Bezel Style = {db.config['bezel_style']}")
+                            elif row_id == "update_check":
+                                if not UPDATER_AND_SERVER_FEATURES_ENABLED:
+                                    pass
+                                elif app_state.get("_update_check_inflight", False):
+                                    pass
+                                elif app_state.get("_update_ready", False):
+                                    _launch_staged_update()
+                                elif app_state.get("_update_available", False) and app_state.get("_update_record"):
+                                    _open_update_popup(app_state["_update_record"], False)
+                                else:
+                                    _start_update_check()
+                            elif _kiosk_cfg_key:
+                                db.config[_kiosk_cfg_key] = not db.config.get(_kiosk_cfg_key, False)
+                                db.save_settings()
+                                print(f"[SETTINGS] {row_id} = {db.config[_kiosk_cfg_key]}")
                         elif is_enter and row_id == "reset_settings":
                             if _any_settings_to_reset():
                                 app_state["show_clear_confirm"]    = True
