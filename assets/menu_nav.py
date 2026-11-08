@@ -236,18 +236,19 @@ def system_table(rows):
 def _build_system_table(rows):
     left = [r for r in rows if r in SYSTEM_LEFT_TOGGLES]
     right = [r for r in rows if r in SYSTEM_RIGHT_TOGGLES]
-    has_advanced = "advanced_settings" in rows
+    stand = "advanced_settings" if "advanced_settings" in rows else ("update_check" if "update_check" in rows else None)
+    has_advanced = stand is not None
     poweroff_standalone = "poweroff" in rows and has_advanced
     bottom = [r for r in rows
-              if r not in left and r not in right and r != "advanced_settings"
+              if r not in left and r not in right and r != stand
               and not (r == "poweroff" and poweroff_standalone)]
     t = NavTable()
     t.known(CLOSE, *rows)
     if "captions_toggle" in right:
         t.known(SYSTEM_CAPTIONS_COLOR_CELL)
 
-    below_columns = "advanced_settings" if has_advanced else (bottom[0] if bottom else CLOSE)
-    above_bottom = "advanced_settings" if has_advanced else (left[-1] if left else TAB_BAR)
+    below_columns = stand if has_advanced else (bottom[0] if bottom else CLOSE)
+    above_bottom = stand if has_advanced else (left[-1] if left else TAB_BAR)
 
     for i, row in enumerate(left):
         t.link(row, UP, TAB_BAR if i == 0 else left[i - 1])
@@ -274,10 +275,10 @@ def _build_system_table(rows):
 
     if has_advanced:
         if "kiosk_mode" in rows:
-            t.link("advanced_settings", UP, Remember("kiosk_mode"))
+            t.link(stand, UP, Remember("kiosk_mode"))
             sources = tuple(s for s in ("kiosk_mode", "mono_stereo_toggle") if s in rows)
-            t.remember["advanced_settings"] = sources
-        t.link("advanced_settings", DOWN, bottom[0] if bottom else CLOSE)
+            t.remember[stand] = sources
+        t.link(stand, DOWN, bottom[0] if bottom else CLOSE)
 
     for k, row in enumerate(bottom):
         t.link(row, UP, above_bottom if k == 0 else bottom[k - 1])

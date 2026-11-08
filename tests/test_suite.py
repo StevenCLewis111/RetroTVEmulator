@@ -27082,7 +27082,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.3.5", "build_info.py says 1.3.5 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.3.6", "build_info.py says 1.3.6 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27487,7 +27487,7 @@ class TestGovernorOwnLoad(_SectionCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.3.5"""
+    """This build is 1.3.6"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)

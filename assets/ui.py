@@ -1146,6 +1146,26 @@ SYSTEM_KIOSK_SETTING_KEYS = {
 }
 
 
+def _update_button_text(app_state):
+    """Returns the Look for Updates button text for the current update state."""
+    if not UPDATER_AND_SERVER_FEATURES_ENABLED:
+        return "Updates Disabled"
+    if app_state.get("_update_check_inflight", False):
+        return "Checking..."
+    if app_state.get("_update_ready", False):
+        return "Install Update"
+    if app_state.get("_update_available", False):
+        return "Update Now"
+    if app_state.get("_update_up_to_date", False):
+        return "Up to Date"
+    status = str(app_state.get("_update_status", "")).lower()
+    if "not configured" in status:
+        return "Updates Unconfigured"
+    if "failed" in status:
+        return "Retry Updates"
+    return SYSTEM_ROW_META["update_check"]["label"]
+
+
 def get_system_menu_rows(db, app_state):
     kiosk_on = db.config.get("kiosk_mode_enabled", False) if db is not None else False
 
@@ -3941,32 +3961,18 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _any_settings_to_reset_fn = getattr(_main, "_any_settings_to_reset", None) if _main else None
         _reset_has_content = bool(_any_settings_to_reset_fn()) if _any_settings_to_reset_fn else True
 
-        poweroff_standalone = "poweroff" in sys_rows and "advanced_settings" in sys_rows
+        _standalone_id = "advanced_settings" if "advanced_settings" in sys_rows else ("update_check" if "update_check" in sys_rows else None)
+        poweroff_standalone = "poweroff" in sys_rows and _standalone_id is not None
         bottom_left_button_rows = [r for r in button_rows
-                                    if r not in ("advanced_settings",)
+                                    if r != _standalone_id
                                     and not (r == "poweroff" and poweroff_standalone)]
 
         _bx = bx_left
         for row_id in bottom_left_button_rows:
             row_idx = sys_rows.index(row_id)
             is_btn_highlighted = (layer == "SYSTEM_ROWS" and cur_sel == row_idx)
-            if row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED:
-                btn_txt = "Updates Disabled"
-            elif row_id == "update_check":
-                if app_state.get("_update_check_inflight", False):
-                    btn_txt = "Checking..."
-                elif app_state.get("_update_ready", False):
-                    btn_txt = "Install Update"
-                elif app_state.get("_update_available", False):
-                    btn_txt = "Update Now"
-                elif app_state.get("_update_up_to_date", False):
-                    btn_txt = "Up to Date"
-                elif "not configured" in str(app_state.get("_update_status", "")).lower():
-                    btn_txt = "Updates Unconfigured"
-                elif "failed" in str(app_state.get("_update_status", "")).lower():
-                    btn_txt = "Retry Updates"
-                else:
-                    btn_txt = SYSTEM_ROW_META[row_id]["label"]
+            if row_id == "update_check":
+                btn_txt = _update_button_text(app_state)
             elif row_id == "bezel_style_select":
                 try:
                     _bs_val = max(1, min(int(db.config.get("bezel_style", 1)), media.bezel_style_count()))
@@ -4000,7 +4006,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                                       bottom_row_y + btn_text_y_offset_base - (lbl_b.get_height() // 2)))
             _bx += btn_w + btn_gap
 
-        _standalone_order = [r for r in ("advanced_settings",) if r in sys_rows]
+        _standalone_order = [_standalone_id] if _standalone_id else []
         if _standalone_order:
             _left_col_bottom_y = content_y + toggle_start_y + (max(0, len(left_toggle_rows) - 1) * toggle_gap) + toggle_h
             _standalone_gap = bottom_row_y - _left_col_bottom_y
@@ -4009,9 +4015,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _x = bx_left
             for _row_id in _standalone_order:
                 _row_idx = sys_rows.index(_row_id)
-                _lbl_txt = _gpu_render_mode_label(db) if _row_id == "gpu_render_mode" else SYSTEM_ROW_META[_row_id]["label"]
+                _lbl_txt = _gpu_render_mode_label(db) if _row_id == "gpu_render_mode" else (
+                    _update_button_text(app_state) if _row_id == "update_check" else SYSTEM_ROW_META[_row_id]["label"])
                 _gpu_disabled = (_row_id == "gpu_render_mode" and not GPU_RENDER_MODE_ENABLED)
-                _row_disabled = _gpu_disabled
+                _row_disabled = _gpu_disabled or (_row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
                 _focused = (layer == "SYSTEM_ROWS" and cur_sel == _row_idx)
                 _txt_col = COLOR_MENU_TEXT_GREYED if _row_disabled else TEXT_WHITE
                 _lbl = f_ch_btn.render(_lbl_txt, True, _txt_col)
