@@ -386,8 +386,8 @@ _CHANNEL_SURF_HESITATE_MS = performance_governor.CHANNEL_SURF_HESITATE_MS if per
 _SCHEDULE_MODE_COMMIT_HOLD_MS = performance_governor.SCHEDULE_MODE_COMMIT_HOLD_MS if performance_governor is not None else 5000
 # WARNING: the 3 fallback must match SCHEDULE_MODE_STOP_POINTS_KEPT in performance_governor.py; it is used only when that module fails to import.
 _SCHEDULE_MODE_STOP_POINTS_KEPT = performance_governor.SCHEDULE_MODE_STOP_POINTS_KEPT if performance_governor is not None else 3
-# WARNING: the 1.0 fallback must match HUB_CLOCK_COMPARE_GRACE_SECONDS in performance_governor.py; it is used only when that module fails to import.
-_HUB_CLOCK_COMPARE_GRACE_SECONDS = performance_governor.HUB_CLOCK_COMPARE_GRACE_SECONDS if performance_governor is not None else 1.0
+# WARNING: the 60.0 fallback must match HUB_CLOCK_COMPARE_GRACE_SECONDS in performance_governor.py; it is used only when that module fails to import.
+_HUB_CLOCK_COMPARE_GRACE_SECONDS = performance_governor.HUB_CLOCK_COMPARE_GRACE_SECONDS if performance_governor is not None else 60.0
 # WARNING: the 1.0 fallback must match HUB_AIRING_LOOKUP_RETRY_SECONDS in performance_governor.py; it is used only when that module fails to import.
 _HUB_AIRING_LOOKUP_RETRY_SECONDS = performance_governor.HUB_AIRING_LOOKUP_RETRY_SECONDS if performance_governor is not None else 1.0
 # WARNING: the 60.0 fallback must match HUB_ROW_GENERATION_START_TOLERANCE_SECONDS in performance_governor.py; it is used only when that module fails to import.
@@ -1298,7 +1298,7 @@ def _start_old_vlc_folder_removal(old_dir, in_use_dir):
     threading.Thread(target=_remove, name="OldVlcCleanup", daemon=True).start()
 
 
-_libvlc_located = _bootstrap_libvlc()
+_bootstrap_libvlc()
 
 try:
     import vlc
@@ -1577,7 +1577,6 @@ if os.name == "nt":
             if not hook:
                 print("[VOLUME OSD GUARD] SetWinEventHook returned NULL — OSD suppression inactive.", flush=True)
                 return
-            print("[VOLUME OSD GUARD] active -- native volume/mute flyout will be hidden on appearance.", flush=True)
             msg = _ctwt.MSG()
             while _u32.GetMessageW(_ctypes.byref(msg), None, 0, 0) != 0:
                 _u32.TranslateMessage(_ctypes.byref(msg))
@@ -1823,7 +1822,6 @@ def _start_autoplay_dismisser():
                 hwnd = _user32.FindWindowExW(None, None, None, "AutoPlay")
                 while hwnd:
                     if _user32.IsWindowVisible(hwnd):
-                        print(f"[AUTOPLAY GUARD] AutoPlay dialog detected (hwnd={hwnd}) -- closing it.")
                         _user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
                     hwnd = _user32.FindWindowExW(None, hwnd, None, "AutoPlay")
             except Exception as _find_err:
@@ -1831,7 +1829,6 @@ def _start_autoplay_dismisser():
             time.sleep(0.75)
 
     threading.Thread(target=_watch, daemon=True, name="AutoPlayGuard").start()
-    print("[AUTOPLAY GUARD] Watcher thread started.")
 
 
 def _restore_windowed_maximize_box(win_hwnd):
@@ -2110,7 +2107,6 @@ def _gpu_swapchain_open():
 def _gpu_release_swapchain():
     """Close the GPU swapchain if one is open, so pygame can present the window again."""
     if _gpu_swapchain_open():
-        _frame_path_flush()
         _gpu_frame_state["gate"].close()
 
 
@@ -2139,72 +2135,6 @@ def _present_window(gpu_frame_drawn):
         return False
     pygame.display.flip()
     return True
-
-
-# ============================================================================
-# SECTION: Frame path statistics
-# ============================================================================
-
-_frame_path_stats = {
-    "gpu": [0, 0.0, 0.0, 0.0, 0.0], "cpu": [0, 0.0, 0.0, 0.0, 0.0],
-    "not_presented": 0, "present_failed": 0, "size": (0, 0), "scanlines": False,
-}
-
-
-def _frame_path_log_interval():
-    """Return how many frames of one path are collected before a [GPU FRAME] line is written, or 0 when the governor is missing."""
-    try:
-        return max(1, int(performance_governor.GPU_FRAME_LOG_INTERVAL_FRAMES))
-    except Exception as _swallowed_error:
-        _log_swallowed("_frame_path_log_interval: return max(1, int(performance_governor.GPU_FRAME_LOG_INTERVA", _swallowed_error)
-        return 0
-
-
-def _frame_path_effects_label():
-    """Return the effect settings in force as text for the [GPU FRAME] line."""
-    try:
-        _w, _h = _frame_path_stats["size"]
-        _scan = _frame_path_stats["scanlines"]
-        return "fx=%s bezel=%s scan=%s" % (_crt_effect_mode(_w, _h, _scan) or "none",
-                                          "on" if _setting_on("fake_43_border_enabled") else "off",
-                                          "on" if _scan else "off")
-    except Exception as _swallowed_error:
-        _log_swallowed("_frame_path_effects_label: _w, _h = _frame_path_stats['size']", _swallowed_error)
-        return "fx=?"
-
-
-def _frame_path_flush():
-    """Write one [GPU FRAME] line per path that has collected frames, then clear the counters."""
-    _st = _frame_path_stats
-    for _path in ("gpu", "cpu"):
-        _row = _st[_path]
-        if _row[0] <= 0:
-            continue
-        _tail = ("present_failed=%d" % _st["present_failed"]) if _path == "gpu" else ("not_presented=%d" % _st["not_presented"])
-        log.info("[GPU FRAME] path=%s frames=%d draw avg=%.2f max=%.2f ms present avg=%.2f max=%.2f ms size=%dx%d %s %s",
-                 _path, _row[0], _row[1] / _row[0], _row[2], _row[3] / _row[0], _row[4],
-                 _st["size"][0], _st["size"][1], _frame_path_effects_label(), _tail)
-        _row[:] = [0, 0.0, 0.0, 0.0, 0.0]
-    _st["not_presented"] = 0
-    _st["present_failed"] = 0
-
-
-def _frame_path_note(gpu_frame, presented, draw_ms, present_ms, size, scanlines_wanted):
-    """Add one finished frame to the statistics of the path that drew it and write the [GPU FRAME] line when enough frames are collected."""
-    _st = _frame_path_stats
-    _row = _st["gpu" if gpu_frame else "cpu"]
-    _row[0] += 1
-    _row[1] += draw_ms
-    _row[2] = max(_row[2], draw_ms)
-    _row[3] += present_ms
-    _row[4] = max(_row[4], present_ms)
-    if not presented:
-        _st["present_failed" if gpu_frame else "not_presented"] += 1
-    _st["size"] = size
-    _st["scanlines"] = bool(scanlines_wanted)
-    _limit = _frame_path_log_interval()
-    if _limit and _row[0] >= _limit:
-        _frame_path_flush()
 
 
 # ============================================================================
@@ -2671,7 +2601,7 @@ def _tv_border_osd_offset(stem):
 # WARNING: the fallback numbers below must match CH_NUM_TOP_ALIGN_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
 _CH_NUM_TOP_ALIGN_NUDGE_PX = performance_governor.CH_NUM_TOP_ALIGN_NUDGE_PX if performance_governor is not None else -20
 
-# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_NOISE_REFRESH_MS, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_MEDIUM_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, RECEPTION_LINE_COUNT_WEIGHTS, RECEPTION_LINE_BIG_CHANCE, RECEPTION_LINE_MEDIUM_CHANCE, RECEPTION_LINE_GAP_FRAC_RANGE, RECEPTION_LINE_GAP_MIN_DIFF_FRAC, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, FRAME_COPY_LOG_EVERY_FRAMES, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_NOISE_REFRESH_MS, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_MEDIUM_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, RECEPTION_LINE_COUNT_WEIGHTS, RECEPTION_LINE_BIG_CHANCE, RECEPTION_LINE_MEDIUM_CHANCE, RECEPTION_LINE_GAP_FRAC_RANGE, RECEPTION_LINE_GAP_MIN_DIFF_FRAC, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
 _TV_BORDER_SCREEN_EXPAND = performance_governor.TV_BORDER_SCREEN_EXPAND if performance_governor is not None else {"bezel": (1.00, 1.00), "bezel1": (1.00, 1.00), "bezel2": (1.00, 1.00)}
 _TV_BORDER_SCREEN_EXPAND_DEFAULT = performance_governor.TV_BORDER_SCREEN_EXPAND_DEFAULT if performance_governor is not None else (1.00, 1.00)
 RECEPTION_NOISE_BLOCK_PX = performance_governor.RECEPTION_NOISE_BLOCK_PX if performance_governor is not None else 2
@@ -2691,7 +2621,6 @@ RECEPTION_LINE_GAP_FRAC_RANGE = performance_governor.RECEPTION_LINE_GAP_FRAC_RAN
 RECEPTION_LINE_GAP_MIN_DIFF_FRAC = performance_governor.RECEPTION_LINE_GAP_MIN_DIFF_FRAC if performance_governor is not None else 0.06
 FILE_EXPLORER_EXPAND_TIMEOUT_MS = performance_governor.FILE_EXPLORER_EXPAND_TIMEOUT_MS if performance_governor is not None else 6000
 SEEK_RETRY_INTERVAL_MS = performance_governor.SEEK_RETRY_INTERVAL_MS if performance_governor is not None else 1500
-FRAME_COPY_LOG_EVERY_FRAMES = performance_governor.FRAME_COPY_LOG_EVERY_FRAMES if performance_governor is not None else 600
 GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS = performance_governor.GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS if performance_governor is not None else 30.0
 CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS = performance_governor.CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS if performance_governor is not None else 0.3
 SCHEDULER_REPEAT_GUARD_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_SECONDS if performance_governor is not None else 60
@@ -3166,9 +3095,7 @@ def _store_bezel_led_window(border_surf, key, stem, hole_frac):
         log.warning("_store_bezel_led_window: measuring the number window of '%s' failed: %s", stem, e)
     _tv_border_led_window_cache[key] = window
     _tv_border_led_tilt_cache[key] = tilt
-    if window is not None:
-        print(f"[4:3 BORDER] Number window measured from the dark pixels of {stem}: {window}, tilt {tilt:.2f} degrees")
-    else:
+    if window is None:
         log.warning("_store_bezel_led_window: no black number window found in '%s'; using the listed numbers", stem)
 
 
@@ -3228,8 +3155,6 @@ def _full_tv_border_cutout_frac(border_surf, cache_key=None, allow_compute=True,
     frac = None
     try:
         frac = _measure_bezel_screen_hole(border_surf)
-        if frac is not None:
-            print(f"[4:3 BORDER] Screen hole measured from the transparent pixels of {_stem or 'bezel'}: {frac}")
     except Exception as e:
         log.warning("_full_tv_border_cutout_frac: measuring the screen hole of '%s' failed: %s", _stem, e)
     if frac is None:
@@ -3285,11 +3210,6 @@ def _full_tv_border_geometry_impl(win_w, win_h):
         max(1, int(draw_bw * rw)),
         max(1, int(draw_bh * rh)),
     )
-    log_key = (border_path, win_w, win_h)
-    if _bezel_geometry_log_state.get("key") != log_key:
-        _bezel_geometry_log_state["key"] = log_key
-        log.info("[BEZEL GEOMETRY] path=%s win=%sx%s border_img=%sx%s border_aspect=%.4f outer=%s scale=%.4f border_rect=%s cutout_frac=(%.4f,%.4f,%.4f,%.4f) inner=%s",
-                  border_path, win_w, win_h, bw, bh, border_aspect, tuple(outer), scale, tuple(border_rect), rx, ry, rw, rh, tuple(inner))
     return outer, border_rect, inner
 
 
@@ -3303,15 +3223,6 @@ _PIXEL_ORBITER_OFFSETS = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1
 
 _pixel_orbiter_session_started_ms = None
 _pixel_orbiter_was_active = False
-_bezel_geometry_log_state = {"key": None}
-_overlay_content_rect_log_state = {"key": None}
-_composite_bezel_frame_log_state = {"key": None}
-_video_screen_mode_rect_log_state = {"key": None}
-_bezel_video_source_rect_log_state = {"key": None}
-_real_video_blit_log_state = {"key": None}
-_bezel_composite_geometry_debug = {}
-_true_content_surf_log_state = {"key": None}
-_blit_video_log_state = {"key": None}
 
 
 # ============================================================================
@@ -3472,11 +3383,6 @@ def _video_screen_mode_rect(content_rect, win_w, win_h, source_aspect=None, mode
     boxed = _full_tv_43_outer_rect(_box_w, _box_h, aspect=aspect)
     _result = pygame.Rect(content_rect.x + boxed.x, content_rect.y + boxed.y,
                         boxed.width, boxed.height)
-    _log_key = (round(aspect, 4), tuple(content_rect), tuple(_result))
-    if _video_screen_mode_rect_log_state.get("key") != _log_key:
-        _video_screen_mode_rect_log_state["key"] = _log_key
-        log.info("[VIDEO SCREEN MODE RECT] aspect=%.4f content_rect=%s -> target=%s",
-                 aspect, tuple(content_rect), tuple(_result))
     return _result
 
 
@@ -3606,11 +3512,6 @@ def _true_content_surf(surf, vlc_engine):
     try:
         dw, dh = vlc_engine._decode_w, vlc_engine._decode_h
         cw, ch = vlc_engine.width, vlc_engine.height
-        _log_key = (dw, dh, cw, ch)
-        if _true_content_surf_log_state.get("key") != _log_key:
-            _true_content_surf_log_state["key"] = _log_key
-            log.info("[TRUE CONTENT SURF] decode=%sx%s canvas=%sx%s -> %s", dw, dh, cw, ch,
-                     "no_crop(matches_canvas)" if (dw <= 0 or dh <= 0 or (dw == cw and dh == ch)) else "will_crop")
         if dw <= 0 or dh <= 0 or (dw == cw and dh == ch):
             return surf
         ox, oy = vlc_engine._letterbox_offset_x, vlc_engine._letterbox_offset_y
@@ -4110,26 +4011,6 @@ def _picture_adjust_live_tick():
         _apply_picture_adjust_to_engine(engine, adjust)
 
 
-_video_draw_stats = {"n": 0, "parts": [0.0, 0.0, 0.0, 0.0, 0.0], "max": 0.0}
-# WARNING: the fallback number below must match VIDEO_DRAW_LOG_FRAMES in performance_governor.py; it is used only when that module fails to import.
-VIDEO_DRAW_LOG_FRAMES = performance_governor.VIDEO_DRAW_LOG_FRAMES if performance_governor is not None else 600
-
-
-def _note_video_draw_timing(copy_s, prepare_s, place_s, scale_s, store_s, mode):
-    """Adds one drawn video picture's part times and writes one [VIDEO DRAW] line every VIDEO_DRAW_LOG_FRAMES pictures."""
-    st = _video_draw_stats
-    parts = (copy_s, prepare_s, place_s, scale_s, store_s)
-    st["n"] += 1
-    for i, v in enumerate(parts):
-        st["parts"][i] += v
-    st["max"] = max(st["max"], sum(parts))
-    if st["n"] >= VIDEO_DRAW_LOG_FRAMES:
-        n = float(st["n"])
-        log.info("[VIDEO DRAW] %s pictures=%d avg ms: copy=%.2f crop+effects=%.2f place=%.2f scale+blit=%.2f keep=%.2f total=%.2f max=%.1f",
-                 mode, st["n"], *[1000.0 * v / n for v in st["parts"]], 1000.0 * sum(st["parts"]) / n, 1000.0 * st["max"])
-        st.update(n=0, parts=[0.0, 0.0, 0.0, 0.0, 0.0], max=0.0)
-
-
 _replay_scaled_cache = {}
 
 
@@ -4148,13 +4029,6 @@ def _blit_video_with_screen_mode(screen, surf, rect, mode=None, analysis_surf=No
                      * pixel_aspect)
     pan_offset = 0.0
     pan_axis = None
-
-    _log_key = (mode, sw, sh, tuple(rect), round(pixel_aspect, 4), round(source_aspect, 4))
-    if _blit_video_log_state.get("key") != _log_key:
-        _blit_video_log_state["key"] = _log_key
-        log.info("[BLIT VIDEO SCREEN MODE] mode=%s source=%sx%s (raw_aspect=%.4f used_aspect=%.4f pixel_aspect=%.4f) rect=%s (aspect=%.4f) source_aspect%stargets_aspect",
-                 mode, sw, sh, sw / sh, source_aspect, pixel_aspect, tuple(rect), target_aspect,
-                 (">" if source_aspect > target_aspect else "<=" if source_aspect < target_aspect else "=="))
 
     if mode == "stretch":
         draw_w = rect.width
@@ -4286,12 +4160,6 @@ def _overlay_content_rect(screen):
         cr = pygame.Rect(inset_from.x + (inset_from.width - new_w) // 2,
                           inset_from.y + (inset_from.height - new_h) // 2,
                           new_w, new_h)
-    log_key = (real_w, real_h, tuple(cr), db.config.get("aspect_ratio") if db is not None else None)
-    if _overlay_content_rect_log_state.get("key") != log_key:
-        _overlay_content_rect_log_state["key"] = log_key
-        log.info("[OVERLAY CONTENT RECT] real=%sx%s aspect_ratio=%s package_pillarbox_active=%s -> cr=%s",
-                  real_w, real_h, db.config.get("aspect_ratio") if db is not None else None,
-                  _package_pillarbox_active(real_w, real_h), tuple(cr))
     return cr
 
 
@@ -4456,22 +4324,12 @@ def _bezel_composite_geometry(win_w, win_h, ignore_package_aspect=False):
     if sw <= 0 or sh <= 0:
         return None
     expand_x, expand_y = _active_tv_border_screen_expand()
-    _dbg = {
-        "video_source_rect": tuple(_video_source_rect) if _video_source_rect is not None else None,
-        "inner": tuple(inner),
-        "source_rect_pre_clip": tuple(source_rect),
-        "expand_x": expand_x, "expand_y": expand_y,
-    }
     if _video_source_rect is not None:
-        _dbg["branch"] = "video_visible"
         _uniform_scale = min(inner.width / sw, inner.height / sh)
         _uniform_expand = min(expand_x, expand_y)
         scale_x = _uniform_scale * _uniform_expand
         scale_y = _uniform_scale * _uniform_expand
-        _dbg["uniform_scale_inputs"] = (inner.width, sw, inner.height, sh)
-        _dbg["uniform_scale"] = _uniform_scale
     else:
-        _dbg["branch"] = "full_frame_independent"
         scale_x = (inner.width / sw) * expand_x
         scale_y = (inner.height / sh) * expand_y
     draw_w = max(1, round(sw * scale_x))
@@ -4480,9 +4338,6 @@ def _bezel_composite_geometry(win_w, win_h, ignore_package_aspect=False):
     if _bezel_right_grow(_active_bezel_stem()) > 1.0:
         dest_x = inner.x
     dest_y = inner.y + (inner.height - draw_h) // 2
-    _dbg["draw_overflows_inner"] = (draw_w > inner.width, draw_h > inner.height)
-    _bezel_composite_geometry_debug.clear()
-    _bezel_composite_geometry_debug.update(_dbg)
     return source_rect, scale_x, scale_y, dest_x, dest_y, draw_w, draw_h
 
 
@@ -4554,39 +4409,6 @@ def _render_crt_power_on_effect(real_screen, screen_rect):
             real_screen.blit(_flash, (screen_rect.x, _band_y), special_flags=pygame.BLEND_RGB_ADD)
 
 
-def _log_bezel_composite(vw, vh, source_rect, scale_x, scale_y, dest_x, dest_y, draw_w, draw_h):
-    """Log the final composite geometry and why it was chosen, once per change."""
-    _dbg = _bezel_composite_geometry_debug
-    _branch = _dbg.get("branch", "?")
-    log_key = (vw, vh, dest_x, dest_y, tuple(source_rect), _branch)
-    if _composite_bezel_frame_log_state.get("key") != log_key:
-        _composite_bezel_frame_log_state["key"] = log_key
-        log.info("[BEZEL COMPOSITE] win=%sx%s virtual=%sx%s package_pillarbox_active=%s source_rect=%s scale_x=%.4f scale_y=%.4f draw=%sx%s dest=(%s,%s)",
-                  vw, vh, vw, vh, _package_pillarbox_active(vw, vh), tuple(source_rect), scale_x, scale_y, draw_w, draw_h, dest_x, dest_y)
-        log.info("[BEZEL COMPOSITE WHY] branch=%s video_source_rect=%s "
-                 "inner=%s uniform_scale=%s uniform_scale_inputs=%s expand=(%.4f,%.4f) "
-                 "draw_overflows_inner=%s",
-                 _branch, _dbg.get("video_source_rect"),
-                 _dbg.get("inner"), _dbg.get("uniform_scale"), _dbg.get("uniform_scale_inputs"),
-                 _dbg.get("expand_x", 1.0), _dbg.get("expand_y", 1.0),
-                 _dbg.get("draw_overflows_inner"))
-
-
-def _log_bezel_composite_clip(draw_w, draw_h, dest_x, dest_y, inner):
-    """Log which slice of an oversized scaled picture stays visible inside the bezel cutout, once per change."""
-    _visible = pygame.Rect(dest_x, dest_y, draw_w, draw_h).clip(inner)
-    _visible_in_scaled = pygame.Rect(_visible.x - dest_x, _visible.y - dest_y,
-                                      _visible.width, _visible.height)
-    _clip_key = (tuple(_visible), tuple(_visible_in_scaled), draw_w, draw_h)
-    if _composite_bezel_frame_log_state.get("clip_key") != _clip_key:
-        _composite_bezel_frame_log_state["clip_key"] = _clip_key
-        log.info("[BEZEL COMPOSITE CLIP] scaled=%sx%s dest=(%s,%s) inner=%s -> visible_on_screen=%s "
-                 "visible_slice_of_picture=%s cut_off_left=%s cut_off_right=%s cut_off_top=%s cut_off_bottom=%s",
-                 draw_w, draw_h, dest_x, dest_y, tuple(inner), tuple(_visible), tuple(_visible_in_scaled),
-                 _visible_in_scaled.x, draw_w - _visible_in_scaled.right,
-                 _visible_in_scaled.y, draw_h - _visible_in_scaled.bottom)
-
-
 def _composite_bezel_frame(real_screen, virtual_surf, ignore_package_aspect=False):
     """Single, final compositing step for the whole frame."""
     vw, vh = virtual_surf.get_size()
@@ -4601,7 +4423,6 @@ def _composite_bezel_frame(real_screen, virtual_surf, ignore_package_aspect=Fals
 
     real_screen.fill(_video_bar_color())
 
-    _log_bezel_composite(vw, vh, source_rect, scale_x, scale_y, dest_x, dest_y, draw_w, draw_h)
 
     if source_rect.topleft == (0, 0) and sw == vw and sh == vh and draw_w == vw and draw_h == vh:
         scaled = virtual_surf
@@ -4618,7 +4439,6 @@ def _composite_bezel_frame(real_screen, virtual_surf, ignore_package_aspect=Fals
         real_screen.set_clip(inner)
         real_screen.blit(scaled, (dest_x, dest_y))
         real_screen.set_clip(_prev_clip)
-        _log_bezel_composite_clip(draw_w, draw_h, dest_x, dest_y, inner)
     else:
         real_screen.blit(scaled, (dest_x, dest_y))
     _render_crt_power_on_effect(real_screen, pygame.Rect(dest_x, dest_y, draw_w, draw_h).clip(inner))
@@ -4828,10 +4648,8 @@ def _gpu_draw_frame(real_screen, virtual_surf, ignore_package_aspect, scanlines_
             _plan = _ref.ScalePlan(source_rect.x, source_rect.y, source_rect.width, source_rect.height,
                                    draw_w, draw_h, dest_x, dest_y)
             _bar_color = _video_bar_color()
-            _log_bezel_composite(vw, vh, source_rect, scale_x, scale_y, dest_x, dest_y, draw_w, draw_h)
             if draw_w > inner.width or draw_h > inner.height:
                 _clip = _frame_mod.ClipRect(inner.x, inner.y, inner.width, inner.height)
-                _log_bezel_composite_clip(draw_w, draw_h, dest_x, dest_y, inner)
             _power_rect = pygame.Rect(dest_x, dest_y, draw_w, draw_h).clip(inner)
         _elapsed = _crt_power_on_elapsed_ms(_power_rect)
         _power_on = None if _elapsed is None else _ref.power_on_plan(
@@ -4918,95 +4736,13 @@ def _active_bezel_stem():
     return _bezel_style_stem(os.path.splitext(os.path.basename(border_path))[0])
 
 
-# ============================================================================
-# SECTION: Menu navigation trace
-# ============================================================================
-# WARNING: the fallback numbers below must match MENU_NAV_TRACE in performance_governor.py; they are used only when that module fails to import.
-_MENU_NAV_TRACE = performance_governor.MENU_NAV_TRACE if performance_governor is not None else True
-_MENU_NAV_TRACE_KEYS = (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d)
 _NAV_DUP_KEYS = (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d)
 
 
-def _menu_nav_trace(kind, key, detail=""):
-    """Logs one menu navigation key press, release or auto-repeat while the menu is open."""
-    if not _MENU_NAV_TRACE or key not in _MENU_NAV_TRACE_KEYS:
-        return
-    log.info("[MENU NAV TRACE] %s key=%s tick=%d last_frame_gap=%sms layer=%s sel=%s %s",
-             kind, pygame.key.name(key), pygame.time.get_ticks(),
-             globals().get("_last_frame_gap_ms"), app_state.get("menu_layer"), _menu_nav_position_text(), detail)
-
-
-def _menu_nav_row_id(layer, sel):
-    """Returns the row name the highlight is on for the layers whose rows come from ui.py, else None."""
-    try:
-        if layer == "SYSTEM_ROWS":
-            _rows = get_system_menu_rows(db, app_state)
-        elif layer == "SYSTEM_ADVANCED_SUB_MENU":
-            _rows = get_advanced_settings_menu_rows(db, app_state)
-        elif layer == "CHANNEL_SETTINGS_SUB_MENU":
-            _rows = get_channels_settings_menu_rows(db, app_state)
-        else:
-            return None
-        if sel == len(_rows):
-            return "close"
-        return _rows[sel] if 0 <= sel < len(_rows) else None
-    except Exception as _swallowed_error:
-        _log_swallowed("menu navigation: finding the id of the selected menu row", _swallowed_error)
-        return None
-
-
-def _menu_nav_position_text():
-    """Returns the highlight as text: the selection index, the row name when known, and the active tab on the tab bar."""
-    _layer = app_state.get("menu_layer")
-    _sel = app_state.get("menu_selection_index")
-    _row = _menu_nav_row_id(_layer, _sel)
-    _text = "%s(%s)" % (_sel, _row) if _row else str(_sel)
-    if _layer == "TAB_SELECTION":
-        _text += " tab=%s" % app_state.get("active_menu_tab")
-    return _text
-
-
-def _menu_nav_frame_begin():
-    """Returns the highlight position and menu state at the start of the event handling of one frame."""
-    return (bool(app_state.get("show_menu", False)), app_state.get("menu_layer"), _menu_nav_position_text())
-
-
-def _menu_nav_frame_end(begin, frame_events):
-    """Writes one [MENU NAV FRAME] line when nav keys were handled in the frame: highlight before and after, and a warning on a burst."""
-    if not _MENU_NAV_TRACE:
-        return
-    _downs = 0
-    _ups = 0
-    _names = []
-    for _ev in frame_events:
-        if _ev.type not in (pygame.KEYDOWN, pygame.KEYUP) or getattr(_ev, "key", None) not in _MENU_NAV_TRACE_KEYS:
-            continue
-        if _ev.type == pygame.KEYDOWN:
-            _downs += 1
-        else:
-            _ups += 1
-        _names.append(pygame.key.name(_ev.key) + ("+" if _ev.type == pygame.KEYDOWN else "-")
-                      + ("r" if getattr(_ev, "menu_repeat", False) else ""))
-    if not _names or not (begin[0] or app_state.get("show_menu", False)):
-        return
-    _after = "%s %s" % (app_state.get("menu_layer"), _menu_nav_position_text())
-    log.info("[MENU NAV FRAME] keys=%d (%s) last_frame_gap=%sms before=%s %s after=%s",
-             len(_names), " ".join(_names), globals().get("_last_frame_gap_ms"), begin[1], begin[2], _after)
-    try:
-        _burst = int(performance_governor.MENU_NAV_BURST_WARN_EVENTS)
-    except Exception as _swallowed_error:
-        _log_swallowed("_menu_nav_frame_end: _burst = int(performance_governor.MENU_NAV_BURST_WARN_EVENTS)", _swallowed_error)
-        _burst = 0
-    if _burst and len(_names) >= _burst:
-        log.warning("[MENU NAV BURST] %d nav key events (%d down, %d up) handled in one frame: %s",
-                    len(_names), _downs, _ups, " ".join(_names))
-
-
 # ============================================================================
-# SECTION: Main loop timing profile
+# SECTION: Main loop stall stack
 # ============================================================================
 
-_loop_profile = {"t": None, "stages": {}, "frames": 0, "total": 0.0, "worst": 0.0}
 
 # WARNING: the main loop writes the start time of every frame here and the stall-stack check reads it from the watchdog thread; without it no [STALL STACK] line is ever written.
 _main_frame_clock = {"start": None, "n": 0, "sampled_n": -1, "samples": 0, "last_sample": 0.0}
@@ -5054,59 +4790,6 @@ def _make_stall_stack_tick():
         log.warning("[STALL STACK] frame %d has run %.1fs on channel %s; the screen thread is in: %s",
                     frame_no, running_ms / 1000.0, app_state.get("current_channel"), _stall_stack_text(frame, STALL_STACK_DEPTH))
     return _tick
-
-
-def _loop_profile_interval():
-    """Returns how many frames are collected before a [LOOP PROFILE] line is written, or 0 when off or the governor is missing."""
-    try:
-        return max(0, int(performance_governor.LOOP_PROFILE_LOG_INTERVAL_FRAMES))
-    except Exception as _swallowed_error:
-        _log_swallowed("_loop_profile_interval: return max(0, int(performance_governor.LOOP_PROFILE_LOG_INTE", _swallowed_error)
-        return 0
-
-
-def _prof_begin():
-    """Starts the timing of one main-loop frame."""
-    _loop_profile["t"] = time.perf_counter() if _loop_profile_interval() else None
-    _loop_profile["frame"] = {}
-
-
-def _prof_mark(stage):
-    """Adds the time since the previous mark to the named stage of this frame."""
-    _t0 = _loop_profile["t"]
-    if _t0 is None:
-        return
-    _now = time.perf_counter()
-    _frame = _loop_profile["frame"]
-    _frame[stage] = _frame.get(stage, 0.0) + (_now - _t0) * 1000.0
-    _loop_profile["t"] = _now
-
-
-def _prof_end():
-    """Closes the frame, adds it to the totals and writes the [LOOP PROFILE] line when enough frames are collected."""
-    if _loop_profile["t"] is None:
-        return
-    _frame = _loop_profile["frame"]
-    _total = sum(_frame.values())
-    _lp = _loop_profile
-    _lp["frames"] += 1
-    _lp["total"] += _total
-    _lp["worst"] = max(_lp["worst"], _total)
-    for _k, _v in _frame.items():
-        _row = _lp["stages"].setdefault(_k, [0.0, 0.0])
-        _row[0] += _v
-        _row[1] = max(_row[1], _v)
-    _limit = _loop_profile_interval()
-    if _limit and _lp["frames"] >= _limit:
-        _n = float(_lp["frames"])
-        _parts = " ".join("%s=%.2f/%.1f" % (_k, _r[0] / _n, _r[1]) for _k, _r in _lp["stages"].items())
-        log.info("[LOOP PROFILE] frames=%d total avg=%.2f max=%.1f ms | per stage avg/max ms: %s | channel=%s menu=%s",
-                 _lp["frames"], _lp["total"] / _n, _lp["worst"], _parts,
-                 app_state.get("current_channel"), bool(app_state.get("show_menu", False)))
-        _lp["frames"] = 0
-        _lp["total"] = 0.0
-        _lp["worst"] = 0.0
-        _lp["stages"] = {}
 
 
 def _active_bezel_stem_if_on():
@@ -5293,61 +4976,6 @@ def _crt_shader_src_scratch_buffer(w, h):
 
 
 # ============================================================================
-# SECTION: Frame and shader timing log
-# ============================================================================
-# WARNING: the fallback numbers below must match PERF_LOG_INTERVAL_S, PERF_LOG_MAX_SAMPLES in performance_governor.py; they are used only when that module fails to import.
-_PERF_LOG_INTERVAL_S = performance_governor.PERF_LOG_INTERVAL_S if performance_governor is not None else 5.0
-_PERF_LOG_MAX_SAMPLES = performance_governor.PERF_LOG_MAX_SAMPLES if performance_governor is not None else 900
-
-_frame_time_state = {"samples": [], "last_log": 0.0}
-_crt_timing_state = {"samples": [], "last_log": 0.0}
-
-
-def _median_ms(values):
-    ordered = sorted(values)
-    return ordered[len(ordered) // 2]
-
-
-def _log_frame_time_sample(gap_ms, channel):
-    st = _frame_time_state
-    samples = st["samples"]
-    if len(samples) < _PERF_LOG_MAX_SAMPLES:
-        samples.append(gap_ms)
-    now = time.monotonic()
-    if st["last_log"] == 0.0:
-        st["last_log"] = now
-        return
-    if now - st["last_log"] < _PERF_LOG_INTERVAL_S or not samples:
-        return
-    avg = sum(samples) / len(samples)
-    log.info("[FRAME TIME] avg=%.1fms fps=%.1f max=%sms n=%d channel=%s",
-             avg, 1000.0 / avg if avg > 0 else 0.0, max(samples), len(samples), channel)
-    st["samples"] = []
-    st["last_log"] = now
-
-
-def _crt_timing_record(path, w, h, stages):
-    st = _crt_timing_state
-    samples = st["samples"]
-    if len(samples) < _PERF_LOG_MAX_SAMPLES:
-        samples.append((path, w, h, stages))
-    now = time.monotonic()
-    if st["last_log"] == 0.0:
-        st["last_log"] = now
-        return
-    if now - st["last_log"] < _PERF_LOG_INTERVAL_S or not samples:
-        return
-    last_path, last_w, last_h, _ = samples[-1]
-    same = [x[3] for x in samples if x[0] == last_path and x[1] == last_w and x[2] == last_h]
-    names = list(same[-1].keys())
-    parts = " ".join("%s=%.1fms" % (n, _median_ms([x.get(n, 0.0) for x in same])) for n in names)
-    log.info("[CRT-SHADER TIMING] path=%s size=%dx%d median over %d calls: %s",
-             last_path, last_w, last_h, len(same), parts)
-    st["samples"] = []
-    st["last_log"] = now
-
-
-# ============================================================================
 # SECTION: CRT shader raw-buffer pass (CPU warp)
 # ============================================================================
 # WARNING: only valid for a 32-bit surface with masks R=0xFF0000 G=0xFF00 B=0xFF and no alpha; any other layout must use the legacy path.
@@ -5390,7 +5018,6 @@ def _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, curvature):
         return None
     raw4 = None
     try:
-        t0 = time.perf_counter()
         rc = _CRT_RAW_CACHE
         if rc["key"] != c["key"]:
             rc = _crt_raw_rebuild(c, w, h)
@@ -5399,7 +5026,6 @@ def _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, curvature):
         raw4 = px.T.view(np.uint8).reshape(h, w, 4)
         del px
         cv2.cvtColor(raw4, cv2.COLOR_BGRA2BGR, dst=rc["src3"])
-        t_copy = time.perf_counter()
 
         cv2.remap(rc["src3"], rc["map_x_t"], rc["map_y_t"],
                   interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
@@ -5407,7 +5033,6 @@ def _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, curvature):
         warped3 = rc["warped3"]
         f3 = rc["f3"]
         np.copyto(f3, warped3)
-        t_warp = time.perf_counter()
 
         mult2d = rc["vig_t"]
         if scanlines:
@@ -5431,26 +5056,18 @@ def _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, curvature):
             np.add(sc["base_t"], bloom, out=bloom)
             np.multiply(mult2d, bloom, out=bloom)
             mult2d = bloom
-        t_bloom = time.perf_counter()
 
         cv2.merge((mult2d, mult2d, mult2d), dst=rc["mult3"])
         cv2.multiply(f3, rc["mult3"], dst=f3)
         cv2.convertScaleAbs(f3, dst=rc["out3"])
         cv2.cvtColor(rc["out3"], cv2.COLOR_BGR2BGRA, dst=rc["out4"])
         raw4[...] = rc["out4"]
-        t_end = time.perf_counter()
-        return {
-            "src-copy": (t_copy - t0) * 1000.0,
-            "remap": (t_warp - t_copy) * 1000.0,
-            "bloom": (t_bloom - t_warp) * 1000.0,
-            "writeback": (t_end - t_bloom) * 1000.0,
-            "total": (t_end - t0) * 1000.0,
-        }
+        return True
     except Exception as e:
         _crt_raw_state["disabled"] = True
         if not _crt_raw_state["warned"]:
             _crt_raw_state["warned"] = True
-            log.warning("_crt_shader_raw_pass: failed, using the legacy shader path from now on: %s", e)
+            log.warning("_crt_shader_raw_pass: failed, using the legacy shader path from now on: %s", str(e))
         return None
     finally:
         del raw4
@@ -5464,7 +5081,6 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
     try:
         import numpy as np
         w, h = rect.width, rect.height
-        _t0 = time.perf_counter()
 
         _sub_cache = _CRT_SHADER_SUBSURFACE_CACHE
         _sub_key = (id(screen), rect.x, rect.y, rect.width, rect.height)
@@ -5478,9 +5094,7 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
         c = _build_crt_shader_maps(w, h, curvature=_curvature)
         vignette_mult3 = c["mult3"]
 
-        _raw_stages = _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, _curvature)
-        if _raw_stages is not None:
-            _crt_timing_record("raw", w, h, _raw_stages)
+        if _crt_shader_raw_pass(screen, sub, w, h, c, scanlines, _curvature):
             return
 
         arr = pygame.surfarray.pixels3d(sub)
@@ -5498,7 +5112,6 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
                 _src_buf = _crt_shader_src_scratch_buffer(w, h)
                 np.copyto(_src_buf, arr)
                 src = _src_buf
-            _t_copy = time.perf_counter()
             warped = cv2.remap(src, c["map_y"], c["map_x"],
                                 interpolation=cv2.INTER_LINEAR,
                                 borderMode=cv2.BORDER_REPLICATE)
@@ -5519,7 +5132,6 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
             bot = arr[x0, y1] * (1 - fx) + arr[x1, y1] * fx
             warped_f = top * (1 - fy) + bot * fy
 
-        _t_warp = time.perf_counter()
         final_mult3 = vignette_mult3
         if scanlines:
             _geom = _bezel_composite_geometry(*screen.get_size())
@@ -5530,7 +5142,6 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
             scan_mult3 = _crt_scanline_bloom_mult(_scan_base, _scan_bloom_range, warped_f, _warped_u8)
             final_mult3 = vignette_mult3 * scan_mult3
 
-        _t_bloom = time.perf_counter()
         _f2d = final_mult3[:, :, 0]
         _f_buf, _u8_buf, _mult3_buf = _crt_shader_scratch_buffers(w, h)
         if _have_cv2:
@@ -5541,17 +5152,9 @@ def _apply_crt_shader(screen, rect, scanlines=True, curvature=None):
             np.copyto(_u8_buf, _f_buf, casting="unsafe")
         arr[:, :, :] = _u8_buf
         del arr
-        _t_end = time.perf_counter()
-        if _have_cv2:
-            _crt_timing_record("legacy", w, h, {
-                "src-copy": (_t_copy - _t0) * 1000.0 if not _src_contig else 0.0,
-                "remap": (_t_warp - _t_copy) * 1000.0 if not _src_contig else (_t_warp - _t0) * 1000.0,
-                "bloom": (_t_bloom - _t_warp) * 1000.0,
-                "writeback": (_t_end - _t_bloom) * 1000.0,
-                "total": (_t_end - _t0) * 1000.0})
 
     except Exception as e:
-        log.warning("_apply_crt_shader: draw failed, skipping this frame: %s", e)
+        log.warning("_apply_crt_shader: draw failed, skipping this frame: %s", str(e))
 
 
 # WARNING: the fallback numbers below must match STATIC_NOISE_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
@@ -5567,6 +5170,10 @@ _STATIC_NOISE_BUILD_GAP_MS = performance_governor.STATIC_NOISE_BUILD_GAP_MS if p
 # WARNING: the fallback numbers below must match STATIC_NOISE_STRENGTH_STEPS and STATIC_NOISE_BAKED_MAX in performance_governor.py; they are used only when that module fails to import.
 _STATIC_NOISE_STRENGTH_STEPS = performance_governor.STATIC_NOISE_STRENGTH_STEPS if performance_governor is not None else 16
 _STATIC_NOISE_BAKED_MAX = performance_governor.STATIC_NOISE_BAKED_MAX if performance_governor is not None else 24
+# WARNING: the fallback numbers below must match STATIC_NOISE_TINT_AMBIENT_REFRESH_MS, STATIC_NOISE_TINT_DENSITY_SCALE and STATIC_NOISE_TINT_REFRESH_MS in performance_governor.py; they are used only when that module fails to import.
+_STATIC_NOISE_TINT_AMBIENT_REFRESH_MS = performance_governor.STATIC_NOISE_TINT_AMBIENT_REFRESH_MS if performance_governor is not None else 100
+_STATIC_NOISE_TINT_DENSITY_SCALE = performance_governor.STATIC_NOISE_TINT_DENSITY_SCALE if performance_governor is not None else 0.7
+_STATIC_NOISE_TINT_REFRESH_MS = performance_governor.STATIC_NOISE_TINT_REFRESH_MS if performance_governor is not None else 170
 _static_noise_baked = collections.OrderedDict()
 _static_noise_pools = collections.OrderedDict()
 
@@ -5669,6 +5276,8 @@ def _static_noise_frame(w, h, tint_style):
     _grain = max(1, int(_STATIC_NOISE_GRAIN_PX))
     sw, sh = max(8, w // _grain), max(8, h // _grain)
     density = 0.18 + _STATIC_HEAVY * 0.5
+    if tint_style in ("rainbow", "theme"):
+        density *= _STATIC_NOISE_TINT_DENSITY_SCALE
     speckle = np.random.random((sw, sh)) < density
     alpha = np.zeros((sw, sh), dtype=np.uint8)
     alpha[speckle] = np.random.randint(35, 115, size=int(speckle.sum()))
@@ -5718,7 +5327,8 @@ def _apply_static_noise_effect(screen, rect, ch_str):
                 _static_noise_pools.popitem(last=False)
         else:
             _static_noise_pools.move_to_end(key)
-        tick = now // max(1, int(_STATIC_NOISE_AMBIENT_REFRESH_MS))
+        _refresh_ms = _STATIC_NOISE_TINT_AMBIENT_REFRESH_MS if tint_style in ("rainbow", "theme") else _STATIC_NOISE_AMBIENT_REFRESH_MS
+        tick = now // max(1, int(_refresh_ms))
         if pool["last_tick"] != tick:
             pool["last_tick"] = tick
             if len(pool["frames"]) < max(1, int(_STATIC_NOISE_POOL_FRAMES)) and (pool["built_at"] is None or now - pool["built_at"] >= int(_STATIC_NOISE_BUILD_GAP_MS)):
@@ -6136,7 +5746,6 @@ def _read_registry_text(path, name):
 
 def _set_start_on_boot(enabled):
     if os.name != "nt":
-        print("[STARTUP] Not running on Windows — start-on-boot toggle has no effect here.")
         return False
     try:
         import winreg
@@ -6217,7 +5826,6 @@ try:
     if os.path.exists(_icon_path):
         _icon_surface = pygame.image.load(_icon_path)
         pygame.display.set_icon(_icon_surface)
-        print("Window/taskbar icon set from icon.png")
         if sys.platform == "win32":
             try:
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("retro.tv.emulator.app")
@@ -7039,12 +6647,6 @@ def _visualizer_title_path(channel_key, fallback_path):
     return fallback_path
 
 
-def _title_y_on_screen(aligned_y, line_gap, last_line_height, screen_height):
-    """The top of the song title's first line: the channel number's top when both lines fit on the screen from there, else moved up just far enough, never above the top edge."""
-    _lowest = screen_height - (line_gap + last_line_height) - 2
-    return int(max(0, min(aligned_y, _lowest)))
-
-
 def _picture_row_of_window_row(window_y, geom):
     """The row of the picture (before the bezel scales it into its cutout) that lands on window row `window_y`."""
     src_rect, _scale_x, scale_y, _dest_x, dest_y, _draw_w, _draw_h = geom
@@ -7584,8 +7186,6 @@ def _confirm_playback_started(ch_key, attempt_id, file_path, seek_offset, slot_s
     _clear_channel_playback_failure(ch_key)
     if extra_state:
         app_state.update(extra_state)
-    if deferred:
-        print(f"[CHANNEL] Switched to video channel {ch_key} (confirmed after deferred open, attempt {attempt_id})")
 
     _anchor_seek = seek_offset
     try:
@@ -7930,7 +7530,6 @@ def _start_guide_preview_load(hl_ch, hl_state):
 
     # WARNING: owner 2026-11-03: the picture box is scanned first and then the preview opens, never on the screen thread; the open runs on the same worker as a channel change, so the guide keeps drawing and taking keys while a scan runs (owner log: the guide froze 5.6 s in the pre-show scan).
     _dispatch_content_activation(_gp_open)
-    _mute_guard_log("ARM (guide preview load)", ch=hl_ch, filepath=hl_state["file"])
     app_state["loaded_preview_path_cache"] = hl_state["file"]
     app_state["guide_preview_loading"] = True
     app_state["guide_preview_load_started_ms"] = pygame.time.get_ticks()
@@ -7980,7 +7579,6 @@ def _arm_guide_preview_transition():
             _log_swallowed("_arm_guide_preview_transition: vlc_engine.player.audio_set_mute(True)", _swallowed_error)
     app_state["_video_pending_unmute"] = True
     _governor_note_event("guide_row_switch")
-    _mute_guard_log("ARM (guide row switch)", ch=app_state.get("highlighted_guide_channel"))
 
 
 def _capture_guide_preview_position(ch_key):
@@ -8355,7 +7953,6 @@ else:
     loading_bg_surface = None
     screen.fill(COLOR_LOADING_EMPTY_BG)
     _present_cpu_window()
-    print("No loading image - using fallback black screen.")
 
 pygame.event.pump()
 print("Loading screen visible - window has popped up. at", time.time(), flush=True)
@@ -8566,9 +8163,6 @@ def _disconnect_remote_server(reason=""):
     app_state["remote_schedule_revision"] = 0
     app_state["active_remote_server"] = None
     app_state["user_selected_server_name"] = ""
-    if restored or reason:
-        print("[SERVER SYNC] Disconnected%s; local channel state restored."
-              % (f" ({reason})" if reason else ""))
     log.info("Remote server disconnected reason=%s restored=%s",
              reason or "unspecified", restored)
 
@@ -8630,7 +8224,7 @@ from media import (
     bake_compressor_pass,
 )
 import ui
-from ui import draw_popup_yes_no, render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, _remote_key_label as remote_key_label, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
+from ui import draw_popup_yes_no, render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
     get_server_picker_entries, get_server_picker_selectable_count, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
     UPDATER_AND_SERVER_FEATURES_ENABLED, SERVER_TOGGLE_ENABLED, GPU_RENDER_MODE_ENABLED, NUM_CONTROL_PAGES
 from visualizers import VisualizerDeck
@@ -9174,8 +8768,6 @@ def _fe_poll_expand():
         _locked = _fe_locked_playing_path(app_state.get("file_explorer_context", {}))
         if _locked and _locked in to_remove:
             to_remove.discard(_locked)
-            print(f"[FILE EXPLORER] Skipped removing {os.path.basename(_locked)} "
-                  f"from folder-remove -- it's currently playing live on this channel.")
         checked = app_state.get("file_explorer_checked", [])
         app_state["file_explorer_checked"] = [f for f in checked if f not in to_remove]
 
@@ -9394,7 +8986,6 @@ def set_remote_binding(db_inst, action, key_code):
 
     db_inst.config["remote_bindings"] = bindings
     db_inst.save_settings()
-    print(f"[REMOTE REMAP] '{action}' bound to {remote_key_label(key_code)}")
 
 
 def translate_remote_key(db_inst, raw_key):
@@ -9423,7 +9014,6 @@ def set_dvd_binding(db_inst, action, key_code):
             game_deck.refresh_from_config(db_inst.config)
         except Exception as _e:
             log.warning(f"[DVD REMAP] game_deck refresh failed: {_e}")
-    print(f"[DVD REMAP] '{action}' bound to {remote_key_label(key_code)}")
 
 
 def _ch03_entry_is_default_music(entry):
@@ -9455,13 +9045,11 @@ def _ensure_ch03_menu_music_seeded():
                 _changed = True
         if _changed:
             db.save_settings()
-            print("[CH03 MUSIC] Playlist brought up to date: the shipped track's path, gains kept only in the library")
         return
     _default = os.path.join(resolve_main_dir(), "audio", "Game Music", "gamemusic.mp3")
     if os.path.isfile(_default):
         db.config["ch03_menu_music"] = [{"path": _default}]
         db.save_settings()
-        print(f"[CH03 MUSIC] Seeded default track: {os.path.basename(_default)}")
 
 
 _CH03_MENU_MUSIC_LIST_ID = "ch03_menu_music"
@@ -9567,7 +9155,6 @@ def _start_ch03_menu_music():
         _get_ch03_music_channel().play(sound)
         app_state["ch03_menu_music_track"] = track
         app_state["ch03_menu_music_started_at"] = pygame.time.get_ticks()
-        print(f"[CH03 MUSIC] Playing track {idx + 1}/{len(playlist)}: {os.path.basename(track)}")
     except Exception as _e:
         log.warning(f"[CH03 MUSIC] Failed to play '{track}': {_e}")
 
@@ -9604,7 +9191,6 @@ def _toggle_ss():
     """Flip the ch03 screen-saver enabled flag and persist it."""
     db.config["ch03_screensaver_enabled"] = not db.config.get("ch03_screensaver_enabled", True)
     db.save_settings()
-    print(f"[GAMES] ch03 screen saver = {db.config['ch03_screensaver_enabled']}")
 
 
 def _toggle_menu_music():
@@ -9615,7 +9201,6 @@ def _toggle_menu_music():
         _start_ch03_menu_music()
     else:
         _stop_ch03_menu_music()
-    print(f"[GAMES] ch03 menu music enabled = {db.config['ch03_menu_music_enabled']}")
 
 
 def _toggle_all_consoles():
@@ -9632,13 +9217,11 @@ def _toggle_all_consoles():
     db.save_settings()
     if game_deck is not None:
         game_deck.refresh_from_config(db.config)
-    print(f"[GAMES] all consoles set to {'ON' if new_state else 'OFF'} (DVD unaffected)")
 
 
 def _toggle_all_profiles():
     db.config["all_profiles_sync"] = not db.config.get("all_profiles_sync", False)
     _mark_settings_dirty()
-    print(f"[GAMES] all_profiles_sync (All Settings) = {db.config['all_profiles_sync']}")
 
 
 def _adjust_all_settings_sync_profile(step, wrap=False):
@@ -9650,7 +9233,6 @@ def _adjust_all_settings_sync_profile(step, wrap=False):
         new = max(1, min(3, new))
     db.config["all_profiles_sync_target"] = new
     _mark_settings_dirty()
-    print(f"[GAMES] all_profiles_sync_target (Sync Profile) = {new}")
 
 
 def _sync_profile_setting_across_consoles(source_console, profile_num, key, value):
@@ -9683,8 +9265,6 @@ def _sync_profile_setting_across_consoles(source_console, profile_num, key, valu
                 game_deck.set_border_style_live(value)
             elif key == "screen_size":
                 game_deck._libretro_screen_size = value
-    print(f"[GAMES] all_profiles_sync mirrored {key}={value} from {source_console} "
-          f"Profile {profile_num} (Sync Profile) to Profile {profile_num} on every other console")
 
 
 def _set_splash_enabled(console, enabled):
@@ -9698,10 +9278,6 @@ def _set_splash_enabled(console, enabled):
         else:
             _cse[con] = enabled
     db.save_settings()
-    if len(consoles) > 1:
-        print(f"[GAMES] All Settings: splash screen enabled = {enabled} on every console (from {console})")
-    else:
-        print(f"[GAMES] {console} splash screen enabled = {enabled}")
 
 
 def _set_console_bezel_enabled(console, profile_num, value):
@@ -9823,7 +9399,6 @@ def _fe_add_selected_rom_folder():
     context["picked_rom_count"]  = n_found
     app_state["file_explorer_checked"]   = [""] * n_found
     app_state["file_explorer_selection"] = set()
-    print(f"[GAMES] {ck}: {n_found} ROM(s) found in {picked_dir}")
 
 
 def _fe_add_selected_scan_folder():
@@ -9859,8 +9434,6 @@ def _fe_add_selected_scan_folder():
     context["picked_rom_count"]  = n_matched
     app_state["file_explorer_checked"]   = ["x"]
     app_state["file_explorer_selection"] = set()
-    print(f"[GAMES] Scan For Roms: {picked_dir} selected "
-          f"({n_matched} console-named folder(s) matched at top level)")
 
 
 def _fe_add_selected_scan_cores_folder():
@@ -9899,8 +9472,6 @@ def _fe_add_selected_scan_cores_folder():
     context["picked_rom_count"]  = n_matched
     app_state["file_explorer_checked"]   = ["x"]
     app_state["file_explorer_selection"] = set()
-    print(f"[GAMES] Scan For Cores: {picked_dir} selected "
-          f"({n_matched} core .dll(s) found within 2 levels)")
 
 
 def _fe_expand_worker(req_id, op, dir_paths, valid_exts, session_id=0):
@@ -10681,11 +10252,6 @@ def _apply_show_loudness_smoothing(norm_p, gain, shortfall_info):
             return gain
         if floor is not None and achieved > floor + SHOW_SMOOTH_TOLERANCE_DB:
             _smoothed_gain = min(gain, 10 ** ((floor - measured) / 20.0))
-            print(f"[LOUDNESS PROBE] *** SHOW SMOOTHED *** {os.path.basename(norm_p)}: "
-                  f"would land at {achieved:.1f} LUFS (uncapped) but a peak-limited sibling "
-                  f"in this show already established a {floor:.1f} LUFS floor -- "
-                  f"matched down to x{_smoothed_gain:.2f} so this episode doesn't stand out "
-                  f"louder than its neighbors")
             return _smoothed_gain
     return gain
 
@@ -11103,10 +10669,6 @@ def _probe_loudness_guarded(norm_p, out_shortfall=None, apply_learned_offset=Tru
     if _group_key:
         _group_entry = _read_part_group_gain(_group_key)
         if _group_entry and os.path.normpath(_group_entry.get("anchor_path", "")) != norm_p:
-            print(f"[LOUDNESS PROBE] '{os.path.basename(norm_p)}' is part of the same "
-                  f"title as already-scanned '{os.path.basename(_group_entry.get('anchor_path', ''))}' "
-                  f"-- reusing its gain x{_group_entry.get('gain', 1.0):.2f} instead of "
-                  f"re-measuring this part independently.")
             if out_shortfall is not None:
                 out_shortfall["measured_lufs"] = None
             return _group_entry.get("gain", 1.0)
@@ -11305,8 +10867,6 @@ def _register_unplayable_strike(norm_path, reason):
     if count is None:
         log.warning("[PLAYABILITY PROBE] the library could not save a strike for %s (%s)", os.path.basename(norm_path), reason)
         return 0
-    print(f"[PLAYABILITY PROBE] Strike {count}/{UNPLAYABLE_STRIKE_THRESHOLD} for "
-          f"'{os.path.basename(norm_path)}' -- {reason}")
     return count
 
 
@@ -11317,8 +10877,6 @@ def _mark_confirmed_no_audio(norm_path, reason):
     if _hub is None or not _hub.note(norm_path, confirmed_no_audio=True, no_audio_reason=reason):
         log.warning("[PLAYABILITY PROBE] the library could not record no audible content for %s (%s)", os.path.basename(norm_path), reason)
         return
-    print(f"[PLAYABILITY PROBE] Confirmed no audible content in "
-          f"'{os.path.basename(norm_path)}' -- {reason}")
 
 
 def _register_probe_batch(batch_id, ch_key, container_key, sub_key, remaining_paths):
@@ -11578,7 +11136,6 @@ def _fe_remove_selected_from_queue():
     locked_path = _fe_locked_playing_path(context)
     to_remove  = set()
     dirs_to_expand = []
-    _blocked_live = False
     for idx in sorted(sel):
         if not (0 <= idx < len(items)):
             continue
@@ -11589,12 +11146,8 @@ def _fe_remove_selected_from_queue():
         elif item["type"] == "file":
             np_ = os.path.normpath(p)
             if locked_path and np_ == locked_path:
-                _blocked_live = True
                 continue
             to_remove.add(np_)
-    if _blocked_live:
-        print(f"[FILE EXPLORER] Skipped removing {os.path.basename(locked_path)} -- "
-              f"it's currently playing live on this channel.")
     app_state["file_explorer_checked"]  = [f for f in checked if f not in to_remove]
     app_state["file_explorer_selection"] = set()
     if dirs_to_expand:
@@ -11618,7 +11171,6 @@ def _fe_apply_bios_selection(ck, checked):
     picked = os.path.abspath(_copy_tool_for_console(os.path.abspath(checked[0]), ck, True))
     db.config.setdefault("active_bios", {})[ck] = picked
     db.save_settings_async()
-    print(f"[GAMES] Active BIOS for {ck} is: {picked}")
     if game_deck is not None:
         game_deck.refresh_from_config(db.config)
 
@@ -11755,7 +11307,6 @@ def _copy_tool_for_console(source, console_key, want_bios):
         return os.path.abspath(str(source))
     if made:
         _record_tool_copies([kept])
-        print(f"[GAMES] {console_key}: copied {os.path.basename(kept)} into {os.path.dirname(kept)}")
     return kept
 
 
@@ -11837,7 +11388,6 @@ def _remember_old_core_and_bios_copies():
         if path and cfg.get(console) != os.path.abspath(path):
             cfg[console] = os.path.abspath(path)
             cfg_changed = True
-            print(f"[GAMES] {console}: remembered core {cfg[console]}")
     if cfg_changed:
         _write_emulator_config(cfg)
     active_bios = db.config.setdefault("active_bios", {})
@@ -11852,7 +11402,6 @@ def _remember_old_core_and_bios_copies():
             path = os.path.join(folder, min(files, key=_bios_priority_key)) if files else None
         if path:
             active_bios[console] = os.path.abspath(path)
-            print(f"[GAMES] {console}: remembered BIOS {active_bios[console]}")
     db.config["remembered_tools_v1"] = True
     db.save_settings()
 
@@ -11994,12 +11543,6 @@ def _probe_and_patch_durations(ch_key, container_key, sub_key, items_pool, _resu
         _clear_probe_batch(batch_id)
     try: db.save_settings_async()
     except Exception as e: log.warning("Final settings save failed after duration probe for %s/%s: %s", container_key, sub_key, e)
-    _drop_summary = ""
-    if _removed_long_commercials or _removed_silent_commercials or _removed_unplayable:
-        _drop_summary = (f" (dropped {_removed_long_commercials} too-long, "
-                          f"{_removed_silent_commercials} no-audio, "
-                          f"{_removed_unplayable} unplayable)")
-    print(f"[DURATION PROBE] {container_key}/{sub_key} for ch {ch_key} -> probed {save_counter}/{pool_size} file(s){_drop_summary}")
 
 
 def _dedupe_incoming_files(existing_entries, incoming_paths):
@@ -12037,7 +11580,6 @@ def _fe_close(commit):
                     game_deck.console_rom_dir[ck] = picked
                 db.config.setdefault("console_rom_dir", {})[ck] = picked
                 db.save_settings_async()
-                print(f"[GAMES] {ck} ROM folder relocated to: {picked}")
                 if game_deck is not None:
                     game_deck.refresh_from_config(db.config)
         elif mode in ("schedule", "commercial", "holiday"):
@@ -12058,9 +11600,6 @@ def _fe_close(commit):
                 entries, new_paths, removed_n, dupe_n = _reconcile_schedule_entries(existing, _final_checked)
                 ch_data["schedules"][block] = entries
                 db.save_settings_async()
-                print(f"[FILE EXPLORER] {block} -> {len(entries)} file(s) for ch {ch_key} "
-                      f"(+{len(new_paths)} new, -{removed_n} removed"
-                      + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
                 _note_scan_work_added()
                 if new_paths:
                     _warm_new_file_lengths(new_paths)
@@ -12079,9 +11618,6 @@ def _fe_close(commit):
                 entries, new_paths, removed_n, dupe_n = _reconcile_schedule_entries(existing, _final_checked)
                 ch_data["holiday_schedules"][hkey] = entries
                 db.save_settings_async()
-                print(f"[FILE EXPLORER] Holiday {hkey} -> {len(entries)} file(s) for ch {ch_key} "
-                      f"(+{len(new_paths)} new, -{removed_n} removed"
-                      + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
                 _note_scan_work_added()
                 if new_paths:
                     _warm_new_file_lengths(new_paths)
@@ -12099,7 +11635,6 @@ def _fe_close(commit):
             if not picked:
                 pass
             elif not _is_drive_responsive(picked):
-                print("[GAMES] Scan For Roms: drive not responding — try again once it's connected")
                 app_state["_games_menu_flash_msg"] = "SCAN FOR ROMS: DRIVE NOT RESPONDING"
                 app_state["_games_menu_flash_at"]  = pygame.time.get_ticks()
             elif os.path.isdir(picked) and game_deck is not None and hasattr(game_deck, "bulk_scan_for_roms"):
@@ -12124,7 +11659,6 @@ def _fe_close(commit):
             if not picked:
                 pass
             elif not _is_drive_responsive(picked):
-                print("[GAMES] Scan For Cores: drive not responding — try again once it's connected")
                 app_state["_games_menu_flash_msg"] = "SCAN FOR CORES: DRIVE NOT RESPONDING"
                 app_state["_games_menu_flash_at"]  = pygame.time.get_ticks()
             elif os.path.isdir(picked) and game_deck is not None and hasattr(game_deck, "bulk_scan_for_cores"):
@@ -12150,7 +11684,6 @@ def _fe_close(commit):
                 if unresponsive_roots:
                     summary += ("; skipped unreadable drive(s): "
                                 + ", ".join(r.rstrip("\\") for r in unresponsive_roots))
-                print(f"[GAMES] {summary}")
         elif mode == "add_roms":
             ck = context.get("console_key", "")
             if ck and game_deck is not None:
@@ -12175,28 +11708,19 @@ def _fe_close(commit):
                 game_deck.console_roms_manual[ck] = final_list
                 db.config.setdefault("console_roms_manual", {})[ck] = list(final_list)
                 db.save_settings_async()
-                _dupe_note = f", {n_dupe} duplicate(s) skipped" if n_dupe else ""
-                print(f"[GAMES] {ck}: {len(final_list)} manually-added rom(s) total "
-                      f"(+{n_new} new, -{removed_n} removed{_dupe_note})")
         elif mode == "ch03_menu_music":
             existing = db.config.get("ch03_menu_music", [])
             entries, new_paths, removed_n, dupe_n = _reconcile_schedule_entries(existing, checked)
-            _default_dropped = False
             if new_paths and len(existing) == 1 and _ch03_entry_is_default_music(existing[0]):
                 _without_default = [e for e in entries if not _ch03_entry_is_default_music(e)]
                 if _without_default and len(_without_default) < len(entries):
                     entries = _without_default
-                    _default_dropped = True
                     removed_n += 1
                     app_state["ch03_menu_music_idx"] = 0
                     if _ch03_entry_is_default_music(app_state.get("ch03_menu_music_track", "")):
                         _stop_ch03_menu_music()
             db.config["ch03_menu_music"] = entries
             db.save_settings_async()
-            print(f"[GAMES] Menu music -> {len(entries)} track(s) total "
-                  f"(+{len(new_paths)} new, -{removed_n} removed"
-                  + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "")
-                  + (", default track dropped" if _default_dropped else "") + ")")
             if (app_state.get("current_channel") == "03"
                     and game_deck is not None
                     and getattr(game_deck, "mode", "BROWSE") == "BROWSE"
@@ -12212,8 +11736,7 @@ def _fe_close(commit):
                 if chosen and ck:
                     cfg = _read_emulator_config()
                     cfg[ck] = os.path.abspath(_copy_tool_for_console(chosen, ck, False))
-                    if _write_emulator_config(cfg):
-                        print(f"[GAMES] Libretro core for {ck} set to: {cfg[ck]}")
+                    _write_emulator_config(cfg)
             elif mode == "add_bios":
                 _fe_apply_bios_selection(context.get("console_key", ""), checked)
             elif mode == "console_splash":
@@ -12226,7 +11749,6 @@ def _fe_close(commit):
                     else:
                         db.config.setdefault("console_splash_path", {})[ck] = dest
                     db.save_settings_async()
-                    print(f"[GAMES] {ck} splash screen set to: {dest}")
                     if game_deck is not None:
                         game_deck.refresh_from_config(db.config)
             elif mode == "menu_bg":
@@ -12235,7 +11757,6 @@ def _fe_close(commit):
                     dest = os.path.abspath(chosen)
                     db.config["menu_bg_path"] = dest
                     db.save_settings_async()
-                    print(f"[GAMES] Menu background set to: {dest}")
                     if game_deck is not None:
                         game_deck.refresh_from_config(db.config)
             elif mode == "watermark_select":
@@ -12247,7 +11768,6 @@ def _fe_close(commit):
                     _wm_channel_info["watermark_enabled"] = True
                     _wm_channel_info["watermark_path"] = dest
                     db.save_settings_async()
-                    print(f"[WATERMARK] Channel {_wm_channel} watermark image set to: {dest}")
                     _watermark_cache["path"] = None
                     _watermark_cache["raw"] = None
                     _watermark_cache["surface"] = None
@@ -12307,7 +11827,6 @@ def _fe_cancel_bulkscan():
         if app_state.get("file_explorer_bulkscan_committing", False):
             return False
         app_state["file_explorer_bulkscan_cancel"] = True
-    print("[GAMES] Scan For Roms: cancelled, no ROMs added")
     app_state["file_explorer_bulkscan_pending"] = False
     _fe_finish_close()
     return True
@@ -12357,7 +11876,6 @@ def _fe_poll_bulkscan():
     if unresponsive_roots:
         summary += ("; skipped unreadable drive(s): "
                     + ", ".join(r.rstrip("\\") for r in unresponsive_roots))
-    print(f"[GAMES] {summary}")
 
     _fe_finish_close()
 
@@ -12972,7 +12490,6 @@ def _fe_render(screen, active_theme, fe_rect):
         screen.blit(bl, (rect.x + (rect.w - bl.get_width()) // 2, rect.y + (rect.h - bl.get_height()) // 2))
 
     pending    = app_state.get("file_explorer_expand_pending", 0)
-    started_ms = app_state.get("file_explorer_expand_started_ms", 0)
     scan_pending    = app_state.get("file_explorer_scan_pending", False)
     scan_started_ms = app_state.get("file_explorer_scan_started_ms", 0)
     _done_waiting = app_state.get("file_explorer_done_requested", False)
@@ -13392,14 +12909,10 @@ def _refresh_audio_track_picker(filepath, started_at):
 def _open_audio_track_picker(target_ch_str):
     is_live = str(app_state.get("current_channel", "")).zfill(2) == target_ch_str
     if not is_live or vlc_engine is None:
-        print(f"[AUDIO TRACK] Channel {target_ch_str} isn't the one currently on screen -- "
-              f"tune to it first, then use this option.")
         return
 
     tracks = vlc_engine.get_audio_tracks()
     if not tracks:
-        print(f"[AUDIO TRACK] No audio track info available yet for channel {target_ch_str} "
-              f"(the file may still be loading) -- try again in a moment.")
         return
 
     current_id = vlc_engine.get_current_audio_track()
@@ -13427,13 +12940,10 @@ def _open_audio_track_picker(target_ch_str):
 
 def _open_dvd_audio_track_picker():
     if dvd_engine is None:
-        print("[AUDIO TRACK] DVD player isn't active -- nothing to list tracks for.")
         return
 
     tracks = dvd_engine.get_audio_tracks()
     if not tracks:
-        print("[AUDIO TRACK] No audio track info available yet for the DVD player "
-              "(the video may still be loading) -- try again in a moment.")
         return
 
     current_id = dvd_engine.get_current_audio_track()
@@ -13713,7 +13223,6 @@ def initialize_vlc_on_demand():
     global vlc_engine, dvd_engine, vlc_boot_requested, VLC_DEBUG_LOG_PATH
     if vlc_engine is None and not vlc_boot_requested:
         vlc_boot_requested = True
-        print("VLC initialization triggered synchronously.")
         _vlc_start_t0 = time.perf_counter()
         try:
             import vlc
@@ -13928,34 +13437,6 @@ def initialize_vlc_on_demand():
                         self._warmup_skip -= 1
                         return None
                     self._frame_ready = True
-
-                    try:
-                        if getattr(self, "is_dvd_iso", False):
-                            now = pygame.time.get_ticks()
-                            if now >= getattr(self, "_spu_diag_next_tick", 0):
-                                self._spu_diag_next_tick = now + 400
-                                buf = bytes(self.raw_buffer)
-                                checksum = sum(buf[::997]) & 0xFFFFFFFF
-                                hl_display = getattr(self, "_dvd_sig_highlight_display", None)
-                                hl_button = getattr(self, "_dvd_sig_highlight_button", None)
-                                prev_checksum = getattr(self, "_spu_diag_last_checksum", None)
-                                prev_button = getattr(self, "_spu_diag_last_button", None)
-                                if checksum != prev_checksum or hl_button != prev_button:
-                                    log.info(
-                                        "[DVD SPU DIAG] frame_checksum=%s prev_checksum=%s "
-                                        "(%s) highlight_display=%s highlight_button=%s "
-                                        "prev_button=%s blend_active=%s vout_opens=%s",
-                                        checksum, prev_checksum,
-                                        "CHANGED" if checksum != prev_checksum else "SAME",
-                                        hl_display, hl_button, prev_button,
-                                        getattr(self, "_dvd_sig_blend_active", None),
-                                        getattr(self, "_dvd_sig_vout_open_count", 0),
-                                    )
-                                self._spu_diag_last_checksum = checksum
-                                self._spu_diag_last_button = hl_button
-                    except Exception as e:
-                        log.warning("[DVD SPU DIAG] failed (non-fatal): %s", e)
-
                     return None
 
                 def _set_crop_geometry(self, geometry):
@@ -14070,37 +13551,29 @@ def initialize_vlc_on_demand():
                         if self.target_aspect == "4:3":
                             self._fill_full_canvas()
                             self._set_crop_geometry("4:3")
-                            log.info("[SCREEN MODE GEOMETRY:%s] is_dvd_iso=True target_aspect=4:3 branch=dvd_crop_4:3 canvas=%sx%s", self.engine_label, self.width, self.height)
                         else:
                             self._set_crop_geometry(None)
                             _dvd_mode = self._configured_screen_mode()
                             if _dvd_mode in ("normal", "crop", "panscan") and src_dims:
                                 self._configure_letterbox_for_source(*src_dims)
-                                log.info("[SCREEN MODE GEOMETRY:%s] is_dvd_iso=True screen_mode='%s' branch=dvd_letterbox_for_source(%s,%s) canvas=%sx%s decode=%sx%s offset=(%s,%s)", self.engine_label, _dvd_mode, src_dims[0], src_dims[1], self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None), getattr(self, "_letterbox_offset_x", None), getattr(self, "_letterbox_offset_y", None))
                             else:
                                 self._fill_full_canvas()
-                                log.info("[SCREEN MODE GEOMETRY:%s] is_dvd_iso=True screen_mode='%s' branch=dvd_fill_full_canvas(src_dims=%s) canvas=%sx%s", self.engine_label, _dvd_mode, src_dims, self.width, self.height)
                         return
-
-                    _screen_mode = self._configured_screen_mode()
 
                     self._set_crop_geometry(None)
                     if src_dims:
                         self._configure_letterbox_for_source(*src_dims)
                         self._native_dims_pending = False
-                        log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=letterbox_for_source(%s,%s) canvas=%sx%s decode=%sx%s offset=(%s,%s)", self.engine_label, _screen_mode, src_dims[0], src_dims[1], self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None), getattr(self, "_letterbox_offset_x", None), getattr(self, "_letterbox_offset_y", None))
                     else:
                         self._fill_full_canvas()
                         self._native_dims_pending = True
                         self._native_dims_deadline_ms = pygame.time.get_ticks() + 1500
-                        log.info("[SCREEN MODE GEOMETRY:%s] screen_mode='%s' branch=letterbox_no_src_dims->fill_full_canvas canvas=%sx%s decode=%sx%s", self.engine_label, _screen_mode, self.width, self.height, getattr(self, "_decode_w", None), getattr(self, "_decode_h", None))
 
                 def refresh_screen_mode_geometry(self):
                     """Re-applies Screen Mode's VLC-side crop/letterbox geometry to whatever is playing, keeping the position."""
                     try:
                         fp = getattr(self, "current_filepath", None)
                         if not fp:
-                            log.info("[SCREEN MODE REFRESH:%s] skipped: no current_filepath (nothing open on this engine)", self.engine_label)
                             return
                         try:
                             import vlc as _vlc
@@ -14110,7 +13583,6 @@ def initialize_vlc_on_demand():
                             _state = None
                             _vlc = None
                         if _vlc is not None and _state not in (_vlc.State.Playing, _vlc.State.Paused):
-                            log.info("[SCREEN MODE REFRESH:%s] skipped: player state=%s (not Playing/Paused)", self.engine_label, _state)
                             return
                         _gen = getattr(self, "_seek_generation", None)
                         if (getattr(self, "_pending_seek_generation", None) == _gen
@@ -14283,7 +13755,6 @@ def initialize_vlc_on_demand():
                                             and not getattr(self, "is_dvd_iso", False)
                                             and db is not None
                                             and self._configured_screen_mode() in ("normal", "crop", "panscan")):
-                                        log.info("[GEOMETRY REFRESH TRIGGER:%s] source=slow_ffmpeg_probe file=%s gen=%s", self.engine_label, _fp, _gen)
                                         self.refresh_screen_mode_geometry()
                                 except Exception as e:
                                     log.warning("play_file_segmented: post-probe geometry refresh failed for %s: %s", _fp, e)
@@ -14435,8 +13906,6 @@ def initialize_vlc_on_demand():
                             if _open_err:
                                 raise _open_err[0]
 
-                            log.info("[ATTEMPT %s][STATE RACE] reset _current_state/_current_length before play(): file=%s",
-                                      _attempt_id, filepath)
                         except Exception as e:
                             log.warning("[ATTEMPT %s] play_file_segmented: VLC failed to start playback for %s: %s",
                                          _attempt_id, filepath, e)
@@ -14673,19 +14142,14 @@ def initialize_vlc_on_demand():
                 def _apply_native_dims_when_ready(self, filepath, norm_fp, generation, timeout_ms=1200):
                     """Polls the open VLC player for the source's real pixel size."""
                     deadline = pygame.time.get_ticks() + timeout_ms
-                    log.info("[NATIVE DIMS POLL:%s] START file=%s gen=%s timeout_ms=%s", self.engine_label, filepath, generation, timeout_ms)
                     while pygame.time.get_ticks() < deadline:
                         if (getattr(self, "current_filepath", None) != filepath
                                 or getattr(self, "_seek_generation", None) != generation):
-                            log.info("[NATIVE DIMS POLL:%s] SUPERSEDED file=%s gen=%s current_filepath=%s current_gen=%s -- another open/seek took over, this poll never applied anything",
-                                     self.engine_label, filepath, generation, getattr(self, "current_filepath", None), getattr(self, "_seek_generation", None))
                             return
                         dims = self._display_dims_from_player()
                         if dims:
                             w, h = dims
                             if w > 0 and h > 0:
-                                _elapsed_ms = timeout_ms - (deadline - pygame.time.get_ticks())
-                                log.info("[NATIVE DIMS POLL:%s] FOUND file=%s gen=%s dims=%sx%s after %sms", self.engine_label, filepath, generation, w, h, _elapsed_ms)
                                 self._dim_probe_cache[norm_fp] = (w, h)
                                 try:
                                     _save_file_probe_facts(norm_fp, dims=(w, h))
@@ -14700,7 +14164,6 @@ def initialize_vlc_on_demand():
                                             and db is not None
                                             and self._configured_screen_mode() in ("normal", "crop", "panscan"))
                                     if _refresh_gate:
-                                        log.info("[GEOMETRY REFRESH TRIGGER:%s] source=native_dims_poll file=%s gen=%s dims=%sx%s", self.engine_label, filepath, generation, w, h)
                                         self.refresh_screen_mode_geometry()
                                     else:
                                         log.info("[NATIVE DIMS POLL:%s] dims found but refresh SKIPPED (gate failed) file=%s gen=%s current_filepath_match=%s current_gen_match=%s is_dvd_iso=%s screen_mode=%s",
@@ -14773,8 +14236,6 @@ def initialize_vlc_on_demand():
                                         except Exception as _swallowed_error:
                                             _log_swallowed("initialize_vlc_on_demand.VLCEngineWrapper._apply_volume_when_ready: self.player.audio_set_mute(True)", _swallowed_error)
                                         if not _watchdog_armed:
-                                            _mute_guard_log("apply_volume_when_ready FORCE-REMUTE + spawning watchdog",
-                                                             ch=app_state.get("current_channel"), filepath=filepath)
                                             _arm_mute_guard_watchdog(app_state.get("current_channel"), filepath)
                                             _watchdog_armed = True
                                     if pygame.time.get_ticks() >= _reassert_deadline:
@@ -14981,12 +14442,10 @@ def initialize_vlc_on_demand():
                         return generation is not None and generation != self._seek_generation
 
                     if _superseded():
-                        log.info("[STATE RACE] _seek_when_ready superseded before starting: file=%s", getattr(self, "current_filepath", "?"))
                         return
                     with self._state_cond:
                         while True:
                             if _superseded():
-                                log.info("[STATE RACE] _seek_when_ready superseded mid-wait, bailing: file=%s", getattr(self, "current_filepath", "?"))
                                 return
                             remaining_ms = deadline - pygame.time.get_ticks()
                             if remaining_ms <= 0:
@@ -14994,15 +14453,11 @@ def initialize_vlc_on_demand():
                                 break
                             state = self._current_state
                             if state in (_vlc.State.Ended, _vlc.State.Error):
-                                log.info("[STATE RACE] _seek_when_ready bailing: terminal state=%s file=%s", state, getattr(self, "current_filepath", "?"))
                                 return
                             if state == _vlc.State.Stopped:
-                                log.info("[STATE RACE] saw Stopped, debouncing before treating as terminal: file=%s", getattr(self, "current_filepath", "?"))
                                 self._state_cond.wait(0.1)
                                 if self._current_state == _vlc.State.Stopped:
-                                    log.info("[STATE RACE] Stopped persisted after debounce, bailing: file=%s", getattr(self, "current_filepath", "?"))
                                     return
-                                log.info("[STATE RACE] Stopped was stale, state now=%s -- continuing wait: file=%s", self._current_state, getattr(self, "current_filepath", "?"))
                                 continue
                             if state in (_vlc.State.Playing, _vlc.State.Paused) and self._current_length > 0:
                                 if is_disc_image and self._current_title < 1:
@@ -15015,13 +14470,10 @@ def initialize_vlc_on_demand():
                                 while (not self._frame_ready
                                        and pygame.time.get_ticks() < _frame_grace_deadline):
                                     if _superseded():
-                                        log.info("[STATE RACE] _seek_when_ready superseded while "
-                                                  "waiting for first frame, bailing: file=%s",
-                                                  getattr(self, "current_filepath", "?"))
                                         return
                                     self._state_cond.wait(0.02)
                                 if not self._frame_ready:
-                                    log.info("[SEEK VERIFY] first frame never arrived within %dms -- "
+                                    log.warning("[SEEK VERIFY] first frame never arrived within %dms -- "
                                               "seeking anyway: file=%s", _SEEK_FRAME_READY_GRACE_MS,
                                               getattr(self, "current_filepath", "?"))
                                 _still_in_menu_at_timeout = False
@@ -15031,15 +14483,12 @@ def initialize_vlc_on_demand():
                         if is_disc_image and _still_in_menu_at_timeout:
                             return
                     if _superseded():
-                        log.info("[STATE RACE] _seek_when_ready superseded right before initial seek, bailing: file=%s", getattr(self, "current_filepath", "?"))
                         return
                     if self._closed:
-                        log.info("[STATE RACE] _seek_when_ready: engine closed right before initial seek, bailing: file=%s", getattr(self, "current_filepath", "?"))
                         return
                     _opened_there = False
                     if opened_at_position:
                         _open_poll_t0 = pygame.time.get_ticks()
-                        _not_published_logged = False
                         while True:
                             try:
                                 _cur_at_open = self.player.get_time()
@@ -15049,73 +14498,42 @@ def initialize_vlc_on_demand():
                             if (_cur_at_open is not None and _cur_at_open >= 0
                                     and abs(_cur_at_open - target_ms) <= 1500):
                                 _opened_there = True
-                                log.info("[SEEK VERIFY] opened at the target via start-time, no seek needed: "
-                                         "get_time()=%s target=%s file=%s", _cur_at_open, target_ms,
-                                         getattr(self, "current_filepath", "?"))
                                 break
                             if _cur_at_open is not None and _cur_at_open > 0:
-                                log.info("[SEEK VERIFY] start-time at open did not take (get_time()=%s target=%s) "
-                                         "-- seeking: file=%s", _cur_at_open, target_ms,
-                                         getattr(self, "current_filepath", "?"))
                                 break
-                            if not _not_published_logged:
-                                _not_published_logged = True
-                                log.info("[SEEK VERIFY] start-time at open: VLC has not published a time yet "
-                                         "(get_time()=%s target=%s) -- waiting: file=%s", _cur_at_open, target_ms,
-                                         getattr(self, "current_filepath", "?"))
                             if pygame.time.get_ticks() - _open_poll_t0 >= _START_TIME_CONFIRM_MS:
-                                log.info("[SEEK VERIFY] start-time at open never confirmed within %dms "
-                                         "(get_time()=%s target=%s) -- seeking: file=%s", _START_TIME_CONFIRM_MS,
-                                         _cur_at_open, target_ms, getattr(self, "current_filepath", "?"))
                                 break
                             pygame.time.wait(_START_TIME_POLL_MS)
                             if _superseded():
-                                log.info("[STATE RACE] _seek_when_ready superseded while confirming start-time, bailing: file=%s",
-                                         getattr(self, "current_filepath", "?"))
                                 return
                             if self._closed:
-                                log.info("[STATE RACE] _seek_when_ready: engine closed while confirming start-time, bailing: file=%s",
-                                         getattr(self, "current_filepath", "?"))
                                 return
                     if not _opened_there:
                         self.player.set_time(target_ms)
-                    _seek_verify_t0 = pygame.time.get_ticks()
-                    if not _opened_there:
-                        log.info("[SEEK VERIFY] seek requested: target_ms=%s file=%s", target_ms, getattr(self, "current_filepath", "?"))
                     _seek_deadline = pygame.time.get_ticks() + 3000
                     _last_set_time_at = pygame.time.get_ticks()
                     _SEEK_RETRY_INTERVAL_MS = SEEK_RETRY_INTERVAL_MS
-                    _landed_at_ms = None
                     while pygame.time.get_ticks() < _seek_deadline:
                         if _superseded():
-                            log.info("[STATE RACE] _seek_when_ready superseded during verify poll, bailing: file=%s", getattr(self, "current_filepath", "?"))
                             return
                         pygame.time.wait(150)
                         if self._closed:
-                            log.info("[STATE RACE] _seek_when_ready: engine closed during verify poll, bailing: file=%s", getattr(self, "current_filepath", "?"))
                             return
                         try:
                             _cur = self.player.get_time()
                         except Exception as e:
                             log.warning("_seek_when_ready: get_time() failed during seek verification: %s", e)
                             break
-                        _elapsed = pygame.time.get_ticks() - _seek_verify_t0
-                        log.info("[SEEK VERIFY] +%sms poll: get_time()=%s target=%s delta=%s",
-                                 _elapsed, _cur, target_ms, (None if _cur is None else _cur - target_ms))
                         if _cur is not None and _cur >= 0 and abs(_cur - target_ms) <= 1500:
-                            _landed_at_ms = _elapsed
-                            log.info("[SEEK VERIFY] landed close enough at +%sms (get_time()=%s)", _elapsed, _cur)
                             if getattr(self, "_pending_seek_generation", None) == generation:
                                 self._pending_seek_generation = None
                             break
                         if pygame.time.get_ticks() - _last_set_time_at >= _SEEK_RETRY_INTERVAL_MS:
                             if self._closed:
-                                log.info("[STATE RACE] _seek_when_ready: engine closed before retry set_time(), bailing: file=%s", getattr(self, "current_filepath", "?"))
                                 return
                             try:
                                 self.player.set_time(target_ms)
                                 _last_set_time_at = pygame.time.get_ticks()
-                                log.info("[SEEK VERIFY] +%sms re-issued set_time(%s)", _elapsed, target_ms)
                             except Exception as e:
                                 log.warning("_seek_when_ready: retry set_time failed: %s", e)
                                 break
@@ -15132,29 +14550,6 @@ def initialize_vlc_on_demand():
                         if getattr(self, "_pending_seek_generation", None) == generation:
                             self._pending_seek_generation = None
 
-                    if _landed_at_ms is not None:
-                        for _post_delay_s in (1, 2, 4, 8):
-                            pygame.time.wait(int(_post_delay_s * 1000) - 0)
-                            if _superseded():
-                                log.info("[SEEK VERIFY] post-check superseded, stopping: file=%s", getattr(self, "current_filepath", "?"))
-                                return
-                            if self._closed:
-                                log.info("[SEEK VERIFY] post-check: engine closed, stopping: file=%s", getattr(self, "current_filepath", "?"))
-                                return
-                            try:
-                                _post_cur = self.player.get_time()
-                            except Exception as e:
-                                log.warning("[SEEK VERIFY] post-check get_time() failed: %s", e)
-                                break
-                            _total_elapsed = pygame.time.get_ticks() - _seek_verify_t0
-                            _expected = target_ms + _total_elapsed
-                            log.info(
-                                "[SEEK VERIFY] post-landing +%sms real: get_time()=%s expected~=%s "
-                                "(target+elapsed) diff_from_expected=%s diff_from_elapsed_only=%s",
-                                _total_elapsed, _post_cur, _expected,
-                                (None if _post_cur is None else _post_cur - _expected),
-                                (None if _post_cur is None else _post_cur - _total_elapsed),
-                            )
 
 
                 def stop(self, block=True):
@@ -15507,7 +14902,6 @@ def initialize_vlc_on_demand():
                                 db.save_settings_async()
                         except Exception as e:
                             log.warning("_self_heal_native_dims: failed to persist dims for %s: %s", filepath, e)
-                    log.info("[GEOMETRY REFRESH TRIGGER:%s] source=self_heal_main_thread file=%s dims=%sx%s", self.engine_label, filepath, w, h)
                     try:
                         self.refresh_screen_mode_geometry()
                     except Exception as e:
@@ -15526,19 +14920,7 @@ def initialize_vlc_on_demand():
                         with self._frame_lock:
                             if self._decode_buffer is not None:
                                 self._composite_letterboxed_frame()
-                            _copy_t0 = time.perf_counter()
                             _out = bytes(self.raw_buffer)
-                        _copy_ms = (time.perf_counter() - _copy_t0) * 1000.0
-                        _stats = getattr(self, "_frame_copy_stats", None)
-                        if _stats is None:
-                            _stats = self._frame_copy_stats = [0, 0.0, 0.0]
-                        _stats[0] += 1
-                        _stats[1] += _copy_ms
-                        _stats[2] = max(_stats[2], _copy_ms)
-                        if _stats[0] >= FRAME_COPY_LOG_EVERY_FRAMES:
-                            log.info("[FRAME COPY] %s frames=%d avg=%.2f ms max=%.2f ms size=%dx%d",
-                                     self.engine_label, _stats[0], _stats[1] / _stats[0], _stats[2], self.width, self.height)
-                            _stats[0], _stats[1], _stats[2] = 0, 0.0, 0.0
                         return _out
                     return None
 
@@ -15553,7 +14935,6 @@ def initialize_vlc_on_demand():
             vlc_engine = VLCEngineWrapper(engine_label="main")
             _vlc_main_s = time.perf_counter() - _vlc_main_t0
             
-            log.info("[DEBUG VLC MASTER] Core framework ready and operational.")
             # WARNING: a windowed build (no console) has sys.stdout set to None, so the flush is skipped there; the handler flushes below are the ones that matter for the log file.
             if sys.stdout is not None:
                 try:
@@ -15566,7 +14947,6 @@ def initialize_vlc_on_demand():
                 except Exception as _swallowed_error:
                     _log_swallowed("initialize_vlc_on_demand: _h.flush()", _swallowed_error)
 
-            log.info("[DEBUG VLC MASTER] About to construct dedicated DVD engine (hw decode disabled)...")
             for _h in logging.getLogger().handlers:
                 try:
                     _h.flush()
@@ -15576,13 +14956,8 @@ def initialize_vlc_on_demand():
                 _vlc_dvd_t0 = time.perf_counter()
                 dvd_engine = VLCEngineWrapper(instance_args=vlc_args_dvd, engine_label="dvd")
                 
-                log.info("[DEBUG VLC MASTER] Dedicated DVD engine ready and operational.")
                 log.info("[VLC] start-up took %.1f s: loading VLC %.1f s, main engine %.1f s, DVD engine %.1f s",
                          time.perf_counter() - _vlc_start_t0, _vlc_import_s, _vlc_main_s, time.perf_counter() - _vlc_dvd_t0)
-                print("[DVD ENGINE] Menu navigation uses libVLC's native dvdnav "
-                      "signal only (no app-side heuristics). Regular DVDs are "
-                      "fully supported; interactive multi-path DVD 'games' "
-                      "with unreliable disc menu metadata are not.")
             except Exception as e:
                 log.warning(f"[VLC INITIALIZE FAILURE] DVD engine failed to initialize (main engine unaffected): {e}")
                 log.warning("DVD engine failed to initialize (main engine unaffected): %s", e)
@@ -15596,8 +14971,6 @@ def initialize_vlc_on_demand():
             log.warning(f"[VLC INITIALIZE FAILURE] Failed to load libVLC module hooks: {e}")
             vlc_engine = None
             dvd_engine = None
-
-_dvd_probe_inflight = set()
 
 # WARNING: DVD/disc playback is never loudness-scanned or gain-adjusted; a scan could only start mid-playback and interrupt it.
 DVD_FIXED_GAIN = 1.0
@@ -15635,7 +15008,6 @@ def _toggle_holiday_force(holiday_key, channel_key):
     # WARNING: the saved live anchor must stay: it holds the airing show or movie until it ends, and the channel changes over after that.
     app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
     db.save_settings_async()
-    print(f"[HOLIDAY] Switched from channel {ch_key}: {holiday_key} force is now {'on' if media.holiday_forced_key_global(db.config) else 'off'} for every channel")
     return True
 
 
@@ -16359,23 +15731,15 @@ def _prime_missing_durations(ch_str, missing, pace=True):
 
 def _prime_channel_block_durations_worker(ch_str, missing):
     # WARNING: missing[0] is what is on air (or must air first); it is probed at once in a priority scope so the channel leaves Static in about a second, never queued behind the paced scan of the files after it.
-    _t_first = time.monotonic()
     _first_probed = _prime_one_missing_duration(ch_str, missing[0], priority=True)
     _probed = _first_probed
     if len(missing) > 1:
         _probed += _prime_missing_durations(ch_str, missing[1:], pace=True)[0]
-    _elapsed = time.monotonic() - _t_first
-    if _probed:
-        print(f"[TUNE PRIME] ch{ch_str}: background-probed {_probed} near-term duration(s) "
-              f"in {_elapsed:.2f}s (off the main thread -- "
-              f"calculate_slotted_playback_state's stale-lineup rebuild picks up the "
-              f"correction on its next call, same as any other background-probe catch-up)")
     with _priming_inflight_lock:
         _priming_inflight.discard(ch_str)
 
 
 # WARNING: the fallback numbers below must match PRIME_DURATIONS_NEAR_TERM_N in performance_governor.py; they are used only when that module fails to import.
-# WARNING: keep in sync with the "near-term" wording in this function's log line.
 _PRIME_DURATIONS_NEAR_TERM_N = performance_governor.PRIME_DURATIONS_NEAR_TERM_N if performance_governor is not None else 8
 
 def _prime_channel_block_durations(ch_key, synchronous=False):
@@ -16431,9 +15795,6 @@ def _prime_channel_block_durations(ch_key, synchronous=False):
 
     if synchronous:
         _probed, _elapsed = _prime_missing_durations(ch_str, missing, pace=False)
-        if _probed:
-            print(f"[TUNE PRIME] ch{ch_str}: boot-probed {_probed} near-term duration(s) "
-                  f"in {_elapsed:.2f}s before computing initial playback state")
         return
 
     with _priming_inflight_lock:
@@ -16646,11 +16007,6 @@ def _probe_and_apply_loudness_blocking(kind, ch_key, block_key, norm_p, tag, chu
             _pb_thread.join()
     if gain:
         _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=gain, duration=None)
-    if gain:
-        _label = f"ch{ch_key}" if ch_key else kind
-        _measured = _shortfall.get("measured_lufs")
-        _lufs_note = f" (measured {_measured:.1f} LUFS)" if _measured is not None else ""
-        print(f"[LOUDNESS PROBE] {_label} {tag}: '{os.path.basename(norm_p)}' -> gain x{gain:.2f}{_lufs_note}")
     return gain
 
 
@@ -16680,11 +16036,6 @@ def _probe_and_apply_music_loudness_blocking(kind, ch_key, block_key, norm_p, ta
     if gain or _scan_duration.get("duration_sec"):
         _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=(gain or None),
                            duration=_scan_duration.get("duration_sec"))
-    if gain:
-        _label = f"ch{ch_key}" if ch_key else kind
-        _measured = _shortfall.get("measured_lufs")
-        _lufs_note = f" (measured {_measured:.1f} LUFS)" if _measured is not None else ""
-        print(f"[LOUDNESS PROBE] {_label} {tag}: '{os.path.basename(norm_p)}' -> gain x{gain:.2f} (music target){_lufs_note}")
     return gain
 
 
@@ -16795,7 +16146,6 @@ def _run_first_pass_now_playing_sweep():
     """Scans every currently-airing audio target back to back before any ambient backlog tier work, until nothing live is left unscanned; each scan waits first for the airing shows' length and picture-box scans."""
     if db is None:
         return
-    print("[LOUDNESS PROBE] First-pass now-playing sweep starting...")
     _t0 = time.monotonic()
     _scanned = 0
     _crashed = False
@@ -16818,8 +16168,6 @@ def _run_first_pass_now_playing_sweep():
                     block_key, norm_p = _first_scheduled_target_for_channel(new_ch, ch_info)
                     if not norm_p:
                         continue
-                    print(f"[LOUDNESS PROBE] New channel ch{new_ch} detected mid-sweep -- "
-                          f"pausing to scan its first scheduled show before resuming.")
                     if _sweep_wait_for_airing_info_scans():
                         return
                     if _probe_and_apply_loudness_blocking(
@@ -16841,9 +16189,6 @@ def _run_first_pass_now_playing_sweep():
                     break
             if _drifted_key is not None:
                 kind, ch_key, block_key, norm_p = _fresh[_drifted_key]
-                _label = f"ch{ch_key}" if ch_key else kind
-                print(f"[LOUDNESS PROBE] {_label} now-playing changed mid-sweep -- "
-                      f"pausing to scan the new show before resuming.")
                 if _sweep_wait_for_airing_info_scans():
                     return
                 if _probe_and_apply_loudness_blocking(
@@ -17202,8 +16547,6 @@ def _log_missing_probe_path_once(raw_path, ch_key, block_key):
     if not raw_path or raw_path in _logged_missing_probe_paths:
         return
     _logged_missing_probe_paths.add(raw_path)
-    print(f"[MEDIA PRECACHE] Skipping ch{ch_key} '{block_key}' entry -- path does not exist, "
-          f"will never be scanned until fixed: {raw_path}")
 
 
 def _gather_probe_priority_queue():
@@ -17771,7 +17114,6 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
         return
     if kind == "ch03_menu_music":
         if gain is not None:
-            print(f"[LOUDNESS PROBE] ch03 menu music '{os.path.basename(norm_p)}': gain x{gain:.2f}")
             try:
                 _active_ch03_track = app_state.get("ch03_menu_music_track", "") or ""
                 if (_active_ch03_track
@@ -17782,7 +17124,6 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
                         db.config.get("global_volume", 70),
                         db.config.get("is_muted", False),
                     )
-                    log.info("[PRECACHE] Hot-patched live ch03 menu music gain x%.2f for %s", gain, norm_p)
             except Exception as _hp_e3:
                 log.warning("_patch_probed_gain (ch03_menu_music): live gain hot-patch failed: %s", _hp_e3)
         return
@@ -17822,7 +17163,6 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
                     db.config.get("global_volume", 70),
                     db.config.get("is_muted", False),
                 )
-                log.info("[PRECACHE] Hot-patched live VLC gain x%.2f for channel content %s", gain, norm_p)
         except Exception as _hp_e:
             log.warning("_patch_probed_gain (channel): live gain hot-patch failed: %s", _hp_e)
 
@@ -17838,7 +17178,6 @@ def _patch_probed_gain(kind, ch_key, block_key, norm_p, gain=None, duration=None
                     * MUSIC_GAIN
                     * _effective_loudness_gain(gain)
                 )
-                log.info("[PRECACHE] Hot-patched live visualizer/music gain x%.2f for %s", gain, norm_p)
         except Exception as _hp_e2:
             log.warning("_patch_probed_gain (channel): visualizer/music live gain hot-patch failed: %s", _hp_e2)
 
@@ -18031,7 +17370,6 @@ def _probe_upcoming_media():
     try:
         _stripped = _strip_local_entry_gains()
         if _stripped:
-            print(f"[MEDIA PRECACHE] Removed {_stripped} old gain value(s) from the channel lists; gains live only in the library.")
             db.save_settings()
     except Exception as _strip_e:
         log.warning(f"[MEDIA PRECACHE] removing old gains from the channel lists failed (non-fatal): {_strip_e}")
@@ -18086,7 +17424,6 @@ def _probe_upcoming_media():
         if time.monotonic() - _last_resweep_at >= _RESWEEP_COOLDOWN_S and not _background_scan_should_pause():
             try:
                 if _snapshot_now_playing_loudness_targets():
-                    print("[LOUDNESS PROBE] Airing show(s) still unscanned -- running the now-playing sweep again.")
                     _run_first_pass_now_playing_sweep()
             except Exception as _resweep_e:
                 log.warning("[LOUDNESS PROBE] now-playing re-sweep failed (non-fatal): %s", _resweep_e)
@@ -18203,8 +17540,6 @@ def _probe_upcoming_media():
                             )
                     except Exception as _hp_e:
                         log.warning("_probe_pair_loudness: live gain hot-patch failed: %s", _hp_e)
-                print(f"[LOUDNESS PROBE] Combined pair gain x{gain:.2f} for "
-                      f"'{os.path.basename(np1)}' + '{os.path.basename(np2)}' (plays as one)")
                 with _pass_state_lock:
                     _pass_stats["n"] += 1
             finally:
@@ -19665,8 +19000,6 @@ def _background_subsystem_worker():
             daemon=True,
             name="BackgroundUpdateChecker",
         ).start()
-    else:
-        print("[SETTINGS] Updater disabled (UPDATER_AND_SERVER_FEATURES_ENABLED=False) -- background update checker not started.")
 
     if UPDATER_AND_SERVER_FEATURES_ENABLED:
         _start_update_check(boot=True)
@@ -19701,7 +19034,6 @@ def _background_subsystem_worker():
                         playback_provider=lambda: {"screen_mode": db.config.get("screen_mode", "normal")})
                     running.start()
                     server_broadcaster = running
-                    print("[SERVER SYNC] In-process fallback broadcaster started.")
                 except Exception as e:
                     _server_breadcrumb(
                         log, logging.ERROR, "server-fallback-start",
@@ -19734,15 +19066,12 @@ def _background_subsystem_worker():
     if UPDATER_AND_SERVER_FEATURES_ENABLED:
         threading.Thread(target=_schedule_broadcaster_controller,
                          daemon=True, name="ScheduleBroadcasterController").start()
-    else:
-        print("[SETTINGS] Server subsystem disabled (UPDATER_AND_SERVER_FEATURES_ENABLED=False) -- schedule broadcaster controller not started.")
 
     if UPDATER_AND_SERVER_FEATURES_ENABLED:
         try:
             _server_device_id = server_discovery.get_or_create_device_id(db.base_dir)
             db.server_listener = server_discovery.ServerListener(device_id=_server_device_id)
             db.server_listener.start()
-            print("[SERVER DISCOVERY] Listener started.")
         except Exception as e:
             _server_breadcrumb(
                 log, logging.ERROR, "server-listener-start",
@@ -19752,7 +19081,6 @@ def _background_subsystem_worker():
             db.server_listener = None
     else:
         db.server_listener = None
-        print("[SETTINGS] Server subsystem disabled (UPDATER_AND_SERVER_FEATURES_ENABLED=False) -- discovery listener not started.")
 
     _ensure_splash_folder_structure()
 
@@ -20146,10 +19474,6 @@ def _apply_scheduling_mode_change(ch_info, new_mode, target_ch_str):
         try:
             change_channel(target_ch_str, is_surfing=False, force_reload=True,
                             internal_advance=True, snap_internal_advance=False)
-            if entering_marathon:
-                print(f"[MARATHON] Started marathon at episode 1 on ch{target_ch_str}.")
-            else:
-                print(f"[MARATHON] Left marathon on ch{target_ch_str}; resumed {new_mode} schedule.")
         except Exception:
             log.exception("[MARATHON] Boundary re-tune failed")
 
@@ -20412,7 +19736,6 @@ def _apply_repeat_guard(target_clean_key, playback_log, block_label, timeline,
                     or os.path.normpath(str(_cand_file)).lower() != _guard_file
                     or (_cand_seek <= _REPEAT_GUARD_SEC and not _floor_forced_self)):
                 break
-            _last_skip_file = _guard_file
             position_in_playlist = target_show["start_time"] + target_show["duration"] + 1
             if position_in_playlist >= total_block_content:
                 position_in_playlist = 0
@@ -20422,12 +19745,6 @@ def _apply_repeat_guard(target_clean_key, playback_log, block_label, timeline,
                     target_show = _it
                     break
             _guard_iters += 1
-        if _guard_iters > 0:
-            _guard_named = _last_skip_file or _je_file or _lec_file
-            print(f"[REPEAT-GUARD] ch{target_clean_key} ({block_label}): skipped {_guard_iters} slot(s) past "
-                  f"just-ended '{os.path.basename(_guard_named or '')}' -- raw wall-clock position "
-                  f"would have re-landed inside it (position_in_playlist={position_in_playlist}, "
-                  f"total_block_content={total_block_content})")
 
     if _je_slot or _lec_slot:
         _prev_floor_pos = _floor_slot.get("position", -1) if _floor_slot else -1
@@ -21599,11 +20916,6 @@ def _next_item_prep_plan(ch_key, file_path):
             continue
         out.append(norm_p)
     return out, break_near
-
-
-def _next_item_prep_paths(ch_key, file_path):
-    """The video files _next_item_prep_plan readies ahead after file_path in ch_key's block."""
-    return _next_item_prep_plan(ch_key, file_path)[0]
 
 
 def _first_start_scans_run_alone():
@@ -24174,8 +23486,9 @@ def _render_transition_static(screen, rect, target_aspect=None):
         now = pygame.time.get_ticks()
         key = (rect.width, rect.height, noise_style, theme_hue)
         cache = _transition_static_noise_cache
+        _burst_refresh_ms = _STATIC_NOISE_TINT_REFRESH_MS if noise_style in ("rainbow", "theme") else _STATIC_NOISE_REFRESH_MS
         if (cache["key"] != key or cache["surface"] is None
-                or now - cache["built_at"] >= _STATIC_NOISE_REFRESH_MS):
+                or now - cache["built_at"] >= _burst_refresh_ms):
             if noise_style == "rainbow":
                 noise = np.random.randint(30, 170, (sw, sh, 3), dtype=np.uint8)
             elif noise_style == "theme":
@@ -24270,21 +23583,6 @@ def _mute_guard_engine(ch):
     return vlc_engine
 
 
-def _mute_guard_log(event, ch=None, filepath=None, extra=""):
-    _engine = _mute_guard_engine(ch)
-    _tid = threading.get_ident()
-    _short_fp = os.path.basename(filepath) if filepath else None
-    _cur_fp = os.path.basename(getattr(_engine, "current_filepath", "") or "") if _engine is not None else "?"
-    try:
-        _mute_now = _engine.player.audio_get_mute() if _engine is not None else "?"
-    except Exception as _swallowed_error:
-        _log_swallowed("_mute_guard_log: _mute_now = _engine.player.audio_get_mute() if _engine is not None ...", _swallowed_error)
-        _mute_now = "?"
-    print(f"[MUTE GUARD] {event} | thread={_tid} ch={ch} armed_for={_short_fp} "
-          f"engine_current_file={_cur_fp} pending_unmute={app_state.get('_video_pending_unmute', False)} "
-          f"audio_get_mute()={_mute_now} {extra}")
-
-
 _mute_guard_lock = threading.Lock()
 _mute_guard_generation = 0
 
@@ -24304,7 +23602,6 @@ def _watchdog_hold_mute_during_buffering(ch, filepath=None, generation=None):
     _engine = _mute_guard_engine(ch)
     if _engine is None:
         return
-    _mute_guard_log("watchdog SPAWNED", ch=ch, filepath=filepath)
     _deadline = time.time() + 5.0
     _landed_logged = False
     while time.time() < _deadline:
@@ -24312,19 +23609,14 @@ def _watchdog_hold_mute_during_buffering(ch, filepath=None, generation=None):
         if _engine is None:
             return
         if filepath is not None and getattr(_engine, "current_filepath", None) != filepath:
-            _mute_guard_log("watchdog BAIL (superseded)", ch=ch, filepath=filepath)
             return
         if generation is not None and generation != _mute_guard_generation:
-            _mute_guard_log("watchdog BAIL (superseded, stale generation)", ch=ch, filepath=filepath)
             return
         if not app_state.get("_video_pending_unmute", False):
-            _mute_guard_log("watchdog BAIL (flag cleared)", ch=ch, filepath=filepath)
             return
         try:
             _cur = _engine.player.audio_get_mute()
             if _cur != 1:
-                _mute_guard_log("watchdog FORCE-REMUTE", ch=ch, filepath=filepath,
-                                 extra=f"(saw audio_get_mute()={_cur}, forcing back to muted)")
                 _engine.player.audio_set_mute(True)
             elif not _landed_logged:
                 
@@ -24333,14 +23625,12 @@ def _watchdog_hold_mute_during_buffering(ch, filepath=None, generation=None):
             _log_swallowed("_watchdog_hold_mute_during_buffering: _cur = _engine.player.audio_get_mute()", _swallowed_error)
             return
         time.sleep(0.1)
-    _mute_guard_log("watchdog TIMED OUT (5s)", ch=ch, filepath=filepath)
 
 
 def _lift_buffering_mute(ch, reason):
     if not app_state.get("_video_pending_unmute", False):
         return
     app_state["_video_pending_unmute"] = False
-    _mute_guard_log("lift CLEARING flag", ch=ch, extra=f"reason={reason}")
     _still_muted = db.config.get("is_muted", False) if db is not None else False
 
     _engine = _mute_guard_engine(ch)
@@ -24430,8 +23720,6 @@ def _quiet_game_channel():
         try:
             dvd_engine.player.audio_set_mute(True)
             game_deck.dvd_iso_backgrounded = True
-            print("[DVD] Backgrounded on channel leave -- dvd_engine muted, "
-                  "left running as-is (unmute-in-place on return, no reopen).")
         except Exception as _me:
             log.warning(f"[DVD] Failed to mute backgrounded DVD on channel leave: {_me}")
 
@@ -24740,7 +24028,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                         pre_captured_position.get("written_at", broadcast_clock.now().timestamp())
                         if pre_captured_position is not None else broadcast_clock.now().timestamp())
                     _old_ch_entry["playback_anchor"] = _old_anc
-                    print(f"[ANCHOR] Snapped ch{_old_snap_key} leave-position to {_old_anc['seek_offset']:.3f}s.")
                     if str(new_ch).zfill(2) == _old_snap_key:
                         _fresh_self_anchor = True
                     
@@ -24853,7 +24140,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                 # WARNING: the shield's own timer owns unmuting here, not the readiness lifter.
                 app_state["_video_pending_unmute"] = False
                 _arm_warm_transition_shield(vlc_engine, _warm_burst_ms)
-                _mute_guard_log("ARM (guide-exit warm transition shield)", ch=new_ch)
 
     _guide_exit_warm_skip_music_stop = False
     if _GUIDE_WARM_CONTINUATION_ENABLED and old_ch == "04" and new_ch != "04":
@@ -24918,7 +24204,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
             except Exception as _swallowed_error:
                 _log_swallowed("change_channel: vlc_engine.player.audio_set_mute(True)", _swallowed_error)
             app_state["_warm_static_mute_active"] = True
-            _mute_guard_log("ARM (warm static transition duck)", ch=new_ch)
     elif is_surfing:
         app_state["_boot_suppress_static"] = False
         app_state["channel_switch_static_until"] = 0
@@ -25079,8 +24364,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         if _guide_entry_warm_skip_stop and _guide_entry_warm_target_file:
             app_state["loaded_preview_path_cache"] = _guide_entry_warm_target_file
             app_state["_live_playback_channel"] = str(old_ch).zfill(2)
-            print(f"[GUIDE ENTRY WARM] highlight already matches live playback -- "
-                  f"skipping reload for {_guide_entry_warm_target_file}")
 
             # WARNING: this is the one transition path that never calls play_file_segmented() again.
             _warm_transition_style = _configured_transition_style()
@@ -25097,7 +24380,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
             # WARNING: the shield's own timer owns unmuting here, not the readiness lifter.
             app_state["_video_pending_unmute"] = False
             _arm_warm_transition_shield(vlc_engine, _warm_burst_ms)
-            _mute_guard_log("ARM (guide-entry warm transition shield)", ch=old_ch)
     else:
         app_state["guide_col_pos"] = 0
         app_state["guide_row_offset"] = 0
@@ -25114,7 +24396,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
         initialize_vlc_on_demand()
 
         if vlc_engine is None:
-            print(f"[VLC WAIT] Engine still initializing for channel {new_ch}...")
             app_state["is_playing_video"] = False
             app_state["last_vlc_retry_at"] = pygame.time.get_ticks()
         else:
@@ -25243,7 +24524,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                         app_state["last_video_play_started_at"] = pygame.time.get_ticks()
                         if internal_advance:
                             _hold_picture_through_advance()
-                        _mute_guard_log("ARM (real channel change)", ch=new_ch, filepath=t_state["file"])
                         _played_ok = vlc_engine.play_file_segmented(
                             t_state["file"], t_state["seek"],
                             gain=_lookup_file_gain(new_ch, t_state["file"]),
@@ -25447,7 +24727,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                     guide_target,
                 )
         app_state["is_playing_video"] = False
-        print(f"[CHANNEL] Switched to non-video channel {new_ch}")
         
     _dvd_resume_activate = None
     if new_ch == "03" and game_deck is not None and getattr(game_deck, 'dvd_playback_active', False) and getattr(game_deck, 'dvd_file_path', ''):
@@ -25463,7 +24742,6 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                     game_deck.dvd_exit_confirm = False
                     game_deck.dvd_awaiting_resume = False
                     game_deck.dvd_resume_pending = False
-                    print("[DVD] Background resume: dvd_engine unmuted in place, no reopen needed.")
                 except Exception as _ue:
                     log.warning(f"[DVD] Background resume unmute failed: {_ue}")
 
@@ -25706,7 +24984,6 @@ def _surf_up_from_disabled(off_ch):
         return
 
     target = next((ch for ch in allowed if int(ch) > int(off_str)), allowed[0])
-    print(f"[CHANNEL] {off_str} turned off while watching — surfing up to {target}.")
     change_channel(target, is_surfing=True)
 
 
@@ -26628,7 +25905,6 @@ def _execute_commercial_media_clear(target_ch_str, ch_info):
     _reset_channel_lineup_after_clear(target_ch_str, ch_info)
     db.save_settings()
     invalidate_guide_cache()
-    print(f"[CLEARED COMMERCIAL MEDIA] Channel {target_ch_str}.")
 
 
 def _execute_holiday_media_clear(target_ch_str, ch_info):
@@ -26636,7 +25912,6 @@ def _execute_holiday_media_clear(target_ch_str, ch_info):
     _reset_channel_lineup_after_clear(target_ch_str, ch_info)
     db.save_settings()
     invalidate_guide_cache()
-    print(f"[CLEARED HOLIDAY MEDIA] Storage wiped for Channel {target_ch_str}.")
 
 
 def _execute_channel_media_clear(target_ch_str, ch_info):
@@ -26652,7 +25927,6 @@ def _execute_channel_media_clear(target_ch_str, ch_info):
     ch_info.pop("playback_log",          None)
     ch_info.pop("playback_anchor", None)
 
-    print(f"[CLEARED PROFILE] Storage wiped for Channel {target_ch_str}.")
 
     if app_state.get("current_channel", "") == target_ch_str:
         try:
@@ -26691,7 +25965,6 @@ def _execute_clear_manual_roms():
         game_deck.console_roms_manual = {}
     db.config["console_roms_manual"] = {}
     db.save_settings()
-    print("[GAMES] Clear Roms: manually-added ROM lists cleared for all consoles.")
 
 
 def _any_manual_roms_exist():
@@ -26707,7 +25980,6 @@ def _execute_clear_console_manual_roms(console_key):
         game_deck.console_roms_manual.pop(console_key, None)
     db.config.setdefault("console_roms_manual", {}).pop(console_key, None)
     db.save_settings()
-    print(f"[GAMES] Clear Roms: manually-added ROM list cleared for {console_key}.")
 
 
 def _execute_clear_all_cores():
@@ -26805,10 +26077,9 @@ def _cycle_performance_mode():
     """Moves the Performance Mode row to the next allowed mode (Lite, Standard, Performance), applies it live and saves."""
     if performance_governor is None or db is None:
         return
-    _new_mode = performance_governor.choose_mode(
+    performance_governor.choose_mode(
         db.config, performance_governor.next_mode(performance_governor.get_mode()))
     db.save_settings()
-    print(f"[SETTINGS] Performance Mode = {_new_mode}")
 
 
 # WARNING: the fallback number below must match RESET_DISK_CHECK_SECONDS in performance_governor.py; it is used only when that module fails to import.
@@ -27387,7 +26658,6 @@ _start_health_monitor()
 _MODULE_DEFINED.set()
 
 while True:
-    _prof_begin()
     _main_frame_clock["start"] = time.monotonic()
     _main_frame_clock["n"] += 1
 
@@ -27475,9 +26745,6 @@ while True:
                 if not _mnav_released and _mnav_same_layer and _mnav_repeat_ok:
                     events.append(pygame.event.Event(
                         pygame.KEYDOWN, key=_mnav_key, synthetic=True, menu_repeat=True))
-                    _menu_nav_trace("repeat", _mnav_key,
-                                    "held_ms=%d since_last=%d matrix_down=%s batch=%d" % (
-                                        _mnav_held_ms, _mnav_since, bool(_mnav_matrix[_mnav_key]), len(events)))
         else:
             _mnav_hold.clear()
 
@@ -27488,7 +26755,6 @@ while True:
         _governor_feed_frame(_fgap_ms)
         if performance_governor is not None:
             performance_governor.set_game_active(_is_game_actively_playing())
-        _log_frame_time_sample(_fgap_ms, app_state.get("current_channel"))
         if health_monitor is not None:
             health_monitor.explain_gap(_fgap_ms, "ch%s%s" % (app_state.get("current_channel"), ", guide open" if app_state.get("current_channel") == "04" else ""))
         if _fgap_ms >= 200:
@@ -27509,9 +26775,6 @@ while True:
     _hb_last = app_state.get("_heartbeat_last_ticks", 0)
     if now_ticks - _hb_last >= 15000:
         app_state["_heartbeat_last_ticks"] = now_ticks
-        print(f"[HEARTBEAT] main loop alive at {now_ticks}ms, "
-              f"channel={app_state.get('current_channel')}, "
-              f"fullscreen={app_state.get('is_fullscreen')}", flush=True)
         _health_watch_instance_locks()
 
     if (sys.platform == "win32" and pygame_hwnd
@@ -27522,10 +26785,7 @@ while True:
             u32 = ctypes.windll.user32
             fg_hwnd = u32.GetForegroundWindow()
             if fg_hwnd != pygame_hwnd:
-                if u32.IsIconic(pygame_hwnd):
-                    print(f"[WINDOW] Focus watchdog: window is minimized (user-initiated), "
-                          f"NOT forcing focus back. fg_hwnd={fg_hwnd} pygame_hwnd={pygame_hwnd}")
-                else:
+                if not u32.IsIconic(pygame_hwnd):
                     _watchdog_ok = _win32_force_foreground(pygame_hwnd)
                     print(f"[WINDOW] Focus watchdog: foreground mismatch, re-grabbed focus. "
                           f"fg_hwnd_before={fg_hwnd} pygame_hwnd={pygame_hwnd} success={_watchdog_ok}")
@@ -27539,7 +26799,6 @@ while True:
         app_state["digit_timer"] = 0
         
         if _typed_channel_valid(final_ch):
-            print(f"[TUNER] digit_buffer resolved ({_digit_count} digit(s)): tuning to {final_ch}")
             if _surf_origin_active():
                 _tune_after_flip(final_ch, is_surfing=True)
             else:
@@ -27555,7 +26814,6 @@ while True:
                 and not app_state.get("file_explorer_active", False)
                 and not app_state.get("show_menu", False)):
             target_burn_in_safe_ch = str(app_state.get("highlighted_guide_channel", "05")).zfill(2)
-            print(f"[ANTI-BURN-IN SHIELD] Inactivity limit reached. Forcing fullscreen re-entry to Channel: {target_burn_in_safe_ch}")
             app_state["loaded_preview_path_cache"] = ""
             change_channel(target_burn_in_safe_ch)
             continue
@@ -27628,9 +26886,6 @@ while True:
                     db.channels_db[target_ch]["schedules"][active_b] = new_entries
                     
                     newly_added_paths = added_paths
-                    print(f"[FILE EXPLORER] (schedule) {active_b} -> {len(new_entries)} file(s) "
-                          f"for ch {target_ch} (+{len(added_paths)} new, -{removed_n} removed"
-                          + (f", {dupe_n} exact-name duplicate(s) skipped" if dupe_n else "") + ")")
                 else:
                     deduped_files = _dedupe_incoming_files(existing_entries, files_list)
                     _dupe_count = len(files_list) - len(deduped_files)
@@ -27641,9 +26896,6 @@ while True:
                         existing_entries.append(new_entry)
                     db.channels_db[target_ch]["schedules"][active_b] = existing_entries
                     newly_added_paths = deduped_files
-                    print(f"[FILE EXPLORER] (schedule, append-fallback) {active_b} -> "
-                          f"{len(existing_entries)} file(s) for ch {target_ch} "
-                          f"(+{len(deduped_files)} new, {_dupe_count} duplicate(s) skipped)")
 
                 _plog_invalidate = db.channels_db[target_ch].setdefault("playback_log", {})
                 _plog_invalidate["sched_block_key"] = ""
@@ -27780,8 +27032,6 @@ while True:
         _picture_adjust_live_tick()
     except Exception as _pic_tick_e:
         _log_warn_throttled("picture_adjust_tick", "[PICTURE ADJUST] checking the Video tab values failed: %s", _pic_tick_e)
-    _prof_mark("housekeeping")
-    _nav_frame_begin = _menu_nav_frame_begin()
 
     for event in events:
         if event.type == pygame.QUIT:
@@ -27885,7 +27135,6 @@ while True:
             try:
                 _j = pygame.joystick.Joystick(event.device_index)
                 _j.init()
-                print(f"[CTRL] Joystick connected: {_j.get_name()} (id={event.device_index})")
             except Exception as _je:
                 log.warning(f"[CTRL] Joystick connect error: {_je}")
 
@@ -27907,7 +27156,6 @@ while True:
                     if app_state.get("ch03_screensaver_active", False):
                         app_state["ch03_screensaver_active"] = False
                         if app_state.get("ch03_ss_was_game_running", False) and game_deck is not None:
-                            print("[SCREENSAVER] Unfreezing emulator after controller dismiss.")
                             game_deck.set_paused(False, reason="screensaver", muted=False)
                         app_state["ch03_ss_was_game_running"] = False
                 elif not _past_deadzone and _axis_key in _axis_active_set:
@@ -27918,7 +27166,6 @@ while True:
                 if app_state.get("ch03_screensaver_active", False):
                     app_state["ch03_screensaver_active"] = False
                     if app_state.get("ch03_ss_was_game_running", False) and game_deck is not None:
-                        print("[SCREENSAVER] Unfreezing emulator after controller dismiss.")
                         game_deck.set_paused(False, reason="screensaver", muted=False)
                     app_state["ch03_ss_was_game_running"] = False
                 continue
@@ -28006,8 +27253,6 @@ while True:
                 event.key = translate_remote_key(db, event.key)
             app_state["_held_keys"].discard(_raw_keyup_key)
             app_state["_held_keys"].discard(event.key)
-            if app_state.get("show_menu", False):
-                _menu_nav_trace("up", event.key, "raw=%s" % pygame.key.name(_raw_keyup_key))
 
         elif event.type == pygame.KEYDOWN:
             now_ticks = pygame.time.get_ticks()
@@ -28030,8 +27275,6 @@ while True:
                         now_ticks - _dup_last[0],
                         _raw_key_before_translate == _dup_last[1],
                         event.key in app_state["_held_keys"]):
-                    _menu_nav_trace("dup", event.key, "raw=%s since_last=%d" % (
-                        pygame.key.name(_raw_key_before_translate), now_ticks - _dup_last[0]))
                     continue
                 app_state["_nav_last_down"][event.key] = (now_ticks, _raw_key_before_translate)
 
@@ -28055,9 +27298,6 @@ while True:
                 app_state.setdefault("_held_key_down_layer", {})[event.key] = app_state.get("menu_layer")
             if not getattr(event, "synthetic", False):
                 app_state["_held_keys_source"][_raw_key_before_translate] = event.key
-            if app_state.get("show_menu", False) and not getattr(event, "menu_repeat", False):
-                _menu_nav_trace("gated" if _nav_gated else "down", event.key, "raw=%s synthetic=%s" % (
-                    pygame.key.name(_raw_key_before_translate), bool(getattr(event, "synthetic", False))))
             if _nav_gated:
                 continue
 
@@ -28067,7 +27307,6 @@ while True:
                     app_state["ch03_screensaver_active"] = False
                     globals()["_ch03_ss_surf_cache"] = None
                     if app_state.get("ch03_ss_was_game_running", False) and game_deck is not None:
-                        print("[SCREENSAVER] Unfreezing emulator after keyboard dismiss.")
                         game_deck.set_paused(False, reason="screensaver", muted=False)
                     app_state["ch03_ss_was_game_running"] = False
                     continue
@@ -28234,17 +27473,8 @@ while True:
                         # WARNING: the fallback numbers below must match KEY_CAPTURE_SAME_PRESS_MS in performance_governor.py; they are used only when that module fails to import.
                         _REMAP_HARD_DEDUP_MS = performance_governor.KEY_CAPTURE_SAME_PRESS_MS if performance_governor is not None else 250
                         if _ra_dt < _REMAP_HARD_DEDUP_MS:
-                            print(f"[REMOTE REMAP] Ignored duplicate capture event "
-                                  f"(key={event.key} scancode={getattr(event, 'scancode', '?')}, "
-                                  f"last accepted key={_last_accept['key']}) within "
-                                  f"{_REMAP_HARD_DEDUP_MS}ms -- second delivery path of same "
-                                  f"physical press.", flush=True)
                             continue
                         if _ra_same_key and _ra_dt < _REMAP_CAPTURE_DEDUP_MS and not _ra_same_sc:
-                            print(f"[REMOTE REMAP] Ignored duplicate capture event "
-                                  f"(key={event.key} scancode={getattr(event, 'scancode', '?')}) "
-                                  f"within {_REMAP_CAPTURE_DEDUP_MS}ms of the last binding -- "
-                                  f"same physical button arriving on a second input path.", flush=True)
                             continue
 
                 _is_number_capture = (_capture_layer == "NUMBER_REMAP_CAPTURE")
@@ -28279,7 +27509,6 @@ while True:
                     app_state["menu_selection_index"] = _landing_sel
                     app_state["remote_remap_index"] = 0
                     app_state.pop("_remap_used_keys", None)
-                    print("[REMOTE REMAP] Sequence complete.")
                 continue
 
             _kiosk_on_now = db.config.get("kiosk_mode_enabled", False) if db is not None else False
@@ -28344,7 +27573,6 @@ while True:
                             if _set_start_on_boot(True):
                                 db.config["start_on_boot"] = True
                                 db.save_settings()
-                                print("[SETTINGS] Boot on Start = True (confirmed).")
                         elif _cc_target == "commercial_media":
                             _cc_ch_str = app_state.get("clear_confirm_channel")
                             if _cc_ch_str:
@@ -28384,8 +27612,6 @@ while True:
                             _bz_console = app_state.get("clear_confirm_channel")
                             _bz_profile = app_state.get("clear_confirm_profile_num")
                             if _bz_console and _bz_profile is not None:
-                                log.info("[BEZEL DEBUG] Console Bezel ON (confirmed after burn-in warning), "
-                                         "console=%s profile=%s", _bz_console, _bz_profile)
                                 _set_console_bezel_enabled(_bz_console, _bz_profile, True)
                                 if app_state.get("clear_confirm_dont_show_again", False):
                                     db.config["console_bezel_skip_confirm"] = True
@@ -28394,8 +27620,6 @@ while True:
                                       f"after burn-in warning confirmation "
                                       f"(skip_confirm={app_state.get('clear_confirm_dont_show_again', False)}).")
                         elif _cc_target == "program_bezel_toggle":
-                            log.info("[BEZEL DEBUG] TV Bezel ON (confirmed after burn-in warning), channel=%s",
-                                     app_state.get("current_channel"))
                             db.config["fake_43_border_enabled"] = True
                             if app_state.get("clear_confirm_dont_show_again", False):
                                 db.config["program_bezel_skip_confirm"] = True
@@ -28418,7 +27642,6 @@ while True:
                                   f"skip_confirm={app_state.get('clear_confirm_dont_show_again', False)}).")
                     if _cc_target == "app_update" and app_state.get("clear_confirm_selection") != "Yes":
                         _remember_update_prompt_skip(app_state.get("clear_confirm_dont_show_again", False))
-                    print(f"[SETTINGS ENGINE] Clear-confirm popup: committing '{app_state.get('clear_confirm_selection')}' for target '{_cc_target}'.")
                     app_state["show_clear_confirm"]     = False
                     app_state["clear_confirm_target"]   = None
                     app_state["clear_confirm_channel"]  = None
@@ -28439,13 +27662,9 @@ while True:
                          or getattr(game_deck, "dvd_return_menu_confirm", False))):
                 if (menu_nav.deck_confirm_choice(menu_nav.key_to_direction(event.key)) is not None
                         or menu_nav.is_accept(event.key) or menu_nav.is_back(event.key)):
-                    print(f"[DVD GATE] Confirm popup open -> routing '{pygame.key.name(event.key)}' to DVD deck.")
                     game_deck.handle_event(event)
                     continue
-                if event.key in (pygame.K_UP, pygame.K_DOWN):
-                    print(f"[DVD GATE] Confirm popup open -> channel key '{pygame.key.name(event.key)}' stays live.")
-                else:
-                    print(f"[DVD GATE] Confirm popup open -> swallowing '{pygame.key.name(event.key)}' (inactive until a choice is made).")
+                if event.key not in (pygame.K_UP, pygame.K_DOWN):
                     continue
 
             if app_state.get("current_channel") == "03" and not is_any_menu_showing and not is_global_menu_trigger:
@@ -28484,7 +27703,6 @@ while True:
                 if ch_info.get("server_locked", False):
                     app_state["editing_channel_name"] = False
                     app_state["channel_name_all_selected"] = False
-                    print(f"[SERVER SYNC] Ignored channel-name edit on locked channel {target_ch_str}.")
                     continue
                 current_name = ch_info.get("name", f"STATION {target_ch_str}")
                 all_selected = app_state.get("channel_name_all_selected", False)
@@ -28496,7 +27714,6 @@ while True:
                     app_state["editing_channel_name"] = False
                     app_state["channel_name_all_selected"] = False
                     db.save_settings()
-                    print(f"[NAME ENGINE] Saved customized channel label: '{current_name}'")
                 elif _name_result == menu_nav.NAME_EDIT:
                     ch_info["name"] = _name_text
                     app_state["channel_name_all_selected"] = _name_selected
@@ -28527,7 +27744,6 @@ while True:
                                 if new_slot_id in db.SERVER_SLOT_IDS else 0
                             )
                             app_state["menu_selection_index"] = _new_idx
-                            print(f"[SERVER SLOTS] Created {new_slot_id}: '{name}'")
                         else:
                             print(f"[SERVER SLOTS] Could not create slot for '{name}' (6-slot limit reached?)")
                     else:
@@ -28535,7 +27751,6 @@ while True:
                         if db.rename_server_slot(target_slot_id, name):
                             app_state["editing_server_slot_name"] = False
                             app_state["server_slot_name_all_selected"] = False
-                            print(f"[SERVER SLOTS] Renamed {target_slot_id} -> '{name}'")
                 elif _slot_result == menu_nav.NAME_EDIT:
                     app_state["server_slot_name_buffer"] = _slot_text
                     app_state["server_slot_name_all_selected"] = _slot_selected
@@ -28590,8 +27805,6 @@ while True:
                             _win_hwnd_dbg = pygame.display.get_wm_info().get("window")
                         except Exception as _swallowed_error:
                             _log_swallowed("main script: _win_hwnd_dbg = pygame.display.get_wm_info().get('window')", _swallowed_error)
-                    print(f"[WINDOW] Minimize/restore toggle: was_fullscreen={app_state.get('is_fullscreen', True)} "
-                          f"hwnd={_win_hwnd_dbg} foreground_before={ctypes.windll.user32.GetForegroundWindow() if sys.platform == 'win32' else None}")
                     if app_state.get("is_fullscreen", True):
                         min_width, min_height = _compute_boot_window_size(
                             NATIVE_WIDTH, NATIVE_HEIGHT, DETECTED_ASPECT_RATIO
@@ -28658,7 +27871,6 @@ while True:
 
                 if _layer == "DVD_BTN_MAP" and app_state.get("dvd_map_capturing", False):
                     app_state["dvd_map_capturing"] = False
-                    print("[DVD REMAP] Capture cancelled.")
                     continue
 
                 _sub_menu_parent = {
@@ -28733,7 +27945,6 @@ while True:
                     else:
                         app_state["sub_menu_row_index"] = 0
                         app_state["sub_menu_col_index"] = 0
-                    print(f"[SETTINGS ENGINE] ESC: stepped back from {_layer} to {_sub_menu_parent}.")
                 else:
                     if app_state.get("current_channel") != "04":
                         app_state["loaded_preview_path_cache"] = ""
@@ -28741,7 +27952,6 @@ while True:
                     app_state["games_tab_page"] = 0
                     app_state["menu_shown_at"] = 0
                     app_state["_esc_menu_close_guard_until"] = now_ticks + 400
-                    print("[SETTINGS ENGINE] Overlay menu dismissed via ESCAPE.")
                 continue
 
             if menu_nav.is_back(event.key) and not app_state.get("show_menu", False):
@@ -28755,7 +27965,6 @@ while True:
                         continue
 
                 if now_ticks < app_state.get("_esc_menu_close_guard_until", 0):
-                    print("[SETTINGS ENGINE] ESC swallowed: duplicate of the press that just closed the menu.")
                     continue
 
                 if not app_state.get("shell_takeover_active", False):
@@ -28779,7 +27988,6 @@ while True:
                     app_state["menu_layer"] = "TAB_SELECTION"
                     if db is not None and db.config.get("game_channel_enabled", True):
                         preload_games_tab_assets(app_state)
-                    print("[SETTINGS ENGINE] Main overlay menu initialized.")
                 continue
 
             if app_state["current_channel"] == "04" and not app_state["show_menu"] and not app_state["show_quit_confirm"] and not app_state["show_splash"]:
@@ -28790,7 +27998,6 @@ while True:
 
                 if menu_nav.is_accept(event.key):
                     target_tuning_channel = str(app_state["selected_guide_channel"]).zfill(2)
-                    print(f"[EPG TUNER] Activation dispatch caught. Tuning to selected row channel: {target_tuning_channel}")
                     change_channel(target_tuning_channel, is_surfing=True)
                     continue
 
@@ -28920,10 +28127,8 @@ while True:
                                 app_state["menu_selection_index"] = _cl_page * menu_nav.CHANNELS_PAGE_SIZE
                             else:
                                 app_state["menu_selection_index"] = 0
-                            print(f"[MENU NAVIGATION] Dropped cursor down into sub-panel layer: {target_layer}")
                         elif _tb_to is not None:
                             app_state["active_menu_tab"] = _tb_to
-                            print(f"[MENU NAVIGATION] Swapped tab focus {'right' if _tb_dir == menu_nav.RIGHT else 'left'} to: {app_state['active_menu_tab']}")
                         continue
 
                 elif app_state["menu_layer"] == "CHANNEL_LIST":
@@ -28970,7 +28175,6 @@ while True:
                             app_state["sub_menu_col_index"] = 1 if _is_last else 0
 
                             app_state["menu_layer"] = "CHANNEL_SUB_MENU"
-                            print(f"[MENU NAVIGATION] Selected Channel {str(selected_ch_num).zfill(2)}. Opening sub-menu details window.")
                         pygame.event.clear(pygame.KEYDOWN)
                         continue
 
@@ -29004,28 +28208,21 @@ while True:
                         elif _cs_row_id == "scan_lines":
                             db.config["fake_43_scanlines_enabled"] = not db.config.get("fake_43_scanlines_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Scan Lines = {db.config['fake_43_scanlines_enabled']}")
                         elif _cs_row_id == "static_noise":
                             db.config["fake_static_noise_enabled"] = not db.config.get("fake_static_noise_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Static Noise = {db.config['fake_static_noise_enabled']}")
                         elif _cs_row_id == "warp_screen":
                             db.config["warp_screen_enabled"] = not db.config.get("warp_screen_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Warp Screen = {db.config['warp_screen_enabled']}")
                         elif _cs_row_id == "reception_lines":
                             db.config["fake_reception_lines_enabled"] = not db.config.get("fake_reception_lines_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Reception Lines = {db.config['fake_reception_lines_enabled']}")
                         elif _cs_row_id == "bezel_toggle":
                             _bz_turning_on = not db.config.get("fake_43_border_enabled", False)
                             if _bz_turning_on:
                                 if db.config.get("program_bezel_skip_confirm", False):
-                                    log.info("[BEZEL DEBUG] TV Bezel ON (skip-confirm path), channel=%s",
-                                             app_state.get("current_channel"))
                                     db.config["fake_43_border_enabled"] = True
                                     db.save_settings()
-                                    print("[SETTINGS] Bezel = True (confirmation skipped by user preference).")
                                 else:
                                     app_state["show_clear_confirm"]      = True
                                     app_state["clear_confirm_selection"]  = "No"
@@ -29034,11 +28231,8 @@ while True:
                                     app_state["clear_confirm_burnin_new_value"] = True
                                     app_state["clear_confirm_dont_show_again"]  = False
                             else:
-                                log.info("[BEZEL DEBUG] TV Bezel OFF, channel=%s",
-                                         app_state.get("current_channel"))
                                 db.config["fake_43_border_enabled"] = False
                                 db.save_settings()
-                                print("[SETTINGS] Bezel = False")
                         elif _cs_row_id == "bezel_style_select":
                             _n_styles = _effective_bezel_style_count(*screen.get_size())
                             if _n_styles > 1 and db.config.get("fake_43_border_enabled", False):
@@ -29050,11 +28244,9 @@ while True:
                                     _cur_style = 1
                                 db.config["bezel_style"] = (_cur_style % _n_styles) + 1
                                 db.save_settings()
-                                print(f"[SETTINGS] Bezel Style = {db.config['bezel_style']}")
                         elif _cs_row_id == "boot_anim":
                             db.config["boot_anim_enabled"] = not db.config.get("boot_anim_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Boot Anim = {db.config['boot_anim_enabled']}")
                         else:
                             app_state["menu_layer"] = "CHANNEL_LIST"
                             app_state["menu_selection_index"] = 43
@@ -29086,9 +28278,7 @@ while True:
                                 _disconnect_remote_server("Server Mode turned off")
                             if not db.config["server_mode_enabled"] and db.config.get("active_server_slot") is not None:
                                 db.leave_server_slot()
-                                print("[SERVER SLOTS] Server Mode turned off while a slot was active — channels back to main project")
                             db.save_settings()
-                            print(f"[SETTINGS] Server Mode = {db.config['server_mode_enabled']}")
                         elif _as_row_id == "server_menu_open":
                             if UPDATER_AND_SERVER_FEATURES_ENABLED and db.config.get("server_mode_enabled", False):
                                 app_state["menu_layer"] = "SERVER_MENU"
@@ -29103,7 +28293,6 @@ while True:
                             elif _set_start_on_boot(False):
                                 db.config["start_on_boot"] = False
                                 db.save_settings()
-                                print("[SETTINGS] Boot on Start = False")
                         elif _as_row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED:
                             pass
                         elif _as_row_id == "update_check":
@@ -29130,7 +28319,6 @@ while True:
                             db.config["render_mode_override"] = _render_values[_next_i]
                             db.config["render_mode_user_chosen"] = True
                             db.save_settings()
-                            print(f"[SETTINGS] GPU/CPU render mode = {db.config['render_mode_override']}")
                         elif _as_row_id == "remote_remap":
                             app_state["menu_layer"] = "REMOTE_REMAP_LIST"
                             app_state["menu_selection_index"] = 0
@@ -29180,30 +28368,25 @@ while True:
                                     _cci = 0
                                 db.config["tv_captions_color"] = LIST_TEXT_COLOR_NAMES[(_cci + 1) % len(LIST_TEXT_COLOR_NAMES)]
                                 db.save_settings()
-                                print(f"[SETTINGS] TV Captions Color = {db.config['tv_captions_color']}")
                         elif row_id == "game_ch":
                             db.config["game_channel_enabled"] = not db.config.get("game_channel_enabled", True)
                             db.save_settings()
-                            print(f"[SETTINGS] Channel 03 (Games) flipped to: {db.config['game_channel_enabled']}")
                             if not db.config.get("game_channel_enabled", True):
                                 _surf_up_from_disabled("03")
                         elif row_id == "guide":
                             db.config["tv_guide_enabled"] = not db.config.get("tv_guide_enabled", True)
                             db.save_settings()
-                            print(f"[SETTINGS] Channel 04 (TV Guide) flipped to: {db.config['tv_guide_enabled']}")
                             if not db.config.get("tv_guide_enabled", True):
                                 _surf_up_from_disabled("04")
                         elif row_id == "controls_on_start":
                             db.config["show_controls_on_launch"] = not db.config.get("show_controls_on_launch", True)
                             db.save_settings()
-                            print(f"[SETTINGS] Controls Menu on Start = {db.config['show_controls_on_launch']}")
                         elif row_id == "advanced_settings":
                             app_state["menu_layer"] = "SYSTEM_ADVANCED_SUB_MENU"
                             app_state["menu_selection_index"] = 0
                         elif row_id == "kiosk_mode":
                             db.config["kiosk_mode_enabled"] = not db.config.get("kiosk_mode_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Kiosk Mode = {db.config['kiosk_mode_enabled']}")
                             if db.config["kiosk_mode_enabled"] and not app_state.get("is_fullscreen", False):
                                 WINDOW_WIDTH, WINDOW_HEIGHT = NATIVE_WIDTH, NATIVE_HEIGHT
                                 screen = _set_display_mode((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.NOFRAME)
@@ -29225,8 +28408,6 @@ while True:
                                     db.config["global_volume"] = 50
                                     db.config["is_muted"] = False
                                     db.config["loudness_off_seen"] = True
-                                    print("[SETTINGS] Loudness Scan off for the first time -- "
-                                          "volume set to 50% for safety")
                                 else:
                                     # WARNING: a restored off-volume must never come back above 70, or repeated toggles can ratchet it upward.
                                     _remembered_off_vol = db.config.get("volume_loudness_off", 50)
@@ -29236,7 +28417,6 @@ while True:
                                 db.config["global_volume"] = db.config.get(
                                     "volume_loudness_on", db.config.get("global_volume", 70))
                             db.save_settings()
-                            print(f"[SETTINGS] Loudness Scan = {db.config['loudness_scan_enabled']}")
                             if _loudness_was_enabled != _loudness_now_enabled:
                                 app_state["osd_volume_timer"] = now_ticks + 2500
                             # WARNING: apply the setting to the active audio players right now; do not wait for the next file or channel change.
@@ -29269,7 +28449,6 @@ while True:
                                 if db.config.get("pixel_orbiter_skip_confirm", False):
                                     db.config["pixel_orbiter_enabled"] = False
                                     db.save_settings()
-                                    print("[SETTINGS] Pixel Orbiter = False (confirmation skipped by user preference).")
                                 else:
                                     app_state["show_clear_confirm"]      = True
                                     app_state["clear_confirm_selection"]  = "No"
@@ -29280,20 +28459,17 @@ while True:
                             else:
                                 db.config["pixel_orbiter_enabled"] = True
                                 db.save_settings()
-                                print("[SETTINGS] Pixel Orbiter = True")
                         elif row_id == "captions_toggle" and _feature_locked("tv_captions_enabled"):
                             # WARNING: Enter is a no-op while the mode locks this row; the stored setting must not flip.
                             pygame.event.clear(pygame.KEYDOWN)
                         elif row_id == "captions_toggle":
                             db.config["tv_captions_enabled"] = not db.config.get("tv_captions_enabled", False)
                             db.save_settings()
-                            print(f"[SETTINGS] Captions = {db.config['tv_captions_enabled']}")
                             if db.config["tv_captions_enabled"]:
                                 _start_caption_model_prewarm("captions switched on")
                         elif row_id == "mono_stereo_toggle":
                             db.config["audio_stereo"] = not db.config.get("audio_stereo", True)
                             db.save_settings()
-                            print(f"[SETTINGS] Mono Audio = {not db.config['audio_stereo']}")
                             try:
                                 _apply_live_stereo_mode(reason="toggle")
                             except Exception as _live_err:
@@ -29326,7 +28502,6 @@ while True:
                                     if db.config.get("program_bezel_skip_confirm", False):
                                         db.config["fake_43_border_enabled"] = True
                                         db.save_settings()
-                                        print("[SETTINGS] Bezel = True (confirmation skipped by user preference).")
                                     else:
                                         app_state["show_clear_confirm"]      = True
                                         app_state["clear_confirm_selection"]  = "No"
@@ -29337,7 +28512,6 @@ while True:
                                 else:
                                     db.config["fake_43_border_enabled"] = False
                                     db.save_settings()
-                                    print("[SETTINGS] Bezel = False")
                             elif row_id == "bezel_style_select":
                                 _n_styles = _effective_bezel_style_count(*screen.get_size())
                                 if _n_styles > 1 and db.config.get("fake_43_border_enabled", False):
@@ -29348,7 +28522,6 @@ while True:
                                         _cur_style = 1
                                     db.config["bezel_style"] = (_cur_style % _n_styles) + 1
                                     db.save_settings()
-                                    print(f"[SETTINGS] Bezel Style = {db.config['bezel_style']}")
                             elif row_id == "update_check":
                                 if not UPDATER_AND_SERVER_FEATURES_ENABLED:
                                     pass
@@ -29363,7 +28536,6 @@ while True:
                             elif _kiosk_cfg_key:
                                 db.config[_kiosk_cfg_key] = not db.config.get(_kiosk_cfg_key, False)
                                 db.save_settings()
-                                print(f"[SETTINGS] {row_id} = {db.config[_kiosk_cfg_key]}")
                         elif is_enter and row_id == "reset_settings":
                             if _any_settings_to_reset():
                                 app_state["show_clear_confirm"]    = True
@@ -29406,16 +28578,13 @@ while True:
                                 _disconnect_remote_server("role changed to Server")
                             db.config["server_role"] = "server"
                             db.save_settings()
-                            print("[SETTINGS] Server Menu role = server")
                         elif srv_sel == 1:
                             if app_state.get("active_remote_server") is not None:
                                 _disconnect_remote_server("role changed to User")
                             if db.config.get("active_server_slot") is not None:
                                 db.leave_server_slot()
-                                print("[SERVER SLOTS] Left server slot mode (role -> User) — channels back to main project")
                             db.config["server_role"] = "user"
                             db.save_settings()
-                            print("[SETTINGS] Server Menu role = user")
                         elif _srv_manage_visible and srv_sel == 2:
                             app_state["menu_layer"] = "SERVER_SLOTS_MENU"
                             app_state["menu_selection_index"] = 0
@@ -29484,7 +28653,6 @@ while True:
                             server_schedule_client.start()
                             app_state["user_selected_server_name"] = _picked["name"]
                             app_state["active_remote_server"] = _picked
-                            print(f"[SERVER PICKER] Connected to '{_picked['name']}'")
                             app_state["menu_layer"] = "SYSTEM_ADVANCED_SUB_MENU"
                             _as_rows_now = get_advanced_settings_menu_rows(db, app_state)
                             app_state["menu_selection_index"] = (
@@ -29558,10 +28726,8 @@ while True:
                             if target_slot_id is not None:
                                 if db.config.get("active_server_slot") == target_slot_id:
                                     db.leave_server_slot()
-                                    print(f"[SERVER SLOTS] Deactivated {target_slot_id} ('{target_name}') — channels back to main project")
                                 else:
-                                    if db.make_server_slot_active(target_slot_id):
-                                        print(f"[SERVER SLOTS] Made {target_slot_id} ('{target_name}') active for edit")
+                                    db.make_server_slot_active(target_slot_id)
                             app_state["menu_layer"] = "SERVER_SLOTS_MENU"
                             app_state["menu_selection_index"] = target_row
                         elif sa_sel == 1:
@@ -29576,7 +28742,6 @@ while True:
                             if app_state.get("server_slot_pending_delete", False):
                                 if target_slot_id is not None:
                                     db.delete_server_slot(target_slot_id)
-                                    print(f"[SERVER SLOTS] Deleted {target_slot_id} ('{target_name}')")
                                 app_state["server_slot_pending_delete"] = False
                                 app_state["menu_layer"] = "SERVER_SLOTS_MENU"
                                 app_state["menu_selection_index"] = 0
@@ -29607,7 +28772,6 @@ while True:
                             app_state["_remap_used_keys"]   = []
                             app_state["_remap_reject_flash"] = None
                             app_state["_remap_last_accept"]  = None
-                            print("[REMOTE REMAP] Sequence started.")
                         elif rr_sel == 1:
                             app_state["menu_layer"] = "NUMBER_REMAP_CAPTURE"
                             _hook_reinstall_fn = globals().get("_kbd_hook_request_reinstall")
@@ -29617,7 +28781,6 @@ while True:
                             app_state["_remap_used_keys"]   = []
                             app_state["_remap_reject_flash"] = None
                             app_state["_remap_last_accept"]  = None
-                            print("[NUMBER REMAP] Sequence started.")
                         else:
                             app_state["menu_layer"] = "SYSTEM_ADVANCED_SUB_MENU"
                             _as_rows_now = get_advanced_settings_menu_rows(db, app_state)
@@ -29656,13 +28819,10 @@ while True:
 
                     if is_server_locked and menu_nav.is_accept(event.key):
                         if sub_row == max_close_row:
-                            print(f"[SERVER SYNC] Closing locked channel {target_ch_str} editor.")
                             app_state["menu_layer"] = "CHANNEL_LIST"
                             app_state["menu_selection_index"] = max(
                                 0, min(39, app_state.get("selected_channel_row", 5) - 5)
                             )
-                        else:
-                            print(f"[SERVER SYNC] Channel {target_ch_str} is server-controlled; edit ignored.")
                         pygame.event.clear(pygame.KEYDOWN)
                         continue
 
@@ -29717,7 +28877,6 @@ while True:
                         if sub_row == 4 and sub_col == 1 and not is_music_mode and ch_info.get("active", True):
                             ch_info["watermark_enabled"] = not ch_info.get("watermark_enabled", False)
                             db.save_settings()
-                            print(f"[WATERMARK] Channel {target_ch_str} = {ch_info['watermark_enabled']}")
                             continue
                         if sub_row == 4 and sub_col == 2 and not is_music_mode and ch_info.get("active", True):
                             from game_deck import DVD_SPLASH_IMAGE_EXTS
@@ -29738,7 +28897,6 @@ while True:
                             continue
                         # WARNING: on a TV channel that is on, the bottom row holds two buttons: column 0 is Clear All Scheduled Media (handled further down) and column 3 is Close; a music or off channel has only Close there.
                         if sub_row == max_close_row and not ((not is_music_mode) and ch_info.get("active", True) and sub_col == 0):
-                            print("[SUB-MENU CONTROLLER] Close button triggered. Returning to main Channels tab layout.")
                             app_state["menu_layer"] = "CHANNEL_LIST"
                             app_state["menu_selection_index"] = max(0, min(39, app_state.get("selected_channel_row", 5) - 5))
                         elif sub_row == 0:
@@ -29747,18 +28905,15 @@ while True:
                                 if currently_active:
                                     if _count_active_content_channels(db) > 1:
                                         ch_info["active"] = False
-                                        print(f"[CHANNEL] {target_ch_str} turned OFF.")
                                         app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
                                         _surf_up_from_disabled(target_ch_str)
                                     else:
                                         print(f"[CHANNEL] {target_ch_str} is the last active channel - blocked.")
                                 else:
                                     ch_info["active"] = True
-                                    print(f"[CHANNEL] {target_ch_str} turned ON.")
                                     app_state["guide_refresh_token"] = app_state.get("guide_refresh_token", 0) + 1
                             elif sub_col == 1:
                                 ch_info["is_visualizer"] = not ch_info.get("is_visualizer", False)
-                                print(f"[MODE ENGINE] Toggled channel mode. is_visualizer={ch_info['is_visualizer']}")
                             elif sub_col == 2: 
                                 app_state["editing_channel_name"] = True
                                 app_state["channel_name_all_selected"] = True
@@ -29767,7 +28922,6 @@ while True:
                                 except Exception as _name_len_err:
                                     log.warning(f"[NAME ENGINE] Could not compute guide-cell name limit, falling back to 18: {_name_len_err}")
                                     app_state["channel_name_max_len"] = 18
-                                print(f"[NAME ENGINE] Editing channel {target_ch_str} text identification label string (max {app_state['channel_name_max_len']} chars).")
                         else:
                             active_block = "Morning"
                             
@@ -29798,7 +28952,6 @@ while True:
                                         print(f"[VISUALIZER STYLE] Leaving Random for {_next_style} -- confirming burn-in warning first.")
                                     else:
                                         ch_info["visualizer_style"] = _next_style
-                                        print(f"[VISUALIZER STYLE] Cycled forward to style: {ch_info['visualizer_style']}")
                                         db.save_settings()
                                     continue
                                 elif sub_row in (3, 5):
@@ -29830,7 +28983,6 @@ while True:
                                     if sub_col == 1 and not _sched_is_marathon:
                                         _cur_order = ch_info.get("episode_order_mode", "sequential")
                                         ch_info["episode_order_mode"] = "random" if _cur_order == "sequential" else "sequential"
-                                        print(f"[EPISODE ORDER] ch{target_ch_str} -> {ch_info['episode_order_mode']}")
                                         db.save_settings()
                                     else:
                                         _SM = ["random_slots", "one_slot", "two_slots", "marathon"]
@@ -29869,7 +29021,6 @@ while True:
                                             ch_info["commercial_placement"] = (
                                                 "end_of_show" if _cur_place == "interrupt_half_hour"
                                                 else "interrupt_half_hour")
-                                            print(f"[COMMERCIALS] Placement -> {ch_info['commercial_placement']} for ch {target_ch_str}")
                                             db.save_settings()
                                             _replan_hub_future_soon(target_ch_str)
                                     continue
@@ -29887,7 +29038,6 @@ while True:
                                     _plog["sched_block_key"] = ""
                                     _plog["sched_cached_tracks"] = []
                                     _plog["sched_cached_durations"] = {}
-                                    print(f"[BLOCK LENGTH] ch{target_ch_str} -> {ch_info['block_mode']}")
                                     db.save_settings()
                                     _replan_hub_future_soon(target_ch_str)
                                     continue
@@ -29988,7 +29138,6 @@ while True:
                             _target_engine.set_audio_track(track_id)
                             if _audio_ctx == "dvd":
                                 app_state["audio_track_active_id"] = track_id
-                                print(f"[AUDIO TRACK] DVD: switched to '{track_name}'.")
                             else:
                                 _src_ch = app_state.get("audio_track_source_channel")
                                 _cur_file = getattr(_target_engine, "current_filepath", None)
@@ -30005,7 +29154,6 @@ while True:
                                     log.info("[AUDIO TRACK] %s: track %s chosen, playing at gain x%.3f",
                                              os.path.basename(_cur_file), (_vlc_index or 0) + 1, _target_engine.file_gain)
                                 app_state["audio_track_active_id"] = track_id
-                                print(f"[AUDIO TRACK] Channel {_src_ch}: switched to '{track_name}' and remembered for this file.")
                         if _audio_ctx == "dvd":
                             _dvd_rows_now = ["status"] + get_games_sub_menu_rows(db, app_state, "DVD", True) + ["close"]
                             app_state["menu_layer"] = "GAMES_SUB_MENU"
@@ -30167,7 +29315,6 @@ while True:
                                 app_state["games_sub_row"] = 1 if _con_is_last_entry else 0
 
                             app_state["menu_layer"] = "GAMES_SUB_MENU"
-                            print(f"[GAMES TAB] Opening sub-menu for: {console_list[cur_sel]}")
                         pygame.event.clear(pygame.KEYDOWN)
                         continue
 
@@ -30219,7 +29366,6 @@ while True:
                                 if game_deck is not None: game_deck.refresh_from_config(db.config)
                                 if not enabled_map[console_key]:
                                     app_state["games_sub_row"] = 0
-                                print(f"[GAMES] {console_key} enabled = {enabled_map[console_key]}")
                         elif row_id == "core_select":
                             import os as _os
                             emu_folder = _os.path.join(resolve_main_dir(), "cores", console_key)
@@ -30243,7 +29389,6 @@ while True:
                                 status = game_deck.toggle_multitap_live(enabled)
                                 if status == "UNSUPPORTED":
                                     post_status_notice("MULTITAP NOT SUPPORTED THIS SESSION")
-                            print(f"[GAMES] Multitap (all consoles) = {enabled}")
                         elif row_id == "stick_deadzone":
                             app_state["menu_layer"] = "GAMES_STICK_DZ"
                             app_state["stick_dz_cursor"] = 0
@@ -30260,13 +29405,11 @@ while True:
                                 game_deck._ctrl_map_cursor  = 1
                                 _remembered_p = game_deck._mapping_player_by_console.get(console_key, 1)
                                 app_state["ctrl_map_player_sel"] = _remembered_p
-                            print(f"[GAMES] Opening controller mapping UI for {console_key}")
                         elif row_id in ("profile1", "profile2", "profile3"):
                             profile_num = int(row_id[-1])
                             app_state["games_profile_num"]  = profile_num
                             app_state["games_profile_row"]  = 0
                             app_state["menu_layer"] = "GAMES_SAVE_PROFILE"
-                            print(f"[GAMES] Opening profile {profile_num} for {console_key}")
                         elif row_id == "disc":
                             _advance_psx_disc_to_next()
                         elif row_id == "dvd_captions_toggle" and _feature_locked("dvd_captions_enabled"):
@@ -30291,14 +29434,12 @@ while True:
                                         game_deck._apply_dvd_captions_state(False, _dvd_live_vlc, silent=True)
                                         game_deck._dvd_captions_auto_pending = False
                                         game_deck._dvd_captions_auto_done = True
-                            print(f"[GAMES] DVD captions enabled = {enabled}")
                         elif row_id == "dvd_resume_toggle":
                             enabled = not db.config.get("dvd_resume_enabled", False)
                             db.config["dvd_resume_enabled"] = enabled
                             # WARNING: switching Resume off keeps every saved place (owner 2026-11-06); the places are written whether or not it is on.
                             db.save_settings()
                             if game_deck is not None: game_deck.refresh_from_config(db.config)
-                            print(f"[GAMES] DVD resume-from-last-played enabled = {enabled}")
                         elif row_id == "splash_toggle":
                             if console_key == "DVD":
                                 enabled = not db.config.get("dvd_splash_enabled", False)
@@ -30374,7 +29515,6 @@ while True:
                             db.config["console_scroll_style"] = new_style
                             db.save_settings()
                             if game_deck is not None: game_deck.refresh_from_config(db.config)
-                            print(f"[GAMES] Console scroll style = {new_style}")
                         elif row_id == "text_color":
                             from game_deck import LIST_TEXT_COLOR_NAMES
                             current = db.config.get("menu_text_color", "white")
@@ -30387,14 +29527,12 @@ while True:
                             db.config["menu_text_color"] = new_color
                             db.save_settings()
                             if game_deck is not None: game_deck.refresh_from_config(db.config)
-                            print(f"[GAMES] Menu text color = {new_color}")
                         elif row_id == "game_screen_mode":
                             _game_mode_cycle = ["normal", "stretch"]
                             _cur_game_mode = db.config.get("game_screen_mode", "normal")
                             _gidx = _game_mode_cycle.index(_cur_game_mode) if _cur_game_mode in _game_mode_cycle else 0
                             db.config["game_screen_mode"] = _game_mode_cycle[(_gidx + 1) % len(_game_mode_cycle)]
                             db.save_settings()
-                            print(f"[SETTINGS] Game Screen Mode = {db.config['game_screen_mode']}")
                             pygame.event.clear(pygame.KEYDOWN)
                         elif row_id == "relocate_roms_folder":
                             pygame.mixer.Channel(1).stop()
@@ -30449,7 +29587,6 @@ while True:
                             app_state["dvd_map_cursor"] = 0
                             app_state["dvd_map_capturing"] = False
                             app_state["dvd_map_capture_idx"] = 0
-                            print("[DVD REMAP] Opening DVD button mapping popup")
                         elif row_id == "dvd_audio_track":
                             if app_state.get("dvd_audio_track_count", 0) > 1:
                                 _open_dvd_audio_track_picker()
@@ -30460,7 +29597,6 @@ while True:
                             _new_dvd_mode = _dvd_mode_cycle[(_idx + 1) % len(_dvd_mode_cycle)]
                             db.config["dvd_screen_mode"] = _new_dvd_mode
                             db.save_settings()
-                            print(f"[SETTINGS] DVD Screen Mode = {db.config['dvd_screen_mode']}")
                             try:
                                 if dvd_engine is not None and hasattr(dvd_engine, "refresh_screen_mode_geometry"):
                                     if _dvd_screen_mode_change_needs_reopen(dvd_engine, _cur_dvd_mode, _new_dvd_mode):
@@ -30499,17 +29635,10 @@ while True:
                         if _dvd_last is not None:
                             _dvd_dt = pygame.time.get_ticks() - _dvd_last["ms"]
                             if _dvd_dt < _DVD_HARD_DEDUP_MS:
-                                print(f"[DVD REMAP] Ignored duplicate capture event "
-                                      f"(key={event.key} scancode={getattr(event, 'scancode', '?')}, "
-                                      f"last accepted key={_dvd_last['key']}) within "
-                                      f"{_DVD_HARD_DEDUP_MS}ms -- second delivery path of same "
-                                      f"physical press.", flush=True)
                                 continue
                             _dvd_same_key = (event.key == _dvd_last["key"])
                             _dvd_same_scancode = getattr(event, "scancode", 0) == _dvd_last["scancode"]
                             if _dvd_same_key and _dvd_dt < _REMAP_CAPTURE_DEDUP_MS and not _dvd_same_scancode:
-                                print("[DVD REMAP] Ignored duplicate capture event "
-                                      "(same button on a second input path).", flush=True)
                                 continue
 
                         _remote_binds = db.config.get("remote_bindings", {}) if db is not None else {}
@@ -30540,7 +29669,6 @@ while True:
                         _idx += 1
                         if _idx >= len(DVD_MAP_ACTIONS):
                             app_state["dvd_map_capturing"] = False
-                            print("[DVD REMAP] Mapping sequence complete.")
                         else:
                             app_state["dvd_map_capture_idx"] = _idx
                         pygame.event.clear(pygame.KEYDOWN)
@@ -30560,7 +29688,6 @@ while True:
                             app_state["_dvd_map_last_accept"] = None
                             app_state["_dvd_map_reject_flash"] = None
                             app_state["_dvd_map_used_keys"] = []
-                            print("[DVD REMAP] Starting capture sequence.")
                             pygame.event.clear(pygame.KEYDOWN)
                         else:
                             _close_dvd_map()
@@ -30670,7 +29797,6 @@ while True:
                         is_active = (_active_prof(console_key) == profile_num)
                         if profile_row == 0:
                             _set_active_prof(console_key, profile_num)
-                            print(f"[GAMES] Profile {profile_num} now active for {console_key}")
                         elif profile_row == SAVE_ROW and is_active:
                             if game_deck is not None and hasattr(game_deck, "libretro_save_to_profile"):
                                 # WARNING: a save that worked says nothing (owner 2026-11-06); the banner bar speaks only when something is wrong.
@@ -30713,8 +29839,6 @@ while True:
                             if _bz_needs_warning:
                                 if db.config.get("console_bezel_skip_confirm", False):
                                     _toggle_border(console_key, profile_num)
-                                    print(f"[CONSOLE BEZEL] Turned on for {console_key} profile "
-                                          f"{profile_num} (confirmation skipped by user preference).")
                                 else:
                                     app_state["show_clear_confirm"]        = True
                                     app_state["clear_confirm_selection"]   = "No"
@@ -30738,7 +29862,6 @@ while True:
                                     _cur_style = 1
                                 _new_style = (_cur_style % _n_styles) + 1
                                 _set_console_bezel_style(console_key, profile_num, _new_style)
-                                print(f"[CONSOLE BEZEL] Style = {_new_style} for {console_key} profile {profile_num}")
                         elif profile_row == BACK_ROW:
                             app_state["menu_layer"] = "GAMES_SUB_MENU"
                         pygame.event.clear(pygame.KEYDOWN)
@@ -30764,7 +29887,6 @@ while True:
                     if menu_nav.is_accept(event.key):
                         if cur_row in (0, 1, 2, 3) and db.remote_screen_mode_for(app_state.get("current_channel", "")):
                             # WARNING: a Server-streamed channel's Screen Mode is decided by the Server; do not touch the user's own setting.
-                            print("[SERVER SYNC] Screen Mode is controlled by the Server on streamed channels.")
                             pygame.event.clear(pygame.KEYDOWN)
                             continue
                         elif cur_row in (0, 1, 2, 3):
@@ -30772,7 +29894,6 @@ while True:
                             _old_mode = db.config.get("screen_mode", "normal")
                             db.config["screen_mode"] = _new_mode
                             db.save_settings()
-                            print(f"[SETTINGS] Screen Mode = {db.config['screen_mode']}")
 
                             _vlc_needs_reopen = _screen_mode_change_needs_reopen(vlc_engine, _old_mode, _new_mode)
                             _dvd_needs_reopen = _screen_mode_change_needs_reopen(dvd_engine, _old_mode, _new_mode)
@@ -30848,9 +29969,6 @@ while True:
                             app_state["menu_shown_at"] = 0
                             pygame.event.clear(pygame.KEYDOWN)
                             continue
-
-    _menu_nav_frame_end(_nav_frame_begin, events)
-    _prof_mark("events")
 
     # ========================================================================
     # SECTION: Loading screen
@@ -30963,7 +30081,6 @@ while True:
             if 'game_deck' in globals() and game_deck is not None:
                 try:
                     game_deck.refresh_from_config(db.config)
-                    print("[PERSISTENCE HOOK] Synchronized game_deck configurations with disk records on launch.")
                 except Exception as deck_sync_err:
                     log.warning(f"[PERSISTENCE HOOK ERROR] Could not sync game_deck options on boot: {deck_sync_err}")
 
@@ -30978,8 +30095,6 @@ while True:
         _present_cpu_window()
         clock.tick(60)
         continue
-
-    _prof_mark("loading")
 
     # ========================================================================
     # SECTION: Frame setup: virtual screen, content rect & playback state
@@ -31046,8 +30161,6 @@ while True:
         except Exception as e:
             log.warning("[WATCHDOG] owner-channel schedule lookup failed for ch%s: %s", _watchdog_owner_ch, e)
             _owner_playback_state = {}
-
-    _prof_mark("frame_setup")
 
     # ========================================================================
     # SECTION: Video end & stall detection
@@ -31141,8 +30254,6 @@ while True:
                             "block": _bg_ab,
                             "armed_ts": broadcast_clock.now().timestamp(),
                         }
-                    print(f"[BG WATCHDOG] ch{_bg_ch} (warm-continued in background) "
-                          f"finished '{os.path.basename(str(_bg_anchor['file']))}' -- advancing.")
                 _bg_ch_entry["playback_anchor"] = {}
                 _bg_next = calculate_slotted_playback_state(_bg_ch)
                 if _bg_next.get("mode") in ("Video", "Commercial") and _bg_next.get("file"):
@@ -31264,9 +30375,6 @@ while True:
                         _suspicious = (_finish_reason == "error") or _too_long or _transient_blip or _far_from_known_end
                         if _real_dur > 0 and not _suspicious:
                             # WARNING: this estimate must never be written back into the probe cache, the anchor or the frozen schedule durations; only a real ffmpeg/libVLC measurement goes there.
-                            print(f"[WATCHDOG] {os.path.basename(str(_anchor['file']))} on ch{ch} "
-                                  f"ended (wall-clock position {_real_dur}s, probed runtime "
-                                  f"{_known_dur if _known_dur else 'unknown'}s) -- advancing to next show.")
                             if _known_dur and _known_dur > 0 and abs(_real_dur - _known_dur) > 5:
                                 log.warning(
                                     "WATCHDOG: ch%s %s ended at a wall-clock position of %ss but its probed "
@@ -31346,9 +30454,6 @@ while True:
                                         _ch_entry, _ab, str(_anchor["file"]))
                                     if _ended_show is not None and len(_ended_eps) <= 1:
                                         _skip_guard_arm = True
-                                        print(f"[REPEAT-GUARD] ch{ch}: '{_ended_show}' has only "
-                                              f"1 episode on hand -- skipping the 900s repeat-guard "
-                                              f"hold, immediate repeat is correct here.")
                                 except Exception as e:
                                     log.warning("WATCHDOG: episode-count check for repeat-guard "
                                                 "exemption failed on ch%s: %s", ch, e)
@@ -31456,8 +30561,6 @@ while True:
                 loaded_path = os.path.normpath(unquote(current_media.get_mrl().replace("file:///", ""))).lower()
             sched_path = os.path.normpath(current_playback_state["file"]).lower()
             if loaded_path and loaded_path != sched_path:
-                print(f"[SCHEDULE] Mid-stream content change on ch{ch}: "
-                      f"{os.path.basename(loaded_path)} -> {os.path.basename(sched_path)}")
 
                 _resume_seek = current_playback_state.get("seek", 0)
                 if db is not None:
@@ -31478,9 +30581,6 @@ while True:
                                 "seek":     _leave_pos_ms / 1000.0,
                                 "armed_ts": broadcast_clock.now().timestamp(),
                             }
-                            print(f"[INTERIOR-BREAK] ch{ch}: paused "
-                                  f"'{os.path.basename(str(_old_anchor_ms['file']))}' at real "
-                                  f"position {_leave_pos_ms / 1000.0:.3f}s before cutting to break.")
                         elif _leave_pos_ms is not None and _leave_pos_ms >= 0:
                             print(f"[INTERIOR-BREAK] ch{ch}: discarded a bad leave-position "
                                   f"capture ({_leave_pos_ms / 1000.0:.3f}s, segment started at "
@@ -31491,9 +30591,6 @@ while True:
                     if (_pause_rec and _pause_rec.get("file") == sched_path
                             and broadcast_clock.now().timestamp() - _pause_rec.get("armed_ts", 0) < 3600):
                         _resume_seek = _pause_rec["seek"]
-                        print(f"[INTERIOR-BREAK] ch{ch}: resuming "
-                              f"'{os.path.basename(sched_path)}' from real pause point "
-                              f"{_resume_seek}s instead of the schedule's fixed offset.")
                         _plog_ms.pop("interior_break_pause", None)
 
                 try:
@@ -31505,11 +30602,6 @@ while True:
                     pygame.time.get_ticks() + SAME_CHANNEL_AUDIO_HOLD_MS
                 )
                 _hold_picture_through_advance()
-                _mute_guard_log(
-                    "ARM (mid-stream content change)",
-                    ch=ch,
-                    filepath=current_playback_state["file"],
-                )
                 _ms_ch_key = str(ch).zfill(2)
                 _ms_snap = dict(current_playback_state)
                 _ms_resume_seek = _resume_seek
@@ -31602,8 +30694,6 @@ while True:
         screen.fill(COLOR_SCREEN_BLACK)
         w_w, w_h = 100, 100
 
-    _prof_mark("stall_detect")
-
     # ========================================================================
     # SECTION: Video render (TV channels)
     # ========================================================================
@@ -31693,11 +30783,9 @@ while True:
                 _draw_channel_failure_message(screen, _full_window_rect, str(ch).zfill(2))
             elif vlc_engine is not None:
                 try:
-                    _vd_t0 = time.perf_counter()
                     vlc_bytes = vlc_engine.get_display_frame()
                     if vlc_bytes is not None and len(vlc_bytes) >= vlc_engine.buf_size:
                         _note_fresh_live_video_frame(ch)
-                        _vd_t1 = time.perf_counter()
                         video_surf = pygame.image.frombuffer(vlc_bytes, (vlc_engine.width, vlc_engine.height), "BGRA")
                         video_surf = _true_content_surf(video_surf, vlc_engine)
                         _picture_box_set_content(current_playback_state.get("file", ""))
@@ -31706,7 +30794,6 @@ while True:
                             
                             # WARNING: the Video tab's adjustments are drawn by VLC itself (_picture_adjust_media_options); adding the CPU pass here would apply them twice.
                             effected_surf = video_surf
-                            _vd_t2 = time.perf_counter()
 
                             _pan_scan_set_content(current_playback_state.get("file", ""))
                             _video_sa = _snap_standard_aspect(_pb_aspect or (video_surf.get_width() / video_surf.get_height()))
@@ -31714,29 +30801,12 @@ while True:
                             if (_video_target_rect.width < content_rect.width
                                     or _video_target_rect.height < content_rect.height):
                                 screen.fill(_video_bar_color(), content_rect)
-                            _real_blit_geom = {}
-                            _vd_t3 = time.perf_counter()
                             _draw_video_picture(screen, effected_surf, _video_target_rect,
                                                 mode=_bezel_video_fit_mode(),
-                                                analysis_surf=video_surf, geom_out=_real_blit_geom,
+                                                analysis_surf=video_surf,
                                                 pixel_aspect=_video_pixel_aspect(w_w, w_h, _video_sa),
                                                 fit_aspect=_video_sa)
-                            _vd_t4 = time.perf_counter()
-                            _rbg_key = (tuple(content_rect), tuple(_video_target_rect),
-                                        video_surf.get_size(), tuple(sorted(_real_blit_geom.items())) if _real_blit_geom else None)
-                            if _real_video_blit_log_state.get("key") != _rbg_key:
-                                _real_video_blit_log_state["key"] = _rbg_key
-                                log.info("[REAL VIDEO BLIT] content_rect=%s video_target_rect=%s true_content_surf=%sx%s "
-                                         "actual_draw=(%s,%s,%s,%s) actual_draw_aspect=%s target_rect_aspect=%.4f",
-                                         tuple(content_rect), tuple(_video_target_rect), video_surf.get_width(), video_surf.get_height(),
-                                         _real_blit_geom.get("dest_x"), _real_blit_geom.get("dest_y"),
-                                         _real_blit_geom.get("draw_w"), _real_blit_geom.get("draw_h"),
-                                         ("%.4f" % (_real_blit_geom["draw_w"] / _real_blit_geom["draw_h"])
-                                          if _real_blit_geom.get("draw_w") and _real_blit_geom.get("draw_h") else None),
-                                         _video_target_rect.width / _video_target_rect.height if _video_target_rect.height else 0)
                             _store_last_video_frame(effected_surf, raw_surf=video_surf, context="fullscreen", fit_aspect=_video_sa)
-                            _note_video_draw_timing(_vd_t1 - _vd_t0, _vd_t2 - _vd_t1, _vd_t3 - _vd_t2, _vd_t4 - _vd_t3,
-                                                    time.perf_counter() - _vd_t4, current_playback_state.get("mode", ""))
                             app_state["_video_painted_this_frame"] = True
                         else:
                             if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
@@ -32180,7 +31250,6 @@ while True:
                     try: vlc_engine.player.audio_set_mute(False)
                     except Exception as _swallowed_error:
                         _log_swallowed("main script: vlc_engine.player.audio_set_mute(False)", _swallowed_error)
-            _mute_guard_log("warm static transition duck LIFTED", ch=ch)
 
         if app_state.get("_visualizer_audio_duck_active", False):
             app_state["_visualizer_audio_duck_active"] = False
@@ -32208,8 +31277,6 @@ while True:
                             db.config.get("global_volume", 70) if db else 70, _still_muted)
                 except Exception as _ch03_restore_err:
                     log.warning(f"[CH03 AUDIO] static-burst restore failed: {_ch03_restore_err}")
-
-    _prof_mark("video")
 
     # ========================================================================
     # SECTION: Game deck render (CH 03)
@@ -32593,7 +31660,6 @@ while True:
                         try: vlc_engine.player.audio_set_mute(False)
                         except Exception as _swallowed_error:
                             _log_swallowed("main script: vlc_engine.player.audio_set_mute(False)", _swallowed_error)
-                _mute_guard_log("warm static transition duck LIFTED", ch=ch)
             pass
         else:
             if app_state.get("_warm_static_mute_active", False):
@@ -32604,7 +31670,6 @@ while True:
                         try: vlc_engine.player.audio_set_mute(False)
                         except Exception as _swallowed_error:
                             _log_swallowed("main script: vlc_engine.player.audio_set_mute(False)", _swallowed_error)
-                _mute_guard_log("warm static transition duck LIFTED", ch=ch)
             preview_ch_num = str(app_state.get("highlighted_guide_channel", "05")).zfill(2)
             preview_ch_info = db.channels_db.get(preview_ch_num, {}) if db is not None else {}
             p_state = _get_guide_hl_playback_state(preview_ch_num)
@@ -32625,8 +31690,6 @@ while True:
             and current_playback_state.get("mode") == "Static"
             and pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)):
         _static_sound_play()
-
-    _prof_mark("game_deck")
 
     # ========================================================================
     # SECTION: Overlays: captions, static, reception lines & watermark
@@ -32700,8 +31763,6 @@ while True:
     except Exception as _pic_layer_err:
         _picture_layer_state.update(rect=None, taken=False)
         _log_warn_throttled("picture_layer", "[PICTURE ADJUST] could not mark the broadcast picture, the Video tab settings skip this frame: %s" % _pic_layer_err)
-
-    _prof_mark("overlays")
 
     # ========================================================================
     # SECTION: Idle timeouts & held-key input
@@ -32836,8 +31897,6 @@ while True:
             if app_state.pop("_guide_hold_moved_rows", False):
                 _resync_guide_stop_after_row_switch()
 
-    _prof_mark("idle_input")
-
     # ========================================================================
     # SECTION: Volume OSD
     # ========================================================================
@@ -32891,11 +31950,6 @@ while True:
                 _off_scale, _off_scale_x = _ch_scale, _ch_scale_x
             def _cs(px):
                 return max(1, round(px * _ch_scale))
-            def _cs_x(px):
-                return max(1, round(px * _ch_scale_x))
-            def _cs_signed(px):
-                # WARNING: do not apply _cs()'s max(1, ...) floor to a signed offset; a negative value would silently clamp up to +1.
-                return round(px * _ch_scale)
 
             _true_top_y = _ch_rect.y + round(_osd_top_off * _off_scale)
             app_state["_ch_num_generic_osd_y"] = _true_top_y
@@ -32991,8 +32045,6 @@ while True:
 
     _vol_matrix = pygame.key.get_pressed()
 
-    _prof_mark("volume_osd")
-
     # ========================================================================
     # SECTION: Menus & overlays
     # ========================================================================
@@ -33036,7 +32088,7 @@ while True:
                     else:
                         app_state["_held_keys"].discard(pygame.K_RIGHT)
                 else:
-                    log.warning("[VOLUME DEBUG] SUSPECTED STUCK KEY: saw both LEFT and RIGHT "
+                    log.warning("[VOLUME] stuck key: saw both LEFT and RIGHT "
                                 "held via _held_keys with matrix=(LEFT=%s, RIGHT=%s) -- "
                                 "clearing both and stopping repeat", _l_phys, _r_phys)
                     app_state["_held_keys"].discard(pygame.K_LEFT)
@@ -33058,11 +32110,8 @@ while True:
             _vol_step = menu_nav.hold_step(
                 menu_nav.hold_rule(_vol_key), _vol_hold, _vol_key, now_ticks_ms, bool(_vol_matrix[_vol_key]),
                 False, menu_nav.HOLD_STUCK_MS["volume"])
-            if _vol_step == menu_nav.HOLD_STARTED:
-                log.info("[VOLUME DEBUG] hold started key=%s tracked=%s sdl_down=%s", pygame.key.name(_vol_key),
-                         _vol_key in app_state["_held_keys"], bool(_vol_matrix[_vol_key]))
-            elif _vol_step == menu_nav.HOLD_STUCK:
-                log.warning("[VOLUME DEBUG] SUSPECTED STUCK KEY: key=%s counted as held but SDL says NOT pressed -- "
+            if _vol_step == menu_nav.HOLD_STUCK:
+                log.warning("[VOLUME] stuck key: key=%s counted as held but SDL says NOT pressed -- "
                             "releasing it now (probably a swallowed key-up)", pygame.key.name(_vol_key))
                 app_state["_held_keys"].discard(_vol_key)
             elif _vol_step == menu_nav.HOLD_REPEAT:
@@ -33375,7 +32424,6 @@ while True:
                     app_state["ch03_screensaver_active"]    = True
                     app_state["ch03_ss_was_game_running"]   = _game_is_running
                     if _game_is_running and game_deck is not None:
-                        print("[SCREENSAVER] Freezing emulator.")
                         game_deck.set_paused(True, hard=True, reason="screensaver")
 
                 _ss_tick = pygame.time.get_ticks()
@@ -33440,8 +32488,6 @@ while True:
         )
     except Exception as e:
         _log_warn_throttled("xi_nav_state_sync", "Per-frame XInput nav-state sync failed: %s", e)
-
-    _prof_mark("menus")
 
     # ========================================================================
     # SECTION: CRT power animation
@@ -33549,8 +32595,6 @@ while True:
 
     # WARNING: thread this through to the shader branch, or toggling Scan Lines while Bezel is on is a silent no-op.
 
-    _prof_mark("power_anim")
-
     # ========================================================================
     # SECTION: Final compositing & present
     # ========================================================================
@@ -33572,7 +32616,6 @@ while True:
     _draw_status_banners(screen)
 
     _scanlines_wanted = _setting_on("fake_43_scanlines_enabled")
-    _path_t0 = time.perf_counter()
     _gpu_frame_drawn = _gpu_draw_frame(
         _real_screen, screen,
         _content_ignores_package_aspect(w_w, w_h), _scanlines_wanted)
@@ -33593,22 +32636,15 @@ while True:
     # WARNING: this call must stay last.
     if not _gpu_frame_drawn:
         _draw_channel_volume_osd("led")
-    _path_draw_ms = (time.perf_counter() - _path_t0) * 1000.0
-    _prof_mark("composite")
 
     _gov_flip_t0 = time.perf_counter()
-    _frame_presented = _present_window(_gpu_frame_drawn)
+    _present_window(_gpu_frame_drawn)
     _path_present_ms = (time.perf_counter() - _gov_flip_t0) * 1000.0
     _governor_note_flip(_path_present_ms)
-    _frame_path_note(_gpu_frame_drawn, _frame_presented, _path_draw_ms, _path_present_ms, screen.get_size(), _scanlines_wanted)
-    _prof_mark("present")
     app_state["_chsurf_display_gate"] = False
     _gd = globals().get("game_deck", None)
     _tick_fps = _resolve_main_loop_tick_fps(_gd)
 
     _gov_tick_t0 = time.perf_counter()
-    _prof_mark("tail")
     clock.tick(_tick_fps)
     _governor_note_tick_wait((time.perf_counter() - _gov_tick_t0) * 1000.0, _tick_fps, _governor_screen_kind(_gd))
-    _prof_mark("wait")
-    _prof_end()

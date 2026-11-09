@@ -240,7 +240,7 @@ def _build_system_table(rows):
     has_advanced = stand is not None
     poweroff_standalone = "poweroff" in rows and has_advanced
     bottom = [r for r in rows
-              if r not in left and r not in right and r != stand
+              if r not in left and r not in right and r != stand and r != "bezel_style_select"
               and not (r == "poweroff" and poweroff_standalone)]
     t = NavTable()
     t.known(CLOSE, *rows)
@@ -267,6 +267,13 @@ def _build_system_table(rows):
         if row == "captions_toggle":
             t.link(row, RIGHT, SYSTEM_CAPTIONS_COLOR_CELL)
 
+    if "bezel_style_select" in rows and "bezel_toggle" in left:
+        b = left.index("bezel_toggle")
+        t.link("bezel_toggle", RIGHT, "bezel_style_select")
+        t.link("bezel_style_select", LEFT, "bezel_toggle")
+        t.link("bezel_style_select", UP, TAB_BAR if b == 0 else left[b - 1])
+        t.link("bezel_style_select", DOWN, left[b + 1] if b + 1 < len(left) else below_columns)
+
     if "captions_toggle" in right:
         c = right.index("captions_toggle")
         t.link(SYSTEM_CAPTIONS_COLOR_CELL, UP, TAB_BAR if c == 0 else right[c - 1])
@@ -274,10 +281,9 @@ def _build_system_table(rows):
         t.link(SYSTEM_CAPTIONS_COLOR_CELL, LEFT, "captions_toggle")
 
     if has_advanced:
-        if "kiosk_mode" in rows:
-            t.link(stand, UP, Remember("kiosk_mode"))
-            sources = tuple(s for s in ("kiosk_mode", "mono_stereo_toggle") if s in rows)
-            t.remember[stand] = sources
+        if left:
+            t.link(stand, UP, Remember(left[-1]))
+            t.remember[stand] = tuple([left[-1]] + ([right[-1]] if right else []))
         t.link(stand, DOWN, bottom[0] if bottom else CLOSE)
 
     for k, row in enumerate(bottom):
@@ -620,6 +626,8 @@ def _slider_move(store, spec, direction):
     key, default, low, high = spec
     moved = store.get(key, default) + (SLIDER_STEP if direction == RIGHT else -SLIDER_STEP)
     store[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
+    if key == "theme_ui_hue" and _governor is not None:
+        store[key] = _governor.theme_ui_hue_clear(store[key], 1 if direction == RIGHT else -1)
     return True
 
 

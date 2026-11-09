@@ -1058,12 +1058,6 @@ def _path_status(p):
     return status
 
 
-def queued_path_refreshes():
-    """How many path re-checks the screen thread has queued."""
-    with _path_exists_cache_lock:
-        return len(_path_refresh_queue)
-
-
 def run_queued_path_refreshes(limit=None):
     """Re-checks the paths the screen thread used past their time (oldest first, at most `limit`); returns how many were checked. For a background thread only."""
     with _path_exists_cache_lock:
@@ -5262,7 +5256,6 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
 
     def _pack_even_breaks(show, show_dur, num_breaks, t_block_content, next_mark, first_cut=None):
         """Cuts the show into num_breaks equal parts (a pair at its seam) with a break after each, the last one at its end; the ad time up to next_mark is shared evenly so the next show starts on its mark."""
-        nonlocal _deferred_fill
         # WARNING: these breaks are held neither to max_interrupt_break_seconds nor to BREAK_MIN_SECONDS; either made a show under an hour get a 3rd break or lose one, or pushed the next show off its mark (owner 2026-11-03: the break count is the rule, a break every half hour and one at the end).
         gap = max(0, next_mark - (t_block_content + show_dur))
         per_break = gap / float(num_breaks)
@@ -8740,25 +8733,14 @@ def _lufs_window_ffmpeg(file_path, target_lufs, start_sec=None, length_sec=None,
     """Run one loudness window after the governor admits it; the work is in _lufs_window_ffmpeg_inner; pre_filter is an ffmpeg audio filter run before the loudness measurement; dialogue (from _resolve_dialogue_basis) also measures the window's dialogue in the same decode and dialogue_out receives it as "i" with its speech seconds as "speech_seconds"."""
     _lane = "music_loudness" if semaphore is _MUSIC_LOUDNESS_PROBE_SEMAPHORE else "loudness_and_bake"
     _prio = semaphore is _LOUDNESS_PRIORITY_SEMAPHORE or semaphore is _LOUDNESS_PARALLEL_SEMAPHORE
-    _win_t0 = time.time()
     with _gov_gate(_lane, priority=_prio, timeout=semaphore_timeout,
                    label=f"loudness({os.path.basename(file_path)})") as _admitted:
         if not _admitted:
             return None, None, None, "", True
-        _gate_wait = time.time() - _win_t0
         _result = _lufs_window_ffmpeg_inner(file_path, target_lufs, start_sec=start_sec, length_sec=length_sec,
                                              timeout=timeout, semaphore=semaphore,
                                              semaphore_timeout=semaphore_timeout, pre_filter=pre_filter,
                                              dialogue=dialogue, dialogue_out=dialogue_out, stream_index=stream_index)
-        _total = time.time() - _win_t0
-        if _prio or _total >= LOUDNESS_WINDOW_LOG_MIN_SECONDS:
-            log.info("[LOUDNESS WINDOW TIMING] %s start=%s len=%s gate_wait=%.1fs total=%.1fs reading=%s%s",
-                     os.path.basename(file_path),
-                     "whole" if start_sec is None else f"{start_sec:.0f}s",
-                     "whole" if length_sec is None else f"{length_sec:.0f}s",
-                     _gate_wait, _total,
-                     "none" if _result[0] is None else f"{_result[0]:.1f}LUFS",
-                     " TIMEOUT" if _result[4] else "")
         return _result
 
 
@@ -8891,8 +8873,6 @@ def _combine_true_peak_readings(tp_readings):
 # WARNING: the fallback number below must match LOUDNESS_WINDOW_DISAGREE_LU in performance_governor.py; it is used only when that module fails to import.
 LOUDNESS_WINDOW_DISAGREE_LU = _perf_governor.LOUDNESS_WINDOW_DISAGREE_LU if _perf_governor is not None else 3.0
 
-# WARNING: the fallback number below must match LOUDNESS_WINDOW_LOG_MIN_SECONDS in performance_governor.py; it is used only when that module fails to import.
-LOUDNESS_WINDOW_LOG_MIN_SECONDS = _perf_governor.LOUDNESS_WINDOW_LOG_MIN_SECONDS if _perf_governor is not None else 5.0
 
 # WARNING: the fallback number below must match LOUDNESS_WIDE_LRA_FLAG_LU in performance_governor.py; it is used only when that module fails to import.
 LOUDNESS_WIDE_LRA_FLAG_LU = _perf_governor.LOUDNESS_WIDE_LRA_FLAG_LU if _perf_governor is not None else 15.0
@@ -9751,19 +9731,6 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
                 "windows": [[c, v] for c, v in _windows],
                 "basis": _basis_label,
             })
-        log.info(
-            "[LOUDNESS DEBUG] %s target=%.1f measured=%.1f achieved=%.1f "
-            "gain_db=%+.1f gain=%.3f clamped=%.3f peak=%s peak_dbtp=%s "
-            "lra=%s duration=%s windows=%s recheck=%s basis=%s",
-            os.path.basename(file_path), target_lufs,
-            measured_i, measured_i + (20 * math.log10(_clamped_gain)),
-            gain_db, gain, _clamped_gain, _peak_capped,
-            "none" if combined_tp is None else f"{combined_tp:.1f}",
-            "none" if _max_lra is None else f"{_max_lra:.1f}",
-            "none" if not _dur_info.get("duration_sec") else f"{_dur_info['duration_sec']:.1f}s",
-            "[" + ",".join(f"{place:.3f}:{value:.1f}" for place, value in _windows) + "]",
-            _double_checked, _basis_label,
-        )
         if gain != _clamped_gain:
             _achieved_lufs = measured_i + (20 * math.log10(_clamped_gain))
             _shortfall_db = target_lufs - _achieved_lufs
@@ -10138,6 +10105,8 @@ def bake_compressor_pass(file_path, timeout=180, should_abort=None):
 
 # WARNING: the fallback numbers below must match SETTINGS_SAVE_DELAY_SECONDS, SETTINGS_SAVE_REPORT_SECONDS in performance_governor.py; they are used only when that module fails to import.
 SETTINGS_SAVE_DELAY_SECONDS = _perf_governor.SETTINGS_SAVE_DELAY_SECONDS if _perf_governor is not None else 2.0
+# WARNING: the 5 fallback must match CONFIG_BACKUPS_KEPT in performance_governor.py; it is used only when that module fails to import.
+CONFIG_BACKUPS_KEPT = _perf_governor.CONFIG_BACKUPS_KEPT if _perf_governor is not None else 5
 SETTINGS_SAVE_REPORT_SECONDS = _perf_governor.SETTINGS_SAVE_REPORT_SECONDS if _perf_governor is not None else 60.0
 # WARNING: the fallback number below must match SETTINGS_SAVE_PIECE_ENTRIES in performance_governor.py; it is used only when that module fails to import.
 SETTINGS_SAVE_PIECE_ENTRIES = _perf_governor.SETTINGS_SAVE_PIECE_ENTRIES if _perf_governor is not None else 500
@@ -10249,6 +10218,8 @@ class RetroDatabase:
         """Fill in defaults/migrations on top of a raw 'config' dict loaded from disk."""
         config = dict(raw_config)
         config["is_muted"] = False
+        if _perf_governor is not None and isinstance(config.get("theme_ui_hue"), (int, float)):
+            config["theme_ui_hue"] = _perf_governor.theme_ui_hue_clear(config["theme_ui_hue"])
         if "screen_mode" not in config:
             config["screen_mode"] = "normal"
         if "dvd_screen_mode" not in config:
@@ -10635,6 +10606,28 @@ class RetroDatabase:
     # SECTION: Settings load & save
     # ========================================================================
 
+    def _log_settings_loaded(self, raw_config):
+        """Writes one [SETTINGS LOAD] line: the file read, its size, and the values of the main look and picture settings as the file held them (MISSING when the file had none), so a setting that comes up at its default can be told from one that was never saved."""
+        try:
+            keys = ("screen_mode", "current_theme", "theme_ui_hue", "theme_bg_hue", "menu_opacity", "brightness", "contrast", "color", "sharpness", "tint", "vlc_decode_res", "bezel_style")
+            shown = ", ".join("%s=%s" % (k, raw_config.get(k, "MISSING")) for k in keys)
+            log.info("[SETTINGS LOAD] %s, %d bytes, %d setting(s): %s", self.config_path, os.path.getsize(self.config_path), len(raw_config), shown)
+        except Exception as note_err:
+            log.warning("[SETTINGS LOAD] could not describe the settings file: %s", note_err)
+
+    def _back_up_loaded_settings(self):
+        """Copies the settings file that just loaded to logs/config_backups/retro_config_<time>.json and keeps the newest CONFIG_BACKUPS_KEPT copies, so a settings file that is lost or overwritten can be put back by copying one."""
+        try:
+            folder = os.path.join(self.logs_dir, "config_backups")
+            os.makedirs(folder, exist_ok=True)
+            target = os.path.join(folder, "retro_config_%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+            shutil.copy2(self.config_path, target)
+            old = sorted(n for n in os.listdir(folder) if n.startswith("retro_config_") and n.endswith(".json"))
+            for name in old[:-CONFIG_BACKUPS_KEPT]:
+                os.remove(os.path.join(folder, name))
+        except Exception as backup_err:
+            log.warning("[SETTINGS LOAD] could not back up the settings file: %s", backup_err)
+
     def load_settings_async(self):
         if os.path.exists(self.config_path):
             try:
@@ -10642,6 +10635,8 @@ class RetroDatabase:
                     data = json.load(f)
                 self.config = self._apply_config_defaults(data.get("config", {}))
                 raw_channels = data.get("channels", {})
+                self._log_settings_loaded(data.get("config", {}))
+                self._back_up_loaded_settings()
 
                 self._main_channels_cache = raw_channels
 
@@ -10791,16 +10786,6 @@ class RetroDatabase:
                     snapshot_err,
                 )
                 return None
-
-    def _snapshot_settings(self):
-        """Return a stable copy of both mutable settings trees."""
-        config_snapshot = self._snapshot_config()
-        if config_snapshot is None:
-            return None
-        channels_snapshot = self._snapshot_channels()
-        if channels_snapshot is None:
-            return None
-        return {"config": config_snapshot, "channels": channels_snapshot}
 
     def _snapshot_playback_anchors(self):
         """Return a stable copy of just the per-channel playback_anchor data."""

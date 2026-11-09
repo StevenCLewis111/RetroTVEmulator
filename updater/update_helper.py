@@ -15,7 +15,6 @@ import argparse
 import json
 import logging
 import logging.handlers
-import math
 import os
 import re
 import shutil
@@ -126,7 +125,6 @@ def _pid_alive(pid):
 # ============================================================================
 
 
-PROTECTED_TOP_LEVEL_DIRS = {"main"}
 # NOTE: PyInstaller 6 onedir builds bundle add-data under _internal, and the app
 # resolves its 'main' folder there first, so that copy holds user data too.
 PROTECTED_RELATIVE_DIRS = ("main", "_internal/main")
@@ -511,7 +509,6 @@ def _restore_stamp(install_dir, previous):
 # The bar the owner sees between the app closing and the app coming back: a small dark box like the update bar inside the app, so the minute or so of installing and restarting never looks like nothing is happening.
 
 PROGRESS_WINDOW_TITLE = "Retro TV Emulator Update"
-APP_WINDOW_TITLE = "Retro TV Emulator"
 PROGRESS_WINDOW_SIZE = (440, 150)
 PROGRESS_PANEL_RGB = (20, 28, 46)
 PROGRESS_TRACK_RGB = (10, 15, 30)
@@ -529,36 +526,15 @@ PROGRESS_CAPTION = "The app closes, installs and reopens by itself. This takes a
 PROGRESS_REFRESH_MS = 50
 PROGRESS_WAIT_BAR = 0.05
 PROGRESS_PREPARE_BAR = (0.08, 0.30)
-PROGRESS_COPY_BAR = (0.30, 0.60)
-PROGRESS_START_BAR = 0.65
-PROGRESS_HOLD_BAR = 0.99
-PROGRESS_START_EASE_SECONDS = 30.0
-APP_WINDOW_MAX_WAIT_SECONDS = 150
+PROGRESS_COPY_BAR = (0.30, 0.95)
 PROGRESS_DONE_HOLD_SECONDS = 0.7
 PROGRESS_ERROR_SHOW_SECONDS = 4.0
-
-
-def _app_window_is_up():
-    """True once the app's own window is on screen (a visible top-level window titled like the app)."""
-    try:
-        import ctypes
-        user32 = ctypes.windll.user32
-        handle = user32.FindWindowW(None, APP_WINDOW_TITLE)
-        return bool(handle) and bool(user32.IsWindowVisible(handle))
-    except Exception:
-        return False
 
 
 class _NullProgress:
     """Stands in for the progress window when there is none (not the packaged exe, or no screen): every call does nothing."""
 
     def update(self, label, fraction):
-        pass
-
-    def start_stage(self):
-        pass
-
-    def creep(self, label):
         pass
 
     def finish(self):
@@ -594,8 +570,6 @@ def _theme_progress_colors(install_dir):
 class _ProgressWindow(_NullProgress):
     """A borderless always-on-top box with a title and a fill bar, drawn by tkinter in its own thread; the helper just sets its label and fraction."""
 
-    waits_for_app = True
-
     def __init__(self, install_dir=None):
         import threading
         self._accent_rgb, self._panel_rgb, self._track_rgb = (
@@ -605,7 +579,6 @@ class _ProgressWindow(_NullProgress):
         self._fraction = 0.0
         self._failed = False
         self._closing = False
-        self._started_at = None
         self._ready = threading.Event()
         self._ok = False
         self._thread = threading.Thread(target=self._run, name="UpdateProgressWindow", daemon=True)
@@ -664,17 +637,6 @@ class _ProgressWindow(_NullProgress):
             self._label = label
             self._fraction = max(self._fraction if not self._failed else 0.0, fraction)
 
-    def start_stage(self):
-        self._started_at = time.monotonic()
-
-    def creep(self, label):
-        """Moves the bar on its own from where the install left it toward just short of full, the longer the app takes to start."""
-        if self._started_at is None:
-            self._started_at = time.monotonic()
-        elapsed = time.monotonic() - self._started_at
-        left = PROGRESS_HOLD_BAR - PROGRESS_START_BAR
-        self.update(label, PROGRESS_START_BAR + left * (1.0 - math.exp(-elapsed / PROGRESS_START_EASE_SECONDS)))
-
     def finish(self):
         self.update("READY", 1.0)
         time.sleep(PROGRESS_DONE_HOLD_SECONDS)
@@ -700,15 +662,10 @@ def preview_progress_bar(seconds=20.0, install_dir=None):
     if not window._ok:
         return 1
     steps = (("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR), ("PREPARING THE UPDATE...", PROGRESS_PREPARE_BAR[1]),
-             ("INSTALLING UPDATE...", PROGRESS_COPY_BAR[1]), ("STARTING THE UPDATED APP...", PROGRESS_START_BAR))
+             ("INSTALLING UPDATE...", PROGRESS_COPY_BAR[1]))
     for label, fraction in steps:
         window.update(label, fraction)
-        time.sleep(seconds / (len(steps) * 2))
-    window.start_stage()
-    end = time.monotonic() + seconds / 2
-    while time.monotonic() < end:
-        window.creep("STARTING THE UPDATED APP...")
-        time.sleep(0.1)
+        time.sleep(seconds / len(steps))
     window.finish()
     window.close()
     return 0
@@ -906,8 +863,10 @@ def apply_update(metadata_path):
             else:
                 log.info("[UPDATE DIAG] Install folder renamed: %s -> %s", install_dir, where)
                 launch_command[0] = _rebase(launch_command[0], install_dir, where)
-        progress.update("STARTING THE UPDATED APP...", PROGRESS_START_BAR)
-        progress.start_stage()
+        # WARNING: owner 2026-11-08: the bar ends when the install is done and closes before the app is launched, so it is never up beside the app's own loading screen.
+        progress.finish()
+        progress.close()
+        progress = _NullProgress()
         process = subprocess.Popen(
             launch_command,
             cwd=where,
@@ -919,24 +878,15 @@ def apply_update(metadata_path):
         )
         # NOTE: a spawn that dies immediately is usually a bad executable or
         # path. Give normal startup a little time, then restore the old files.
-        # WARNING: owner 2026-11-07: the bar finishes the moment the app's first window (its boot loading page) shows, then closes; it no longer waits out the whole health check first. The app dying early still restores the old version.
         started = time.monotonic()
-        waits = getattr(progress, "waits_for_app", False)
-        deadline = started + (APP_WINDOW_MAX_WAIT_SECONDS if waits else HEALTH_CHECK_SECONDS)
-        while time.monotonic() < deadline:
+        while time.monotonic() < started + HEALTH_CHECK_SECONDS:
             if process.poll() is not None:
-                if time.monotonic() - started < HEALTH_CHECK_SECONDS:
-                    raise RuntimeError("Updated application exited during startup")
-                break
-            progress.creep("STARTING THE UPDATED APP...")
-            if waits and _app_window_is_up():
-                break
+                raise RuntimeError("Updated application exited during startup")
             time.sleep(0.25)
         _repoint_shortcuts(old_exe_path or command[0], launch_command[0], install_dir, where)
         if old_exe_path and not _remove_with_retry(_rebase(old_exe_path, install_dir, where)):
             log.warning("[UPDATE DIAG] Could not delete the old exe %s; the new version is running",
                         old_exe_path)
-        progress.finish()
     except Exception as exc:
         progress.fail("UPDATE FAILED - RESTORING THE OLD VERSION")
         _server_breadcrumb(

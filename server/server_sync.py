@@ -58,11 +58,6 @@ def sanitize_channels(channels: Mapping, remote_id: str = "") -> dict:
     return safe
 
 
-# NOTE: server-owned playback settings that DO cross the wire, alongside the
-# schedule. Everything else in the server's config stays home.
-VALID_SCREEN_MODES = ("normal", "stretch", "crop", "panscan")
-
-
 def sanitize_playback(playback) -> dict:
     """Do not transmit video/playback settings through the schedule server."""
     return {}

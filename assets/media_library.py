@@ -2499,29 +2499,11 @@ def _forgets_show_facts(method):
     return wrapper
 
 
-def _forgets_current_show(method):
-    """Makes a hub write throw away the station's cached current-show record, so the next read looks at the rows again."""
-    import functools
-
-    @functools.wraps(method)
-    def wrapper(self, *args, **kwargs):
-        try:
-            return method(self, *args, **kwargs)
-        finally:
-            channel = args[0] if args else kwargs.get("channel")
-            if channel is None:
-                self._current_show.clear()
-            else:
-                self._current_show.pop(channel, None)
-    return wrapper
-
-
 class ScheduleHub:
     """Keeps each channel's ordered rows in the library: what is meant to play, when, for how long, and what has played."""
     # WARNING: a row that is airing, aired or static is history; no call here may change or remove it except mark() moving it forward, or aired rows and pass records are lost (R26) and a past slot moves (R18).
 
     def __init__(self, library: "MediaLibrary"):
-        self._current_show = {}
         self._show_facts = {}
         self.library = library
 
@@ -2530,7 +2512,6 @@ class ScheduleHub:
         return dict(zip(_SCHEDULE_ROW_FIELDS, row))
 
     @_forgets_show_facts
-    @_forgets_current_show
     def put_rows(self, channel, slot_key, rows):
         """Replaces the slot's planned rows with the given ones; rows already airing, aired or static stay as they are and a new row for their position is skipped. A row without a pass number gets one more than the highest pass of that file already on air in this channel, and a continuation of a split show keeps its first part's pass. Returns (written, skipped)."""
         with self.library._lock:
@@ -2645,7 +2626,6 @@ class ScheduleHub:
         return result
 
     @_forgets_show_facts
-    @_forgets_current_show
     def place_rows(self, channel, block_key, rows, airing_position=None, now_epoch=None, start_tolerance=None, mode=None):
         """Writes a block's planned rows into its newest set. When the plan holds other files, or other start times, at positions that already airing, aired or static rows hold, or when the slot mode changed, it opens a new set: the old set is put aside with its unaired rows kept, its airing row is closed at the clock moment and the stopping point is recorded, and the new set gets the rows from the airing position on, the first starting at the clock moment, all in one saved change. Returns (slot_key, written, skipped, new_generation)."""
         # WARNING: rows already airing, aired or static are history (R26) and the old set's unaired rows are kept, never deleted (owner answer to Q1); only a clear of the whole app or one channel may delete. The close, the labels and the new rows are one transaction, so a failure leaves the old set exactly as it was.
@@ -2720,7 +2700,6 @@ class ScheduleHub:
         return slot_key, written, skipped, new_generation
 
     @_forgets_show_facts
-    @_forgets_current_show
     def put_aired_rows(self, channel, slot_key, rows, mode=None):
         """Saves rows of a stretch that has already passed, such as a block the station missed while it was off, as aired rows in a set of their own, in one saved change. Returns how many rows were written."""
         # WARNING: the rows go through the same round numbering as planned rows and are marked aired in the same transaction; a slot that already holds rows keeps them (R26).
@@ -2789,7 +2768,6 @@ class ScheduleHub:
         return value if isinstance(value, dict) else None
 
     @_forgets_show_facts
-    @_forgets_current_show
     def clear_all_schedule_data(self):
         """Empties every channel's schedule: the planned, airing and aired rows, the future rows, the slot records and the play orders; returns {table: rows removed}."""
         # WARNING: only for a fresh start (no retro_config.json at boot, owner order 2026-11-02); everywhere else aired rows are history and stay (R26).
@@ -2873,21 +2851,6 @@ class ScheduleHub:
         facts["seek"] = seek
         return facts
 
-    def current_show(self, channel, epoch):
-        """The station's current-show record at one clock moment: the row airing then plus how far into it the clock is. The record is kept per station and only looked up again when the clock leaves the show or a hub write changes the rows, so a channel change is clock math on the kept record."""
-        # WARNING: this only reads; the scheduler and the scans stay the writers, and every hub write drops the kept record.
-        kept = self._current_show.get(channel)
-        if kept is not None and kept["start"] <= epoch < kept["end"]:
-            return dict(kept["row"], seek=epoch - kept["start"])
-        row = self.at(channel, epoch)
-        if row is None:
-            self._current_show.pop(channel, None)
-            return None
-        start = float(row["planned_start"])
-        end = start + float(row.get("used_length") or 0)
-        self._current_show[channel] = {"row": row, "start": start, "end": end}
-        return dict(row, seek=epoch - start)
-
     def at(self, channel, epoch):
         """The channel's row that covers one clock moment (planned start up to planned start plus length), or None; a row that has aired, is airing or went to Static is preferred over a planned one, then the latest start."""
         sql = ("SELECT channel, slot_key, position, path, kind, pass_no, planned_start, used_length, length_source, state "
@@ -2900,7 +2863,6 @@ class ScheduleHub:
             found = self.library._conn.execute(sql, (channel, float(epoch), float(epoch))).fetchone()
         return self._as_dict(found) if found else None
 
-    @_forgets_current_show
     def mark(self, channel, slot_key, position, state, used_length=None, length_source=None):
         """Moves a row forward (planned, airing, aired or static); a row never moves back. Returns whether it changed."""
         if state not in _SCHEDULE_STATE_RANK:
@@ -2919,7 +2881,6 @@ class ScheduleHub:
             return True
 
 
-    @_forgets_current_show
     def mark_airing_static(self, channel, path):
         """Marks the channel's newest airing row for this file as static, the slot that went to Static because the file would not play. Returns how many rows changed."""
         # WARNING: only the newest airing row of the file changes; an older row of the same file that was left airing by an earlier block is history and must not become Static.
@@ -2933,7 +2894,6 @@ class ScheduleHub:
                     (time.time(), channel, key, channel, key))
             return cur.rowcount
 
-    @_forgets_current_show
     def close_passed_rows(self, channel, now_epoch, current_slot, current_position):
         """Marks as aired every row of the channel that the clock has left behind in another block: a row still airing that is not the one airing now, and a planned row of an active set whose start and length ended before now_epoch. Rows of a set that was put aside and rows without a start time stay as they are. Returns (rows closed that were airing, rows closed that were planned)."""
         # WARNING: nothing is deleted and no row moves back (R26); a row of the block on air is left to the caller's own marking, and a set that was put aside keeps its unaired rows (owner answer to Q1).

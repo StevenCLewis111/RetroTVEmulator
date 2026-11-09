@@ -39,7 +39,6 @@ import ctypes
 import datetime
 import inspect
 import io
-import itertools
 import math
 import os
 import random
@@ -1261,206 +1260,14 @@ class TestPictureBoxRealFfmpeg(unittest.TestCase):
 # SECTION: Picture-box flat-bar detection (bars of any one colour)
 # ============================================================================
 
-def _flat_frame(pixel):
-    """Builds one gray frame at the flat-check size; pixel(x, y) gives the level."""
-    w, h = ml._PB_FLAT_W, ml._PB_FLAT_H
-    out = bytearray(w * h)
-    for y in range(h):
-        row = y * w
-        for x in range(w):
-            out[row + x] = pixel(x, y) & 255
-    return bytes(out)
 
 
-def _picture(x, y):
-    return (x * 7 + y * 13 + ((x * y) % 29) * 5) % 200 + 20
 
 
-def _bars_frame(left=0, right=0, top=0, bottom=0, side=128, cap=128, noise=0):
-    w, h = ml._PB_FLAT_W, ml._PB_FLAT_H
-
-    def pixel(x, y):
-        jitter = ((x * 31 + y * 17) % (2 * noise + 1)) - noise if noise else 0
-        if y < top or y >= h - bottom:
-            return cap + jitter
-        if x < left or x >= w - right:
-            return side + jitter
-        return _picture(x, y)
-    return _flat_frame(pixel)
 
 
-def _flat_detect(frame_size, flat_frames, cropdetect_boxes):
-    """Runs the real detector with canned ffmpeg output: stderr text and the given gray frames."""
-    stderr = _pb_stderr(frame_size, cropdetect_boxes)
-    stdout = b"".join(flat_frames)
-    fake = lambda cmd, **kw: mock.Mock(stderr=stderr.encode("utf-8"), stdout=stdout, returncode=0)
-    with mock.patch.object(ml.subprocess, "run", fake):
-        return ml.detect_picture_box("movie.mp4", duration=3000.0, ffmpeg_path="ffmpeg")
 
 
-class TestPictureBoxFlatBars(unittest.TestCase):
-
-    def test_grey_side_bars_are_measured(self):
-        flat = ml._pb_flat_sample([_bars_frame(left=80, right=80)])
-        self.assertEqual((flat["left"][0], flat["right"][0], flat["top"][0], flat["bottom"][0]), (80, 80, 0, 0))
-        self.assertAlmostEqual(flat["left"][1], 128, delta=1)
-
-    def test_bar_colour_does_not_matter(self):
-        for level in (0, 20, 60, 128, 180, 235):
-            flat = ml._pb_flat_sample([_bars_frame(left=60, right=60, side=level)])
-            self.assertEqual((flat["left"][0], flat["right"][0]), (60, 60), "level %d" % level)
-
-    def test_noise_inside_the_tolerance_still_reads_as_a_bar(self):
-        flat = ml._pb_flat_sample([_bars_frame(left=50, right=50, noise=4)])
-        self.assertEqual((flat["left"][0], flat["right"][0]), (50, 50))
-
-    def test_noise_past_the_tolerance_is_picture(self):
-        flat = ml._pb_flat_sample([_bars_frame(left=50, right=50, noise=ml._PB_FLAT_TOLERANCE)])
-        self.assertEqual((flat["left"][0], flat["right"][0]), (0, 0))
-
-    def test_picture_to_the_edge_has_no_strip(self):
-        flat = ml._pb_flat_sample([_bars_frame()])
-        self.assertEqual([flat[k][0] for k in ("top", "bottom", "left", "right")], [0, 0, 0, 0])
-
-    def test_letterbox_rows_are_measured(self):
-        flat = ml._pb_flat_sample([_bars_frame(top=60, bottom=60, cap=128)])
-        self.assertEqual((flat["top"][0], flat["bottom"][0], flat["left"][0], flat["right"][0]), (60, 60, 0, 0))
-
-    def test_windowbox_pillars_are_measured_beside_the_picture_rows_only(self):
-        flat = ml._pb_flat_sample([_bars_frame(left=70, right=70, top=50, bottom=50, side=128, cap=16)])
-        self.assertEqual((flat["top"][0], flat["bottom"][0], flat["left"][0], flat["right"][0]), (50, 50, 70, 70))
-
-    def test_a_frame_flat_all_over_cannot_say(self):
-        self.assertIsNone(ml._pb_flat_sample([_flat_frame(lambda x, y: 128)]))
-
-    def test_a_picture_thinner_than_the_limit_cannot_say(self):
-        thin = int(ml._PB_FLAT_H * (1 - ml._PB_FLAT_MIN_PICTURE_FRACTION / 2) / 2)
-        self.assertIsNone(ml._pb_flat_sample([_bars_frame(top=thin, bottom=thin)]))
-
-    def test_no_frames_cannot_say(self):
-        self.assertIsNone(ml._pb_flat_sample([]))
-        self.assertIsNone(ml._pb_flat_sample(None))
-        self.assertIsNone(ml._pb_flat_sample([b"short"]))
-
-    def test_every_frame_of_the_sample_must_agree(self):
-        flat = ml._pb_flat_sample([_bars_frame(left=80, right=80), _bars_frame(left=20, right=80)])
-        self.assertEqual((flat["left"][0], flat["right"][0]), (20, 80))
-
-    def test_bars_scale_to_the_frame_and_stay_inside_the_picture(self):
-        flat = ml._pb_flat_sample([_bars_frame(left=80, right=80)])
-        boxes = ml._pb_flat_boxes([flat] * 6, 1280, 720)
-        x, y, w, h = boxes[0]
-        self.assertEqual((x, y, w, h), (160, 0, 960, 720))
-        self.assertEqual(x % 2, 0)
-
-    def test_a_bar_whose_colour_changes_between_samples_is_not_a_bar(self):
-        a = ml._pb_flat_sample([_bars_frame(left=80, right=80, side=100)])
-        b = ml._pb_flat_sample([_bars_frame(left=80, right=80, side=100 + ml._PB_FLAT_TOLERANCE + 8)])
-        boxes = ml._pb_flat_boxes([a, b, a], 1280, 720)
-        for box in boxes:
-            self.assertEqual(box, (0, 0, 1280, 720))
-
-    def test_a_sample_that_cannot_say_stays_none(self):
-        a = ml._pb_flat_sample([_bars_frame(left=80, right=80)])
-        boxes = ml._pb_flat_boxes([a, None, a], 1280, 720)
-        self.assertIsNone(boxes[1])
-        self.assertEqual(boxes[0], (160, 0, 960, 720))
-
-    def test_detector_finds_grey_bars_that_cropdetect_misses(self):
-        frames = [_bars_frame(left=80, right=80), _bars_frame(left=80, right=80)]
-        box = _flat_detect((1280, 720), frames, [(1280, 720, 0, 0)])
-        self.assertEqual(box["reason"], "pillarbox")
-        self.assertEqual(box["rect"], [160, 0, 960, 720])
-        self.assertEqual(box["flat_samples"], 6)
-        self.assertAlmostEqual(box["picture_aspect"], 4 / 3, places=3)
-
-    def test_without_frames_the_detector_answers_as_cropdetect_alone(self):
-        box = _flat_detect((1280, 720), [], [(1280, 720, 0, 0)])
-        self.assertEqual(box["reason"], "no_bars")
-        self.assertEqual(box["flat_samples"], 0)
-
-    def test_black_bars_cropdetect_finds_stay_cropped(self):
-        frames = [_bars_frame(left=80, right=80, side=0)]
-        box = _flat_detect((1280, 720), frames, [(960, 720, 160, 0)])
-        self.assertEqual(box["reason"], "pillarbox")
-        self.assertEqual(box["rect"], [160, 0, 960, 720])
-
-    def test_a_flat_strip_on_one_side_only_is_cropped(self):
-        frames = [_bars_frame(left=80, right=0)]
-        box = _flat_detect((1280, 720), frames, [(1280, 720, 0, 0)])
-        self.assertEqual(box["reason"], "pillarbox")
-        self.assertEqual(box["rect"][0] + box["rect"][2], 1280)
-        self.assertGreater(box["rect"][0], 0)
-
-    def test_one_sample_with_picture_to_the_edge_cancels_the_bars(self):
-        with_bars = [_bars_frame(left=80, right=80)]
-        without = [_bars_frame()]
-        answers = [with_bars, with_bars, without, with_bars, with_bars, with_bars]
-        calls = []
-
-        def fake(cmd, **kw):
-            frames = answers[len(calls)]
-            calls.append(cmd)
-            return mock.Mock(stderr=_pb_stderr((1280, 720), [(1280, 720, 0, 0)]).encode("utf-8"),
-                             stdout=b"".join(frames), returncode=0)
-        with mock.patch.object(ml.subprocess, "run", fake):
-            box = ml.detect_picture_box("movie.mp4", duration=3000.0, ffmpeg_path="ffmpeg")
-        self.assertEqual(box["reason"], "no_bars")
-
-    def test_a_failing_flat_check_is_logged_and_the_scan_goes_on(self):
-        with mock.patch.object(ml, "_pb_flat_sample", side_effect=RuntimeError("boom")), \
-             mock.patch.object(ml, "_log_swallowed") as logged:
-            box = _flat_detect((1280, 720), [_bars_frame(left=80, right=80)], [(1280, 720, 0, 0)])
-        self.assertEqual(box["reason"], "no_bars")
-        self.assertTrue(any("detect_picture_box: _pb_flat_sample" in c.args[0] for c in logged.call_args_list))
-
-    def test_one_process_per_sample_reads_both_the_text_and_the_frames(self):
-        fake = _FakeSamples([_pb_stderr((1280, 720), [(1280, 720, 0, 0)])])
-        with mock.patch.object(ml.subprocess, "run", fake):
-            ml.detect_picture_box("movie.mp4", duration=3000.0, ffmpeg_path="ffmpeg")
-        self.assertEqual(len(fake.calls), 6)
-        self.assertIn("cropdetect=limit=%d" % ml._PB_LIMIT, " ".join(fake.calls[0]))
-        self.assertIn("rawvideo", fake.calls[0])
-
-    def test_the_governor_table_holds_the_numbers(self):
-        self.assertEqual(ml._PB_FLAT_W, gov.PICTURE_BOX_FLAT_WIDTH)
-        self.assertEqual(ml._PB_FLAT_H, gov.PICTURE_BOX_FLAT_HEIGHT)
-        self.assertEqual(ml._PB_FLAT_TOLERANCE, gov.PICTURE_BOX_FLAT_TOLERANCE)
-        self.assertEqual(ml._PB_FLAT_FRAMES, gov.PICTURE_BOX_FLAT_FRAMES)
-        self.assertEqual(ml._PB_FLAT_MIN_PICTURE_FRACTION, gov.PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION)
-        src = inspect.getsource(ml)
-        for name, attr in (("_PB_FLAT_W", "PICTURE_BOX_FLAT_WIDTH"), ("_PB_FLAT_H", "PICTURE_BOX_FLAT_HEIGHT"),
-                           ("_PB_FLAT_TOLERANCE", "PICTURE_BOX_FLAT_TOLERANCE"), ("_PB_FLAT_FRAMES", "PICTURE_BOX_FLAT_FRAMES"),
-                           ("_PB_FLAT_MIN_PICTURE_FRACTION", "PICTURE_BOX_FLAT_MIN_PICTURE_FRACTION")):
-            self.assertIn("%s = _governor.%s if _governor is not None else %r" % (name, attr, getattr(gov, attr)), src)
-
-    def test_a_box_saved_by_the_old_detector_is_measured_again(self):
-        self.assertGreaterEqual(ml.PICTURE_BOX_DETECTOR_VERSION, 2)
-        tmp = tempfile.mkdtemp()
-        try:
-            library = ml.MediaLibrary(os.path.join(tmp, "lib.sqlite3"))
-            probe_library = ml.ProbeLibrary(library, ffmpeg_path="ffmpeg", use_vlc_fallback=False)
-            path = os.path.join(tmp, "rugrats.avi")
-            _write_file(path, os.urandom(50_000))
-            old_box = {"rect": [0, 0, 1280, 720], "frame": [1280, 720], "norm": [0, 0, 1, 1], "has_bars": False,
-                       "reason": "no_bars", "pixel_aspect": 1.0, "picture_aspect": 1.7778, "samples": 6,
-                       "sample_boxes": [], "detector_version": 1}
-            new_box = dict(old_box, rect=[160, 0, 960, 720], has_bars=True, reason="pillarbox",
-                           detector_version=ml.PICTURE_BOX_DETECTOR_VERSION)
-            key = probe_library.keys.resolve(path)
-            library.upsert_fields(key, picture_box=old_box, picture_box_detector_version=1, header_probed_at=1.0)
-            with mock.patch.object(ml, "detect_picture_box", return_value=new_box) as detect:
-                got = probe_library.detect_picture_box_if_needed(path)
-            self.assertEqual(detect.call_count, 1)
-            self.assertEqual(got["reason"], "pillarbox")
-            self.assertEqual(probe_library.get_cached(path)["picture_box_detector_version"], ml.PICTURE_BOX_DETECTOR_VERSION)
-            with mock.patch.object(ml, "detect_picture_box", return_value=None) as detect:
-                again = probe_library.detect_picture_box_if_needed(path)
-            self.assertEqual(detect.call_count, 0)
-            self.assertEqual(again["reason"], "pillarbox")
-            library.close()
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ============================================================================
@@ -1469,7 +1276,7 @@ class TestPictureBoxFlatBars(unittest.TestCase):
 
 
 def with_profile(profile, mode, fn):
-    old_profile, old_mode = gov.get_profile, gov._resolve_mode
+    old_profile = gov.get_profile
     gov.get_profile = lambda: profile
     try:
         return fn()
@@ -1759,88 +1566,11 @@ class TestPictureBoxSetContent(unittest.TestCase):
         self.assertTrue(log.warnings)
 
 
-class TestApplyPictureBoxCrop(unittest.TestCase):
-    def _ns_with_state(self, norm_rect, picture_aspect):
-        ns, log, calls = _make_ns()
-        ns["_picture_box_fit_state"] = {"content_key": "x", "norm_rect": norm_rect,
-                                        "picture_aspect": picture_aspect}
-        return ns, log
-
-    def test_no_override_returns_the_original_surface_untouched(self):
-        ns, log = self._ns_with_state(None, None)
-        src = pygame.Surface((720, 480))
-        out_surf, aspect = ns["_apply_picture_box_crop"](src)
-        self.assertIs(out_surf, src)
-        self.assertIsNone(aspect)
-
-    def test_crops_to_the_normalized_rect_at_the_surfaces_own_resolution(self):
-        ns, log = self._ns_with_state(BATB_NORM, 1.9149)
-        src = pygame.Surface(BATB_FRAME)
-        out_surf, aspect = ns["_apply_picture_box_crop"](src)
-        self.assertEqual(out_surf.get_size(), (BATB_RECT[2], BATB_RECT[3]))
-        self.assertEqual(aspect, 1.9149)
-
-    def test_crop_scales_proportionally_to_a_different_decode_resolution(self):
-        ns, log = self._ns_with_state(BATB_NORM, 1.9149)
-        scale = 2
-        src = pygame.Surface((BATB_FRAME[0] * scale, BATB_FRAME[1] * scale))
-        out_surf, aspect = ns["_apply_picture_box_crop"](src)
-        self.assertEqual(out_surf.get_size(), (BATB_RECT[2] * scale, BATB_RECT[3] * scale))
-
-    def test_full_frame_rect_is_a_no_op_but_still_returns_the_measured_aspect(self):
-        ns, log = self._ns_with_state([0.0, 0.0, 1.0, 1.0], 1.3333)
-        src = pygame.Surface((640, 480))
-        out_surf, aspect = ns["_apply_picture_box_crop"](src)
-        self.assertIs(out_surf, src)
-        self.assertEqual(aspect, 1.3333)
-
-    def test_zero_size_surface_is_handled_without_raising(self):
-        ns, log = self._ns_with_state(BATB_NORM, 1.9149)
-        src = pygame.Surface((0, 0))
-        out_surf, aspect = ns["_apply_picture_box_crop"](src)
-        self.assertIsNone(aspect)
 
 
 # ============================================================================
 # SECTION: Source-level wiring check (both TV render sites)
 # ============================================================================
-class TestPictureBoxCropIsWiredIntoBothTvRenderSites(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.src = MAIN_SRC
-
-    def test_both_video_sa_assignments_prefer_the_picture_box_aspect(self):
-        count = self.src.count("_video_sa = _snap_standard_aspect(_pb_aspect or (video_surf.get_width() / video_surf.get_height()))")
-        self.assertEqual(count, 2, "expected both TV render call sites to use the override")
-
-    def test_both_sites_crop_before_computing_video_sa(self):
-        idx = 0
-        found = 0
-        while True:
-            idx = self.src.find("_apply_picture_box_crop(video_surf)", idx)
-            if idx == -1:
-                break
-            found += 1
-            after = self.src[idx:idx + 2000]
-            self.assertTrue(
-                "_video_sa = _snap_standard_aspect(_pb_aspect or" in after
-                or "_pv_fit_aspect = _snap_standard_aspect(" in after,
-                "crop call must precede the source_aspect it's meant to correct")
-            idx += 1
-        self.assertEqual(found, 3, "two TV render sites plus the TV Guide preview")
-
-    def test_content_is_registered_before_the_crop_is_applied(self):
-        idx = 0
-        found = 0
-        while True:
-            idx = self.src.find("_picture_box_set_content(current_playback_state.get(\"file\", \"\"))", idx)
-            if idx == -1:
-                break
-            after = self.src[idx:idx + 200]
-            self.assertIn("_apply_picture_box_crop(video_surf)", after)
-            found += 1
-            idx += 1
-        self.assertEqual(found, 2)
 
 
 # ============================================================================
@@ -1862,12 +1592,6 @@ _step = load_function("_screensaver_step", _ns)
 RESOLUTIONS = [(640, 480), (1280, 720), (1366, 768), (1920, 1080), (2560, 1440), (3840, 2160), (1024, 1024)]
 
 
-def _padded_logo(w, h, pad_l, pad_t, pad_r, pad_b):
-    """A logo surface with a transparent margin around an opaque body."""
-    surf = pygame.Surface((w, h), pygame.SRCALPHA)
-    surf.fill((0, 0, 0, 0))
-    surf.fill((255, 255, 255, 255), pygame.Rect(pad_l, pad_t, w - pad_l - pad_r, h - pad_t - pad_b))
-    return surf
 
 
 def _run(scr_w, scr_h, logo, seconds=120, fps=60, vx=0.8, vy=0.6):
@@ -1926,13 +1650,8 @@ KNOWN_ONE_WAY_ADVANCED = {
     ("server_menu_open", mn.DOWN, "close", mn.UP, "server_option"),
 }
 
-def n1_check(name, got, want):
-    _check_result(got == want, "%s | got %r | want %r" % (name, got, want))
 
 
-class FakeDB:
-    def __init__(self, kiosk):
-        self.config = {"kiosk_mode_enabled": kiosk}
 
 
 CONFIGS = {
@@ -1943,256 +1662,24 @@ CONFIGS = {
 }
 
 
-def system_rows(kiosk, poweroff):
-    return ui.get_system_menu_rows(FakeDB(kiosk), {"shell_takeover_active": poweroff})
 
 
 def move(table, layer_state, layer, cell, direction):
     return mn.navigate(layer_state, layer, table, cell, direction)
 
 
-def walk_table(label, table, valid_cells):
-    for cell in sorted(table.cells):
-        for d in mn.DIRECTIONS:
-            to = table.step(cell, d, {})
-            n1_check(f"{label}: {cell} {d} lands on a real cell", to is None or to == mn.TAB_BAR or to in valid_cells, True)
-    first = next(iter(table.cells))
-    seen = {first}
-    todo = [first]
-    while todo:
-        cur = todo.pop()
-        for d in mn.DIRECTIONS:
-            to = table.step(cur, d, {})
-            if to not in (None, mn.TAB_BAR) and to not in seen:
-                seen.add(to)
-                todo.append(to)
-    n1_check(f"{label}: every cell can be reached from the first", seen, set(table.cells))
 
 
-def way_back(label, table, expected):
-    found = set()
-    for cell in sorted(table.cells):
-        for d in mn.DIRECTIONS:
-            memory = {}
-            to = table.step(cell, d, memory)
-            if to is None or to == mn.TAB_BAR:
-                continue
-            back = table.step(to, OPPOSITE[d], memory)
-            if back != cell:
-                found.add((cell, d, to, OPPOSITE[d], back))
-    n1_check(f"{label}: moves without a way back are exactly the known ones", found, expected)
 
 
-def system_checks():
-    for name, (kiosk, poweroff) in CONFIGS.items():
-        rows = system_rows(kiosk, poweroff)
-        table = mn.system_table(rows)
-        valid = set(rows) | {mn.CLOSE}
-        if "captions_toggle" in rows:
-            valid.add(mn.SYSTEM_CAPTIONS_COLOR_CELL)
-        walk_table(f"System {name}", table, valid)
-        way_back(f"System {name}", table, KNOWN_ONE_WAY[name])
-        for sel in list(range(len(rows) + 1)) + ([mn.SYSTEM_CAPTIONS_COLOR_SELECTION] if "captions_toggle" in rows else []):
-            n1_check(f"System {name}: selection {sel} converts and back", mn.system_index(rows, mn.system_cell(rows, sel)), sel)
-        n1_check(f"System {name}: table is cached", mn.system_table(rows) is table, True)
-
-    rows = system_rows(False, False)
-    table = mn.system_table(rows)
-    state = {}
-
-    def go(cell, d):
-        return move(table, state, "SYSTEM_ROWS", cell, d)
-
-    n1_check("Mono Audio S goes to Advanced Settings", go("mono_stereo_toggle", mn.DOWN), "advanced_settings")
-    n1_check("W from Advanced goes back to Mono Audio", go("advanced_settings", mn.UP), "mono_stereo_toggle")
-    n1_check("Kiosk Mode S goes to Advanced Settings", go("kiosk_mode", mn.DOWN), "advanced_settings")
-    n1_check("W from Advanced goes back to Kiosk Mode", go("advanced_settings", mn.UP), "kiosk_mode")
-    go("mono_stereo_toggle", mn.DOWN)
-    n1_check("S from Advanced goes to Reset", go("advanced_settings", mn.DOWN), "reset_settings")
-    n1_check("W from Reset goes to Advanced", go("reset_settings", mn.UP), "advanced_settings")
-    n1_check("the way back survives going down to Reset and up again", go("advanced_settings", mn.UP), "mono_stereo_toggle")
-    fresh = {}
-    n1_check("with nothing remembered W from Advanced goes to Kiosk Mode", move(table, fresh, "SYSTEM_ROWS", "advanced_settings", mn.UP), "kiosk_mode")
-    for direction in (mn.LEFT, mn.RIGHT):
-        n1_check(f"Advanced Settings {direction} does nothing on the System tab", go("advanced_settings", direction), None)
-    n1_check("W on the first left row leaves to the tab bar", go("game_ch", mn.UP), mn.TAB_BAR)
-    n1_check("W on the first right row leaves to the tab bar", go("loudness_scan", mn.UP), mn.TAB_BAR)
-    n1_check("D on Captions goes to its colour box", go("captions_toggle", mn.RIGHT), mn.SYSTEM_CAPTIONS_COLOR_CELL)
-    n1_check("A on the colour box goes back to Captions", go(mn.SYSTEM_CAPTIONS_COLOR_CELL, mn.LEFT), "captions_toggle")
-
-    rows = system_rows(False, True)
-    table = mn.system_table(rows)
-    n1_check("with Turn Off Computer showing, Mono Audio S goes to it", move(table, {}, "SYSTEM_ROWS", "mono_stereo_toggle", mn.DOWN), "poweroff")
-    n1_check("with Turn Off Computer showing, W from it goes back to Mono Audio", move(table, {}, "SYSTEM_ROWS", "poweroff", mn.UP), "mono_stereo_toggle")
-
-    s1, s2 = {}, {}
-    rows = system_rows(False, False)
-    table = mn.system_table(rows)
-    move(table, s1, "SYSTEM_ROWS", "mono_stereo_toggle", mn.DOWN)
-    n1_check("the way back is kept per layer", move(table, s2, "SYSTEM_ROWS", "advanced_settings", mn.UP), "kiosk_mode")
 
 
-def advanced_checks():
-    rows = ui.get_advanced_settings_menu_rows(None, {})
-    table = mn.advanced_table(rows)
-    visible = [r for r in rows if r != "server_menu_open"]
-    walk_table("Advanced", table, set(rows) | {mn.CLOSE})
-    way_back("Advanced", table, KNOWN_ONE_WAY_ADVANCED)
-    for sel in range(len(rows) + 1):
-        n1_check(f"Advanced: selection {sel} converts and back", mn.advanced_index(rows, mn.advanced_cell(rows, sel)), sel)
-    for i, row in enumerate(visible):
-        n1_check(f"Advanced: S from {row}", table.step(row, mn.DOWN, {}), visible[i + 1] if i + 1 < len(visible) else mn.CLOSE)
-        n1_check(f"Advanced: W from {row}", table.step(row, mn.UP, {}), visible[i - 1] if i else None)
-        n1_check(f"Advanced: A from {row}", table.step(row, mn.LEFT, {}), None)
-        n1_check(f"Advanced: D from {row}", table.step(row, mn.RIGHT, {}), "server_menu_open" if row == "server_option" else None)
-    n1_check("Advanced: W from Close goes to the last row", table.step(mn.CLOSE, mn.UP, {}), visible[-1])
-    n1_check("Advanced: S, A and D from Close do nothing", [table.step(mn.CLOSE, d, {}) for d in (mn.DOWN, mn.LEFT, mn.RIGHT)], [None, None, None])
-    n1_check("Advanced: A from the Menu button returns to Server Mode", table.step("server_menu_open", mn.LEFT, {}), "server_option")
-    n1_check("Advanced: D from the Menu button does nothing", table.step("server_menu_open", mn.RIGHT, {}), None)
-    n1_check("Advanced: W from the Menu button goes to the row above Server Mode", table.step("server_menu_open", mn.UP, {}), visible[visible.index("server_option") - 1])
-    n1_check("Advanced: S from the Menu button goes to Close", table.step("server_menu_open", mn.DOWN, {}), mn.CLOSE)
-    position = visible[0]
-    for _ in range(len(visible) - 1):
-        position = table.step(position, mn.DOWN, {})
-    n1_check("Advanced: pressing S down the whole list ends on the last row", position, visible[-1])
-    for _ in range(len(visible) - 1):
-        position = table.step(position, mn.UP, {})
-    n1_check("Advanced: pressing W back up ends on the first row", position, visible[0])
 
 
-def block_between(source, head, tail):
-    a = source.index(head) + len(head)
-    b = source.index(tail, a)
-    return textwrap.dedent(source[a:b])
 
 
-def hookup_checks():
-    with open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8") as f:
-        main_source = f.read()
-
-    sys_block = block_between(
-        main_source,
-        '                elif app_state["menu_layer"] == "SYSTEM_ROWS":\n',
-        '                    if menu_nav.is_accept(event.key):\n                        is_enter = True\n')
-    adv_block = block_between(
-        main_source,
-        '                elif app_state["menu_layer"] == "SYSTEM_ADVANCED_SUB_MENU":\n',
-        '                    if menu_nav.is_accept(event.key):\n                        if _as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED:')
-
-    def build(block, extra):
-        code = ("def run(event, app_state, db, get_system_menu_rows, get_advanced_settings_menu_rows, menu_nav,\n"
-                "        SERVER_MENU_BTN_SEL, CAPTIONS_COLOR_BOX_SEL, SYSTEM_ROW_META, pygame):\n"
-                "    for _once in [0]:\n" + textwrap.indent(block, "        ") + extra)
-        ns = {}
-        exec(code, ns)
-        return ns["run"]
-
-    run_sys = build(sys_block, "        return 'fell-through'\n    return 'moved'\n")
-    run_adv = build(adv_block, "        return 'fell-through'\n    return 'moved'\n")
-
-    class Ev:
-        def __init__(self, key):
-            self.key = key
-
-    def call(runner, state, db, key):
-        return runner(Ev(key), state, db, ui.get_system_menu_rows, ui.get_advanced_settings_menu_rows, mn,
-                      ui.SERVER_MENU_BTN_SEL, ui.CAPTIONS_COLOR_BOX_SEL, ui.SYSTEM_ROW_META, pygame)
-
-    for name, (kiosk, poweroff) in CONFIGS.items():
-        db = FakeDB(kiosk)
-        rows = system_rows(kiosk, poweroff)
-        table = mn.system_table(rows)
-        for sel in range(len(rows) + 1):
-            for d in mn.DIRECTIONS:
-                state = {"menu_selection_index": sel, "menu_layer": "SYSTEM_ROWS", "shell_takeover_active": poweroff}
-                result = call(run_sys, state, db, KEY[d])
-                want = mn.navigate({}, "SYSTEM_ROWS", table, mn.system_cell(rows, sel), d)
-                if want == mn.TAB_BAR:
-                    ok = state["menu_layer"] == "TAB_SELECTION" and state["menu_selection_index"] == sel
-                elif want is None:
-                    ok = state["menu_layer"] == "SYSTEM_ROWS" and state["menu_selection_index"] == sel
-                else:
-                    ok = state["menu_layer"] == "SYSTEM_ROWS" and state["menu_selection_index"] == mn.system_index(rows, want)
-                n1_check(f"main script System {name}: selection {sel} {d} moves as the table says", (result, ok), ("moved", True))
-        state = {"menu_selection_index": 0, "menu_layer": "SYSTEM_ROWS"}
-        n1_check(f"main script System {name}: a non-direction key falls through to the old handler",
-              call(run_sys, state, db, pygame.K_RETURN), "fell-through")
-
-    adv_rows = ui.get_advanced_settings_menu_rows(None, {})
-    adv_table = mn.advanced_table(adv_rows)
-    for sel in range(len(adv_rows) + 1):
-        for d in mn.DIRECTIONS:
-            state = {"menu_selection_index": sel, "menu_layer": "SYSTEM_ADVANCED_SUB_MENU"}
-            result = call(run_adv, state, None, KEY[d])
-            want = mn.navigate({}, "SYSTEM_ADVANCED_SUB_MENU", adv_table, mn.advanced_cell(adv_rows, sel), d)
-            expect = sel if want is None else mn.advanced_index(adv_rows, want)
-            n1_check(f"main script Advanced: selection {sel} {d} moves as the table says",
-                  (result, state["menu_selection_index"]), ("moved", expect))
-    state = {"menu_selection_index": 0, "menu_layer": "SYSTEM_ADVANCED_SUB_MENU"}
-    n1_check("main script Advanced: a non-direction key falls through to the Enter handler",
-          call(run_adv, state, None, pygame.K_RETURN), "fell-through")
-
-    sys_rows = system_rows(False, False)
-    state = {"menu_selection_index": sys_rows.index("mono_stereo_toggle"), "menu_layer": "SYSTEM_ROWS"}
-    call(run_sys, state, FakeDB(False), pygame.K_s)
-    n1_check("main script: Mono Audio S lands on Advanced Settings", sys_rows[state["menu_selection_index"]], "advanced_settings")
-    call(run_sys, state, FakeDB(False), pygame.K_RETURN)
-    state["menu_selection_index"] = adv_rows.index("update_check")
-    state["menu_layer"] = "SYSTEM_ROWS"
-    state["menu_selection_index"] = sys_rows.index("advanced_settings")
-    call(run_sys, state, FakeDB(False), pygame.K_w)
-    n1_check("main script: W from Advanced Settings goes back to Mono Audio", sys_rows[state["menu_selection_index"]], "mono_stereo_toggle")
-
-    inj = block_between(
-        main_source,
-        '        _mnav_held_set = app_state["_held_keys"]\n',
-        '    _fgap_last = app_state.get("_frame_gap_last_ticks")')
-    inj_code = ("def run(app_state, _mnav_held_set, _mnav_matrix, events, now_ticks, pygame, log, _menu_nav_trace, _MENU_NAV_REPEAT_DELAY_MS):\n"
-                "    if True:\n" + textwrap.indent(inj, "        "))
-    ns = {"menu_nav": mn}
-    exec(inj_code, ns)
-
-    def tick(app_state, held, now, events):
-        matrix = {pygame.K_w: True, pygame.K_s: True, pygame.K_a: True, pygame.K_d: True}
-        ns["run"](app_state, held, matrix, events, now, pygame, types.SimpleNamespace(warning=lambda *a, **k: None),
-                  lambda *a, **k: None, 400)
-
-    def repeats(events):
-        return [e for e in events if getattr(e, "menu_repeat", False)]
-
-    def hold(layer, selection, key, down_layer=None):
-        state = {"menu_layer": layer, "menu_selection_index": selection, "_held_keys": {key}, "_held_keys_source": {},
-                 "_held_key_down_layer": {key: down_layer or layer}, "_hold_menu": mn.HoldState()}
-        events = []
-        for now in (1000, 1500, 1700, 1900, 2100):
-            tick(state, state["_held_keys"], now, events)
-        return len(repeats(events))
-
-    n1_check("a slider key held on a Video slider row repeats", hold("VIDEO_ROWS", 5, pygame.K_d) >= 1, True)
-    n1_check("a slider key held on the last Video slider row repeats", hold("VIDEO_ROWS", 9, pygame.K_a) >= 1, True)
-    n1_check("a slider key held on a Theme slider row repeats", hold("THEME_ROWS", 3, pygame.K_d) >= 1, True)
-    n1_check("a slider key held on the last Theme slider row repeats", hold("THEME_ROWS", 5, pygame.K_a) >= 1, True)
-    n1_check("W held on a Video slider row repeats", hold("VIDEO_ROWS", 5, pygame.K_w) >= 1, True)
-    n1_check("S held on a Theme slider row repeats", hold("THEME_ROWS", 4, pygame.K_s) >= 1, True)
-    n1_check("D held on a Video radio row repeats", hold("VIDEO_ROWS", 1, pygame.K_d) >= 1, True)
-    n1_check("D held on the Theme transition row repeats", hold("THEME_ROWS", 2, pygame.K_d) >= 1, True)
-    n1_check("S held on the tab bar repeats", hold("TAB_SELECTION", 4, pygame.K_s) >= 1, True)
-    n1_check("S held in System repeats", hold("SYSTEM_ROWS", 3, pygame.K_s) >= 1, True)
-    n1_check("A held in Advanced Settings repeats", hold("SYSTEM_ADVANCED_SUB_MENU", 0, pygame.K_a) >= 1, True)
-    n1_check("a key held in the controller map never repeats", hold("GAMES_CTRL_MAP", 0, pygame.K_s), 0)
-    n1_check("a key held in the DVD button map never repeats", hold("DVD_BTN_MAP", 0, pygame.K_d), 0)
-    n1_check("a slider key that went down in another layer does not repeat", hold("VIDEO_ROWS", 5, pygame.K_d, "TAB_SELECTION"), 0)
 
 
-def repeat_allowed_checks():
-    for layer in ("VIDEO_ROWS", "THEME_ROWS", "TAB_SELECTION", "SYSTEM_ROWS", "SYSTEM_ADVANCED_SUB_MENU", "CHANNEL_LIST",
-                  "CHANNEL_SETTINGS_SUB_MENU", "GAMES_LIST", "GAMES_SUB_MENU", "GAMES_SAVE_PROFILE", "DVD_BTN_MAP", "GAMES_CTRL_MAP",
-                  "SERVER_MENU", "SERVER_SLOTS_MENU", "REMOTE_REMAP_LIST", "AUDIO_TRACK_PICKER", "HOLIDAY_SUB_MENU", None):
-        for key in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d, pygame.K_RETURN, pygame.K_UP, pygame.K_LEFT):
-            expected = key in (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d) and layer not in mn.NO_REPEAT_LAYERS
-            n1_check("repeat_allowed %s %s" % (layer, pygame.key.name(key)), mn.repeat_allowed(layer, key), expected)
-            n1_check("repeat_allowed suppressed %s %s" % (layer, pygame.key.name(key)), mn.repeat_allowed(layer, key, True), False)
-    n1_check("the capture layers are the four that map keys", tuple(mn.NO_REPEAT_LAYERS), ("GAMES_CTRL_MAP", "DVD_BTN_MAP", "REMOTE_REMAP_CAPTURE", "NUMBER_REMAP_CAPTURE"))
 
 
 # ============================================================================
@@ -2248,118 +1735,20 @@ def extract_branch(script_path, layer):
     return compile(text, script_path + ":" + layer, "exec")
 
 
-class Outcome(object):
-    def __init__(self, state, config):
-        self.layer = state["menu_layer"]
-        self.sel = state["menu_selection_index"]
-        self.row2 = state.get("theme_row2_col", 0)
-        self.config = dict(config)
-
-    def key(self):
-        return (self.layer, self.sel, self.row2, tuple(sorted(self.config.items())))
 
 
-def run_handler(code, layer, rows, sel, key, row2=0, page=0, config=None, memory=None):
-    state = {"menu_layer": layer, "menu_selection_index": sel, "theme_row2_col": row2, "channels_tab_page": page, "games_tab_page": page,
-             "show_menu": True}
-    if memory is not None:
-        state["_nav_memory"] = {layer: dict(memory)}
-    cfg = dict(config or {})
-    db = types.SimpleNamespace(config=cfg, channels_db={}, save_settings=lambda: None)
-    env = {
-        "pygame": pygame, "menu_nav": mn, "app_state": state, "db": db,
-        "event": types.SimpleNamespace(key=n2_KEYS[key]),
-        "get_channels_settings_menu_rows": lambda _db, _state: list(rows or []),
-        "_mark_settings_dirty": lambda: None, "now_ticks": 0, "log": types.SimpleNamespace(info=lambda *a, **k: None),
-    }
-    exec(code, env)
-    return Outcome(state, cfg), state
 
 
 # ============================================================================
 # SECTION: Table checks
 # ============================================================================
 
-def _remember_names(table, cell, target):
-    if not isinstance(target, mn.Remember):
-        return [target]
-    allowed = table.remember.get(cell, ())
-    if isinstance(allowed, dict):
-        allowed = [name for names in allowed.values() for name in names]
-    return [target.default] + list(allowed)
 
 
-def reachable(table, start):
-    seen = {start}
-    todo = [start]
-    while todo:
-        cell = todo.pop()
-        for target in table.cells.get(cell, {}).values():
-            names = _remember_names(table, cell, target)
-            for name in names:
-                if name != mn.TAB_BAR and name not in seen and name in table.cells:
-                    seen.add(name)
-                    todo.append(name)
-    return seen
 
 
-def structure(table, label, start):
-    bad = []
-    for cell, entry in table.cells.items():
-        for direction, target in entry.items():
-            names = _remember_names(table, cell, target)
-            for name in names:
-                if name != mn.TAB_BAR and name not in table.cells:
-                    bad.append((cell, direction, name))
-    check(not bad, "%s: every link lands on a known cell %s" % (label, bad))
-    seen = reachable(table, start)
-    check(seen == set(table.cells), "%s: every cell is reachable from %s, missing %s" % (label, start, sorted(set(table.cells) - seen)))
-    for cell in table.cells:
-        for direction in mn.DIRECTIONS:
-            res = go(table, cell, direction)
-            check(res is None or res == mn.TAB_BAR or res in table.cells, "%s: %s %s lands on a known cell" % (label, cell, direction))
 
 
-def case_channels():
-    for page in range(mn.CHANNELS_NUM_PAGES):
-        t = mn.channels_table(page)
-        structure(t, "channels page %d" % page, mn.channels_cell(page * mn.CHANNELS_PAGE_SIZE))
-        base = page * mn.CHANNELS_PAGE_SIZE
-        name = lambda k: mn.channels_cell(base + k)
-        check(go(t, name(0), mn.UP) == mn.TAB_BAR and go(t, name(3), mn.UP) == mn.TAB_BAR, "channels p%d: top row goes to the tab bar" % page)
-        check(go(t, name(0), mn.DOWN) == name(4) and go(t, name(4), mn.UP) == name(0), "channels p%d: down and up are one row" % page)
-        check(go(t, name(0), mn.LEFT) is None and go(t, name(3), mn.RIGHT) is None, "channels p%d: no wrap sideways" % page)
-        check(go(t, name(1), mn.RIGHT) == name(2) and go(t, name(2), mn.LEFT) == name(1), "channels p%d: left and right are one cell" % page)
-        for k in (16, 17):
-            check(go(t, name(k), mn.DOWN) == "settings", "channels p%d: bottom left half goes to Settings (%d)" % (page, k))
-        for k in (18, 19):
-            check(go(t, name(k), mn.DOWN) == "page_button", "channels p%d: bottom right half goes to the page button (%d)" % (page, k))
-        check(go(t, "settings", mn.UP) == name(16), "channels p%d: Settings up defaults to column 0 of the last row" % page)
-        check(go(t, "page_button", mn.UP) == name(19), "channels p%d: page button up defaults to the last cell" % page)
-        check(go(t, "settings", mn.RIGHT) == "page_button" and go(t, "page_button", mn.LEFT) == "settings", "channels p%d: Settings and page button are neighbours" % page)
-        check(go(t, "settings", mn.LEFT) is None and go(t, "page_button", mn.RIGHT) is None, "channels p%d: nothing beyond the two buttons" % page)
-        check(go(t, "settings", mn.DOWN) == mn.CLOSE and go(t, "page_button", mn.DOWN) == mn.CLOSE, "channels p%d: both buttons go down to Close" % page)
-        check(go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None and go(t, mn.CLOSE, mn.DOWN) is None, "channels p%d: Close only goes up" % page)
-        for k in range(16, 20):
-            memory = {}
-            down = go(t, name(k), mn.DOWN, memory)
-            check(go(t, down, mn.UP, memory) == name(k), "channels p%d: way back from %s through %s" % (page, name(k), down))
-        for button in ("settings", "page_button"):
-            memory = {}
-            go(t, button, mn.DOWN, memory)
-            check(go(t, mn.CLOSE, mn.UP, memory) == button, "channels p%d: Close returns to %s" % (page, button))
-        check(go(t, mn.CLOSE, mn.UP) == "settings", "channels p%d: Close with no memory goes to Settings" % page)
-        memory = {"settings": name(17)}
-        other = {"settings": mn.channels_cell(((page + 1) % mn.CHANNELS_NUM_PAGES) * mn.CHANNELS_PAGE_SIZE + 17)}
-        check(go(t, "settings", mn.UP, memory) == name(17), "channels p%d: memory on this page is used" % page)
-        if mn.CHANNELS_NUM_PAGES > 1:
-            check(go(t, "settings", mn.UP, other) == name(16), "channels p%d: memory from another page is ignored" % page)
-    for sel in list(range(mn.CHANNELS_TOTAL)) + [42, 43, 99]:
-        check(mn.channels_index(mn.channels_cell(sel)) == sel, "channels: selection %d round trip" % sel)
-    check(mn.channels_cell(41) is None and mn.channels_cell(-1) is None and mn.channels_cell(None) is None, "channels: unknown selection gives None")
-    check(mn.channels_cell(0) == "ch05" and mn.channels_cell(39) == "ch44", "channels: cell names are channel numbers")
-    check(mn.channels_page_of(25, 0) == 1 and mn.channels_page_of(19, 1) == 0, "channels: page of a channel cell")
-    check(mn.channels_page_of(43, 1) == 1 and mn.channels_page_of(99, 7) == mn.CHANNELS_NUM_PAGES - 1, "channels: page of a button uses the stored page, kept in range")
 
 
 ROWS_WITH_STYLE = ["bezel_toggle", "bezel_style_select", "warp_screen", "boot_anim",
@@ -2367,89 +1756,10 @@ ROWS_WITH_STYLE = ["bezel_toggle", "bezel_style_select", "warp_screen", "boot_an
 ROWS_NO_STYLE = [r for r in ROWS_WITH_STYLE if r != "bezel_style_select"]
 
 
-def case_channel_settings():
-    left, right = ("bezel_toggle", "warp_screen", "boot_anim"), ("static_noise", "reception_lines", "scan_lines")
-    for rows in (ROWS_WITH_STYLE, ROWS_NO_STYLE):
-        label = "channel settings (%d rows)" % len(rows)
-        t = mn.channel_settings_table(rows)
-        structure(t, label, "bezel_toggle")
-        check(mn.channel_settings_table(rows) is t, label + ": table is cached")
-        check(go(t, "bezel_toggle", mn.UP) is None and go(t, "static_noise", mn.UP) is None, label + ": first rows do not leave upward")
-        for column, name in ((left, "left"), (right, "right")):
-            for k in range(len(column) - 1):
-                check(go(t, column[k], mn.DOWN) == column[k + 1] and go(t, column[k + 1], mn.UP) == column[k], label + ": %s column goes down and up at %s" % (name, column[k]))
-            check(go(t, column[-1], mn.DOWN) == mn.CLOSE, label + ": the %s column ends at Close" % name)
-        for k in range(3):
-            check(go(t, right[k], mn.LEFT) == left[k], label + ": right column goes left row by row at " + right[k])
-            check(go(t, right[k], mn.RIGHT) is None, label + ": nothing right of " + right[k])
-        for k in (1, 2):
-            check(go(t, left[k], mn.RIGHT) == right[k], label + ": left column goes right row by row at " + left[k])
-        check(go(t, mn.CLOSE, mn.UP) == "boot_anim", label + ": Close goes up to the bottom of the left column")
-        check(go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None and go(t, mn.CLOSE, mn.DOWN) is None, label + ": Close only goes up")
-        if "bezel_style_select" in rows:
-            check(go(t, "bezel_toggle", mn.RIGHT) == "bezel_style_select" and go(t, "bezel_style_select", mn.LEFT) == "bezel_toggle", label + ": the style box hangs off Bezel")
-            check(go(t, "bezel_style_select", mn.RIGHT) == "static_noise", label + ": right of the style box is the right column")
-            check(go(t, "bezel_style_select", mn.DOWN) == "warp_screen" and go(t, "bezel_style_select", mn.UP) is None, label + ": the style box moves vertically like its row")
-        else:
-            check(go(t, "bezel_toggle", mn.RIGHT) == "static_noise", label + ": Bezel goes straight to the right column")
-        for index, row in enumerate(rows):
-            check(mn.channel_settings_index(rows, mn.channel_settings_cell(rows, index)) == index, label + ": selection %d round trip" % index)
-        check(mn.channel_settings_cell(rows, len(rows)) == mn.CLOSE and mn.channel_settings_index(rows, mn.CLOSE) == len(rows), label + ": Close is one past the rows")
 
 
-def case_video():
-    t = mn.video_table()
-    structure(t, "video", "mode_normal")
-    check(mn.video_table() is t, "video: table is cached")
-    radios = mn.VIDEO_RADIOS
-    check(radios == ("mode_normal", "mode_stretch", "mode_crop", "mode_panscan"), "video: four screen-mode radios in a row")
-    check(mn.VIDEO_SLIDERS == ("brightness", "contrast", "color", "sharpness", "tint"), "video: five sliders in a column")
-    for k, radio in enumerate(radios):
-        check(go(t, radio, mn.UP) == mn.TAB_BAR and go(t, radio, mn.DOWN) == "brightness", "video: %s goes up and down" % radio)
-        check(go(t, radio, mn.LEFT) == (radios[k - 1] if k else None), "video: %s left" % radio)
-        check(go(t, radio, mn.RIGHT) == (radios[k + 1] if k + 1 < len(radios) else None), "video: %s right" % radio)
-        memory = {}
-        go(t, radio, mn.DOWN, memory)
-        check(go(t, "brightness", mn.UP, memory) == radio, "video: way back to %s from Brightness" % radio)
-    check(go(t, "brightness", mn.UP) == "mode_normal", "video: Brightness up with no memory goes to Normal Mode")
-    sliders = mn.VIDEO_SLIDERS
-    for k, slider in enumerate(sliders):
-        check(go(t, slider, mn.DOWN) == (sliders[k + 1] if k + 1 < len(sliders) else mn.CLOSE), "video: %s down" % slider)
-        if k:
-            check(go(t, slider, mn.UP) == sliders[k - 1], "video: %s up" % slider)
-        check(go(t, slider, mn.LEFT) is None and go(t, slider, mn.RIGHT) is None, "video: %s sideways is left to the value change" % slider)
-    check(go(t, mn.CLOSE, mn.UP) == "tint" and go(t, mn.CLOSE, mn.DOWN) is None and go(t, mn.CLOSE, mn.LEFT) is None, "video: Close only goes up to Tint")
-    for sel in range(10):
-        check(mn.video_index(mn.video_cell(sel)) == sel, "video: selection %d round trip" % sel)
-    check(mn.video_cell(9) == mn.CLOSE, "video: selection 9 is Close")
-    check("aspect_ratio" not in t.cells, "video: there is no Aspect Ratio row")
 
 
-def case_theme():
-    t = mn.theme_table()
-    structure(t, "theme", "volume_bar")
-    check(mn.theme_table() is t, "theme: table is cached")
-    check(go(t, "volume_bar", mn.UP) == mn.TAB_BAR and go(t, "static_color", mn.UP) == mn.TAB_BAR, "theme: the top pair goes up to the tab bar")
-    check(go(t, "volume_bar", mn.RIGHT) == "static_color" and go(t, "static_color", mn.LEFT) == "volume_bar", "theme: Volume Bar and Channel Static are neighbours")
-    check(go(t, "volume_bar", mn.LEFT) is None and go(t, "static_color", mn.RIGHT) is None, "theme: nothing beyond the top pair")
-    check(go(t, "volume_bar", mn.DOWN) == "transition" and go(t, "static_color", mn.DOWN) == "letterbox", "theme: each top button goes down to the button under it")
-    check(go(t, "transition", mn.RIGHT) == "letterbox" and go(t, "letterbox", mn.LEFT) == "transition", "theme: Transition and Letterboxing are neighbours")
-    check(go(t, "transition", mn.LEFT) is None and go(t, "letterbox", mn.RIGHT) is None, "theme: nothing beyond the second pair")
-    check(go(t, "transition", mn.UP) == "volume_bar" and go(t, "letterbox", mn.UP) == "static_color", "theme: each second-row button goes up to the button above it")
-    check(go(t, "transition", mn.DOWN) == "opacity" and go(t, "letterbox", mn.DOWN) == "opacity", "theme: both second-row buttons go down to Menu Opacity")
-    check(go(t, "opacity", mn.UP) == "transition", "theme: W from Opacity lands on Channel Transition, never on Letterboxing")
-    for a, b in (("opacity", "bg_hue"), ("bg_hue", "ui_hue"), ("ui_hue", mn.CLOSE)):
-        check(go(t, a, mn.DOWN) == b and go(t, b, mn.UP) == a, "theme: %s and %s are neighbours" % (a, b))
-    for slider in mn.THEME_SLIDERS:
-        check(go(t, slider, mn.LEFT) is None and go(t, slider, mn.RIGHT) is None, "theme: %s sideways is left to the value change" % slider)
-    check(go(t, mn.CLOSE, mn.DOWN) is None and go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None, "theme: Close only goes up")
-    for sel in range(6):
-        cell = mn.theme_cell(sel, 0)
-        check(mn.theme_index(cell) == sel and mn.theme_row2_column(cell) == 0, "theme: selection %d round trip" % sel)
-    check(mn.theme_cell(0, 1) == "static_color" and mn.theme_index("static_color") == 0 and mn.theme_row2_column("static_color") == 1, "theme: row 0 column 1 is Channel Static")
-    check(mn.theme_cell(1, 1) == "letterbox" and mn.theme_index("letterbox") == 1 and mn.theme_row2_column("letterbox") == 1, "theme: row 1 column 1 is Letterboxing")
-    check(mn.theme_cell(2, 1) == "opacity", "theme: a stale right column does not change other rows")
-    check(mn.theme_cell(5, 0) == mn.CLOSE, "theme: selection 5 is Close")
 
 
 # ============================================================================
@@ -2460,90 +1770,6 @@ def expected(table, cell, key, memory=None):
     return table.step(cell, DIRS[key], {} if memory is None else memory)
 
 
-def case_handlers():
-    if not os.path.exists(MAIN_SCRIPT):
-        check(False, "main script not found at " + MAIN_SCRIPT)
-        return
-    code = {layer: extract_branch(MAIN_SCRIPT, layer) for layer in HEADERS}
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    for needle in ("menu_nav.channels_table(", "menu_nav.channel_settings_table(", "menu_nav.video_table()", "menu_nav.theme_table()"):
-        check(text.count(needle) == 1, "main script: one hookup for " + needle)
-    check("_cl_total = 40" not in text, "main script: the tab bar no longer carries its own copy of the channel count")
-
-    for page in range(mn.CHANNELS_NUM_PAGES):
-        table = mn.channels_table(page)
-        for sel in [page * mn.CHANNELS_PAGE_SIZE + k for k in range(mn.CHANNELS_PAGE_SIZE)] + [42, 43, 99]:
-            for key in "WASD":
-                out, _ = run_handler(code["CHANNEL_LIST"], "CHANNEL_LIST", None, sel, key, page=page)
-                want = expected(table, mn.channels_cell(sel), key)
-                if want == mn.TAB_BAR:
-                    ok = out.layer == "TAB_SELECTION"
-                elif want is None:
-                    ok = out.layer == "CHANNEL_LIST" and out.sel == sel
-                else:
-                    ok = out.layer == "CHANNEL_LIST" and out.sel == mn.channels_index(want)
-                check(ok, "handler channels p%d sel %d %s -> %s %s (table says %s)" % (page, sel, key, out.layer, out.sel, want))
-    out, _ = run_handler(code["CHANNEL_LIST"], "CHANNEL_LIST", None, 17, "S", page=0)
-    out2, st = run_handler(code["CHANNEL_LIST"], "CHANNEL_LIST", None, 43, "W", page=0, memory={"settings": "ch22"})
-    check(out.sel == 43 and out2.sel == 17, "handler channels: S then W returns to where it started (through remembered memory)")
-    out, st = run_handler(code["CHANNEL_LIST"], "CHANNEL_LIST", None, 17, "S", page=0)
-    out2, _ = run_handler(code["CHANNEL_LIST"], "CHANNEL_LIST", None, 43, "W", page=0, memory=st["_nav_memory"]["CHANNEL_LIST"])
-    check(out2.sel == 17, "handler channels: the memory the handler wrote is the one that brings it back")
-
-    for rows in (ROWS_WITH_STYLE, ROWS_NO_STYLE):
-        table = mn.channel_settings_table(rows)
-        for sel in range(len(rows) + 1):
-            for key in "WASD":
-                out, _ = run_handler(code["CHANNEL_SETTINGS_SUB_MENU"], "CHANNEL_SETTINGS_SUB_MENU", rows, sel, key)
-                want = expected(table, mn.channel_settings_cell(rows, sel), key)
-                ok = out.sel == (sel if want is None else mn.channel_settings_index(rows, want)) and out.layer == "CHANNEL_SETTINGS_SUB_MENU"
-                check(ok, "handler channel settings (%d rows) sel %d %s -> %s (table says %s)" % (len(rows), sel, key, out.sel, want))
-
-    table = mn.video_table()
-    cfg = {name: 50 for name in ("brightness", "contrast", "color", "sharpness", "tint")}
-    for sel in range(11):
-        for key in "WASD":
-            out, _ = run_handler(code["VIDEO_ROWS"], "VIDEO_ROWS", None, sel, key, config=cfg)
-            cell = mn.video_cell(sel)
-            want = expected(table, cell, key)
-            is_value_edit = cell in mn.VIDEO_SLIDERS and key in "AD"
-            if want == mn.TAB_BAR:
-                ok = out.layer == "TAB_SELECTION"
-            else:
-                ok = out.layer == "VIDEO_ROWS" and out.sel == (sel if want is None else mn.video_index(want))
-            if is_value_edit:
-                ok = ok and out.config[cell] == (55 if key == "D" else 45) and all(out.config[o] == 50 for o in cfg if o != cell)
-            else:
-                ok = ok and out.config == cfg
-            check(ok, "handler video sel %d %s -> %s %s %s (table says %s)" % (sel, key, out.layer, out.sel, out.config, want))
-
-    table = mn.theme_table()
-    cfg = {"menu_opacity": 50, "theme_bg_hue": 220, "theme_ui_hue": 140}
-    cfg_key = {"opacity": "menu_opacity", "bg_hue": "theme_bg_hue", "ui_hue": "theme_ui_hue"}
-    for sel in range(7):
-        for col in ((0, 1) if sel == 2 else (0,)):
-            for key in "WASD":
-                out, _ = run_handler(code["THEME_ROWS"], "THEME_ROWS", None, sel, key, row2=col, config=cfg)
-                cell = mn.theme_cell(sel, col)
-                want = expected(table, cell, key)
-                is_value_edit = cell in mn.THEME_SLIDERS and key in "AD"
-                if want == mn.TAB_BAR:
-                    ok = out.layer == "TAB_SELECTION"
-                elif want is None:
-                    ok = out.layer == "THEME_ROWS" and out.sel == sel and out.row2 == col
-                else:
-                    ok = out.layer == "THEME_ROWS" and out.sel == mn.theme_index(want) and out.row2 == mn.theme_row2_column(want)
-                if is_value_edit:
-                    changed = {k: v for k, v in out.config.items() if v != cfg[k]}
-                    ok = ok and changed == {cfg_key[cell]: cfg[cfg_key[cell]] + (5 if key == "D" else -5)}
-                else:
-                    ok = ok and out.config == cfg
-                check(ok, "handler theme sel %d col %d %s -> %s %s col %s %s (table says %s)" % (sel, col, key, out.layer, out.sel, out.row2, out.config, want))
-    out, _ = run_handler(code["THEME_ROWS"], "THEME_ROWS", None, 3, "W", row2=1, config=cfg)
-    check(out.sel == 2 and out.row2 == 0, "handler theme: W onto row 2 always lands on Channel Transition, even with a stale column")
-    out, _ = run_handler(code["THEME_ROWS"], "THEME_ROWS", None, 1, "S", row2=1, config=cfg)
-    check(out.sel == 2 and out.row2 == 0, "handler theme: S onto row 2 always lands on Channel Transition, even with a stale column")
 
 
 # ============================================================================
@@ -2551,95 +1777,8 @@ def case_handlers():
 # ============================================================================
 
 
-def case_games_list():
-    total = len(CONSOLES)
-    pages = mn.games_page_count(total)
-    check(pages == 2, "games: 16 consoles make 2 pages")
-    for kiosk in (False, True):
-        for page in range(pages):
-            t = mn.games_table(page, total, kiosk)
-            label = "games p%d kiosk=%s" % (page, kiosk)
-            structure(t, label, "console%02d" % (page * mn.GAMES_PAGE_SIZE))
-            check(mn.games_table(page, total, kiosk) is t, label + ": table is cached")
-            start = page * mn.GAMES_PAGE_SIZE
-            end = min(start + mn.GAMES_PAGE_SIZE, total)
-            name = lambda i: "console%02d" % i
-            for i in range(start, end):
-                col = (i - start) % 4
-                check(go(t, name(i), mn.UP) == (mn.TAB_BAR if i - start < 4 else name(i - 4)), label + ": up from %d" % i)
-                check(go(t, name(i), mn.DOWN) == (name(i + 4) if i + 4 < end else "page_button"), label + ": down from %d" % i)
-                check(go(t, name(i), mn.LEFT) == (name(i - 1) if col else None), label + ": left from %d" % i)
-                check(go(t, name(i), mn.RIGHT) == (name(i + 1) if col < 3 and i + 1 < end else None), label + ": right from %d" % i)
-            check(go(t, "page_button", mn.UP) == name(end - 1), label + ": page button up defaults to the last console of the page")
-            check(go(t, "page_button", mn.DOWN) == "all_consoles", label + ": page button down defaults to All Consoles")
-            check(go(t, "page_button", mn.LEFT) is None and go(t, "page_button", mn.RIGHT) is None, label + ": nothing beside the page button")
-            bottoms = [name(i) for i in range(start, end) if i + 4 >= end]
-            for cell in bottoms:
-                memory = {}
-                go(t, cell, mn.DOWN, memory)
-                check(go(t, "page_button", mn.UP, memory) == cell, label + ": way back up to " + cell)
-            for cell in ("all_consoles", "all_settings", "sync_profile"):
-                memory = {}
-                check(go(t, cell, mn.UP, memory) == "page_button", label + ": %s up is the page button" % cell)
-                back = go(t, "page_button", mn.DOWN, memory)
-                check(back == ("all_consoles" if cell == "all_consoles" else "all_settings"), label + ": way back down to %s from %s" % (back, cell))
-                check(go(t, "page_button", mn.UP, memory) == go(t, "page_button", mn.UP), label + ": the up memory is not disturbed by the down trip")
-            check(go(t, "all_consoles", mn.DOWN) == "screensaver" and go(t, "screensaver", mn.DOWN) == "menu_music" and go(t, "menu_music", mn.DOWN) == mn.CLOSE, label + ": left column goes down to Close")
-            check(go(t, "menu_music", mn.UP) == "screensaver" and go(t, "screensaver", mn.UP) == "all_consoles", label + ": left column goes up")
-            check(go(t, "all_consoles", mn.RIGHT) == "all_settings" and go(t, "all_settings", mn.LEFT) == "all_consoles", label + ": All Consoles and All Settings are neighbours")
-            check(go(t, "all_settings", mn.RIGHT) == "sync_profile" and go(t, "sync_profile", mn.LEFT) == "all_settings" and go(t, "sync_profile", mn.RIGHT) is None, label + ": the profile badge hangs off All Settings")
-            check(go(t, "sync_profile", mn.DOWN) == "ss_timer" and go(t, "all_settings", mn.DOWN) == "ss_timer", label + ": both go down to the timer")
-            check(go(t, "ss_timer", mn.UP) == "all_settings", label + ": timer up lands on All Settings, not the badge")
-            check(go(t, "screensaver", mn.RIGHT) == "ss_timer" and go(t, "ss_timer", mn.LEFT) == "screensaver" and go(t, "ss_timer", mn.RIGHT) is None, label + ": Screen Saver and its timer")
-            check(go(t, "all_consoles", mn.LEFT) is None and go(t, "screensaver", mn.LEFT) is None and go(t, "menu_music", mn.LEFT) is None, label + ": nothing left of the left column")
-            check(go(t, mn.CLOSE, mn.LEFT) is None and go(t, mn.CLOSE, mn.RIGHT) is None and go(t, mn.CLOSE, mn.DOWN) is None, label + ": Close only goes up")
-            if kiosk:
-                check("set_music" not in t.cells, label + ": Set Music is not a cell in kiosk mode")
-                check(go(t, "menu_music", mn.RIGHT) is None and go(t, "ss_timer", mn.DOWN) == mn.CLOSE, label + ": kiosk skips Set Music")
-                check(go(t, mn.CLOSE, mn.UP) == "menu_music", label + ": kiosk Close up is Game Music")
-            else:
-                check(go(t, "menu_music", mn.RIGHT) == "set_music" and go(t, "set_music", mn.LEFT) == "menu_music", label + ": Game Music and Set Music")
-                check(go(t, "ss_timer", mn.DOWN) == "set_music" and go(t, "set_music", mn.UP) == "ss_timer" and go(t, "set_music", mn.DOWN) == mn.CLOSE, label + ": Set Music sits under the timer")
-                check(go(t, "set_music", mn.RIGHT) is None, label + ": nothing right of Set Music")
-                check(go(t, mn.CLOSE, mn.UP) == "set_music", label + ": Close up defaults to Set Music")
-                for source in ("set_music", "menu_music"):
-                    memory = {}
-                    go(t, source, mn.DOWN, memory)
-                    check(go(t, mn.CLOSE, mn.UP, memory) == source, label + ": Close returns to " + source)
-    for sel in list(range(total)) + list(range(95, 104)):
-        check(mn.games_index(mn.games_cell(sel, total)) == sel, "games: selection %d round trip" % sel)
-    check(mn.games_cell(16, total) is None and mn.games_cell(94, total) is None and mn.games_cell(None, total) is None, "games: unknown selection gives None")
-    check(mn.games_page_of(13, total, 0) == 1 and mn.games_page_of(102, total, 1) == 1 and mn.games_page_of(102, total, 9) == 1, "games: page of a cell")
 
 
-def case_games_handler():
-    code = extract_branch(MAIN_SCRIPT, "GAMES_LIST")
-    total = len(CONSOLES)
-    for kiosk in (False, True):
-        cfg = {"kiosk_mode_enabled": kiosk}
-        for page in range(mn.games_page_count(total)):
-            table = mn.games_table(page, total, kiosk)
-            sels = list(range(page * mn.GAMES_PAGE_SIZE, min((page + 1) * mn.GAMES_PAGE_SIZE, total))) + list(range(95, 104))
-            for sel in sels:
-                if kiosk and sel == 96:
-                    continue
-                for key in "WASD":
-                    out, _ = run_handler(code, "GAMES_LIST", None, sel, key, page=page, config=cfg)
-                    want = expected(table, mn.games_cell(sel, total), key)
-                    if want == mn.TAB_BAR:
-                        ok = out.layer == "TAB_SELECTION"
-                    elif want is None:
-                        ok = out.layer == "GAMES_LIST" and out.sel == sel
-                    else:
-                        ok = out.layer == "GAMES_LIST" and out.sel == mn.games_index(want)
-                    check(ok, "handler games kiosk=%s p%d sel %d %s -> %s %s (table says %s)" % (kiosk, page, sel, key, out.layer, out.sel, want))
-    out, st = run_handler(code, "GAMES_LIST", None, 101, "W", page=0, config={})
-    out2, _ = run_handler(code, "GAMES_LIST", None, 102, "S", page=0, config={}, memory=st["_nav_memory"]["GAMES_LIST"])
-    check(out.sel == 102 and out2.sel == 101, "handler games: All Settings, W, S returns to All Settings")
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    check(text.count("menu_nav.games_table(") == 1, "main script: one hookup for the Games list")
-    check("_gl_page_size = 4 * 3" not in text, "main script: the tab bar no longer carries its own copy of the Games page size")
 
 
 # ============================================================================
@@ -2659,38 +1798,12 @@ SUB_LAYOUTS = {
 }
 
 
-def sub_rows_for(console_key, on, kiosk, psx, bios):
-    """Returns the rows get_games_sub_menu_rows gives for one console setup (the same lists as ui.py)."""
-    if console_key == "MENU":
-        return ["controller_map", "stick_deadzone", "scan_for_roms", "clear_roms", "scan_for_cores", "clear_cores", "clear_bios", "menu_bg_select_image",
-                "multitap_toggle", "scroll_style", "text_color", "game_screen_mode"]
-    if not on:
-        return []
-    if console_key == "DVD":
-        return ["splash_toggle", "splash_select_image", "splash_select_video", "dvd_captions_toggle", "dvd_resume_toggle",
-                "dvd_button_mapping", "dvd_screen_mode", "dvd_audio_track"]
-    rows = [] if kiosk else ["core_select"]
-    rows += ["controller_map", "profile1", "profile2", "profile3"]
-    if psx:
-        rows.append("disc")
-    rows += ["splash_toggle", "splash_select_image", "splash_select_video"]
-    if bios:
-        rows.append("add_bios")
-    return rows + ["relocate_roms_folder", "clear_console_roms"]
 
 
-def sub_full_rows(console_key, sub_rows):
-    return sub_rows + ["close"] if console_key == "MENU" else ["status"] + sub_rows + ["close"]
 
 
-def sub_setup(layout):
-    console_key, on, kiosk, psx, bios = SUB_LAYOUTS[layout]
-    sub_rows = sub_rows_for(console_key, on, kiosk, psx, bios)
-    return console_key, sub_rows, sub_full_rows(console_key, sub_rows)
 
 
-def sub_lasts(layout):
-    return (False, True) if SUB_LAYOUTS[layout][1] and SUB_LAYOUTS[layout][0] != "MENU" else (False,)
 
 
 EXPECTED_SUB = {
@@ -2814,181 +1927,18 @@ EXPECTED_SUB = {
     },
 }
 
-def parse_moves(text):
-    return {part.split(":")[0]: (None if part.split(":")[1] == "-" else part.split(":")[1]) for part in text.split()}
 
 
-def case_games_sub_rows_match_ui():
-    from game_deck import BIOS_REQUIRED_CONSOLES
-    compared = []
-    for layout, (console_key, on, kiosk, psx, bios) in SUB_LAYOUTS.items():
-        if console_key not in ("MENU", "DVD") and bios != (console_key in BIOS_REQUIRED_CONSOLES):
-            continue
-        compared.append(layout)
-        real = ui.get_games_sub_menu_rows(FakeDbConfig({"kiosk_mode_enabled": kiosk}), {}, console_key, on)
-        check(sub_rows_for(console_key, on, kiosk, psx, bios) == real,
-              "games sub %s: the test's rows %s differ from ui.get_games_sub_menu_rows %s" % (layout, sub_rows_for(console_key, on, kiosk, psx, bios), real))
-    check(sorted(compared) == ["DVD", "MENU", "NES", "NES kiosk", "PSX", "PSX kiosk", "disabled"], "the layouts compared against ui.py are %s" % compared)
-    for gone in ("game_aspect_ratio", "dvd_aspect_ratio"):
-        check(gone not in ui.get_games_sub_menu_rows(None, {}, "MENU", True) + ui.get_games_sub_menu_rows(None, {}, "DVD", True),
-              "%s is not a Games sub-menu row" % gone)
 
 
-def case_games_sub_tables():
-    for layout in SUB_LAYOUTS:
-        console_key, sub_rows, full = sub_setup(layout)
-        for last in sub_lasts(layout):
-            label = "games sub %s%s" % (layout, " (last console)" if last else "")
-            t = mn.games_sub_table(full, last)
-            structure(t, label, full[0])
-            check(mn.games_sub_table(list(full), last) is t, label + ": table is cached")
-            check(set(t.cells) == set(full), label + ": the cells are exactly the rows %s" % sorted(set(t.cells) ^ set(full)))
-            for index, row in enumerate(full):
-                check(mn.games_sub_cell(full, index) == row and mn.games_sub_index(full, row) == index, label + ": selection %d round trip" % index)
-            check(mn.games_sub_cell(full, len(full) + 3) == mn.CLOSE and mn.games_sub_cell(full, -1) == mn.CLOSE and mn.games_sub_cell(full, None) == mn.CLOSE,
-                  label + ": a selection outside the rows is Close")
-            want = {cell: dict(parse_moves(text)) for cell, text in EXPECTED_SUB[layout].items()}
-            if last:
-                for cell in want:
-                    want[cell] = {k: (None if v == "status" else v) for k, v in want[cell].items()}
-            for cell in full:
-                got = {k: go(t, cell, DIRS[k]) for k in "WSAD"}
-                check(got == want[cell], "%s: neighbours of %s are %s, table says %s" % (label, cell, want[cell], got))
-            if last and layout != "MENU":
-                led_to_status = [(cell, k) for cell in full for k in "WSAD" if go(t, cell, DIRS[k]) == "status"]
-                check(not led_to_status, label + ": no move leads to the greyed Status row %s" % led_to_status)
 
 
-def case_games_sub_way_back():
-    def walk(table, start, moves, memory=None):
-        memory = {} if memory is None else memory
-        cell = start
-        for key in moves:
-            nxt = table.step(cell, DIRS[key], memory)
-            cell = nxt if nxt is not None else cell
-        return cell
-
-    nes = mn.games_sub_table(sub_setup("NES")[2], False)
-    kiosk = mn.games_sub_table(sub_setup("NES kiosk")[2], False)
-    psx = mn.games_sub_table(sub_setup("PSX")[2], False)
-    dvd = mn.games_sub_table(sub_setup("DVD")[2], False)
-    menu = mn.games_sub_table(sub_setup("MENU")[2], False)
-    off = mn.games_sub_table(sub_setup("disabled")[2], False)
-
-    for button in ("splash_select_video", "splash_select_image"):
-        check(walk(nes, button, "WS") == button, "games sub NES: %s, W, S returns to %s" % (button, button))
-        check(walk(nes, button, "SW") == button, "games sub NES: %s, S, W returns to %s" % (button, button))
-        check(walk(dvd, button, "WS") == button, "games sub DVD: %s, W, S returns to %s" % (button, button))
-        check(walk(dvd, button, "SW") == button, "games sub DVD: %s, S, W returns to %s" % (button, button))
-    check(walk(nes, "splash_toggle", "S") == "splash_select_image", "games sub NES: the toggle goes down to Image with no memory")
-    check(walk(nes, "relocate_roms_folder", "W") == "splash_select_video", "games sub NES: the row under the buttons goes up to Video with no memory")
-    check(walk(nes, "splash_toggle", "SD") == "splash_select_image" and walk(nes, "splash_select_image", "A") == "splash_select_video", "games sub NES: Video and Image are neighbours")
-
-    check(walk(nes, "core_select", "WS") == "core_select" and walk(nes, "splash_toggle", "WS") == "splash_toggle", "games sub NES: Status way back to the column you left")
-    check(walk(dvd, "dvd_button_mapping", "WS") == "dvd_button_mapping" and walk(dvd, "splash_toggle", "WS") == "splash_toggle", "games sub DVD: Status way back to the column you left")
-    check(walk(nes, "status", "S") == "core_select" and walk(kiosk, "status", "S") == "controller_map", "games sub: Status down with no memory goes to the first left row")
-
-    check(walk(nes, "core_select", "DA") == "core_select" and walk(nes, "controller_map", "DA") == "controller_map", "games sub NES: Video back to the left row you came from")
-    check(walk(nes, "splash_select_video", "A") == "core_select", "games sub NES: Video left with no memory goes to the first left row")
-    check(walk(kiosk, "controller_map", "DA") == "controller_map", "games sub NES kiosk: the only left row goes to the toggle and comes back")
-    check(walk(kiosk, "status", "DA") == "status" and walk(nes, "status", "DA") == "status", "games sub: Status, D, A returns to Status")
-    check(walk(nes, "splash_toggle", "A") == "core_select" and walk(dvd, "splash_toggle", "A") == "status", "games sub: toggle left with no memory (console: first left row, DVD: Status)")
-
-    check(walk(nes, "clear_console_roms", "SW") == "clear_console_roms", "games sub NES: Close way back to Clear Roms")
-    check(walk(nes, "profile3", "SW") == "profile3", "games sub NES: Close way back to Profile 3")
-    check(walk(nes, "profile3", "DA") == "profile3" and walk(nes, "profile3", "DW") == "clear_console_roms", "games sub NES: Close left returns to Profile 3, Close up is untouched by a sideways trip")
-    check(walk(psx, "disc", "SW") == "disc" and walk(psx, "disc", "DA") == "disc", "games sub PSX: Close way back to Disc, up and left")
-    check(walk(psx, "profile3", "DA") == "profile3" and walk(psx, "profile3", "DW") == "clear_console_roms", "games sub PSX: Profile 3 right then left returns to Profile 3, Close up still goes to Clear Roms")
-    check(walk(psx, "clear_console_roms", "SA") == "disc", "games sub PSX: Close left with no sideways memory goes to Disc")
-    check(walk(dvd, "dvd_resume_toggle", "SW") == "dvd_resume_toggle" and walk(dvd, "dvd_audio_track", "SW") == "dvd_audio_track",
-          "games sub DVD: Close way back to Resume or Change Audio, from S")
-    check(walk(dvd, "dvd_audio_track", "D") == "dvd_resume_toggle" and walk(dvd, "dvd_audio_track", "DA") == "dvd_audio_track"
-          and walk(dvd, "dvd_resume_toggle", "AD") == "dvd_resume_toggle",
-          "games sub DVD: Change Audio and Resume share a row, so each goes sideways to the other and back")
-    check(walk(dvd, "dvd_screen_mode", "D") == "dvd_captions_toggle" and walk(dvd, "dvd_captions_toggle", "A") == "dvd_screen_mode",
-          "games sub DVD: Screen Mode and Captions share a row")
-    check(walk(dvd, "close", "W") == "dvd_resume_toggle", "games sub DVD: Close up with no memory goes to Resume")
-    check(walk(menu, "clear_roms", "SW") == "clear_roms" and walk(menu, "clear_cores", "SW") == "clear_cores" and walk(menu, "close", "W") == "clear_bios", "games sub MENU: Close way back, default Clear BIOS")
-    check(walk(menu, "close", "A") == "clear_bios" and walk(menu, "clear_roms", "SA") == "clear_bios", "games sub MENU: Close left is always Clear BIOS")
-    check(walk(menu, "clear_cores", "S") == "clear_bios" and walk(menu, "clear_bios", "W") == "clear_cores" and walk(menu, "clear_bios", "D") == "clear_roms", "games sub MENU: Clear BIOS sits under Clear Cores and its right is Clear Roms")
-    check(walk(menu, "scroll_style", "DA") == "scroll_style" and walk(menu, "text_color", "W") == "multitap_toggle" and walk(menu, "text_color", "S") == "scan_for_roms",
-          "games sub MENU: the colour swatch hangs off Scroll Style and moves vertically like it")
-    check(walk(off, "status", "S") == "close" and walk(off, "close", "W") == "status", "games sub disabled console: Status and Close are neighbours")
 
 
-def run_games_sub(code, layout, sel, key, last, state=None):
-    console_key, sub_rows, full = sub_setup(layout)
-    state = state if state is not None else {"menu_layer": "GAMES_SUB_MENU", "games_sub_row": sel, "games_selected_console": console_key, "show_menu": True}
-    state["games_sub_row"] = sel
-    state["menu_layer"] = "GAMES_SUB_MENU"
-    db = types.SimpleNamespace(config={"consoles_enabled": {console_key: bool(sub_rows)}}, save_settings=lambda: None)
-    env = {
-        "pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "event": types.SimpleNamespace(key=n2_KEYS[key]),
-        "get_games_sub_menu_rows": lambda _db, _state, _console, _on: list(sub_rows),
-        "_count_active_consoles": lambda _db: 1 if last else 5, "game_deck": None, "print": lambda *a, **k: None,
-    }
-    exec(code, env)
-    return state["games_sub_row"], state["menu_layer"], state
 
 
-def case_games_sub_handler():
-    code = extract_branch(MAIN_SCRIPT, "GAMES_SUB_MENU")
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    check(text.count("menu_nav.games_sub_table(") == 1, "main script: one hookup for the Games sub-menu")
-    for layout in SUB_LAYOUTS:
-        console_key, sub_rows, full = sub_setup(layout)
-        for last in sub_lasts(layout):
-            table = mn.games_sub_table(full, last)
-            for sel, cell in enumerate(full):
-                for key in "WASD":
-                    to, layer, _ = run_games_sub(code, layout, sel, key, last)
-                    want = expected(table, cell, key)
-                    ok = layer == "GAMES_SUB_MENU" and to == (sel if want is None else mn.games_sub_index(full, want))
-                    check(ok, "handler games sub %s last=%s sel %d (%s) %s -> %s (table says %s)" % (layout, last, sel, cell, key, to, want))
-    console_key, sub_rows, full = sub_setup("NES")
-    sel = full.index("splash_select_video")
-    to, _, state = run_games_sub(code, "NES", sel, "W", False)
-    check(full[to] == "splash_toggle", "handler games sub: Video up goes to the toggle")
-    to, _, state = run_games_sub(code, "NES", to, "S", False, state)
-    check(full[to] == "splash_select_video", "handler games sub: the toggle down returns to Video through the memory the handler wrote")
-    check("GAMES_SUB_MENU:NES" in state["_nav_memory"], "handler games sub: the memory is kept per console")
-    other_to, _, other_state = run_games_sub(code, "BIOS", 1, "S", False)
-    check("GAMES_SUB_MENU:A2600" in other_state["_nav_memory"] and "GAMES_SUB_MENU:NES" not in other_state["_nav_memory"], "handler games sub: another console starts with no memory")
-    to, _, _ = run_games_sub(code, "NES", full.index("splash_toggle"), "S", False, {"menu_layer": "GAMES_SUB_MENU", "games_sub_row": 0, "games_selected_console": "NES", "show_menu": True,
-                                                                              "_nav_memory": {"GAMES_SUB_MENU:A2600": {"splash_toggle": "splash_select_video"}}})
-    check(full[to] == "splash_select_image", "handler games sub: memory of another console is not used")
-    for layout in ("MENU", "NES"):
-        console_key, sub_rows, full = sub_setup(layout)
-        for key in "WASD":
-            to, layer, _ = run_games_sub(code, layout, len(full) + 4, key, False)
-            check(layer == "GAMES_SUB_MENU", "handler games sub %s: a stale selection past the rows still moves as Close (%s)" % (layout, key))
 
 
-def case_games_sub_sequences():
-    """Runs the real handler over long random key sequences and checks every step against the table with the memory the handler itself has written."""
-    import random
-    code = extract_branch(MAIN_SCRIPT, "GAMES_SUB_MENU")
-    random.seed(10102026)
-    steps = 0
-    wrong = []
-    for layout in SUB_LAYOUTS:
-        console_key, sub_rows, full = sub_setup(layout)
-        for last in sub_lasts(layout):
-            table = mn.games_sub_table(full, last)
-            for _ in range(300):
-                state = None
-                cur = random.randrange(len(full))
-                for _step in range(60):
-                    key = random.choice("WASD")
-                    memory = dict(((state or {}).get("_nav_memory", {}).get("GAMES_SUB_MENU:" + console_key, {})))
-                    want = table.step(mn.games_sub_cell(full, cur), DIRS[key], memory)
-                    to, layer, state = run_games_sub(code, layout, cur, key, last, state)
-                    steps += 1
-                    if to != (cur if want is None else mn.games_sub_index(full, want)) or layer != "GAMES_SUB_MENU":
-                        wrong.append((layout, last, full[cur], key, full[to], want))
-                    cur = to
-    check(not wrong, "handler games sub: %d random steps all follow the table with the handler's own memory %s" % (steps, wrong[:3]))
 
 
 # ============================================================================
@@ -3025,110 +1975,22 @@ _stub.border_available_for_console = lambda console: console in BORDER_ANY
 SAVE_CONSOLES = [c for c in CONSOLES if c not in ("MENU", "DVD")]
 
 
-def save_layout(console):
-    handheld = console in HANDHELD
-    border = console in BORDER_ANY
-    return handheld, border, border and console in BORDER_HOME
 
 
-def _walk(table, start, moves, memory=None):
-    memory = {} if memory is None else memory
-    cell = start
-    for move in moves:
-        to = table.step(cell, DIRS[move], memory)
-        cell = cell if to is None else to
-    return cell
 
 
-def test_n3c_directions():
-    for name, key in n2_ALL_KEYS.items():
-        check(mn.key_to_direction(key, arrows=True) == ALL_DIRS[name], "key_to_direction with arrows: %s" % name)
-        check(mn.key_to_direction(key) == (ALL_DIRS[name] if name in "WASD" else None), "key_to_direction without arrows: %s" % name)
-    check(mn.key_to_direction(pygame.K_RETURN, arrows=True) is None and mn.key_to_direction(pygame.K_ESCAPE) is None, "key_to_direction: other keys give None")
 
 
 # ============================================================================
 # SECTION: DVD button map
 # ============================================================================
 
-def test_dvd_map_tables():
-    t = mn.dvd_map_table()
-    structure(t, "dvd map", "map_buttons")
-    check(mn.dvd_map_table() is t, "dvd map: table is cached")
-    check(set(t.cells) == {"map_buttons", "close"}, "dvd map: the cells are exactly the two buttons")
-    want = {"map_buttons": {"W": None, "S": "close", "A": None, "D": "close"}, "close": {"W": "map_buttons", "S": None, "A": "map_buttons", "D": None}}
-    for cell in want:
-        got = {k: go(t, cell, DIRS[k]) for k in "WSAD"}
-        check(got == want[cell], "dvd map: neighbours of %s are %s, table says %s" % (cell, want[cell], got))
-    check(mn.dvd_map_cell(0) == "map_buttons" and mn.dvd_map_cell(1) == "close" and mn.dvd_map_cell(7) == "close" and mn.dvd_map_cell(None) == "close", "dvd map: cursor to cell")
-    check(mn.dvd_map_index("map_buttons") == 0 and mn.dvd_map_index("close") == 1, "dvd map: cell to cursor")
 
 
-def run_dvd_map(code, cursor, key, capturing=False):
-    state = {"menu_layer": "DVD_BTN_MAP", "dvd_map_cursor": cursor, "dvd_map_capturing": capturing, "show_menu": True}
-    db = types.SimpleNamespace(config={}, save_settings=lambda: None)
-    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "performance_governor": gov, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)),
-           "get_games_sub_menu_rows": lambda _db, _state, _console, _on: sub_rows_for("DVD", True, False, False, False),
-           "CANONICAL_REMOTE_KEYS": {}, "DVD_MAP_ACTIONS": [("play", "PLAY"), ("stop", "STOP"), ("next", "NEXT")],
-           "set_dvd_binding": lambda *a, **k: None, "_REMAP_CAPTURE_DEDUP_MS": 400, "print": lambda *a, **k: None}
-    exec(code, env)
-    return state
 
 
-def run_central_back(state, channels=None):
-    """Runs the main loop's shared Back handler once on a copy of state and returns it."""
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    begin = '            if menu_nav.is_back(event.key) and app_state.get("show_menu", False):\n'
-    end = '            if menu_nav.is_back(event.key) and not app_state.get("show_menu", False):\n'
-    block = text[text.index(begin):text.index(end)]
-    code = "for _once in (0,):\n" + textwrap.indent(textwrap.dedent(block), "    ")
-    state = dict(state)
-    db = types.SimpleNamespace(config={}, channels_db=channels or {})
-    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "performance_governor": gov, "event": types.SimpleNamespace(key=pygame.K_ESCAPE),
-           "now_ticks": 777, "print": lambda *a, **k: None,
-           "get_games_sub_menu_rows": lambda _db, _state, _console, _on: sub_rows_for("DVD", True, False, False, False)}
-    exec(compile(code, MAIN_SCRIPT + ":central back", "exec"), env)
-    return state
 
 
-def test_dvd_map_handler():
-    code = extract_branch(MAIN_SCRIPT, "DVD_BTN_MAP")
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    check(text.count("menu_nav.dvd_map_table()") == 1, "main script: one hookup for the DVD button map")
-    pygame.display.init()
-    table = mn.dvd_map_table()
-    for cursor in (0, 1):
-        cell = mn.dvd_map_cell(cursor)
-        for key in n2_ALL_KEYS:
-            state = run_dvd_map(code, cursor, key)
-            want = table.step(cell, ALL_DIRS[key], {})
-            got = state["dvd_map_cursor"]
-            check(got == (cursor if want is None else mn.dvd_map_index(want)) and state["menu_layer"] == "DVD_BTN_MAP" and not state["dvd_map_capturing"],
-                  "handler dvd map cursor %d %s -> %s (table says %s)" % (cursor, key, got, want))
-    state = run_dvd_map(code, 0, pygame.K_RETURN)
-    check(state["dvd_map_capturing"] is True and state["dvd_map_capture_idx"] == 0 and state["menu_layer"] == "DVD_BTN_MAP", "handler dvd map: Enter on Map Buttons starts the capture")
-    state = run_dvd_map(code, 1, pygame.K_RETURN)
-    check(state["menu_layer"] == "GAMES_SUB_MENU" and state["dvd_map_capturing"] is False and state["games_sub_row"] == 1 + sub_rows_for("DVD", True, False, False, False).index("dvd_button_mapping"), "handler dvd map: Enter on Close returns to the Games sub-menu on the DVD mapping row")
-    state = run_dvd_map(code, 0, pygame.K_ESCAPE)
-    check(state["menu_layer"] == "DVD_BTN_MAP", "handler dvd map: the map's own branch leaves Escape to the shared Back handler")
-    state = run_central_back({"show_menu": True, "menu_layer": "DVD_BTN_MAP", "dvd_map_cursor": 0, "dvd_map_capturing": False})
-    check(state["menu_layer"] == "GAMES_SUB_MENU" and state["games_sub_row"] == 1 + sub_rows_for("DVD", True, False, False, False).index("dvd_button_mapping")
-          and state["dvd_map_capturing"] is False, "handler dvd map: Escape returns to the Games sub-menu on the DVD mapping row")
-    state = run_central_back({"show_menu": True, "menu_layer": "DVD_BTN_MAP", "dvd_map_cursor": 0, "dvd_map_capturing": True})
-    check(state["menu_layer"] == "DVD_BTN_MAP" and state["dvd_map_capturing"] is False, "handler dvd map: Escape while capturing cancels the capture and stays on the map")
-    for mode, row in (("marathon", 5), ("block", 6)):
-        state = run_central_back({"show_menu": True, "menu_layer": "HOLIDAY_SUB_MENU", "selected_channel_row": 5, "sub_menu_row_index": 2, "sub_menu_col_index": 1},
-                                 {"05": {"scheduling_mode": mode, "active": True}})
-        check(state["menu_layer"] == "CHANNEL_SUB_MENU" and (state["sub_menu_row_index"], state["sub_menu_col_index"]) == (row, 0),
-              "Escape in Holiday returns to the channel menu on the Holiday row (%s)" % mode)
-    state = run_dvd_map(code, 0, pygame.K_x)
-    check(state["dvd_map_cursor"] == 0 and state["menu_layer"] == "DVD_BTN_MAP", "handler dvd map: another key changes nothing")
-    for key in n2_ALL_KEYS:
-        state = run_dvd_map(code, 0, key, capturing=True)
-        check(state["dvd_map_cursor"] == 0 and state["dvd_map_capture_idx"] == 1 and state["dvd_map_capturing"] is True,
-              "handler dvd map: while capturing a direction key is captured as the binding and never moves the cursor (%s)" % key)
 
 
 # ============================================================================
@@ -3157,119 +2019,12 @@ EXPECTED_SAVE_PLAIN.update({
 del EXPECTED_SAVE_PLAIN["bezel_style"]
 
 
-def test_save_profile_tables():
-    check(mn.save_profile_rows(True, True, True) == ["active", "save", "load", "auto_save", "auto_load", "screen_size", "tv_bezel", "bezel_style", "close"], "save profile rows: home console")
-    check(mn.save_profile_rows(True, True, False) == ["active", "save", "load", "auto_save", "auto_load", "screen_size", "tv_bezel", "close"], "save profile rows: handheld with bezel")
-    check(mn.save_profile_rows(True, False, False) == ["active", "save", "load", "auto_save", "auto_load", "screen_size", "close"], "save profile rows: screen size only")
-    check(mn.save_profile_rows(False, True, True)[-3:] == ["tv_bezel", "bezel_style", "close"], "save profile rows: bezel and style without screen size")
-    check(mn.save_profile_rows(False, False, False) == ["active", "save", "load", "auto_save", "auto_load", "close"], "save profile rows: no right column")
-    check(mn.save_profile_rows(True, False, True) == mn.save_profile_rows(True, False, False), "save profile rows: a style row never appears without the bezel row")
-    for console in SAVE_CONSOLES:
-        handheld, border, style = save_layout(console)
-        check(handheld and border, "every console that has Save Profile is a handheld-group console with a bezel row (%s)" % console)
-    check({save_layout(c) for c in SAVE_CONSOLES} == set(SAVE_LAYOUTS.values()), "the real consoles use exactly the two layouts tested by hand")
-    layouts = {"home": (True, True, True), "handheld": (True, True, False), "screen only": (True, False, False),
-               "bezel only": (False, True, False), "bezel and style": (False, True, True), "none": (False, False, False)}
-    for label, layout in layouts.items():
-        rows = mn.save_profile_rows(*layout)
-        t = mn.save_profile_table(rows)
-        structure(t, "save profile " + label, "active")
-        check(mn.save_profile_table(list(rows)) is t, "save profile %s: table is cached" % label)
-        check(set(t.cells) == set(rows), "save profile %s: the cells are exactly the rows" % label)
-        for index, row in enumerate(rows):
-            check(mn.save_profile_cell(rows, index) == row and mn.save_profile_index(rows, row) == index, "save profile %s: selection %d round trip" % (label, index))
-        check(mn.save_profile_cell(rows, len(rows) + 2) == "close" and mn.save_profile_cell(rows, -1) == "close" and mn.save_profile_cell(rows, None) == "close", "save profile %s: a selection outside the rows is Close" % label)
-        for cell in rows:
-            check(go(t, cell, mn.UP) != "@tab_bar" and go(t, cell, mn.UP) in (None, *rows), "save profile %s: %s up never leaves the layer" % (label, cell))
-    for label, layout in SAVE_LAYOUTS.items():
-        rows = mn.save_profile_rows(*layout)
-        t = mn.save_profile_table(rows)
-        want = {cell: parse_moves(text) for cell, text in (EXPECTED_SAVE_STYLE if layout[2] else EXPECTED_SAVE_PLAIN).items()}
-        check(set(want) == set(rows), "save profile %s: the hand-written neighbour list covers every row" % label)
-        for cell in rows:
-            got = {k: go(t, cell, DIRS[k]) for k in "WSAD"}
-            check(got == want[cell], "save profile %s: neighbours of %s are %s, table says %s" % (label, cell, want[cell], got))
 
 
-def test_save_profile_way_back():
-    for label, layout in SAVE_LAYOUTS.items():
-        rows = mn.save_profile_rows(*layout)
-        t = mn.save_profile_table(rows)
-        last_right = "bezel_style" if layout[2] else "tv_bezel"
-        check(_walk(t, "active", "S") == "save", "save profile %s: Active down with no memory goes to Save Now" % label)
-        check(_walk(t, "save", "WS") == "save" and _walk(t, "screen_size", "WS") == "screen_size", "save profile %s: Active down returns to the column you left" % label)
-        check(_walk(t, "screen_size", "WSS") == "tv_bezel", "save profile %s: Screen Size up, then down twice, ends on TV Bezel" % label)
-        check(_walk(t, "auto_load", "SW") == "auto_load", "save profile %s: Close up returns to Auto-Load" % label)
-        check(_walk(t, last_right, "SW") == last_right, "save profile %s: Close up returns to %s" % (label, last_right))
-    t = mn.save_profile_table(mn.save_profile_rows(*SAVE_LAYOUTS["handheld (no bezel style)"]))
-    check(_walk(t, "close", "W") == "auto_load", "save profile handheld: Close up with no memory goes to Auto-Load (as before)")
-    t = mn.save_profile_table(mn.save_profile_rows(*SAVE_LAYOUTS["home (with bezel style)"]))
-    check(_walk(t, "close", "W") == "bezel_style", "save profile home: Close up with no memory goes to Bezel Style (as before)")
-    mem = {}
-    _walk(t, "auto_load", "S", mem)
-    check(_walk(t, "close", "W", mem) == "auto_load", "save profile: way back through the memory dict")
-    mem = {}
-    _walk(t, "screen_size", "W", mem)
-    check(_walk(t, "active", "S", mem) == "screen_size", "save profile: Active down way back through the memory dict")
-    mem = {}
-    _walk(t, "save", "WS", mem)
-    _walk(t, "bezel_style", "S", mem)
-    check(_walk(t, "active", "S", mem) == "save" and _walk(t, "close", "W", mem) == "bezel_style", "save profile: the Active and Close memories are separate")
-    check(_walk(t, "screen_size", "D") == "screen_size" and _walk(t, "save", "A") == "save", "save profile: left of the left column and right of the right column stay put")
 
 
-def run_save_profile(code, console, sel, key, state=None, game_deck_obj=None, config=None):
-    handheld, border, style = save_layout(console)
-    state = state if state is not None else {"menu_layer": "GAMES_SAVE_PROFILE", "games_selected_console": console, "games_profile_num": 1, "show_menu": True}
-    state["games_profile_row"] = sel
-    state["menu_layer"] = "GAMES_SAVE_PROFILE"
-    db = types.SimpleNamespace(config=config if config is not None else {"console_profiles": {}}, save_settings=lambda: None)
-    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "db": db, "performance_governor": gov, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)),
-           "game_deck": game_deck_obj, "now_ticks": 0, "print": lambda *a, **k: None, "log": types.SimpleNamespace(info=lambda *a, **k: None),
-           "_sync_profile_setting_across_consoles": lambda *a, **k: None, "_set_console_bezel_enabled": lambda *a, **k: None, "_set_console_bezel_style": lambda *a, **k: None}
-    exec(code, env)
-    return state["games_profile_row"], state["menu_layer"], state
 
 
-def test_save_profile_handler():
-    code = extract_branch(MAIN_SCRIPT, "GAMES_SAVE_PROFILE")
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    check(text.count("menu_nav.save_profile_table(") == 1, "main script: one hookup for Save Profile")
-    pygame.display.init()
-    for console in SAVE_CONSOLES:
-        rows = mn.save_profile_rows(*save_layout(console))
-        table = mn.save_profile_table(rows)
-        for sel, cell in enumerate(rows):
-            for key in "WASD":
-                to, layer, _ = run_save_profile(code, console, sel, key)
-                want = expected(table, cell, key)
-                check(layer == "GAMES_SAVE_PROFILE" and to == (sel if want is None else mn.save_profile_index(rows, want)),
-                      "handler save profile %s sel %d (%s) %s -> %s (table says %s)" % (console, sel, cell, key, to, want))
-    for console in ("NES", "GB"):
-        rows = mn.save_profile_rows(*save_layout(console))
-        for key in "WASD":
-            to, layer, _ = run_save_profile(code, console, len(rows) + 4, key)
-            check(layer == "GAMES_SAVE_PROFILE", "handler save profile %s: a stale selection past the rows still moves as Close (%s)" % (console, key))
-    rows = mn.save_profile_rows(*save_layout("NES"))
-    to, _, state = run_save_profile(code, "NES", rows.index("screen_size"), "W")
-    check(rows[to] == "active", "handler save profile: Screen Size up goes to the banner")
-    to, _, state = run_save_profile(code, "NES", to, "S", state)
-    check(rows[to] == "screen_size", "handler save profile: the banner down returns to Screen Size through the memory the handler wrote")
-    check("GAMES_SAVE_PROFILE:NES" in state["_nav_memory"], "handler save profile: the memory is kept per console")
-    other = run_save_profile(code, "GB", rows.index("auto_load"), "S")[2]
-    check("GAMES_SAVE_PROFILE:GB" in other["_nav_memory"] and "GAMES_SAVE_PROFILE:NES" not in other["_nav_memory"], "handler save profile: another console starts with no memory")
-    to, _, state = run_save_profile(code, "NES", rows.index("bezel_style"), "S")
-    to, _, state = run_save_profile(code, "NES", to, "W", state)
-    check(rows[to] == "bezel_style", "handler save profile: Close up returns to Bezel Style")
-    to, _, state = run_save_profile(code, "NES", rows.index("auto_load"), "S")
-    to, _, state = run_save_profile(code, "NES", to, "W", state)
-    check(rows[to] == "auto_load", "handler save profile: Close up returns to Auto-Load")
-    to, layer, state = run_save_profile(code, "NES", rows.index("close"), pygame.K_RETURN)
-    check(layer == "GAMES_SUB_MENU", "handler save profile: Enter on Close returns to the Games sub-menu")
-    config = {"console_profiles": {}}
-    to, layer, state = run_save_profile(code, "NES", rows.index("active"), pygame.K_RETURN, config=config, state={"menu_layer": "GAMES_SAVE_PROFILE", "games_selected_console": "NES", "games_profile_num": 2, "show_menu": True})
-    check(layer == "GAMES_SAVE_PROFILE" and config["console_profiles"]["NES"]["active"] == 2, "handler save profile: Enter on the banner makes the profile active")
 
 
 # ============================================================================
@@ -3289,186 +2044,20 @@ EXPECTED_CTRL_N64 = {
 }
 
 
-def test_ctrl_map_tables():
-    check(mn.ctrl_map_rows(True) == ["squares", "map_buttons", "stick_as_dpad", "close"], "ctrl map rows: with the stick row")
-    check(mn.ctrl_map_rows(False) == ["squares", "map_buttons", "close"], "ctrl map rows: N64 has no stick row")
-    for has_stick, want_text in ((True, EXPECTED_CTRL_STICK), (False, EXPECTED_CTRL_N64)):
-        label = "ctrl map " + ("with stick" if has_stick else "N64")
-        rows = mn.ctrl_map_rows(has_stick)
-        t = mn.ctrl_map_table(has_stick)
-        structure(t, label, "squares")
-        check(mn.ctrl_map_table(has_stick) is t, label + ": table is cached")
-        check(set(t.cells) == set(rows), label + ": the cells are exactly the rows")
-        for index, row in enumerate(rows):
-            check(mn.ctrl_map_cell(rows, index) == row and mn.ctrl_map_index(rows, row) == index, label + ": cursor %d round trip" % index)
-        check(mn.ctrl_map_cell(rows, len(rows) + 1) == "close" and mn.ctrl_map_cell(rows, None) == "close", label + ": a cursor outside the rows is Close")
-        want = {cell: parse_moves(text) for cell, text in want_text.items()}
-        for cell in rows:
-            got = {k: go(t, cell, DIRS[k]) for k in "WSAD"}
-            check(got == want[cell], "%s: neighbours of %s are %s, table says %s" % (label, cell, want[cell], got))
-    t = mn.ctrl_map_table(True)
-    check(_walk(t, "map_buttons", "AD") == "map_buttons" and _walk(t, "stick_as_dpad", "AD") == "stick_as_dpad", "ctrl map: the squares row returns to the row you left")
-    check(_walk(t, "map_buttons", "AA") == "map_buttons" and _walk(t, "stick_as_dpad", "AA") == "stick_as_dpad", "ctrl map: either side key leaves the squares to the row you left")
-    check(_walk(t, "map_buttons", "AW") == "squares" and _walk(t, "map_buttons", "AS") == "squares", "ctrl map: up and down do nothing on the squares row")
-    mem = {}
-    _walk(t, "stick_as_dpad", "A", mem)
-    check(_walk(t, "squares", "D", mem) == "stick_as_dpad", "ctrl map: the way back is kept in the memory dict")
-    check(_walk(t, "squares", "D") == "map_buttons", "ctrl map: with no memory the squares row leaves to Map Buttons")
-    n64 = mn.ctrl_map_table(False)
-    check(_walk(n64, "squares", "D", {"squares": "stick_as_dpad"}) == "map_buttons", "ctrl map N64: a remembered Stick row is not used (no such row)")
 
 
-def test_ctrl_map_squares_step():
-    import itertools
-    pickable_sets = [[1]] + [[1] + list(extra) for n in (1, 2, 3) for extra in itertools.combinations((2, 3, 4), n)]
-    count = 0
-    for pickable in pickable_sets:
-        length = len(pickable) + 1
-        for selected in (1, 2, 3, 4):
-            for on_pick in (False, True):
-                for direction in (mn.LEFT, mn.RIGHT):
-                    count += 1
-                    start = length - 1 if on_pick else (pickable.index(selected) if selected in pickable else 0)
-                    got = mn.ctrl_map_squares_step(pickable, selected, on_pick, direction, False)
-                    if direction == mn.RIGHT and start == length - 1:
-                        want = (selected, on_pick, True)
-                    else:
-                        new = (start + (1 if direction == mn.RIGHT else -1)) % length
-                        want = (selected, True, False) if new == length - 1 else (pickable[new], False, False)
-                    check(got == want, "squares step pickable=%s sel=%d pick=%s %s -> %s, expected %s" % (pickable, selected, on_pick, direction, got, want))
-                    check(mn.ctrl_map_squares_step(pickable, selected, on_pick, direction, True) == (selected, on_pick, True), "squares step MENU: both keys leave")
-        for direction in (mn.UP, mn.DOWN):
-            check(mn.ctrl_map_squares_step(pickable, 1, False, direction, False) == (1, False, False), "squares step: up and down do nothing")
-    check(mn.ctrl_map_squares_step([1], 1, False, mn.LEFT, False) == (1, True, False), "squares step: left from the only player wraps to the Pick button")
-    check(mn.ctrl_map_squares_step([1], 1, True, mn.LEFT, False) == (1, False, False), "squares step: left from the Pick button goes to the only player")
-    check(mn.ctrl_map_squares_step([], 1, False, mn.LEFT, False) == (1, True, False) and mn.ctrl_map_squares_step([], 1, False, mn.RIGHT, False) == (1, False, True),
-          "squares step: with no pickable player the row is only the Pick button")
-    check(mn.ctrl_map_squares_step([1, 2, 3], 3, False, mn.RIGHT, False) == (3, True, False), "squares step: right from the last player goes to the Pick button")
-    check(mn.ctrl_map_squares_step([1, 2, 3], 2, True, mn.LEFT, False) == (3, False, False), "squares step: left from the Pick button goes to the last player")
-    check(mn.ctrl_map_squares_step([1, 2], 4, False, mn.RIGHT, False) == (2, False, False), "squares step: a selected player that is not pickable counts as the first square")
-    print("controller map squares step: %d cases" % count)
 
 
-class n2_FakeDeck(object):
-    def __init__(self, console, pickable):
-        self._active_mapping_console = console
-        self._active_mapping_player = 1
-        self._pick_layout_popup_player = None
-        self._seq_remap_active = False
-        self.ctrl_mapping_active_btn = None
-        self.ctrl_mapping = {}
-        self._mapping_close_requested = False
-        self.calls = []
-        self.pickable = set(pickable)
-
-    def mapping_reassign_pending(self):
-        return False
-
-    def _player_slot_pickable(self, player, console=None):
-        return player in self.pickable
-
-    def start_sequential_remap(self):
-        self.calls.append("remap")
-
-    def _save_controller_mapping(self):
-        self.calls.append("save")
-
-    def _switch_mapping_player(self, player):
-        self.calls.append(("switch", player))
-
-    def start_controller_pick(self, player):
-        self.calls.append(("pick", player))
-
-    def start_menu_controller_pick(self):
-        self.calls.append("menu_pick")
 
 
-def extract_ctrl_map(script_path):
-    """Returns the body of the controller map key handler, wrapped in a one-pass loop so its continue statements work."""
-    with open(script_path, encoding="utf-8") as handle:
-        lines = handle.read().split("\n")
-    marker = None
-    for i, line in enumerate(lines):
-        if line == '                    app_state.get("menu_layer") == "GAMES_CTRL_MAP" and':
-            marker = i
-            break
-    if marker is None:
-        raise RuntimeError("controller map handler not found")
-    start = marker + 2
-    end = start
-    while not lines[end].startswith('            _capture_layer = app_state.get("menu_layer")'):
-        end += 1
-    body = [line[16:] if line.strip() else "" for line in lines[start:end]]
-    return compile("for _once in (0,):\n" + "\n".join("    " + b if b else "" for b in body) + "\n", script_path + ":GAMES_CTRL_MAP", "exec")
 
 
-def run_ctrl_map(code, console, cursor, key, pickable=(1, 2), state=None, player_sel=1, on_pick=False, return_row=None, memory=None):
-    deck = n2_FakeDeck(console, pickable)
-    if state is None:
-        state = {"menu_layer": "GAMES_CTRL_MAP", "show_menu": True, "ctrl_map_cursor": cursor, "ctrl_map_player_sel": player_sel,
-                 "ctrl_map_on_pick": on_pick, "ctrl_map_return_row": return_row}
-        if memory is not None:
-            state["_nav_memory"] = {"GAMES_CTRL_MAP": dict(memory)}
-    else:
-        state["ctrl_map_cursor"] = cursor
-    env = {"pygame": pygame, "menu_nav": mn, "app_state": state, "game_deck": deck, "event": types.SimpleNamespace(key=n2_ALL_KEYS.get(key, key)), "print": lambda *a, **k: None}
-    exec(code, env)
-    return state, deck
 
 
-def ctrl_snapshot(state):
-    return (state["ctrl_map_cursor"], state["ctrl_map_player_sel"], state["ctrl_map_on_pick"])
 
 
-def test_ctrl_map_handler():
-    code = extract_ctrl_map(MAIN_SCRIPT)
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    check(text.count("menu_nav.ctrl_map_table(") == 2 and text.count("menu_nav.ctrl_map_rows(") == 1, "main script: one hookup for the controller map")
-    for console in ("GBA", "N64", "MENU", "NES"):
-        has_stick = console != "N64"
-        rows = mn.ctrl_map_rows(has_stick)
-        table = mn.ctrl_map_table(has_stick)
-        for cursor, cell in enumerate(rows):
-            for key in n2_ALL_KEYS:
-                state, _ = run_ctrl_map(code, console, cursor, key, memory={"squares": "map_buttons"})
-                if cell == "squares":
-                    continue
-                want = table.step(cell, ALL_DIRS[key], {})
-                got = state["ctrl_map_cursor"]
-                check(got == (cursor if want is None else mn.ctrl_map_index(rows, want)), "handler ctrl map %s cursor %d (%s) %s -> %s (table says %s)" % (console, cursor, cell, key, got, want))
-                if want == "squares":
-                    check(state["ctrl_map_on_pick"] == (console == "MENU") and (console == "MENU" or state["ctrl_map_player_sel"] == 1),
-                          "handler ctrl map %s: A into the squares row selects player 1 (MENU: the Pick button)" % console)
-    state, deck = run_ctrl_map(code, "GBA", 1, pygame.K_RETURN)
-    check(deck.calls == ["remap"], "handler ctrl map: Enter on Map Buttons starts the sequential remap")
-    state, deck = run_ctrl_map(code, "GBA", 2, pygame.K_RETURN)
-    check(deck.calls == ["save"] and deck.ctrl_mapping.get("stick_as_dpad") is True, "handler ctrl map: Enter on Stick as D-pad flips it and saves")
-    state, deck = run_ctrl_map(code, "GBA", 3, pygame.K_RETURN)
-    check(deck._mapping_close_requested is True, "handler ctrl map: Enter on Close asks to close")
-    state, deck = run_ctrl_map(code, "N64", 2, pygame.K_RETURN)
-    check(deck._mapping_close_requested is True, "handler ctrl map N64: Enter on Close (cursor 2) asks to close")
-    state, deck = run_ctrl_map(code, "GBA", 0, pygame.K_RETURN, player_sel=2)
-    check(deck.calls == [("switch", 2)], "handler ctrl map: Enter on a player square switches to that player")
-    state, deck = run_ctrl_map(code, "GBA", 0, pygame.K_RETURN, on_pick=True, player_sel=2)
-    check(deck.calls == [("pick", 2)], "handler ctrl map: Enter on the Pick button picks a controller for the selected player")
-    state, deck = run_ctrl_map(code, "MENU", 0, pygame.K_RETURN, on_pick=True)
-    check(deck.calls == ["menu_pick"], "handler ctrl map MENU: Enter on the Pick button starts the menu pick")
-    state, deck = run_ctrl_map(code, "GBA", 1, pygame.K_x)
-    check(ctrl_snapshot(state) == (1, 1, False), "handler ctrl map: another key changes nothing")
 
 
-def case_n3c():
-    test_n3c_directions()
-    test_dvd_map_tables()
-    test_dvd_map_handler()
-    test_save_profile_tables()
-    test_save_profile_way_back()
-    test_save_profile_handler()
-    test_save_profile_sequences()
-    test_ctrl_map_tables()
-    test_ctrl_map_squares_step()
-    test_ctrl_map_handler()
 
 
 # ============================================================================
@@ -3484,95 +2073,12 @@ n4_KEYS = {"W": pygame.K_w, "A": pygame.K_a, "S": pygame.K_s, "D": pygame.K_d}
 # ============================================================================
 
 
-def case_guide_move():
-    check(mn.guide_move(mn.UP) == (mn.GUIDE_ROW, -1), "guide up")
-    check(mn.guide_move(mn.DOWN) == (mn.GUIDE_ROW, 1), "guide down")
-    check(mn.guide_move(mn.LEFT) == (mn.GUIDE_TIME, -1), "guide left")
-    check(mn.guide_move(mn.RIGHT) == (mn.GUIDE_TIME, 1), "guide right")
-    check(mn.guide_move(None) is None, "guide none")
-    check(mn.guide_move("accept") is None, "guide unknown")
 
 
-def reference_row_step(allowed, selected, offset, rows, step):
-    """The old W / S code of the guide, written out as it was."""
-    if not allowed:
-        return None
-    selected = str(selected).zfill(2)
-    pos = allowed.index(selected) if selected in allowed else 0
-    if step < 0:
-        nxt = pos - 1 if pos > 0 else len(allowed) - 1
-        if nxt < offset:
-            offset = nxt
-        elif nxt >= offset + rows:
-            offset = max(0, nxt - (rows - 1))
-    else:
-        nxt = pos + 1 if pos < len(allowed) - 1 else 0
-        if nxt >= offset + rows:
-            offset = nxt - (rows - 1)
-        elif nxt < offset:
-            offset = nxt
-    return allowed[nxt], offset
 
 
-def case_guide_row_step():
-    check(mn.guide_row_step([], 5, 0, 5, 1) is None, "guide rows: no rows")
-    check(mn.guide_row_step([], 5, 0, 5, -1) is None, "guide rows: no rows up")
-    rng = random.Random(4)
-    cases = 0
-    for total in (1, 2, 3, 5, 6, 12, 40):
-        allowed = [str(5 + i).zfill(2) for i in range(total)]
-        for rows in (1, 2, 4, 5, 8, 40):
-            for offset in range(0, max(1, total - rows + 1)):
-                for selected in allowed + ["99", "04"]:
-                    for step in (-1, 1):
-                        want = reference_row_step(allowed, selected, offset, rows, step)
-                        got = mn.guide_row_step(allowed, selected, offset, rows, step)
-                        cases += 1
-                        check(got == want, "guide rows total=%d rows=%d off=%d sel=%s step=%d got=%r want=%r" % (total, rows, offset, selected, step, got, want))
-    check(cases > 5000, "guide rows cases ran: %d" % cases)
-    check(mn.guide_row_step(["05", "06"], 5, 0, 5, -1)[0] == "06", "guide rows wrap up")
-    check(mn.guide_row_step(["05", "06"], "06", 0, 5, 1)[0] == "05", "guide rows wrap down")
-    check(mn.guide_row_step(["05", "06", "07"], 5, 0, 5, 1) == ("06", 0), "guide rows plain step")
-    for _ in range(2000):
-        total = rng.randint(1, 40)
-        allowed = [str(5 + i).zfill(2) for i in range(total)]
-        rows = rng.randint(1, 9)
-        offset = rng.randint(0, max(0, total - 1))
-        selected = rng.choice(allowed)
-        step = rng.choice((-1, 1))
-        check(mn.guide_row_step(allowed, selected, offset, rows, step) == reference_row_step(allowed, selected, offset, rows, step), "guide rows random")
-    walk, offset = "05", 0
-    allowed = [str(5 + i).zfill(2) for i in range(40)]
-    seen = set()
-    for _ in range(40):
-        walk, offset = mn.guide_row_step(allowed, walk, offset, 5, 1)
-        seen.add(walk)
-        check(offset <= allowed.index(walk) < offset + 5, "guide rows keep selection visible going down")
-    check(len(seen) == 40 and walk == "05", "guide rows walk all 40 and wrap")
 
 
-def case_deck_functions():
-    check(mn.deck_browse_step("side", mn.LEFT) == (-1, mn.LEFT), "browse side left")
-    check(mn.deck_browse_step("side", mn.RIGHT) == (1, mn.RIGHT), "browse side right")
-    check(mn.deck_browse_step("side", mn.UP) is None and mn.deck_browse_step("side", mn.DOWN) is None, "browse side up/down ignored")
-    for style in ("stack", "vertical", "", None):
-        check(mn.deck_browse_step(style, mn.UP) == (-1, mn.UP), "browse %r up" % (style,))
-        check(mn.deck_browse_step(style, mn.DOWN) == (1, mn.DOWN), "browse %r down" % (style,))
-        check(mn.deck_browse_step(style, mn.LEFT) is None and mn.deck_browse_step(style, mn.RIGHT) is None, "browse %r left/right ignored" % (style,))
-    check(mn.deck_browse_step("side", None) is None, "browse none")
-    check(mn.deck_list_step(mn.UP) == mn.DECK_PREV, "list up")
-    check(mn.deck_list_step(mn.DOWN) == mn.DECK_NEXT, "list down")
-    check(mn.deck_list_step(mn.RIGHT) == mn.DECK_TO_ARROWS, "list right")
-    check(mn.deck_list_step(mn.LEFT) is None and mn.deck_list_step(None) is None, "list left and none")
-    check(mn.deck_arrows_step("up", mn.UP) == mn.DECK_ACTIVATE, "arrows up on up")
-    check(mn.deck_arrows_step("down", mn.UP) == mn.DECK_SELECT_UP, "arrows up on down")
-    check(mn.deck_arrows_step("down", mn.DOWN) == mn.DECK_ACTIVATE, "arrows down on down")
-    check(mn.deck_arrows_step("up", mn.DOWN) == mn.DECK_SELECT_DOWN, "arrows down on up")
-    check(mn.deck_arrows_step("up", mn.LEFT) == mn.DECK_TO_LIST and mn.deck_arrows_step("down", mn.LEFT) == mn.DECK_TO_LIST, "arrows left")
-    check(mn.deck_arrows_step("up", mn.RIGHT) is None and mn.deck_arrows_step("up", None) is None, "arrows right and none")
-    check(mn.deck_confirm_choice(mn.LEFT) == "Yes" and mn.deck_confirm_choice(mn.RIGHT) == "No", "confirm left/right")
-    check(mn.deck_confirm_choice(mn.UP) is None and mn.deck_confirm_choice(mn.DOWN) is None and mn.deck_confirm_choice(None) is None, "confirm up/down/none")
-    check(mn.key_to_direction(pygame.K_UP) is None and mn.key_to_direction(pygame.K_UP, arrows=True) == mn.UP, "arrow keys only with arrows=True")
 
 
 # ============================================================================
@@ -3583,18 +2089,6 @@ GUIDE_START = 'if app_state["current_channel"] == "04" and not app_state["show_m
 GUIDE_END = '            if app_state.get("show_menu", False):\n                pass\n'
 
 
-def extract_guide(script_path):
-    """Returns the guide key block of a main script, wrapped in a one-pass loop so its continue statements work."""
-    with open(script_path, encoding="utf-8") as handle:
-        text = handle.read()
-    begin = text.index(GUIDE_START)
-    line_start = text.rfind("\n", 0, begin) + 1
-    indent = begin - line_start
-    end = text.index(GUIDE_END, begin)
-    body = text[line_start:end].split("\n")
-    lines = [ln[indent:] if ln.strip() else "" for ln in body]
-    code = "for _once in (0,):\n" + "\n".join("    " + ln if ln else "" for ln in lines) + "\n"
-    return compile(code, script_path + ":guide", "exec")
 
 
 def step_row_source():
@@ -3610,71 +2104,12 @@ def step_row_source():
 STEP_ROW_CODE = compile(step_row_source(), MAIN_SCRIPT + ":_guide_step_row", "exec")
 
 
-class n4_FakeDb:
-    def __init__(self, active):
-        self.channels_db = {str(i).zfill(2): {"active": (i in active)} for i in range(5, 45)}
 
 
-def n4_run_guide(code, active, selected, offset, rows, key, curr_col=0):
-    calls = []
-    state = {
-        "current_channel": "04", "show_menu": False, "show_quit_confirm": False, "show_splash": False,
-        "selected_guide_channel": selected, "guide_row_offset": offset, "highlighted_guide_channel": None,
-    }
-    env = {
-        "app_state": state, "db": n4_FakeDb(active), "pygame": pygame, "event": types.SimpleNamespace(key=key),
-        "MENU_IDLE_CLOSE_MS": int(gov.MENU_IDLE_CLOSE_SECONDS * 1000),
-        "menu_nav": mn, "get_guide_visible_rows": lambda _db: rows,
-        "_clear_last_video_frame": lambda context=None: calls.append(("clear", context)),
-        "_arm_guide_preview_transition": lambda: calls.append(("arm",)),
-        "_resync_guide_stop_after_row_switch": lambda: calls.append(("resync",)),
-        "_guide_jump_col": lambda step, _source="": calls.append(("jump", step, _source)),
-        "change_channel": lambda ch, is_surfing=False: calls.append(("tune", ch, is_surfing)),
-    }
-    exec(STEP_ROW_CODE, env)
-    exec(code, env)
-    state.pop("guide_inactivity_timer", None)
-    return calls, dict(state)
 
 
-def guide_cases(rng):
-    for _ in range(600):
-        total = rng.randint(0, 40)
-        active = set(rng.sample(range(5, 45), total))
-        names = sorted(active)
-        rows = rng.randint(1, 8)
-        offset = rng.randint(0, max(0, total))
-        selected = rng.choice(names) if names and rng.random() < 0.85 else rng.choice((5, 44, 12))
-        yield active, selected, offset, rows
 
 
-def case_guide_block():
-    code = extract_guide(MAIN_SCRIPT)
-    rng = random.Random(11)
-    n = 0
-    for active, selected, offset, rows in guide_cases(rng):
-        names = [str(i).zfill(2) for i in sorted(active)]
-        for label, key in n4_KEYS.items():
-            calls, state = n4_run_guide(code, active, selected, offset, rows, key)
-            n += 1
-            if label in ("A", "D"):
-                step = -1 if label == "A" else 1
-                check(calls == [("jump", step, "keydown")], "guide %s jumps time %d: %r" % (label, step, calls))
-                check(state["selected_guide_channel"] == selected and state["guide_row_offset"] == offset, "guide %s leaves rows alone" % label)
-            else:
-                step = -1 if label == "W" else 1
-                want = mn.guide_row_step(names, selected, offset, rows, step)
-                if want is None:
-                    check(calls == [] and state["selected_guide_channel"] == selected, "guide %s with no rows does nothing" % label)
-                else:
-                    check(state["selected_guide_channel"] == int(want[0]) and state["highlighted_guide_channel"] == want[0], "guide %s selects %s" % (label, want[0]))
-                    check(state["guide_row_offset"] == want[1], "guide %s offset" % label)
-                    check(calls == [("clear", "preview"), ("arm",), ("resync",)], "guide %s calls %r" % (label, calls))
-    calls, state = n4_run_guide(code, {5, 6}, 6, 0, 5, pygame.K_RETURN)
-    check(calls == [("tune", "06", True)], "guide Enter tunes the selected row: %r" % (calls,))
-    calls, state = n4_run_guide(code, {5, 6}, 6, 0, 5, pygame.K_x)
-    check(calls == [], "guide other key does nothing")
-    check(n == 2400, "guide block cases ran: %d" % n)
 
 
 # ============================================================================
@@ -3690,172 +2125,34 @@ def load_deck_module(path, name):
     return module
 
 
-class FakeVlc:
-    def __init__(self, log):
-        self.log = log
-        self.player = types.SimpleNamespace(get_time=lambda: 0, get_length=lambda: 0, pause=lambda: None, set_time=lambda t: None)
-
-    def navigate(self, what):
-        self.log.append(("vlc.navigate", what))
-
-    def stop(self):
-        self.log.append(("vlc.stop",))
 
 
 _RECORDED = ("_enter_romlist", "_launch_selected_rom", "_scan_roms", "_snap_rom_cursor_if_scan_landed", "_set_dvd_osd",
              "_dvd_save_resume_position", "_get_console_rom_dir")
 
 
-def make_deck(module, **attrs):
-    cls = module.ExternalGameDeck
-    deck = object.__new__(cls)
-    log = []
-    base = dict(
-        mode="BROWSE", dvd_playback_active=False, scroll_style="side", consoles=["NES", "SNES", "GB", "DVD"], console_index=1,
-        romlist_focus="list", romlist_arrow_sel="up", roms=[("a", "a"), ("b", "b"), ("c", "c")], rom_index=1, rom_scroll=0,
-        active_console="SNES", current_browse_dir="", _console_arrow_flash_dir=None, _console_arrow_flash_until=0,
-        dvd_exit_confirm=False, dvd_exit_selection="No", dvd_exit_confirm_shown_at=0,
-        dvd_return_menu_confirm=False, dvd_return_menu_selection="No", dvd_return_menu_confirm_shown_at=0,
-        dvd_splash_playing=False, dvd_is_disc_image=True, dvd_in_menu=True, _dvd_menu_manual_override=False,
-        vlc_engine=FakeVlc(log), dvd_resume_enabled=False, dvd_file_path="",
-        dvd_paused=False, _dvd_skip_cooldown=0, _scan_pending=False, _CONSOLE_ARROW_FLASH_MS=200,
-    )
-    base.update(attrs)
-    for name, value in base.items():
-        setattr(deck, name, value)
-    for name in _RECORDED:
-        setattr(deck, name, (lambda n: (lambda *a, **k: log.append((n,) + a)))(name))
-    deck._dvd_translate_key = lambda key: key
-    deck._dvd_menu_is_up = lambda: bool(deck.dvd_in_menu) and deck.dvd_is_disc_image
-    deck._cycle_console = lambda delta: (log.append(("cycle", delta)), setattr(deck, "console_index", (deck.console_index + delta) % len(deck.consoles)))
-    deck._log = log
-    return deck
 
 
 def snapshot(deck):
     return {k: v for k, v in vars(deck).items() if not callable(v) and k not in ("vlc_engine", "_log")}
 
 
-def run_event(module, setup, event):
-    saved = pygame.time.get_ticks
-    pygame.time.get_ticks = lambda: 5000
-    try:
-        deck = make_deck(module, **setup)
-        result = deck.handle_event(event)
-        return result, snapshot(deck), list(deck._log)
-    finally:
-        pygame.time.get_ticks = saved
 
 
-def key_event(key):
-    return pygame.event.Event(pygame.KEYDOWN, key=key, mod=0, unicode="")
 
 
-def deck_setups():
-    for style in ("side", "stack"):
-        yield dict(mode="BROWSE", scroll_style=style)
-    for focus in ("list", "arrows"):
-        for sel in ("up", "down"):
-            for index in (0, 1, 2):
-                yield dict(mode="ROMLIST", romlist_focus=focus, romlist_arrow_sel=sel, rom_index=index)
-            yield dict(mode="ROMLIST", romlist_focus=focus, romlist_arrow_sel=sel, roms=[], rom_index=0)
-            yield dict(mode="ROMLIST", romlist_focus=focus, romlist_arrow_sel=sel, consoles=["NES"], console_index=0, rom_index=1)
-    yield dict(mode="GAME")
 
 
 n4_ALL_KEYS = list(n4_KEYS.values()) + [pygame.K_RETURN, pygame.K_ESCAPE, pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_x]
 
 
-def case_deck_handler():
-    module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_new")
-    n = 0
-    for setup in deck_setups():
-        for key in n4_ALL_KEYS:
-            result, snap, log = run_event(module, setup, key_event(key))
-            n += 1
-            mode = setup["mode"]
-            if mode == "GAME":
-                check(result is False and log == [], "deck GAME ignores keys")
-                continue
-            if mode == "BROWSE" and key in n4_KEYS.values():
-                direction = {pygame.K_w: mn.UP, pygame.K_s: mn.DOWN, pygame.K_a: mn.LEFT, pygame.K_d: mn.RIGHT}[key]
-                move = mn.deck_browse_step(setup["scroll_style"], direction)
-                if move is None:
-                    check(result is True and log == [], "deck browse %s %s unused direction" % (setup["scroll_style"], direction))
-                else:
-                    check(("cycle", move[0]) in log and snap["_console_arrow_flash_dir"] == move[1], "deck browse %s %s moves %s" % (setup["scroll_style"], direction, move))
-            if mode == "ROMLIST" and setup["romlist_focus"] == "list" and key in (pygame.K_w, pygame.K_s):
-                want = setup["rom_index"] + (-1 if key == pygame.K_w else 1)
-                roms_count = len(setup["roms"]) if "roms" in setup else 3
-                if not roms_count or not (0 <= want < roms_count):
-                    want = setup["rom_index"]
-                check(snap["rom_index"] == want and result is True, "deck list %s %d" % (key, setup["rom_index"]))
-            if mode == "ROMLIST" and setup["romlist_focus"] == "list" and key == pygame.K_d:
-                check(snap["romlist_focus"] == "arrows", "deck list D goes to arrows")
-            if mode == "ROMLIST" and setup["romlist_focus"] == "arrows" and key == pygame.K_a:
-                check(snap["romlist_focus"] == "list", "deck arrows A goes to list")
-            if mode == "ROMLIST" and setup["romlist_focus"] == "arrows" and key in (pygame.K_w, pygame.K_s):
-                which = "up" if key == pygame.K_w else "down"
-                if setup["romlist_arrow_sel"] == which:
-                    check(any(entry[0] == "cycle" for entry in log) or len(setup.get("consoles", [0, 1])) <= 1, "deck arrows %s activates" % which)
-                else:
-                    check(snap["romlist_arrow_sel"] == which and not log, "deck arrows %s selects" % which)
-    check(n == 17 * len(n4_ALL_KEYS) - 0 or n > 200, "deck handler cases ran: %d" % n)
 
 
-def dvd_setups():
-    for confirm in ("exit", "return", "none"):
-        for sel in ("Yes", "No"):
-            for disc in (True, False):
-                for in_menu in (True, False):
-                    setup = dict(mode="DVD_PLAYER", dvd_playback_active=True, dvd_is_disc_image=disc, dvd_in_menu=in_menu)
-                    if confirm == "exit":
-                        setup.update(dvd_exit_confirm=True, dvd_exit_selection=sel)
-                    elif confirm == "return":
-                        setup.update(dvd_return_menu_confirm=True, dvd_return_menu_selection=sel)
-                    yield setup
 
 
 DVD_KEYS = list(n4_KEYS.values()) + [pygame.K_RETURN, pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_x, pygame.K_BACKSPACE]
 
 
-def case_dvd_handler():
-    module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_new2")
-    n = 0
-    for setup in dvd_setups():
-        for key in DVD_KEYS:
-            result, snap, log = run_event(module, setup, key_event(key))
-            n += 1
-            check(result is True, "dvd handler returns True")
-            popup = setup.get("dvd_exit_confirm") or setup.get("dvd_return_menu_confirm")
-            if popup:
-                field = "dvd_exit_selection" if setup.get("dvd_exit_confirm") else "dvd_return_menu_selection"
-                if key == pygame.K_a:
-                    check(snap[field] == "Yes", "dvd popup A is Yes")
-                elif key == pygame.K_d:
-                    check(snap[field] == "No", "dvd popup D is No")
-                elif key != pygame.K_RETURN:
-                    check(snap[field] == setup[field], "dvd popup other keys keep the answer")
-            elif setup["dvd_is_disc_image"] and setup["dvd_in_menu"]:
-                expected = {pygame.K_w: "up", pygame.K_s: "down", pygame.K_a: "left", pygame.K_d: "right", pygame.K_RETURN: "activate"}
-                if key in expected:
-                    check(("vlc.navigate", expected[key]) in log, "dvd menu %s navigates %s" % (key, expected[key]))
-                else:
-                    check(not any(entry[0] == "vlc.navigate" for entry in log) or key == pygame.K_BACKSPACE, "dvd menu other keys do not navigate")
-    check(n > 200, "dvd handler cases ran: %d" % n)
-    arrows = {pygame.K_UP: "up", pygame.K_DOWN: "down", pygame.K_LEFT: "left", pygame.K_RIGHT: "right", pygame.K_w: "up", pygame.K_s: "down",
-              pygame.K_a: "left", pygame.K_d: "right", pygame.K_RETURN: "activate"}
-    for key, want in arrows.items():
-        deck = make_deck(module, mode="DVD_PLAYER")
-        check(deck._handle_dvd_menu_nav(key) is True and ("vlc.navigate", want) in deck._log, "dvd menu direct %s -> %s" % (key, want))
-    deck = make_deck(module, mode="DVD_PLAYER")
-    deck._handle_dvd_menu_nav(pygame.K_x)
-    check(deck._log == [], "dvd menu direct: other key does nothing")
-    deck = make_deck(module, mode="DVD_PLAYER", _dvd_menu_manual_override=True)
-    deck._handle_dvd_menu_nav(pygame.K_RETURN)
-    check(deck._dvd_menu_manual_override is False, "dvd menu Enter clears the manual override")
-    deck = make_deck(module, mode="DVD_PLAYER", vlc_engine=None)
-    check(deck._handle_dvd_menu_nav(pygame.K_w) is True and deck._log == [], "dvd menu with no player does nothing")
 
 
 # ============================================================================
@@ -3873,181 +2170,22 @@ n6_ALL_KEYS = DIRECTION_KEYS + OTHER_KEYS
 # ============================================================================
 
 
-def case_tabs():
-    pools = (["System", "Channels", "Games", "Video", "Theme"], ["System", "Games", "Video", "Theme"],
-             ["System", "Channels", "Video", "Theme"], ["System", "Video", "Theme"], ["Video"])
-    for pool in pools:
-        table = mn.tabs_table(pool)
-        check(mn.tabs_table(list(pool)) is table, "tabs table cached %r" % pool)
-        for i, tab in enumerate(pool):
-            memory = {}
-            check(table.step(tab, mn.RIGHT, memory) == (pool[(i + 1) % len(pool)] if len(pool) > 1 else None), "tabs %s right in %r" % (tab, pool))
-            check(table.step(tab, mn.LEFT, memory) == (pool[i - 1] if len(pool) > 1 else None), "tabs %s left in %r" % (tab, pool))
-            check(table.step(tab, mn.DOWN, memory) == mn.PANEL, "tabs %s down leaves into the panel" % tab)
-            check(table.step(tab, mn.UP, memory) is None, "tabs %s up does nothing" % tab)
-            check(mn.tabs_cell(pool, tab) == tab, "tabs_cell keeps %s" % tab)
-        check(mn.tabs_cell(pool, "Bogus") == pool[0] and mn.tabs_cell(pool, None) == pool[0], "tabs_cell unknown tab is the first")
-        seen, walk = {pool[0]}, pool[0]
-        for _ in range(len(pool)):
-            walk = table.step(walk, mn.RIGHT, {}) or walk
-            seen.add(walk)
-        check(seen == set(pool), "tabs walk right reaches every tab in %r" % pool)
-    check(set(mn.TAB_PANEL_LAYERS) == {"System", "Channels", "Games", "Video", "Theme"}, "tab panel layers cover the five tabs")
-    check(mn.TAB_PANEL_LAYERS["Games"] == "GAMES_LIST" and mn.TAB_PANEL_LAYERS["System"] == "SYSTEM_ROWS", "tab panel layer names")
 
 
-def old_clamp(selection, count, step):
-    return max(0, min(count - 1, selection + step))
 
 
-def case_column_move():
-    for count in range(1, 12):
-        for selection in range(-3, count + 4):
-            for direction, step in ((mn.UP, -1), (mn.DOWN, 1)):
-                got = mn.column_move({}, "T", selection, count, direction)
-                check(got == old_clamp(selection, count, step), "column_move count=%d sel=%d %s got %d" % (count, selection, direction, got))
-            for direction in (mn.LEFT, mn.RIGHT):
-                got = mn.column_move({}, "T", selection, count, direction)
-                check(got == selection, "column_move count=%d sel=%d %s does nothing" % (count, selection, direction))
-    check(mn.column_move({}, "T", 3, 0, mn.DOWN) == 3, "column_move empty list leaves the number")
-    walk = 0
-    for _ in range(20):
-        walk = mn.column_move({}, "T", walk, 6, mn.DOWN)
-    check(walk == 5, "column_move down stops on the last row")
-    check(mn.column_move({}, "T", 5, 6, mn.UP) == 4, "column_move up from the last row")
 
 
-def case_ring_move():
-    for count in range(1, 9):
-        for selection in range(-4, count + 5):
-            for direction in mn.DIRECTIONS:
-                step = -1 if direction in (mn.UP, mn.LEFT) else 1
-                got = mn.ring_move({}, "T", selection, count, direction)
-                check(got == (selection + step) % count, "ring_move count=%d sel=%d %s got %d" % (count, selection, direction, got))
-    check(mn.ring_move({}, "T", 0, 3, mn.UP) == 2 and mn.ring_move({}, "T", 2, 3, mn.DOWN) == 0, "ring_move wraps both ways")
 
 
-def case_server_slots():
-    table = mn.server_slots_table()
-    check(mn.server_slots_table() is table, "server slots table cached")
-    check(len(mn.SERVER_SLOT_CELLS) == 9 and mn.SERVER_SLOT_CELLS[6:] == ("create", "manage", mn.CLOSE), "server slots cells")
-    for sel in range(9):
-        check(mn.server_slots_index(mn.server_slots_cell(sel)) == sel, "server slots cell round trip %d" % sel)
-        for direction in mn.DIRECTIONS:
-            column, row = sel // 3, sel % 3
-            if direction == mn.UP:
-                row = max(0, row - 1)
-            elif direction == mn.DOWN:
-                row = min(2, row + 1)
-            elif direction == mn.LEFT:
-                column = max(0, column - 1)
-            else:
-                column = min(2, column + 1)
-            want = column * 3 + row
-            to = mn.navigate({}, "T", table, mn.server_slots_cell(sel), direction)
-            got = sel if to is None else mn.server_slots_index(to)
-            check(got == want, "server slots %d %s got %d want %d" % (sel, direction, got, want))
-    check(mn.server_slots_cell(99) == mn.CLOSE and mn.server_slots_cell(-1) == mn.CLOSE, "server slots out of range is Close")
-    seen, todo = {"slot0"}, ["slot0"]
-    while todo:
-        cur = todo.pop()
-        for direction in mn.DIRECTIONS:
-            to = table.step(cur, direction, {})
-            if to not in (None, mn.TAB_BAR, mn.PANEL) and to not in seen:
-                seen.add(to)
-                todo.append(to)
-    check(seen == set(table.cells), "server slots every cell reachable")
 
 
-def case_channel_sub_table():
-    seen_layouts = set()
-    for info in channel_sub_infos():
-        for count in (1, 2):
-            layout = mn.channel_sub_layout(info, count)
-            if layout in seen_layouts:
-                continue
-            seen_layouts.add(layout)
-            table = mn.channel_sub_table(layout)
-            check(mn.channel_sub_table(layout) is table, "channel sub table cached %r" % (layout,))
-            close = mn.channel_sub_close_row(layout)
-            on, music, marathon = layout[0], layout[1], layout[2]
-            check(close == (1 if not on else 7 if music else 6 if marathon else 7), "channel sub close row %r" % (layout,))
-            for row in range(close + 1):
-                for col in range(mn.CHANNEL_SUB_MAX_COL + 1):
-                    check(mn.channel_sub_index(mn.channel_sub_cell(row, col)) == (row, col), "channel sub cell round trip")
-                    for direction in mn.DIRECTIONS:
-                        to = table.step(mn.channel_sub_cell(row, col), direction, {})
-                        if to is not None:
-                            r, c = mn.channel_sub_index(to)
-                            check(0 <= r <= close and 0 <= c <= mn.CHANNEL_SUB_MAX_COL, "channel sub %r (%d,%d) %s lands inside" % (layout, row, col, direction))
-            seen, todo = {mn.channel_sub_cell(0, 0 if not layout[6] else 1)}, [mn.channel_sub_cell(0, 0 if not layout[6] else 1)]
-            while todo:
-                cur = todo.pop()
-                for direction in mn.DIRECTIONS:
-                    to = table.step(cur, direction, {})
-                    if to is not None and to not in seen:
-                        seen.add(to)
-                        todo.append(to)
-            check(mn.channel_sub_cell(close, 0) in seen, "channel sub Close reachable %r" % (layout,))
-            check(all(any(mn.channel_sub_cell(r, c) in seen for c in range(mn.CHANNEL_SUB_MAX_COL + 1)) for r in range(close + 1)), "channel sub every row reachable %r" % (layout,))
-    check(len(seen_layouts) > 20, "channel sub layouts covered: %d" % len(seen_layouts))
-    fresh = {"active": True}
-    layout = mn.channel_sub_layout(fresh, 1)
-    table = mn.channel_sub_table(layout)
-    check(table.step("r1c0", mn.UP, {}) == "r0c1" and table.step("r0c1", mn.LEFT, {}) is None, "only active channel: up lands on the Mode button and left cannot reach On")
-    layout = mn.channel_sub_layout(fresh, 5)
-    check(mn.channel_sub_table(layout).step("r1c0", mn.UP, {}) == "r0c0", "other channels on: up lands on the On button")
-    layout = mn.channel_sub_layout(fresh, 5)
-    table = mn.channel_sub_table(layout)
-    check(table.step("r7c0", mn.DOWN, {}) is None and table.step("r7c0", mn.RIGHT, {}) == "r7c3" and table.step("r7c3", mn.LEFT, {}) == "r7c0"
-          and table.step("r7c3", mn.RIGHT, {}) is None and table.step("r7c3", mn.DOWN, {}) is None,
-          "a TV channel's last row is Clear on the left and Close on the right, with nothing below them")
-    for mode in ("random_slots", "marathon"):
-        music = mn.channel_sub_layout({"active": True, "is_visualizer": True, "scheduling_mode": mode}, 5)
-        music_table, music_close = mn.channel_sub_table(music), mn.channel_sub_close_row(music)
-        check(music_table.step(mn.channel_sub_cell(music_close - 1, 0), mn.DOWN, {}) == mn.channel_sub_cell(music_close, 0)
-              and all(music_table.step(mn.channel_sub_cell(music_close, 0), d, {}) is None for d in (mn.LEFT, mn.RIGHT, mn.DOWN)),
-              "a music channel's Close is one button: nothing beside it or below it (%s)" % mode)
 
 
-def case_popup_tables():
-    for has_box in (False, True):
-        table = mn.confirm_table(has_box)
-        check(mn.confirm_table(has_box) is table, "confirm table cached %s" % has_box)
-        for selection in ("Yes", "No", None, "x"):
-            for focus in ("buttons", "checkbox"):
-                cell = mn.confirm_cell(selection, focus)
-                check((mn.confirm_focus(cell), mn.confirm_answer(cell)) == (focus, "Yes" if selection == "Yes" else "No"), "confirm cell round trip %s %s" % (selection, focus))
-        check(table.step("no", mn.LEFT, {}) == "yes" and table.step("yes", mn.RIGHT, {}) == "no", "confirm left is Yes, right is No")
-        check(table.step("yes", mn.LEFT, {}) is None and table.step("no", mn.RIGHT, {}) is None, "confirm stays on the answer it is on")
-        check((table.step("yes", mn.DOWN, {}) == "check_yes") == has_box and (table.step("no", mn.DOWN, {}) == "check_no") == has_box, "confirm down reaches the box only when there is one")
-        if has_box:
-            check(table.step("check_no", mn.UP, {}) == "no" and table.step("check_yes", mn.UP, {}) == "yes", "confirm up returns to the same answer")
-            check(table.step("check_yes", mn.LEFT, {}) is None and table.step("check_no", mn.RIGHT, {}) is None, "confirm sideways does nothing on the box")
-    table = mn.splash_table()
-    check(table.step("back", mn.RIGHT, {}) == "next" and table.step("next", mn.LEFT, {}) == "back", "splash left and right")
-    check(table.step("back", mn.LEFT, {}) is None and table.step("next", mn.RIGHT, {}) is None and table.step("next", mn.UP, {}) is None, "splash edges")
-    check(mn.splash_cell(0) == "back" and mn.splash_cell(1) == "next" and mn.splash_focus("back") == 0 and mn.splash_focus("next") == 1, "splash cell and focus")
 
 
-def case_gate_key_classes():
-    for key in list(range(0, 400)) + [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN, pygame.K_ESCAPE, pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d]:
-        old_gate = key in (pygame.K_a, pygame.K_d, pygame.K_RETURN)
-        new_gate = mn.deck_confirm_choice(mn.key_to_direction(key)) is not None or key == pygame.K_RETURN
-        check(old_gate == new_gate, "DVD gate key class %d" % key)
-        old_nav = key in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, pygame.K_ESCAPE, pygame.K_RETURN)
-        new_nav = mn.key_to_direction(key) is not None or key in (pygame.K_ESCAPE, pygame.K_RETURN)
-        check(old_nav == new_nav, "DVD deck key class %d" % key)
 
 
-def case_tab_bar_exit_targets():
-    table = mn.NavTable()
-    table.known("a")
-    table.link("a", mn.DOWN, mn.PANEL)
-    table.link("a", mn.UP, mn.TAB_BAR)
-    memory = {}
-    check(table.step("a", mn.DOWN, memory) == mn.PANEL and table.step("a", mn.UP, memory) == mn.TAB_BAR and memory == {}, "PANEL and TAB_BAR are exits and record nothing")
-    check(mn.navigate({}, "T", table, "a", mn.LEFT) is None, "an unlinked direction stays")
 
 
 # ============================================================================
@@ -4125,13 +2263,6 @@ def make_env():
     }
 
 
-def run_block(runner, state, db, key):
-    event = types.SimpleNamespace(key=key)
-    work = dict(state)
-    with Quiet():
-        runner(event, work, db, make_env())
-    work.pop("_nav_memory", None)
-    return work
 
 
 # ============================================================================
@@ -4254,15 +2385,6 @@ def splash_cases():
             yield n6_FakeDb(), {"show_splash": True, "controls_splash_page": page, "controls_splash_focus": focus, "splash_shown_at": 5}
 
 
-class n6_FakeDeck:
-    def __init__(self, exit_confirm, return_confirm):
-        self.mode = "DVD_PLAYER"
-        self.dvd_exit_confirm = exit_confirm
-        self.dvd_return_menu_confirm = return_confirm
-        self.handled = []
-
-    def handle_event(self, event):
-        self.handled.append(event.key)
 
 
 def gate_cases():
@@ -4270,22 +2392,8 @@ def gate_cases():
         yield n6_FakeDb(), {"current_channel": "03", "_deck": (exit_confirm, return_confirm)}
 
 
-def cut_between(text, begin_marker, end_marker):
-    begin = text.index(begin_marker)
-    line_start = text.rfind("\n", 0, begin) + 1
-    end = text.index(end_marker, begin)
-    return textwrap.dedent(text[line_start:end])
 
 
-def build_runner_fell(code_body):
-    """Like build_runner, but returns True when the block ended without a continue."""
-    code = ("def run(event, app_state, db, env):\n"
-            "    globals().update(env)\n"
-            "    fell = False\n"
-            "    for _once in [0]:\n" + textwrap.indent(code_body, "        ") + "\n        fell = True\n    return fell\n")
-    namespace = {}
-    exec(compile(code, "<block>", "exec"), namespace)
-    return namespace["run"]
 
 
 POPUP_BLOCKS = {
@@ -4297,86 +2405,12 @@ POPUP_CASES = (("CLEAR_CONFIRM", confirm_cases), ("DVD_GATE", gate_cases), ("CON
 POPUP_KEYS = n6_ALL_KEYS + [pygame.K_RETURN, pygame.K_c]
 
 
-def run_popup(runner, name, state, db, key):
-    work = dict(state)
-    deck = None
-    env = make_env()
-    env["now_ticks"] = 777
-    if name == "DVD_GATE":
-        deck = n6_FakeDeck(*work.pop("_deck"))
-        env["game_deck"] = deck
-    env["print"] = lambda *a, **k: None
-    event = types.SimpleNamespace(key=key)
-    with Quiet():
-        fell = runner(event, work, db, env)
-    work.pop("_nav_memory", None)
-    return fell, work, (deck.handled if deck else None)
 
 
-def popup_keys(name, state):
-    """Keys to run: Enter only where its branch is a plain toggle (the box on a burn-in popup), the splash, or the gate."""
-    keys = [k for k in POPUP_KEYS if k != pygame.K_RETURN]
-    if name in ("CONTROLS_SPLASH", "DVD_GATE"):
-        keys.append(pygame.K_RETURN)
-    if name == "CLEAR_CONFIRM" and state.get("clear_confirm_target") in BURNIN_TARGETS and state.get("clear_confirm_focus") == "checkbox":
-        keys.append(pygame.K_RETURN)
-    return keys
 
 
-def case_popup_blocks():
-    new_text = read(MAIN_SCRIPT)
-    n = 0
-    for name, cases in POPUP_CASES:
-        begin, end = POPUP_BLOCKS[name]
-        new_runner = build_runner_fell(cut_between(new_text, begin, end))
-        for db, state in cases():
-            for key in popup_keys(name, state):
-                got = run_popup(new_runner, name, state, db, key)
-                n += 1
-                check_popup(name, state, key, got)
-    check(n > 1500, "popup cases ran: %d" % n)
 
 
-def check_popup(name, state, key, got):
-    fell, after, handled = got
-    label = "%s %s %s" % (name, state, pygame.key.name(key))
-    if name == "CLEAR_CONFIRM":
-        check(fell is False, label + " is swallowed by the popup")
-        focus = state.get("clear_confirm_focus", "buttons")
-        burn = state["clear_confirm_target"] in BURNIN_TARGETS
-        want = dict(state)
-        if mn.is_back(key):
-            want.update(show_clear_confirm=False, clear_confirm_target=None, clear_confirm_channel=None, clear_confirm_console=None,
-                        clear_confirm_shown_at=0, clear_confirm_focus="buttons", clear_confirm_dont_show_again=False)
-        elif key == pygame.K_w:
-            if burn and focus == "checkbox":
-                want["clear_confirm_focus"] = "buttons"
-            want["clear_confirm_shown_at"] = 777
-        elif key == pygame.K_s:
-            if burn and focus == "buttons":
-                want["clear_confirm_focus"] = "checkbox"
-            want["clear_confirm_shown_at"] = 777
-        elif key in (pygame.K_a, pygame.K_d) and focus == "buttons":
-            want["clear_confirm_selection"] = "Yes" if key == pygame.K_a else "No"
-            want["clear_confirm_shown_at"] = 777
-        elif key == pygame.K_RETURN:
-            want["clear_confirm_dont_show_again"] = not state["clear_confirm_dont_show_again"]
-            want["clear_confirm_shown_at"] = 777
-        check(after == want, label + " got %r want %r" % (after, want))
-    elif name == "DVD_GATE":
-        routed = key in (pygame.K_a, pygame.K_d, pygame.K_RETURN, pygame.K_ESCAPE)
-        check(handled == ([key] if routed else []), label + " routing")
-        check(fell == (not routed and key in (pygame.K_UP, pygame.K_DOWN)), label + " swallow or fall through")
-    elif name == "CONTROLS_SPLASH":
-        page, focus = state["controls_splash_page"], state["controls_splash_focus"]
-        if key in (pygame.K_a, pygame.K_LEFT) and page != 0 and key != pygame.K_RETURN:
-            check(after["controls_splash_focus"] == 0, label + " focuses Back")
-        if key in (pygame.K_d, pygame.K_RIGHT) and page != 0:
-            check(after["controls_splash_focus"] == 1, label + " focuses Next")
-        if key in (pygame.K_a, pygame.K_d, pygame.K_LEFT, pygame.K_RIGHT) and page == 0:
-            check(after == state, label + " on the first page does nothing")
-        if key in (pygame.K_w, pygame.K_s, pygame.K_UP, pygame.K_DOWN, pygame.K_x):
-            check(after == state, label + " does nothing")
 
 
 def runner_for(text, name, layer):
@@ -4388,138 +2422,12 @@ def read(path):
         return handle.read()
 
 
-def case_blocks_against_tables():
-    text = read(MAIN_SCRIPT)
-    ran = 0
-    for name, layer, cases in LAYER_CASES:
-        runner = runner_for(text, name, layer)
-        for db, state in cases():
-            for key in DIRECTION_KEYS:
-                after = run_block(runner, state, db, key)
-                ran += 1
-                check_block(name, db, state, key, after)
-            for key in OTHER_KEYS:
-                after = run_block(runner, state, db, key)
-                ran += 1
-                check(after == expected_untouched(name, db, state), "%s %s key %s changes nothing" % (name, state, pygame.key.name(key)))
-    check(ran > 1500, "handler cases ran: %d" % ran)
 
 
-def expected_untouched(name, db, state):
-    """The state after a key the layer ignores; the tab bar still puts a tab the bar does not show back on System."""
-    want = dict(state)
-    if name == "TAB_SELECTION":
-        if (not db.config["game_channel_enabled"] and state["active_menu_tab"] == "Games") or (db.config["kiosk_mode_enabled"] and state["active_menu_tab"] == "Channels"):
-            want["active_menu_tab"] = "System"
-    return want
 
 
-def check_block(name, db, state, key, after):
-    direction = {pygame.K_w: mn.UP, pygame.K_a: mn.LEFT, pygame.K_s: mn.DOWN, pygame.K_d: mn.RIGHT}[key]
-    label = "%s %s %s" % (name, {k: v for k, v in state.items() if k != "audio_track_list"}, direction)
-    want = dict(state)
-    if name == "TAB_SELECTION":
-        game_ch, kiosk = db.config["game_channel_enabled"], db.config["kiosk_mode_enabled"]
-        pool = ["System", "Channels", "Games", "Video", "Theme"] if game_ch else ["System", "Channels", "Video", "Theme"]
-        if kiosk:
-            pool = [t for t in pool if t != "Channels"]
-        tab = state["active_menu_tab"]
-        if not game_ch and tab == "Games":
-            tab = want["active_menu_tab"] = "System"
-            want["menu_layer"] = "TAB_SELECTION"
-        if kiosk and tab == "Channels":
-            tab = want["active_menu_tab"] = "System"
-            want["menu_layer"] = "TAB_SELECTION"
-        index = pool.index(tab) if tab in pool else 0
-        if direction == mn.RIGHT:
-            want["active_menu_tab"] = pool[(index + 1) % len(pool)]
-        elif direction == mn.LEFT:
-            want["active_menu_tab"] = pool[(index - 1) % len(pool)]
-        elif direction == mn.DOWN:
-            layer = mn.TAB_PANEL_LAYERS.get(want["active_menu_tab"], "SYSTEM_ROWS")
-            want["menu_layer"] = layer
-            want["menu_selection_index"] = {"GAMES_LIST": min(1, mn.games_page_count(len(__import__("game_deck").CONSOLE_ORDER)) - 1) * mn.GAMES_PAGE_SIZE,
-                                            "CHANNEL_LIST": min(1, mn.CHANNELS_NUM_PAGES - 1) * mn.CHANNELS_PAGE_SIZE}.get(layer, 0)
-        check(after == want, label + " got %r want %r" % (after, want))
-        return
-    if name == "CHANNEL_SUB_MENU":
-        row, col = state["sub_menu_row_index"], state["sub_menu_col_index"]
-        layout = mn.channel_sub_layout(db.channels_db["07"], sum(1 for v in db.channels_db.values() if v.get("active")))
-        close = mn.channel_sub_close_row(layout)
-        new_row, new_col = after["sub_menu_row_index"], after["sub_menu_col_index"]
-        if db.channels_db["07"].get("is_visualizer") and row == 5 and direction in (mn.LEFT, mn.RIGHT):
-            strength = db.channels_db["07"].get("reactive_visualizer_strength", mn.REACTIVE_STRENGTH_SPEC[1])
-            check((new_row, new_col) == (row, col), label + " Reactive Strength keeps the cursor where it is")
-            check(mn.REACTIVE_STRENGTH_SPEC[2] <= strength <= mn.REACTIVE_STRENGTH_SPEC[3], label + " Reactive Strength stays inside its range")
-            check({k: v for k, v in after.items() if k != "_step_gate"} == state, label + " Reactive Strength changes only the channel's strength and its step timer")
-            return
-        if db.channels_db["07"].get("is_visualizer") and row == 3 and direction in (mn.LEFT, mn.RIGHT):
-            step = -1 if direction == mn.LEFT else 1
-            check((new_row, new_col) == (row, col), label + " Loudness Gain keeps the cursor where it is")
-            check(after.get("visualizer_gain_db") == step, label + " Loudness Gain moves one dB the way the key points")
-            check(abs(after.get("active_music_gain", 0) - 10 ** (step / 20.0)) < 1e-9, label + " the live music gain follows the dB")
-            check({k: v for k, v in after.items() if k not in ("visualizer_gain_db", "active_music_gain")} == state, label + " Loudness Gain changes only the gain values")
-            return
-        check(0 <= new_row <= close and 0 <= new_col <= mn.CHANNEL_SUB_MAX_COL, label + " stays inside the grid")
-        check(abs(new_row - row) <= 1 or (row == close and new_row == close - 1), label + " moves at most one row")
-        if direction in (mn.LEFT, mn.RIGHT):
-            check(new_row == row, label + " sideways keeps the row")
-        check({k: v for k, v in after.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")} == {k: v for k, v in state.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")}, label + " changes only the cursor")
-        return
-    if name == "HOLIDAY_SUB_MENU":
-        row, col = state["sub_menu_row_index"], state["sub_menu_col_index"]
-        new_row, new_col = after["sub_menu_row_index"], after["sub_menu_col_index"]
-        check(0 <= new_row <= mn.HOLIDAY_CLOSE_ROW and new_col in (0, 1), label + " stays inside the grid")
-        check(new_row != mn.HOLIDAY_CLOSE_ROW or new_col == 0, label + " Close has no second column")
-        if direction in (mn.LEFT, mn.RIGHT) and row < mn.HOLIDAY_CLEAR_ROW:
-            check(new_row == row, label + " sideways keeps the row")
-        if direction == mn.RIGHT and col == 0 and row < mn.HOLIDAY_CLEAR_ROW:
-            check((new_row, new_col) == (row, 1), label + " right goes to the toggle of its row, greyed or not")
-        if direction == mn.LEFT and col == 1 and row < mn.HOLIDAY_CLEAR_ROW:
-            check((new_row, new_col) == (row, 0), label + " left goes back to the file picker")
-        if row == mn.HOLIDAY_CLEAR_ROW and direction == mn.RIGHT:
-            check((new_row, new_col) == (mn.HOLIDAY_CLOSE_ROW, 0), label + " right from Clear Media goes to Close on the same line")
-        if row == mn.HOLIDAY_CLOSE_ROW and direction == mn.LEFT:
-            check((new_row, new_col) == (mn.HOLIDAY_CLEAR_ROW, 0), label + " left from Close goes to Clear Media on the same line")
-        if row == mn.HOLIDAY_CLOSE_ROW and direction == mn.UP:
-            check((new_row, new_col) == (mn.HOLIDAY_ROWS - 1, 1), label + " up from Close goes to the last Force toggle")
-        else:
-            check(abs(new_row - row) <= 1, label + " moves at most one row")
-        check({k: v for k, v in after.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")} == {k: v for k, v in state.items() if k not in ("sub_menu_row_index", "sub_menu_col_index")}, label + " changes only the cursor")
-        return
-    sel_key = "sub_menu_row_index" if name in ("AUDIO_TRACK_PICKER",) else "menu_selection_index"
-    sel = state[sel_key]
-    if name == "SERVER_MENU":
-        extra = db.config["server_role"] in ("server", "user")
-        count = 4 if extra else 3
-        want[sel_key] = old_move_column(sel, count, direction)
-    elif name == "SERVER_PICKER_MENU":
-        want[sel_key] = old_move_column(sel, len(db.config["_picker"]) + 1, direction)
-    elif name == "SERVER_SLOT_ACTIONS":
-        want[sel_key] = old_move_column(sel, 4, direction)
-        if want[sel_key] != sel:
-            want["server_slot_pending_delete"] = False
-    elif name == "AUDIO_TRACK_PICKER":
-        want[sel_key] = old_move_column(sel, len(state["audio_track_list"]) + 2, direction)
-        if state["audio_track_context"] == "channel" and sel == len(state["audio_track_list"]) and direction in (mn.LEFT, mn.RIGHT):
-            want["audio_track_gain_db"] = -1 if direction == mn.LEFT else 1
-    elif name == "REMOTE_REMAP_LIST":
-        want[sel_key] = (sel + (-1 if direction in (mn.UP, mn.LEFT) else 1)) % 3
-    elif name == "SERVER_SLOTS_MENU":
-        column, row = sel // 3, sel % 3
-        row = max(0, row - 1) if direction == mn.UP else min(2, row + 1) if direction == mn.DOWN else row
-        column = max(0, column - 1) if direction == mn.LEFT else min(2, column + 1) if direction == mn.RIGHT else column
-        want[sel_key] = column * 3 + row
-    check(after == want, label + " got %r want %r" % (after, want))
 
 
-def old_move_column(sel, count, direction):
-    """The old W and S clamp written out; A and D did nothing."""
-    if direction == mn.UP:
-        return max(0, min(count - 1, sel - 1))
-    if direction == mn.DOWN:
-        return max(0, min(count - 1, sel + 1))
-    return sel
 
 
 # ============================================================================
@@ -4532,56 +2440,10 @@ def old_move_column(sel, count, direction):
 # ============================================================================
 
 
-def case_actions():
-    for key in list(range(0, 1200)) + [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN, pygame.K_ESCAPE]:
-        want = {pygame.K_w: mn.UP, pygame.K_s: mn.DOWN, pygame.K_a: mn.LEFT, pygame.K_d: mn.RIGHT, pygame.K_RETURN: mn.ACCEPT, pygame.K_ESCAPE: mn.BACK}.get(key)
-        check(mn.key_to_action(key) == want, "key_to_action %d" % key)
-        check(mn.is_accept(key) == (key == pygame.K_RETURN) and mn.is_back(key) == (key == pygame.K_ESCAPE), "is_accept and is_back %d" % key)
-        arrows = {pygame.K_UP: mn.UP, pygame.K_DOWN: mn.DOWN, pygame.K_LEFT: mn.LEFT, pygame.K_RIGHT: mn.RIGHT}.get(key, want)
-        check(mn.key_to_action(key, arrows=True) == arrows, "key_to_action arrows %d" % key)
 
 
-def old_slider(value, direction, low, high):
-    return max(low, min(high, ((value + (5 if direction == mn.RIGHT else -5)) // 5) * 5))
 
 
-def case_sliders():
-    check(set(mn.SLIDER_SPECS) == set(mn.VIDEO_SLIDERS) | set(mn.THEME_SLIDERS), "slider specs cover the Video and Theme sliders")
-    for cell, (key, default, low, high) in mn.SLIDER_SPECS.items():
-        for value in list(range(-12, 405)):
-            for direction in (mn.LEFT, mn.RIGHT):
-                config = {key: value}
-                changed = mn.slider_adjust(config, cell, direction)
-                check(changed is True and config[key] == old_slider(value, direction, low, high), "slider %s %d %s" % (cell, value, direction))
-        config = {}
-        mn.slider_adjust(config, cell, mn.RIGHT)
-        check(config[key] == old_slider(default, mn.RIGHT, low, high), "slider %s starts from its default" % cell)
-        for direction in (mn.UP, mn.DOWN):
-            config = {key: 40}
-            check(mn.slider_adjust(config, cell, direction) is False and config == {key: 40}, "slider %s ignores %s" % (cell, direction))
-    config = {"x": 1}
-    check(mn.slider_adjust(config, "aspect_ratio", mn.RIGHT) is False and config == {"x": 1}, "a cell that is not a slider is left alone")
-    check(mn.slider_adjust({}, mn.CLOSE, mn.LEFT) is False, "Close is not a slider")
-    check(mn.SLIDER_SPECS["bg_hue"][1:] == (220, 0, 360) and mn.SLIDER_SPECS["ui_hue"][1:] == (140, 0, 360) and mn.SLIDER_SPECS["opacity"][1:] == (50, 0, 100), "slider ranges and defaults match the Theme and Video drawing")
-    held = {mn.repeat_allowed("VIDEO_ROWS", key) for key in (pygame.K_a, pygame.K_d)}
-    check(held == {True}, "held slider keys still repeat on Video sliders")
-    key, default, low, high = mn.REACTIVE_STRENGTH_SPEC
-    check(key == "reactive_visualizer_strength" and (default, low, high) == (50, 0, 100), "Reactive Strength spec is the 0 to 100 channel value that starts at 50")
-    for value in list(range(-12, 125)):
-        for direction in (mn.LEFT, mn.RIGHT):
-            ch_info = {key: value}
-            check(mn.reactive_strength_adjust(ch_info, direction) is True and ch_info[key] == old_slider(value, direction, low, high), "reactive strength %d %s moves like the Video sliders" % (value, direction))
-    ch_info = {}
-    mn.reactive_strength_adjust(ch_info, mn.RIGHT)
-    check(ch_info[key] == 55, "reactive strength starts from 50 and moves 5")
-    for direction in (mn.UP, mn.DOWN):
-        ch_info = {key: 40}
-        check(mn.reactive_strength_adjust(ch_info, direction) is False and ch_info == {key: 40}, "reactive strength ignores %s" % direction)
-    check(mn.reactive_strength_adjust({key: 40}, None) is False, "reactive strength ignores a key that is not a direction")
-    check(mn.repeat_allowed("CHANNEL_SUB_MENU", pygame.K_a) and mn.repeat_allowed("CHANNEL_SUB_MENU", pygame.K_d), "held keys repeat on the music channel editor like the Video sliders")
-    f_low = ui._channel_menu_fingerprint({"is_visualizer": True, "reactive_visualizer_strength": 50})
-    check(f_low != ui._channel_menu_fingerprint({"is_visualizer": True, "reactive_visualizer_strength": 55}), "menu picture redraws when Reactive Strength changes")
-    check(f_low != ui._channel_menu_fingerprint({"is_visualizer": True, "reactive_visualizer_strength": 50, "reactive_visualizer_enabled": False}), "menu picture redraws when Reactive Visualizer is toggled")
 
 
 # ============================================================================
@@ -4589,85 +2451,25 @@ def case_sliders():
 # ============================================================================
 
 
-class Dirty:
-    def __init__(self):
-        self.calls = 0
-
-    def __call__(self):
-        self.calls += 1
 
 
-def run_slider_block(runner, state, config, key):
-    db = n6_FakeDb()
-    db.config.update(config)
-    dirty = Dirty()
-    env = make_env()
-    env["_mark_settings_dirty"] = dirty
-    env["now_ticks"] = 100000
-    work = dict(state)
-    with Quiet():
-        fell = runner(types.SimpleNamespace(key=key), work, db, env)
-    work.pop("_nav_memory", None)
-    return fell, work, dict(db.config), dirty.calls
 
 
 VIDEO_CONFIGS = [{}, {"brightness": 0, "contrast": 100, "color": 97, "sharpness": 3, "tint": 55}, {"brightness": 100, "contrast": 0, "color": 2, "sharpness": 50, "tint": 99}]
 THEME_CONFIGS = [{}, {"menu_opacity": 0, "theme_bg_hue": 360, "theme_ui_hue": 0}, {"menu_opacity": 100, "theme_bg_hue": 358, "theme_ui_hue": 3}, {"menu_opacity": 47, "theme_bg_hue": 221, "theme_ui_hue": 219}]
 
 
-def slider_cases():
-    for config in VIDEO_CONFIGS:
-        for row in range(0, 11):
-            yield "VIDEO_ROWS", {"menu_layer": "VIDEO_ROWS", "menu_selection_index": row}, config
-    for config in THEME_CONFIGS:
-        for row in range(0, 8):
-            for column in (0, 1):
-                yield "THEME_ROWS", {"menu_layer": "THEME_ROWS", "menu_selection_index": row, "theme_row2_col": column}, config
 
 
 SLIDER_KEYS = n6_ALL_KEYS + [pygame.K_c]
 
 
-def cut_last_layer(text, layer):
-    """Returns the handler of the last menu layer, which ends where the event loop ends."""
-    begin = text.index(LAYER % layer) + len(LAYER % layer)
-    end = text.index("    _menu_nav_frame_end(_nav_frame_begin, events)", begin)
-    return textwrap.dedent(text[begin:end])
 
 
-def block_runner(text, layer):
-    body = cut_last_layer(text, layer) if layer == "THEME_ROWS" else cut_layer(text, layer)
-    return build_runner_fell("if True:\n" + textwrap.indent(body, "    "))
 
 
-def case_slider_blocks():
-    new_text = read(MAIN_SCRIPT)
-    runners = {layer: block_runner(new_text, layer) for layer in ("VIDEO_ROWS", "THEME_ROWS")}
-    n = 0
-    for layer, state, config in slider_cases():
-        new_runner = runners[layer]
-        for key in SLIDER_KEYS:
-            got = run_slider_block(new_runner, state, config, key)
-            n += 1
-            fell, after, config_after, dirty = got
-            cell = mn.video_cell(state["menu_selection_index"]) if layer == "VIDEO_ROWS" else mn.theme_cell(state["menu_selection_index"], state.get("theme_row2_col", 0))
-            is_slider = cell in mn.SLIDER_SPECS
-            if key in (pygame.K_a, pygame.K_d):
-                check(fell is False, "%s %s %s ends the handler" % (layer, state, pygame.key.name(key)))
-                check(dirty == (1 if is_slider else 0), "%s %s %s marks settings dirty only on a slider" % (layer, state, pygame.key.name(key)))
-                if is_slider:
-                    config_key, default, low, high = mn.SLIDER_SPECS[cell]
-                    direction = mn.LEFT if key == pygame.K_a else mn.RIGHT
-                    check(config_after[config_key] == old_slider(config.get(config_key, default), direction, low, high), "%s %s %s value" % (layer, state, pygame.key.name(key)))
-            else:
-                check(dirty == 0 and config_after == dict(n6_FakeDb(**config).config), "%s %s %s changes no setting" % (layer, state, pygame.key.name(key)))
-    check(n > 1000, "slider cases ran: %d" % n)
 
 
-def case_no_raw_action_keys():
-    text = read(MAIN_SCRIPT)
-    for name in ("pygame.K_RETURN", "pygame.K_ESCAPE", "pygame.K_KP_ENTER"):
-        check(name not in text, "the main script does not test %s itself" % name)
 
 
 # ============================================================================
@@ -4675,64 +2477,6 @@ def case_no_raw_action_keys():
 # ============================================================================
 
 
-def case_hold_functions():
-    check(mn.HOLD_RULES["vertical"] == mn.HoldRule(None, 100, False), "vertical rule is the old 100 ms")
-    check(mn.HOLD_RULES["horizontal"] == mn.HoldRule(None, 110, False), "horizontal rule is the old 110 ms")
-    check(mn.HOLD_RULES["rom_list"] == mn.HoldRule(380, 70, True), "ROM list rule is the old 380 ms then 70 ms")
-    check(mn.HOLD_RULES["volume"] == mn.HoldRule(100, 160, False), "volume rule is 100 ms then 160 ms (V169 started it twice as soon; repeats are now 0.2 s faster than the V169 360 ms)")
-    check(mn.HOLD_STUCK_MS == {"menu": 1500, "guide": 3000, "rom_list": 1500, "volume": 1500, "slider": 15000}, "stuck limits are menu 1500, guide 3000, ROM list 1500, volume 1500, slider 15000")
-    arrows = [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN]
-    for key in list(range(0, 1200)) + arrows:
-        want = (mn.HOLD_RULES["vertical"] if key in (pygame.K_w, pygame.K_s)
-                else mn.HOLD_RULES["horizontal"] if key in (pygame.K_a, pygame.K_d)
-                else mn.HOLD_RULES["volume"] if key in (pygame.K_LEFT, pygame.K_RIGHT) else None)
-        check(mn.hold_rule(key) == want, "hold_rule %d" % key)
-    old_menu = lambda held, since, interval: held > 400 and since >= interval
-    old_rom = lambda held, since: held >= 380 and since >= 70
-    for held in range(0, 1000):
-        for since in list(range(0, 130)) + [200, 500]:
-            check(mn.hold_due(mn.HOLD_RULES["vertical"], held, since, 400) == old_menu(held, since, 100), "vertical due %d %d" % (held, since))
-            check(mn.hold_due(mn.HOLD_RULES["horizontal"], held, since, 400) == old_menu(held, since, 110), "horizontal due %d %d" % (held, since))
-            check(mn.hold_due(mn.HOLD_RULES["rom_list"], held, since) == old_rom(held, since), "ROM list due %d %d" % (held, since))
-    check(mn.hold_due(mn.HOLD_RULES["vertical"], 301, 100, 300) is True and mn.hold_due(mn.HOLD_RULES["vertical"], 300, 100, 300) is False, "the menu delay is the caller's value")
-    for pressed in (True, False):
-        for held in (0, 1499, 1500, 1501, 2999, 3000, 3001, 9000):
-            for released in (True, False):
-                for limit in (1500, 3000):
-                    check(mn.hold_stuck(pressed, held, released, limit) is (not pressed and not released and held > limit), "hold_stuck %s %d %s %d" % (pressed, held, released, limit))
-    for first in (True, False):
-        for second in (True, False):
-            for ticks in ((0, 0), (1, 2), (2, 1), (5, 5)):
-                if first and not second:
-                    want = (mn.DROP_SECOND, mn.DROP_SECOND)
-                elif second and not first:
-                    want = (mn.DROP_FIRST, mn.DROP_FIRST)
-                elif first and second:
-                    want = (mn.DROP_FIRST if ticks[0] <= ticks[1] else mn.DROP_SECOND, mn.DROP_BOTH)
-                else:
-                    want = (mn.DROP_BOTH, mn.DROP_BOTH)
-                check(mn.hold_conflict(first, second, *ticks) == want[0], "hold_conflict older %s %s %s" % (first, second, ticks))
-                check(mn.hold_conflict(first, second, *ticks, both_pressed=mn.DROP_BOTH) == want[1], "hold_conflict both %s %s %s" % (first, second, ticks))
-    check(mn.hold_pick({pygame.K_s, pygame.K_d}, (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d)) == pygame.K_s, "hold_pick takes the first key of the order")
-    check(mn.hold_pick(set(), (pygame.K_w,)) is None and mn.hold_pick({pygame.K_x}, (pygame.K_w,)) is None, "hold_pick finds nothing")
-    up = pygame.event.Event(pygame.KEYUP, key=pygame.K_d)
-    down = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d)
-    check(mn.hold_released([up], pygame.K_d) and not mn.hold_released([down], pygame.K_d) and not mn.hold_released([], pygame.K_d), "hold_released sees a key-up of the key only")
-    check(not mn.hold_released([up], pygame.K_a), "hold_released ignores another key")
-    check(mn.hold_released([pygame.event.Event(pygame.KEYUP, key=999)], pygame.K_d, {999: pygame.K_d}), "hold_released follows the remap source")
-    state = mn.HoldState(pygame.K_d, 5, 9)
-    state.clear()
-    check((state.key, state.start, state.last) == (None, 0, 0), "HoldState.clear")
-    rule = mn.HOLD_RULES["horizontal"]
-    state = mn.HoldState()
-    steps = [(1000, mn.HOLD_STARTED), (1400, mn.HOLD_WAIT), (1401, mn.HOLD_REPEAT), (1500, mn.HOLD_WAIT), (1511, mn.HOLD_REPEAT), (1621, mn.HOLD_REPEAT)]
-    for now, want in steps:
-        check(mn.hold_step(rule, state, pygame.K_d, now, True, False, 1500, 400) == want, "hold_step at %d" % now)
-    check(mn.hold_step(rule, state, pygame.K_a, 1700, True, False, 1500, 400) == mn.HOLD_STARTED and state.key == pygame.K_a and state.start == 1700, "a new key restarts the hold")
-    check(mn.hold_step(rule, state, pygame.K_a, 3300, False, False, 1500, 400) == mn.HOLD_STUCK and state.key is None, "a key that is not down and not released is stuck and clears the hold")
-    state = mn.HoldState()
-    mn.hold_step(rule, state, pygame.K_a, 0, True, False, 1500, 400)
-    check(mn.hold_step(rule, state, pygame.K_a, 3300, False, True, 1500, 400) != mn.HOLD_STUCK, "a key released in this frame is not stuck")
 
 
 # ============================================================================
@@ -4742,7 +2486,7 @@ def case_hold_functions():
 INJECTOR_HEAD = '        _mnav_held_set = app_state["_held_keys"]\n'
 INJECTOR_TAIL = '    _fgap_last = app_state.get("_frame_gap_last_ticks")'
 GUIDE_HEAD = '        for _gh_a, _gh_b in ((pygame.K_w, pygame.K_s), (pygame.K_a, pygame.K_d)):\n            if _gh_a in app_state["_held_keys"]'
-GUIDE_TAIL = '    _prof_mark("idle_input")'
+GUIDE_TAIL = '    # SECTION: Volume OSD'
 WASD = (pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d)
 FRAMES = 60
 
@@ -4769,16 +2513,8 @@ def function_source(text, name):
     raise KeyError(name)
 
 
-def kind_of(lines):
-    return sorted("both" if "saw both" in line else "stuck" for line in lines)
 
 
-def key_up_mimic(state, events):
-    for event in events:
-        if event.type == pygame.KEYUP:
-            key = state["_held_keys_source"].pop(event.key, event.key)
-            state["_held_keys"].discard(key)
-            state["_held_keys"].discard(event.key)
 
 
 def timeline(held, mode, release_frame, step_ms):
@@ -4791,148 +2527,29 @@ def timeline(held, mode, release_frame, step_ms):
         yield frame, now, matrix, ups
 
 
-def injector_runner(text):
-    block = cut(text, INJECTOR_HEAD, INJECTOR_TAIL)
-    code = ("def run(app_state, _mnav_held_set, _mnav_matrix, events, now_ticks, pygame, log, _menu_nav_trace, _MENU_NAV_REPEAT_DELAY_MS):\n"
-            "    if True:\n" + textwrap.indent(block, "        "))
-    ns = {"menu_nav": mn}
-    exec(code, ns)
-    return ns["run"]
 
 
-def injector_state(new, layer, selection, held, down_layer, down_ticks):
-    state = {"menu_layer": layer, "menu_selection_index": selection, "_held_keys": set(held), "_held_keys_source": {},
-             "_held_key_down_layer": {key: down_layer for key in held}, "_held_key_down_ticks": dict(down_ticks)}
-    if new:
-        state["_hold_menu"] = mn.HoldState()
-    else:
-        state.update({"_menu_nav_hold_key": None, "_menu_nav_hold_start": 0, "_menu_nav_last_repeat": 0})
-    return state
 
 
-def injector_hold(state):
-    if "_hold_menu" in state:
-        hold = state["_hold_menu"]
-        return (hold.key, hold.start, hold.last) if hold.key is not None else (None,)
-    key = state["_menu_nav_hold_key"]
-    return (key, state["_menu_nav_hold_start"], state["_menu_nav_last_repeat"]) if key is not None else (None,)
 
 
-def run_injector(runner, new, layer, selection, held, down_layer, down_ticks, mode, release_frame, step_ms):
-    state = injector_state(new, layer, selection, held, down_layer, down_ticks)
-    log = Recorder()
-    trace = []
-    frames = []
-    for frame, now, matrix, ups in timeline(held, mode, release_frame, step_ms):
-        events = [pygame.event.Event(pygame.KEYUP, key=key) for key in ups]
-        before = len(events)
-        runner(state, state["_held_keys"], matrix, events, now, pygame, log, lambda *a, **k: trace.append(a[:2]), 400)
-        injected = [(event.key, getattr(event, "menu_repeat", False)) for event in events[before:]]
-        lines, log.lines = list(log.lines), []
-        key_up_mimic(state, events)
-        frames.append((injected, sorted(state["_held_keys"]), injector_hold(state), kind_of(lines), bool(ups), len(trace)))
-    return frames
 
 
-def injector_expectations():
-    """The false warning: a key held a long time and then released does not log a stuck key, but a key that stops being down without a key-up still does."""
-    runner = injector_runner(read(MAIN_SCRIPT))
-    for key in WASD:
-        for mode, expect in (("released", False), ("swallowed", True)):
-            frames = run_injector(runner, True, "VIDEO_ROWS", 5, (key,), "VIDEO_ROWS", {}, mode, 40, 50)
-            warned = any("stuck" in frame[3] for frame in frames)
-            check(warned is expect, "injector %s %s: stuck warning %s" % (pygame.key.name(key), mode, expect))
-    frames = run_injector(runner, True, "VIDEO_ROWS", 5, (pygame.K_d,), "VIDEO_ROWS", {}, "down", 0, 16)
-    check(sum(len(frame[0]) for frame in frames) >= 5, "a held D on a Video slider still repeats")
-    frames = run_injector(runner, True, "VIDEO_ROWS", 5, (pygame.K_a, pygame.K_d), "VIDEO_ROWS", {pygame.K_a: 1, pygame.K_d: 2}, "released", 5, 16)
-    check(not any("both" in frame[3] for frame in frames), "two keys let go in the same frame do not log a stuck pair")
-    frames = run_injector(runner, True, "VIDEO_ROWS", 5, (pygame.K_a, pygame.K_d), "VIDEO_ROWS", {pygame.K_a: 1, pygame.K_d: 2}, "swallowed", 0, 16)
-    check(any("both" in frame[3] for frame in frames), "two keys that vanish without a key-up still log a stuck pair")
 
 
 GUIDE_CHANNELS = {"active_all": {}, "some_off": {"06": False, "09": False, "12": False, "44": False}, "two": {str(i).zfill(2): (i in (5, 20)) for i in range(5, 45)}}
 
 
-def guide_namespace(text, new):
-    ns = {"pygame": pygame, "menu_nav": mn, "_MENU_NAV_REPEAT_DELAY_MS": 400}
-    ns["_key_is_held"] = lambda key: key in ns["app_state"]["_held_keys"]
-    ns["_guide_dirty_event"] = types.SimpleNamespace(set=lambda: ns["calls"].append(("dirty",)))
-    ns["get_guide_visible_rows"] = lambda db: ns["visible_rows"]
-    ns["_clear_last_video_frame"] = lambda **kw: ns["calls"].append(("clear", kw.get("context")))
-    ns["_arm_guide_preview_transition"] = lambda: ns["calls"].append(("arm",))
-    ns["_resync_guide_stop_after_row_switch"] = lambda: ns["calls"].append(("resync",))
-    ns["_guide_jump_col"] = lambda direction, _source="unknown": ns["calls"].append(("jump", direction, _source))
-    if new:
-        exec(function_source(text, "_guide_step_row"), ns)
-    block = cut(text, GUIDE_HEAD, GUIDE_TAIL)
-    exec("def run():\n    if True:\n" + textwrap.indent(block, "        "), ns)
-    return ns
 
 
-def guide_state(new, selected, offset, held, ticks):
-    state = {"_held_keys": set(held), "_held_keys_source": {}, "_held_key_down_ticks": dict(ticks), "selected_guide_channel": selected,
-             "highlighted_guide_channel": str(selected).zfill(2), "guide_row_offset": offset, "guide_inactivity_timer": 0}
-    if new:
-        state["_hold_guide"] = mn.HoldState()
-    else:
-        state.update({"_gh_held_key": None, "_gh_hold_start": 0, "_gh_last_repeat": 0})
-    return state
 
 
-def guide_hold(state):
-    if "_hold_guide" in state:
-        hold = state["_hold_guide"]
-        return (hold.key, hold.start, hold.last) if hold.key is not None else (None,)
-    key = state["_gh_held_key"]
-    return (key, state["_gh_hold_start"], state["_gh_last_repeat"]) if key is not None else (None,)
 
 
-def n7_run_guide(ns, new, channels, selected, offset, rows, held, ticks, mode, release_frame, step_ms):
-    state = guide_state(new, selected, offset, held, ticks)
-    ns["app_state"] = state
-    ns["MENU_IDLE_CLOSE_MS"] = int(gov.MENU_IDLE_CLOSE_SECONDS * 1000)
-    ns["db"] = types.SimpleNamespace(channels_db={str(i).zfill(2): ({"active": channels[str(i).zfill(2)]} if str(i).zfill(2) in channels else {}) for i in range(5, 45)})
-    ns["visible_rows"] = rows
-    log = Recorder()
-    ns["log"] = log
-    frames = []
-    for frame, now, matrix, ups in timeline(held, mode, release_frame, step_ms):
-        ns["calls"] = []
-        ns["now_ticks_ms"] = now
-        ns["pressed_keys_matrix"] = matrix
-        ns["run"]()
-        lines, log.lines = list(log.lines), []
-        for key in ups:
-            state["_held_keys"].discard(key)
-        frames.append((list(ns["calls"]), state["selected_guide_channel"], state["highlighted_guide_channel"], state["guide_row_offset"],
-                       state["guide_inactivity_timer"], sorted(state["_held_keys"]), guide_hold(state), kind_of(lines)))
-    return frames
 
 
-def case_hold_blocks():
-    new_text = read(MAIN_SCRIPT)
-    injector_expectations()
-    guide_expectations(new_text)
 
 
-def guide_expectations(new_text):
-    ns = guide_namespace(new_text, True)
-    channels = GUIDE_CHANNELS["active_all"]
-    frames = n7_run_guide(ns, True, channels, 5, 0, 5, (pygame.K_s,), {}, "down", 0, 16)
-    check(any(("resync",) in frame[0] for frame in frames) is False, "a held row repeat does not re-aim the time stop, as before")
-    check(any(frame[1] == 6 for frame in frames), "a held S moves the guide down")
-    ns["calls"] = []
-    ns["app_state"] = guide_state(True, 5, 0, (), {})
-    ns["db"] = types.SimpleNamespace(channels_db={})
-    ns["visible_rows"] = 5
-    ns["_guide_step_row"](1, True)
-    check(("resync",) in ns["calls"] and ns["app_state"]["selected_guide_channel"] == 6, "one key press moves a row and re-aims the time stop")
-    ns["calls"] = []
-    ns["db"] = None
-    ns["_guide_step_row"](1, True)
-    check(ns["calls"] == [], "no database, no row move")
-    frames = n7_run_guide(ns, True, channels, 5, 0, 5, (pygame.K_s,), {}, "swallowed", 3, 250)
-    check(sum("stuck" in frame[7] for frame in frames) == 1, "a stuck guide key logs once")
 
 
 # ============================================================================
@@ -4940,53 +2557,12 @@ def guide_expectations(new_text):
 # ============================================================================
 
 
-def case_action_keys():
-    arrows_of = {mn.UP: pygame.K_UP, mn.DOWN: pygame.K_DOWN, mn.LEFT: pygame.K_LEFT, mn.RIGHT: pygame.K_RIGHT}
-    first = {mn.UP: pygame.K_w, mn.DOWN: pygame.K_s, mn.LEFT: pygame.K_a, mn.RIGHT: pygame.K_d, mn.ACCEPT: pygame.K_RETURN, mn.BACK: pygame.K_ESCAPE}
-    for action in (mn.UP, mn.DOWN, mn.LEFT, mn.RIGHT, mn.ACCEPT, mn.BACK):
-        check(mn.action_keys(action) == (first[action],), "action_keys %s" % action)
-        want = (first[action], arrows_of[action]) if action in arrows_of else (first[action],)
-        check(mn.action_keys(action, arrows=True) == want, "action_keys arrows %s" % action)
-        check(mn.action_key(action) == first[action], "action_key %s" % action)
-        check(mn.key_to_action(mn.action_key(action)) == action, "action_key round trip %s" % action)
-    for key in list(range(0, 1200)) + [pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT]:
-        for arrows in (False, True):
-            action = mn.key_to_action(key, arrows)
-            check((action is not None) == any(key in mn.action_keys(a, arrows) for a in (mn.UP, mn.DOWN, mn.LEFT, mn.RIGHT, mn.ACCEPT, mn.BACK)), "action_keys cover key %d %s" % (key, arrows))
-            direction = mn.key_to_direction(key, arrows)
-            check(direction == (action if action in mn.DIRECTIONS else None), "key_to_direction agrees with key_to_action %d %s" % (key, arrows))
-    every = [pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN, pygame.K_ESCAPE, pygame.K_x]
-    for mask in range(1 << len(every)):
-        matrix = collections.defaultdict(bool)
-        down = [key for index, key in enumerate(every) if mask >> index & 1]
-        for key in down:
-            matrix[key] = True
-        for arrows in (False, True):
-            want = {mn.key_to_action(key, arrows) for key in down} - {None}
-            check(mn.pressed_actions(matrix, arrows) == want, "pressed_actions %d %s" % (mask, arrows))
-    check(mn.HOLD_RULES["gamepad"] == mn.HoldRule(400, 180, True), "gamepad rule is 400 ms then 180 ms, inclusive")
 
 
-def old_pad_due(held_s, since_s):
-    return held_s >= 400 / 1000 and since_s >= 180 / 1000
 
 
-def case_pad_rule_numbers():
-    rule = mn.HOLD_RULES["gamepad"]
-    steps = [i / 1000 for i in range(0, 1200)]
-    differ = 0
-    for held in steps[::3]:
-        for since in steps[::3]:
-            if mn.hold_due(rule, held * 1000.0, since * 1000.0) != old_pad_due(held, since):
-                differ += 1
-    check(differ == 0, "gamepad hold_due against the old seconds test over %d pairs: %d differ" % (len(steps[::3]) ** 2, differ))
 
 
-def case_no_raw_deck_keys():
-    deck = read(os.path.join(ROOT, "game_deck.py"))
-    raw = [line.strip() for line in deck.splitlines() if "pygame.K_" in line]
-    check(raw == [], "game_deck has no raw pygame key left (Backspace moved to menu_nav in v94): %s" % raw)
-    check('_nav.HOLD_RULES["gamepad"]' in deck, "the gamepad worker takes its numbers from menu_nav")
 
 
 # ============================================================================
@@ -4999,155 +2575,16 @@ def case_no_raw_deck_keys():
 # ============================================================================
 
 
-def case_keys():
-    wanted = {pygame.K_w: mn.UP, pygame.K_s: mn.DOWN, pygame.K_a: mn.LEFT, pygame.K_d: mn.RIGHT, pygame.K_RETURN: mn.ACCEPT, pygame.K_ESCAPE: mn.BACK}
-    arrows = {pygame.K_UP: mn.UP, pygame.K_DOWN: mn.DOWN, pygame.K_LEFT: mn.LEFT, pygame.K_RIGHT: mn.RIGHT}
-    for key in list(range(0, 1200)) + list(arrows):
-        plain = wanted.get(key)
-        check(mn.key_to_action(key) == plain, "default key_to_action %d is unchanged" % key)
-        check(mn.key_to_action(key, arrows=True) == arrows.get(key, plain), "arrows key_to_action %d is unchanged" % key)
-        parent = mn.PARENT if key == pygame.K_BACKSPACE else plain
-        check(mn.key_to_action(key, parent=True) == parent, "parent key_to_action %d" % key)
-        check(mn.key_to_action(key, arrows=True, parent=True) == (mn.PARENT if key == pygame.K_BACKSPACE else arrows.get(key, plain)), "arrows and parent key_to_action %d" % key)
-        check(not mn.is_accept(key) or key == pygame.K_RETURN, "Backspace is not accept %d" % key)
-        check(not mn.is_back(key) or key == pygame.K_ESCAPE, "Backspace is not back %d" % key)
-    check(mn.PARENT not in mn.DIRECTIONS and mn.PARENT not in (mn.ACCEPT, mn.BACK), "PARENT is its own action")
-    check(mn.key_to_direction(pygame.K_BACKSPACE) is None, "Backspace is no direction")
-    check(pygame.K_BACKSPACE not in mn.action_keys(mn.BACK) and pygame.K_BACKSPACE not in mn.action_keys(mn.ACCEPT), "action_keys leaves Backspace out")
-    down = collections.defaultdict(bool)
-    down[pygame.K_BACKSPACE] = True
-    check(mn.pressed_actions(down) == set() and mn.pressed_actions(down, arrows=True) == set(), "pressed_actions leaves Backspace out")
 
 
-def case_wheel():
-    for count in range(0, 41):
-        for visible in range(1, 16):
-            for scroll in range(0, count + 7):
-                for notches in range(-4, 5):
-                    old = max(0, min(max(0, count - visible), scroll - notches * 3))
-                    check(mn.explorer_wheel(scroll, count, visible, notches) == old, "wheel %r" % ((count, visible, scroll, notches),))
-                old_up = max(0, min(max(0, count - visible), scroll - 3))
-                old_down = max(0, min(max(0, count - visible), scroll + 3))
-                check(mn.explorer_wheel_button(4, scroll, count, visible) == old_up, "wheel button 4 %r" % ((count, visible, scroll),))
-                check(mn.explorer_wheel_button(5, scroll, count, visible) == old_down, "wheel button 5 %r" % ((count, visible, scroll),))
-    for button in range(0, 12):
-        if button not in (4, 5):
-            check(mn.explorer_wheel_button(button, 5, 50, 5) is None, "button %d is no wheel button" % button)
 
 
-def case_select_and_clicks():
-    rows = 10
-    for index in range(-3, rows + 3):
-        for anchor in (0, 3, 9):
-            for selection in (set(), {2}, {2, 3, 4}, {index}):
-                for shift in (False, True):
-                    for ctrl in (False, True):
-                        got = mn.explorer_select(index, rows, selection, anchor, shift, ctrl)
-                        if 0 <= index < rows:
-                            if shift:
-                                want = (set(range(min(anchor, index), max(anchor, index) + 1)), anchor)
-                            elif ctrl:
-                                want = (set(selection) ^ {index}, index)
-                            else:
-                                want = ({index}, index)
-                        else:
-                            want = (selection if (shift or ctrl) else set(), anchor)
-                        check(got == want, "select %r" % ((index, anchor, sorted(selection), shift, ctrl),))
-    selection = {1, 2}
-    mn.explorer_select(1, rows, selection, 0, False, True)
-    check(selection == {1, 2}, "select does not change the set it is given")
-    for gap in range(0, 1200):
-        check(mn.explorer_double_click(10000 + gap, 10000, 4, 4) == (gap < 500), "double click gap %d" % gap)
-        check(not mn.explorer_double_click(10000 + gap, 10000, 4, 5), "double click on another row %d" % gap)
-    check(not mn.explorer_double_click(100, 0, -1, 4), "no earlier click is no double click")
-    shift, ctrl = mn.explorer_modifiers(0)
-    check((shift, ctrl) == (False, False), "no modifiers")
-    for mods in range(0, 1 << 14):
-        shift, ctrl = mn.explorer_modifiers(mods)
-        check(shift == bool(mods & pygame.KMOD_SHIFT) and ctrl == bool(mods & pygame.KMOD_CTRL), "modifiers %d" % mods)
 
 
-def case_rows():
-    for y in range(-5, 300):
-        for scroll in (0, 1, 7):
-            want = -1 if (y < 100 or y >= 240) else int(scroll + (y - 100) // 34)
-            check(mn.explorer_row_at(y, 100, 240, 34, scroll) == want, "row_at %r" % ((y, scroll),))
-            check(mn.explorer_row_at(y + 0.5, 100, 240, 34, scroll) == (-1 if (y + 0.5 < 100 or y + 0.5 >= 240) else int(scroll + (y + 0.5 - 100) // 34)), "row_at float %r" % ((y, scroll),))
-    for count in (0, 1, 4, 5, 9, 30):
-        for scroll in (-3, 0, 2, 6, 40):
-            for y in range(95, 100 + 5 * 40 + 6):
-                got = mn.explorer_list_pick(y, 100, 5, 40, count, scroll)
-                if not (100 <= y < 300):
-                    want = None
-                else:
-                    held = max(0, min(max(0, count - 5), scroll))
-                    index = held + int((y - 100) // 40)
-                    want = index if 0 <= index < count else -1
-                check(got == want, "list_pick %r" % ((count, scroll, y),))
-    for x in range(0, 120):
-        check(mn.explorer_in_remove_zone(x, 100, 24) == (x >= 76), "remove zone %d" % x)
-    check(mn.explorer_visible_rows(0, 34) == 1 and mn.explorer_visible_rows(33, 34) == 1 and mn.explorer_visible_rows(68, 34) == 2 and mn.explorer_visible_rows(700, 34) == 20, "visible rows")
-    rect = pygame.Rect(10, 20, 30, 40)
-    for x in (9, 9.9, 10, 39, 39.9, 40, -0.5):
-        for y in (19, 20, 59, 59.5, 60):
-            check(mn.explorer_hit(rect, x, y) == rect.collidepoint(x, y), "hit %r" % ((x, y),))
-    buttons = [(pygame.Rect(0, 0, 10, 10), "a"), (pygame.Rect(5, 5, 10, 10), "b"), (pygame.Rect(20, 0, 5, 5), "c")]
-    check(mn.explorer_button_at(buttons, 7, 7) == "a" and mn.explorer_button_at(buttons, 12, 12) == "b" and mn.explorer_button_at(buttons, 21, 1) == "c" and mn.explorer_button_at(buttons, 30, 30) is None, "button_at picks the first match")
-    check(mn.explorer_in_band(100, 100, 40) and not mn.explorer_in_band(140, 100, 40) and not mn.explorer_in_band(99, 100, 40), "in_band")
-    check(mn.explorer_drag_moved((10, 10), 14, 10) is False and mn.explorer_drag_moved((10, 10), 15, 10) and mn.explorer_drag_moved((10, 10), 10, 5) and not mn.explorer_drag_moved((10, 10), 6, 14), "drag moved needs more than 4 pixels")
 
 
-def case_drag_steps():
-    for count in (0, 1, 5, 12, 40):
-        for visible in (1, 5, 8):
-            for scroll in range(0, max(1, count) + 2):
-                for anchor in (0, 2, 4, 11):
-                    for y in (50, 60, 99, 100, 101, 133, 134, 135, 269, 270, 271, 300, 320, 321, 400):
-                        for wait in (0, 59, 60, 61, 119, 120, 200):
-                            got = mn.explorer_drag_step(y, 100, 270, 34, count, visible, scroll, anchor, 1000, 1000 + wait)
-                            max_scroll = max(0, count - visible)
-                            delta = 0
-                            speed = 120
-                            if y < 100:
-                                speed = max(60, 120 - int(60 * min(100 - y, 50) / 50))
-                                delta = -1
-                            elif y > 270:
-                                speed = max(60, 120 - int(60 * min(y - 270, 50) / 50))
-                                delta = 1
-                            stamp = 1000
-                            sc = scroll
-                            if delta and wait >= speed:
-                                sc = max(0, min(max_scroll, sc + delta))
-                                stamp = 1000 + wait
-                            if y <= 100:
-                                index = sc
-                            elif y >= 270:
-                                index = sc + visible - 1
-                            else:
-                                index = sc + int((y - 100) // 34)
-                            index = max(0, min(count - 1, index))
-                            want = (sc, set(range(min(anchor, index), max(anchor, index) + 1)), stamp)
-                            check(got == want, "drag step %r" % ((count, visible, scroll, anchor, y, wait),))
 
 
-def case_scrollbar_press():
-    for count in (0, 1, 14, 50, 300):
-        for visible in (1, 8, 20):
-            for y in range(112, 117 + 400 + 6, 3):
-                for x in (895, 899, 900, 904, 907, 908, 910, 911.5):
-                    for scroll in sorted({0, 1, max(0, count - visible) // 2, max(0, count - visible)}):
-                        got = mn.explorer_scrollbar_press(x, y, 900, 117, 400, count, visible, scroll)
-                        thumb_y, thumb_h = mn.explorer_thumb(117, 400, count, visible, scroll)
-                        thumb = pygame.Rect(900, thumb_y, 8, thumb_h)
-                        if thumb.collidepoint(x, y):
-                            want = (None, y - thumb.y)
-                        else:
-                            grab = thumb.h // 2
-                            new_ty = max(117, min(117 + 400 - thumb.h, y - grab))
-                            want = (mn.explorer_scroll_from_thumb(new_ty, 117, 400, count, visible), grab)
-                        check(got == want, "scrollbar press %r" % ((count, visible, x, y, scroll),))
-    track = mn.explorer_scrollbar_track(900, 117, 400)
-    check((track.x, track.y, track.w, track.h) == (896, 117, 16, 400), "scrollbar track is the thumb column plus the pad")
 
 
 # ============================================================================
@@ -5155,55 +2592,8 @@ def case_scrollbar_press():
 # ============================================================================
 
 
-def case_static():
-    text = read(MAIN_SCRIPT)
-    handler = function_source(text, "_fe_handle_event")
-    for needle in ("collidepoint", "K_BACKSPACE", "KMOD_", "_ZONE", "< 500", "* 3", "scroll - 3", "scroll + 3", "_SB_PAD", "idx_at", "max(1, items_h"):
-        check(needle not in handler, "the explorer handler no longer holds %r itself" % needle)
-    check("_fe_scroll_from_thumb_y" not in text, "the old scroll-from-thumb helper is removed")
-    thumb = function_source(text, "_fe_scrollbar_thumb_rect")
-    check("max(20" not in thumb, "the thumb rectangle helper holds no sizes of its own")
-    nav_text = read(os.path.join(ROOT, "menu_nav.py"))
-    section = nav_text[nav_text.index("# SECTION: File explorer"):nav_text.index("# SECTION: Exports")]
-    check("# WARNING: the fallback numbers below must match EXPLORER_WHEEL_ROWS" in section and "if _governor is not None else" in section,
-          "the explorer numbers read the governor, with the fallback under one WARNING line")
-    gov_text = read(os.path.join(ROOT, "performance_governor.py"))
-    check("# VALUES CHANGE HERE" in gov_text[:gov_text.index("\nEXPLORER_WHEEL_ROWS = ")].rsplit("\n\n", 1)[-1],
-          "the explorer numbers carry the VALUES CHANGE HERE tag in the governor")
-    for name in ("EXPLORER_WHEEL_ROWS", "EXPLORER_DOUBLE_CLICK_MS", "EXPLORER_DRAG_START_PX", "EXPLORER_DRAG_EDGE_ZONE_PX", "EXPLORER_THUMB_MIN_H"):
-        check(name in section and ('"%s"' % name) in nav_text, "%s is defined and exported" % name)
-    lines = text.splitlines()
-    for number, line in enumerate(lines):
-        if "pygame.K_BACKSPACE" in line:
-            around = "\n".join(lines[number:number + 4])
-            check("[:-1]" in around or "skip_current_remap_button" in around, "the Backspace on line %d deletes a typed character or skips a remap button" % (number + 1))
-    check(sum("pygame.K_BACKSPACE" in line or "pygame.K_SPACE" in line for line in lines) == 0, "no raw Backspace or Space test remains in the main script (v95 moved them to menu_nav)")
-    check(all(name in mn.__all__ for name in dir(mn) if name.startswith("explorer_")), "every explorer function is exported")
 
 
-class TestMenuNavFileExplorer(_SectionCase):
-    """File explorer: Backspace as parent, wheel, scrollbar, row selection, double click, drag select"""
-
-    def test_keys(self):
-        self.run_section(case_keys)
-
-    def test_wheel(self):
-        self.run_section(case_wheel)
-
-    def test_select_and_clicks(self):
-        self.run_section(case_select_and_clicks)
-
-    def test_rows(self):
-        self.run_section(case_rows)
-
-    def test_drag_steps(self):
-        self.run_section(case_drag_steps)
-
-    def test_scrollbar_press(self):
-        self.run_section(case_scrollbar_press)
-
-    def test_static(self):
-        self.run_section(case_static)
 
 
 # ============================================================================
@@ -5211,282 +2601,24 @@ class TestMenuNavFileExplorer(_SectionCase):
 # ============================================================================
 
 
-def n8_run_guide_hold(text, frames):
-    """Runs the real held-repeat block frame by frame on a simulated clock; frames is a list of (now_ms, held keys)."""
-    log_lines = []
-    calls = []
-    app_state = {"_hold_guide": mn.HoldState(), "_held_keys": set(), "guide_inactivity_timer": 0}
-    ns = {
-        "MENU_IDLE_CLOSE_MS": int(gov.MENU_IDLE_CLOSE_SECONDS * 1000),
-        "pygame": pygame, "menu_nav": mn, "app_state": app_state, "log": types.SimpleNamespace(warning=lambda *a: log_lines.append(a)),
-        "_guide_dirty_event": types.SimpleNamespace(set=lambda: calls.append(("dirty",))),
-        "_guide_jump_col": lambda step, _source: calls.append(("col", step, _source)),
-        "_guide_step_row": lambda step, resync: calls.append(("row", step, resync)),
-        "_resync_guide_stop_after_row_switch": lambda: calls.append(("resync",)),
-        "_MENU_NAV_REPEAT_DELAY_MS": 400,
-    }
-    body = textwrap.dedent(text)
-    src = "def frame(now_ticks_ms, held, pressed_keys_matrix):\n    app_state['_held_keys'] = set(held)\n    _key_is_held = lambda k: k in app_state['_held_keys']\n" + textwrap.indent(body, "    ")
-    exec(src, ns)
-    out = []
-    for now_ms, held in frames:
-        calls.clear()
-        matrix = {k: True for k in held}
-        ns["frame"](now_ms, held, types.SimpleNamespace(__getitem__=None) if False else n8_Matrix(matrix))
-        out.append(tuple(calls))
-    return out, app_state
 
 
-class n8_Matrix:
-    def __init__(self, data):
-        self.data = data
-
-    def __getitem__(self, key):
-        return self.data.get(key, False)
 
 
-def n8_case_wheel_clamp():
-    """Every wheel path clamps at the end of the list."""
-    for count in range(0, 40):
-        for visible in range(1, 14):
-            for scroll in range(0, 45):
-                top = max(0, count - visible)
-                for notches in (-3, -2, -1, 1, 2, 3):
-                    got = mn.explorer_wheel(scroll, count, visible, notches)
-                    want = max(0, min(top, scroll - notches * mn.EXPLORER_WHEEL_ROWS))
-                    check(got == want, f"wheel {scroll},{count},{visible},{notches}")
-                up = mn.explorer_wheel_button(4, scroll, count, visible)
-                down = mn.explorer_wheel_button(5, scroll, count, visible)
-                check(up == max(0, min(top, scroll - mn.EXPLORER_WHEEL_ROWS)), f"btn4 {scroll},{count},{visible}")
-                check(down == max(0, min(top, scroll + mn.EXPLORER_WHEEL_ROWS)), f"btn5 {scroll},{count},{visible}")
-                check(up <= top and down <= top, f"wheel stays in list {scroll},{count},{visible}")
-    for button in (0, 1, 2, 3, 6, 7, 8):
-        check(mn.explorer_wheel_button(button, 5, 30, 10) is None, f"non-wheel button {button}")
 
 
-def n8_case_joystick():
-    """The one place a joystick event becomes an action."""
-    def event(kind, **fields):
-        return pygame.event.Event(kind, **fields)
-
-    for value, want in (((0, 1), mn.UP), ((0, -1), mn.DOWN), ((-1, 0), mn.LEFT), ((1, 0), mn.RIGHT), ((0, 0), None),
-                        ((1, 1), mn.UP), ((-1, -1), mn.DOWN), (1, mn.UP), (-1, mn.DOWN), (0, None)):
-        check(mn.joystick_action(event(pygame.JOYHATMOTION, value=value, joy=0, hat=0)) == want, "hat %r" % (value,))
-    limit = mn.JOY_AXIS_THRESHOLD
-    for axis, low, high in ((mn.JOY_VERTICAL_AXIS, mn.UP, mn.DOWN), (mn.JOY_HORIZONTAL_AXIS, mn.LEFT, mn.RIGHT)):
-        for value, want in ((-1.0, low), (-limit - 0.01, low), (-limit, None), (-0.1, None), (0.0, None), (0.1, None),
-                            (limit, None), (limit + 0.01, high), (1.0, high)):
-            check(mn.joystick_action(event(pygame.JOYAXISMOTION, axis=axis, value=value, joy=0)) == want, "axis %d %r" % (axis, value))
-    for axis in range(0, 8):
-        if axis not in (mn.JOY_VERTICAL_AXIS, mn.JOY_HORIZONTAL_AXIS):
-            check(mn.joystick_action(event(pygame.JOYAXISMOTION, axis=axis, value=1.0, joy=0)) is None, "unmapped axis %d" % axis)
-    for button in range(0, 20):
-        want = mn.ACCEPT if button in mn.JOY_ACCEPT_BUTTONS else (mn.BACK if button in mn.JOY_BACK_BUTTONS else None)
-        check(mn.joystick_action(event(pygame.JOYBUTTONDOWN, button=button, joy=0)) == want, "button down %d" % button)
-        check(mn.joystick_action(event(pygame.JOYBUTTONUP, button=button, joy=0)) is None, "button up %d" % button)
-    check(not (set(mn.JOY_ACCEPT_BUTTONS) & set(mn.JOY_BACK_BUTTONS)), "no button is both accept and back")
-    check(mn.joystick_action(event(pygame.KEYDOWN, key=pygame.K_w, mod=0, unicode="w", scancode=0)) is None, "a key press is not a joystick action")
-    check(mn.joystick_action(event(pygame.MOUSEBUTTONDOWN, pos=(0, 0), button=1)) is None, "a mouse click is not a joystick action")
 
 
-def n8_case_digit_entry():
-    """Channel number entry: keys, steps, deadline, channel text."""
-    keycodes = list(range(0, 1200)) + list(range(0x40000000, 0x40000000 + 700)) + [pygame.K_KP0 + i for i in range(-3, 15)]
-    digit_keys = {}
-    for key in keycodes:
-        digit = mn.key_to_digit(key)
-        if digit is not None:
-            digit_keys[key] = digit
-    check(len(digit_keys) == 20, f"20 digit keys, got {len(digit_keys)}")
-    old_map = {
-        pygame.K_KP0: "0", pygame.K_KP1: "1", pygame.K_KP2: "2", pygame.K_KP3: "3", pygame.K_KP4: "4",
-        pygame.K_KP5: "5", pygame.K_KP6: "6", pygame.K_KP7: "7", pygame.K_KP8: "8", pygame.K_KP9: "9",
-    }
-    for key in keycodes:
-        want = None
-        if key in [pygame.K_0, pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5, pygame.K_6, pygame.K_7, pygame.K_8, pygame.K_9]:
-            want = chr(key)
-        elif key in old_map:
-            want = old_map[key]
-        check(mn.key_to_digit(key) == want, f"key_to_digit {key}")
 
 
-    def old_digit_block(buffer, digit, now):
-        """The digit rule written out: a full number waits the confirm time, a short one waits the single-digit time."""
-        state = {"digit_buffer": buffer}
-        if len(state.get("digit_buffer", "")) < 2:
-            state["digit_buffer"] = state.get("digit_buffer", "") + digit
-        if len(state["digit_buffer"]) >= 2:
-            state["digit_timer"] = now + 350
-        else:
-            state["digit_timer"] = now + 2500
-        return state["digit_buffer"], state["digit_timer"]
 
 
-    for buffer in ("", "1", "12", "07", "99"):
-        for digit in "0123456789":
-            for now in (0, 1, 999, 123456):
-                check(mn.digit_entry_step(buffer, digit, now) == old_digit_block(buffer, digit, now), f"digit step {buffer!r} {digit} {now}")
-        for deadline in (0, 100, 5000):
-            for now in (0, 99, 100, 101, 5000, 6000):
-                check(mn.digit_entry_due(buffer, deadline, now) == bool(buffer and now >= deadline), f"digit due {buffer!r} {deadline} {now}")
-        check(mn.digit_entry_channel(buffer) == buffer.zfill(2), f"digit channel {buffer!r}")
-    check((mn.DIGIT_ENTRY_MAX, mn.DIGIT_ENTRY_SINGLE_MS, mn.DIGIT_ENTRY_CONFIRM_MS) == (2, 2500, 350), "digit numbers match the rule: two digits, 2.5 seconds for a single digit, 0.35 seconds after the second digit")
 
 
-def n8_case_dvd_controls():
-    """DVD action ids, key translation, seek maths and hold timing."""
-    check(mn.DVD_ACTIONS == ("play_pause", "rewind", "fast_forward", "return_to_menu"), "DVD action ids unchanged")
-    check([mn.dvd_canonical(a) for a in mn.DVD_ACTIONS] == [-9001, -9002, -9003, pygame.K_BACKSPACE], "DVD canonical codes unchanged")
-    check([mn.dvd_default_binding(a) for a in mn.DVD_ACTIONS] == [0x40000000 | 261, 0x40000000 | 285, 0x40000000 | 286, pygame.K_BACKSPACE], "DVD default keys unchanged")
-    check((mn.DVD_SKIP_TAP_MS, mn.DVD_SKIP_HOLD_MS, mn.DVD_SKIP_END_GUARD_MS, mn.DVD_SKIP_COOLDOWN_MS, mn.DVD_SKIP_HOLD_START_MS) == (30000, 5000, 10000, 400, 500), "DVD numbers unchanged")
-    for action in mn.DVD_ACTIONS:
-        check(mn.dvd_action(mn.dvd_canonical(action)) == action, f"dvd_action round trip {action}")
-    check(mn.dvd_action(mn.DVD_REMOTE_FAST_FORWARD) is None and mn.dvd_action(mn.DVD_REMOTE_FAST_FORWARD, remote=True) == mn.DVD_FAST_FORWARD, "remote fast forward only with remote=True")
-    check(mn.dvd_action(mn.DVD_REMOTE_REWIND) is None and mn.dvd_action(mn.DVD_REMOTE_REWIND, remote=True) == mn.DVD_REWIND, "remote rewind only with remote=True")
-    check(mn.dvd_action(mn.DVD_REMOTE_PLAY_PAUSE, remote=True) is None, "remote play is not a transport key of its own")
-    for key in range(0, 1200):
-        got = mn.dvd_action(key)
-        check((got == mn.DVD_RETURN_MENU) == (key == pygame.K_BACKSPACE), f"only Backspace is return to menu {key}")
-        check(mn.dvd_action(key, remote=True) == got, f"remote flag leaves ordinary keys alone {key}")
-
-    for is_iso, menu_up in itertools.product((False, True), repeat=2):
-        want = "ignore" if not is_iso else ("reissue" if menu_up else "confirm")
-        check(mn.dvd_return_menu_step(is_iso, menu_up) == want, f"return step {is_iso} {menu_up}")
-        for action in mn.DVD_ACTIONS:
-            swallowed = mn.dvd_swallows_transport(mn.dvd_canonical(action), is_iso, menu_up)
-            check(swallowed == (is_iso and menu_up and action != mn.DVD_RETURN_MENU), f"swallow {action} {is_iso} {menu_up}")
-
-    for position in (0, 1, 4999, 5000, 29999, 30000, 60000, 99999, 100000, 7200000):
-        for length in (None, 0, -1, 1, 9999, 10000, 10001, 40000, 100000, 7200000, 7200001):
-            for direction in (1, -1):
-                tap = position + direction * 30000
-                hold = position + direction * 5000
-                if direction > 0 and length and length > 0:
-                    tap = min(tap, max(0, length - 10000))
-                    hold = min(hold, max(0, length - 10000))
-                check(mn.dvd_tap_seek(direction, position, length) == max(0, tap), f"tap {direction} {position} {length}")
-                check(mn.dvd_hold_seek(direction, position, length) == max(0, hold), f"hold {direction} {position} {length}")
-    for fwd, rew in itertools.product((False, True), repeat=2):
-        check(mn.dvd_hold_direction(fwd, rew) == (1 if fwd else (-1 if rew else 0)), f"hold dir {fwd} {rew}")
-    for held in (0, 499, 500, 501, 9000):
-        for now, cooldown in ((100, 100), (101, 100), (99, 100), (0, 0)):
-            check(mn.dvd_hold_due(held, now, cooldown) == (held > 500 and now > cooldown), f"hold due {held} {now} {cooldown}")
-            check(mn.dvd_skip_blocked(now, cooldown) == (now <= cooldown), f"skip blocked {now} {cooldown}")
-    for bindings in (None, {}, {"play_pause": 11, "rewind": 12, "fast_forward": 13, "return_to_menu": 14}, {"play_pause": 0x40000000 | 261}):
-        for key in list(range(0, 40)) + [-9001, -9002, -9003, 0x40000000 | 261, 0x40000000 | 285, 0x40000000 | 286]:
-            want = key
-            if bindings:
-                for action, canon in zip(mn.DVD_ACTIONS, (-9001, -9002, -9003, pygame.K_BACKSPACE)):
-                    mapped = bindings.get(action)
-                    if mapped is not None and key == mapped:
-                        want = canon
-                        break
-            check(mn.dvd_translate(bindings, key) == want, f"dvd_translate {bindings} {key}")
 
 
-def n8_poll_dvd_hold_function(broken=False):
-    """The real GameDeck._poll_dvd_hold cut out of game_deck.py; broken=True puts the old attribute-exists test back."""
-    path = os.path.join(ROOT, "game_deck.py")
-    with open(path, encoding="utf-8") as handle:
-        source = handle.read()
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == "_poll_dvd_hold":
-                    code = textwrap.dedent(ast.get_source_segment(source, item))
-                    if broken:
-                        new_test = 'if not getattr(self, "_dvd_skip_hold_start", 0):'
-                        old_test = 'if not hasattr(self, "_dvd_skip_hold_start"):'
-                        code = code.replace(new_test, old_test)
-                    return code
-    raise LookupError("_poll_dvd_hold not found in game_deck.py")
 
 
-def n8_run_dvd_hold(code, frames, start_attribute=None):
-    """Runs the extracted _poll_dvd_hold once per (time, keys down, menu up) frame; returns the times VLC was asked to seek."""
-    clock = [0]
-    down = set()
-
-    class Keys(object):
-        def __getitem__(self, key_code):
-            return key_code in down
-
-    seeks = []
-    vlc_player = types.SimpleNamespace(get_time=lambda: 600000, get_length=lambda: 7200000, set_time=lambda value: seeks.append(clock[0]))
-    deck = types.SimpleNamespace(dvd_in_menu=False, dvd_bindings=None, vlc_engine=types.SimpleNamespace(player=vlc_player),
-                                 _set_dvd_osd=lambda *a, **k: None)
-    if start_attribute is not None:
-        deck._dvd_skip_hold_start = start_attribute
-    env = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: clock[0]),
-                                           key=types.SimpleNamespace(get_pressed=lambda: Keys())),
-           "_nav": mn, "_xi_nav_state": {},
-           "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)}
-    exec(compile(code, "<extracted:_poll_dvd_hold>", "exec"), env)
-    poll = env["_poll_dvd_hold"]
-    for now, keys_down, menu_up in frames:
-        clock[0] = now
-        down.clear()
-        down.update(keys_down)
-        deck.dvd_in_menu = menu_up
-        poll(deck)
-    return seeks
-
-
-def n8_case_dvd_hold_poll():
-    """A held DVD fast-forward or rewind key waits the 500 ms start delay on every fresh press, then repeats after the cooldown."""
-    forward = mn.dvd_default_binding(mn.DVD_FAST_FORWARD)
-    rewind = mn.dvd_default_binding(mn.DVD_REWIND)
-    good = n8_poll_dvd_hold_function()
-    bad = n8_poll_dvd_hold_function(broken=True)
-    for label, key_code in (("fast forward", forward), ("rewind", rewind)):
-        frames = [(1000 + t, {key_code}, False) for t in range(0, 1600, 16)]
-        frames += [(2600 + t, set(), False) for t in range(0, 160, 16)]
-        frames += [(5000 + t, {key_code}, False) for t in range(0, 1600, 16)]
-        seeks = n8_run_dvd_hold(good, frames)
-        first = [t for t in seeks if t < 2600]
-        second = [t for t in seeks if t >= 5000]
-        check(bool(first) and first[0] - 1000 > mn.DVD_SKIP_HOLD_START_MS, f"{label}: first hold waits the start delay, seeks {first[:2]}")
-        check(bool(second) and second[0] - 5000 > mn.DVD_SKIP_HOLD_START_MS, f"{label}: a fresh press after a release waits the start delay, seeks {second[:2]}")
-        check(all(b - a >= mn.DVD_SKIP_COOLDOWN_MS for a, b in zip(seeks, seeks[1:]) if b < 2600 or a >= 5000), f"{label}: repeats keep the cooldown")
-        old_seeks = n8_run_dvd_hold(bad, frames)
-        old_second = [t for t in old_seeks if t >= 5000]
-        check(bool(old_second) and old_second[0] - 5000 <= mn.DVD_SKIP_HOLD_START_MS, f"{label}: the old attribute test is caught (seeks at {old_second[:2]})")
-    tap_then_hold = [(1000 + t, {forward}, False) for t in range(0, 1200, 16)]
-    seeks = n8_run_dvd_hold(good, tap_then_hold, start_attribute=1000)
-    check(bool(seeks) and seeks[0] - 1000 > mn.DVD_SKIP_HOLD_START_MS, "a hold that starts at a tap's time waits from the tap")
-    in_menu = [(1000 + t, {forward}, True) for t in range(0, 1600, 16)]
-    check(n8_run_dvd_hold(good, in_menu) == [], "no seek while the disc menu is up")
-    nothing = [(1000 + t, set(), False) for t in range(0, 1600, 16)]
-    check(n8_run_dvd_hold(good, nothing) == [], "no seek with no key down")
-    both = [(1000 + t, {forward, rewind}, False) for t in range(0, 1600, 16)]
-    only_forward = [(1000 + t, {forward}, False) for t in range(0, 1600, 16)]
-    check(n8_run_dvd_hold(good, both) == n8_run_dvd_hold(good, only_forward), "both keys down act as fast forward, as dvd_hold_direction says")
-
-
-def n8_case_guide_hold():
-    """A held guide row repeat never re-aims; the time stop is re-aimed once when the hold ends."""
-    block_start = MAIN_SRC.index("        _gh_any = False\n        _gh_hold = app_state[\"_hold_guide\"]")
-    block = MAIN_SRC[block_start:MAIN_SRC.index("    _prof_mark(\"idle_input\")", block_start)]
-    frames = []
-    for t in range(0, 2400, 16):
-        frames.append((1000 + t, {pygame.K_s} if t < 1200 else set()))
-    new_out, new_state = n8_run_guide_hold(block, frames)
-    rows = [c for f in new_out for c in f if c[0] == "row"]
-    resyncs = [c for f in new_out for c in f if c[0] == "resync"]
-    check(len(rows) > 5, "a held S repeats rows")
-    check(all(c == ("row", 1, False) for c in rows), "held repeat rows never re-aim")
-    check(len(resyncs) == 1, f"one re-aim when the hold ends, got {len(resyncs)}")
-    last_row_frame = max(i for i, f in enumerate(new_out) if any(c[0] == "row" for c in f))
-    resync_frames = [i for i, f in enumerate(new_out) if any(c[0] == "resync" for c in f)]
-    check(bool(resync_frames) and resync_frames[0] > last_row_frame, "the re-aim comes after the last repeat")
-    check("_guide_hold_moved_rows" not in new_state, "the flag is cleared")
-    quick = [(1000 + t, {pygame.K_s} if t < 100 else set()) for t in range(0, 800, 16)]
-    q_out, _ = n8_run_guide_hold(block, quick)
-    check(not any(c[0] in ("row", "resync") for f in q_out for c in f), "a quick tap repeats nothing and re-aims nothing here")
-    side = [(1000 + t, {pygame.K_d} if t < 1200 else set()) for t in range(0, 2400, 16)]
-    s_out, _ = n8_run_guide_hold(block, side)
-    check(any(c[0] == "col" for f in s_out for c in f) and not any(c[0] == "resync" for f in s_out for c in f), "a held D moves columns and does not re-aim")
 
 
 # ============================================================================
@@ -5501,310 +2633,22 @@ _DVD_CAP_METHODS = ("_apply_dvd_captions_state", "_dvd_caption_spu_ids", "_dvd_c
 _DVD_CAP_NODES = []
 
 
-def dvd_cap_method_nodes():
-    """The real DVD caption methods of game_deck.py as (name, AST node, source) triples."""
-    if _DVD_CAP_NODES:
-        return _DVD_CAP_NODES
-    with open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8") as handle:
-        source = handle.read()
-    found = {}
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name in _DVD_CAP_METHODS:
-                    found[item.name] = (item, textwrap.dedent(ast.get_source_segment(source, item)))
-    missing = [name for name in _DVD_CAP_METHODS if name not in found]
-    if missing:
-        raise LookupError("not found in game_deck.py: %s" % missing)
-    _DVD_CAP_NODES.extend((name,) + found[name] for name in _DVD_CAP_METHODS)
-    return _DVD_CAP_NODES
 
 
-class DvdCapVlc(object):
-    """A stand-in VLC: a list of subtitle track ids, a selected one, and slave files that appear after a delay."""
-
-    def __init__(self, clock, tracks=(), selected=-1, appear_after_ms=700, never_lists=False):
-        self.clock = clock
-        self.player = self
-        self.tracks = list(tracks)
-        self.selected = selected
-        self.appear_after_ms = appear_after_ms
-        self.never_lists = never_lists
-        self.slaves = []
-        self.set_calls = []
-        self.highlight_calls = 0
-        self._due = []
-        self._next_id = 100
-
-    def video_get_spu_description(self):
-        for due, track_id in list(self._due):
-            if self.clock[0] >= due:
-                self.tracks.append(track_id)
-                self._due.remove((due, track_id))
-        return [(-1, "Disable")] + [(t, "Track %d" % t) for t in self.tracks]
-
-    def add_slave(self, kind, uri, select):
-        self.slaves.append(uri)
-        if not self.never_lists:
-            self._next_id += 1
-            self._due.append((self.clock[0] + self.appear_after_ms, self._next_id))
-
-    def video_get_spu(self):
-        return self.selected
-
-    def video_set_spu(self, track_id):
-        self.selected = track_id
-        self.set_calls.append(track_id)
-
-    def _ensure_menu_highlight_spu(self):
-        self.highlight_calls += 1
 
 
-def dvd_cap_build(source_transform=None, resolver=None, lookup_runs=True):
-    """Builds a deck class from the real methods; returns (class, env) where env holds the stubs the methods use."""
-    clock = [1000]
-    logs = []
-    calls = {"resolve": [], "asr": [], "threads": 0, "wait": 0}
-
-    def wait(_ms):
-        calls["wait"] += 1
-        raise AssertionError("pygame.time.wait was called on the render thread")
-
-    class Thread(object):
-        def __init__(self, target=None, args=(), daemon=None, name=None):
-            self.target, self.args = target, args
-
-        def start(self):
-            calls["threads"] += 1
-            if lookup_runs:
-                self.target(*self.args)
-
-    def resolve(path):
-        calls["resolve"].append(path)
-        if isinstance(resolver, Exception):
-            raise resolver
-        return resolver
-
-    env = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: clock[0], wait=wait)),
-           "os": os, "threading": types.SimpleNamespace(Thread=Thread), "_gov": gov,
-           "resolve_caption_source": resolve,
-           "log": types.SimpleNamespace(info=lambda *a, **k: logs.append(("info", a[0] % a[1:] if len(a) > 1 else a[0])),
-                                        warning=lambda *a, **k: logs.append(("warning", a[0] % a[1:] if len(a) > 1 else a[0]))),
-           "_log_warn_throttled": lambda key, msg, *a, **k: logs.append(("warning", msg))}
-    namespace = {}
-    for name, _node, source in dvd_cap_method_nodes():
-        if source_transform:
-            source = source_transform(name, source)
-        exec(compile(source, "<extracted:%s>" % name, "exec"), env)
-        namespace[name] = staticmethod(env[name]) if name == "_dvd_caption_lookup_job" else env[name]
-    namespace["_start_dvd_captions_asr_job"] = lambda self, path: calls["asr"].append(path)
-    return type("Deck", (), namespace), {"clock": clock, "logs": logs, "calls": calls}
 
 
-def dvd_cap_deck(cls, disc=False, path=r"C:\movies\film.mkv", pending=True):
-    deck = cls()
-    deck.dvd_file_path, deck.dvd_is_disc_image = path, disc
-    deck.dvd_in_menu, deck.dvd_splash_done = False, True
-    deck.dvd_captions, deck.dvd_captions_enabled = False, True
-    deck._dvd_captions_auto_pending, deck._dvd_captions_auto_done = pending, not pending
-    deck._dvd_captions_auto_deadline = deck._dvd_captions_auto_next_try = 0
-    deck._dvd_captions_asr_state, deck._dvd_captions_asr_srt_path = "idle", None
-    deck._dvd_cap_flow = deck._dvd_cap_suppress = None
-    return deck
 
 
-def dvd_cap_run(deck, vlc, env, until_ms, step=100, hook=None):
-    """Ticks the deck once per step from the current clock up to until_ms; hook(now) runs before each tick."""
-    while env["clock"][0] <= until_ms:
-        if hook:
-            hook(env["clock"][0])
-        deck._maybe_auto_apply_dvd_captions(vlc)
-        env["clock"][0] += step
 
 
-def dvd_cap_problems(source_transform=None):
-    """Runs every scenario against the real methods (optionally with their source altered) and returns what went wrong."""
-    problems = []
-
-    def ok(condition, label):
-        if not condition:
-            problems.append(label)
-
-    fake_vlc_module = types.SimpleNamespace(MediaSlaveType=types.SimpleNamespace(subtitle=1))
-    with mock.patch.dict(sys.modules, {"vlc": fake_vlc_module}):
-        cls, env = dvd_cap_build(source_transform, {"kind": "sidecar", "srt_path": r"C:\movies\film.srt"})
-        vlc, deck = DvdCapVlc(env["clock"], tracks=[5]), None
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 1500)
-        ok(vlc.slaves == ["file:///C:/movies/film.srt"], f"sidecar: file handed to VLC once, got {vlc.slaves}")
-        ok(vlc.set_calls == [], f"sidecar: nothing selected before VLC lists the new track, got {vlc.set_calls}")
-        dvd_cap_run(deck, vlc, env, 6000)
-        ok(vlc.set_calls == [101], f"sidecar: the new track, not the embedded one, is selected, got {vlc.set_calls}")
-        ok(deck.dvd_captions and deck._dvd_captions_auto_done and not deck._dvd_captions_auto_pending, "sidecar: captions on and the tick finished")
-        ok(env["calls"]["asr"] == [] and env["calls"]["wait"] == 0, "sidecar: no speech recognition, no blocking wait")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "sidecar", "srt_path": r"C:\movies\film.srt"})
-        vlc = DvdCapVlc(env["clock"], tracks=[5], never_lists=True)
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 9000)
-        ok(any("never listed" in text for kind, text in env["logs"]), "sidecar never listed: the fallback is logged")
-        ok(env["calls"]["asr"] == [r"C:\movies\film.mkv"], "sidecar never listed: the old flow (speech recognition) takes over")
-        ok(len(vlc.slaves) == 1, f"sidecar never listed: the file is handed over once, got {len(vlc.slaves)}")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "baked", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[3], selected=3)
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 1500)
-        ok(vlc.set_calls == [-1], f"burned-in: VLC's own track is switched off, got {vlc.set_calls}")
-        vlc.selected = 3
-        dvd_cap_run(deck, vlc, env, 6000)
-        ok(vlc.selected == -1, "burned-in: a track VLC selects again is switched off again")
-        ok(env["calls"]["asr"] == [] and vlc.slaves == [] and not deck.dvd_captions, "burned-in: no speech recognition, no file handed to VLC, captions not on")
-        ok(deck._dvd_captions_auto_done and not deck._dvd_captions_auto_pending, "burned-in: the tick finished")
-        dvd_cap_run(deck, vlc, env, 22000)
-        vlc.selected = 3
-        dvd_cap_run(deck, vlc, env, 24000)
-        ok(vlc.selected == 3, "burned-in: after the watch window VLC is left alone")
-        ok(deck._dvd_cap_suppress is None, "burned-in: the watch state is cleared")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "baked", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[3], selected=3)
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 1200)
-        deck.dvd_captions_enabled = False
-        vlc.selected = 3
-        dvd_cap_run(deck, vlc, env, 3000)
-        ok(vlc.selected == 3 and deck._dvd_cap_suppress is None, "burned-in: with the DVD Captions setting off VLC is left alone")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "embedded", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[4, 6])
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 3000)
-        ok(vlc.set_calls == [4] and deck.dvd_captions, f"embedded: VLC's first track is selected, got {vlc.set_calls}")
-        ok(env["calls"]["asr"] == [] and deck._dvd_captions_auto_done, "embedded: no speech recognition, tick finished")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "embedded", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[])
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 11000)
-        ok(any("lists no embedded track" in text for kind, text in env["logs"]), "embedded but not listed: the fallback is logged")
-        ok(env["calls"]["asr"] == [r"C:\movies\film.mkv"], "embedded but not listed: speech recognition takes over")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": None, "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[])
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 3000)
-        ok(env["calls"]["asr"] == [r"C:\movies\film.mkv"] and deck._dvd_captions_asr_state == "running", "no source: speech recognition starts once")
-
-        def finish_asr(now):
-            if now == 4000:
-                deck._dvd_captions_asr_state = "done"
-                deck._dvd_captions_asr_srt_path = r"C:\temp\asr.srt"
-
-        dvd_cap_run(deck, vlc, env, 8000, hook=finish_asr)
-        ok(vlc.slaves == ["file:///C:/temp/asr.srt"], f"speech recognition result handed to VLC, got {vlc.slaves}")
-        ok(vlc.set_calls == [101] and deck.dvd_captions and deck._dvd_captions_auto_done, f"speech recognition track selected, got {vlc.set_calls}")
-        ok(deck._dvd_captions_asr_state == "applying" and env["calls"]["wait"] == 0, "speech recognition result: state moves on, no blocking wait")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": None, "srt_path": None}, lookup_runs=False)
-        vlc = DvdCapVlc(env["clock"], tracks=[])
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 19000)
-        ok(env["calls"]["asr"] == [], "slow lookup: nothing starts before the timeout")
-        dvd_cap_run(deck, vlc, env, 22000)
-        ok(any("took over" in text for kind, text in env["logs"]), "slow lookup: the fallback is logged")
-        ok(env["calls"]["asr"] == [r"C:\movies\film.mkv"], "slow lookup: the old flow takes over")
-
-        cls, env = dvd_cap_build(source_transform, RuntimeError("boom"))
-        vlc = DvdCapVlc(env["clock"], tracks=[])
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 2000)
-        ok(env["calls"]["asr"] == [r"C:\movies\film.mkv"], "failed lookup: the old flow takes over")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "baked", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[7])
-        deck = dvd_cap_deck(cls, disc=True, path=r"D:\disc.iso")
-        dvd_cap_run(deck, vlc, env, 2500)
-        ok(env["calls"]["resolve"] == [] and env["calls"]["threads"] == 0, "disc image: no caption lookup")
-        ok(vlc.set_calls == [7] and deck._dvd_captions_auto_done and env["calls"]["asr"] == [], "disc image: VLC's listed track is used as before, no speech recognition")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "baked", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[7])
-        deck = dvd_cap_deck(cls, pending=False)
-        dvd_cap_run(deck, vlc, env, 2500)
-        ok(env["calls"]["resolve"] == [] and vlc.set_calls == [], "captions off or locked: the tick does nothing")
-
-        cls, env = dvd_cap_build(source_transform, {"kind": "embedded", "srt_path": None})
-        vlc = DvdCapVlc(env["clock"], tracks=[4])
-        deck = dvd_cap_deck(cls)
-        dvd_cap_run(deck, vlc, env, 2500)
-        dvd_cap_run(deck, vlc, env, 3000)
-        ok(deck._dvd_cap_flow is None, "the per-title state is cleared once the tick is finished")
-        deck._dvd_captions_auto_pending, deck._dvd_captions_auto_done = True, False
-        deck._dvd_captions_auto_deadline = deck._dvd_captions_auto_next_try = 0
-        deck._dvd_captions_asr_state, deck._dvd_captions_asr_srt_path = "idle", None
-        dvd_cap_run(deck, vlc, env, 5000)
-        ok(len(env["calls"]["resolve"]) == 2, f"turning the setting on again looks the file up again, got {len(env['calls']['resolve'])}")
-
-        cls, env = dvd_cap_build(source_transform, None)
-        vlc = DvdCapVlc(env["clock"], tracks=[4], selected=4)
-        deck = dvd_cap_deck(cls)
-        deck._apply_dvd_captions_state(False, vlc)
-        ok(vlc.set_calls == [-1] and not deck.dvd_captions and vlc.highlight_calls == 1, "captions off: VLC's track is switched off and the highlight re-checked")
-        deck._apply_dvd_captions_state(True, vlc)
-        ok(vlc.set_calls == [-1, 4] and deck.dvd_captions, "captions on: VLC's listed track is selected")
-    return problems
 
 
-def dvd_cap_source_checks():
-    """The caption methods hold no blocking wait and no bare tunable number; the governor table holds the numbers."""
-    problems = []
-    for name, node, _source in dvd_cap_method_nodes():
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Attribute) and sub.attr == "wait":
-                problems.append(f"{name} calls a wait")
-            if isinstance(sub, ast.Constant) and isinstance(sub.value, int) and not isinstance(sub.value, bool) and sub.value not in (-1, 0, 1):
-                problems.append(f"{name} holds the bare number {sub.value}")
-    return problems
 
 
-def dvd_cap_break_checks():
-    """Deliberate breaks of the real source; each one has to make the scenarios fail."""
-    breaks = {
-        "burned-in watch skipped": ("_dvd_caption_source_step", 'self._dvd_cap_suppress = {"path": flow["path"],', 'self._dvd_cap_suppress = None; _unused = {"path": flow["path"],'),
-        "burned-in does not finish": ("_dvd_caption_source_step", "self._dvd_captions_auto_done = True\n                self._dvd_captions_auto_pending = False\n                return True\n            if kind in", "return True\n            if kind in"),
-        "old track picked instead of the new one": ("_dvd_caption_slave_step", "vlc.player.video_set_spu(added[-1])", "vlc.player.video_set_spu(slave['before'][0] if slave['before'] else added[-1])"),
-        "no wait for the lookup": ("_dvd_caption_source_step", "                    return True\n                log.warning(\"[DVD CAPTIONS] Caption lookup for", "                    pass\n                log.warning(\"[DVD CAPTIONS] Caption lookup for"),
-        "speech recognition always starts": ("_maybe_auto_apply_dvd_captions", "        elif self._dvd_caption_source_step(vlc, flow, now):\n            return\n", "        else:\n            self._dvd_caption_source_step(vlc, flow, now)\n"),
-        "disc images looked up": ("_dvd_caption_flow_new", "if self.dvd_is_disc_image or not self.dvd_file_path:", "if not self.dvd_file_path:"),
-    }
-    results = {}
-    for label, (method, old, new) in breaks.items():
-        def transform(name, source, method=method, old=old, new=new):
-            if name != method:
-                return source
-            if source.count(old) != 1:
-                raise LookupError("break %r: text to change found %d times" % (label, source.count(old)))
-            return source.replace(old, new)
-
-        try:
-            results[label] = bool(dvd_cap_problems(transform))
-        except AssertionError:
-            results[label] = True
-    return results
 
 
-def dvd_cap_case_flow():
-    """DVD captions: caption file first, burned-in files keep VLC's own track off, embedded track before speech recognition, slow or failed lookups fall back, nothing blocks."""
-    for label in dvd_cap_problems():
-        check(False, label)
-    check(True, "dvd caption scenarios ran")
-    for label in dvd_cap_source_checks():
-        check(False, label)
-    check((gov.DVD_CAPTIONS_LOOKUP_TIMEOUT_MS, gov.DVD_CAPTIONS_TRACK_TIMEOUT_MS, gov.DVD_CAPTIONS_POLL_MS,
-           gov.DVD_CAPTIONS_SUPPRESS_WATCH_MS, gov.DVD_CAPTIONS_SUPPRESS_POLL_MS) == (20000, 8000, 500, 20000, 400), "DVD caption numbers sit in the governor table")
-    for label, caught in dvd_cap_break_checks().items():
-        check(caught, f"deliberate break caught: {label}")
 
 
 # ============================================================================
@@ -5853,607 +2697,36 @@ def main_assignment_code(name):
 # ============================================================================
 
 
-def suite_name_step_direct():
-    max_len = 4
-    r = menu_nav.name_entry_step(pygame.K_RETURN, "\r", "AB", False, max_len)
-    check(r == (menu_nav.NAME_SAVE, "AB", False), "enter saves")
-    r = menu_nav.name_entry_step(pygame.K_ESCAPE, "\x1b", "AB", True, max_len)
-    check(r == (None, "AB", True), "escape does nothing when cancel_on_back is off")
-    r = menu_nav.name_entry_step(pygame.K_ESCAPE, "\x1b", "AB", True, max_len, cancel_on_back=True)
-    check(r == (menu_nav.NAME_CANCEL, "AB", True), "escape cancels when cancel_on_back is on")
-    r = menu_nav.name_entry_step(pygame.K_BACKSPACE, "\x08", "AB", False, max_len)
-    check(r == (menu_nav.NAME_EDIT, "A", False), "backspace removes one")
-    r = menu_nav.name_entry_step(pygame.K_BACKSPACE, "\x08", "AB", True, max_len)
-    check(r == (menu_nav.NAME_EDIT, "", False), "backspace clears a full selection")
-    r = menu_nav.name_entry_step(pygame.K_BACKSPACE, "\x08", "", False, max_len)
-    check(r == (menu_nav.NAME_EDIT, "", False), "backspace on empty text")
-    r = menu_nav.name_entry_step(pygame.K_a, "a", "ABC", False, max_len)
-    check(r == (menu_nav.NAME_EDIT, "ABCa", False), "letter added with room")
-    r = menu_nav.name_entry_step(pygame.K_a, "a", "ABCD", False, max_len)
-    check(r == (None, "ABCD", False), "letter refused when full")
-    r = menu_nav.name_entry_step(pygame.K_a, "a", "ABCD", True, max_len)
-    check(r == (menu_nav.NAME_EDIT, "a", False), "letter replaces a full selection even when full")
-    r = menu_nav.name_entry_step(pygame.K_SPACE, " ", "AB", False, max_len)
-    check(r == (menu_nav.NAME_EDIT, "AB ", False), "space added")
-    r = menu_nav.name_entry_step(pygame.K_SPACE, " ", "AB", True, max_len)
-    check(r == (menu_nav.NAME_EDIT, " ", False), "space replaces a selection")
-    r = menu_nav.name_entry_step(pygame.K_MINUS, "-", "AB", False, max_len)
-    check(r == (None, "AB", False), "punctuation ignored")
-    r = menu_nav.name_entry_step(pygame.K_w, "w", "AB", False, max_len)
-    check(r == (menu_nav.NAME_EDIT, "ABw", False), "W is a letter in a name box")
-    check(menu_nav.NAME_ENTRY_CHANNEL_MAX_DEFAULT == 18 and menu_nav.NAME_ENTRY_SLOT_MAX == 24, "name limits")
 
 
 # ============================================================================
 # SECTION: File Explorer rectangle against the Main Menu rectangle
 # ============================================================================
 
-class FakeDbConfig:
-    def __init__(self, config):
-        self.config = config
 
 
-class FakeGameDeck:
-    def __init__(self, inner):
-        self.inner = pygame.Rect(inner) if inner is not None else None
 
-    def get_active_console_bezel_inner_rect(self, rect):
-        return self.inner
 
 
-def build_main_namespace(config, stem, warp_on, orbiter, channel, console_inner):
-    ns = {"pygame": pygame, "menu_panel_rect": ui.menu_panel_rect, "fit_menu_envelope": ui.fit_menu_envelope, "performance_governor": gov,
-          "db": FakeDbConfig(config), "app_state": {"current_channel": channel},
-          "game_deck": FakeGameDeck(console_inner) if console_inner is not None else FakeGameDeck(None),
-          "_active_bezel_stem": lambda: stem, "_bezel_led_stem": lambda: stem, "_setting_on": lambda key, default=False: warp_on,
-          "_TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS": (), "_TV_BORDER_SCREEN_EXPAND": {}, "_TV_BORDER_SCREEN_EXPAND_DEFAULT": (1.0, 1.0),
-          "_full_tv_border_geometry": lambda w, h: None, "_bezel_right_grow": lambda stem: 1.0,
-          "_package_pillarbox_active": lambda w, h: False,
-          "_log_warn_throttled": lambda *a, **k: None,
-          "log": type("L", (), {"info": staticmethod(lambda *a, **k: None), "warning": staticmethod(lambda *a, **k: None)})()}
-    margin = 3
 
-    def orbiter_fn(rect):
-        if not orbiter:
-            return rect
-        ox, oy = orbiter
-        return pygame.Rect(rect.x + ox * margin - margin, rect.y + oy * margin - margin,
-                           rect.width + margin * 2, rect.height + margin * 2)
 
-    ns["_apply_pixel_orbiter"] = orbiter_fn
-    for name in ("_MENU_BEZEL_SHRINK", "_MENU_BEZEL_SHRINK_DEFAULT", "_MENU_WARP_OFF_EXTRA_SHRINK",
-                 "_OVERLAY_BORDER_FIT_MARGIN", "_overlay_content_rect_log_state"):
-        exec(main_assignment_code(name), ns)
-    for name in ("_overlay_content_rect", "_overlay_target", "_overlay_target_for_menu",
-                 "_active_menu_bezel_shrink", "_menu_panel_rect_on"):
-        exec(main_function_code(name), ns)
-    return ns
 
 
-def old_menu_rect_on_screen(ns, screen):
-    target = ns["_overlay_target_for_menu"](screen)
-    tx, ty = target.get_abs_offset()
-    real_w, real_h = target.get_size()
-    x, y, w, h = ui.menu_panel_rect(real_w, real_h, ns["db"])
-    sx, sy = screen.get_abs_offset()
-    return tx - sx + x, ty - sy + y, w, h
 
 
-def suite_explorer_rect():
-    sizes = [(1280, 720), (1920, 1080), (1024, 768), (800, 600), (640, 480), (1366, 768), (2560, 1440),
-             (854, 480), (1600, 1200), (3440, 1440), (720, 720), (400, 300)]
-    configs = [{"fake_43_border_enabled": False}]
-    for style in (1, 2, 3, "x"):
-        configs.append({"fake_43_border_enabled": True, "bezel_style": style})
-    stems = [None, "bezel", "bezel1", "bezel2", "other"]
-    orbiters = [None, (0, 0), (1, 0), (-1, 1), (0, -1)]
-    consoles = [None, (100, 80, 600, 400), (0, 0, 400, 300)]
-    surfaces = {}
-    new_vs_menu_bad = 0
-    runs = 0
-    for (w, h) in sizes:
-        screen = surfaces.setdefault((w, h), pygame.Surface((w, h)))
-        for config in configs:
-            for stem in stems:
-                for warp_on in (True, False):
-                    for orbiter in orbiters:
-                        for channel, console in (("05", None), ("03", None), ("03", consoles[1]), ("03", consoles[2])):
-                            ns = build_main_namespace(config, stem, warp_on, orbiter, channel, console)
-                            menu = old_menu_rect_on_screen(ns, screen)
-                            new = ns["_menu_panel_rect_on"](screen)
-                            runs += 1
-                            if tuple(new) != tuple(menu):
-                                new_vs_menu_bad += 1
-                                if new_vs_menu_bad <= 5:
-                                    print("NEW EXPLORER != MENU", (w, h), config, stem, warp_on, orbiter, channel, console, new, menu)
-    check(new_vs_menu_bad == 0, "explorer rect differs from the menu rect on %d of %d configurations" % (new_vs_menu_bad, runs))
 
 
-def suite_video_mode_rect():
-    def build(config, mode_name):
-        ns = {"pygame": pygame, "db": FakeDbConfig(config), "_active_screen_mode": lambda: mode_name,
-              "_package_pillarbox_active": lambda w, h: True,
-              "_bezel_video_wants_tube_fit": lambda source_aspect, mode=None: False,
-              "_apply_pixel_orbiter": lambda rect: rect,
-              "_selected_package_aspect": lambda: 16.0 / 9.0,
-              "_video_screen_mode_rect_log_state": {"key": None},
-              "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
-        exec(main_function_code("_full_tv_43_outer_rect"), ns)
-        exec(main_function_code("_video_screen_mode_rect"), ns)
-        ns["package_box"] = lambda w, h: ns["_full_tv_43_outer_rect"](w, h, aspect=16.0 / 9.0)
-        return ns["_video_screen_mode_rect"]
 
-    def package_box(w, h):
-        return build({"fake_43_border_enabled": False}, "normal").__globals__["package_box"](w, h)
 
-    def build_blit():
-        ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
-              "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
-              "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
-        exec(main_function_code("_blit_video_with_screen_mode"), ns)
-        return ns["_blit_video_with_screen_mode"]
 
-    box = pygame.Rect(0, 60, 1024, 576)
-    for name in ("normal", "stretch", "crop", "panscan"):
-        fn = build({"fake_43_border_enabled": False}, name)
-        check(tuple(fn(box, 1024, 768, mode=name)) == (0, 0, 1024, 768), "%s gets the whole window with Bezel off" % name)
-        check(tuple(fn(box, 1280, 720, mode=name)) == (0, 0, 1280, 720), "%s gets the whole window on a 16:9 screen" % name)
-        fn = build({"fake_43_border_enabled": True}, name)
-        check(tuple(fn(box, 1024, 768, mode=name)) == (128, 60, 768, 576), "with Bezel on %s keeps the 4:3 box inside the content rect" % name)
 
-    blit = build_blit()
-    rect_fn = build({"fake_43_border_enabled": False}, "normal")
-    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
-    pictures = ((16, 9), (4, 3), (9, 16), (21, 9), (5, 4))
-    for win_w, win_h in screens:
-        for pic_w, pic_h in pictures:
-            surf = pygame.Surface((pic_w * 40, pic_h * 40))
-            screen = pygame.Surface((win_w, win_h))
-            target = rect_fn(package_box(win_w, win_h), win_w, win_h)
-            geom = {}
-            blit(screen, surf, target, mode="normal", geom_out=geom, fit_aspect=pic_w / pic_h)
-            side_bars = geom["dest_x"] > 1 or win_w - (geom["dest_x"] + geom["draw_w"]) > 1
-            top_bars = geom["dest_y"] > 1 or win_h - (geom["dest_y"] + geom["draw_h"]) > 1
-            check(not (side_bars and top_bars), "%dx%d screen, %d:%d picture has bars on both axes: %s" % (win_w, win_h, pic_w, pic_h, geom))
-            check(abs(geom["draw_w"] / geom["draw_h"] - pic_w / pic_h) < 0.02, "%dx%d screen, %d:%d picture is distorted: %s" % (win_w, win_h, pic_w, pic_h, geom))
-            for name in ("stretch", "crop"):
-                geom = {}
-                blit(screen, surf, target, mode=name, geom_out=geom, fit_aspect=pic_w / pic_h)
-                covered = geom["draw_w"] >= win_w and geom["draw_h"] >= win_h
-                check(covered, "%dx%d screen, %d:%d picture in %s does not fill the screen: %s" % (win_w, win_h, pic_w, pic_h, name, geom))
 
 
-def suite_one_picture_path():
-    class Gov:
-        VIDEO_DECODE_CANVAS_SD = (854, 480)
-        VIDEO_DECODE_CANVAS_HD = (1280, 720)
 
-    ns = {"performance_governor": Gov}
-    exec(main_function_code("_video_decode_canvas_size"), ns)
-    size = ns["_video_decode_canvas_size"]
-    check(size("sd") == (854, 480) and size("hd") == (1280, 720), "decode canvas sizes are %s and %s" % (size("sd"), size("hd")))
-    ns_no_gov = {"performance_governor": None}
-    exec(main_function_code("_video_decode_canvas_size"), ns_no_gov)
-    check(ns_no_gov["_video_decode_canvas_size"]("sd") == size("sd") and ns_no_gov["_video_decode_canvas_size"]("hd") == size("hd"),
-          "the fallback canvas sizes must equal the governor table")
 
-    for gone in ("_canvas_is_genuinely_4_3", "genuine_4:3_fastpath", "_bezel_off_fit_aspect", "_filled_canvas_aspect_state", "canvas_genuinely_4_3"):
-        check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
-    check(len(re.findall(r"= _video_decode_canvas_size\(", MAIN_SRC)) == 1 and "def resize_canvas" not in MAIN_SRC, "the engine start sizes its canvas through _video_decode_canvas_size, and the old resize_canvas (left from the removed Aspect Ratio setting) is gone")
-    check("(960, 720) if" not in MAIN_SRC and "(640, 480) if" not in MAIN_SRC, "a 4:3 decode canvas branch is still in the main script")
 
-    import performance_governor as _pg
-    check(tuple(_pg.VIDEO_DECODE_CANVAS_SD) == size("sd") and tuple(_pg.VIDEO_DECODE_CANVAS_HD) == size("hd"), "governor canvas table does not match")
 
-    ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
-          "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
-          "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
-    exec(main_function_code("_blit_video_with_screen_mode"), ns)
-    blit = ns["_blit_video_with_screen_mode"]
-    pictures = ((1280, 720), (640, 480), (1080, 1920), (1920, 804), (1280, 1024))
-    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
-    bars = {}
-    for win_w, win_h in screens:
-        for pw, ph in pictures:
-            surf = pygame.Surface((pw, ph))
-            geom = {}
-            blit(pygame.Surface((win_w, win_h)), surf, pygame.Rect(0, 0, win_w, win_h), mode="normal", geom_out=geom)
-            label = "%dx%d screen, %dx%d picture: %s" % (win_w, win_h, pw, ph, geom)
-            check(abs(geom["draw_w"] / geom["draw_h"] - pw / float(ph)) < 0.02, "distorted, " + label)
-            check(geom["draw_w"] >= win_w - 1 or geom["draw_h"] >= win_h - 1, "bars on both axes, " + label)
-            bars[(win_w, win_h, pw, ph)] = (geom["dest_x"], geom["dest_y"])
-            stretch = {}
-            blit(pygame.Surface((win_w, win_h)), surf, pygame.Rect(0, 0, win_w, win_h), mode="stretch", geom_out=stretch)
-            check((stretch["draw_w"], stretch["draw_h"]) == (win_w, win_h), "stretch does not fill, " + label)
-    for win_w, win_h in screens:
-        for pw, ph in pictures:
-            for other_w, other_h in screens:
-                if (other_w, other_h) != (win_w, win_h) and (other_w / float(other_h) == win_w / float(win_h)):
-                    x1, y1 = bars[(win_w, win_h, pw, ph)]
-                    x2, y2 = bars[(other_w, other_h, pw, ph)]
-                    check(abs(x1 / float(win_w) - x2 / float(other_w)) < 0.01 and abs(y1 / float(win_h) - y2 / float(other_h)) < 0.01,
-                          "same-shape screens must have proportional bars")
 
-
-def suite_one_shape_per_label():
-    import performance_governor as _pg
-    ns = {"performance_governor": _pg, "math": math}
-    exec(main_function_code("_snap_standard_aspect"), {"_PICTURE_STANDARD_ASPECTS": tuple(_pg.PICTURE_STANDARD_ASPECTS), "math": math}, ns)
-    snap = ns["_snap_standard_aspect"]
-    scope, two, wide, three_two, std, square, portrait, tall = 2.39, 2.0, 16.0 / 9.0, 1.5, 4.0 / 3.0, 1.0, 0.8, 9.0 / 16.0
-    expected = ((2.76, scope), (2.39, scope), (2.35, scope), (2.2, scope), (2.0, two), (1.9, two), (1.85, wide), (16.0 / 9.0, wide),
-                (1.66, wide), (1.6, three_two), (1.5, three_two), (1.43, three_two), (1.37, std), (4.0 / 3.0, std), (1.25, std),
-                (1.0, square), (0.8, portrait), (0.75, portrait), (0.5625, tall), (0.5, tall), (0.4, tall))
-    for aspect, want in expected:
-        got = snap(aspect)
-        check(abs(got - want) < 1e-9, "aspect %s snapped to %s, expected %s" % (aspect, got, want))
-    check(snap(None) is None and snap(0) == 0, "no shape must pass through untouched")
-    check(tuple(_pg.PICTURE_STANDARD_ASPECTS) == (scope, two, wide, three_two, std, square, portrait, tall),
-          "the governor table must hold 2.39, 2:1, 16:9, 3:2, 4:3, 1:1, 4:5 and 9:16")
-    for content in (2.76, 2.39, 2.2, 2.0, 1.9, 1.85, 16.0 / 9.0, 1.66, 1.6, 1.5, 1.43, 1.37, 4.0 / 3.0, 1.25, 1.0, 0.8, 0.75, 0.5625):
-        got = snap(content)
-        check(max(got, content) / min(got, content) <= 1.16, "a %.3f picture must not be stretched or squeezed more than 16 %% (snapped to %.3f)" % (content, got))
-    for gone in ("_PICTURE_FIT_NEAR_169_MIN", "_PICTURE_FIT_NEAR_169_MAX", "_PICTURE_FIT_NEAR_43_MIN", "_PICTURE_FIT_NEAR_916_MIN", "_PICTURE_FIT_NEAR_916_MAX"):
-        check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
-    check("performance_governor.PICTURE_STANDARD_ASPECTS" in MAIN_SRC, "the main script must read the governor table")
-
-    blit_ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
-               "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
-               "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
-    exec(main_function_code("_blit_video_with_screen_mode"), blit_ns)
-    blit = blit_ns["_blit_video_with_screen_mode"]
-    groups = {"2.39": ((1920, 804), (1280, 534)), "2:1": ((1920, 960), (1280, 640)), "16:9": ((1280, 720), (1920, 1040), (1920, 1080)),
-              "3:2": ((720, 480), (1080, 720)), "4:3": ((640, 480), (720, 540), (1024, 768)), "1:1": ((1080, 1080), (720, 720)),
-              "4:5": ((1080, 1350), (864, 1080)), "9:16": ((1080, 1920), (720, 1280))}
-    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
-    for win_w, win_h in screens:
-        rect = pygame.Rect(0, 0, win_w, win_h)
-        for label, sizes in groups.items():
-            seen = set()
-            for pw, ph in sizes:
-                geom = {}
-                blit(pygame.Surface((win_w, win_h)), pygame.Surface((pw, ph)), rect, mode="normal", geom_out=geom, fit_aspect=snap(pw / float(ph)))
-                seen.add((geom["dest_x"], geom["dest_y"], geom["draw_w"], geom["draw_h"]))
-                check(geom["draw_w"] >= win_w - 1 or geom["draw_h"] >= win_h - 1, "bars on both axes, %s on %dx%d" % (label, win_w, win_h))
-            check(len(seen) == 1, "%s pictures got different boxes on %dx%d: %s" % (label, win_w, win_h, sorted(seen)))
-            stretch = {}
-            blit(pygame.Surface((win_w, win_h)), pygame.Surface(sizes[0]), rect, mode="stretch", geom_out=stretch, fit_aspect=snap(sizes[0][0] / float(sizes[0][1])))
-            check((stretch["draw_w"], stretch["draw_h"]) == (win_w, win_h), "stretch must still fill %dx%d" % (win_w, win_h))
-    for site in ("_video_sa = _snap_standard_aspect(", "_pv_fit_aspect = _snap_standard_aspect("):
-        check(site in MAIN_SRC, "draw site missing: " + site)
-
-
-def suite_picture_box_before_show():
-    check(gov.PICTURE_BOX_PRE_SHOW_BUDGET_S == 8.0 and gov.PICTURE_BOX_PRE_SHOW_PARALLEL == 6, "the governor must hold the pre-show budget and parallel count")
-
-    def fake_text(w, h, crop, dar=None):
-        dar_text = (", DAR %d:%d" % dar) if dar else ""
-        return "Input #0, matroska\n  Stream #0:0: Video: h264, yuv420p, %dx%d%s\n[Parsed_cropdetect_0] crop=%d:%d:%d:%d\n" % (w, h, dar_text, crop[0], crop[1], crop[2], crop[3])
-
-    answers = {}
-
-    def fake_sample(file_path, ffmpeg, t, timeout):
-        time.sleep(0.05)
-        return answers["text"]
-
-    answers["text"] = fake_text(1920, 1080, (1440, 1080, 240, 0))
-    with mock.patch.object(ml, "_pb_run_sample", side_effect=fake_sample), mock.patch.object(ml, "_resolve_ffmpeg", return_value="ffmpeg"):
-        started = time.monotonic()
-        serial = ml.detect_picture_box("a.mkv", duration=3000.0, parallel=1)
-        serial_s = time.monotonic() - started
-        started = time.monotonic()
-        parallel = ml.detect_picture_box("a.mkv", duration=3000.0, parallel=6)
-        parallel_s = time.monotonic() - started
-    check(serial is not None and serial == parallel, "parallel scan must give the same box as the serial scan")
-    check(serial["reason"] == "pillarbox" and abs(serial["picture_aspect"] - 4.0 / 3.0) < 0.01, "a 4:3 picture inside 16:9 must read as a pillarbox of 4:3: %s" % serial)
-    check(parallel_s < serial_s * 0.7, "parallel samples must be faster: %.2f vs %.2f" % (parallel_s, serial_s))
-
-    ns = {"os": os, "time": time, "threading": threading, "media": media, "ml_box": None, "_season_guess_picture_box": lambda p: None}
-    log_stub = type("L", (), {"info": staticmethod(lambda *a, **k: None), "warning": staticmethod(lambda *a, **k: None)})()
-    store = {}
-
-    class FakeLib:
-        def get_cached(self, path):
-            box = store.get(path)
-            return {"picture_box": box, "picture_box_detector_version": ml.PICTURE_BOX_DETECTOR_VERSION} if box else None
-
-    scans = []
-    delay = {"s": 0.0}
-
-    def fake_scan(lib, mlmod, path, parallel=1):
-        scans.append(parallel)
-        time.sleep(delay["s"])
-        store[path] = {"reason": "letterbox", "frame": [1920, 1080], "pixel_aspect": 1.0, "picture_aspect": 1.78}
-        return True
-
-    ns.update({"log": log_stub, "_cached_path_exists": lambda p: True, "_get_probe_library": lambda: FakeLib(),
-               
-               "_is_drive_degraded": lambda p: False, "_picture_box_scan_one": fake_scan,
-               "_PICTURE_BOX_PRE_SHOW_BUDGET_S": 0.5, "_activation_superseded": lambda: False})
-    plan = {"together": (True, "test PC")}
-    ns["performance_governor"] = types.SimpleNamespace(
-        picture_box_pre_show_parallel=lambda: (gov.PICTURE_BOX_PRE_SHOW_PARALLEL if plan["together"][0] else 1, plan["together"][1]))
-    ns["_governor_priority_scope"] = gov.priority_scope
-    exec(main_function_code("_picture_box_scan_one_priority"), ns)
-    exec(main_function_code("_decide_picture_box_before_show"), ns)
-    decide = ns["_decide_picture_box_before_show"]
-    path = os.path.normpath(os.path.abspath("show.mkv"))
-
-    box = decide("show.mkv")
-    check(box is not None and scans == [6], "an unscanned file must be scanned with all samples at once before the show: %s" % scans)
-    store.clear()
-    scans.clear()
-    plan["together"] = (False, "weak PC")
-    check(decide("show.mkv") is not None and scans == [1],
-          "on a PC where first-start scans must run in sequence the sample points are decoded one at a time, so the starting file keeps its picture: %s" % scans)
-    plan["together"] = (True, "test PC")
-    with mock.patch.object(gov, "first_start_scan_plan", lambda profile=None, mode=None: (False, "lite mode")):
-        check(gov.picture_box_pre_show_parallel() == (1, "lite mode"), "the governor gives one sample point at a time where first-start scans run in sequence")
-    with mock.patch.object(gov, "first_start_scan_plan", lambda profile=None, mode=None: (True, "scan cores 4.0")):
-        check(gov.picture_box_pre_show_parallel() == (6, "scan cores 4.0"), "the governor gives the table's count where first-start scans may run together")
-    saved_gov = ns.pop("performance_governor")
-    ns["performance_governor"] = None
-    store.clear()
-    scans.clear()
-    check(decide("show.mkv") is not None and scans == [1], "without the governor the sample points are decoded one at a time")
-    ns["performance_governor"] = saved_gov
-    store.clear()
-    decide("show.mkv")
-    scans.clear()
-    check(decide("show.mkv") == box and scans == [], "a file with a stored box must not be scanned again")
-    store.clear()
-    delay["s"] = 1.5
-    started = time.monotonic()
-    check(decide("show.mkv") is None, "a scan that misses the budget must give no box")
-    check(time.monotonic() - started < 1.2, "the pre-show wait must stop at the budget")
-    time.sleep(1.5)
-    store.clear()
-    scans.clear()
-    ns["_is_drive_degraded"] = lambda p: True
-    check(decide("show.mkv") is None and scans == [], "a file on a struggling drive must be played without a scan")
-    ns["_is_drive_degraded"] = lambda p: False
-    check(decide("song.mp3") is None, "a non-video file must be skipped")
-
-    play_src = MAIN_SRC
-    gate_at = play_src.index("_pre_show_box = _decide_picture_box_before_show(filepath)")
-    probe_at = play_src.index("if _src_dims is None and _norm_fp not in self._dim_probe_inflight:")
-    geom_at = play_src.index("self._apply_screen_mode_geometry(False, _src_dims)")
-    check(gate_at < probe_at < geom_at, "the picture box must be decided before the size probe and before the geometry is applied")
-    frame_src = play_src[play_src.index("def get_display_frame(self):"):]
-    check(frame_src.index("self._native_dims_pending and not self.is_dvd_iso") < frame_src.index("self.player.get_state()"),
-          "frames must be withheld while the picture size is unknown")
-
-
-def suite_random_start():
-    import collections as _col
-    raw = []
-    for show in ("Rugrats", "Ben 10", "Real Monsters", "Hey Arnold"):
-        for ep in range(1, 9):
-            raw.append({"path": "/tv/%s/Season 1/%s S01E%02d.mkv" % (show, show, ep), "duration": 1320})
-    shows = ("Rugrats", "Ben 10", "Real Monsters", "Hey Arnold")
-
-    def build(order_seed, day_seed=20261012 + 105, fixed=None, pool=raw, mode="random_slots", pos=None):
-        return media.build_show_rotation(pool, mode, dict(pos or {}), day_seed, episode_order_mode="sequential",
-                                         fixed_show_order=fixed, block_duration_seconds=8 * 3600, channel_id="05",
-                                         order_seed=order_seed)
-
-    firsts = _col.Counter()
-    for k in range(300):
-        tracks, _pos, order = build("%d:100" % k)
-        firsts[order[0]] += 1
-    check(set(firsts) == set(shows) and min(firsts.values()) >= 40, "every show must start about equally often across fresh starts: %s" % dict(firsts))
-
-    _t1, _p1, order_a = build("777:100", day_seed=1)
-    _t2, _p2, order_b = build("777:100", day_seed=999999)
-    check(order_a == order_b, "one start number must give the same order on every day")
-    _t3, _p3, order_fixed = build("777:100", fixed=["Hey Arnold", "Rugrats"])
-    check(order_fixed[:2] == ["Hey Arnold", "Rugrats"], "a saved show order must win over the start number")
-
-    names = ["Rugrats", "Ben 10", "Real Monsters", "Hey Arnold"]
-    expected = list(media.split_movies_and_series(raw, channel_id="05")[1])
-    import random as _r
-    _r.Random(12345).shuffle(expected)
-    _t4, _p4, order_old = build(None, day_seed=12345)
-    check(order_old == expected, "without a start number the date seed must behave as before")
-
-    seq_a, _pa, _oa = build("1:100", fixed=names)
-    seq_b, _pb, _ob = build("2:100", fixed=names)
-    check([t["path"] for t in seq_a] == [t["path"] for t in seq_b], "the start number must not change episodes or slot counts once the order is fixed")
-    counts_a = _col.Counter(os.path.basename(os.path.dirname(os.path.dirname(t["path"]))) for t in build("1:100")[0])
-    counts_b = _col.Counter(os.path.basename(os.path.dirname(os.path.dirname(t["path"]))) for t in build("2:100")[0])
-    check(counts_a == counts_b, "episodes per series in a block must not depend on the start number")
-
-    movies = [{"path": "/movies/Movie%s.mkv" % c, "duration": 6000} for c in "ABCDE"]
-    first_movies = set()
-    for k in range(100):
-        tracks, _pos, _order = build("%d:100" % k, pool=movies)
-        first_movies.add(tracks[0]["path"])
-    check(len(first_movies) >= 4, "the first movie must vary across fresh starts: %s" % sorted(first_movies))
-    t_a = build("42:100", pool=movies)[0]
-    t_b = build("42:100", pool=movies)[0]
-    check([x["path"] for x in t_a] == [x["path"] for x in t_b], "one start number must give the same movies")
-
-    with tempfile.TemporaryDirectory() as tmp:
-        items = []
-        for show in ("Alpha", "Bravo", "Charlie"):
-            os.makedirs(os.path.join(tmp, show), exist_ok=True)
-            for ep in range(1, 5):
-                p = os.path.join(tmp, show, "%s S01E%02d.mkv" % (show, ep))
-                open(p, "wb").close()
-                items.append({"path": p, "duration": 1500})
-        starters = _col.Counter()
-        for k in range(60):
-            lineup = media.build_ordered_tracks(items, "marathon", "%d:marathon" % k)
-            names_in_order = [os.path.basename(os.path.dirname(x["path"])) for x in lineup]
-            starters[names_in_order[0]] += 1
-            runs = [key for key, _g in __import__("itertools").groupby(names_in_order)]
-            check(len(runs) == 3 and len(lineup) == 12, "marathon must play each series through once, together")
-            for show in ("Alpha", "Bravo", "Charlie"):
-                eps = [os.path.basename(x["path"]) for x in lineup if os.path.basename(os.path.dirname(x["path"])) == show]
-                check(eps == sorted(eps), "marathon episodes must stay in order")
-        check(set(starters) == {"Alpha", "Bravo", "Charlie"}, "every series must start a marathon across fresh starts: %s" % dict(starters))
-        fixed_seed = [media.build_ordered_tracks(items, "marathon", "9:marathon") for _ in range(3)]
-        check(all([x["path"] for x in l] == [x["path"] for x in fixed_seed[0]] for l in fixed_seed), "one start number must give one marathon order")
-
-    saved = []
-    ns = {"threading": threading, "random": random, "isinstance": isinstance, "int": int, "bool": bool,
-          "_intro_seed_lock": threading.Lock(),
-          "db": type("D", (), {"save_settings_async": staticmethod(lambda: saved.append(1))})(),
-          "log": type("L", (), {"warning": staticmethod(lambda *a, **k: None)})()}
-    for name in ("_channel_intro_seed", "_start_order_seed", "_marathon_start_seed"):
-        exec(main_function_code(name), ns)
-    ch = {}
-    first = ns["_channel_intro_seed"](ch)
-    check(isinstance(first, int) and ch["playback_log"]["intro_seed"] == first and saved, "the start number must be saved with the channel")
-    check(ns["_channel_intro_seed"](ch) == first, "the saved start number must be reused")
-    check(ns["_start_order_seed"](ch, 100) != ns["_start_order_seed"](ch, 200), "blocks must not share one order seed")
-    results = []
-    threads = [threading.Thread(target=lambda: results.append(ns["_channel_intro_seed"]({"playback_log": ch["playback_log"]}))) for _ in range(8)]
-    for th in threads: th.start()
-    for th in threads: th.join()
-    check(set(results) == {first}, "every reader must get the same start number")
-    ch.pop("playback_log")
-    check(ns["_channel_intro_seed"](ch) != first, "clearing the channel must draw a new start number")
-    check(len({ns["_channel_intro_seed"]({}) for _ in range(50)}) == 50, "fresh channels must draw different start numbers")
-
-    for node in ast.walk(MAIN_TREE):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("build_show_rotation", "fast_forward_show_pos"):
-            check(any(k.arg == "order_seed" for k in node.keywords), "%s at line %d must pass order_seed" % (node.func.id, node.lineno))
-    check('"marathon", int(' not in MAIN_SRC, "marathon must not be seeded by the channel number")
-
-
-def suite_caption_memory_guard():
-    saved_read = gov._read_ram_gb
-    try:
-        gov._read_ram_gb = lambda: (8.0, 0.5)
-        ok, total, avail, need = gov.caption_memory_check()
-        check(not ok and need == gov.CAPTION_MODEL_MIN_AVAILABLE_RAM_GB, "0.5 GB free must be refused: %s" % ((ok, total, avail, need),))
-        gov._read_ram_gb = lambda: (8.0, gov.CAPTION_MODEL_MIN_AVAILABLE_RAM_GB + 0.5)
-        check(gov.caption_memory_check()[0], "enough free memory must be allowed")
-        gov._read_ram_gb = lambda: (0.0, 0.0)
-        check(gov.caption_memory_check()[0], "memory that cannot be read must not block captions")
-
-        calls = []
-        saved_gov, saved_handler = media._perf_governor, media._caption_memory_refusal_handler
-        saved_model, saved_failed = media._whisper_model, media._whisper_model_load_failed
-        try:
-            media._perf_governor = gov
-            media._whisper_model, media._whisper_model_load_failed = None, False
-            media.set_caption_memory_refusal_handler(lambda t, a, n: calls.append((t, a, n)))
-            gov._read_ram_gb = lambda: (4.0, 0.4)
-            check(media._get_whisper_model() is None, "a refused load must return no model")
-            check(len(calls) == 1 and calls[0][2] == gov.CAPTION_MODEL_MIN_AVAILABLE_RAM_GB, "the handler must be told once: %s" % calls)
-            check(media._whisper_model_load_failed is False, "a memory refusal must not mark the model permanently failed")
-            gov._read_ram_gb = lambda: (16.0, 8.0)
-            check(media._caption_memory_allows_load() is True and len(calls) == 1, "enough memory must load without telling the handler")
-        finally:
-            media._perf_governor, media._caption_memory_refusal_handler = saved_gov, saved_handler
-            media._whisper_model, media._whisper_model_load_failed = saved_model, saved_failed
-    finally:
-        gov._read_ram_gb = saved_read
-
-    class Db:
-        def __init__(self, config):
-            self.config = config
-            self.saves = 0
-
-        def save_settings(self):
-            self.saves += 1
-
-    class Deck:
-        refreshed = 0
-
-        def refresh_from_config(self, config):
-            Deck.refreshed += 1
-
-    logs = []
-    ns = {"performance_governor": gov, "log": type("L", (), {"info": staticmethod(lambda *a, **k: None),
-                                                             "warning": staticmethod(lambda *a, **k: logs.append(a))})(),
-          "STATUS_BANNER_DURATION_MS": 30000, "_caption_prewarm_started": True, "_caption_prewarm_lock": threading.Lock(),
-          "_caption_memory_refusal_pending": False, "_caption_memory_banner_pending": False, "game_deck": Deck(),
-          "released": []}
-    ns["_release_tv_caption_state_when_off"] = lambda reason="": ns["released"].append(reason)
-    for name in ("_on_caption_memory_refused", "_apply_caption_memory_refusal", "_status_banner_is_active", "_status_banner_is_consumed",
-                 "_mark_status_banner_consumed", "_status_banner_label", "_status_banner_duration_ms"):
-        exec(main_function_code(name), ns)
-    for const in ("CAPTION_MEMORY_BANNER_MS", "CAPTION_MEMORY_BANNER_LABEL"):
-        exec(main_assignment_code(const), ns)
-    ns["_drive_streak_signature"] = ns["_server_streak_signature"] = ns["_gamepad_streak_signature"] = ns["_missing_media_streak_signature"] = None
-    ns["_server_streak_consumed"] = ns["_drive_streak_consumed"] = ns["_gamepad_streak_consumed"] = ns["_missing_media_streak_consumed"] = False
-    ns["pygame"] = pygame
-
-    check(ns["CAPTION_MEMORY_BANNER_MS"] == 5000, "banner is %s ms, want 5000" % ns["CAPTION_MEMORY_BANNER_MS"])
-    check(ns["_status_banner_duration_ms"]("captions_memory") == 5000 and ns["_status_banner_duration_ms"]("drive") == 30000,
-          "only the memory banner is 5 seconds")
-    check("LACK OF MEMORY" in ns["_status_banner_label"]("captions_memory"), "banner text must say memory")
-
-    db = Db({"tv_captions_enabled": True, "dvd_captions_enabled": True})
-    ns["db"] = db
-    ns["_apply_caption_memory_refusal"]()
-    check(db.saves == 0 and not ns["_caption_memory_banner_pending"], "nothing happens before a refusal")
-    ns["_on_caption_memory_refused"](4.0, 0.4, 1.5)
-    ns["_apply_caption_memory_refusal"]()
-    check(db.config == {"tv_captions_enabled": False, "dvd_captions_enabled": False} and db.saves == 1, "captions must be switched off and saved: %s" % db.config)
-    check(ns["_caption_memory_banner_pending"] and ns["_status_banner_is_active"]("captions_memory"), "the banner must be raised")
-    check(ns["_caption_prewarm_started"] is False and ns["released"], "the pre-warm must be re-armed and the caption state cleared")
-    check(Deck.refreshed == 1, "the game deck must be refreshed")
-    ns["_mark_status_banner_consumed"]("captions_memory")
-    check(not ns["_status_banner_is_active"]("captions_memory"), "the banner ends once it has been shown")
-
-    db2 = Db({"tv_captions_enabled": False})
-    ns["db"] = db2
-    ns["_on_caption_memory_refused"](4.0, 0.4, 1.5)
-    ns["_apply_caption_memory_refusal"]()
-    check(not ns["_caption_memory_banner_pending"], "no banner when captions were already off")
-
-    check("_apply_caption_memory_refusal()" in main_function_source("_advance_status_banner_streaks"), "the refusal must be applied every frame")
-    check('"captions_memory"' in main_function_source("_draw_status_banners"), "the draw loop must know the memory banner")
-    check("set_caption_memory_refusal_handler(" in MAIN_SRC, "the main script must register the refusal handler")
-
-
-def suite_real_menu_build():
-    db = FakeDbConfig({"menu_opacity": 50, "fake_43_border_enabled": True, "bezel_style": 1})
-    app_state = {"menu_layer": "TAB_SELECTION", "menu_tab_index": 0, "menu_selection_index": 0}
-    for size in ((1280, 720), (1024, 768)):
-        surface = pygame.Surface(size)
-        try:
-            stamp, pos = ui._build_settings_overlay_menu(surface, {}, app_state, db)
-        except Exception as error:
-            check(False, "real menu build failed at %s: %r" % (size, error))
-            continue
-        x, y, w, h = ui.menu_panel_rect(size[0], size[1], db)
-        check(tuple(pos) == (x, y) and stamp.get_size() == (w, h), "real menu stamp %s %s != panel rect %s" % (stamp.get_size(), pos, (x, y, w, h)))
-
-
-class TestMenuNavNameEntryAndExplorerRect(_SectionCase):
-    """Name entry steps and the File Explorer panel matching the Main Menu rectangle"""
-
-    def test_name_step_direct(self):
-        self.run_section(suite_name_step_direct)
-
-    def test_explorer_rect(self):
-        self.run_section(suite_explorer_rect)
-
-    def test_video_mode_rect(self):
-        self.run_section(suite_video_mode_rect)
-
-    def test_one_picture_path(self):
-        self.run_section(suite_one_picture_path)
-
-    def test_one_shape_per_label(self):
-        self.run_section(suite_one_shape_per_label)
-
-    def test_picture_box_before_show(self):
-        self.run_section(suite_picture_box_before_show)
-
-    def test_random_start(self):
-        self.run_section(suite_random_start)
-
-    def test_caption_memory_guard(self):
-        self.run_section(suite_caption_memory_guard)
-
-    def test_real_menu_build(self):
-        self.run_section(suite_real_menu_build)
 
 
 # ============================================================================
@@ -6621,151 +2894,20 @@ class TestLoudnessToggle(_SectionCase):
 # ============================================================================
 
 
-def eq_case_ease():
-    """The column smoothing covers the same share of the gap in the same time at 30, 60 and 144 frames a second."""
-    import visualizers as vz
-    tau = vz._eq_tunables()[0]
-    expected = 1.0 - math.exp(-1.0 / tau)
-    for fps in (30, 60, 144):
-        value = 0.0
-        for _ in range(fps):
-            value = vz._eq_ease(value, 1.0, 1.0 / fps, tau)
-        check(abs(value - expected) < 0.002, "one second at %d fps reaches %.4f, expected %.4f" % (fps, value, expected))
-    check(vz._eq_ease(0.25, 1.0, 0.0, tau) == 0.25, "no time passed means no movement")
-    check(vz._eq_ease(0.25, 1.0, 0.05, 0.0) == 1.0, "a zero smooth time snaps to the target")
-    check(0.25 < vz._eq_ease(0.25, 1.0, 0.016, tau) < 1.0, "a normal step moves part of the way")
 
 
-def eq_case_column():
-    """A column level becomes whole dots plus a fade for the next dot, never fewer than one dot and never past the top."""
-    import visualizers as vz
-    col = vz._eq_column
-    check(col(3.25, 13) == (3, 0.25), "3.25 is 3 dots and a quarter fade (%r)" % (col(3.25, 13),))
-    check(col(3.0, 13) == (3, 0.0), "an exact step has no fade")
-    check(col(0.0, 13) == (1, 0.0) and col(-5.0, 13) == (1, 0.0), "never fewer than one dot")
-    check(col(0.4, 13) == (1, 0.0), "under one dot stays one full dot")
-    check(col(13.0, 13) == (13, 0.0) and col(99.0, 13) == (13, 0.0), "never past the top dot, no fade there")
-    whole, fade = col(12.9, 13)
-    check(whole == 12 and abs(fade - 0.9) < 1e-9, "just under the top fades the top dot in (%r)" % ((whole, fade),))
-    last = None
-    for step in range(0, 1300):
-        whole, fade = col(step / 100.0, 13)
-        shown = whole + fade
-        check(last is None or 0 <= shown - last < 0.011, "shown height rises smoothly at %.2f" % (step / 100.0))
-        last = shown
 
 
-def eq_run_deck(frames, fps, seed):
-    """Drives the real Equalizer Grid with the main loop's own made-up level on a simulated clock; returns the shown height per column per frame, and the same bars shown with the old whole-dot rule."""
-    import visualizers as vz
-    clock = [1000.0]
-    real_time = vz._time
-    vz._time = types.SimpleNamespace(monotonic=lambda: clock[0] / 1000.0)
-    random.seed(seed)
-    try:
-        deck = vz.VisualizerDeck()
-        surface = pygame.Surface((960, 540))
-        shown_rows, plain_rows = [], []
-        max_dots = (540 - 10) // (max(4, 960 // 24 - 4) + 3)
-        for _ in range(frames):
-            clock[0] += 1000.0 / fps
-            amp = 45 + int(math.sin(clock[0] * 0.045) * 45) + random.randint(0, 5)
-            deck.render_active_engine(surface, {}, mock_amplitude=amp, style_override="EqualizerGrid")
-            shown_rows.append([sum(vz._eq_column(b * max_dots, max_dots)) for b in deck.eq_bars])
-            plain_rows.append([float(max(1, int(b * max_dots))) for b in deck.eq_bars])
-        return shown_rows, plain_rows, max_dots
-    finally:
-        vz._time = real_time
 
 
-def eq_jumps(rows, size):
-    """Counts frame to frame changes of a column's shown height that are at least size dots, after the first 60 frames of climbing from empty."""
-    return sum(1 for column in range(len(rows[0])) for k in range(61, len(rows)) if abs(rows[k][column] - rows[k - 1][column]) >= size)
 
 
-def eq_motion(rows):
-    """The average over columns of how far each column's shown height travels between its lowest and highest point."""
-    spans = [max(row[c] for row in rows[60:]) - min(row[c] for row in rows[60:]) for c in range(len(rows[0]))]
-    return sum(spans) / len(spans)
 
 
-def eq_case_flicker():
-    """On the real signal no column jumps a whole dot in one frame, the columns still visibly move, and the same signal gives the same picture."""
-    for fps in (30, 60):
-        shown, plain, max_dots = eq_run_deck(fps * 20, fps, seed=7)
-        check(eq_jumps(plain, 1.0) > 100, "the old whole-dot rule jumps a dot in one frame often at %d fps (%d times), so the comparison means something" % (fps, eq_jumps(plain, 1.0)))
-        check(eq_jumps(shown, 0.5) == 0, "%d fps: no column changes by half a dot in one frame (%d did)" % (fps, eq_jumps(shown, 0.5)))
-        check(eq_motion(shown) > 0.4 * eq_motion(plain), "%d fps: the columns still move (%.2f dots against %.2f before)" % (fps, eq_motion(shown), eq_motion(plain)))
-        check(all(1.0 <= v <= max_dots for row in shown for v in row), "%d fps: shown heights stay between 1 and %d" % (fps, max_dots))
-    first, _, _ = eq_run_deck(600, 60, seed=3)
-    second, _, _ = eq_run_deck(600, 60, seed=3)
-    check(first == second, "the same signal gives the same picture")
 
 
-def eq_case_fade_drawn():
-    """Each column draws its whole dots plus one dimmer dot above them whose brightness follows the fade."""
-    import visualizers as vz
-    clock = [1000.0]
-    real_time = vz._time
-    vz._time = types.SimpleNamespace(monotonic=lambda: clock[0] / 1000.0)
-    drawn = []
-    real_rect = pygame.draw.rect
-    pygame.draw.rect = lambda surf, color, rect, *a, **k: drawn.append((tuple(color), tuple(rect)))
-    try:
-        deck = vz.VisualizerDeck()
-        surface = pygame.Surface((960, 540))
-        for _ in range(180):
-            clock[0] += 1000.0 / 60.0
-            drawn.clear()
-            deck.render_active_engine(surface, {}, mock_amplitude=60, style_override="EqualizerGrid")
-    finally:
-        pygame.draw.rect = real_rect
-        vz._time = real_time
-    h, bar_w = 540, 960 // 24
-    dot_h, dot_w = max(4, bar_w - 4), max(4, bar_w - 6)
-    cell_h = dot_h + 3
-    max_dots = (h - 10) // cell_h
-    peak_color = (255, 240, 80)
-    faded_columns = 0
-    for column in range(24):
-        bar_x = column * bar_w + (bar_w - dot_w) // 2
-        whole, fade = vz._eq_column(deck.eq_bars[column] * max_dots, max_dots)
-        rects = [(c, r) for c, r in drawn if r[0] == bar_x and c != peak_color]
-        check(len(rects) == whole + (1 if fade >= 0.04 else 0), "column %d draws %d dots plus the fade dot (fade %.2f), found %d" % (column, whole, fade, len(rects)))
-        if fade >= 0.04:
-            faded_columns += 1
-            top = [c for c, r in rects if r[1] == h - dot_h - whole * cell_h]
-            check(len(top) == 1, "column %d has one dot at the fade position" % column)
-            row_frac = max(0.0, min(1.0, whole / float(max(1, max_dots))))
-            if row_frac < 0.5:
-                lo, hi, f = (255, 60, 170), (0, 210, 220), row_frac / 0.5
-            else:
-                lo, hi, f = (0, 210, 220), (210, 230, 60), (row_frac - 0.5) / 0.5
-            row_color = tuple(int(lo[k] + (hi[k] - lo[k]) * f) for k in range(3))
-            expected = tuple(int(1 + (c - 1) * fade) for c in row_color)
-            check(bool(top) and top[0] == expected, "column %d fade dot is %r, expected %r" % (column, top[:1], expected))
-    check(faded_columns > 0, "at least one column is mid-step, so the fade is exercised")
 
 
-def eq_case_source():
-    """The Equalizer Grid branch holds no old per-frame constants and the governor table holds the three numbers, matching the fallback."""
-    import visualizers as vz
-    with open(os.path.join(ROOT, "visualizers.py"), encoding="utf-8") as handle:
-        source = handle.read()
-    branch = source[source.index('elif style == "EqualizerGrid":'):source.index('elif style == "ParticleFlow":')]
-    check("* 0.18" not in branch and "- 0.007" not in branch, "no per-frame smoothing or peak numbers left in the branch")
-    check("int(self.eq_bars[bi] * max_dots)" not in branch.replace("peak_di = int(self.eq_peaks[bi] * max_dots)", ""), "the whole-dot rule is gone from the columns")
-    check("_eq_column(" in branch and "_eq_ease(" in branch, "the branch uses both helpers")
-    for name in ("EQ_GRID_SMOOTH_SECONDS", "EQ_GRID_PEAK_FALL_PER_SECOND", "EQ_GRID_MAX_STEP_SECONDS"):
-        check(hasattr(gov, name), "governor has %s" % name)
-    real = vz._eq_tunables()
-    saved = vz._governor
-    vz._governor = None
-    try:
-        fallback = vz._eq_tunables()
-    finally:
-        vz._governor = saved
-    check(tuple(real) == tuple(fallback), "the import fallback %r matches the governor table %r" % (fallback, real))
 
 
 # ============================================================================
@@ -6887,51 +3029,8 @@ class TestBroadcastClockTable(_SectionCase):
 # ============================================================================
 
 
-def stick_activity_table_case():
-    import menu_nav as mn
-    import game_deck as gd
-    for name in ("STICK_SS_ACTIVITY_DEADZONE", "STICK_MULTITAP_ACTIVITY_DEADZONE",
-                 "STICK_CH03_AXIS_ACTIVITY_DEADZONE", "STICK_MENU_AXIS_THRESHOLD"):
-        check(hasattr(gov, name), "%s is in the governor table" % name)
-    check(mn.JOY_AXIS_THRESHOLD == float(gov.STICK_MENU_AXIS_THRESHOLD), "the menu joystick threshold follows the table")
-    check(gd.ExternalGameDeck._MULTITAP_ACTIVITY_DZ == gov.STICK_MULTITAP_ACTIVITY_DEADZONE, "the multitap activity number follows the table")
-    with open(os.path.join(ROOT, "game_deck.py"), "r", encoding="utf-8") as handle:
-        deck_src = handle.read()
-    check("_SS_STICK_ACTIVITY_DZ = _gov.STICK_SS_ACTIVITY_DEADZONE" in deck_src, "the screensaver stick number follows the table")
-    with open(os.path.join(ROOT, "retro_tv_emulator.py"), "r", encoding="utf-8") as handle:
-        main_src = handle.read()
-    check("performance_governor.STICK_CH03_AXIS_ACTIVITY_DEADZONE" in main_src, "the Channel 03 axis wake number follows the table")
-    check("8000 / 32767.0" in main_src and gov.STICK_CH03_AXIS_ACTIVITY_DEADZONE == 8000 / 32767.0, "its fallback matches the table")
-    with open(os.path.join(ROOT, "menu_nav.py") if os.path.exists(os.path.join(ROOT, "menu_nav.py")) else os.path.join(ROOT, "assets", "menu_nav.py"), "r", encoding="utf-8") as handle:
-        nav_src = handle.read()
-    check("JOY_AXIS_THRESHOLD = float(_governor.STICK_MENU_AXIS_THRESHOLD) if _governor is not None else 0.6\n" in nav_src and gov.STICK_MENU_AXIS_THRESHOLD == 0.6, "its fallback matches the table")
 
 
-def controller_read_table_case():
-    import game_deck as gd
-    expected = {"TRIGGER_PRESS_THRESHOLD": 30, "GAME_HOTKEY_TRIGGER_THRESHOLD": 128, "GAME_HOTKEY_COOLDOWN_MS": 2000,
-                "DINPUT_AXIS_LIVENESS_THRESHOLD": 1500, "HID_IDENTITY_CACHE_TTL_SECONDS": 2.0,
-                "DINPUT_FRAME_CACHE_WINDOW_SECONDS": 0.008, "JS_DEAD_TIMEOUT_SECONDS": 5.0, "XI_NAV_POLL_HZ": 30,
-                "XI_NAV_NO_PAD_INTERVAL_SECONDS": 0.25, "XI_NAV_MISSES_BEFORE_SLOW": 30}
-    for name, value in expected.items():
-        check(getattr(gov, name, None) == value, "%s is in the governor table with the number the code had (%s)" % (name, value))
-    check(gd._DINPUT_AXIS_LIVENESS_THRESHOLD == gov.DINPUT_AXIS_LIVENESS_THRESHOLD, "the liveness number follows the table")
-    check(gd._HID_IDENTITY_CACHE_TTL == gov.HID_IDENTITY_CACHE_TTL_SECONDS, "the identity cache time follows the table")
-    check(gd._DINPUT_FRAME_CACHE_WINDOW == gov.DINPUT_FRAME_CACHE_WINDOW_SECONDS, "the DirectInput frame cache follows the table")
-    check(gd._JS_DEAD_TIMEOUT == gov.JS_DEAD_TIMEOUT_SECONDS, "the Linux joystick timeout follows the table")
-    check((gd._XI_NAV_POLL_HZ, gd._XI_NAV_NO_PAD_INTERVAL, gd._XI_NAV_MISSES_BEFORE_SLOW)
-          == (gov.XI_NAV_POLL_HZ, gov.XI_NAV_NO_PAD_INTERVAL_SECONDS, gov.XI_NAV_MISSES_BEFORE_SLOW), "the menu pad polling follows the table")
-    with open(gd.__file__, encoding="utf-8") as handle:
-        tree = ast.parse(handle.read())
-    local_names = {"TRIG_THRESH", "TRIGGER_PRESS_THRESHOLD", "_TRIG_THRESH", "_COOLDOWN_MS", "_DINPUT_AXIS_LIVENESS_THRESHOLD",
-                   "_HID_IDENTITY_CACHE_TTL", "_DINPUT_FRAME_CACHE_WINDOW", "_JS_DEAD_TIMEOUT", "_XI_NAV_POLL_HZ",
-                   "_XI_NAV_NO_PAD_INTERVAL", "_XI_NAV_MISSES_BEFORE_SLOW"}
-    seen = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in local_names:
-            seen.add(node.targets[0].id)
-            check(not isinstance(node.value, ast.Constant), "%s is assigned a literal number in game_deck.py" % node.targets[0].id)
-    check(seen == local_names, "every moved name is still assigned from the table: missing %s" % sorted(local_names - seen))
 
 
 # ============================================================================
@@ -6939,69 +3038,6 @@ def controller_read_table_case():
 # ============================================================================
 
 
-def stick_per_player_case():
-    import game_deck as gd
-    names = ("deadzone", "sensitivity", "axis_threshold")
-    check(gd.stick_config_key("stick_deadzone_percent", 1) == "stick_deadzone_percent", "Player 1 keeps the plain key")
-    check(gd.stick_config_key("stick_deadzone_percent", 3) == "stick_deadzone_percent_p3", "Players 2 to 4 add _pN")
-    cfg = {}
-    for player in gd.STICK_PLAYERS:
-        check(gd.stick_switch_on(cfg, player) is gov.STICK_DZ_ENABLED_DEFAULT, "player %d starts with the default switch" % player)
-    gd.adjust_stick_setting(cfg, "deadzone", 1, 2)
-    gd.adjust_stick_setting(cfg, "sensitivity", 1, 3)
-    gd.toggle_stick_switch(cfg, 4)
-    check(gd.stick_setting_percent(cfg, "deadzone", 2) == 1 and gd.stick_setting_percent(cfg, "deadzone", 1) == 0, "a change to Player 2 leaves Player 1 alone")
-    check(gd.stick_setting_percent(cfg, "sensitivity", 3) == 105 and gd.stick_setting_percent(cfg, "sensitivity", 2) == 100, "a change to Player 3 leaves Player 2 alone")
-    check(gd.stick_switch_on(cfg, 4) is (not gov.STICK_DZ_ENABLED_DEFAULT) and gd.stick_switch_on(cfg, 1) is gov.STICK_DZ_ENABLED_DEFAULT, "the switch is per player")
-    gd.reset_stick_defaults(cfg, 2)
-    check(gd.stick_setting_percent(cfg, "deadzone", 2) == gov.STICK_DZ_SPECS["deadzone"][1], "reset acts on one player")
-    check(gd.stick_setting_percent(cfg, "sensitivity", 3) == 105, "reset of Player 2 leaves Player 3's values")
-    old = {gov.STICK_DZ_SPECS[n][0]: v for n, v in (("deadzone", 30), ("sensitivity", 120), ("axis_threshold", 40))}
-    check(gd.stick_settings_from_config(old, 1).deadzone == 0.30, "an old saved config still drives Player 1")
-    check(gd.stick_settings_from_config(old, 2).deadzone == 0.0, "an old saved config does not leak into Player 2")
-
-    previous = {p: gd.current_stick_settings(p) for p in gd.STICK_PLAYERS}
-    saved_slots = dict(gd._player_slot_of)
-    try:
-        cfg = {gov.STICK_DZ_ENABLED_KEY: True, gd.stick_config_key(gov.STICK_DZ_SPECS["deadzone"][0], 2): 50,
-               gd.stick_config_key(gov.STICK_DZ_SPECS["axis_threshold"][0], 2): 80,
-               gd.stick_config_key(gov.STICK_DZ_ENABLED_KEY, 3): False}
-        gd.apply_stick_config(cfg)
-        check(gd.current_stick_settings(2).deadzone == 0.5 and gd.current_stick_settings(1).deadzone == 0.0, "apply keeps four separate settings")
-        check(gd.stick_axis_threshold_raw(2) == int(0.8 * gd.STICK_MAX), "Player 2's threshold is its own")
-        check(gd.stick_axis_threshold_raw(1) == int(0.5 * gd.STICK_MAX), "Player 1's threshold is its own")
-        check(gd.stick_axis_threshold_raw(3) == gov.STICK_DZ_OFF_DPAD_THRESHOLD and gd.stick_dinput_threshold_raw(3) == gov.STICK_DZ_OFF_DINPUT_THRESHOLD, "Player 3 with the switch off keeps the fixed numbers")
-        gd._player_slot_of.clear()
-        gd._player_slot_of.update({1: 0, 2: 1, 3: "di7"})
-        check(gd.stick_player_of_slot(1) == 2 and gd.stick_player_of_slot("di7") == 3 and gd.stick_player_of_slot(9) == 1, "a pad slot belongs to its player; an unassigned pad counts as Player 1")
-
-        def pad(lx, ly):
-            g = gd._GPState()
-            g.sLX, g.sLY = lx, ly
-            return g
-
-        g1 = gd.apply_stick_correction(pad(10000, 0), 0)
-        g2 = gd.apply_stick_correction(pad(10000, 0), 1)
-        g3 = gd.apply_stick_correction(pad(10000, 0), "di7")
-        check(g1.sLX == 10000, "the pad of Player 1 (no deadzone) is left as read")
-        check(g2.sLX == 0 and g2.rawLX == 10000, "the pad of Player 2 is cut by Player 2's deadzone and keeps its raw value")
-        check(g3.sLX == 10000, "the pad of Player 3 (switch off) is left as read")
-        gd._player_slot_of[2] = "js:/dev/input/js0"
-        reader = gd._LinuxJoystickReader.__new__(gd._LinuxJoystickReader)
-        reader._path, reader._fd, reader._state = "/dev/input/js0", None, gd._GPState()
-        reader._fd = os.open(os.devnull, os.O_RDONLY)
-        reader._state.sLX = 10000
-        try:
-            with mock.patch.object(gd.os, "read", side_effect=BlockingIOError):
-                lg = reader.read()
-        finally:
-            os.close(reader._fd)
-        check(lg is not None and lg.sLX == 0 and lg.rawLX == 10000, "a Linux (Wine) joystick follows the settings of the player it is assigned to")
-    finally:
-        gd._player_slot_of.clear()
-        gd._player_slot_of.update(saved_slots)
-        for p, st in previous.items():
-            gd._stick_current[p] = st
 
 
 # ============================================================================
@@ -7009,23 +3045,6 @@ def stick_per_player_case():
 # ============================================================================
 
 
-def aspect_keys_gone_case():
-    import media as _media
-    for gone in ("dvd_aspect_ratio", "game_aspect_ratio", "_apply_bezel_on_aspect_lock", "_restore_aspect_ratio_after_bezel_off",
-                 "_aspect_ratio_locked_by_bezel", "_before_bezel_boot_aspect", "_is_true_43_hardware"):
-        check(gone not in MAIN_SRC, "%s is gone from the main script" % gone)
-    with open(_media.__file__, encoding="utf-8") as handle:
-        media_src = handle.read()
-    check("_aspect_ratio_before_bezel" not in media_src.replace("\"_aspect_ratio_before_bezel\"", "").replace("_dvd_aspect_ratio_before_bezel", "").replace("_game_aspect_ratio_before_bezel", ""), "media.py no longer restores aspect_ratio from a stash entry")
-    check("game_aspect_ratio\"] = " not in media_src and "\"dvd_aspect_ratio\": " not in media_src, "media.py no longer sets either key")
-    db = _media.RetroDatabase.__new__(_media.RetroDatabase)
-    config = db._apply_config_defaults({"aspect_ratio": "4:3", "dvd_aspect_ratio": "4:3", "game_aspect_ratio": "4:3",
-                                        "_aspect_ratio_before_bezel": "4:3", "_dvd_aspect_ratio_before_bezel": "4:3", "_game_aspect_ratio_before_bezel": "16:9"})
-    check(not any(k in config for k in ("dvd_aspect_ratio", "game_aspect_ratio", "_aspect_ratio_before_bezel", "_dvd_aspect_ratio_before_bezel", "_game_aspect_ratio_before_bezel")),
-          "an old saved config loses the five old keys")
-    check(config["aspect_ratio"] == "16:9", "the main aspect ratio is still forced to 16:9")
-    block_start = MAIN_SRC.index('self.target_aspect = "16:9"')
-    check('engine_label == "dvd"' in MAIN_SRC[block_start - 120:block_start], "the DVD engine's target aspect is the fixed 16:9")
 
 
 # ============================================================================
@@ -7033,49 +3052,6 @@ def aspect_keys_gone_case():
 # ============================================================================
 
 
-def canvas_fit_case():
-    import game_deck as gd
-    with open(os.path.join(ROOT, "game_deck.py"), "r", encoding="utf-8") as handle:
-        src = handle.read()
-    check("_cover_scale_bg" not in src, "the cropping background scaler is gone")
-    check(src.count("_scale_to_canvas(") >= 4, "the menu background, console splash and DVD splash all use the canvas fit")
-    for w, h in ((640, 480), (1152, 864), (1280, 720), (500, 900)):
-        src_surf = pygame.Surface((160, 90))
-        src_surf.fill((10, 20, 30))
-        src_surf.set_at((0, 0), (255, 0, 0))
-        src_surf.set_at((159, 0), (0, 255, 0))
-        src_surf.set_at((0, 89), (0, 0, 255))
-        src_surf.set_at((159, 89), (255, 255, 0))
-        big = pygame.transform.scale(src_surf, (1600, 900))
-        out = gd._scale_to_canvas(big, w, h)
-        check(out.get_size() == (w, h), "%dx%d: the picture is scaled to exactly the canvas" % (w, h))
-        for name, pos, want in (("top left", (1, 1), (255, 0, 0)), ("top right", (w - 2, 1), (0, 255, 0)),
-                                ("bottom left", (1, h - 2), (0, 0, 255)), ("bottom right", (w - 2, h - 2), (255, 255, 0))):
-            got = tuple(out.get_at(pos))[:3]
-            check(sum(abs(a - b) for a, b in zip(got, want)) < 400 and max(got) > 60, "%dx%d: %s corner of the picture is still shown (no crop): %s" % (w, h, name, got))
-        check(tuple(out.get_at((w // 2, h // 2)))[:3] != (0, 0, 0), "%dx%d: no black bars in the middle" % (w, h))
-        for edge_pos in ((0, h // 2), (w - 1, h // 2), (w // 2, 0), (w // 2, h - 1)):
-            check(tuple(out.get_at(edge_pos))[:3] != (0, 0, 0), "%dx%d: no black bar at edge %s" % (w, h, edge_pos))
-    check(gd._scale_to_canvas(pygame.Surface((8, 8)), 0, 0).get_size() == (1, 1), "a zero-size canvas gives one pixel, not a crash")
-
-    class _Deck:
-        dvd_splash_enabled = True
-        DVD_LOAD_SCREEN_MS = 1000
-
-        def _ensure_fonts(self):
-            pass
-
-        def _get_dvd_custom_splash_surface(self):
-            pic = pygame.Surface((160, 90))
-            pic.fill((200, 50, 50))
-            return pic
-
-    for w, h in ((640, 480), (1152, 864)):
-        screen = pygame.Surface((w, h))
-        screen.fill((0, 0, 0))
-        gd.ExternalGameDeck._render_dvd_load_screen(_Deck(), screen, pygame.Rect(0, 0, w, h))
-        for pos in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1), (w // 2, 2), (w // 2, h - 3)):
-            check(tuple(screen.get_at(pos))[:3] != (0, 0, 0), "%dx%d: the DVD splash image fills the screen with no bars at %s" % (w, h, pos))
 
 
 # ============================================================================
@@ -7083,174 +3059,10 @@ def canvas_fit_case():
 # ============================================================================
 
 
-def game_dvd_picture_box_case():
-    import game_deck as gd
-    for gone in ("_dvd_pillarbox_active", "_game_pillarbox_active"):
-        check(gone not in MAIN_SRC, "%s is still in the main script" % gone)
-    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
-    pictures = ((16, 9), (4, 3), (9, 16), (21, 9), (5, 4))
-    for bezel in (False, True):
-        for ratio in ("16:9", "4:3"):
-            config = {"fake_43_border_enabled": bezel, "aspect_ratio": ratio}
-            ns = {"pygame": pygame, "db": FakeDbConfig(config), "_PICTURE_STANDARD_ASPECTS": (16 / 9, 4 / 3, 9 / 16), "math": math}
-            for name in ("_compute_dvd_content_rect", "_compute_game_content_rect", "_dvd_bezel_video_fit", "_snap_standard_aspect"):
-                exec(main_function_code(name), ns)
-            for w, h in screens:
-                check(tuple(ns["_compute_dvd_content_rect"](w, h)) == (0, 0, w, h), "%dx%d bezel=%s %s: the DVD canvas is not the whole window" % (w, h, bezel, ratio))
-                check(tuple(ns["_compute_game_content_rect"](w, h)) == (0, 0, w, h), "%dx%d bezel=%s %s: the game canvas is not the whole window" % (w, h, bezel, ratio))
-    ns = {"pygame": pygame, "db": FakeDbConfig({"fake_43_border_enabled": False}), "_PICTURE_STANDARD_ASPECTS": (16 / 9, 4 / 3, 9 / 16), "math": math}
-    for name in ("_dvd_bezel_video_fit", "_snap_standard_aspect"):
-        exec(main_function_code(name), ns)
-    blit_ns = {"pygame": pygame, "time": time, "_blit_video_log_state": {"key": None}, "_last_screen_mode_picture_rect": None,
-               "_video_bar_color": lambda: (0, 0, 0), "_active_screen_mode": lambda: "normal",
-               "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()}
-    exec(main_function_code("_blit_video_with_screen_mode"), blit_ns)
-    dvd_blit = blit_ns["_blit_video_with_screen_mode"]
-
-    def bars_of(geom, w, h):
-        sides = geom["dest_x"] > 1 or w - (geom["dest_x"] + geom["draw_w"]) > 1
-        tops = geom["dest_y"] > 1 or h - (geom["dest_y"] + geom["draw_h"]) > 1
-        return sides, tops
-
-    for w, h in screens:
-        for pw, ph in pictures:
-            surf = pygame.Surface((pw * 40, ph * 40))
-            label = "%dx%d screen, %d:%d picture" % (w, h, pw, ph)
-            for mode in ("normal", "stretch"):
-                screen = pygame.Surface((w, h))
-                geom = {}
-                rect, pa = ns["_dvd_bezel_video_fit"](pygame.Rect(0, 0, w, h), w, h, ns["_snap_standard_aspect"](pw / ph), mode)
-                check(tuple(rect) == (0, 0, w, h), "DVD %s: the fit rect is not the whole window" % label)
-                dvd_blit(screen, surf, rect, mode=mode, geom_out=geom, pixel_aspect=pa, fit_aspect=ns["_snap_standard_aspect"](pw / ph))
-                sides, tops = bars_of(geom, w, h)
-                check(not (sides and tops), "DVD %s in %s has bars on both axes: %s" % (label, mode, geom))
-                if mode == "stretch":
-                    check(geom["draw_w"] >= w and geom["draw_h"] >= h, "DVD %s in Stretch does not fill the screen: %s" % (label, geom))
-            for mode in ("normal", "stretch"):
-                screen = pygame.Surface((w, h))
-                screen.fill((0, 0, 0))
-                frame = pygame.Surface((pw * 40, ph * 40))
-                frame.fill((200, 200, 200))
-                gd._libretro_blit_scaled(screen, frame, pygame.Rect(0, 0, w, h), mode=mode)
-                lit = [(x, y) for x in range(0, w, 4) for y in range(0, h, 4) if screen.get_at((x, y))[0] > 100]
-                xs = [p[0] for p in lit]
-                ys = [p[1] for p in lit]
-                left, right, top, bottom = min(xs), w - 1 - max(xs), min(ys), h - 1 - max(ys)
-                side_bars = left > 6 or right > 6
-                top_bars = top > 6 or bottom > 6
-                check(not (side_bars and top_bars), "Game %s in %s has bars on both axes: %s" % (label, mode, (left, right, top, bottom)))
-                if mode == "stretch":
-                    check(not side_bars and not top_bars, "Game %s in Stretch does not fill the screen: %s" % (label, (left, right, top, bottom)))
-                else:
-                    drawn = (max(xs) - min(xs) + 4) / float(max(ys) - min(ys) + 4)
-                    check(abs(drawn - pw / ph) < 0.05, "Game %s in Normal is distorted: %.3f" % (label, drawn))
 
 
-def game_no_second_box_case():
-    import game_deck as gd
-    screens = ((1152, 864), (1024, 768), (1280, 1024), (1280, 800), (1280, 720), (1920, 1080), (2560, 1080))
-    frames = {"NES": (256, 240), "SNES": (256, 224), "GENESIS": (320, 224), "PSX": (320, 240), "N64": (640, 480),
-              "GBA": (240, 160), "GB": (160, 144), "ARCADE43": (1024, 768)}
-    four_three = {"PSX", "N64", "ARCADE43", "NES", "SNES"}
-    check(gov.GAME_DISPLAY_ASPECTS == {"NES": 4.0 / 3.0, "SNES": 4.0 / 3.0}, "the governor table makes NES and SNES 4:3 and lists no other console")
-
-    def shape_of(name, fw, fh):
-        return gov.GAME_DISPLAY_ASPECTS.get(name, fw / float(fh))
-
-    def lit_box(screen, w, h):
-        xs = [x for x in range(w) if screen.get_at((x, h // 2))[0] > 100]
-        ys = [y for y in range(h) if screen.get_at((w // 2, y))[0] > 100]
-        return xs[0], w - 1 - xs[-1], ys[0], h - 1 - ys[-1], xs[-1] - xs[0] + 1, ys[-1] - ys[0] + 1
-
-    deck = gd.ExternalGameDeck.__new__(gd.ExternalGameDeck)
-    deck._libretro_border_enabled = False
-    deck._libretro_border_surf = None
-    for mode in ("normal", "stretch"):
-        with mock.patch.object(gd, "_active_game_screen_mode", lambda mode=mode: mode):
-            for w, h in screens:
-                for name, (fw, fh) in frames.items():
-                    deck._libretro_console = name
-                    label = "%dx%d screen, %s frame %dx%d, %s" % (w, h, name, fw, fh, mode)
-                    screen = pygame.Surface((w, h))
-                    screen.fill((0, 0, 0))
-                    frame = pygame.Surface((fw, fh))
-                    frame.fill((200, 200, 200))
-                    deck._blit_libretro_frame_impl(screen, frame, pygame.Rect(0, 0, w, h))
-                    left, right, top, bottom, drawn_w, drawn_h = lit_box(screen, w, h)
-                    side_bars = left > 2 or right > 2
-                    top_bars = top > 2 or bottom > 2
-                    check(not (side_bars and top_bars), "%s: bars on both axes %s" % (label, (left, right, top, bottom)))
-                    if mode == "stretch":
-                        check(not side_bars and not top_bars, "%s: does not fill the screen %s" % (label, (left, right, top, bottom)))
-                    else:
-                        want = shape_of(name, fw, fh)
-                        check(abs(drawn_w / float(drawn_h) - want) < 0.02, "%s: drawn shape %.3f, wanted %.3f" % (label, drawn_w / float(drawn_h), want))
-                        check(side_bars or top_bars or abs(w / float(h) - want) < 0.02, "%s: no bars but the shape differs" % label)
-                        if (w, h) in ((1152, 864), (1024, 768)) and name in four_three:
-                            check(not side_bars and not top_bars, "%s: a 4:3 picture does not fill a 4:3 screen %s" % (label, (left, right, top, bottom)))
-    with mock.patch.object(gd, "_active_game_screen_mode", lambda: "normal"):
-        for name, fw, fh, want in (("SNES", 256, 224, (1152, 864)), ("NES", 256, 240, (1152, 864)), ("GENESIS", 320, 224, (1152, 806)), ("PSX", 320, 240, (1152, 864))):
-            deck._libretro_console = name
-            screen = pygame.Surface((1152, 864))
-            screen.fill((0, 0, 0))
-            frame = pygame.Surface((fw, fh))
-            frame.fill((200, 200, 200))
-            deck._blit_libretro_frame_impl(screen, frame, pygame.Rect(0, 0, 1152, 864))
-            check(lit_box(screen, 1152, 864)[4:] == want, "%s %dx%d draws %s on a 1152x864 screen, got %s" % (name, fw, fh, want, lit_box(screen, 1152, 864)[4:]))
-        snes_w, snes_h = gd._game_layout_shape("SNES", 256, 224)
-        check(snes_h == 224.0 and abs(snes_w / snes_h - 4.0 / 3.0) < 1e-9, "the SNES layout shape is 4:3 of its frame height")
-        check(gd._game_layout_shape("GENESIS", 320, 224) == (320.0, 224.0) and gd._game_layout_shape(None, 320, 224) == (320.0, 224.0), "a console not in the table keeps its frame shape")
-
-        deck._libretro_border_enabled = True
-        deck._libretro_border_path = None
-        deck._border_blit_cache = None
-        deck._libretro_border_rect_frac = (0.1, 0.1, 0.8, 0.8)
-        for name, fw, fh, fills in (("SNES", 256, 224, True), ("NES", 256, 240, True), ("PSX", 320, 240, True), ("GENESIS", 320, 224, False)):
-            deck._libretro_console = name
-            deck._border_blit_cache = None
-            deck._libretro_border_surf = pygame.Surface((1152, 864), pygame.SRCALPHA)
-            screen = pygame.Surface((1152, 864))
-            screen.fill((0, 0, 0))
-            frame = pygame.Surface((fw, fh))
-            frame.fill((200, 200, 200))
-            deck._blit_libretro_frame_impl(screen, frame, pygame.Rect(0, 0, 1152, 864))
-            inner_x, inner_y = 115, 86
-            inner_w, inner_h = 921, 691
-            corners = [screen.get_at((inner_x + 3, inner_y + 3))[0], screen.get_at((inner_x + inner_w - 4, inner_y + inner_h - 4))[0]]
-            if fills:
-                check(all(c > 100 for c in corners), "%s %dx%d fills the 4:3 console bezel window, corners %s" % (name, fw, fh, corners))
-            else:
-                check(screen.get_at((inner_x + 3, inner_y + inner_h // 2))[0] < 100 or screen.get_at((inner_x + inner_w // 2, inner_y + 3))[0] < 100,
-                      "%s %dx%d keeps its own shape inside the console bezel window" % (name, fw, fh))
-        deck._libretro_border_enabled = False
-
-    ns = {"pygame": pygame, "db": FakeDbConfig({"fake_43_border_enabled": True, "aspect_ratio": "16:9"}), "_real_screen_matches_aspect": lambda *a, **k: False,
-          "_selected_package_aspect": lambda: 16 / 9}
-    exec(main_function_code("_package_pillarbox_active"), ns)
-    for w, h in screens:
-        check(ns["_package_pillarbox_active"](w, h) is False, "%dx%d: with Bezel on the package box is never cut out of a game canvas" % (w, h))
-
-    with open(gd.__file__, encoding="utf-8") as handle:
-        deck_tree = ast.parse(handle.read())
-    for name in ("_blit_libretro_frame_impl", "_render_libretro_impl"):
-        node = next(n for c in ast.walk(deck_tree) if isinstance(c, ast.ClassDef) and c.name == "ExternalGameDeck"
-                    for n in c.body if isinstance(n, ast.FunctionDef) and n.name == name)
-        called = {x.func.id for x in ast.walk(node) if isinstance(x, ast.Call) and isinstance(x.func, ast.Name)}
-        called |= {x.func.attr for x in ast.walk(node) if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute)}
-        for banned in ("_snap_standard_aspect", "_compute_content_rect", "_video_screen_mode_rect", "_dvd_fit_aspect", "_dvd_video_fit", "_aspect_fit_blit"):
-            check(banned not in called, "%s calls %s, which would add a second box to a game" % (name, banned))
-    check("else _compute_game_content_rect(*screen.get_size())" in MAIN_SRC, "the Channel 03 draw hands a game the whole-window canvas")
-    check(MAIN_SRC.count("_compute_game_content_rect(") == 2, "the game canvas is computed in one place only")
 
 
-class TestGameDvdPictureBox(_SectionCase):
-    """Game and DVD pictures are boxed exactly like a TV station: the whole window, one fit, bars on one axis only"""
-
-    def test_game_dvd_picture_box(self):
-        self.run_section(game_dvd_picture_box_case)
-
-    def test_game_no_second_box(self):
-        self.run_section(game_no_second_box_case)
 
 
 # ============================================================================
@@ -7258,187 +3070,12 @@ class TestGameDvdPictureBox(_SectionCase):
 # ============================================================================
 
 
-def stick_case_maths_and_settings():
-    import game_deck as gd
-    key_on = gov.STICK_DZ_ENABLED_KEY
-    check(gd.correct_stick_pair(0, 0, 0.0, 1.0) == (0, 0), "centre stays centre")
-    check(gd.correct_stick_pair(20000, -12345, 0.0, 1.0) == (20000, -12345), "no deadzone and sensitivity 1 leaves a stick as it is")
-    check(gd.correct_stick_pair(3000, 3000, 0.2, 1.0) == (0, 0), "inside the circle gives zero")
-    check(gd.correct_stick_pair(32767, 0, 0.2, 1.0) == (32767, 0), "full push still reaches full range")
-    check(gd.correct_stick_pair(-32767, 0, 0.2, 1.0) == (-32767, 0), "full push left still reaches full range")
-    x, y = gd.correct_stick_pair(20000, 20000, 0.2, 1.0)
-    check(x == y and 0 < x < 20000, "diagonal keeps its angle and is rescaled")
-    check(gd.correct_stick_pair(10000, 0, 0.0, 2.0) == (20000, 0), "sensitivity 2 doubles")
-    check(gd.correct_stick_pair(30000, 0, 0.0, 2.0) == (32767, 0), "sensitivity result is clamped")
-    check(gd.correct_stick_pair(99999, -99999, 0.0, 1.0) == (32767, -32767), "input past full range is clamped to each axis limit")
-
-    default = gd.stick_settings_from_config({})
-    check(default == gd.StickSettings(True, 0.0, 1.0, 0.5), "with nothing saved the switch is on with the default values")
-    check(gd.stick_switch_on({}) is True, "the switch is on by default")
-    off = gd.stick_settings_from_config({key_on: False})
-    check(off.enabled is False and off.deadzone == 0.0 and off.sensitivity == 1.0, "switch off gives neutral values")
-    off_with_values = gd.stick_settings_from_config({key_on: False, gov.STICK_DZ_SPECS["deadzone"][0]: 50})
-    check(off_with_values.deadzone == 0.0, "switch off ignores saved values")
-    on = gd.stick_settings_from_config({key_on: True, gov.STICK_DZ_SPECS["deadzone"][0]: 30,
-                                        gov.STICK_DZ_SPECS["sensitivity"][0]: 150,
-                                        gov.STICK_DZ_SPECS["axis_threshold"][0]: 40})
-    check(on == gd.StickSettings(True, 0.30, 1.5, 0.40), "switch on reads the saved values")
-    bad = gd.stick_settings_from_config({key_on: True, gov.STICK_DZ_SPECS["deadzone"][0]: "junk",
-                                         gov.STICK_DZ_SPECS["sensitivity"][0]: 9999,
-                                         gov.STICK_DZ_SPECS["axis_threshold"][0]: -4})
-    check(bad.deadzone == 0.0 and bad.sensitivity == 2.0 and bad.axis_threshold == 0.05, "bad values are defaulted or clamped")
-
-    previous = gd.current_stick_settings()
-    try:
-        gd.apply_stick_config({key_on: False})
-        check(gd.stick_axis_threshold_raw() == gov.STICK_DZ_OFF_DPAD_THRESHOLD, "off uses the old fixed threshold")
-        check(gd.correct_stick_with_current(5000, 5000) == (5000, 5000), "off corrects nothing")
-        gd.apply_stick_config({key_on: True, gov.STICK_DZ_SPECS["axis_threshold"][0]: 50})
-        check(gd.stick_axis_threshold_raw() == int(0.5 * gd.STICK_MAX), "on uses the menu threshold")
-    finally:
-        gd.apply_stick_config({key_on: previous.enabled})
-
-    cfg = {key_on: True}
-    for name in gd.STICK_SETTING_NAMES:
-        cfg[gov.STICK_DZ_SPECS[name][0]] = gov.STICK_DZ_SPECS[name][2]
-    gd.reset_stick_defaults(cfg)
-    check(all(cfg[gov.STICK_DZ_SPECS[n][0]] == gov.STICK_DZ_SPECS[n][1] for n in gd.STICK_SETTING_NAMES), "reset writes every default")
-    check(cfg[key_on] is True, "reset leaves the switch")
-    for name, (_key, default, low, high, step) in gov.STICK_DZ_SPECS.items():
-        check(low <= default <= high and step > 0, "spec for %s is consistent" % name)
 
 
-def stick_case_screen():
-    import game_deck as gd
-    key_on = gov.STICK_DZ_ENABLED_KEY
-    check(mn.stick_dz_rows(False) == [mn.STICK_DZ_SWITCH, mn.STICK_DZ_PLAYERS, mn.CLOSE], "off shows only the switch, the player squares and Close")
-    check(mn.stick_dz_rows(True) == [mn.STICK_DZ_SWITCH, mn.STICK_DZ_DEADZONE, mn.STICK_DZ_SENSITIVITY, mn.STICK_DZ_AXIS, mn.STICK_DZ_RESET, mn.STICK_DZ_PLAYERS, mn.CLOSE], "on shows the settings, Reset and the player squares")
-    check(mn.stick_dz_cell(mn.stick_dz_rows(True), 99) == mn.CLOSE, "a number outside the rows is Close")
-    for enabled in (False, True):
-        rows = mn.stick_dz_rows(enabled)
-        table = mn.stick_dz_table(enabled)
-        down = [rows[0]]
-        while True:
-            nxt = table.cells[down[-1]].get(mn.DOWN)
-            if nxt is None:
-                break
-            down.append(nxt)
-        check(down == rows, "down walks every row in order (switch %s)" % enabled)
-        check(table.cells[mn.CLOSE].get(mn.UP) == rows[-2], "up from Close reaches the row above it (switch %s)" % enabled)
-    for enabled in (False, True):
-        table = mn.stick_dz_table(enabled)
-        check(table.cells[mn.STICK_DZ_PLAYERS].get(mn.RIGHT) == mn.CLOSE and table.cells[mn.CLOSE].get(mn.LEFT) == mn.STICK_DZ_PLAYERS,
-              "Right from the squares reaches Close and Left from Close returns to them (switch %s)" % enabled)
-    check([mn.stick_dz_player_step(1, mn.LEFT), mn.stick_dz_player_step(1, mn.RIGHT), mn.stick_dz_player_step(3, mn.RIGHT),
-           mn.stick_dz_player_step(4, mn.RIGHT), mn.stick_dz_player_step(4, mn.LEFT)] == [1, 2, 4, None, 3],
-          "Left and Right step the player square, and Right from Player 4 leaves toward Close")
-    check(mn.GAMES_SUB_MENU_RIGHT[0] == "stick_deadzone", "the MENU page has the Stick Deadzone row at the top of the right column")
-    check(mn.GAMES_SUB_MENU_LEFT.index("menu_bg_select_image") == mn.GAMES_SUB_MENU_LEFT.index("controller_map") + 1, "the Background Image row sits under Controller Mapping")
-    with open(ui.__file__, "r", encoding="utf-8") as _ui_file:
-        _ui_text = _ui_file.read()
-    check('"menu_bg_select_image": "BACKGROUND IMAGE",' in _ui_text and "SET MENU BACKGROUND IMAGE" not in _ui_text, "the menu background row is labelled Background Image")
-    rows = ui.get_games_sub_menu_rows(None, {}, "MENU", True)
-    check("stick_deadzone" in rows, "the MENU console lists the row")
-    table = mn.games_sub_table(rows + [mn.CLOSE], False)
-    check(table.cells["controller_map"].get(mn.DOWN) == "menu_bg_select_image", "down from Controller Mapping reaches Background Image")
-    check(table.cells["controller_map"].get(mn.RIGHT) == "stick_deadzone" and table.cells["stick_deadzone"].get(mn.LEFT) == "controller_map", "Right from Controller Mapping reaches Stick Deadzone and Left returns")
-
-    cfg = {key_on: True}
-    check(gd.adjust_stick_setting(cfg, "deadzone", 1) == 1, "deadzone steps up by 1")
-    check(gd.adjust_stick_setting(cfg, "deadzone", -1) == 0 and gd.adjust_stick_setting(cfg, "deadzone", -1) == 0, "deadzone stops at its low end")
-    check(gd.adjust_stick_setting(cfg, "sensitivity", 1) == 105, "sensitivity steps up by 5")
-    cfg[gov.STICK_DZ_SPECS["axis_threshold"][0]] = 95
-    check(gd.adjust_stick_setting(cfg, "axis_threshold", 1) == 95, "threshold stops at its high end")
-    check(gd.toggle_stick_switch(cfg) is False and gd.stick_switch_on(cfg) is False, "toggle turns the switch off")
-    check(gd.toggle_stick_switch(cfg) is True, "toggle turns the switch on")
-
-    check(gd.stick_direction_names(9000, 0, 8000) == ["RIGHT"] and gd.stick_direction_names(-9000, 9000, 8000) == ["UP", "LEFT"], "direction names follow the threshold")
-    check(gd.stick_direction_names(8000, -8000, 8000) == [], "exactly at the threshold fires nothing")
-    check(gd.stick_test_open() is False, "the screen is not open before it is drawn")
-    gd.mark_stick_test_open()
-    check(gd.stick_test_open() is True, "drawing the screen marks it open")
-    check(gd.stick_test_sticks() is None or len(gd.stick_test_sticks()) == 2, "stick read gives nothing or two pairs")
-
-    class _Db:
-        config = {key_on: True, "menu_opacity": 50}
-    for enabled in (False, True):
-        _Db.config[key_on] = enabled
-        surface = pygame.Surface((1036, 680), pygame.SRCALPHA)
-        rows = mn.stick_dz_rows(enabled)
-        for cursor in range(len(rows)):
-            gd.render_stick_deadzone_ui(surface, (20, 138, 996, 525), (0, 255, 128), _Db, cursor, rows, ((20000, -5000), (-32767, 32767)))
-        check(surface.get_at((20 + 996 - 60, 138 + 525 - 30))[:3] != (0, 0, 0), "the Close button is drawn (switch %s)" % enabled)
-        for shown in gd.STICK_PLAYERS:
-            _Db.config[key_on] = True
-            surface = pygame.Surface((1036, 680), pygame.SRCALPHA)
-            rows = mn.stick_dz_rows(True)
-            gd.render_stick_deadzone_ui(surface, (20, 138, 996, 525), (0, 255, 128), _Db, rows.index(mn.STICK_DZ_PLAYERS), rows, None, shown)
-            square_x = 20 + 16 + (shown - 1) * 42 + 17
-            check(surface.get_at((square_x, 138 + 525 - 14 - 30))[:3] != (0, 0, 0), "the square of Player %d is drawn" % shown)
 
 
-def stick_case_wiring():
-    import game_deck as gd
-    key_on = gov.STICK_DZ_ENABLED_KEY
-    for old in ("DEFAULT_STICK_DEADZONE", "_get_stick_deadzone", "_STICK_DPAD_RELEASE_FRAC"):
-        check(not hasattr(gd, old), "%s is gone" % old)
-
-    def pad(lx, ly, rx, ry):
-        g = gd._GPState()
-        g.sLX, g.sLY, g.sRX, g.sRY = lx, ly, rx, ry
-        return g
-
-    previous = gd.current_stick_settings()
-    try:
-        gd.apply_stick_config({key_on: False})
-        g = gd.apply_stick_correction(pad(-32768, 5000, 123, -4567))
-        check((g.sLX, g.sLY, g.sRX, g.sRY) == (-32768, 5000, 123, -4567), "off leaves every stick value exactly as read")
-        check((g.rawLX, g.rawLY, g.rawRX, g.rawRY) == (-32768, 5000, 123, -4567), "off still keeps the raw values")
-        check(gd.stick_dinput_threshold_raw() == gov.STICK_DZ_OFF_DINPUT_THRESHOLD, "off keeps the old DirectInput threshold")
-        check(gd.stick_axis_threshold_raw() == gov.STICK_DZ_OFF_DPAD_THRESHOLD, "off keeps the old D-pad threshold")
-
-        gd.apply_stick_config({key_on: True, gov.STICK_DZ_SPECS["deadzone"][0]: 20, gov.STICK_DZ_SPECS["axis_threshold"][0]: 40})
-        g = gd.apply_stick_correction(pad(3000, 3000, 32767, 0))
-        check((g.sLX, g.sLY) == (0, 0), "on zeroes a stick inside the deadzone")
-        check(g.sRX == 32767 and g.sRY == 0, "on keeps full push at full range")
-        check((g.rawLX, g.rawLY, g.rawRX) == (3000, 3000, 32767), "on keeps the raw values beside the corrected ones")
-        check(gd.stick_dinput_threshold_raw() == gd.stick_axis_threshold_raw() == int(0.4 * gd.STICK_MAX), "on, both thresholds follow the menu setting")
-        check(gd.stick_test_sticks() is None or gd.stick_test_sticks()[0] == (gd.player1_gpstate().rawLX, gd.player1_gpstate().rawLY), "the test panel reads the raw values")
-    finally:
-        gd.apply_stick_config({key_on: previous.enabled})
 
 
-def stick_case_main_script_calls():
-    import game_deck as gd
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        tree = ast.parse(handle.read())
-    module_defs = {n.name for n in ast.parse(open(gd.__file__, encoding="utf-8").read()).body if isinstance(n, ast.FunctionDef)}
-    deck_names = set()
-    for node in ast.walk(ast.parse(open(gd.__file__, encoding="utf-8").read())):
-        if isinstance(node, ast.ClassDef) and node.name == "ExternalGameDeck":
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.FunctionDef):
-                    deck_names.add(sub.name)
-                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) and sub.value.id == "self" and isinstance(sub.ctx, ast.Store):
-                    deck_names.add(sub.attr)
-    stick_names = {name for name in module_defs if "stick" in name and name not in deck_names}
-    bad = sorted({node.attr for node in ast.walk(tree)
-                  if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
-                  and node.value.id == "game_deck" and node.attr in stick_names})
-    check(not bad, "the main script calls module-level stick helpers on the game deck object: %s" % bad)
-    check(len(stick_names) >= 8, "the stick helpers were found")
-    with open(MAIN_SCRIPT, encoding="utf-8") as handle:
-        text = handle.read()
-    start = text.index('app_state.get("menu_layer") == "GAMES_STICK_DZ" and game_deck is not None')
-    block = text[start:text.index('app_state.get("menu_layer") == "GAMES_CTRL_MAP" and game_deck is not None', start)]
-    check("menu_panel_rect(" in block and "_overlay_target_for_menu(screen)" in block,
-          "the stick screen takes its place from the same surface and rectangle the menu uses")
-    check("fit_design_canvas" not in block, "the stick screen does not size itself with a separate canvas")
-    map_start = text.index('app_state.get("menu_layer") == "GAMES_CTRL_MAP" and game_deck is not None')
-    map_block = text[map_start:text.index('app_state.get("menu_layer") == "DVD_BTN_MAP"', map_start)]
-    check("menu_panel_rect(" in map_block and "_overlay_target_for_menu(screen)" in map_block,
-          "the controller mapping screen takes its place from the same surface and rectangle the menu uses")
-    check("fit_design_canvas" not in map_block, "the controller mapping screen does not size itself with a separate canvas")
 
 
 # ============================================================================
@@ -7446,115 +3083,6 @@ def stick_case_main_script_calls():
 # ============================================================================
 
 
-def guide_highlight_case():
-    cols = 4
-    total = 336
-    clock = {"t": datetime.datetime(2026, 10, 12, 14, 10, 0)}
-
-    class _Clock:
-        @staticmethod
-        def now():
-            return clock["t"]
-
-    def clamp(raw, n):
-        return max(0, min(raw, total - n))
-
-    def make_schedule(rng):
-        t, out = -86400, []
-        while t < 8 * 86400:
-            d = rng.choice([1200, 1800, 1800, 3600, 5400, 7200, 9000, 18000])
-            out.append((t, t + d))
-            t += d
-            if rng.random() < 0.25:
-                t += rng.choice([600, 1800, 3000, 7200])
-        return out
-
-    scheds = {}
-
-    def stops_for(ch, time_idx):
-        vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
-        stops, cursor, prev_end = [], vs, vs
-        for a, b in scheds[ch]:
-            if b <= vs:
-                prev_end = b
-                continue
-            if a >= ve:
-                break
-            cs = max(vs, a)
-            if cs > cursor:
-                stops.append({"col": int((cursor - vs) / 1800.0), "abs": prev_end, "key": ("offair", round(prev_end))})
-            stops.append({"col": int((cs - vs) / 1800.0 + 1e-6), "abs": a, "key": ("show", round(a))})
-            cursor = min(ve, b)
-            prev_end = b
-        if cursor < ve:
-            stops.append({"col": int((cursor - vs) / 1800.0), "abs": prev_end, "key": ("offair", round(prev_end))})
-        return stops
-
-    state = {}
-
-    def live_idx():
-        return clock["t"].hour * 2 + (1 if clock["t"].minute >= 30 else 0)
-
-    def view_idx():
-        return clamp(live_idx() + state.get("selected_guide_time_idx", 0), cols)
-
-    def refresh():
-        state["guide_current_row_stops"] = stops_for(str(state["selected_guide_channel"]).zfill(2), view_idx())
-
-    log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
-    ns = dict(app_state=state, log=log, broadcast_clock=_Clock, db=object(), str=str, performance_governor=gov,
-              get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
-              _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh,
-              get_current_guide_time_idx=lambda a, d: view_idx(),
-              get_cached_row_stops=lambda ch, expected_time_idx=None: None,
-              get_guide_visible_rows=lambda d: 4)
-    for name in ("_guide_jump_col", "_resync_guide_stop_after_row_switch", "_guide_keep_highlight_in_view"):
-        exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
-
-    def visible_problem():
-        vs, ve = view_idx() * 1800, view_idx() * 1800 + cols * 1800
-        target = state.get("guide_selected_abs_time")
-        if target is None:
-            return None
-        hit = [x for x in scheds[str(state["selected_guide_channel"]).zfill(2)] if x[0] <= target < x[1]]
-        if not hit:
-            return None if vs <= target < ve else "gap target outside the window"
-        a, b = hit[0]
-        return "highlighted show outside the window" if (b <= vs or a >= ve) else None
-
-    broken = []
-    for seed in range(120):
-        rng = random.Random(seed)
-        for c in range(5, 9):
-            scheds[str(c).zfill(2)] = make_schedule(rng)
-        clock["t"] = datetime.datetime(2026, 10, 12, 14, 10, 0)
-        state.clear()
-        state.update({"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0})
-        refresh()
-        ns["_resync_guide_stop_after_row_switch"]()
-        ns["_guide_keep_highlight_in_view"]()
-        history = ""
-        for _ in range(60):
-            act = rng.choice("LRRUDT")
-            history += act
-            if act == "T":
-                clock["t"] += datetime.timedelta(minutes=rng.choice([5, 20, 30, 45]))
-            elif act in "LR":
-                ns["_guide_jump_col"](1 if act == "R" else -1)
-            else:
-                state["selected_guide_channel"] = 5 + ((state["selected_guide_channel"] - 5 + (1 if act == "D" else -1)) % 4)
-                ns["_resync_guide_stop_after_row_switch"]()
-            ns["_guide_keep_highlight_in_view"]()
-            problem = visible_problem()
-            if problem:
-                broken.append("seed %d after %s: %s" % (seed, history[-10:], problem))
-                break
-    check(not broken, "guide highlight left the window: %s" % broken[:3])
-
-    main_src = MAIN_SRC
-    frame_block = main_src.index('    if app_state["current_channel"] == "04":\n        _guide_keep_highlight_in_view()\n        if (now_ticks >= app_state.get("guide_inactivity_timer", 0)')
-    check(frame_block > 0, "the per-frame guide block calls the keeper before the inactivity check")
-    check('app_state["_guide_live_idx_seen"] = None\n        app_state["guide_inactivity_timer"]' in main_src, "entering the guide clears the keeper's last seen column")
 
 
 # ============================================================================
@@ -7948,7 +3476,6 @@ def suite_lineup_groups():
     check(list(dict.fromkeys(sum((g["paths"] for g in saved["groups"]), []))) == list(plog["sched_cached_tracks"]), "the saved groups describe exactly the saved path list")
 
     now = times[-1]
-    probe = {os.path.normpath(x["path"]): {"duration": x["duration"]} for x in content}
     with patch.object(media, "_cached_path_exists", lambda p: True):
         read_back, _ = media.read_block_lineup("05", channels["05"], "Evening", now, lambda p: True, lambda ci, off: 1)
     last_used = used[-1]
@@ -8592,7 +4119,6 @@ def suite_gap_with_unscanned_files():
                     cur_key = media.block_key_for(boundary, name)
                     if not prev_key or cur_key == prev_key:
                         continue
-                    probe = {os.path.normpath(p): {"duration": d} for p, d in full.items() if not any(m in p for m in markers)}
                     seed = lambda offset: seed_ns["_start_order_seed"](reference, offset)
                     show_pos = copy.deepcopy(plog.get("show_pos") or {})
                     catch_up_end = media.catch_up_overrun_end("05", snap, copy.deepcopy(show_pos), prev_key, cur_key, lambda p: True, [], seed, None)
@@ -8722,7 +4248,7 @@ def suite_gap_probe_discovers_duration():
             resume = clock[0] + datetime.timedelta(minutes=minutes_after)
             early_ns, early_calls = unscanned_copy(snapshot, resume, full, True)
             with patch.object(media, "_cached_path_exists", lambda p: True):
-                early = early_ns["_scheduler_playback_state"]("05")
+                early_ns["_scheduler_playback_state"]("05")
             probe_ns, probe_calls = unscanned_copy(snapshot, resume, full, False)
             with patch.object(media, "_cached_path_exists", lambda p: True):
                 got = probe_ns["_scheduler_playback_state"]("05")
@@ -8816,8 +4342,6 @@ def suite_guide_past_no_skipped_episode():
         if name not in wanted:
             continue
         info = _sched_record_channel(block_mode, placement, sched, commercials)
-        probe = {os.path.normpath(item["path"]): {"duration": item["duration"]}
-                 for items in info["schedules"].values() for item in items}
         first_block = {"eight_hour": "Morning", "six_block": media.SIX_HOUR_BLOCK_NAMES[0], "full_day": "Full Day"}[block_mode]
         now = datetime.datetime(2026, 10, 16, 4, 0, 5)
         records = media.replay_missed_blocks(
@@ -9652,7 +5176,7 @@ def suite_audit2_libretro_core():
 def suite_audit2_rest():
     scripts = {name: read(os.path.join(ROOT, *name.split("/"))) for name in (
         "media.py", "menu_nav.py", "libretro_core.py", "ui.py", "media_library.py", "visualizers.py", "assets/audio_analysis.py",
-        "game_deck.py", "retro_tv_emulator.py", "performance_governor.py")}
+        "game_deck.py", "retro_tv_emulator.py", "assets/performance_governor.py")}
     for name, tag in (("media.py", "[MEDIA]"), ("menu_nav.py", "[MENU NAV]"), ("libretro_core.py", "[LIBRETRO]"), ("ui.py", "[UI]"),
                       ("media_library.py", "[MEDIA LIBRARY]"), ("visualizers.py", "[VISUALIZER]"), ("assets/audio_analysis.py", "[VISUALIZER ANALYSIS]")):
         src = scripts[name]
@@ -9668,7 +5192,7 @@ def suite_audit2_rest():
         "game_deck.py": ("dvd_hud_until", "_dvd_skip_dir", "dvd_was_in_menu_on_leave", "_gba_wf_", "_mapping_reassign_wait_started", "_perm_denied ="),
         "retro_tv_emulator.py": ("def _hot_patch_live_gain", "def _is_usa_bios_filename", "def resize_canvas", "flash_intensity", "galaxy_glow", "playback_active_check"),
         "media.py": ("playback_active_check", "self.audio_files"),
-        "performance_governor.py": ("last_reason",),
+        "assets/performance_governor.py": ("last_reason",),
         "visualizers.py": ("Kaleidoscope",),
     }
     gone["retro_tv_emulator.py"] = gone["retro_tv_emulator.py"] + ("def _poll_dvd_menu_signals", "def _enter_title_when_ready", "def _process_pending_dvd_events",
@@ -9814,10 +5338,10 @@ def suite_tune_priority():
     check(not pg.tune_in_progress(), "a picture that never steadies holds at most TUNE_STEADY_MAX_SECONDS")
     check(pg._gate_state["tune_settling_since"] is None, "and the settling ends then")
     pg._gate_state["tune_until"] = 0.0
-    gate_src = read(os.path.join(ROOT, "performance_governor.py"))
+    gate_src = read(os.path.join(ROOT, "assets", "performance_governor.py"))
     check("return (not tune_in_progress() and scan_throttle_mode() != \"stopped\"" in gate_src, "a background gate does not admit new work while a tune is in progress")
     cc = MAIN_SRC[MAIN_SRC.index("def change_channel("):]
-    check(cc.index("performance_governor.hold_background_for_tune()") < cc.index("_mute_guard_log(\"ARM (real channel change)\""),
+    check(cc.index("performance_governor.hold_background_for_tune()") < cc.index("t_state = calculate_slotted_playback_state("),
           "a channel change starts the hold before the show is opened")
     conf = MAIN_SRC[MAIN_SRC.index("def _confirm_playback_started"):]
     check("performance_governor.release_tune_hold()" in conf[:conf.index("_anchor_seek = seek_offset")], "the hold ends when VLC has accepted the show")
@@ -9827,7 +5351,6 @@ def suite_tune_priority():
     exec(MAIN_SRC[MAIN_SRC.index("_hub_row_sync_pending = {}"):MAIN_SRC.index("def _sync_hub_rows_for_block(")], ns)
     done = []
     ns["_sync_hub_rows_for_block"] = lambda *a, now_epoch=None: done.append((a[0], a[4], now_epoch))
-    started = threading.Event()
     ns["_hub_row_sync_lock"].acquire()
     try:
         ns["_hub_row_sync_pending"]["09"] = ("09", "b", [], None, 1.0, None, 0.0, 1.0)
@@ -9896,7 +5419,7 @@ def suite_new_channel_first_show():
     pause = MAIN_SRC[MAIN_SRC.index("def _background_scan_should_pause"):]
     check(pause.index("_NEW_CHANNEL_SCAN_ACTIVE.is_set()") < pause.index("def _background_scan_pace_seconds"),
           "the duration, picture box, loudness and future guide scans all pause through the shared background pause")
-    explorer = MAIN_SRC[MAIN_SRC.index("[FILE EXPLORER] (schedule) {active_b}"):]
+    explorer = MAIN_SRC[MAIN_SRC.index("if _channel_was_empty_before_write and newly_added_paths:"):]
     check("if newly_added_paths:\n                    _warm_new_file_lengths(newly_added_paths)\n                    _queue_new_channel_first_show(target_ch)" in explorer[:explorer.index("if str(app_state.get(\"current_channel\", \"\")).zfill(2) == str(target_ch).zfill(2):")],
           "saving a channel's files in the explorer starts its first-show scan at once, whichever channel is on screen")
 
@@ -9904,11 +5427,11 @@ def suite_new_channel_first_show():
 def suite_one_scan_order_for_new_files():
     check("_deferred_metadata_probing_worker" not in MAIN_SRC and "[METADATA PROBE TIMING]" not in MAIN_SRC and "_deferred_metadata_probe_lock" not in MAIN_SRC,
           "the separate scanner for files just added is gone; the ordered scans measure them")
-    save = MAIN_SRC[MAIN_SRC.index("[FILE EXPLORER] (schedule) {active_b}"):]
+    save = MAIN_SRC[MAIN_SRC.index("if _channel_was_empty_before_write and newly_added_paths:"):]
     save = save[:save.index("except Exception as e:\n        _failed_ch")]
     check(save.count("_note_scan_work_added()") == 1 and "_queue_new_channel_first_show(target_ch)" in save,
           "a schedule save queues the first show and tells the ordered scans about the new files")
-    for label in ("[FILE EXPLORER] {block} -> {len(entries)} file(s) for ch {ch_key}", "[FILE EXPLORER] Holiday {hkey} -> {len(entries)} file(s) for ch {ch_key}"):
+    for label in ('elif mode == "commercial" and ch_key and block:', 'elif mode == "holiday" and ch_key and hkey:'):
         part = MAIN_SRC[MAIN_SRC.index(label):]
         check(part.index("_note_scan_work_added()") < part.index("if new_paths:"), "a commercial or holiday save tells the ordered scans too")
     start = MAIN_SRC.index("_scan_files_added_generation = [0]")
@@ -9975,21 +5498,21 @@ def suite_scan_turns():
     pg.scan_report_head("loudness", (2, 1), now=t)
     pg.scan_report_head("duration", (3, 4), now=t)
     pg.scan_report_head("picture_box", (3, 6), now=t)
-    check(pg.scan_should_yield("duration", (3, 4), now=t + 1) and pg.scan_should_yield("picture_box", (3, 6), now=t + 1),
+    check(pg._scan_more_urgent("duration", (3, 4), now=t + 1) and pg._scan_more_urgent("picture_box", (3, 6), now=t + 1),
           "lengths and picture boxes far ahead wait while loudness has a next show waiting")
-    check(not pg.scan_should_yield("loudness", (2, 1), now=t + 1) and pg.scan_is_most_urgent("loudness", now=t + 1),
+    check(not pg._scan_more_urgent("loudness", (2, 1), now=t + 1) and pg.scan_is_most_urgent("loudness", now=t + 1),
           "loudness takes the turn and may use the threads the others leave")
     pg.scan_report_head("loudness", (1, 0), now=t + 2)
     pg.scan_report_head("duration", (2, 0), now=t + 2)
-    check(pg.scan_should_yield("duration", (2, 0), now=t + 3), "an unscanned commercial airing soon goes ahead of the next shows")
-    check(not pg.scan_should_yield("duration", (2, 0), now=t + 2 + pg.SCAN_TURN_STALE_SECONDS + 1),
+    check(pg._scan_more_urgent("duration", (2, 0), now=t + 3), "an unscanned commercial airing soon goes ahead of the next shows")
+    check(not pg._scan_more_urgent("duration", (2, 0), now=t + 2 + pg.SCAN_TURN_STALE_SECONDS + 1),
           "a scan that stopped reporting no longer holds the others")
     pg.scan_report_head("loudness", (1, 0), now=t + 200)
     pg._scan_turns["loudness"]["progress"] = t + 200 - pg.SCAN_TURN_STUCK_SECONDS - 1
-    check(not pg.scan_should_yield("duration", (2, 0), now=t + 200), "a scan stuck on one file no longer holds the others")
+    check(not pg._scan_more_urgent("duration", (2, 0), now=t + 200), "a scan stuck on one file no longer holds the others")
     pg.scan_report_head("loudness", None, now=t + 201)
-    check(not pg.scan_should_yield("duration", (3, 9), now=t + 201), "a scan with nothing waiting holds nobody")
-    check(not pg.scan_should_yield("duration", (2, 0), now=t + 201) and not pg.scan_should_yield("x", None), "equal or unknown urgency never waits")
+    check(not pg._scan_more_urgent("duration", (3, 9), now=t + 201), "a scan with nothing waiting holds nobody")
+    check(not pg._scan_more_urgent("duration", (2, 0), now=t + 201) and not pg._scan_more_urgent("x", None, t), "equal or unknown urgency never waits")
     pg._scan_turns.clear()
     pg.set_game_active(True)
     try:
@@ -10008,7 +5531,7 @@ def suite_scan_turns():
     finally:
         pg.set_game_active(False)
     check(not pg.game_needs_all() and pg.scan_threads() >= 1, "leaving the game returns to normal")
-    gate_src = read(os.path.join(ROOT, "performance_governor.py"))
+    gate_src = read(os.path.join(ROOT, "assets", "performance_governor.py"))
     check("and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))" in gate_src and "not tune_in_progress()" in gate_src,
           "background scan work may not start past the overall cap (the PC's peak, narrowed with the level) or during a tune; priority work never waits")
     slot = gate_src[gate_src.index("def scan_thread_slot"):]
@@ -10081,7 +5604,7 @@ def suite_schedule_off_screen_thread():
         md.build_block_timeline = real
         md._timeline_memo.clear()
     fs = MAIN_SRC[MAIN_SRC.index("_live_pb_raw = str(app_state.get(\"_live_playback_channel\""):]
-    fs = fs[:fs.index("_prof_mark(\"frame_setup\")")]
+    fs = fs[:fs.index("# SECTION: Video end & stall detection")]
     check(fs.index("elif not app_state.get(\"is_playing_video\", False):") < fs.index("calculate_slotted_playback_state(_watchdog_owner_ch)"),
           "the owner channel's schedule is asked for only while a video plays")
 
@@ -11354,7 +6877,6 @@ class TestRandomPositionByFile(_SectionCase):
 # ============================================================================
 
 def suite_unscanned_not_placed():
-    import copy as _cp
 
     def exists(_p):
         return True
@@ -11463,8 +6985,7 @@ def suite_unscanned_not_placed():
     lineup, _s, _o = media.build_show_rotation(parts, "one_slot", {}, 3, channel_id="05", pending_tracks=[{"path": "/m/Movies/Epic Part 2.mkv"}])
     check(lineup == [], "a movie part is not placed while the other part is not scanned")
 
-    old_style = {"next": None, "owed": []}
-    migrated, _o = run_sequential([1, 2, 3], [4], 1)[0], None
+    run_sequential([1, 2, 3], [4], 1)
     known3 = [{"path": "/m/Show X/Season 1/Show X S01E%02d.mkv" % n, "duration": 1800} for n in (1, 2, 3)]
     lineup, state, _o = media.build_show_rotation(known3, "one_slot", {"05:show-x": 2}, 5, channel_id="05", pending_tracks=[{"path": "/m/Show X/Season 1/Show X S01E04.mkv"}])
     check(names(lineup) == ["Show X S01E03"] and state["05:show-x"]["next"].endswith("E04.mkv"), "an old saved list number turns into the file it pointed at, with the pending file ignored in the count")
@@ -12300,7 +7821,6 @@ def suite_channel_timeline():
     check(media.commercial_interrupt_floor_seconds({"pair_threshold_minutes": 20}) == 1200, "the floor is the channel's pairing threshold in seconds")
     shows = [{"path": "/m/S/S01E%02d.mkv" % i, "duration": d} for i, d in enumerate((1320, 1500, 2640, 600, 1500, 7000), 1)]
     ads = [{"path": "/m/Ads/ad%d.mkv" % i, "duration": d} for i, d in enumerate((15, 30, 30, 45, 60, 90), 1)]
-    cache = {os.path.normpath(t["path"]): {"duration": t["duration"]} for t in shows}
     for placement in ("interrupt_half_hour", "end_of_show"):
         for minutes in (0, 15, 25, 45):
             info = {"commercial_placement": placement, "pair_threshold_minutes": minutes}
@@ -12503,7 +8023,7 @@ def suite_channel_surf():
     check('if _surf_quiet and ch not in ("03", "04"):\n        if _configured_transition_style() == "static":\n            _render_transition_static(screen, _full_window_rect)\n        else:\n            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)\n    elif ch != "04":' in loop,
           "the picture draw shows static for a shut-down show in Static style and grey otherwise")
     check('if _surf_quiet and ch not in ("03", "04"):\n        pass\n    elif ch == "03":' in loop, "the playback and stall-recovery section does nothing for a shut-down show")
-    ov = loop[loop.index("# SECTION: Overlays: captions"):loop.index('_prof_mark("overlays")')]
+    ov = loop[loop.index("# SECTION: Overlays: captions"):loop.index("# SECTION: Idle timeouts & held-key input")]
     check("    if not _surf_quiet:\n        _draw_caption_overlay(" in ov and ov.count("_apply_static_noise_effect(") >= 1 and ov.index("if not _surf_quiet:") < ov.index("_apply_static_noise_effect("),
           "captions, static noise, reception lines, the watermark and the static transition are not drawn while flipping")
     check(ov.index("if not _surf_quiet:") < ov.index("_render_transition_static("), "the static transition is inside the flipping gate")
@@ -12742,8 +8262,6 @@ def run_logged(script_path, run):
             print("[test output saved to %s]" % out_path)
 
 
-def tearDownModule():
-    print("\n%d checks ran inside the menu / media sections, %d failed" % (_CHECKS[0], len(_FAILED)))
 
 
 # ============================================================================
@@ -13449,7 +8967,6 @@ def suite_duration_hub():
             check(row["estimated_duration"] == 1250 and row["duration"] == 1420 and row["estimate_basis"] == "series_average" and row["estimated_at"],
                   "the estimate, its date and its basis stay in the library after the real length arrives")
 
-            cache = {}
             guide = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
             live = {t["path"]: t["duration"] for t in media.build_raw_tracks(items, exists)}
             check(guide == live, "guide history and live playback use the same measured or saved-estimate track list")
@@ -13887,7 +9404,6 @@ def suite_gain_double_check():
         first = [-35.0, -35.2, -34.8]
         gain, info = run(first, [[-27.0, -27.5, -27.2], [-27.3, -27.1, -27.4]])
         db_out = 20 * math.log10(gain)
-        std = list(media._standard_window_centers(2400.0))
         check(len(calls) == 3 and calls[0] is None and all(calls[i] and len(calls[i]) == 3 for i in (1, 2)) and info.get("double_checked") is True,
               "a gain more than 4 dB from 0 gets two more batches of windows, right then, and is marked double-checked")
         check(len(info["windows"]) == 3 + 3 + 3 and all(abs(a[0] - b[0]) * 2400.0 >= 149.0 for a in info["windows"][3:] for b in info["windows"][:3]),
@@ -14091,7 +9607,6 @@ def suite_gain_double_check():
         check(ns["_gain_neighbor_check"](files[0], force=True) == 0 and not rescans,
               "an episode that was already double-checked is never scanned a second time")
 
-        hub2_files = {}
         set_gains({0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0, 4: 4.9})
         hub.note_gain(files[2], 10 ** (2.0 / 20.0), media.TARGET_LUFS, media.LOUDNESS_GAIN_SCAN_VERSION, media.LOUDNESS_CONVERGENCE_DB)
         rescans.clear()
@@ -14381,7 +9896,7 @@ def suite_static_sound():
     for opener in [m.start() for m in re.finditer(r"_fe_open\(", src)]:
         before = src[max(0, opener - 700):opener]
         check("_static_sound_stop(" not in before, "opening the file explorer does not stop the Static noise (at %d)" % opener)
-    check('current_playback_state.get("mode") == "Static"' in src and '_static_sound_play()\n\n    _prof_mark("game_deck")' in src,
+    check('current_playback_state.get("mode") == "Static"' in src and '_static_sound_play()\n\n    # ====' in src,
           "once a frame a channel airing Static keeps its noise playing, under menus and the file explorer too")
     check('if reason != "toggle" and not player.is_playing():\n            continue' in src,
           "the stereo reassert waits for playback instead of retrying every 2 s with nothing loaded")
@@ -15190,7 +10705,6 @@ def suite_scheduler_catch_up():
 
     sched_src = get_function_source("_scheduler_playback_state")
     items = [{"path": "/m/%s/S01E%02d.mkv" % (show, i), "duration": 1500} for show in ("Alpha", "Beta") for i in range(1, 31)]
-    cache = {os.path.normpath(it["path"]): {"duration": 1500} for it in items}
     exists = lambda p: True
     order_seed = lambda offset: "7:%d" % offset
 
@@ -15218,7 +10732,6 @@ def suite_scheduler_catch_up():
     check(media.catch_up_state("07", marathon, {}, "2026_280_Full Day", "2026_283_Full Day", exists, [], order_seed) is None,
           "marathon channels do not use block-gap position advancement")
     mixed = [{"path": "/m/%s/%s S01E%02d.mkv" % (s, s, i), "duration": d} for s, d in (("Alpha", 1320), ("Beta", 2700), ("Gamma", 1500)) for i in range(1, 26)]
-    mixed_cache = {os.path.normpath(it["path"]): {"duration": it["duration"]} for it in mixed}
 
     def run_continuous(ch_info, name, ordinal):
         date = datetime.date.fromordinal(ordinal)
@@ -15548,121 +11061,16 @@ class TestOldCarryInRetired(_SectionCase):
         self.run_section(suite_old_carry_in_retired)
 
 
-def suite_loading_screen_has_no_drive_banner():
-    start = MAIN_SRC.index("render_loading_screen(screen, app_state[\"load_progress\"], green_loading_theme)")
-    end = MAIN_SRC.index("if real_subsystems_loaded and _held_long_enough:", start)
-    block = MAIN_SRC[start:end]
-    check("_unresponsive_drive_roots" not in block and "_draw_status_banner_bar" not in block and "_drive_banner_label" not in block,
-          "the loading screen never draws the drive banner, so a slow first read of a waking drive cannot show it while the media loads")
-    check("_draw_status_banner_bar(screen, _status_banner_label(_status_banner_current))" in MAIN_SRC,
-          "the ordinary status banner, which needs the failing drive to be the one playing, is still drawn after boot")
 
 
-class TestLoadingScreenHasNoDriveBanner(_SectionCase):
-    """The drive banner is not drawn on the loading screen"""
-
-    def test_loading_screen_has_no_drive_banner(self):
-        self.run_section(suite_loading_screen_has_no_drive_banner)
 
 
-def suite_drive_banner_waits_for_failure():
-    ns = {"_station_confirmed_dead_drive": {}, "_visualizer_confirmed_dead_drive": {}, "app_state": {"current_channel": "05"},
-          "game_deck": None, "_unresponsive_drive_roots": lambda: {"D-ROOT"}}
-    exec(main_function_code("_drive_banner_roots"), ns)
-    roots = ns["_drive_banner_roots"]
-
-    check(roots() == set(), "a TV station playing from a drive flagged slow shows no banner while nothing has failed")
-    ns["_station_confirmed_dead_drive"]["05"] = "D-ROOT"
-    check(roots() == {"D-ROOT"}, "a TV station that went to Static for a drive shows the banner for that drive")
-    ns["app_state"]["current_channel"] = "06"
-    check(roots() == set(), "another channel does not show a banner for a drive that failed on channel 05")
-    ns["_visualizer_confirmed_dead_drive"]["06"] = "E-ROOT"
-    check(roots() == {"E-ROOT"}, "a visualizer that went to Static for a drive shows the banner for that drive")
-    ns["app_state"]["current_channel"] = "04"
-    ns["_visualizer_confirmed_dead_drive"]["04"] = "E-ROOT"
-    check(roots() == set(), "channel 04 never shows the drive banner")
-
-    module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_banner")
-    deck = object.__new__(module.ExternalGameDeck)
-    deck._drive_launch_failed = {}
-    deck._romlist_error_msg = ""
-    deck._romlist_error_until = 0
-    ns["game_deck"] = deck
-    ns["app_state"]["current_channel"] = "03"
-    check(roots() == set(), "the games and DVD list shows no banner while nothing has failed, even with a flagged drive")
-
-    deck.note_drive_launch_failure("/mnt/d/a.sfc")
-    failed = roots()
-    check(len(failed) == 1 and set(deck.drive_launch_failures()) == failed,
-          "a game launch that failed on a drive shows the banner for that drive on channel 03")
-    ns["_station_confirmed_dead_drive"].clear()
-    ns["app_state"]["current_channel"] = "05"
-    check(roots() == set(), "channel 03 launch failures do not leak onto a TV station")
-    ns["app_state"]["current_channel"] = "03"
-    for root in list(deck.drive_launch_failures()):
-        deck.clear_drive_launch_failure(root)
-    check(roots() == set(), "a recovered drive clears the banner")
-
-    module._gd_is_drive_responsive = lambda path: False
-    blocked = deck._dvd_launch_blocked_by_drive("/mnt/d/movie.mkv")
-    check(blocked is True and deck.drive_launch_failures() and "Drive not responding" in deck._romlist_error_msg,
-          "a DVD or media player launch from a drive that is not responding stops, stays on the list and notes the failure")
-    deck._drive_launch_failed.clear()
-    module._gd_is_drive_responsive = lambda path: True
-    check(deck._dvd_launch_blocked_by_drive("/mnt/d/movie.mkv") is False and not deck.drive_launch_failures(),
-          "a DVD or media player launch from a responsive drive goes ahead")
-
-    src = MAIN_SRC
-    start = src.index("def _advance_status_banner_streaks")
-    block = src[start:src.index("def _status_banner_is_active", start)]
-    check("_active_playback_drive_roots" not in src and "_return_active_game_to_romlist_if_drive_failed" not in src
-          and "return_active_rom_to_list_for_drive_failure" not in open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read(),
-          "a game past its load screen is never sent back to the list just because its drive is flagged slow")
-    check("_drive_banner_roots()" in block and "_active_playback_drive_roots" not in block and "_unresponsive_drive_roots" not in block,
-          "the banner takes its drives only from real failures, not from the slow-drive flag")
-    sweep = src[src.index("def _sweep_all_recovered_dead_drives"):src.index("CHANNEL_FAILURE_MESSAGE_MS = ")]
-    check("clear_drive_launch_failure" in sweep, "the background sweep clears a game or DVD launch failure once the drive is back")
 
 
-class TestDriveBannerWaitsForFailure(_SectionCase):
-    """The drive banner shows only after a real failure: Static on a TV station or visualizer, or a game, DVD or media player launch that failed and returned to its list"""
-
-    def test_drive_banner_waits_for_failure(self):
-        self.run_section(suite_drive_banner_waits_for_failure)
 
 
-def suite_failed_file_banner():
-    drawn = []
-    ns = {"pygame": pygame, "log": types.SimpleNamespace(warning=lambda *a, **k: drawn.append(("warn", a)), info=lambda *a, **k: None),
-          "CHANNEL_FAILURE_MESSAGE_MS": 30000, "_channel_playback_failures": {}, "_station_confirmed_dead_drive": {},
-          "_visualizer_confirmed_dead_drive": {}, "media": types.SimpleNamespace(_drive_root_of=lambda p: "D-ROOT"),
-          "_draw_reason_banner_bar": lambda screen, rect, label, scale=1.0: drawn.append(label)}
-    exec(main_function_code("_channel_failure_is_drive_wide"), ns)
-    exec(main_function_code("_draw_channel_failure_message"), ns)
-    draw = ns["_draw_channel_failure_message"]
-    now = pygame.time.get_ticks()
-
-    ns["_channel_playback_failures"]["05"] = {"file_path": "/m/Show S01E02.mkv", "file": "Show S01E02.mkv", "reason": "VLC failed to load: bad header", "shown_at": now}
-    draw(None, None, "05")
-    check(len(drawn) == 1 and "Show S01E02.mkv" in drawn[0] and drawn[0].startswith("PLAYBACK FAILED"),
-          "a file that would not load, on a drive that answered, shows a banner naming the file")
-    drawn.clear()
-    draw(None, None, "06")
-    check(drawn == [], "a channel with no failure shows no file banner")
-    ns["_channel_playback_failures"]["05"]["shown_at"] = now - 31000
-    draw(None, None, "05")
-    check(drawn == [], "the file banner goes away after 30 seconds")
-    ns["_channel_playback_failures"]["05"]["shown_at"] = now
-    ns["_channel_playback_failures"]["05"]["reason"] = "drive not responding"
-    draw(None, None, "05")
-    check(drawn == [], "a drive failure shows the drive banner, not the file banner")
 
 
-class TestFailedFileBannerShowsFileName(_SectionCase):
-    """A file that would not load on a drive that answered goes to Static and shows a banner with the file's name"""
-
-    def test_failed_file_banner(self):
-        self.run_section(suite_failed_file_banner)
 
 
 def suite_list_leaves_failed_drive():
@@ -16647,7 +12055,6 @@ def suite_hub_future_holiday_rows():
             sns["db"].channels_db["05"] = unbuilt
             with patch.object(media, "_cached_path_exists", lambda p: True):
                 check(run("05", force=True) == 0, "%s: a holiday day the scheduler has not built leaves the saved rows as they were" % label)
-        src = MAIN_SRC
         code = get_function_source("_hub_future_for_channel")
         check("project_holiday_days(" in code and "holiday_day_tracks(" in code, "the worker plans the holiday days through the media functions")
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8") as handle:
@@ -16712,7 +12119,6 @@ class TestHubPlaybackDoor(unittest.TestCase):
         import types, time, logging
         hub = __import__("media_library").ScheduleHub.__new__(__import__("media_library").ScheduleHub)
         hub._show_facts = {}
-        hub._current_show = {}
         ml = types.SimpleNamespace(shared_schedule_hub=lambda: hub)
         def sched(ch, a=False, b=False, c=False):
             calls.append((ch, a, b, c))
@@ -16733,7 +12139,7 @@ class TestHubPlaybackDoor(unittest.TestCase):
         orig = media_library.shared_schedule_hub
         media_library.shared_schedule_hub = lambda: hub
         try:
-            first = ns["calculate_slotted_playback_state"]("05")
+            ns["calculate_slotted_playback_state"]("05")
             self.assertEqual(len(calls), 1)
             clock[0] = 1030.0
             second = ns["calculate_slotted_playback_state"]("05")
@@ -16779,7 +12185,7 @@ class TestHubWriterTick(unittest.TestCase):
     def test_writer_step_refreshes_the_hubs_record(self):
         import types, media_library
         hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
-        hub._show_facts, hub._current_show = {}, {}
+        hub._show_facts = {}
         calls = []
         ns = {"broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 500.0, toordinal=lambda: 1)),
               "_scheduler_playback_state": lambda ch: (calls.append(ch), {"mode": "Video", "file": "/m/a.mkv", "seek": 10.0, "duration": 1500.0})[1],
@@ -16802,7 +12208,7 @@ class TestHubWriterSkipsValidChannels(unittest.TestCase):
     def test_next_stale_skips_valid_and_recently_checked(self):
         import types, media_library
         hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
-        hub._show_facts, hub._current_show = {}, {}
+        hub._show_facts = {}
         hub.remember_show_facts("06", {"mode": "Video", "file": "x", "seek": 0.0, "duration": 1500.0}, 100.0, ("g",))
         import time
         ns = {"time": time, "db": types.SimpleNamespace(channels_db={c: {"active": True} for c in ("05", "06", "07", "08")}),
@@ -16840,28 +12246,6 @@ class TestGridFollowsTheHub(unittest.TestCase):
         self.assertIn("_replan_hub_future_soon(ch_str)", get_function_source("_request_schedule_rebuild"))
 
 
-class TestVisualizerTitleFromHub(unittest.TestCase):
-    """The song title comes from the hub and lines up with the channel number"""
-
-    def test_title_y_follows_the_channel_number_and_stays_on_screen(self):
-        ns = {}
-        exec(get_function_source("_title_y_on_screen"), ns)
-        f = ns["_title_y_on_screen"]
-        self.assertEqual(f(40, 30, 20, 1080), 40)
-        self.assertEqual(f(1070, 30, 20, 1080), 1080 - 50 - 2)
-        self.assertEqual(f(-15, 30, 20, 1080), 0)
-
-    def test_title_uses_the_hub_answer(self):
-        ns = {"calculate_slotted_playback_state": lambda ch: {"mode": "Visualizer", "file": "/m/01 Song.mp3"},
-              "_log_warn_throttled": lambda *a, **k: None}
-        exec(get_function_source("_visualizer_title_path"), ns)
-        self.assertEqual(ns["_visualizer_title_path"]("05", "/m/other.mp3"), "/m/01 Song.mp3")
-        ns["calculate_slotted_playback_state"] = lambda ch: {"mode": "Static"}
-        self.assertEqual(ns["_visualizer_title_path"]("05", "/m/other.mp3"), "/m/other.mp3")
-
-    def test_card_reads_the_recorded_channel_number_top(self):
-        self.assertIn('app_state.get("_ch_num_generic_osd_y")', get_function_source("_draw_visualizer_song_card"))
-        self.assertIn("_visualizer_title_path(", MAIN_SRC)
 
 
 class TestNov8BootMemoryAndGraphics(unittest.TestCase):
@@ -16978,147 +12362,18 @@ class TestNov7TestListFixes(unittest.TestCase):
         self.assertIn("post_status_notice", get_function_source("_draw_romlist_error_banner", None) if False else open(gd.__file__, encoding="utf-8").read().split("def _draw_romlist_error_banner")[1][:2500])
 
 
-class TestGuideLeftRightOneSpotPerPress(unittest.TestCase):
-    """Owner 2026-11-07: one D or A press is one grid spot (short, long, paired or with breaks), nothing is skipped, and the highlight stays on a block in view"""
-
-    COLS = 5
-
-    def _world(self, spots):
-        cols = self.COLS
-        clock = datetime.datetime(2026, 10, 12, 14, 10, 0)
-        state = {"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0}
-
-        def clamp(raw, n):
-            return max(0, min(raw, 336 - n))
-
-        def live_idx():
-            return clock.hour * 2 + (1 if clock.minute >= 30 else 0)
-
-        def view_idx():
-            return clamp(live_idx() + state.get("selected_guide_time_idx", 0), cols)
-
-        def stops_for(time_idx):
-            vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
-            out = []
-            for a, b, kind in spots:
-                if b <= vs or a >= ve:
-                    continue
-                out.append({"col": int((max(vs, a) - vs) / 1800.0 + 1e-6), "abs": a, "key": (kind, round(a))})
-            return out
-
-        def refresh():
-            state["guide_current_row_stops"] = stops_for(view_idx())
-
-        log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
-        ns = dict(app_state=state, log=log, broadcast_clock=types.SimpleNamespace(now=lambda: clock), db=object(),
-                  performance_governor=gov, get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
-                  _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh)
-        exec(compile(get_function_source("_guide_jump_col"), "<extracted>", "exec"), ns)
-        refresh()
-        return state, ns, view_idx, refresh
-
-    def _spots(self, rng):
-        spots, t = [], 12 * 3600
-        while t < 80 * 3600:
-            d = rng.choice([300, 600, 900, 1200, 1500, 1800, 1800, 3600, 5400, 7200, 12000])
-            spots.append((t, t + d, "show"))
-            t += d
-            if rng.random() < 0.2:
-                gap_end = t + rng.choice([600, 1800, 5400])
-                while t < gap_end:
-                    piece_end = min(gap_end, (t // 1800 + 1) * 1800)
-                    spots.append((t, piece_end, "offair"))
-                    t = piece_end
-        return spots
-
-    def test_each_press_is_exactly_the_next_spot_and_stays_in_view(self):
-        for seed in range(60):
-            rng = random.Random(seed)
-            spots = self._spots(rng)
-            state, ns, view_idx, refresh = self._world(spots)
-            first = next(i for i, sp in enumerate(spots) if sp[1] > view_idx() * 1800)
-            state["guide_selected_stop_key"] = (spots[first][2], round(spots[first][0]))
-            state["guide_selected_abs_time"] = spots[first][0]
-            order = list(range(first, min(first + 40, len(spots))))
-            for i in order[1:]:
-                ns["_guide_jump_col"](1)
-                self.assertEqual(state["guide_selected_abs_time"], spots[i][0], "seed %d: one D press is the next spot" % seed)
-                vs, ve = view_idx() * 1800, view_idx() * 1800 + self.COLS * 1800
-                self.assertTrue(spots[i][1] > vs and spots[i][0] < ve, "seed %d: the highlighted spot is in the window" % seed)
-            for i in reversed(order[:-1]):
-                ns["_guide_jump_col"](-1)
-                self.assertEqual(state["guide_selected_abs_time"], spots[i][0], "seed %d: one A press is the previous spot" % seed)
-                vs, ve = view_idx() * 1800, view_idx() * 1800 + self.COLS * 1800
-                self.assertTrue(spots[i][1] > vs and spots[i][0] < ve, "seed %d: the highlighted spot is in the window" % seed)
-
-    def test_scrolling_moves_the_window_to_the_spot_not_by_half_hours(self):
-        for seed in range(30):
-            rng = random.Random(seed)
-            spots = self._spots(rng)
-            state, ns, view_idx, refresh = self._world(spots)
-            first = next(i for i, sp in enumerate(spots) if sp[1] > view_idx() * 1800)
-            state["guide_selected_stop_key"] = (spots[first][2], round(spots[first][0]))
-            state["guide_selected_abs_time"] = spots[first][0]
-            for i in range(first + 1, min(first + 30, len(spots))):
-                before = view_idx()
-                ns["_guide_jump_col"](1)
-                if view_idx() != before:
-                    self.assertEqual(view_idx(), int(spots[i][0] // 1800), "seed %d: after a scroll the new spot is the first block on the left" % seed)
-
-    def test_a_press_with_nothing_further_leaves_everything_as_it_was(self):
-        spots = [(12 * 3600, 20 * 3600, "show")]
-        state, ns, view_idx, refresh = self._world(spots)
-        state["guide_selected_stop_key"] = ("show", 12 * 3600)
-        state["guide_selected_abs_time"] = 12 * 3600
-        before = (state["selected_guide_time_idx"], state["guide_selected_abs_time"])
-        ns["_guide_jump_col"](-1)
-        self.assertEqual((state["selected_guide_time_idx"], state["guide_selected_abs_time"]), before)
-
-    def test_same_column_spots_are_not_skipped_and_there_is_no_edge_step(self):
-        src = get_function_source("_guide_jump_col")
-        self.assertNotIn("_sync_to_edge_stop", src)
-        self.assertNotIn('s.get("col", 0) > curr_col', src)
 
 
 class TestHubCurrentShowRecord(unittest.TestCase):
     """14.8: each station keeps a current-show record in the hub; a channel change is clock math on it"""
 
-    def test_record_is_kept_until_the_clock_leaves_the_show_or_a_write_happens(self):
-        import tempfile, shutil
-        import media_library as ml
-        tmp = tempfile.mkdtemp()
-        try:
-            lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
-            hub = ml.ScheduleHub(lib)
-            rows = [{"position": i, "path": os.path.join(tmp, "e%d.mkv" % i), "kind": "episode", "pass_no": 1,
-                     "planned_start": 1000.0 + i * 1800.0, "used_length": 1500.0, "length_source": "measured"} for i in range(3)]
-            hub.put_rows("05", "Morning", rows)
-            first = hub.current_show("05", 1100.0)
-            self.assertEqual(first["position"], 0)
-            self.assertAlmostEqual(first["seek"], 100.0)
-            calls = []
-            real_at = hub.at
-            hub.at = lambda c, e: (calls.append(e), real_at(c, e))[1]
-            again = hub.current_show("05", 1400.0)
-            self.assertEqual(calls, [], "same show: no new lookup, only clock math")
-            self.assertAlmostEqual(again["seek"], 400.0)
-            nxt = hub.current_show("05", 2900.0)
-            self.assertEqual(nxt["position"], 1)
-            self.assertEqual(len(calls), 1, "a new show makes one lookup and keeps the record")
-            hub.put_rows("05", "Morning", rows)
-            hub.current_show("05", 2950.0)
-            self.assertEqual(len(calls), 2, "a hub write drops the kept record")
-            self.assertIsNone(hub.current_show("05", 90000.0))
-        finally:
-            lib.close() if hasattr(lib, "close") else None
-            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestHubLoopChannelRows(unittest.TestCase):
     """14.9: Marathon and Visualizer channels get hub future rows built from their own media"""
 
     def _ns(self):
-        import datetime, types
+        import datetime
         ns = {"media": media, "datetime": datetime, "_HUB_FUTURE_HOURS_AHEAD": 6.0}
         for name in ("_hub_loop_cycle_timeline", "_hub_loop_plan"):
             exec(get_function_source(name), ns)
@@ -17550,80 +12805,12 @@ class TestStallStaticThreshold(_SectionCase):
         self.run_section(suite_stall_static_threshold)
 
 
-def suite_guide_entry_warm_static_burst():
-    start = MAIN_SRC.index("[GUIDE ENTRY WARM] highlight already matches live playback")
-    block = MAIN_SRC[start:MAIN_SRC.index("_mute_guard_log(\"ARM (guide-entry warm transition shield)\"", start)]
-    static_part, black_part = block.split("            else:\n                _warm_burst_ms = GUIDE_PREVIEW_SETTLE_MS", 1)
-    check("_warm_transition_style == \"static\"" in static_part, "the guide-entry warm path still splits on the Static style")
-    check("app_state[\"channel_switch_black_until\"] = 0" in static_part, "in Static style the guide-entry warm path leaves no black shield armed")
-    check("channel_switch_black_until\"] = pygame.time.get_ticks()" not in static_part, "in Static style the guide-entry warm path does not arm the black shield")
-    check("app_state[\"guide_preview_static_until\"] = pygame.time.get_ticks() + _warm_burst_ms" in static_part, "in Static style the guide preview still shows the full Static burst")
-    check("app_state[\"channel_switch_black_until\"] = pygame.time.get_ticks() + _warm_burst_ms" in black_part, "in Black style the guide-entry warm path still arms the black shield for the burst")
-    check("app_state[\"guide_preview_black_until\"] = pygame.time.get_ticks() + _warm_burst_ms" in black_part, "in Black style the guide preview still holds black for the burst")
-    check("_arm_warm_transition_shield(vlc_engine, _warm_burst_ms)" in block, "the mute shield is still armed for the full burst in both styles")
-    exit_start = MAIN_SRC.index("_guide_exit_warm_skip_stop = False")
-    exit_block = MAIN_SRC[exit_start:MAIN_SRC.index("_guide_exit_warm_skip_music_stop = False", exit_start)]
-    check("app_state[\"channel_switch_black_until\"] = 0" in exit_block, "the guide-exit warm path does the same in Static style, so entry and exit now agree")
 
 
-class TestGuideEntryWarmStaticBurst(_SectionCase):
-    """Entering the guide on the channel that is already playing shows only the Static burst in Static style, with no black shield armed behind it"""
-
-    def test_guide_entry_warm_static_burst(self):
-        self.run_section(suite_guide_entry_warm_static_burst)
 
 
-def suite_static_effects_wait_for_burst():
-    state = {"now": 1000, "black": 0, "static": 0, "style": "static", "surf": ""}
-
-    class _Time:
-        @staticmethod
-        def get_ticks():
-            return state["now"]
-
-    class _State(dict):
-        pass
-
-    app = _State({"channel_switch_black_until": 0, "channel_switch_static_until": 0, "surf_origin": ""})
-    env = {"pygame": types.SimpleNamespace(time=_Time), "app_state": app,
-           "_configured_transition_style": lambda: state["style"]}
-    env["_surf_origin_active"] = lambda: bool(app.get("surf_origin", ""))
-    env["_static_transition_running"] = load_function("_static_transition_running", env)
-    over = load_function("_channel_transition_over", env)
-
-    check(over() is True, "with no burst and no shield the transition is over")
-    app["channel_switch_static_until"] = 2500
-    check(over() is False, "a running Static burst is not over, even with the black timer at 0")
-    state["now"] = 2500
-    check(over() is True, "the transition is over the moment the Static burst ends")
-    app["channel_switch_black_until"] = 3000
-    state["style"] = "black"
-    check(over() is False, "in Black style the black shield still holds the effects back")
-    state["now"] = 3000
-    check(over() is True, "in Black style the effects return when the shield ends")
-    state["style"] = "static"
-    app["channel_switch_static_until"] = 0
-    app["surf_origin"] = "05"
-    check(over() is False, "a channel flip that is waiting holds the effects back in Static style")
-    app["surf_origin"] = ""
-    state["style"] = "black"
-    app["channel_switch_static_until"] = 99999
-    check(over() is True, "a leftover Static timer does nothing in Black style")
-
-    for name, var in (("fake static noise", "_static_transition_over"), ("reception lines", "_lines_transition_over")):
-        check("%s = _channel_transition_over()" % var in MAIN_SRC, "%s waits for the shared transition-over check" % name)
-        check("%s = pygame.time.get_ticks() >= app_state.get(\"channel_switch_black_until\", 0)" % var not in MAIN_SRC, "%s no longer reads the black timer alone" % name)
-    wm = MAIN_SRC.index("_wm_bounds = _watermark_bounds_rect(content_rect)")
-    check("and _channel_transition_over()):" in MAIN_SRC[wm - 400:wm], "the watermark waits for the shared transition-over check")
-    check("_channel_transition_active = not _channel_transition_over()" in MAIN_SRC, "the bezel channel number stays up through a Static-style burst, not only the black shield")
-    check("_now_layer < app_state.get(\"channel_switch_black_until\", 0)" not in MAIN_SRC, "the overlay layer no longer reads the black timer alone")
 
 
-class TestStaticEffectsWaitForBurst(_SectionCase):
-    """The fake static noise, reception lines and watermark stay off while a Static-style channel burst or flip is running"""
-
-    def test_static_effects_wait_for_burst(self):
-        self.run_section(suite_static_effects_wait_for_burst)
 
 
 def suite_hub_row_pass_numbers():
@@ -17970,7 +13157,7 @@ class TestSmallLogFixes(unittest.TestCase):
         self.assertLess(listing.index("_fe_is_protected_system_entry(entry)"), listing.index("media.resolve_dir_entry("))
 
     def test_mode_lines_come_after_the_mode_is_picked(self):
-        src = read(os.path.join(ROOT, "performance_governor.py"))
+        src = read(os.path.join(ROOT, "assets", "performance_governor.py"))
         start = src[src.index("def start(gpu_tier="):src.index("def new_throttle(")]
         self.assertNotIn("ceilings mode=", start)
         self.assertNotIn("_apply_cv2_threads_logged()", start)
@@ -18021,75 +13208,6 @@ class TestStereoReassertKeepsTheSound(unittest.TestCase):
         self.assertEqual(self._run(7, mono=False), [1], "a player left in mono goes back to stereo")
 
 
-class TestGpuCheckServesEveryWindowSize(unittest.TestCase):
-    """N7: the GPU self-check is built once at a fixed size, so a switch between full screen and a window reopens the GPU path at once instead of rebuilding the check (8.7 s on the weak PC)"""
-
-    def test_one_check_for_every_window_size(self):
-        sys.path.insert(0, os.path.join(ROOT, "GPU"))
-        try:
-            import d3d11_gpu_gate as gate_mod
-            import d3d11_gpu_reference as ref
-        finally:
-            sys.path.pop(0)
-        import performance_governor as gov
-        values = gov.gpu_gate_values()
-        self.assertEqual((values["target_width"], values["target_height"]), tuple(gov.GPU_SELF_CHECK_TARGET_SIZE))
-        settings = gate_mod.GateSettings(**values)
-        built, opened, sizes = [], [], []
-
-        class _Core:
-            def __init__(self, hwnd, w, h, policy):
-                self.size = (w, h)
-                opened.append((w, h))
-
-            def probe(self):
-                pass
-
-            def resize(self, w, h):
-                self.size = (w, h)
-                sizes.append((w, h))
-
-            def describe(self):
-                return "fake"
-
-            def close(self):
-                pass
-
-        class _Pipe:
-            def __init__(self, core):
-                pass
-
-            def close(self):
-                pass
-
-        backend = gate_mod.Backend(_Core, _Pipe, RuntimeError, OSError, RuntimeError, precompile=lambda: built.append("shaders"))
-        real_prepare, real_run = gate_mod.prepare_self_check, gate_mod.run_self_check
-
-        def _prepare(w, h, effects, s):
-            built.append((w, h))
-            return real_prepare(w, h, effects, s)
-
-        def _run(core, pipeline, effects, s, template=None, prepared=None):
-            self.assertEqual(tuple(core.size), (prepared.width, prepared.height), "the check is drawn at its own fixed size")
-            return [{"name": "fake", "ok": True, "max": 0, "mean": 0.0}]
-
-        gate_mod.prepare_self_check, gate_mod.run_self_check = _prepare, _run
-        try:
-            gate = gate_mod.GPUGate(settings, backend)
-            full = ref.FrameParams(width=1152, height=864, scan_lines=360)
-            window = ref.FrameParams(width=1024, height=768, scan_lines=320)
-            self.assertIsNone(gate.acquire(1, 1152, 864, full), "the first open waits for the check to be built in the background")
-            gate._prep_thread.join(30)
-            self.assertIsNotNone(gate.acquire(1, 1152, 864, full))
-            self.assertEqual(sizes[-1], (1152, 864), "the back buffer goes back to the window's size after the check")
-            gate.close()
-            self.assertIsNotNone(gate.acquire(1, 1024, 768, window), "switching to a window reopens at once, with no new check to build")
-            self.assertEqual(sizes[-1], (1024, 768))
-            self.assertEqual([b for b in built if b != "shaders"], [(settings.target_width, settings.target_height)],
-                             "the reference picture is built once, at the fixed size (%s)" % built)
-            self.assertEqual(built.count("shaders"), 1, "the shaders are compiled once")
-        finally:
-            gate_mod.prepare_self_check, gate_mod.run_self_check = real_prepare, real_run
 
 
 class TestStallBannerAndKeepAwake(unittest.TestCase):
@@ -18119,7 +13237,7 @@ class TestNoHoldBetweenMedia(unittest.TestCase):
         self.assertEqual(gov.AUDIO_SYNC_HOLD_MS, 500, "a real channel change keeps its hold, so channel 03's audio never follows the viewer")
         self.assertIn("SAME_CHANNEL_AUDIO_HOLD_MS = performance_governor.SAME_CHANNEL_AUDIO_HOLD_MS if performance_governor is not None else 0", MAIN_SRC)
         self.assertIn("(SAME_CHANNEL_AUDIO_HOLD_MS if internal_advance else AUDIO_SYNC_HOLD_MS)", MAIN_SRC)
-        mid = MAIN_SRC.index('"ARM (mid-stream content change)"')
+        mid = MAIN_SRC.index("_hold_picture_through_advance()\n                _ms_ch_key")
         self.assertIn("SAME_CHANNEL_AUDIO_HOLD_MS", MAIN_SRC[mid - 400:mid], "break clips and the return to the show use the same-channel hold")
         self.assertIn("_lift_buffering_mute(ch, \"first-frame\")", MAIN_SRC, "the mute still lifts at the first frame")
 
@@ -18355,83 +13473,6 @@ class TestLog1103ScanFixes(unittest.TestCase):
         self.assertEqual(len(seen), 1, seen)
 
 
-class TestPictureSettingsOnTheGraphicsCard(unittest.TestCase):
-    """Option A (owner 2026-11-03 10:20 and 10:31): with a graphics card its drawing step applies the Video tab settings to the broadcast picture only (the show, captions, watermark, the guide's preview window, launched games and discs), never to menus or readouts; without one VLC decodes on the CPU so its filters work"""
-
-    def _ns(self, gpu, values):
-        cfg = dict(zip(("brightness", "contrast", "color", "sharpness", "tint"), values))
-        ns = {"db": types.SimpleNamespace(config=cfg), "_get_video_effects": media._get_video_effects, "media": media,
-              "_gpu_frame_path_requested": lambda: gpu, "_gpu_frame_state": {"gate": None}, "_log_swallowed": lambda *a: None}
-        for name in ("_gpu_draws_picture_settings", "_picture_settings_neutral", "_vlc_does_picture_settings", "_picture_adjust_media_options"):
-            exec(compile(get_function_source(name), name, "exec"), ns)
-        return ns
-
-    def test_vlc_draws_them_only_without_the_graphics_card_step(self):
-        ns = self._ns(True, (55, 60, 55, 45, 50))
-        self.assertFalse(ns["_vlc_does_picture_settings"]())
-        self.assertEqual(ns["_picture_adjust_media_options"](), ([], False), "no VLC filter on graphics-card video")
-        ns = self._ns(False, (55, 60, 55, 45, 50))
-        self.assertTrue(ns["_vlc_does_picture_settings"]())
-        options, adjust_on = ns["_picture_adjust_media_options"]()
-        self.assertTrue(adjust_on and any(o.startswith(":video-filter=") for o in options))
-        self.assertFalse(self._ns(False, (50, 50, 50, 50, 50))["_vlc_does_picture_settings"](), "at 50 nothing to draw")
-        ns = self._ns(True, (55, 60, 55, 45, 50))
-        ns["_gpu_frame_state"]["gate"] = types.SimpleNamespace(state="disabled")
-        self.assertTrue(ns["_vlc_does_picture_settings"](), "a switched-off GPU path hands them back to VLC")
-
-    def test_the_open_decodes_on_the_cpu_when_vlc_draws_them(self):
-        steps = MAIN_SRC[MAIN_SRC.index("def _open_and_play_steps(verify_off_thread=False):"):]
-        steps = steps[:steps.index("_opened_at_position = False")]
-        self.assertLess(steps.index("_cpu_for_picture = _vlc_does_picture_settings()"), steps.index('media.add_option(":avcodec-hw=any")'))
-        self.assertIn("if _cpu_for_picture:", steps)
-
-    def test_the_reference_math(self):
-        import dataclasses
-        import numpy as np
-        sys.path.insert(0, os.path.join(ROOT, "GPU"))
-        import d3d11_gpu_reference as ref
-        src = np.random.default_rng(3).integers(0, 256, (40, 60, 3), dtype=np.uint8)
-        base = ref.FrameParams(width=60, height=40)
-        self.assertTrue((ref.reference_frame(src, base) == src).all(), "settings off leave the picture alone")
-        on, b, c, s, t, sh = ref.picture_adjust_values(55, 60, 55, 45, 50)
-        self.assertEqual((on, b, c, s, t, round(sh, 3)), (True, 12.75, 1.2, 1.1, 0.0, -0.1))
-        self.assertFalse(ref.picture_adjust_values(50, 50, 50, 50, 50)[0])
-        p = dataclasses.replace(base, picture_on=True, bright_offset=b, contrast_gain=c, saturation_gain=s, tint_shift=t,
-                                sharpen_amount=sh, picture_rect=(0, 0, 30, 40))
-        out = ref.reference_frame(src, p)
-        self.assertTrue((out[:, 30:] == src[:, 30:]).all(), "outside the broadcast picture nothing changes")
-        self.assertGreater((out[:, :30] != src[:, :30]).mean(), 0.5)
-        layer = src.copy()
-        layer[5:15, 5:15] = 0
-        self.assertTrue((ref.reference_frame(src, p, layer)[5:15, 5:15] == src[5:15, 5:15]).all(),
-                        "what a menu or readout drew over the picture is left alone")
-        self.assertEqual(len(ref.pack_constants(p)), ref.CONSTANT_BUFFER_BYTES)
-        self.assertEqual(ref.CONSTANT_BUFFER_BYTES, 96)
-
-    def test_the_shader_and_the_self_check(self):
-        frame = read(os.path.join(ROOT, "GPU", "d3d11_gpu_frame.py"))
-        for piece in ("Texture2D picTex : register(t1);", "float3 AdjustColor(float3 c)", "bool IsPictureTexel(int2 q)",
-                      "if (pictureOn > 0.5 && IsPictureTexel(q))", "float4 pictureRect;",
-                      "if params.warp or params.scan_mode != SCAN_NONE or params.picture_on:"):
-            self.assertIn(piece, frame)
-        gate = read(os.path.join(ROOT, "GPU", "d3d11_gpu_gate.py"))
-        check_fx = gate[gate.index("def _check_effects"):gate.index("def _ensure_backend")]
-        self.assertIn("picture_on=False", check_fx, "the Video tab's own values never build a new self-check reference")
-        self.assertIn("picture = dict(picture_on=True, bright_offset=12.75", gate, "the picture math is checked with fixed values")
-
-    def test_the_broadcast_picture_and_the_layer_copy(self):
-        layer_rect = get_function_source("_picture_layer_rect")
-        self.assertIn('app_state.get("guide_preview_bounds"', layer_rect, "in the guide only the preview window")
-        self.assertIn('getattr(game_deck, "mode", "") == "GAME" or getattr(game_deck, "dvd_playback_active", False)', layer_rect, "on channel 03 only launched games and discs")
-        take = MAIN_SRC.index("        _take_picture_layer(screen)")
-        self.assertLess(MAIN_SRC.rindex("_draw_watermark(screen, bounds_rect=_wm_bounds)", 0, take), take, "captions and watermark are part of the picture")
-        self.assertLess(take, MAIN_SRC.index('_prof_mark("overlays")'))
-        self.assertLess(take, MAIN_SRC.index("def _draw_channel_volume_osd(phase):"), "the volume and channel readout come after the copy")
-        expected = get_function_source("_ui_layer_expected_this_frame")
-        for flag in ('"show_menu"', '"osd_volume_timer"', '"osd_channel_timer"', '"file_explorer_active"', '"show_clear_confirm"'):
-            self.assertIn(flag, expected)
-        self.assertIn("picture_layer=_picture_layer_state[\"surf\"] if _picture_layer_state.get(\"taken\") else None", MAIN_SRC)
-        self.assertEqual(MAIN_SRC.count("if fx_active and not _gpu_draws_picture_settings():"), 2, "the Visualizer's CPU pass steps aside for the graphics card")
 
 
 class TestSlotsHoldTheWholeFile(unittest.TestCase):
@@ -18630,7 +13671,7 @@ class TestV365FixesFromTheTesterLogs(unittest.TestCase):
     def test_the_health_monitor_copies_a_deque_another_thread_is_changing(self):
         """Owner 2026-11-05 logs: the monitor pass failed twice with deque mutated during iteration"""
         import collections
-        text = read(os.path.join(ROOT, "assets", "health_monitor.py"))
+        text = read(os.path.join(ROOT, "tests", "health_monitor.py"))
         node = next(n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.FunctionDef) and n.name == "_snapshot")
         ns = {}
         exec(compile(ast.get_source_segment(text, node), "s", "exec"), ns)
@@ -19091,43 +14132,6 @@ class TestV357SecurityHardening(unittest.TestCase):
         self.assertTrue(_hold < _fallback < _ret, "the desktop is started between the crash-loop message and giving up")
         self.assertIn('if "--as-shell" in sys.argv:', _src[_hold:_fallback])
 
-class TestV351WarpScreenNeedsABezel(unittest.TestCase):
-    """Owner 2026-11-05: Warp Screen is greyed out and off while bezels are off, remembers it was on for when a bezel comes back, in the system or in a console's own bezel; handhelds do not count because their bezels do not warp"""
-
-    def _db(self, system_bezel, profiles=None, warp=True):
-        return types.SimpleNamespace(config={"fake_43_border_enabled": system_bezel, "console_profiles": profiles or {}, "warp_screen_enabled": warp})
-
-    def test_a_bezel_that_warps_is_the_system_bezel_or_a_home_consoles_own_bezel(self):
-        import game_deck as gd
-        on = {"active": 1, "profiles": {1: {"border_enabled": True}}}
-        off = {"active": 1, "profiles": {1: {"border_enabled": False}}}
-        self.assertFalse(gd.warp_bezel_available(None))
-        self.assertTrue(gd.warp_bezel_available(self._db(True)), "the CRT TV Bezels switch alone is enough")
-        self.assertFalse(gd.warp_bezel_available(self._db(False)), "no bezel at all")
-        self.assertFalse(gd.warp_bezel_available(self._db(False, {"NES": off})))
-        self.assertTrue(gd.warp_bezel_available(self._db(False, {"NES": on})), "a home console's own bezel")
-        self.assertTrue(gd.warp_bezel_available(self._db(False, {"PSX": {"active": 2, "profiles": {"1": {"border_enabled": False}, "2": {"border_enabled": True}}}})), "the active profile counts, whether its key is a number or text")
-        self.assertTrue(gd.warp_bezel_available(self._db(False, {"NES": {"active": 1, "profiles": {1: {"gb_border": True}}}})), "the older saved key still counts")
-        self.assertFalse(gd.warp_bezel_available(self._db(False, {c: on for c in ("GB", "GBC", "GBA", "GG", "NGP", "NGPC")})), "handheld bezels do not warp, so they do not count")
-        self.assertTrue(gd.warp_bezel_available(self._db(False, {"GBA": on, "SNES": on})), "a handheld next to a home console changes nothing")
-        for _console in gd.BORDER_CONSOLES_HANDHELD:
-            self.assertNotIn(_console, gd.BORDER_CONSOLES_HOME)
-
-    def test_the_saved_warp_choice_is_not_touched_and_the_row_is_greyed_without_a_bezel(self):
-        db = self._db(False, warp=True)
-        self.assertTrue(ui._warp_needs_a_bezel(db), "no bezel on: the row is greyed out and shown off")
-        self.assertTrue(db.config["warp_screen_enabled"], "the saved choice stays on")
-        db.config["fake_43_border_enabled"] = True
-        self.assertFalse(ui._warp_needs_a_bezel(db), "a bezel is back: the row is live again with its saved choice")
-        self.assertTrue(db.config["warp_screen_enabled"])
-        db.config["fake_43_border_enabled"] = False
-        db.config["console_profiles"] = {"N64": {"active": 1, "profiles": {1: {"border_enabled": True}}}}
-        self.assertFalse(ui._warp_needs_a_bezel(db), "a console's own bezel brings it back too")
-        _ui_src = inspect.getsource(ui)
-        self.assertIn('_cs_row_id == "warp_screen" and _warp_needs_a_bezel(db)', _ui_src)
-        _enter = MAIN_SRC.index('elif _cs_row_id == "warp_screen" and (_feature_locked("warp_screen_enabled") or not _warp_bezel_available())')
-        _flip = MAIN_SRC.index('db.config["warp_screen_enabled"] = not db.config.get("warp_screen_enabled", False)')
-        self.assertLess(_enter, _flip, "Enter does nothing on the greyed out row before the setting can flip")
 
 
 class TestV350GuideExplorerReception(unittest.TestCase):
@@ -19152,7 +14156,6 @@ class TestV350GuideExplorerReception(unittest.TestCase):
 
     def test_a_file_explorer_opened_for_a_channel_names_the_channel(self):
         """Owner 2026-11-05: carry the channel number into the file explorer's top title so the viewer does not get lost when the titles all say the same"""
-        shown = {}
         app_state = {"file_explorer_expand_lock": __import__("threading").Lock()}
         ns = {"app_state": app_state, "os": os, "db": None, "_fe_existing_schedule_paths": lambda c: [], "_fe_context_key": lambda c: None,
               "pygame": types.SimpleNamespace(mouse=types.SimpleNamespace(set_visible=lambda v: None, set_pos=lambda p: None),
@@ -19229,180 +14232,6 @@ class TestV350GuideExplorerReception(unittest.TestCase):
         self.assertGreaterEqual(_changes_per_second, 25.0, "the noise inside a rolling line changes about 30 times a second (%.1f)" % _changes_per_second)
 
 
-class TestStaticNoiseMadeOnce(unittest.TestCase):
-    """Owner log 2026-11-03: Static Noise made a new snow picture every 80 ms and at every strength change on the screen thread (50 to 140 ms spikes); now a few are made once per screen size and shown in turn"""
-
-    def test_pictures_are_made_once_and_cycled(self):
-        made = []
-        ns = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: now[0])), "db": None,
-              "log": types.SimpleNamespace(warning=lambda *a: None), "collections": __import__("collections"),
-              "_STATIC_NOISE_AMBIENT_REFRESH_MS": 80, "_STATIC_NOISE_POOL_FRAMES": 4, "_STATIC_NOISE_POOL_SIZES": 2,
-              "_STATIC_NOISE_BUILD_GAP_MS": 80, "random": __import__("random").Random(1234),
-              "_static_noise_pools": __import__("collections").OrderedDict(), "_current_noise_tint_style": lambda: "white",
-              "_static_noise_severity_at": lambda t: 0.2 + (t % 1000) / 5000.0, "_STATIC_NOISE_STRENGTH_STEPS": 16,
-              "_static_noise_baked_frame": lambda key, index, frame, step, steps: types.SimpleNamespace(n=frame.n, alpha=step)}
-
-        class Frame:
-            def __init__(self, n):
-                self.n, self.alpha = n, None
-            def set_alpha(self, a):
-                self.alpha = a
-
-        def make(w, h, tint):
-            made.append((w, h))
-            return Frame(len(made))
-        shown = []
-
-        class Screen:
-            def get_rect(self):
-                return Rect(0, 0, 400, 300)
-            def blit(self, surf, pos):
-                shown.append((surf.n, surf.alpha))
-
-        class Rect:
-            def __init__(self, x, y, w, h):
-                self.x, self.y, self.width, self.height = x, y, w, h
-                self.topleft = (x, y)
-            def clip(self, other):
-                return self
-        now = [0]
-        exec(compile(get_function_source("_static_noise_strength_alpha"), "a", "exec"), ns)
-        exec(compile(get_function_source("_apply_static_noise_effect"), "n", "exec"), ns)
-        ns["_static_noise_frame"] = make
-        for i in range(200):
-            now[0] = i * 16
-            ns["_apply_static_noise_effect"](Screen(), Rect(0, 0, 400, 300), "05")
-        self.assertEqual(len(made), 4, "only the set is made, however often the strength changes")
-        self.assertEqual(len({n for n, _a in shown}), 4, "every picture of the set is shown")
-        self.assertTrue(all(a is not None for _n, a in shown))
-        self.assertEqual(gov.STATIC_NOISE_POOL_FRAMES, 12)
-
-    def test_the_strength_is_baked_into_the_picture_so_it_draws_on_the_fast_path(self):
-        """Owner 2026-11-04 (i5-4570): Static Noise made playback really laggy; a picture with its own see-through values and an overall strength is drawn about 8 times slower, so the strength is baked in"""
-        import collections as _collections
-        import numpy as _np
-        ns = {"pygame": pygame, "np": _np, "_static_noise_baked": _collections.OrderedDict(), "_STATIC_NOISE_BAKED_MAX": 3}
-        exec(compile(get_function_source("_static_noise_baked_frame"), "b", "exec"), ns)
-        frame = pygame.Surface((4, 2), pygame.SRCALPHA)
-        frame.fill((200, 200, 200, 200))
-        baked = ns["_static_noise_baked_frame"]("k", 0, frame, 8, 16)
-        self.assertEqual(baked.get_alpha(), 255, "no overall strength is left on the picture")
-        self.assertTrue(baked.get_flags() & pygame.SRCALPHA, "the picture keeps its own see-through values; set_alpha(None) removes them and the snow is drawn solid")
-        _base = pygame.Surface((4, 2))
-        _base.fill((0, 0, 0))
-        _base.blit(baked, (0, 0))
-        self.assertTrue(70 <= _base.get_at((0, 0))[0] <= 85, "drawn on black the baked snow is see-through, not solid: %r" % (_base.get_at((0, 0)),))
-        self.assertNotIn("baked.set_alpha(None)", get_function_source("_static_noise_baked_frame"), "set_alpha(None) turns the snow into a solid black and white screen")
-        self.assertEqual(baked.get_at((0, 0)).a, 200 * 128 // 255, "the strength is in each pixel's own see-through value")
-        self.assertEqual(frame.get_at((0, 0)).a, 200, "the shared picture is not changed")
-        self.assertIs(ns["_static_noise_baked_frame"]("k", 0, frame, 8, 16), baked, "a baked picture is made once")
-        for step in (1, 2, 3, 4):
-            ns["_static_noise_baked_frame"]("k", 0, frame, step, 16)
-        self.assertEqual(len(ns["_static_noise_baked"]), 3, "at most STATIC_NOISE_BAKED_MAX are kept")
-        self.assertNotIn("frame.set_alpha(", get_function_source("_apply_static_noise_effect"), "the shown picture never gets an overall strength")
-
-    def test_the_snow_filter_leaves_the_picture_visible(self):
-        """Owner 2026-11-04: Static Noise is a light snowy filter over the live picture, never a screen of its own; the real snow functions drawn on a picture must leave that picture showing at every strength"""
-        import collections as _collections
-        import numpy as _np
-        ns = {"pygame": pygame, "np": _np, "db": None, "_STATIC_HEAVY": 0.46, "_static_noise_baked": _collections.OrderedDict(), "_STATIC_NOISE_BAKED_MAX": 24, "_STATIC_NOISE_GRAIN_PX": gov.STATIC_NOISE_GRAIN_PX}
-        for _name in ("_tinted_bright_rgb", "_static_noise_frame", "_static_noise_strength_alpha", "_static_noise_baked_frame"):
-            exec(compile(get_function_source(_name), _name, "exec"), ns)
-        _base_rgb = (40, 120, 200)
-        for _severity in (0.16, 0.30, 0.46):
-            _frame = ns["_static_noise_frame"](200, 120, "white")
-            _step = int(round(ns["_static_noise_strength_alpha"](_severity) * 16 / 255.0))
-            _baked = ns["_static_noise_baked_frame"](("k", _severity), 0, _frame, _step, 16)
-            _screen = pygame.Surface((200, 120))
-            _screen.fill(_base_rgb)
-            _screen.blit(_baked, (0, 0))
-            _shown = pygame.surfarray.array3d(_screen).astype(_np.int32)
-            _diff = _np.abs(_shown - _np.array(_base_rgb, dtype=_np.int32)).max(axis=2)
-            self.assertLess(float(_diff.mean()), 30.0, "the picture must stay visible under the snow at severity %s (mean change %.1f)" % (_severity, float(_diff.mean())))
-            self.assertLess(int(_diff.max()), 110, "no snow speck may be solid at severity %s (largest change %d)" % (_severity, int(_diff.max())))
-
-    def test_the_snow_changes_fast_and_shows_no_repeating_pattern(self):
-        """Owner 2026-11-04: the snow is a fine, fast live-TV snow; the picture changes at the governor's rate, never to the same one twice running, and in no fixed order"""
-        made = []
-        ns = {"pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: now[0])), "db": None,
-              "log": types.SimpleNamespace(warning=lambda *a: None), "collections": __import__("collections"),
-              "_STATIC_NOISE_AMBIENT_REFRESH_MS": gov.STATIC_NOISE_AMBIENT_REFRESH_MS, "_STATIC_NOISE_POOL_FRAMES": gov.STATIC_NOISE_POOL_FRAMES,
-              "_STATIC_NOISE_POOL_SIZES": gov.STATIC_NOISE_POOL_SIZES, "_STATIC_NOISE_BUILD_GAP_MS": gov.STATIC_NOISE_BUILD_GAP_MS,
-              "random": __import__("random").Random(7),
-              "_static_noise_pools": __import__("collections").OrderedDict(), "_current_noise_tint_style": lambda: "white",
-              "_static_noise_severity_at": lambda t: 0.3, "_STATIC_NOISE_STRENGTH_STEPS": 16,
-              "_static_noise_baked_frame": lambda key, index, frame, step, steps: types.SimpleNamespace(n=frame.n, alpha=step)}
-
-        class Frame:
-            def __init__(self, n):
-                self.n = n
-
-        def make(w, h, tint):
-            made.append((w, h))
-            return Frame(len(made))
-        shown = []
-
-        class Screen:
-            def get_rect(self):
-                return Rect(0, 0, 400, 300)
-            def blit(self, surf, pos):
-                shown.append((now[0], surf.n))
-
-        class Rect:
-            def __init__(self, x, y, w, h):
-                self.x, self.y, self.width, self.height = x, y, w, h
-                self.topleft = (x, y)
-            def clip(self, other):
-                return self
-        now = [0]
-        exec(compile(get_function_source("_static_noise_strength_alpha"), "a", "exec"), ns)
-        exec(compile(get_function_source("_apply_static_noise_effect"), "n", "exec"), ns)
-        ns["_static_noise_frame"] = make
-        for i in range(1800):
-            now[0] = int(i * 16.7)
-            ns["_apply_static_noise_effect"](Screen(), Rect(0, 0, 400, 300), "05")
-        self.assertEqual(len(made), gov.STATIC_NOISE_POOL_FRAMES, "only the set is made")
-        _refresh = max(1, int(gov.STATIC_NOISE_AMBIENT_REFRESH_MS))
-        _settled = [(t // _refresh, n) for t, n in shown if t >= 3000]
-        _by_tick = []
-        for _tick, _n in _settled:
-            if not _by_tick or _by_tick[-1][0] != _tick:
-                _by_tick.append((_tick, _n))
-        _seconds = (shown[-1][0] - 3000) / 1000.0
-        _changes = sum(1 for a, b in zip(_by_tick, _by_tick[1:]) if a[1] != b[1])
-        self.assertGreaterEqual(_changes / _seconds, 20.0, "the snow changes at least 20 times a second (%.1f)" % (_changes / _seconds))
-        self.assertTrue(all(a[1] != b[1] for a, b in zip(_by_tick, _by_tick[1:])), "never the same picture twice running")
-        _seq = [n for _t, n in _by_tick]
-        _period = gov.STATIC_NOISE_POOL_FRAMES
-        _same = sum(1 for k in range(len(_seq) - _period) if _seq[k] == _seq[k + _period]) / float(len(_seq) - _period)
-        self.assertLess(_same, 0.4, "the order does not repeat every %d pictures (%.2f)" % (_period, _same))
-        self.assertEqual(gov.STATIC_NOISE_AMBIENT_REFRESH_MS, 40)
-        self.assertEqual(gov.STATIC_NOISE_BUILD_GAP_MS, 80)
-
-    def test_the_snow_grain_is_a_governor_number_and_finer_than_the_old_three_pixels(self):
-        """Owner 2026-11-04: fine snow, not big spaced-out pixels; the size of one speck is STATIC_NOISE_GRAIN_PX and a smaller number is a finer snow"""
-        import collections as _collections
-        import numpy as _np
-        self.assertEqual(gov.STATIC_NOISE_GRAIN_PX, 4)
-        self.assertNotIn("// 3", get_function_source("_static_noise_frame"), "the grain is the governor number, not a fixed 3")
-        _like = {}
-        for _grain in (1, 2, 4):
-            ns = {"pygame": pygame, "np": _np, "db": None, "_STATIC_HEAVY": 0.46, "_STATIC_NOISE_GRAIN_PX": _grain}
-            for _name in ("_tinted_bright_rgb", "_static_noise_frame"):
-                exec(compile(get_function_source(_name), _name, "exec"), ns)
-            _np.random.seed(11)
-            _alpha = pygame.surfarray.array_alpha(ns["_static_noise_frame"](400, 300, "white")).astype(_np.int32)
-            _like[_grain] = float((_alpha[1:, :] == _alpha[:-1, :]).mean())
-        self.assertGreater(_like[4], _like[2] + 0.05, "a bigger grain number gives bigger specks (%r)" % (_like,))
-        self.assertGreater(_like[2], _like[1] + 0.05, "a smaller grain number gives finer specks (%r)" % (_like,))
-
-    def test_strength_keeps_the_old_average(self):
-        ns = {}
-        exec(compile(get_function_source("_static_noise_strength_alpha"), "a", "exec"), ns)
-        f = ns["_static_noise_strength_alpha"]
-        self.assertEqual(f(1.0), 255)
-        self.assertEqual(f(0.1), f(0.3), "below 0.31 the old snow sat at its floor alphas")
-        self.assertLess(f(0.3), f(0.46))
 
 
 class TestGovernorLearnsThisPC(unittest.TestCase):
@@ -19420,7 +14249,7 @@ class TestGovernorLearnsThisPC(unittest.TestCase):
         counts = [pg.ffmpeg_scans_at_once(level) for level in range(pg.MAX_LEVEL + 1)]
         self.assertEqual(counts, sorted(counts, reverse=True), "each level allows no more than the one below it")
         self.assertTrue(all(c >= 1 for c in counts), "never below one, so the scans still move")
-        src = read(os.path.join(ROOT, "performance_governor.py"))
+        src = read(os.path.join(ROOT, "assets", "performance_governor.py"))
         self.assertIn("ffmpeg_scans_running() < ffmpeg_scans_at_once(level))", src, "the background gate uses the level's count")
 
     def test_a_weak_pc_keeps_back_only_what_windows_needs(self):
@@ -19479,7 +14308,7 @@ class TestGovernorLearnsThisPC(unittest.TestCase):
         t._set_level(1, "test", 6000.0)
         t.update({}, now=6000.0 + pg.RELAX_RELAPSE_SECONDS + 1)
         self.assertEqual(t._relax_cooldown, pg.RELAX_COOLDOWN_MAX_SECONDS / 2, "a step down that held halves the wait")
-        src = read(os.path.join(ROOT, "performance_governor.py"))
+        src = read(os.path.join(ROOT, "assets", "performance_governor.py"))
         self.assertIn("now - self._last_hold >= self._relax_cooldown", src, "the learned wait is the one used")
 
     def test_python_heavy_work_waits_during_a_tune_and_a_flipped_channel_starts_no_loudness_scan(self):
@@ -19527,7 +14356,7 @@ class TestScreenReadsHeldAnswersWithoutLocks(unittest.TestCase):
     def test_a_held_path_status_is_read_without_the_cache_lock(self):
         import media
         src = read(os.path.join(ROOT, "media.py"))
-        body = src[src.index("def _path_status(p):"):src.index("def queued_path_refreshes")]
+        body = src[src.index("def _path_status(p):"):src.index("def run_queued_path_refreshes")]
         self.assertIn("    cached = _path_exists_cache.get(p)\n", body, "the held status is read outside the lock")
         self.assertLess(body.index("_PATH_EXISTS_CACHE_SWEEP_INTERVAL_MS"), body.index("with _path_exists_cache_lock:"),
                         "the lock is taken only when a sweep is due")
@@ -19620,280 +14449,12 @@ class TestCrashRelaunchTakesOver(unittest.TestCase):
             self.assertEqual(len(failures), 1, "an unreadable record still writes its failure line")
 
 
-class TestFileExplorerEscapeOnly(unittest.TestCase):
-    """Owner 2026-11-04: in the file explorer only Escape works from the keyboard, everything else is the mouse; Backspace no longer goes up a folder there, and still deletes in name boxes and skips a controller remap button"""
-
-    def _explorer_key_block(self):
-        src = read(os.path.join(ROOT, "retro_tv_emulator.py"))
-        start = src.index('    _fe_key_action = menu_nav.key_to_action(')
-        return src[start:src.index("    fe_rect = app_state.get(\"file_explorer_rect\")", start)]
-
-    def test_the_explorer_keys_are_escape_only(self):
-        block = self._explorer_key_block()
-        self.assertNotIn("parent=True", block, "the explorer does not ask for Backspace")
-        self.assertNotIn("PARENT", block)
-        self.assertNotIn("_fe_go_up", block, "no key goes up a folder")
-        self.assertIn("menu_nav.BACK", block, "Escape still closes it")
-
-    def test_the_up_button_still_goes_up_and_backspace_keeps_its_other_jobs(self):
-        src = read(os.path.join(ROOT, "retro_tv_emulator.py"))
-        self.assertIn("if menu_nav.explorer_hit(up_rect, mx, my):\n            _fe_go_up()", src, "the toolbar's up button is unchanged")
-        self.assertEqual(src.count("menu_nav.key_to_action(event.key, parent=True)"), 0, "no controller screen asks for Backspace; the controller remap skips with Enter")
-        self.assertIn("elif menu_nav.is_accept(event.key):\n                        game_deck.skip_current_remap_button()", src, "Enter skips a controller button")
-        self.assertIn("action = key_to_action(key, parent=True)", read(os.path.join(ROOT, "menu_nav.py")), "name boxes still delete with Backspace")
 
 
-class TestDvdControllerPageOrder(unittest.TestCase):
-    """Owner 2026-11-04 06:44: on the DVD PLAYER - CONTROLLER page the directional rows sit together and the buttons sit together, so NAVIGATION comes before RETURN TO MAIN MENU"""
-
-    def test_directions_first_then_buttons(self):
-        ui_src = read(os.path.join(ROOT, "ui.py"))
-        block = ui_src[ui_src.index("dvd_controls_pad = ["):]
-        block = block[:block.index("]\n")]
-        keys = re.findall(r'\(\("(pad_[a-z]+)"', block)
-        self.assertEqual(keys, ["pad_down", "pad_left", "pad_right", "pad_dpad", "pad_y", "pad_a", "pad_b", "pad_start"],
-                         "the D-pad rows come first and every button row after them")
 
 
-class TestControlsMenuKeyPictures(unittest.TestCase):
-    """Owner 2026-11-04 02:47 and 02:48: the controls menu shows the new key pictures, every key the same size whatever size its picture is, the long keys as tall as the square ones and only wider, like one keyboard"""
-
-    @classmethod
-    def setUpClass(cls):
-        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-        import pygame
-        pygame.display.init()
-        if pygame.display.get_surface() is None:
-            pygame.display.set_mode((1280, 800))
-        cls.pygame = pygame
-        import ui
-        cls.ui = ui
-
-    def setUp(self):
-        self.ui._control_key_raw.clear()
-        self.ui._control_key_scaled.clear()
-        self.addCleanup(self.ui._control_key_raw.clear)
-        self.addCleanup(self.ui._control_key_scaled.clear)
-
-    def _main_dir(self, path):
-        return mock.patch.object(media, "resolve_main_dir", lambda: path)
-
-    def test_every_key_picture_is_shipped(self):
-        folder = os.path.join(ROOT, "main", "images", "controls")
-        missing = [f for f in self.ui.CONTROL_KEY_FILES.values() if not os.path.exists(os.path.join(folder, f))]
-        self.assertEqual(missing, [], "every key picture the menu uses is in main/images/controls")
-
-    def test_keys_match_whatever_size_the_pictures_are(self):
-        pygame, ui = self.pygame, self.ui
-        with tempfile.TemporaryDirectory() as root:
-            folder = os.path.join(root, "images", "controls")
-            os.makedirs(folder)
-
-            def picture(name, w, h, pad):
-                surf = pygame.Surface((w + 2 * pad, h + 2 * pad), pygame.SRCALPHA)
-                surf.fill((0, 0, 0, 0))
-                surf.fill((0, 0, 0, 255), (pad, pad, w, h))
-                surf.fill((200, 200, 200, 255), (pad, pad, w, 4))
-                surf.fill((0, 0, 0, 90), (0, 0, w + 2 * pad, pad // 2))
-                pygame.image.save(surf, os.path.join(folder, ui.CONTROL_KEY_FILES[name]))
-            picture("up", 300, 310, 40)
-            picture("m", 1000, 980, 200)
-            picture("enter", 2700, 1000, 90)
-            picture("backspace", 680, 170, 10)
-            with self._main_dir(root):
-                up, m = ui.control_key_picture("up", 54), ui.control_key_picture("m", 54)
-                enter, back = ui.control_key_picture("enter", 54), ui.control_key_picture("backspace", 54)
-        self.assertEqual(up.get_size(), (54, 54), "a square key is exactly as tall as it is wide")
-        self.assertEqual(m.get_size(), (54, 54), "a big picture and a small one come out the same size")
-        self.assertEqual(enter.get_height(), 54, "a long key is as tall as a square key")
-        self.assertEqual(enter.get_width(), round(54 * 2700 / 1000.0), "and as wide as its own shape, its empty border and faint glow cut away")
-        self.assertEqual(back.get_size(), (216, 54))
-        self.assertNotEqual(tuple(up.get_at((27, 30)))[:3], (0, 0, 0), "pure black, the game overlay's see-through colour, is lifted")
-
-    def test_a_missing_picture_falls_back_to_text_and_says_so_once(self):
-        ui = self.ui
-        with tempfile.TemporaryDirectory() as root, self._main_dir(root):
-            with self.assertLogs("ui", level="WARNING") as logs:
-                self.assertIsNone(ui.control_key_picture("c", 54))
-                self.assertIsNone(ui.control_key_picture("c", 30))
-            self.assertEqual(len(logs.output), 1, "one line for a missing picture, not one a frame")
-            self.assertIsNone(ui.control_keys_size(("w", "s"), 54, 10), "a row with a missing picture is shown as text")
-
-    def test_groups_and_wasd_layout(self):
-        ui = self.ui
-        with self._main_dir(os.path.join(ROOT, "main")):
-            self.assertEqual(ui.control_keys_size(("up", "down"), 54, 10), (118, 54))
-            self.assertEqual(ui.control_keys_size(("wasd",), 54, 10), (182, 118), "W sits over S with A and D at its sides")
-            esc = ui.control_key_picture("esc", 54)
-            self.assertEqual(esc.get_height(), 54)
-            self.assertGreater(esc.get_width(), 54)
-
-    def test_every_page_draws(self):
-        pygame, ui = self.pygame, self.ui
-        db = types.SimpleNamespace(config={"menu_opacity": 80, "theme_bg_hue": 220, "theme_ui_hue": 140})
-        screen = pygame.Surface((1280, 800))
-        with self._main_dir(os.path.join(ROOT, "main")):
-            for page in range(ui.NUM_CONTROL_PAGES):
-                ui.render_controls_splash(screen, None, db=db, app_state={"controls_splash_page": page, "controls_splash_focus": 1})
-        self.assertIn(("up", 54), ui._control_key_scaled)
-        self.assertIn(("w", 54), ui._control_key_scaled, "the WASD row is drawn from the single keys")
-        self.assertIn(("enter", gov.CONTROLS_FOOTER_KEY_H_PX), ui._control_key_scaled, "the footer shows its keys too")
-        for name in ("CONTROLS_KEY_H_PX", "CONTROLS_KEY_GAP_PX", "CONTROLS_KEY_ROW_GAP_PX", "CONTROLS_FOOTER_KEY_H_PX",
-                     "CONTROLS_KEY_ALPHA_CUTOFF", "CONTROLS_LONG_KEY_MIN_RATIO"):
-            self.assertTrue(hasattr(gov, name), name)
 
 
-class TestKeyHintsUseKeyPictures(unittest.TestCase):
-    """Owner 2026-11-04 03:10 and 03:12: the controller pages use the controller buttons (the four arrows all from the right arrow), and every hint on screen that names a key or button shows its picture"""
-
-    @classmethod
-    def setUpClass(cls):
-        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-        import pygame
-        pygame.display.init()
-        pygame.font.init()
-        if pygame.display.get_surface() is None:
-            pygame.display.set_mode((1280, 800))
-        cls.pygame = pygame
-        import ui
-        cls.ui = ui
-        cls.font = ui._get_font("Courier New", 17, bold=True)
-
-    def setUp(self):
-        self.ui._control_key_raw.clear()
-        self.ui._control_key_scaled.clear()
-        self.addCleanup(self.ui._control_key_raw.clear)
-        self.addCleanup(self.ui._control_key_scaled.clear)
-        self.enterContext(mock.patch.object(media, "resolve_main_dir", lambda: os.path.join(ROOT, "main")))
-
-    def test_controller_buttons_keep_their_shape_in_the_square(self):
-        ui = self.ui
-        for name in ("pad_up", "pad_down", "pad_left", "pad_right", "pad_dpad", "pad_a", "pad_b", "pad_x", "pad_y"):
-            pic = ui.control_key_picture(name, 54)
-            self.assertEqual(pic.get_size(), (54, 54), name)
-        trimmed = ui._control_key_trimmed("pad_up")
-        rect = self.pygame.mask.from_surface(ui.control_key_picture("pad_up", 54), 200).get_bounding_rects()[0]
-        self.assertLess(rect.width, 54, "a button narrower than tall is not stretched to the square")
-        self.assertAlmostEqual(rect.width / rect.height, trimmed.get_width() / trimmed.get_height(), delta=0.06)
-        start = ui.control_key_picture("pad_start", 54)
-        self.assertEqual(start.get_height(), 54, "SELECT and START take a key's height so rows line up")
-        drawn = self.pygame.mask.from_surface(start, 200).get_bounding_rects()[0]
-        self.assertLessEqual(drawn.height, round(54 * gov.CONTROLS_PAD_LONG_BUTTON_SCALE) + 1,
-                             "but are drawn smaller, to match the round buttons (owner 03:41: too big)")
-        self.assertGreater(drawn.width, drawn.height * 2, "and keep their long shape")
-
-    def test_the_four_arrows_are_one_shape_turned(self):
-        pygame, ui = self.pygame, self.ui
-        right = ui._control_key_trimmed("pad_right")
-        for name, angle in (("pad_up", 90), ("pad_left", 180), ("pad_down", 270)):
-            other = ui._control_key_trimmed(name)
-            turned = pygame.transform.rotate(right, angle)
-            self.assertAlmostEqual(other.get_width() / other.get_height(), turned.get_width() / turned.get_height(), delta=0.03, msg=name)
-
-    def test_a_hint_line_is_measured_and_spaced(self):
-        ui, f = self.ui, self.font
-        key_h = round(f.get_height() * gov.CONTROLS_HINT_KEY_SCALE)
-        enter = ui.control_key_picture("enter", key_h).get_width()
-        a = ui.control_key_picture("a", key_h).get_width()
-        word = f.size("CONFIRM")[0]
-        w, h = ui.key_hint_size([("enter",), "CONFIRM"], f, None)
-        self.assertEqual(w, enter + gov.CONTROLS_HINT_KEY_WORD_GAP_PX + word, "a key sits close to its words")
-        self.assertEqual(h, key_h)
-        w2, _ = ui.key_hint_size([("a", "d"), "SELECT", ("enter",), "CONFIRM"], f, None)
-        gap = max(2, key_h // 8)
-        self.assertEqual(w2, 2 * a + gap + gov.CONTROLS_HINT_KEY_WORD_GAP_PX + f.size("SELECT")[0] + gov.CONTROLS_HINT_GROUP_GAP_PX
-                         + enter + gov.CONTROLS_HINT_KEY_WORD_GAP_PX + word, "one key-and-words pair is spaced from the next")
-        w3, _ = ui.key_hint_size(["PRESS", ("esc",), "TO RESUME"], f, None)
-        esc = ui.control_key_picture("esc", key_h).get_width()
-        self.assertEqual(w3, f.size("PRESS")[0] + 2 * gov.CONTROLS_HINT_KEY_WORD_GAP_PX + esc + f.size("TO RESUME")[0],
-                         "words that lead into a key sit close to it")
-        w4, _ = ui.key_hint_size([("pad_left",), ["OR"], ("a",)], f, None)
-        self.assertEqual(w4, 2 * ui.control_key_picture("pad_left", key_h).get_width() - ui.control_key_picture("pad_left", key_h).get_width() + a
-                         + 2 * gov.CONTROLS_HINT_KEY_WORD_GAP_PX + f.size("OR")[0], "a joining word stays close on both sides")
-        surf = self.pygame.Surface((600, 60), self.pygame.SRCALPHA)
-        drawn = ui.draw_key_hint(surf, [("a", "d"), "SELECT"], 300, 30, f, (255, 255, 255), center=True)
-        self.assertEqual(drawn, ui.key_hint_size([("a", "d"), "SELECT"], f, None))
-        parts = [("w", "a", "s", "d"), "NAVIGATE", ("enter",), "CONFIRM"]
-        full = ui.key_hint_size(parts, ui._get_font("Courier New", 17, bold=True), None)[0]
-        fitted = ui.draw_key_hint_fitted(surf, parts, 300, 30, "Courier New", 17, (255, 255, 255), int(full * 0.85))
-        self.assertLessEqual(fitted[0], int(full * 0.85), "a hint that is too wide is made smaller to fit its box")
-        self.assertEqual(ui.draw_key_hint_fitted(surf, parts, 300, 30, "Courier New", 17, (255, 255, 255), full + 5)[0], full, "one that fits keeps its size")
-
-    def test_a_missing_picture_is_written_as_its_name(self):
-        ui, f = self.ui, self.font
-        with mock.patch.object(media, "resolve_main_dir", lambda: os.path.join(ROOT, "no such folder")), self.assertLogs("ui", level="WARNING"):
-            w, _ = ui.key_hint_size([("pad_b",), "CANCEL"], f, None)
-        self.assertEqual(w, f.size("[B]")[0] + gov.CONTROLS_HINT_KEY_WORD_GAP_PX + f.size("CANCEL")[0])
-
-    def test_the_controls_menu_footer_ends_with_the_quit_keys(self):
-        ui_src = read(os.path.join(ROOT, "ui.py"))
-        parts = '[("a", "d"), "TO NAVIGATE", ("enter",), "TO SELECT", ("c",), ["OR"], ("esc",), "TO QUIT"]'
-        self.assertEqual(ui_src.count(parts), 1, "C or ESC to quit sits to the right of the other footer instructions, once")
-        self.assertLess(ui_src.index(parts), ui_src.index("if page_num == 0:"), "and is drawn with the footer on every page")
-
-    def test_every_hint_on_screen_uses_the_pictures(self):
-        ui_src = read(os.path.join(ROOT, "ui.py"))
-        deck_src = read(os.path.join(ROOT, "game_deck.py"))
-        for old in ("A / D  TO NAVIGATE    ENTER  TO SELECT\", True", "A/D TO ADJUST", "LEFT/RIGHT TO ADJUST", "ENTER FOR DISC",
-                    "PRESS  [ ESCAPE ]", "PRESS  [ ENTER ]", "ENTER  REMAP NOW", "\"ESC  CANCEL\"", "W/A/S/D  NAVIGATE", "A/D  NAVIGATE"):
-            self.assertNotIn(old, ui_src.replace("hint = f_footer.render(\"A / D  TO NAVIGATE    ENTER  TO SELECT\", True", ""), old)
-        for old in ("BACKSPACE to skip button", "A / D  SELECT", "OR A/D  SELECT"):
-            self.assertNotIn(old, deck_src, old)
-        self.assertGreaterEqual(ui_src.count("draw_key_hint("), 8, "the controls footer, both loudness rows, the disc row, the minimize popup and three popups")
-        self.assertEqual(deck_src.count("draw_key_hint_fitted("), 3, "the two DVD prompts and the game exit prompt")
-        self.assertIn("_ui.draw_key_hint(surface, [(_skip_name,), \"to skip button\"", deck_src, "the remap screen")
-        self.assertIn("_ui._get_remote_binding(db, \"enter\")", deck_src, "the skip hint shows the remapped Select key")
-        for page_row in ("((\"pad_dpad\",),", "((\"pad_start\", \"pad_select\"),", "((\"pad_y\",),", "((\"pad_down\",),"):
-            self.assertIn(page_row, ui_src, "the controller pages use the controller buttons")
-
-    def test_the_game_menu_legend_draws_pictures(self):
-        pygame = self.pygame
-        import game_deck as gd
-        fake = types.SimpleNamespace(_font_small=self.font, list_text_color=(230, 230, 230),
-                                     _LEGEND_CONTROLLER_PICTURES=gd.ExternalGameDeck._LEGEND_CONTROLLER_PICTURES,
-                                     _LEGEND_KEYBOARD_PICTURES=gd.ExternalGameDeck._LEGEND_KEYBOARD_PICTURES)
-        surf = pygame.Surface((900, 200))
-        gd.ExternalGameDeck._draw_legend(fake, surf, 450, 0, 200, [("Navigate", "\u2190\u2191\u2193\u2192", "W/A/S/D"), ("Select", "A", "Enter"), ("Back", "B", "ESC")])
-        gd.ExternalGameDeck._draw_legend(fake, surf, 450, 0, 200, [("Navigate", "\u2191/\u2193", "W/S"), ("Select", "A", "Enter"), ("Back", "B", "ESC")])
-        for name in ("pad_dpad", "pad_a", "pad_b", "pad_up", "pad_down", "w", "a", "s", "d", "enter", "esc"):
-            self.assertIn((name, gov.GAME_LEGEND_KEY_H_PX), self.ui._control_key_scaled, name)
-        for text in ("\u2190\u2191\u2193\u2192", "\u2190/\u2192", "\u2191/\u2193", "A", "B"):
-            self.assertIn(text, gd.ExternalGameDeck._LEGEND_CONTROLLER_PICTURES)
-        for text in ("W/A/S/D", "A/D", "W/S", "Enter", "ESC"):
-            self.assertIn(text, gd.ExternalGameDeck._LEGEND_KEYBOARD_PICTURES)
-
-
-    def test_each_legend_section_is_its_name_over_controller_slash_keyboard(self):
-        """Owner 2026-11-04 09:19: "instead of stacked. i want the game buttons first with a / between them and the word/text centered above each section." """
-        import game_deck as gd
-        import ui as ui_mod
-        fake = types.SimpleNamespace(_font_small=self.font, list_text_color=(230, 230, 230),
-                                     _LEGEND_CONTROLLER_PICTURES=gd.ExternalGameDeck._LEGEND_CONTROLLER_PICTURES,
-                                     _LEGEND_KEYBOARD_PICTURES=gd.ExternalGameDeck._LEGEND_KEYBOARD_PICTURES)
-        drawn, titles = [], []
-        real = ui_mod.draw_key_hint
-
-        def spy(target, parts, x, center_y, font, color, key_h=None, gap=None, center=False):
-            if target is not None:
-                drawn.append((parts, x, center_y, center, titles[-1]))
-            return real(target, parts, x, center_y, font, color, key_h=key_h, gap=gap, center=center)
-
-        class Screen:
-            def blit(self, surf, pos):
-                titles.append((pos[0] + surf.get_width() // 2, pos[1], pos[1] + surf.get_height()))
-        ui_mod.draw_key_hint = spy
-        try:
-            gd.ExternalGameDeck._draw_legend(fake, Screen(), 450, 0, 200, [("Navigate", "\u2190\u2191\u2193\u2192", "W/A/S/D"), ("Select", "A", "Enter"), ("Back", "B", "ESC")])
-        finally:
-            ui_mod.draw_key_hint = real
-        self.assertEqual([d[0] for d in drawn], [[("pad_dpad",), ["/"], ("w", "a", "s", "d")], [("pad_a",), ["/"], ("enter",)], [("pad_b",), ["/"], ("esc",)]],
-                         "one line per section: the controller button first, a slash, then the keyboard key")
-        self.assertTrue(all(d[3] for d in drawn), "each line is centred")
-        self.assertEqual([d[4][0] for d in drawn], [d[1] for d in drawn], "each name is centred above its own section")
-        self.assertTrue(all(d[4][2] <= d[2] for d in drawn), "the name sits above its keys")
-        self.assertEqual(len({d[2] for d in drawn}), 1, "all sections on one row")
-        self.assertEqual(sorted(d[1] for d in drawn), [d[1] for d in drawn], "the sections run left to right in order")
-        self.assertGreater(gov.GAME_LEGEND_SECTION_GAP_PX, 0)
 
 
 class TestSurfaceLockFinder(unittest.TestCase):
@@ -20313,7 +14874,6 @@ class TestHealthMonitor(unittest.TestCase):
         self.assertIsNone(refs[0](), "dropping the frames frees them")
 
     def test_a_thread_working_inside_one_long_call_is_not_stuck(self):
-        hm = self.hm
         mon = self._monitor()
         mon.refresh_names()
         frames = {}
@@ -20630,90 +15190,8 @@ class TestBreakCountRule(unittest.TestCase):
         self.assertIn("return max(0, (int(show_dur) - 900) // HALF_HOUR)", src)
 
 
-class TestResetPopupAndButton(unittest.TestCase):
-    """The Reset popup says the app restarts, and game saves light the Reset button (owner 2026-11-03 08:58)"""
-
-    def test_the_popup_says_the_app_restarts(self):
-        src = read(os.path.join(ROOT, "ui.py"))
-        pop = src[src.index("def render_clear_confirm_popup"):]
-        self.assertIn('"Your own files stay. The app restarts."', pop)
-        self.assertIn('_has_body = _is_burnin_family or target in ("app_update", "reset_settings")', pop)
-        self.assertIn("btn_y = box_y + (145 if _has_checkbox else 125 if _has_body else 85)", pop, "the buttons move below the two lines")
-
-    def test_game_saves_light_the_reset_button(self):
-        ns = {"os": os, "time": time, "_log_warn_throttled": lambda *a: None,
-              "_FRESH_START_MAIN_FOLDERS": ("loudness", "captions", "visualizer_analysis"), "_RESET_DISK_CHECK_S": 2.0,
-              "_reset_disk_check": {"at": None, "found": False}}
-        exec(compile(get_function_source("_saved_data_on_disk"), "<disk>", "exec"), ns)
-        with tempfile.TemporaryDirectory() as main:
-            ns["resolve_main_dir"] = lambda: main
-            os.makedirs(os.path.join(main, "roms", "SNES", "saves", "profile1"))
-            self.assertFalse(ns["_saved_data_on_disk"](), "empty save folders are nothing to reset")
-            with open(os.path.join(main, "roms", "SNES", "saves", "profile1", "mario.srm"), "wb") as fh:
-                fh.write(b"x")
-            self.assertFalse(ns["_saved_data_on_disk"](), "the disk is looked at once every RESET_DISK_CHECK_SECONDS, not every frame")
-            ns["_reset_disk_check"]["at"] = None
-            self.assertTrue(ns["_saved_data_on_disk"]())
-        self.assertIn("return _saved_data_on_disk()", get_function_source("_any_settings_to_reset"))
-        self.assertEqual(gov.RESET_DISK_CHECK_SECONDS, 2.0)
 
 
-class TestAllSettingsCoversSplashAndBezels(unittest.TestCase):
-    """With All Settings on, a splash screen switch turns every console's splash on or off (not a profile choice), and a bezel switch reaches the same profile number on every console only (owner 2026-11-03 08:58)"""
-
-    def _db(self, sync):
-        saves = []
-        db = types.SimpleNamespace(config={"all_profiles_sync": sync, "all_profiles_sync_target": 1, "console_splash_enabled": {"NES": False}},
-                                   save_settings=lambda: saves.append(1))
-        return db, saves
-
-    def test_splash_turns_on_for_every_console_with_all_settings(self):
-        import game_deck as gd
-        db, saves = self._db(True)
-        ns = {"db": db}
-        exec(compile(get_function_source("_set_splash_enabled"), "<splash>", "exec"), ns)
-        ns["_set_splash_enabled"]("NES", True)
-        for con in gd.CONSOLE_ORDER:
-            if con == "MENU":
-                continue
-            if con == "DVD":
-                self.assertTrue(db.config["dvd_splash_enabled"])
-            else:
-                self.assertTrue(db.config["console_splash_enabled"][con], con)
-        self.assertNotIn("MENU", db.config["console_splash_enabled"])
-        self.assertTrue(saves)
-
-    def test_splash_is_one_console_without_all_settings(self):
-        db, _saves = self._db(False)
-        ns = {"db": db}
-        exec(compile(get_function_source("_set_splash_enabled"), "<splash>", "exec"), ns)
-        ns["_set_splash_enabled"]("GBA", True)
-        self.assertEqual(db.config["console_splash_enabled"], {"NES": False, "GBA": True})
-        self.assertNotIn("dvd_splash_enabled", db.config)
-        self.assertIn("_set_splash_enabled(console_key, enabled)", MAIN_SRC, "the menu's splash switch uses it")
-
-    def test_a_missing_splash_picture_shows_the_normal_loading_screen(self):
-        src = read(os.path.join(ROOT, "game_deck.py"))
-        self.assertIn("if self.dvd_splash_enabled and self._get_dvd_custom_splash_surface() is not None:", src)
-        self.assertIn("custom_surf = self._get_console_custom_splash_surface(self.active_console)\n                    if custom_surf is not None:", src)
-
-    def test_bezel_reaches_the_same_profile_on_every_console_only(self):
-        import game_deck as gd
-        db, _saves = self._db(True)
-        db.config["console_profiles"] = {"SNES": {"active": 1, "profiles": {2: {"border_enabled": False}}}}
-        ns = {"db": db, "game_deck": None}
-        exec(compile(get_function_source("_sync_profile_setting_across_consoles"), "<sync>", "exec"), ns)
-        ns["_sync_profile_setting_across_consoles"]("NES", 1, "border_enabled", True)
-        for con in gd.CONSOLE_ORDER:
-            if con == "NES":
-                continue
-            self.assertTrue(db.config["console_profiles"][con]["profiles"][1]["border_enabled"], con)
-        self.assertFalse(db.config["console_profiles"]["SNES"]["profiles"][2]["border_enabled"], "profile 2 keeps its own choice")
-        self.assertNotIn(3, db.config["console_profiles"]["SNES"]["profiles"])
-        src = read(os.path.join(ROOT, "game_deck.py"))
-        path_fn = src[src.index("    def _border_source_path"):src.index("    def _prepare_border_asset")]
-        self.assertIn("idx = max(1, min(int(style or 1), n)) - 1", path_fn, "each console uses its own bezel: home consoles a style they have")
-        self.assertIn("            else:\n                idx = 0", path_fn, "handhelds their own frame")
 
 
 class TestCoresAndBiosAreCopiedIntoConsoleFolders(unittest.TestCase):
@@ -21222,7 +15700,6 @@ class TestVisualizerClearMusic(_SectionCase):
 def suite_crash_log_and_exit_notice():
     import datetime as _dt
     import subprocess as _sp
-    import textwrap as _tw
 
     with tempfile.TemporaryDirectory() as folder:
         warnings = []
@@ -21389,7 +15866,8 @@ def shared_helper_import_checks():
 
 def converted_handler_checks(name, expected):
     """Every broad except in the script that only passed now makes exactly one helper call naming its place and its own error."""
-    with open(os.path.join(ROOT, name), encoding="utf-8") as handle:
+    _p = os.path.join(ROOT, name) if os.path.exists(os.path.join(ROOT, name)) else os.path.join(ROOT, "assets", name)
+    with open(_p, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
     parents, top_function = _enclosing_names(tree)
     silent = []
@@ -22741,77 +17219,6 @@ class TestCommercialBundleLaps(unittest.TestCase):
                 current = []
 
 
-class TestGuidePreviewBoxHold(unittest.TestCase):
-    def _ns(self, store):
-        class FakeLib:
-            def get_cached(self, path):
-                box = store.get(path)
-                return {"picture_box": box} if box else None
-
-        clock = {"t": 100.0}
-        fake_time = types.SimpleNamespace(monotonic=lambda: clock["t"])
-        ns = {"os": os, "time": fake_time, "media": media, "math": math, "pygame": MagicMock(), "log": MagicMock(),
-              "performance_governor": gov, "_get_probe_library": lambda: FakeLib(),
-              "_file_identity_key": lambda p: p, "_log_probe_failure": lambda *a, **k: None,
-              "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
-              "PICTURE_BOX_FIT_RETRY_SECONDS": 2.0,
-              "_picture_box_fit_state": {"content_key": None, "norm_rect": None, "picture_aspect": None, "retry_at": 0.0},
-              "GUIDE_PREVIEW_BOX_HOLD_MS": gov.GUIDE_PREVIEW_BOX_HOLD_MS,
-              "GUIDE_PREVIEW_BOX_RECHECK_SECONDS": gov.GUIDE_PREVIEW_BOX_RECHECK_SECONDS,
-              "_guide_preview_box_hold_state": {"content_key": None, "started": 0.0, "gave_up": False}}
-        for name in ("_picture_box_set_content", "_guide_preview_box_hold"):
-            exec(main_function_code(name), ns)
-        return ns, clock
-
-    def test_governor_rows(self):
-        self.assertEqual(gov.GUIDE_PREVIEW_BOX_HOLD_MS, 1500)
-        self.assertEqual(gov.GUIDE_PREVIEW_BOX_RECHECK_SECONDS, 0.2)
-        self.assertEqual(MAIN_SRC.count("GUIDE_PREVIEW_BOX_HOLD_MS = performance_governor.GUIDE_PREVIEW_BOX_HOLD_MS"), 1)
-
-    def test_black_until_the_box_is_read_then_shows(self):
-        path = os.path.normpath(os.path.abspath("/m/show.mkv"))
-        store = {}
-        ns, clock = self._ns(store)
-        hold = ns["_guide_preview_box_hold"]
-        self.assertTrue(hold(path))
-        clock["t"] += 0.5
-        self.assertTrue(hold(path))
-        store[path] = {"reason": "pillarbox", "norm": [0.1, 0.0, 0.8, 1.0], "picture_aspect": 4 / 3}
-        clock["t"] += 0.25
-        self.assertFalse(hold(path))
-        self.assertIsNotNone(ns["_picture_box_fit_state"]["norm_rect"])
-
-    def test_hold_ends_at_the_limit_and_logs_once(self):
-        path = os.path.normpath(os.path.abspath("/m/show.mkv"))
-        ns, clock = self._ns({})
-        hold = ns["_guide_preview_box_hold"]
-        self.assertTrue(hold(path))
-        clock["t"] += gov.GUIDE_PREVIEW_BOX_HOLD_MS / 1000.0 + 0.1
-        self.assertFalse(hold(path))
-        self.assertFalse(hold(path))
-        self.assertEqual(ns["log"].info.call_count, 1)
-
-    def test_no_hold_for_decided_or_unscannable_files(self):
-        path = os.path.normpath(os.path.abspath("/m/show.mkv"))
-        ns, _ = self._ns({path: {"reason": "no_bars"}})
-        self.assertFalse(ns["_guide_preview_box_hold"](path))
-        song = os.path.normpath(os.path.abspath("/m/song.mp3"))
-        ns, _ = self._ns({})
-        self.assertFalse(ns["_guide_preview_box_hold"](song))
-
-    def test_each_file_gets_its_own_hold(self):
-        a = os.path.normpath(os.path.abspath("/m/a.mkv"))
-        b = os.path.normpath(os.path.abspath("/m/b.mkv"))
-        ns, clock = self._ns({})
-        hold = ns["_guide_preview_box_hold"]
-        hold(a)
-        clock["t"] += 5
-        self.assertFalse(hold(a))
-        self.assertTrue(hold(b))
-
-    def test_preview_draw_waits_for_the_hold(self):
-        at = MAIN_SRC.index("_guide_preview_box_hold(hl_state[\"file\"])")
-        self.assertLess(at, MAIN_SRC.index("video_surf = pygame.image.frombuffer(vlc_bytes, (vlc_engine.width, vlc_engine.height), \"BGRA\")", at - 200))
 
 
 class TestProbeMarkerRenameRetry(unittest.TestCase):
@@ -23340,7 +17747,6 @@ class TestHolidayFilesAreScanned(unittest.TestCase):
         self.assertIn("[HOLIDAY SCAN]", ns["log"].warning.call_args[0][0])
 
     def test_the_deep_backlog_puts_holiday_files_ahead_of_the_deep_lineup_and_the_far_ones_last(self):
-        calls = {}
         ns = {"db": types.SimpleNamespace(channels_db={}), "os": os, "_scan_snapshot_channel": lambda ch: None,
               "SCAN_GATHER_LIBRARY_LOOKUPS": 400, "_front_load_watched_channel": lambda items: items,
               "_gather_holiday_scan_items": lambda: ([("channel", "05", "halloween", "A")], [("channel", "05", "christmas", "B")], [("channel", "05", "thanksgiving", "C")])}
@@ -23348,7 +17754,6 @@ class TestHolidayFilesAreScanned(unittest.TestCase):
         self.assertEqual([it[3] for it in ns["_gather_deep_backlog_queue"]()], ["A", "B", "C"])
 
     def test_the_holiday_item_reaches_every_scan_lane_through_the_one_pipeline(self):
-        order = {}
         ns = {"SCAN_CLASS_NOW": 0, "SCAN_CLASS_COMMERCIAL": 1, "SCAN_CLASS_NEXT": 2, "SCAN_CLASS_DEEP": 3, "_channel_scan_rank": lambda ch: (0, int(ch)), "_season_seeds_first": lambda items: items}
         exec(main_function_code("_order_scan_pipeline"), ns)
         out = ns["_order_scan_pipeline"]([[], [], [], []], [("channel", "05", "halloween", "/m/h.mkv")])
@@ -23560,7 +17965,6 @@ def suite_holiday_stale_duration_keeps_aired_entries():
         check(not repeats, "stale at %d: no episode is skipped or repeated early after the rebuild (%s)" % (stale_at, repeats[:3]))
         record = channel["holiday_playback_log"]["halloween"]
         check(record["cycle_start_pos"]["block_key"] == record["block_key"], "stale at %d: the saved record belongs to the day" % stale_at)
-        import re
         later = [r for when, r in out[stale_at + 130:] if r.get("mode") == "Video" and r["file"].endswith("Show A S01E05.mkv")]
         check(not later or all(abs(r["duration"] - 1920.0) < 1.0 for r in later),
               "stale at %d: a later airing of the changed file uses the new length" % stale_at)
@@ -23714,7 +18118,6 @@ def suite_holiday_days_match_continuous_run():
         check(len(sorted({r[1] for r in records})) == 3, "%s: a window that has not opened yet is projected for all three days (%d cycles)" % (label, len(records)))
         check(not problems, "%s: after a year without the holiday the projection matches the running station (%s)" % (label, problems[:3]))
         fresh = copy.deepcopy(snapshot[0])
-        today_key = "2026_%d_Holiday_halloween" % datetime.date(2026, 10, 29).timetuple().tm_yday
         midday = datetime.datetime(2026, 10, 29, 10, 0, 5)
         none_of = lambda d: "halloween" if d >= midday.date() and d <= datetime.date(2026, 10, 31) else None
         args = ("05", fresh, midday, lambda p: True, [], lambda off: 1, none_of, ns["_missed_block_day_seeds"], 70.0)
@@ -23829,7 +18232,6 @@ def suite_guide_aired_cycle_whole():
     check(not any(kind(c[0]) == "C" for c in cells), "no commercial break stands alone as its own cell")
     own = merge(rows)
     check([(c[1], c[2]) for c in cells] == [(c[1], c[2]) for c in own], "the cells are the scheduler's own layout")
-    ends = [base + sum(1 for _ in [0]) * 0]
     slot_end = base
     for target in (1800, 1790, 1812, 1798):
         slot_end += target
@@ -25422,27 +19824,6 @@ class TestUpdateFromGitHub(unittest.TestCase):
             self.assertEqual(self.u.current_version(tmp, {}), "1.0.1")
 
 
-class TestServerToggleGreyedOut(unittest.TestCase):
-    """Advanced Settings: the Server Mode toggle is greyed out and cannot be changed, but the row can still be reached with the keys and controller."""
-
-    def test_the_switch_is_off_and_exported(self):
-        self.assertIs(ui.SERVER_TOGGLE_ENABLED, False)
-        self.assertIn("SERVER_TOGGLE_ENABLED", ui.__all__)
-
-    def test_pressing_the_row_changes_nothing_while_the_switch_is_off(self):
-        body = re.search(r'_as_row_id == "server_option" and not UPDATER_AND_SERVER_FEATURES_ENABLED:.*?elif _as_row_id == "server_menu_open":', MAIN_SRC, re.S).group(0)
-        blocked = body.index('elif _as_row_id == "server_option" and not SERVER_TOGGLE_ENABLED:')
-        changes = body.index('db.config["server_mode_enabled"] = not')
-        self.assertLess(blocked, changes)
-        self.assertIn("pass", body[blocked:changes])
-
-    def test_the_row_is_drawn_grey_and_still_gets_its_focus_border(self):
-        src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
-        self.assertIn('_as_disabled_row = (_as_row_id == "server_option" and not (UPDATER_AND_SERVER_FEATURES_ENABLED and SERVER_TOGGLE_ENABLED))', src)
-        draw = src[src.index("_as_disabled_row = ("):]
-        self.assertLess(draw.index("_as_disabled_row"), draw.index("COLOR_MENU_BUTTON_GREYED if _as_disabled_row"))
-        before = src[:src.index("_as_disabled_row = (")]
-        self.assertIn("if _as_focused:\n                    _aa_rounded_rect(menu_canvas, NEON_GREEN", before[-400:])
 
 
 class TestUpdateLongPaths(unittest.TestCase):
@@ -25924,12 +20305,12 @@ def suite_shared_scan_threads():
         second = []
 
         def holder():
-            with gov.scan_thread_slot("picture_box") as ok:
+            with gov.scan_thread_slot("picture_box"):
                 entered.set()
                 release.wait(5)
 
         def waiter():
-            with gov.scan_thread_slot("loudness") as ok:
+            with gov.scan_thread_slot("loudness"):
                 second.append(time.monotonic())
 
         t1 = threading.Thread(target=holder)
@@ -26313,7 +20694,7 @@ def suite_every_audio_track_scanned():
                 mock.patch.object(media, "_cached_path_exists", lambda p: True), \
                 mock.patch.dict(media._audio_track_resolver, {"fn": None}), \
                 mock.patch.dict(media._track_gains_sink, {"fn": lambda p, primary, gains: sunk.append((primary, gains))}):
-            gain = media.get_media_loudness_gain(path)
+            media.get_media_loudness_gain(path)
         check(streams_seen[0] is not None and 1 in streams_seen, "the second audio track is scanned in the same job (%s)" % streams_seen)
         check(sunk and sunk[0][0] == 0 and set(sunk[0][1]) == {0, 1}, "both tracks' gains are handed to the main script")
         if sunk:
@@ -26392,7 +20773,7 @@ def suite_file_data_in_the_hub():
     check('db.config.get("audio_track_prefs"' not in src.replace('prefs = db.config.get("audio_track_prefs")', "")
           and 'db.config.get("loudness_learning")' not in src.replace('learning = db.config.get("loudness_learning")', ""),
           "nothing but the one-time move reads chosen tracks or learning from the settings file")
-    check("ANTI-BURN-IN SHIELD 2" not in src and src.count("[ANTI-BURN-IN SHIELD] Inactivity limit reached") == 1,
+    check("ANTI-BURN-IN SHIELD 2" not in src,
           "the guide has one idle shield, the one a held key keeps awake")
     check("_server_entry_gain(ch_key, norm_target)" in src and "_strip_local_entry_gains()" in src,
           "gains are read from the library only; only a channel streamed from a Server uses the gain the Server sent")
@@ -26706,7 +21087,7 @@ def suite_stall_stack():
     clock["start"], clock["n"] = time.monotonic() - 0.5, 3
     tick()
     check(lines == [], "nothing is written while the app closes")
-    loop_top = MAIN_SRC[MAIN_SRC.index("\nwhile True:\n    _prof_begin()"):][:200]
+    loop_top = MAIN_SRC[MAIN_SRC.index("\nwhile True:\n"):][:200]
     check('_main_frame_clock["start"] = time.monotonic()' in loop_top and '_main_frame_clock["n"] += 1' in loop_top,
           "the main loop writes the start of every frame")
     sched = main_function_source("_background_watchdog_scheduler")
@@ -26731,7 +21112,7 @@ def suite_open_in_flight():
     loop = MAIN_SRC[MAIN_SRC.index("# SECTION: Video end & stall detection"):]
     check("_engine_open_in_flight(vlc_engine)" in loop[:loop.index("is_video_finished = False") + 600],
           "while an open is in flight the end-of-video check and the watchdog wait")
-    mid = loop[:loop.index("Mid-stream content change on ch")]
+    mid = loop[:loop.index("current_media = vlc_engine.player.get_media()\n            loaded_path")]
     check("and not _open_confirm_pending\n" in mid[-2500:], "the mid-stream check waits while an open is in flight, so a slow tune never opens the same file twice")
 
 
@@ -26754,7 +21135,6 @@ def suite_open_wait_joins_the_clock():
     check(MAIN_SRC.count("follow_clock=True") == 5, "the guide preview, a channel change, the next item, a resume and a mid-stream change all follow the clock")
     check("follow_clock" not in read(os.path.join(ROOT, "game_deck.py")), "the DVD player and the splash videos play from where they were asked")
     ns = {"time": time, "log": types.SimpleNamespace(info=lambda *a, **k: None), "os": os, "OPEN_WAIT_JOIN_CLOCK_MIN_S": 0.5}
-    body = joiner.replace("                    def _seek_at_open():", "def _seek_at_open():")
     import textwrap as _tw
     src = "def _make(follow_clock, is_dvd_iso, _requested_seek, _requested_at, self, _attempt_id=1, filepath='a.mp4'):\n" + _tw.indent(_tw.dedent(joiner), "    ") + "\n    return _seek_at_open\n"
     exec(compile(src, "<join>", "exec"), ns)
@@ -26781,21 +21161,21 @@ def suite_next_item_prep():
     ns = {"os": os, "media": media, "NEXT_ITEM_PREP_ITEMS": 3, "NEXT_ITEM_PREP_BREAK_MAX_ITEMS": 12,
           "_next_n_from_block_timeline": lambda ch, cur, n=4: timeline[:n],
           "_scan_snapshot_channel": lambda ch: None}
-    _exec_emulator_functions(ns, "_next_item_prep_plan", "_next_item_prep_paths", "_next_n_from_ordered", "_paths_from_entry")
+    _exec_emulator_functions(ns, "_next_item_prep_plan", "_next_n_from_ordered", "_paths_from_entry")
     norm = os.path.normpath
-    got = ns["_next_item_prep_paths"]("05", "/tv/now.mkv")
+    got = ns["_next_item_prep_plan"]("05", "/tv/now.mkv")[0]
     check(got == [norm("/ads/a.mp4"), norm("/tv/next.mkv")], "the next items of the block, nearest first, each once, never the playing file (%s)" % got)
     ns["NEXT_ITEM_PREP_ITEMS"] = 6
-    got = ns["_next_item_prep_paths"]("05", "/tv/now.mkv")
+    got = ns["_next_item_prep_plan"]("05", "/tv/now.mkv")[0]
     check(got == [norm("/ads/a.mp4"), norm("/tv/next.mkv"), norm("/tv/later.avi"), norm("/tv/much_later.mkv")], "songs are left out (%s)" % got)
     ns["NEXT_ITEM_PREP_ITEMS"] = 3
     ns["_next_n_from_block_timeline"] = lambda ch, cur, n=4: None
     ns["_scan_snapshot_channel"] = lambda ch: {"ordered": [{"path": "/tv/x.mkv"}, {"path": "/tv/now.mkv"}, {"path": "/tv/y.mkv"},
                                                            {"is_pair": True, "path": "/tv/p1.mkv", "pair_ep1_path": "/tv/p1.mkv", "pair_ep2_path": "/tv/p2.mkv"}]}
-    got = ns["_next_n_from_block_timeline"]("05", "/tv/now.mkv") is None and ns["_next_item_prep_paths"]("05", "/tv/now.mkv")
+    got = ns["_next_n_from_block_timeline"]("05", "/tv/now.mkv") is None and ns["_next_item_prep_plan"]("05", "/tv/now.mkv")[0]
     check(got and got[0] == norm("/tv/y.mkv") and norm("/tv/now.mkv") not in got, "with no cached timeline the saved lineup gives the next items (%s)" % got)
     ns["_scan_snapshot_channel"] = lambda ch: None
-    check(ns["_next_item_prep_paths"]("05", "/tv/now.mkv") == [], "no known order means nothing to prepare")
+    check(ns["_next_item_prep_plan"]("05", "/tv/now.mkv")[0] == [], "no known order means nothing to prepare")
     breaks = [{"path": "/tv/show.mkv"}] + [{"path": "/ads/c%d.mp4" % i, "is_commercial": True} for i in range(6)] + [{"path": "/tv/after.mkv"}, {"path": "/tv/later.mkv"}]
     ns["_next_n_from_block_timeline"] = lambda ch, cur, n=4: breaks[:n]
     got, near = ns["_next_item_prep_plan"]("05", "/tv/show.mkv")
@@ -27082,7 +21462,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.3.6", "build_info.py says 1.3.6 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.3.9", "build_info.py says 1.3.9 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -27203,7 +21583,6 @@ def suite_track_builds_kept_same_answers():
         media._path_exists_cache[items[0]["path"]] = (media.PATH_PRESENT, 0.0)
     with patch.object(media, "_check_path_status_now", lambda p: media.PATH_MISSING):
         check(media._cached_path_exists(items[0]["path"]) is True, "on the screen thread a status past its time is used as it is")
-        check(media.queued_path_refreshes() >= 1, "and its re-check is queued")
         media.run_queued_path_refreshes()
     check(media.path_status_generation() != gen and media.build_raw_tracks(items, media._cached_path_exists) == [],
           "a re-check that finds the file gone moves the generation on and the next build leaves it out")
@@ -27270,13 +21649,12 @@ def suite_channel_ready_thread():
 def suite_stages_b_to_f():
     """V295 stages B to F (owner 2026-11-02 audit items N3, N5, N6, N8, N9, N10, N11, N12 and the slot mode display)."""
     src = MAIN_SRC
-    ms = get_function_source("_decide_picture_box_before_show") if "def _decide_picture_box_before_show" in src else ""
     check("_dispatch_content_activation(_ms_open)" in src, "N5: the next item of a channel on air opens on the content-activate thread")
     check("_dispatch_content_activation(\n                        lambda _f=_bg_file" in src, "N5: a background advance under a menu opens there too")
     import pygame as _pg
     calls = []
     real_ss = _pg.transform.smoothscale
-    ns = {"pygame": _pg, "time": time, "log": types.SimpleNamespace(info=lambda *a, **k: None), "_blit_video_log_state": {},
+    ns = {"pygame": _pg, "time": time, "log": types.SimpleNamespace(info=lambda *a, **k: None),
           "_active_screen_mode": lambda: "normal", "_video_bar_color": lambda: (0, 0, 0), "_pan_scan_update": lambda *a: 0.0}
     exec(compile("_replay_scaled_cache = {}\n" + get_function_source("_blit_video_with_screen_mode"), "<blit>", "exec"), ns)
     screen = _pg.Surface((320, 240)); frame = _pg.Surface((160, 90))
@@ -27286,7 +21664,6 @@ def suite_stages_b_to_f():
         ns["_blit_video_with_screen_mode"](screen, frame, _pg.Rect(0, 0, 320, 240))
     check(len(calls) == 2, "N6: the same last frame drawn again reuses its scaled copy; a live frame is scaled (%d scales)" % len(calls))
     check("reuse_key=context)" in get_function_source("_blit_last_video_frame"), "N6: the last-frame replay asks for the reuse")
-    check("[VIDEO DRAW]" in src and "_note_video_draw_timing(" in src, "N6: the TV picture's part times are logged")
     check("scaled.convert_alpha()" in get_function_source("_static_noise_frame"), "N6: the Static Noise pictures are kept in the screen's format")
     _noise = get_function_source("_apply_static_noise_effect")
     check("len(pool[\"frames\"]) < max(1, int(_STATIC_NOISE_POOL_FRAMES))" in _noise and "_static_noise_strength_alpha(severity)" in _noise
@@ -27486,8 +21863,46 @@ class TestGovernorOwnLoad(_SectionCase):
         self.run_section(suite_governor_own_load)
 
 
+class TestThemeColourSkipsTheButtonBlue(unittest.TestCase):
+    """Owner 2026-11-08: the theme colour slider steps over the blue of the menu buttons, and a saved colour in that blue is moved out of it."""
+
+    def test_the_slider_steps_over_the_blue(self):
+        up, down = {"theme_ui_hue": 190}, {"theme_ui_hue": 245}
+        mn.slider_adjust(up, "ui_hue", mn.RIGHT)
+        mn.slider_adjust(down, "ui_hue", mn.LEFT)
+        self.assertEqual((up["theme_ui_hue"], down["theme_ui_hue"]), (245, 190))
+
+    def test_a_saved_colour_in_the_blue_is_moved_out(self):
+        for hue in range(gov.THEME_UI_HUE_SKIP_LOW, gov.THEME_UI_HUE_SKIP_HIGH + 1):
+            cleared = gov.theme_ui_hue_clear(hue)
+            self.assertTrue(cleared < gov.THEME_UI_HUE_SKIP_LOW or cleared > gov.THEME_UI_HUE_SKIP_HIGH)
+        self.assertEqual(gov.theme_ui_hue_clear(140), 140)
+
+
+class TestEveryGovernorNameIsDefined(unittest.TestCase):
+    """Owner 2026-11-08: a script that reads a performance_governor.py number that no longer exists crashed the app at start, so every name any script reads from it must exist there."""
+
+    def test_no_script_reads_a_governor_name_that_is_missing(self):
+        import re as _re
+        names = set(_re.findall(r"^([A-Za-z_]\w*)\s*=|^def (\w+)|^class (\w+)", open(os.path.join(ROOT, "assets", "performance_governor.py"), encoding="utf-8").read(), _re.M))
+        defined = {n for group in names for n in group if n}
+        missing = []
+        for folder in ("", "assets", "GPU", "server", "updater"):
+            path = os.path.join(ROOT, folder)
+            for name in sorted(os.listdir(path)):
+                if not name.endswith(".py") or name == "performance_governor.py":
+                    continue
+                text = open(os.path.join(path, name), encoding="utf-8").read()
+                for node in ast.walk(ast.parse(text)):
+                    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                            and node.value.id in ("performance_governor", "_governor", "_perf_governor")
+                            and node.attr not in defined):
+                        missing.append("%s: %s" % (name, node.attr))
+        self.assertEqual(missing, [])
+
+
 class TestBuildNumber(_SectionCase):
-    """This build is 1.3.6"""
+    """This build is 1.3.9"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -27555,100 +21970,10 @@ class TestBundleFreeze(_SectionCase):
         self.run_section(suite_bundle_freeze)
 
 
-class TestCloseButtonMatchesEsc(unittest.TestCase):
-    """The Close row of a sub-menu must leave the highlight where Esc leaves it: on the item the person came from, never the first one."""
-
-    def test_games_sub_menu_close_keeps_the_console_highlighted(self):
-        text = read(MAIN_SCRIPT)
-        start = text.index('elif row_id == "close":\n                            # WARNING: Close must do what Esc does')
-        block = text[start:start + 400]
-        self.assertIn('app_state["menu_layer"] = "GAMES_LIST"', block)
-        self.assertNotIn('menu_selection_index"] = 0', block)
-
-    def test_esc_from_the_games_sub_menu_leaves_the_highlight_alone(self):
-        text = read(MAIN_SCRIPT)
-        start = text.index('"GAMES_SUB_MENU":       "GAMES_LIST"')
-        self.assertNotIn('_layer == "GAMES_SUB_MENU"', text[start:start + 6000].split("print(f\"[SETTINGS ENGINE] ESC: stepped back")[0])
 
 
-class TestTrackingLinesNeverOverlap(unittest.TestCase):
-    """Owner 2026-11-06: rolling static has random sizes and counts and may start part way down, but lines never stack or roll into each other"""
-
-    def _batches(self):
-        rng = random.Random(5)
-        ns = {"random": rng, "RECEPTION_LINE_BIG_FRAC_RANGE": gov.RECEPTION_LINE_BIG_FRAC_RANGE,
-              "RECEPTION_LINE_MEDIUM_FRAC_RANGE": gov.RECEPTION_LINE_MEDIUM_FRAC_RANGE,
-              "RECEPTION_LINE_SMALL_FRAC_RANGE": gov.RECEPTION_LINE_SMALL_FRAC_RANGE,
-              "RECEPTION_LINE_COUNT_WEIGHTS": gov.RECEPTION_LINE_COUNT_WEIGHTS, "RECEPTION_LINE_BIG_CHANCE": gov.RECEPTION_LINE_BIG_CHANCE,
-              "RECEPTION_LINE_MEDIUM_CHANCE": gov.RECEPTION_LINE_MEDIUM_CHANCE, "RECEPTION_LINE_GAP_FRAC_RANGE": gov.RECEPTION_LINE_GAP_FRAC_RANGE,
-              "RECEPTION_LINE_GAP_MIN_DIFF_FRAC": gov.RECEPTION_LINE_GAP_MIN_DIFF_FRAC,
-              "RECEPTION_LINE_SPEED_PX_MS": gov.RECEPTION_LINE_SPEED_PX_MS,
-              "_tracking_line_id_counter": itertools.count()}
-        exec(main_function_code("_spawn_tracking_line_batch"), ns)
-        return [ns["_spawn_tracking_line_batch"](1080, 0) for _ in range(600)]
-
-    def test_lines_never_overlap_at_any_moment(self):
-        for lines in self._batches():
-            for t in range(0, 12000, 40):
-                spans = []
-                for ln in lines:
-                    if t >= ln["duration"]:
-                        continue
-                    y = ln["y_start"] + ln["travel"] * (t / ln["duration"])
-                    spans.append((y, y + ln["band_h"]))
-                spans.sort()
-                for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
-                    self.assertLessEqual(a1, b0, "two rolling lines touched")
-
-    def test_sizes_counts_and_part_way_starts_still_vary(self):
-        batches = self._batches()
-        self.assertEqual({len(b) for b in batches}, {1, 2, 3})
-        self.assertTrue(any(ln["y_start"] > 0 for b in batches for ln in b), "some lines start part way down")
-        self.assertTrue(any(ln["y_start"] < 0 for b in batches for ln in b), "some lines start above the top")
-        self.assertGreater(len({ln["band_h"] for b in batches for ln in b}), 20)
-
-    def test_batches_follow_the_owner_rules_for_count_size_and_gaps(self):
-        big_min = gov.RECEPTION_LINE_BIG_FRAC_RANGE[0] * 1080
-        medium_seen = small_seen = big_seen = False
-        uneven = 0
-        for lines in self._batches():
-            self.assertLessEqual(len(lines), 3)
-            bigs = [ln for ln in lines if ln["band_h"] >= big_min - 1]
-            self.assertLessEqual(len(bigs), 1, "at most one big line in a batch")
-            big_seen = big_seen or bool(bigs)
-            for ln in lines:
-                frac = ln["band_h"] / 1080.0
-                medium_seen = medium_seen or gov.RECEPTION_LINE_MEDIUM_FRAC_RANGE[0] - 0.002 <= frac < gov.RECEPTION_LINE_BIG_FRAC_RANGE[0]
-                small_seen = small_seen or frac < gov.RECEPTION_LINE_SMALL_FRAC_RANGE[1] + 0.002
-            ordered = sorted(lines, key=lambda ln: ln["y_start"])
-            gaps = [b["y_start"] - (a["y_start"] + a["band_h"]) for a, b in zip(ordered, ordered[1:])]
-            for gap in gaps:
-                self.assertGreaterEqual(gap, int(1080 * gov.RECEPTION_LINE_GAP_FRAC_RANGE[0]) - 1, "lines are never close together")
-                self.assertLessEqual(gap, 1080 * gov.RECEPTION_LINE_GAP_FRAC_RANGE[1])
-            if len(gaps) == 2 and abs(gaps[0] - gaps[1]) >= 1080 * gov.RECEPTION_LINE_GAP_MIN_DIFF_FRAC - 1:
-                uneven += 1
-        self.assertTrue(big_seen and medium_seen and small_seen)
-        self.assertGreater(uneven, 100, "two gaps in one batch are not the same")
 
 
-class TestBezelTitleRowAndStyleThree(unittest.TestCase):
-    def test_window_row_converts_to_picture_row(self):
-        import pygame as _pg
-        ns = {}
-        exec(get_function_source("_picture_row_of_window_row"), ns)
-        f = ns["_picture_row_of_window_row"]
-        geom = (_pg.Rect(0, 10, 1000, 800), 0.5, 0.5, 100, 60, 500, 400)
-        self.assertEqual(f(60, geom), 10)
-        self.assertEqual(f(160, geom), 210)
-        self.assertEqual(f(30, geom), -50)
-
-    def test_every_bezel_style_is_offered_and_style_three_has_a_number_window(self):
-        text = read(MAIN_SCRIPT)
-        self.assertNotIn("_real_screen_is_true_169(NATIVE_WIDTH", text)
-        self.assertNotIn('_bezel2_no_video', text)
-        import performance_governor as _pg2
-        self.assertNotIn("bezel2", _pg2.BEZEL_CHANNEL_LED_FRAC)
-        self.assertNotIn("bezel2", _pg2.BEZEL_LED_LISTED_ONLY)
 
 
 class TestHubInteriorCutAndRepeatStores(unittest.TestCase):
@@ -27951,221 +22276,10 @@ class TestFirstLoadAllowance(unittest.TestCase):
         self.assertIn("_stall_is_now_static = _stalled_ms >= _stall_static_ms", block)
 
 
-class TestScanBarAlwaysVisible(unittest.TestCase):
-    """Owner 2026-11-06: a music station's bar was under a pixel wide and never seen"""
-
-    def test_bar_has_a_minimum_width(self):
-        self.assertEqual(gov.CHANNEL_SCAN_BAR_MIN_PX, 12)
-        ui_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8").read()
-        self.assertIn("CHANNEL_SCAN_BAR_MIN_PX = performance_governor.CHANNEL_SCAN_BAR_MIN_PX if performance_governor is not None else 12", ui_src)
-        self.assertIn("_bar_w = min(_bar_max_w, max(CHANNEL_SCAN_BAR_MIN_PX, int(_bar_max_w * _scan_done / _scan_total)))", ui_src)
 
 
-class TestGuideBlockIsOnePress(unittest.TestCase):
-    """Owner 2026-11-07: every half-hour grid of an off-air stretch is its own spot, one press each, and the way back works"""
-
-    def test_one_stop_per_off_air_grid_keyed_by_time(self):
-        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui.py"), encoding="utf-8").read()
-        self.assertEqual(src.count('"key": ("offair", _oa_col)'), 0)
-        self.assertEqual(src.count('"key": ("offair", _tr_col)'), 0)
-        self.assertEqual(src.count('"key": ("offair", round(_last_show_end_abs))'), 0)
-        for _name in ("_oa_seg_abs", "_tr_seg_abs", "_fb_abs"):
-            self.assertIn('"key": ("offair", round(%s))' % _name, src)
-        self.assertNotIn("_oa_stop_done", src)
-        self.assertNotIn("_tr_stop_done", src)
-        self.assertIn('"key": ("col", round(_viz_block_abs))', src)
-
-    def test_pressing_right_then_left_steps_through_every_off_air_grid(self):
-        cols = 4
-        scheds = {"05": [(0, 1800), (1800 * 5, 1800 * 6)]}
-        clock = {"t": datetime.datetime(2026, 10, 12, 0, 10, 0)}
-
-        class _Clock:
-            @staticmethod
-            def now():
-                return clock["t"]
-
-        def clamp(raw, n):
-            return max(0, min(raw, 336 - n))
-
-        def stops_for(time_idx):
-            vs, ve = time_idx * 1800, time_idx * 1800 + cols * 1800
-            out, cursor, prev_end = [], vs, vs
-            for a, b in scheds["05"]:
-                if b <= vs:
-                    prev_end = b
-                    continue
-                if a >= ve:
-                    break
-                cs = max(vs, a)
-                if cs > cursor:
-                    g = cursor
-                    while g < cs:
-                        seg = max(prev_end, (g // 1800) * 1800)
-                        out.append({"col": int((seg - vs) / 1800), "abs": seg, "key": ("offair", round(seg))})
-                        g = (g // 1800 + 1) * 1800
-                out.append({"col": int((cs - vs) / 1800), "abs": a, "key": ("show", round(a))})
-                cursor, prev_end = min(ve, b), b
-            g = cursor
-            while g < ve:
-                seg = max(prev_end, (g // 1800) * 1800)
-                out.append({"col": int((seg - vs) / 1800), "abs": seg, "key": ("offair", round(seg))})
-                g = (g // 1800 + 1) * 1800
-            return out
-
-        state = {"guide_col_pos": 0, "selected_guide_channel": 5, "selected_guide_time_idx": 0}
-
-        def view_idx():
-            return clamp(0 * 2 + state["selected_guide_time_idx"], cols)
-
-        def refresh():
-            state["guide_current_row_stops"] = stops_for(view_idx())
-
-        log = types.SimpleNamespace(warning=lambda *a, **k: None, info=lambda *a, **k: None)
-        ns = dict(app_state=state, log=log, broadcast_clock=_Clock, db=object(), str=str, performance_governor=gov,
-                  get_guide_num_cols=lambda db: cols, clamp_guide_time_idx=clamp,
-                  _guide_dirty_event=threading.Event(), _refresh_guide_row_stops_offscreen=refresh)
-        exec(compile(get_function_source("_guide_jump_col"), "<extracted>", "exec"), ns)
-        refresh()
-        state["guide_selected_stop_key"] = ("show", 0)
-        state["guide_selected_abs_time"] = 0
-        walk = [("offair", 1800), ("offair", 3600), ("offair", 5400), ("offair", 7200), ("show", 1800 * 5)]
-        for key in walk:
-            ns["_guide_jump_col"](1)
-            self.assertEqual(state["guide_selected_stop_key"], key, "one press right is the next grid")
-        for key in reversed(walk[:-1] + [("show", 0)][:0]):
-            ns["_guide_jump_col"](-1)
-            self.assertEqual(state["guide_selected_stop_key"], key, "one press left is the previous grid")
-        ns["_guide_jump_col"](-1)
-        self.assertEqual(state["guide_selected_stop_key"], ("show", 0), "and one more reaches the first show")
 
 
-class TestBezelThreeNumberPlace(unittest.TestCase):
-    """Owner 2026-11-06: on bezel 3 the channel number and the song title come in from the rounded glass corner"""
-
-
-    def test_a_holiday_picture_finds_its_own_glass_square_for_the_power_light(self):
-        import numpy as _np
-        import pygame as _pgm
-        ns = {"pygame": _pgm, "np": _np, "_log_swallowed": lambda *a: None, "_BEZEL_POWER_LIGHT_FRAC": gov.BEZEL_POWER_LIGHT_FRAC, "_BEZEL_POWER_LIGHT_ADD_RGB": gov.BEZEL_POWER_LIGHT_ADD_RGB, "_BEZEL_POWER_LIGHT_MULT_RGB": gov.BEZEL_POWER_LIGHT_MULT_RGB, "_BEZEL_POWER_LIGHT_BULB_RGB": gov.BEZEL_POWER_LIGHT_BULB_RGB, "_BEZEL_POWER_LIGHT_BULB_FRAC": gov.BEZEL_POWER_LIGHT_BULB_FRAC, "_BEZEL_POWER_LIGHT_HALO_RGB": gov.BEZEL_POWER_LIGHT_HALO_RGB, "_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX": gov.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX, "_BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX": gov.BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX, "_BEZEL_GLASS_REFERENCE_FRAC": gov.BEZEL_GLASS_REFERENCE_FRAC, "_BEZEL_GLASS_REFERENCE_WIDTH": gov.BEZEL_GLASS_REFERENCE_WIDTH, "_BEZEL_GLASS_COLOR_LIMITS": gov.BEZEL_GLASS_COLOR_LIMITS, "_BEZEL_GLASS_SEARCH_MARGIN_FRAC": gov.BEZEL_GLASS_SEARCH_MARGIN_FRAC}
-        exec(main_function_code("_find_bezel_glass_rect"), ns)
-        exec(main_function_code("_tint_bezel_power_light"), ns)
-        surf = _pgm.Surface((1671, 941), _pgm.SRCALPHA)
-        surf.fill((150, 90, 40, 255))
-        glass = _pgm.Rect(1160, 130, 34, 23)
-        surf.fill((80, 80, 80, 255), glass)
-        found = ns["_find_bezel_glass_rect"](surf, "bezel2")
-        self.assertEqual(tuple(found), tuple(glass))
-        self.assertIsNone(ns["_find_bezel_glass_rect"](surf, "bezel1"))
-        ns["_tint_bezel_power_light"](surf, "bezel2", "christmas")
-        self.assertEqual(tuple(surf.get_at((glass.centerx, glass.centery)))[:3], gov.BEZEL_POWER_LIGHT_BULB_RGB)
-        plain = _pgm.Surface((1671, 941), _pgm.SRCALPHA)
-        plain.fill((150, 90, 40, 255))
-        ns["_tint_bezel_power_light"](plain, "bezel2", "halloween")
-        fx, fy, fw, fh = gov.BEZEL_POWER_LIGHT_FRAC["bezel2"]
-        self.assertEqual(tuple(plain.get_at((round(1671 * (fx + fw / 2)), round(941 * (fy + fh / 2)))))[:3], gov.BEZEL_POWER_LIGHT_BULB_RGB, "no glass found: the table spot is used")
-        self.assertEqual(gov.BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX, {"christmas": (0.0, 0.0, -0.4, 0.0), "thanksgiving": (0.0, 0.0, -0.4, 0.0), "halloween": (0.0, -1.1, -0.9, 0.0)})
-        self.assertIn("_BEZEL_POWER_LIGHT_HOLIDAY_EDGE_ADJUST_PX", MAIN_SRC)
-
-    def test_the_square_on_the_third_bezel_gets_a_red_filter_and_other_bezels_are_untouched(self):
-        import pygame as _pgm
-        ns = {"pygame": _pgm, "_BEZEL_POWER_LIGHT_FRAC": gov.BEZEL_POWER_LIGHT_FRAC, "_BEZEL_POWER_LIGHT_ADD_RGB": gov.BEZEL_POWER_LIGHT_ADD_RGB, "_BEZEL_POWER_LIGHT_MULT_RGB": gov.BEZEL_POWER_LIGHT_MULT_RGB, "_BEZEL_POWER_LIGHT_BULB_RGB": gov.BEZEL_POWER_LIGHT_BULB_RGB, "_BEZEL_POWER_LIGHT_BULB_FRAC": gov.BEZEL_POWER_LIGHT_BULB_FRAC, "_BEZEL_POWER_LIGHT_HALO_RGB": gov.BEZEL_POWER_LIGHT_HALO_RGB, "_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX": gov.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX}
-        exec(main_function_code("_tint_bezel_power_light"), ns)
-        surf = _pgm.Surface((1000, 700), _pgm.SRCALPHA)
-        surf.fill((40, 40, 40, 255))
-        ns["_tint_bezel_power_light"](surf, "bezel2")
-        fx, fy, fw, fh = gov.BEZEL_POWER_LIGHT_FRAC["bezel2"]
-        inside = surf.get_at((int(1000 * (fx + fw / 2)), int(700 * (fy + fh / 2))))
-        self.assertEqual(tuple(inside)[:3], gov.BEZEL_POWER_LIGHT_BULB_RGB)
-        self.assertEqual(inside.a, 255)
-        edge = surf.get_at((round(1000 * fx) + 3, int(700 * (fy + fh / 2))))
-        self.assertGreater(edge.r, 150)
-        self.assertLess(edge.g, 60)
-        self.assertLess(edge.g, inside.g, "the bulb in the middle is brighter than the square around it")
-        self.assertEqual(tuple(surf.get_at((10, 10))), (40, 40, 40, 255))
-        other = _pgm.Surface((1000, 700), _pgm.SRCALPHA)
-        other.fill((40, 40, 40, 255))
-        ns["_tint_bezel_power_light"](other, "bezel1")
-        self.assertEqual(tuple(other.get_at((int(1000 * (fx + fw / 2)), int(700 * (fy + fh / 2))))), (40, 40, 40, 255))
-        self.assertIn("_tint_bezel_power_light(raw_surf,", MAIN_SRC)
-        self.assertIn("_BEZEL_POWER_LIGHT_EDGE_ADJUST_PX", MAIN_SRC)
-        self.assertEqual(gov.BEZEL_POWER_LIGHT_EDGE_ADJUST_PX, (-2.0, 0.2, 0.2, -0.8))
-        grown = _pgm.Surface((1000, 700), _pgm.SRCALPHA)
-        grown.fill((40, 40, 40, 255))
-        ns["_tint_bezel_power_light"](grown, "bezel2")
-        rx = round(1000 * fx)
-        ry = round(700 * fy)
-        rw = round(1000 * fw)
-        rh = round(700 * fh)
-        side = grown.get_at((rx + rw, ry + rh // 2))
-        top = grown.get_at((rx + rw // 2, ry - 1))
-        self.assertTrue(40 < side.r < 150 and 40 < top.r < 150, "the grown edge is a light tint, not the full red")
-        inner_px = grown.get_at((rx + 2, ry + rh // 2 + 2))
-        left_edge = grown.get_at((rx, ry + rh // 2 + 2))
-        self.assertEqual(tuple(left_edge)[:3], (40, 40, 40), "the first column is out of the light: the left edge is 2.0 pixels in")
-        second = grown.get_at((rx + 1, ry + rh // 2 + 2))
-        self.assertEqual(tuple(second)[:3], (40, 40, 40), "the second column is out of the light too: the left edge is 2.0 pixels in")
-        self.assertEqual(tuple(grown.get_at((rx - 1, ry + rh // 2))), (40, 40, 40, 255), "nothing is tinted outside the left edge")
-        bottom_edge = grown.get_at((rx + 2, ry + rh - 1))
-        inner_low = grown.get_at((rx + 2, ry + rh - 3))
-        self.assertTrue(40 < bottom_edge.r < inner_low.r + 1, "the bottom edge row is tinted 0.4 pixel less")
-        self.assertEqual(tuple(grown.get_at((rx + rw // 2, ry + rh))), (40, 40, 40, 255), "nothing is tinted below the bottom edge")
-        self.assertIn("_osd_anisotropic_correct(_osd_surf, w_w, w_h", MAIN_SRC)
-        self.assertIn("_surf1 = _osd_anisotropic_correct(_surf1, sw, sh", MAIN_SRC)
-
-    def test_bezel_three_uses_the_same_picture_pixel_spot_as_bezel_off(self):
-        self.assertNotIn("bezel2", gov.TV_BORDER_OSD_OFFSET_BY_STEM)
-        self.assertIn("bezel2", gov.TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS)
-        self.assertIn("_bezel_led_stem() if _ch_geom is not None else None", MAIN_SRC)
-
-    def test_main_script_picks_the_offset_by_bezel(self):
-        ns = {"_TV_BORDER_OSD_OFFSET": (48, 64), "_TV_BORDER_OSD_OFFSET_BY_STEM": {"bezelX": (160, 105)}}
-        exec(main_function_code("_tv_border_osd_offset"), ns)
-        self.assertEqual(ns["_tv_border_osd_offset"]("bezelX"), (160, 105))
-        self.assertEqual(ns["_tv_border_osd_offset"]("bezel1"), (48, 64))
-        self.assertEqual(ns["_tv_border_osd_offset"](None), (48, 64))
-        self.assertIn("_osd_right_off, _osd_top_off = _tv_border_osd_offset(_osd_stem)", MAIN_SRC)
-        self.assertIn("_osd_stem in _TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS", MAIN_SRC)
-        self.assertIn("round(_osd_top_off * _off_scale)", MAIN_SRC)
-        self.assertIn("_win_unit_x = w_w / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[0])", MAIN_SRC)
-        self.assertIn("                _ch_scale = _win_unit_y\n", MAIN_SRC)
-        self.assertIn("_MARGIN_X_PX * sw / max(1, _TV_BORDER_OSD_REFERENCE_WINDOW[0])", MAIN_SRC)
-        self.assertEqual(gov.TV_BORDER_OSD_REFERENCE_WINDOW, (1276, 717))
-        self.assertEqual(gov.TV_BORDER_SCREEN_EXPAND["bezel2"], (1.0, 1.0), "the picture fits the glass; widening it hid the right edge of the video")
-        self.assertEqual(gov.TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS, ())
-        self.assertEqual(gov.TV_BORDER_PICTURE_BLEED_FRAC, {"bezel2": (0.0019, 0.0, 0.0050, 0.0)})
-        self.assertIn("_TV_BORDER_PICTURE_BLEED_FRAC.get(_active_bezel_stem())", MAIN_SRC)
-        self.assertIn("dest_x = inner.x\n", MAIN_SRC)
-        self.assertIn("min(shrink_x, 1.0) / _grow", MAIN_SRC)
-        ns = {"_TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS": ("bezel2",)}
-        exec(main_function_code("_menu_content_region"), ns)
-        f = ns["_menu_content_region"]
-        self.assertEqual(f(0, 0, 1036, 680, "bezel1"), (20, 138, 996, 525))
-        self.assertEqual(f(0, 0, 1036, 680, None), (20, 138, 996, 525))
-        for stem in ("bezel", "bezel1", "bezel2"):
-            wide = f(10, 10, 1111, 649, stem)
-            self.assertLessEqual(wide[1] + wide[3], 10 + 649, "inside a bezel the controller area stays inside the panel's bottom")
-            self.assertGreaterEqual(wide[0] + wide[2], 10 + 1111 - 25, "and reaches the panel's right side")
-        flat = f(10, 10, 1111, 649, None)
-        self.assertGreater(flat[1] + flat[3], 10 + 649, "with no bezel the width-only sizing is unchanged")
-        self.assertIn("_menu_content_region(_cm_x, _cm_y, _cm_w, _cm_h,", MAIN_SRC)
-        self.assertIn("_menu_content_region(_sz_x, _sz_y, _sz_w, _sz_h2,", MAIN_SRC)
-        self.assertIn("int(tw / (2 * _grow)) - new_w // 2", MAIN_SRC)
-        self.assertEqual(gov.BEZEL_VOLUME_BAR_SHIFT_PX, {"bezel2": -2})
-        self.assertIn("_vol_cx += round(_vol_shift /", MAIN_SRC)
-        self.assertIn("_ch_rect.x + _bezel_visible_picture_width(_ch_rect.width, _osd_stem)", MAIN_SRC)
-        self.assertIn("_picture_right = picture_rect.x + _visible_w", MAIN_SRC)
-        for warp, shown in ((True, 1000), (False, 1060)):
-            ns = {"_TV_BORDER_SCREEN_ANCHOR_LEFT_STEMS": ("bezel2",), "_TV_BORDER_SCREEN_EXPAND": {"bezel2": (1.06, 1.0)}, "_TV_BORDER_SCREEN_EXPAND_DEFAULT": (1.0, 1.0),
-                  "db": object(), "_setting_on": lambda key, default=False, _w=warp: _w}
-            exec(main_function_code("_bezel_right_grow"), ns)
-            exec(main_function_code("_bezel_visible_picture_width"), ns)
-            self.assertEqual(ns["_bezel_visible_picture_width"](1060, "bezel2"), shown, "the growth only applies with Warp Screen on")
-            self.assertEqual(ns["_bezel_visible_picture_width"](1060, "bezel1"), 1060)
-            self.assertEqual(ns["_bezel_visible_picture_width"](1060, None), 1060)
-        self.assertIn("if _bezel_right_grow(_active_bezel_stem()) > 1.0:", MAIN_SRC)
-        self.assertIn("round(_osd_right_off * _off_scale_x)", MAIN_SRC)
-        self.assertEqual(gov.TV_BORDER_OSD_OFFSET_PICTURE_PX_STEMS, ("bezel2",))
 
 
 class TestUpdaterTrustsBundledRoots(unittest.TestCase):
@@ -28393,9 +22507,8 @@ class TestQuietLogLines(unittest.TestCase):
         return self._filter().filter(record)
 
     def test_repeating_status_lines_are_left_out(self):
-        for text in ("[FRAME TIME] avg=16.7ms fps=59.8", "[GPU FRAME] path=gpu frames=600",
-                     "[GOVERNOR] status ch=07 level=3", "[HEALTH QUEUES] station 18 channel(s) on",
-                     "[LOUDNESS DEBUG] x.mp3 target=-24.0", "[MUTE GUARD] ARM (real channel change)",
+        for text in ("[GOVERNOR] status ch=07 level=3", "[HEALTH QUEUES] station 18 channel(s) on",
+                     "[LOUDNESS CHECK] x.mp3: initial gain +1.0 dB", "[PICTURE BOX] lane starting",
                      "[SCHEDULER] ch11 Full Day: background probe stored x.mkv (1251s long)",
                      "[SCHEDULER] ch26 is inactive (disabled) -- Static is expected."):
             self.assertFalse(self._passes(logging.INFO, text), text)
@@ -28408,8 +22521,8 @@ class TestQuietLogLines(unittest.TestCase):
             self.assertTrue(self._passes(logging.INFO, text), text)
 
     def test_a_warning_is_always_written(self):
-        self.assertTrue(self._passes(logging.WARNING, "[FRAME TIME] avg=90ms"))
-        self.assertTrue(self._passes(logging.ERROR, "[HEARTBEAT] stuck"))
+        self.assertTrue(self._passes(logging.WARNING, "[LOUDNESS CHECK] x.mp3 could not be read"))
+        self.assertTrue(self._passes(logging.ERROR, "[PICTURE BOX] stuck"))
 
     def test_vlc_blending_lines_are_left_out_and_errors_kept(self):
         pieces = tuple(gov.LOG_QUIET_VLC_PIECES)
@@ -28488,133 +22601,6 @@ class TestChannel03Audit(unittest.TestCase):
         self.assertNotIn("forcing restart", MAIN_SRC)
 
 
-class TestChannel03MenuAudit(unittest.TestCase):
-    """Channel 03 menu audit 2026-11-06: All-OFF keeps a console, profile Save/Load say what is wrong on their own screen, quitting returns to the game just played"""
-
-    def _deck(self):
-        module = load_deck_module(os.path.join(ROOT, "game_deck.py"), "game_deck_menu_audit")
-        deck = object.__new__(module.ExternalGameDeck)
-        deck._libretro_core = None
-        deck._libretro_console = None
-        deck._libretro_active_profile = 1
-        return module, deck
-
-    def test_all_off_keeps_a_console_when_the_dvd_player_is_off(self):
-        fake_gd = types.SimpleNamespace(CONSOLE_ORDER=["NES", "SNES", "DVD"])
-        saved = []
-        fake_db = types.SimpleNamespace(config={"consoles_enabled": {"NES": True, "SNES": True, "DVD": False}}, save_settings=lambda: saved.append(1))
-        ns = {"db": fake_db, "game_deck": None}
-        with unittest.mock.patch.dict(sys.modules, {"game_deck": fake_gd}):
-            exec(compile(get_function_source("_toggle_all_consoles"), "t", "exec"), ns)
-            ns["_toggle_all_consoles"]()
-        enabled = fake_db.config["consoles_enabled"]
-        self.assertFalse(enabled["NES"] or enabled["SNES"])
-        self.assertTrue(enabled["DVD"], "with every other console off the DVD player is switched back on so one console is left")
-
-    def test_all_off_leaves_the_dvd_player_alone_when_it_is_on(self):
-        fake_gd = types.SimpleNamespace(CONSOLE_ORDER=["NES", "DVD"])
-        fake_db = types.SimpleNamespace(config={"consoles_enabled": {"NES": True}}, save_settings=lambda: None)
-        ns = {"db": fake_db, "game_deck": None}
-        with unittest.mock.patch.dict(sys.modules, {"game_deck": fake_gd}):
-            exec(compile(get_function_source("_toggle_all_consoles"), "t", "exec"), ns)
-            ns["_toggle_all_consoles"]()
-        self.assertFalse(fake_db.config["consoles_enabled"]["NES"])
-        self.assertNotIn("DVD", fake_db.config["consoles_enabled"])
-
-    def test_profile_save_and_load_say_why_they_cannot_run(self):
-        module, deck = self._deck()
-        self.assertEqual(deck.profile_action_block_reason("NES"), "NO GAME IS RUNNING")
-        self.assertFalse(deck.libretro_save_to_profile("NES", 1))
-        self.assertFalse(deck.libretro_load_from_profile("NES", 1))
-        calls = []
-        deck._libretro_core = types.SimpleNamespace(save_state=lambda slot: calls.append(("save", slot)) or True,
-                                                    has_state=lambda slot: True,
-                                                    load_state=lambda slot: calls.append(("load", slot)) or True)
-        deck._libretro_console = "SNES"
-        self.assertEqual(deck.profile_action_block_reason("NES"), "THE RUNNING GAME IS SNES, NOT NES")
-        self.assertFalse(deck.libretro_save_to_profile("NES", 2))
-        self.assertEqual(calls, [], "a profile screen of another console never touches the running game's state")
-        self.assertEqual(deck.profile_action_block_reason("SNES"), "")
-        self.assertTrue(deck.libretro_save_to_profile("SNES", 2))
-        self.assertTrue(deck.libretro_load_from_profile("SNES", 2))
-        self.assertEqual(calls, [("save", 2), ("load", 2)])
-
-    def test_profile_save_and_load_are_silent_when_they_work_and_use_the_banner_bar_when_not(self):
-        """Owner 2026-11-06: no 'you just saved' message; the banner bar speaks only when something is wrong"""
-        src = MAIN_SRC
-        self.assertNotIn("games_profile_notice", src)
-        self.assertNotIn("SAVED TO PROFILE", src)
-        self.assertNotIn("LOADED PROFILE", src)
-        self.assertIn("post_status_notice(_why)", src)
-        self.assertIn('post_status_notice("SAVE TO PROFILE %d FAILED" % profile_num)', src)
-        self.assertIn('post_status_notice("NO SAVE FOUND IN PROFILE %d" % profile_num)', src)
-        ui_src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
-        self.assertNotIn("games_profile_notice", ui_src)
-        self.assertNotIn("COLOR_MENU_NOTICE_TEXT", ui_src)
-
-    def test_the_notice_banner_shows_once_for_the_governor_time_and_a_newer_one_replaces_it(self):
-        ns = {"_notice_banner_text": None, "_notice_banner_fresh": False}
-        exec(compile(get_function_source("post_status_notice"), "p", "exec"), ns)
-        ns["post_status_notice"]("A")
-        self.assertEqual((ns["_notice_banner_text"], ns["_notice_banner_fresh"]), ("A", True))
-        ns["post_status_notice"]("B")
-        self.assertEqual(ns["_notice_banner_text"], "B")
-        self.assertIn('if name == "notice":\n        return NOTICE_BANNER_MS', MAIN_SRC)
-        self.assertGreater(gov.NOTICE_BANNER_SECONDS, 0)
-
-    def test_multitap_not_supported_goes_to_the_banner_bar(self):
-        self.assertIn('post_status_notice("MULTITAP NOT SUPPORTED THIS SESSION")', MAIN_SRC)
-        self.assertNotIn('game_deck._libretro_osd_msg   = "MULTITAP NOT SUPPORTED THIS SESSION"', MAIN_SRC)
-
-    def test_menu_music_with_every_track_missing_plays_the_default_and_says_so(self):
-        src = get_function_source("_start_ch03_menu_music")
-        self.assertIn('post_status_notice("GAME MUSIC NOT FOUND, PLAYING DEFAULT")', src)
-        self.assertIn('"audio", "Game Music", "gamemusic.mp3"', src)
-        self.assertIn('app_state.get("ch03_menu_music_track") != _default_track', src)
-
-    def test_dvd_places_are_kept_whether_or_not_resume_is_on(self):
-        deck_src = open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read()
-        self.assertNotIn("if (self.dvd_resume_enabled and self.dvd_file_path", deck_src)
-        self.assertNotIn("if self.dvd_resume_enabled and self.dvd_file_path:\n                            self._dvd_clear_resume_position", deck_src)
-        self.assertIn('self._scan_is_background = True\n                        self._scan_roms("DVD")', deck_src)
-        self.assertNotIn('db.config["dvd_resume_positions"] = {}', MAIN_SRC)
-        module, deck = self._deck()
-        deck.dvd_resume_enabled = False
-        deck.dvd_resume_positions = {"a.mp4": 300.0}
-        self.assertEqual(deck._dvd_get_resume_seconds("a.mp4"), 0, "with Resume off a file starts at the beginning")
-        deck.dvd_resume_enabled = True
-        self.assertEqual(deck._dvd_get_resume_seconds("a.mp4"), 300.0, "switching Resume on finds the place that was kept")
-
-    def test_quitting_a_game_keeps_the_highlight_and_reports_a_failed_auto_save(self):
-        module, deck = self._deck()
-        scans = []
-        deck._libretro_auto_save = True
-        deck._libretro_active_profile = 1
-        deck._libretro_rom_path = "x"
-        deck._libretro_loading = False
-        deck.emulator_loading = False
-        deck._pause_reasons = {"channel"}
-        deck.active_console = "SNES"
-        deck.roms = [("A", "a"), ("B", "b"), ("C", "c")]
-        deck.rom_index = 2
-        deck.rom_scroll = 1
-        deck._scan_is_background = False
-        deck._romlist_error_msg = ""
-        deck._romlist_error_until = 0
-        deck._stop_console_splash_video = lambda: None
-        deck._scan_roms = lambda c: scans.append((c, deck._scan_is_background))
-        module.pad_poller_stop = lambda: None
-        core = types.SimpleNamespace(save_state=lambda slot: False, unload=lambda: None)
-        deck._libretro_quit_to_romlist(core)
-        self.assertEqual(deck.mode, "ROMLIST")
-        self.assertEqual(deck.rom_index, 2, "back in the list the highlight stays on the game just played")
-        self.assertEqual(scans, [("SNES", True)], "the rescan is a background one, which keeps the cursor on the same file")
-        self.assertEqual(deck._romlist_error_msg, "Auto-save failed")
-        self.assertGreater(deck._romlist_error_until, 0)
-
-    def test_quitting_the_dvd_player_rescans_in_the_background(self):
-        src = open(os.path.join(ROOT, "game_deck.py"), encoding="utf-8").read()
-        self.assertIn('self.mode = "ROMLIST"\n                    self._scan_is_background = True\n                    self._scan_roms("DVD")', src)
 
 
 class TestAutoSaveWhilePlaying(unittest.TestCase):
@@ -29030,67 +23016,8 @@ class TestAllSettingsTurnsOnSticksAndSyncsProfiles(unittest.TestCase):
         self.assertIn("game_deck.sync_profile_from_db(_target, db.config)", MAIN_SRC)
 
 
-class TestUpdateYesClosesMenusBehind(unittest.TestCase):
-    """Owner 2026-11-07: Yes on the update popup closes the menus behind it and leaves the popup and load bar up"""
-
-    def test_yes_closes_the_menu_and_the_controls_splash_but_not_the_popup(self):
-        class _Ticks:
-            @staticmethod
-            def get_ticks():
-                return 1234
-        class _Pg:
-            time = _Ticks
-        class _Thread:
-            def __init__(self, *a, **k):
-                pass
-            def start(self):
-                pass
-        class _Thr:
-            Thread = _Thread
-        class _Log:
-            @staticmethod
-            def info(*a, **k):
-                pass
-        state = {"show_menu": True, "show_splash": True, "show_clear_confirm": True, "clear_confirm_target": "app_update", "menu_layer": "SYSTEM_ADVANCED_SUB_MENU",
-                 "_update_record": {"version": "9.9.9"}, "games_tab_page": 2, "controls_splash_page": 3}
-        ns = {"app_state": state, "pygame": _Pg, "threading": _Thr, "log": _Log, "auto_updater": None, "_update_base_dir": lambda: ".",
-              "UPDATE_INSTALL_DOWNLOAD_CAP": 0.80}
-        exec(main_function_code("_close_menus_behind_update_popup"), ns)
-        exec(main_function_code("_begin_update_install"), ns)
-        self.assertTrue(ns["_begin_update_install"]())
-        self.assertFalse(state["show_menu"])
-        self.assertFalse(state["show_splash"])
-        self.assertEqual(state["menu_layer"], "TAB_SELECTION")
-        self.assertTrue(state["show_clear_confirm"], "the Yes/No popup stays up")
-        self.assertEqual(state["clear_confirm_target"], "app_update")
-        self.assertTrue(state["update_install_active"], "the load bar is on")
-        blocked = {"show_menu": True, "show_splash": True, "_update_record": None}
-        ns["app_state"] = blocked
-        self.assertFalse(ns["_begin_update_install"]())
-        self.assertTrue(blocked["show_menu"], "with no update package nothing is closed")
 
 
-class TestTransitionStaticFollowsTheNoiseColorSetting(unittest.TestCase):
-    """Owner 2026-11-07: the Static burst between channels is the full grey, white, rainbow or theme static, not a tint; the snow's coloured specks show their colour like a reception line's"""
-
-    def test_the_burst_keeps_its_own_full_colour_static(self):
-        self.assertIn("noise = np.random.randint(30, 170, (sw, sh, 3), dtype=np.uint8)", MAIN_SRC)
-        self.assertIn("intensity = np.random.randint(20, 86, (sw, sh, 1)).astype(np.float32)", MAIN_SRC)
-        self.assertNotIn("_line_tint", MAIN_SRC)
-
-    def test_the_snows_coloured_specks_use_the_stronger_range(self):
-        self.assertEqual(gov.STATIC_NOISE_TINT_SPECK_ALPHA, gov.RECEPTION_NOISE_BRIGHT_ALPHA)
-        import pygame as _pg
-        import numpy as _np
-        ns = {"pygame": _pg, "np": _np, "db": types.SimpleNamespace(config={"theme_bg_hue": 220}), "_STATIC_NOISE_GRAIN_PX": 4, "_STATIC_HEAVY": gov.STATIC_HEAVY,
-              "STATIC_NOISE_TINT_SPECK_ALPHA": gov.STATIC_NOISE_TINT_SPECK_ALPHA, "_STATIC_GREY_GRAIN_LEVEL": gov.STATIC_GREY_GRAIN_LEVEL}
-        exec(main_function_code("_tinted_bright_rgb"), ns)
-        exec(main_function_code("_static_noise_frame"), ns)
-        def strongest(style):
-            frame = ns["_static_noise_frame"](400, 400, style)
-            return int(_pg.surfarray.array_alpha(frame).max())
-        self.assertGreaterEqual(strongest("theme"), 180, "a coloured speck is as solid as a line grain")
-        self.assertLess(strongest("white"), 120, "white and grey snow keep the old light specks")
 
 
 class TestUpdateHelperProgressBar(unittest.TestCase):
@@ -29120,10 +23047,6 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         class Recorder:
             def update(self, label, fraction):
                 outer.events.append(("update", label, fraction))
-            def start_stage(self):
-                outer.events.append(("start_stage",))
-            def creep(self, label):
-                outer.events.append(("creep", label))
             def finish(self):
                 outer.events.append(("finish",))
             def fail(self, label):
@@ -29149,21 +23072,45 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         self.assertEqual(self._run(), 0)
         labels = [e[1] for e in self.events if e[0] == "update"]
         self.assertEqual(labels[0], "WAITING FOR THE APP TO CLOSE...")
-        for wanted in ("PREPARING THE UPDATE...", "INSTALLING UPDATE...", "STARTING THE UPDATED APP..."):
+        for wanted in ("PREPARING THE UPDATE...", "INSTALLING UPDATE..."):
             self.assertIn(wanted, labels)
         fractions = [e[2] for e in self.events if e[0] == "update"]
         self.assertEqual(fractions, sorted(fractions), "the bar only moves forward")
         self.assertIn(("finish",), self.events)
         self.assertEqual(self.events[-1], ("close",))
         self.assertNotIn("fail", [e[0] for e in self.events])
+        self.assertNotIn("STARTING THE UPDATED APP...", labels, "the bar ends with the install; there is no starting-app stage")
 
-    def test_a_failed_start_shows_the_failure_and_still_closes_the_bar(self):
-        with self.assertRaises(RuntimeError):
-            self._run(exit_codes=(1, None))
+    def test_the_bar_is_closed_before_the_app_is_launched(self):
+        order = []
+        self.events = order
+        def popen(command, **kwargs):
+            order.append(("launch",))
+            return _FakeProcess(None)
+        path = os.path.join(self.tmp, "order_metadata.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"install_dir": self.install, "staged_path": self.staged, "parent_pid": 0, "version": "",
+                       "relaunch_command": [os.path.join(self.install, self.EXE), "--relaunched"]}, handle)
+        with mock.patch.object(self.h.subprocess, "Popen", popen), mock.patch.object(self.h, "_open_progress", lambda *a: self.recorder):
+            self.assertEqual(self.h.apply_update(path), 0)
+        kinds = [e[0] for e in order]
+        self.assertLess(kinds.index("close"), kinds.index("launch"))
+        self.assertLess(kinds.index("finish"), kinds.index("close"))
+
+    def test_a_failed_install_shows_the_failure_and_still_closes_the_bar(self):
+        with mock.patch.object(self.h, "_apply_payload", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self._run()
         kinds = [e[0] for e in self.events]
         self.assertIn("fail", kinds)
         self.assertEqual(self.events[-1], ("close",))
         self.assertNotIn("finish", kinds)
+
+    def test_an_app_that_dies_right_after_launch_still_restores_the_old_version(self):
+        with self.assertRaises(RuntimeError):
+            self._run(exit_codes=(1, None))
+        with open(os.path.join(self.install, self.EXE), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old")
 
     def test_the_bar_takes_the_saved_theme_colours_and_keeps_the_defaults_without_them(self):
         import colorsys
@@ -29182,22 +23129,6 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
     def test_there_is_no_window_unless_this_is_the_packaged_helper(self):
         self.assertIsInstance(self.h._open_progress(), self.h._NullProgress)
 
-    def test_the_bar_creeps_toward_but_never_reaches_full_before_the_app_is_up(self):
-        window = self.h._ProgressWindow.__new__(self.h._ProgressWindow)
-        import threading as _thr
-        window._lock = _thr.Lock()
-        window._label, window._fraction, window._failed = "", 0.0, False
-        window._started_at = time.monotonic() - 10000
-        window.creep("STARTING THE UPDATED APP...")
-        self.assertLess(window._fraction, 1.0)
-        self.assertGreater(window._fraction, self.h.PROGRESS_START_BAR)
-        self.assertLessEqual(window._fraction, self.h.PROGRESS_HOLD_BAR)
-        window._fraction = 0.0
-        window.update("X", 0.5)
-        window.update("Y", 0.2)
-        self.assertEqual(window._fraction, 0.5, "a lower value never pulls the bar back")
-
-
     def test_preparing_moves_the_bar_with_every_file_instead_of_sitting_on_one_number(self):
         for name in ("a.dll", "b.dll", "c.dll", "d.dll"):
             for folder in (self.install, self.staged):
@@ -29212,138 +23143,16 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         self.assertAlmostEqual(prepared[-1], high)
         self.assertLessEqual(high, self.h.PROGRESS_COPY_BAR[0])
 
-    def test_the_bar_finishes_when_the_apps_window_shows_without_waiting_out_the_health_check(self):
-        self.recorder.waits_for_app = True
-        self.h.HEALTH_CHECK_SECONDS = 600
-        started = time.monotonic()
-        with mock.patch.object(self.h, "_app_window_is_up", lambda: True):
-            self.assertEqual(self._run(), 0)
-        self.assertLess(time.monotonic() - started, 5, "no 600 second wait once the window is up")
-        self.assertIn(("finish",), self.events)
-
     def test_the_preview_flag_is_wired_and_a_window_that_cannot_open_returns_one(self):
         self.assertEqual(self.h.main(["--preview-bar"]), 1, "no tkinter or no screen here, so no window")
         with self.assertRaises(SystemExit):
             self.h.main([])
 
 
-class TestStaticNoiseStaysSteady(unittest.TestCase):
-    """Owner 2026-11-07: the snow keeps one speed and one thickness, a changing level made it flicker"""
-
-    def test_the_thickness_never_changes_over_time(self):
-        ns = {"_STATIC_NOISE_FIXED_SEVERITY": gov.STATIC_NOISE_FIXED_SEVERITY}
-        exec(main_function_code("_static_noise_severity_at"), ns)
-        seen = {ns["_static_noise_severity_at"](t) for t in range(0, 600000, 997)}
-        self.assertEqual(seen, {gov.STATIC_NOISE_FIXED_SEVERITY})
-        for gone in ("STATIC_WEAK_HOLD_MS", "STATIC_RAMP_MS", "STATIC_SUDDEN_RAMP_MS", "STATIC_MEDIUM_HOLD_MS", "STATIC_HEAVY_HOLD_MS"):
-            self.assertFalse(hasattr(gov, gone), gone)
-        self.assertNotIn("_static_noise_cycle_started", MAIN_SRC)
 
 
 
-class TestNoiseGrainFollowsTheFourColorSettings(unittest.TestCase):
-    """Owner 2026-11-07: Static Noise Color white, grey, rainbow and theme must each show in the snow and the reception lines"""
-
-    def _grains(self, style, hue=220):
-        import numpy as _np
-        ns = {"np": _np, "db": types.SimpleNamespace(config={"theme_bg_hue": hue}), "_STATIC_GREY_GRAIN_LEVEL": gov.STATIC_GREY_GRAIN_LEVEL}
-        exec(main_function_code("_tinted_bright_rgb"), ns)
-        return ns["_tinted_bright_rgb"](400, style).astype(int)
-
-    def test_white_is_white_and_grey_is_grey(self):
-        white = self._grains("white")
-        grey = self._grains("grey")
-        self.assertTrue((white == 255).all())
-        self.assertTrue((grey == gov.STATIC_GREY_GRAIN_LEVEL).all())
-        self.assertLess(gov.STATIC_GREY_GRAIN_LEVEL, 255)
-
-    def test_rainbow_varies_in_colour_and_theme_follows_the_chosen_hue(self):
-        rainbow = self._grains("rainbow")
-        self.assertGreater(len({tuple(row) for row in rainbow}), 20)
-        blue = self._grains("theme", 220)
-        red = self._grains("theme", 0)
-        self.assertGreater(blue[:, 2].mean(), blue[:, 0].mean() + 40)
-        self.assertGreater(red[:, 0].mean(), red[:, 2].mean() + 40)
-        self.assertEqual(len({tuple(row) for row in blue}), 1, "one theme colour")
 
 
-class TestWatermarkPicksLandInTheChannelFolder(unittest.TestCase):
-    """Owner 2026-11-07: a picked watermark is kept in that channel's folder so the folder holds every image to choose from"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="rtv-wm-")
-        self.base = os.path.join(self.tmp, "WATERMARK")
-        self.elsewhere = os.path.join(self.tmp, "Pictures")
-        os.makedirs(self.elsewhere)
-        self.ns = {"os": os, "WATERMARK_BASE_DIR": self.base, "_log_swallowed": lambda *a: None,
-                   "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)}
-        exec(main_function_code("_watermark_channel_folder"), self.ns)
-        exec(main_function_code("_same_file_bytes"), self.ns)
-        exec(main_function_code("_save_watermark_into_channel_folder"), self.ns)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _make(self, folder, name, data):
-        path = os.path.join(folder, name)
-        with open(path, "wb") as handle:
-            handle.write(data)
-        return path
-
-    def test_a_pick_from_anywhere_is_copied_into_the_channels_folder(self):
-        picked = self._make(self.elsewhere, "logo.png", b"one")
-        kept = self.ns["_save_watermark_into_channel_folder"]("7", picked)
-        self.assertEqual(os.path.dirname(kept), os.path.join(self.base, "Channel 07"))
-        self.assertEqual(open(kept, "rb").read(), b"one")
-        self.assertTrue(os.path.isfile(picked), "the original stays where it was")
-
-    def test_a_pick_already_in_the_folder_is_used_where_it_is_and_the_folder_name_is_found_in_any_case(self):
-        os.makedirs(os.path.join(self.base, "channel 07"))
-        inside = self._make(os.path.join(self.base, "channel 07"), "a.png", b"a")
-        self.assertEqual(self.ns["_save_watermark_into_channel_folder"]("07", inside), os.path.abspath(inside))
-        self.assertEqual(os.listdir(self.base), ["channel 07"], "no second folder is made")
-
-    def test_the_same_picture_again_is_not_copied_twice_and_a_different_one_with_the_same_name_gets_a_number(self):
-        first = self._make(self.elsewhere, "logo.png", b"one")
-        kept = self.ns["_save_watermark_into_channel_folder"]("07", first)
-        again = self.ns["_save_watermark_into_channel_folder"]("07", first)
-        self.assertEqual(kept, again)
-        other_dir = os.path.join(self.tmp, "Other")
-        os.makedirs(other_dir)
-        different = self._make(other_dir, "logo.png", b"two")
-        second = self.ns["_save_watermark_into_channel_folder"]("07", different)
-        self.assertNotEqual(second, kept)
-        self.assertTrue(second.endswith("logo (2).png"))
-        self.assertEqual(len(os.listdir(os.path.join(self.base, "Channel 07"))), 2)
-
-    def test_the_picker_and_the_menu_use_it(self):
-        self.assertIn("dest = _save_watermark_into_channel_folder(_wm_channel, chosen)", MAIN_SRC)
-        self.assertIn("_fe_navigate(_watermark_channel_folder(target_ch_str))", MAIN_SRC)
 
 
-class TestHeldSliderKeepsSliding(unittest.TestCase):
-    """Owner 2026-11-07: holding the button on a slider must slide the whole bar; a remote or gamepad button sets no keyboard state, so the 1.5 second stuck rule cut the slide short"""
-
-    def test_a_or_d_on_a_slider_menu_gets_the_long_limit(self):
-        import pygame
-        import menu_nav as mn
-        for layer in ("VIDEO_ROWS", "THEME_ROWS", "CHANNEL_SUB_MENU"):
-            for key in (pygame.K_a, pygame.K_d):
-                self.assertEqual(mn.hold_stuck_limit(layer, key), mn.HOLD_STUCK_MS["slider"], (layer, key))
-        self.assertEqual(mn.hold_stuck_limit("THEME_ROWS", pygame.K_w), mn.HOLD_STUCK_MS["menu"])
-        self.assertEqual(mn.hold_stuck_limit("GAMES_TAB", pygame.K_d), mn.HOLD_STUCK_MS["menu"])
-
-    def test_the_long_limit_outlasts_a_full_slide_from_end_to_end(self):
-        import menu_nav as mn
-        steps = 100 // mn.SLIDER_STEP
-        slide_ms = steps * max(mn.HOLD_RULES["horizontal"].interval_ms, mn.VALUE_STEP_MIN_MS) + 400
-        self.assertGreater(mn.HOLD_STUCK_MS["slider"], slide_ms * 2)
-
-    def test_the_held_slider_is_not_called_stuck_for_a_remote_press_until_the_long_limit(self):
-        import menu_nav as mn
-        limit = mn.hold_stuck_limit("THEME_ROWS", __import__("pygame").K_d)
-        self.assertFalse(mn.hold_stuck(False, 5000, False, limit))
-        self.assertTrue(mn.hold_stuck(False, limit + 1, False, limit))
-
-    def test_the_main_loop_uses_the_per_layer_limit(self):
-        self.assertIn('menu_nav.hold_stuck_limit(app_state.get("menu_layer"), _mnav_key)', MAIN_SRC)

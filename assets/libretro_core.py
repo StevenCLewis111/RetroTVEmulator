@@ -1096,7 +1096,6 @@ class LibretroCore:
         self._multitap_hub_port = None
 
         self._rom_load_ts        = None
-        self._first_frame_ts     = None
         self._first_nonblack_ts  = None
 
 
@@ -1244,13 +1243,6 @@ class LibretroCore:
                 var_ptr = ctypes.cast(data, ctypes.POINTER(retro_variable))
                 key_b = var_ptr[0].key
                 key   = key_b.decode("utf-8", "ignore") if key_b else None
-                if not getattr(self, "_logged_var_reads", None):
-                    self._logged_var_reads = set()
-                if key is not None and key not in self._logged_var_reads:
-                    self._logged_var_reads.add(key)
-                    have = key in self._core_variables
-                    val  = self._core_variables[key].decode("utf-8", "ignore") if have else "(no override — core uses its own default)"
-                    print(f"[LIBRETRO VAR] Core requested '{key}' -> {val}")
                 if key is not None and key in self._core_variables:
                     var_ptr[0].value = self._core_variables[key]
                     return True
@@ -1294,9 +1286,6 @@ class LibretroCore:
             elif cmd == RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
                 try:
                     self._controller_info = self._parse_controller_info(data)
-                    for _port, _types in enumerate(self._controller_info):
-                        _names = ", ".join(f"{n!r}(id={i})" for n, i in _types)
-                        print(f"[LIBRETRO] Controller info port {_port}: {_names}")
                 except Exception as e:
                     log.warning(f"[LIBRETRO ENV] SET_CONTROLLER_INFO read failed "
                           f"(falling back to forcing RETRO_DEVICE_JOYPAD on every "
@@ -1428,17 +1417,9 @@ class LibretroCore:
                 return
 
             if self._rom_load_ts is not None:
-                if self._first_frame_ts is None:
-                    self._first_frame_ts = time.time()
-                    ms = int((self._first_frame_ts - self._rom_load_ts) * 1000)
-                    print(f"[LIBRETRO BOOT] First frame from core {ms}ms after ROM load "
-                          f"(still may be black — this is just 'core produced pixels')")
                 if self._first_nonblack_ts is None:
                     if int(rgb.max()) > 8:
                         self._first_nonblack_ts = time.time()
-                        ms = int((self._first_nonblack_ts - self._rom_load_ts) * 1000)
-                        print(f"[LIBRETRO BOOT] First NON-BLACK frame {ms}ms after ROM load "
-                              f"— this is the real black-screen duration the player experiences")
 
             self._base_w = width
             self._base_h = height
@@ -1483,7 +1464,6 @@ class LibretroCore:
         """Load a ROM file. Returns True on success."""
         GAME_FRAME_TIMER.new_session()
         self._rom_load_ts       = time.time()
-        self._first_frame_ts    = None
         self._first_nonblack_ts = None
         if not os.path.exists(rom_path):
             log.warning(f"[LIBRETRO] ROM not found: {rom_path}")
@@ -1500,7 +1480,6 @@ class LibretroCore:
 
         if self._need_fullpath:
             rom_path_for_core = rom_path.replace("\\", "/")
-            print(f"[LIBRETRO] need_fullpath path being sent to core: {rom_path_for_core!r}")
             rom_data = None
             c_data = None
             gi = retro_game_info()
@@ -1619,7 +1598,6 @@ class LibretroCore:
                         hub_port, dev_id, e)
             return False
         self._multitap_hub_port = hub_port
-        print(f"[LIBRETRO] Multitap enabled on port {hub_port} ({name!r}, id={dev_id})")
         return True
 
     def disable_multitap(self):
@@ -1628,7 +1606,6 @@ class LibretroCore:
         port = self._multitap_hub_port
         try:
             self._dll.retro_set_controller_port_device(port, RETRO_DEVICE_JOYPAD)
-            print(f"[LIBRETRO] Multitap disabled on port {port} -- reverted to plain joypad")
         except Exception as e:
             log.warning("disable_multitap: retro_set_controller_port_device(%d) failed: %s", port, e)
         self._multitap_hub_port = None
@@ -1792,12 +1769,10 @@ class LibretroCore:
             self._frozen = True
             self._input.clear()
             self._audio.set_muted(True)
-            print("[LIBRETRO] Frozen.")
 
     def unfreeze(self, muted=False):
         if self._loaded and self._frozen:
             self._frozen = False
-            print("[LIBRETRO] Unfrozen.")
         if self._loaded:
             self._audio.set_muted(muted or self._muted)
 
@@ -1846,7 +1821,6 @@ class LibretroCore:
             data = bytes(buf)
             path = self._sram_path()
             _write_file_safely(path, data)
-            print(f"[LIBRETRO] SRAM saved → {os.path.basename(path)} ({size} bytes)")
             return True
         except Exception as e:
             log.warning(f"[LIBRETRO] save_sram: {e}")
@@ -1871,7 +1845,6 @@ class LibretroCore:
                 return False
             n = min(len(data), size)
             ctypes.memmove(ptr, data, n)
-            print(f"[LIBRETRO] SRAM loaded ← {os.path.basename(path)} ({n} bytes)")
             return True
         except Exception as e:
             log.warning(f"[LIBRETRO] load_sram: {e}")
@@ -1895,8 +1868,6 @@ class LibretroCore:
                         os.rename(stray, stray + ".migrated")
                     except Exception as rename_err:
                         log.warning("Stray save migrated but couldn't rename original %s: %s", stray, rename_err)
-                    print(f"[LIBRETRO] Migrated stray save {os.path.basename(stray)} "
-                          f"→ profile{self.active_profile}/{os.path.basename(dest)}")
                     return
         except Exception as e:
             log.warning("_migrate_stray_save_file failed for %s: %s", rom_path, e)
@@ -1922,7 +1893,6 @@ class LibretroCore:
             _state_writer.cancel(path)
             with _state_write_lock:
                 _write_file_safely(path, data)
-            print(f"[LIBRETRO] State saved → {os.path.basename(path)}")
             return True
         except Exception as e:
             log.warning(f"[LIBRETRO] save_state: {e}")
@@ -1968,7 +1938,8 @@ class LibretroCore:
             with open(path, "rb") as f: data = f.read()
             buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
             ok  = self._dll.retro_unserialize(ctypes.cast(buf, ctypes.c_void_p), len(data))
-            print(f"[LIBRETRO] State {'loaded' if ok else 'FAILED'} ← {os.path.basename(path)}")
+            if not ok:
+                print(f"[LIBRETRO] State FAILED to load ← {os.path.basename(path)}")
             return ok
         except Exception as e:
             log.warning(f"[LIBRETRO] load_state: {e}")
@@ -2048,7 +2019,6 @@ def build_core_for_console(console, base_dir, preferred_name=None, preferred_bio
 
     if console == "PSX":
         _bios_choice = os.path.basename(bios_path) if bios_path else "HLE"
-        print(f"[LIBRETRO] pcsx_rearmed_bios = {_bios_choice}")
         core.set_variable("pcsx_rearmed_bios", _bios_choice)
 
     if not core.load_dll():

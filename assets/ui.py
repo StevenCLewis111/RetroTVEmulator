@@ -128,7 +128,6 @@ COLOR_MENU_POPUP_HINT = performance_governor.COLOR_MENU_POPUP_HINT if performanc
 COLOR_MENU_POPUP_SUBTEXT = performance_governor.COLOR_MENU_POPUP_SUBTEXT if performance_governor is not None else (200, 200, 210)
 COLOR_MENU_POPUP_SUBTEXT_DIM = performance_governor.COLOR_MENU_POPUP_SUBTEXT_DIM if performance_governor is not None else (140, 140, 150)
 COLOR_MENU_CHECKBOX = performance_governor.COLOR_MENU_CHECKBOX if performance_governor is not None else (200, 200, 200)
-COLOR_MENU_DVD_MAP_OFF_RED = performance_governor.COLOR_MENU_DVD_MAP_OFF_RED if performance_governor is not None else (150, 45, 45)
 COLOR_MENU_DVD_MAP_PANEL = performance_governor.COLOR_MENU_DVD_MAP_PANEL if performance_governor is not None else (16, 22, 40)
 COLOR_MENU_DVD_MAP_KEY = performance_governor.COLOR_MENU_DVD_MAP_KEY if performance_governor is not None else (12, 16, 30)
 # WARNING: the fallback numbers below must match the same names in performance_governor.py; they are used only when that module fails to import.
@@ -162,6 +161,8 @@ SELECTION_BORDER_WIDTH = media.SELECTION_BORDER_WIDTH
 CHANNEL_SCAN_BAR_HEIGHT_PX = performance_governor.CHANNEL_SCAN_BAR_HEIGHT_PX if performance_governor is not None else 3
 CHANNEL_SCAN_BAR_HEAD_PX = performance_governor.CHANNEL_SCAN_BAR_HEAD_PX if performance_governor is not None else 6
 CHANNEL_SCAN_BAR_HALO_MIX = performance_governor.CHANNEL_SCAN_BAR_HALO_MIX if performance_governor is not None else 0.35
+# WARNING: the fallback number below must match CHANNEL_ACTIVE_HIGHLIGHT_BRIGHTNESS in performance_governor.py; it is used only when that module fails to import.
+CHANNEL_ACTIVE_HIGHLIGHT_BRIGHTNESS = performance_governor.CHANNEL_ACTIVE_HIGHLIGHT_BRIGHTNESS if performance_governor is not None else 0.5
 # WARNING: the 12 fallback must match CHANNEL_SCAN_BAR_MIN_PX in performance_governor.py; it is used only when that module fails to import.
 CHANNEL_SCAN_BAR_MIN_PX = performance_governor.CHANNEL_SCAN_BAR_MIN_PX if performance_governor is not None else 12
 
@@ -446,7 +447,6 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
     r, g, b = colorsys.hsv_to_rgb(ui_hue, 0.9, 1.0)
     NEON_GREEN = (int(r * 255), int(g * 255), int(b * 255))
     TEXT_WHITE = COLOR_TEXT_WHITE
-    OFF_RED    = COLOR_MENU_DVD_MAP_OFF_RED
     PANEL_BG   = COLOR_MENU_DVD_MAP_PANEL
     ROW_BG     = COLOR_MENU_BUTTON
     KEY_BG     = COLOR_MENU_DVD_MAP_KEY
@@ -1173,11 +1173,11 @@ def get_system_menu_rows(db, app_state):
 
     if kiosk_on:
         # WARNING: with Kiosk on the Channels tab is hidden, so its Settings options (and Look for Updates) are shown here instead; the toggles must stay in SYSTEM_KIOSK_SETTING_KEYS and the same two column groups as menu_nav.SYSTEM_LEFT_TOGGLES / SYSTEM_RIGHT_TOGGLES.
-        kiosk_rows = ["kiosk_mode", "bezel_toggle", "warp_screen", "boot_anim",
-                      "static_noise", "reception_lines", "scan_lines", "update_check"]
+        kiosk_rows = ["kiosk_mode", "warp_screen", "boot_anim", "bezel_toggle"]
         if media.bezel_style_count() > 1:
             kiosk_rows.append("bezel_style_select")
-        kiosk_rows.append("poweroff" if poweroff_visible else "exit_program")
+        kiosk_rows += ["static_noise", "reception_lines", "scan_lines", "update_check",
+                       "poweroff" if poweroff_visible else "exit_program"]
         return kiosk_rows
 
     rows = ["game_ch", "guide", "controls_on_start", "kiosk_mode",
@@ -2483,7 +2483,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
             
             viewport_adjusted_start = viewport_start_seconds
             viewport_adjusted_end = viewport_adjusted_start + viewport_seconds
-            last_drawn_abs_time = viewport_adjusted_start
             
             _is_full_day_guide = (not ch_info.get("is_visualizer", False)
                                   and ch_info.get("scheduling_mode", "random_slots") != "marathon"
@@ -3283,9 +3282,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                 current_draw_w = max(current_draw_w, 1)
                 
                 if cell_x > last_drawn_pixel_x:
-                    _gap_abs_start = last_drawn_abs_time
                     _oa_x = last_drawn_pixel_x
-                    _oa_abs_cursor = _gap_abs_start
                     while _oa_x < cell_x and _oa_x < w:
                         # WARNING: keep the +1e-6 float-truncation guard identical to rounded_start_block_col.
                         _oa_col  = max(0, int(float(_oa_x - col_width) / col_width + 1e-6))
@@ -3303,12 +3300,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             "abs": _oa_seg_abs,
                             "key": ("offair", round(_oa_seg_abs)),
                         })
-                        _oa_abs_start = _oa_abs_cursor
-                        _oa_col_boundary_abs = viewport_adjusted_start + (_oa_col + 1) * 1800
-                        if _oa_end == cell_x:
-                            _oa_abs_end = show_abs_start
-                        else:
-                            _oa_abs_end = _oa_col_boundary_abs
                         _oa_sel = (is_highlighted_row and
                                    _oa_seg_abs <= _guide_target_abs < _oa_seg_end)
                         _oa_bg  = HIGHLIGHT_BG if _oa_sel else UNSELECTED_BLUE
@@ -3318,7 +3309,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         if _oa_x + 8 < w and _oa_bw > 30:
                             _lbl_oa = font_row_lg.render("OFF-AIR", True, _oa_tc)
                             surface.blit(_lbl_oa, (_oa_x + 8, start_y + (row_height // 2 - _lbl_oa.get_height() // 2)))
-                        _oa_abs_cursor = _oa_abs_end
                         _oa_x = _oa_end
                 
                 is_selected_cell = (is_highlighted_row and
@@ -3362,14 +3352,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                                 surface.blit(lbl_cell, (cell_x + 8, start_y + (row_height // 2 - lbl_cell.get_height() // 2)))
                 
                 last_drawn_pixel_x = cell_x + pixel_cell_width
-                last_drawn_abs_time = clip_end
                 _last_show_end_abs = show_abs_end
                 
             viewport_absolute_max_pixel_x = col_width + (num_cols * col_width)
             if last_drawn_pixel_x < viewport_absolute_max_pixel_x and has_rendered_any_video:
-                _gap_abs_start = last_drawn_abs_time
                 _tr_x = last_drawn_pixel_x
-                _tr_abs_cursor = _gap_abs_start
                 while _tr_x < viewport_absolute_max_pixel_x and _tr_x < w:
                     _tr_col  = max(0, int(float(_tr_x - col_width) / col_width))
                     _tr_next = col_width + (_tr_col + 1) * col_width
@@ -3386,8 +3373,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                         "abs": _tr_seg_abs,
                         "key": ("offair", round(_tr_seg_abs)),
                     })
-                    _tr_abs_start = _tr_abs_cursor
-                    _tr_abs_end = viewport_adjusted_start + (_tr_col + 1) * 1800
                     _tr_sel = (is_highlighted_row and
                                _tr_seg_abs <= _guide_target_abs < _tr_seg_end)
                     _tr_bg  = HIGHLIGHT_BG if _tr_sel else UNSELECTED_BLUE
@@ -3915,6 +3900,24 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             if is_focused:
                 pygame.draw.circle(menu_canvas, NEON_GREEN, (handle_x, toggle_y + toggle_h // 2), handle_rad + 2, SELECTION_BORDER_WIDTH)
 
+            if row_id == "bezel_toggle" and "bezel_style_select" in sys_rows:
+                _bs_idx = sys_rows.index("bezel_style_select")
+                _bs_on = bool(current_values.get("bezel_toggle", False))
+                try:
+                    _bs_val = max(1, min(int(db.config.get("bezel_style", 1)), media.bezel_style_count()))
+                except (TypeError, ValueError, AttributeError) as _swallowed_error:
+                    _log_swallowed("render_settings_overlay_menu: bezel style option number", _swallowed_error)
+                    _bs_val = 1
+                _bs_lbl = f_ch_btn.render("Option %d" % _bs_val, True, TEXT_WHITE if _bs_on else COLOR_MENU_TEXT_GREYED)
+                _bs_w = 18 + max(f_ch_btn.size("Option %d" % _n)[0] for _n in range(1, max(media.bezel_style_count(), 1) + 1))
+                _bs_x = toggle_x + toggle_w + 20
+                pygame.draw.rect(menu_canvas, COLOR_MENU_BUTTON_BLUE if _bs_on else COLOR_MENU_BUTTON_GREYED,
+                                 (_bs_x, toggle_y, _bs_w, box_h_43), border_radius=5)
+                if layer == "SYSTEM_ROWS" and cur_sel == _bs_idx:
+                    _aa_rounded_rect(menu_canvas, NEON_GREEN, (_bs_x, toggle_y, _bs_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=5)
+                menu_canvas.blit(_bs_lbl, (_bs_x + (_bs_w - _bs_lbl.get_width()) // 2,
+                                           toggle_y + (box_h_43 - _bs_lbl.get_height()) // 2))
+
             if row_id == "captions_toggle":
                 from game_deck import LIST_TEXT_COLOR_NAMES, LIST_TEXT_COLOR_RGB
                 _captions_on = current_values.get("captions_toggle", False)
@@ -3964,7 +3967,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _standalone_id = "advanced_settings" if "advanced_settings" in sys_rows else ("update_check" if "update_check" in sys_rows else None)
         poweroff_standalone = "poweroff" in sys_rows and _standalone_id is not None
         bottom_left_button_rows = [r for r in button_rows
-                                    if r != _standalone_id
+                                    if r != _standalone_id and r != "bezel_style_select"
                                     and not (r == "poweroff" and poweroff_standalone)]
 
         _bx = bx_left
@@ -3973,20 +3976,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             is_btn_highlighted = (layer == "SYSTEM_ROWS" and cur_sel == row_idx)
             if row_id == "update_check":
                 btn_txt = _update_button_text(app_state)
-            elif row_id == "bezel_style_select":
-                try:
-                    _bs_val = max(1, min(int(db.config.get("bezel_style", 1)), media.bezel_style_count()))
-                except (TypeError, ValueError, AttributeError) as _swallowed_error:
-                    _log_swallowed("render_settings_overlay_menu: bezel style button number", _swallowed_error)
-                    _bs_val = 1
-                btn_txt = "Bezel Style: Option %d" % _bs_val
             else:
                 btn_txt = SYSTEM_ROW_META[row_id]["label"]
 
-            if row_id == "bezel_style_select" and not (db is not None and db.config.get("fake_43_border_enabled", False)):
-                b_color = COLOR_MENU_BUTTON_GREYED
-                btn_txt_col = COLOR_MENU_TEXT_GREYED
-            elif row_id == "reset_settings" and not _reset_has_content:
+            if row_id == "reset_settings" and not _reset_has_content:
                 b_color = COLOR_MENU_BUTTON_GREYED
                 btn_txt_col = COLOR_MENU_TEXT_GREYED
             elif row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED:
@@ -4754,6 +4747,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         cell_text_x_offset = 18
         cell_dot_x_offset = 26
 
+        _on_air_key = str(app_state.get("current_channel", "")).zfill(2)
+        _on_air_color = tuple(int(_c * CHANNEL_ACTIVE_HIGHLIGHT_BRIGHTNESS) for _c in NEON_GREEN)
+
         for local_idx, ch_num in enumerate(page_items):
             idx = page_start + local_idx
             r_pos = local_idx // cols
@@ -4775,7 +4771,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
             dot_color = (COLOR_MENU_DISABLED_GREY if ch_server_locked
                          else (OFF_GREEN if ch_active else OFF_RED))
-            cell_bg = COLOR_MENU_LOCKED_CELL if ch_server_locked else COLOR_MENU_BUTTON
+            cell_bg = COLOR_MENU_LOCKED_CELL if ch_server_locked else (_on_air_color if _on_air_key == current_lookup_key else COLOR_MENU_BUTTON)
             cell_border = COLOR_MENU_TEXT_GREYED if ch_server_locked else None
 
             pygame.draw.rect(menu_canvas, cell_bg, (cell_x, cell_y, cell_w, cell_h), border_radius=cell_radius)
@@ -4899,8 +4895,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             [(_cs_rows.index(_rid), _rid) for _rid in ("static_noise", "reception_lines", "scan_lines") if _rid in _cs_rows],
         ]
 
-        _cs_half_w = content_w // 2
-        _cs_col_centers = [cx + _cs_half_w // 2, cx + _cs_half_w + _cs_half_w // 2]
 
         _cs_grid_rows_tall = max((len(_c) for _c in _cs_columns), default=0)
         _cs_total_rows = _cs_grid_rows_tall
@@ -4924,7 +4918,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         for _cs_col_idx, _cs_col_entries in enumerate(_cs_columns):
             if not _cs_col_entries:
                 continue
-            _cs_block_w = _cs_block_ws[_cs_col_idx]
             if _cs_col_idx == 0:
                 _cs_col_x = cx + _cs_side_margin
             else:
@@ -5666,7 +5659,6 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _draw_menu_clear(menu_canvas, cx, content_y, content_h, focused, _com_has_media, f_ch_btn, NEON_GREEN)
 
         focused = sub_r == menu_nav.COMMERCIALS_CLOSE_ROW
-        close_x = cx + content_w - 135
         _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, focused, f_ch_btn, NEON_GREEN)
 
     # ========================================================================

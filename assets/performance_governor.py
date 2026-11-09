@@ -384,7 +384,7 @@ BOOT_SCAN_GPU_TABLE = (
 BOOT_SCAN_GPU_YEAR_CLASS = ((2013, "A"), (2018, "B"), (9999, "C"))
 
 
-# VALUES CHANGE HERE (GPU frame path: adapter choice "monitor" or "fastest"; start-up self-check picture size, per-channel tolerance out of 255 and the share of values allowed past it; failures in a row before the GPU path is switched off for the run; device losses allowed per run; seconds to wait before reopening after a failure; frames of one path collected before a [GPU FRAME] log line is written)
+# VALUES CHANGE HERE (GPU frame path: adapter choice "monitor" or "fastest"; start-up self-check picture size, per-channel tolerance out of 255 and the share of values allowed past it; failures in a row before the GPU path is switched off for the run; device losses allowed per run; seconds to wait before reopening after a failure)
 GPU_ADAPTER_POLICY = "monitor"
 GPU_SELF_CHECK_SIZE = (640, 360)
 GPU_SELF_CHECK_TOLERANCE = 2
@@ -392,15 +392,11 @@ GPU_SELF_CHECK_MAX_OVER_FRACTION = 0.001
 GPU_FRAME_FAILURE_LIMIT = 3
 GPU_DEVICE_LOST_LIMIT = 3
 GPU_RETRY_COOLDOWN_SECONDS = 30.0
-GPU_FRAME_LOG_INTERVAL_FRAMES = 600
 # VALUES CHANGE HERE (N7 owner 2026-11-03: the back-buffer size the GPU self-check is drawn at, the same for every window size, so switching between full screen and a window reopens the GPU path at once)
 GPU_SELF_CHECK_TARGET_SIZE = (960, 540)
 # VALUES CHANGE HERE (GPU frame path, the Video tab's Tint: colour shift per step away from 50, the same as the CPU picture pass)
 GPU_PICTURE_TINT_PER_STEP = 1.5
 
-# VALUES CHANGE HERE (menu key trace: key events landing in one frame that write a [MENU NAV BURST] warning; loop profile: frames collected before a [LOOP PROFILE] line is written, 0 = off)
-MENU_NAV_BURST_WARN_EVENTS = 3
-LOOP_PROFILE_LOG_INTERVAL_FRAMES = 600
 
 # VALUES CHANGE HERE (stall stacks: when one main-loop frame has run longer than the first ms, a [STALL STACK] line in app_log.txt names where the screen thread is, again every repeat ms while that frame goes on, at most the max lines per frame, each with the innermost depth calls)
 STALL_STACK_FIRST_MS = 1000
@@ -435,8 +431,8 @@ STATIC_TO_GREY_MS = 2000
 # VALUES CHANGE HERE (schedule hub loudness: seconds before the hub asks the library again about a file that has no scanned gain on record)
 HUB_GAIN_MISS_RECHECK_SECONDS = 900.0
 
-# VALUES CHANGE HERE (schedule hub clock check: seconds either side of a slot edge in which the hub's answer for "what is on air now" may differ from the scheduler's without being reported)
-HUB_CLOCK_COMPARE_GRACE_SECONDS = 1.0
+# VALUES CHANGE HERE (schedule hub clock check: seconds either side of a slot edge in which the hub's answer for "what is on air now" may differ from the scheduler's without being reported; kept equal to HUB_ROW_GENERATION_START_TOLERANCE_SECONDS because rows that start that close to the scheduler's are kept, so the hub's edge is allowed to sit that far off)
+HUB_CLOCK_COMPARE_GRACE_SECONDS = 60.0
 
 # VALUES CHANGE HERE (schedule hub airing lookup: seconds the scheduler waits before asking the hub again for the airing entry after the hub had no matching row; the scheduler's own pick airs in the meantime)
 HUB_AIRING_LOOKUP_RETRY_SECONDS = 1.0
@@ -609,13 +605,6 @@ CRT_SCANLINE_BLOOM_GAMMA = 1.6
 CRT_SCANLINE_BLOOM_STRENGTH = 0.95
 
 # VALUES CHANGE HERE
-MENU_NAV_TRACE = True
-
-# VALUES CHANGE HERE
-PERF_LOG_INTERVAL_S = 5.0
-PERF_LOG_MAX_SAMPLES = 900
-
-# VALUES CHANGE HERE
 STATIC_NOISE_REFRESH_MS = 110
 
 # VALUES CHANGE HERE (Static Noise: how often the snow changes to another picture, in ms; smaller is faster, 40 is 25 changes a second; 25 was 40 changes a second, 16 is one on every frame of a 60 Hz screen)
@@ -626,6 +615,11 @@ STATIC_NOISE_POOL_SIZES = 3
 # VALUES CHANGE HERE (Static Noise grain: the size in screen pixels of one speck of snow, 1 is the finest and costs the most to make, 3 was the snow until 2026-11-06, 4 is a little bigger so it can be seen; at most one new picture is made every STATIC_NOISE_BUILD_GAP_MS while the set fills, so the screen thread is never given a burst of them)
 STATIC_NOISE_GRAIN_PX = 4
 STATIC_NOISE_BUILD_GAP_MS = 80
+# VALUES CHANGE HERE (Static Noise in Rainbow and Theme colour only: how often the snow changes to another picture, in ms, slower than the 40 of the other colours so the coloured snow does not buzz; and the share of the plain snow's speckle density it keeps, 1.0 is as dense as white and grey snow)
+STATIC_NOISE_TINT_AMBIENT_REFRESH_MS = 100
+STATIC_NOISE_TINT_DENSITY_SCALE = 0.7
+# VALUES CHANGE HERE (Static transition and no-media Static in Rainbow and Theme colour only: how often the snow picture is made again, in ms, slower than the 110 of the other colours)
+STATIC_NOISE_TINT_REFRESH_MS = 170
 # VALUES CHANGE HERE (Static Noise: the snow's strength is baked into each picture's own see-through values in this many steps, because a picture with both its own see-through values and an overall strength drew about 8 times slower; how many baked pictures are kept, all sizes and strengths together)
 STATIC_NOISE_STRENGTH_STEPS = 16
 STATIC_NOISE_BAKED_MAX = 24
@@ -817,9 +811,6 @@ FILE_EXPLORER_EXPAND_TIMEOUT_MS = 6000
 # VALUES CHANGE HERE (playback seek: milliseconds between retries while a seek is checked to have landed)
 SEEK_RETRY_INTERVAL_MS = 1500
 
-# VALUES CHANGE HERE (frame copy timing: frames counted before one [FRAME COPY] log line)
-FRAME_COPY_LOG_EVERY_FRAMES = 600
-
 # VALUES CHANGE HERE (guide preload: seconds to wait for the window size before the preload worker gives up for that pass)
 GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS = 30.0
 
@@ -856,8 +847,6 @@ CHANNEL_READY_CHANNEL_PAUSE_SECONDS = 0.05
 CHANNEL_READY_REFRESH_BATCH = 400
 CHANNEL_READY_WARM_BATCH = 400
 CHANNEL_READY_LOG_SECONDS = 60.0
-# VALUES CHANGE HERE (one [VIDEO DRAW] line with the part times of the TV picture every this many drawn pictures)
-VIDEO_DRAW_LOG_FRAMES = 600
 # VALUES CHANGE HERE (seconds between [MUSIC SCAN] lines)
 MUSIC_SCAN_LOG_SECONDS = 60.0
 PATH_EXISTS_PROBE_TIMEOUT_MS = 2500
@@ -1013,7 +1002,6 @@ COMPRESSOR_RATIO = 2.0
 COMPRESSOR_KNEE_DB = 6.0
 COMPRESSOR_MAKEUP_DB = 4.0
 LOUDNESS_WINDOW_DISAGREE_LU = 3.0
-LOUDNESS_WINDOW_LOG_MIN_SECONDS = 5.0
 LOUDNESS_WIDE_LRA_FLAG_LU = 15.0
 
 # VALUES CHANGE HERE (media.py, dialogue loudness: a sample window needs at least this many seconds of subtitled speech, and a file at least this many such windows, before its loudness is measured on dialogue; subtitle lines closer together than the gap in seconds are joined; time limits for the header read and the subtitle extract in seconds; largest subtitle text read in bytes; seconds and most entries the dialogue choice is kept)
@@ -1047,6 +1035,8 @@ SETTINGS_SAVE_PIECE_ENTRIES = 500
 CHANNEL_SCAN_BAR_HEIGHT_PX = 3
 CHANNEL_SCAN_BAR_HEAD_PX = 6
 CHANNEL_SCAN_BAR_HALO_MIX = 0.35
+# VALUES CHANGE HERE (Channels tab: the whole button of the channel that is on in the background is filled with the navigation highlight colour at this share of its brightness, so it reads darker than the highlight under the cursor and still follows the theme colour)
+CHANNEL_ACTIVE_HIGHLIGHT_BRIGHTNESS = 0.5
 # VALUES CHANGE HERE (Channels-tab scan bar: narrowest the bar is drawn while its channel still has files to scan, in pixels; a music station lists hundreds of songs and few are scanned, so its true share is under one pixel (owner log 2026-11-06))
 CHANNEL_SCAN_BAR_MIN_PX = 12
 
@@ -1154,6 +1144,20 @@ NAV_DUP_PATH_MS = 50
 NAV_MOVE_MIN_MS = 150
 
 # VALUES CHANGE HERE (menu_nav.py, sliders: one left or right press moves SLIDER_STEP; each slider is (config key, value when unset, lowest, highest); the Reactive Strength slider on a music channel's editor the same way; the fastest a value control (slider, volume) may step in milliseconds, however fast the key is pressed or held, kept below the held-key repeat intervals in HOLD_RULES so a hold is never dropped)
+# VALUES CHANGE HERE (theme colour slider: the hues from the lowest to the highest number below are skipped because that blue is the menu button colour and a border or highlight in it cannot be seen; the button is about 217 degrees)
+THEME_UI_HUE_SKIP_LOW = 195
+THEME_UI_HUE_SKIP_HIGH = 240
+
+
+def theme_ui_hue_clear(hue, direction=0):
+    """Returns the theme colour hue moved out of the skipped blue band, to the far edge in the direction pressed (1 up, -1 down) or to the nearer edge when no direction is given."""
+    if hue < THEME_UI_HUE_SKIP_LOW or hue > THEME_UI_HUE_SKIP_HIGH:
+        return hue
+    if direction > 0 or (direction == 0 and hue - THEME_UI_HUE_SKIP_LOW >= THEME_UI_HUE_SKIP_HIGH - hue):
+        return THEME_UI_HUE_SKIP_HIGH + SLIDER_STEP
+    return THEME_UI_HUE_SKIP_LOW - SLIDER_STEP
+
+
 SLIDER_STEP = 5
 SLIDER_SPECS = {
     "brightness": ("brightness", 50, 0, 100), "contrast": ("contrast", 50, 0, 100), "color": ("color", 50, 0, 100),
@@ -1218,8 +1222,7 @@ GAME_MAP_OPTIONS_TOP_GAP_PX = 14
 GAME_MAP_NES_OPTIONS_LIFT_FRAC = 0.04
 GAME_MAP_OPTIONS_DROP_PX = 20
 
-# VALUES CHANGE HERE (game_deck.py, key legend at the bottom of the game screens: a text row height that nothing reads (left for the owner's yes, R5), bottom padding in pixels, how much darker the key names are than the titles (0 to 255), the height of its key pictures and the space between its rows in pixels)
-GAME_LEGEND_ROW_H_PX = 20
+# VALUES CHANGE HERE (game_deck.py, key legend at the bottom of the game screens: bottom padding in pixels, how much darker the key names are than the titles (0 to 255), the height of its key pictures and the space between its rows in pixels)
 GAME_LEGEND_BOTTOM_PAD_PX = 8
 GAME_LEGEND_KEY_DARKEN = 60
 GAME_LEGEND_KEY_H_PX = 22
@@ -1851,11 +1854,6 @@ def _scan_more_urgent(kind, rank, now):
     return out
 
 
-def scan_should_yield(kind, rank, now=None):
-    """True when another scan has a more urgent file waiting, so this scan leaves the shared scan threads to it for now."""
-    return bool(_scan_more_urgent(kind, rank, time.monotonic() if now is None else now))
-
-
 def scan_is_most_urgent(kind, now=None):
     """True when this scan's next file is at least as urgent as every other scan's, so it may use the scan threads the others are leaving."""
     now = time.monotonic() if now is None else now
@@ -2400,14 +2398,12 @@ PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = 20000
 PICTURE_ENDS_EARLY_MIN_SECONDS = 30
 # VALUES CHANGE HERE (app_log.txt: an INFO line whose text starts with one of these is not written; a WARNING or ERROR line is always written. Status reports that repeat every few seconds and success lines of scans. Remove a name from the list to get that line back. owner 2026-11-06, thin the logs)
 LOG_QUIET_APP_PREFIXES = (
-    "[FRAME TIME]", "[LOOP PROFILE]", "[GPU FRAME]", "[FRAME COPY]", "[VIDEO DRAW]", "[HEARTBEAT]",
-    "[REAL VIDEO BLIT]", "[BLIT VIDEO SCREEN MODE]", "[MENU NAV TRACE]", "[MENU NAV FRAME]",
-    "[LOUDNESS DEBUG]", "[LOUDNESS CHECK]", "[LOUDNESS WINDOW TIMING]",
+    "[LOUDNESS CHECK]",
     "[HEALTH THREADS]", "[HEALTH QUEUES]", "[HEALTH PROFILE]", "[HEALTH MEMORY]", "[HEALTH LOCKS]",
     "[HEALTH CPU]", "[HEALTH WORK]", "[HEALTH STALL]",
     "[GOVERNOR] status", "[GOVERNOR] gate held back", "[GOVERNOR] screen's own load",
     "[GOVERNOR] picture steady", "[GOVERNOR] frames over their time", "[GOVERNOR] stall gap",
-    "[HUB CLOCK]", "[HUB MISS]", "[MUTE GUARD]", "[PICTURE BOX]", "[CHANNEL READY]", "[SETTINGS SAVE]",
+    "[HUB CLOCK]", "[HUB MISS]", "[PICTURE BOX]", "[CHANNEL READY]", "[SETTINGS SAVE]",
 )
 # VALUES CHANGE HERE (app_log.txt: an INFO line of the scheduler that starts with [SCHEDULER] and holds one of these pieces of text is not written)
 LOG_QUIET_SCHEDULER_PIECES = ("background probe stored", "is inactive (disabled)")
@@ -2841,7 +2837,6 @@ COLOR_MENU_POPUP_HINT = (160, 160, 160)
 COLOR_MENU_POPUP_SUBTEXT = (200, 200, 210)
 COLOR_MENU_POPUP_SUBTEXT_DIM = (140, 140, 150)
 COLOR_MENU_CHECKBOX = (200, 200, 200)
-COLOR_MENU_DVD_MAP_OFF_RED = (150, 45, 45)
 COLOR_MENU_DVD_MAP_PANEL = (16, 22, 40)
 COLOR_MENU_DVD_MAP_KEY = (12, 16, 30)
 

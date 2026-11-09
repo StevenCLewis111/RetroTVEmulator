@@ -3170,7 +3170,6 @@ def _xi_nav_worker():
         else:
             time.sleep(1.0 / POLL_HZ)
 
-    log.info("[XI NAV] Thread exited.")
 
 if _WIN:
     threading.Thread(target=_xi_nav_worker, daemon=True).start()
@@ -3497,23 +3496,11 @@ class ExternalGameDeck:
             bezel_dir = os.path.join(rom_dir, "border")
         return bezel_dir
 
-    _bezel_style_debug_seen = {}
-
     def console_bezel_style_count(self, console):
         """Return how many border image styles this console's own frame has (see BORDER_CONSOLES)."""
         if console not in BORDER_CONSOLES_HOME:
             return 1
-        bezel_dir  = self._console_bezel_dir(console)
-        discovered = _discover_border_style_files(bezel_dir)
-        count      = max(1, len(discovered))
-        _key = (console, bezel_dir)
-        _cur = (count, tuple(discovered))
-        if self._bezel_style_debug_seen.get(_key) != _cur:
-            self._bezel_style_debug_seen[_key] = _cur
-            log.info("[CONSOLE BEZEL STYLE] console=%s dir=%s exists=%s found=%s -> count=%d",
-                      console, bezel_dir, os.path.isdir(bezel_dir),
-                      [os.path.basename(f) for f in discovered], count)
-        return count
+        return max(1, len(_discover_border_style_files(self._console_bezel_dir(console))))
 
     def _refresh_consoles(self, consoles_enabled=None):
         if consoles_enabled is None:
@@ -4539,8 +4526,6 @@ class ExternalGameDeck:
                     new_t = _nav.dvd_hold_seek(dir_held, t, length)
                     vlc.player.set_time(new_t)
                     self._set_dvd_osd(">>" if dir_held > 0 else "<<")
-                    log.info("[DVD SEEK] hold %s: %sms -> %sms (length=%sms)",
-                              ">>" if dir_held > 0 else "<<", t, new_t, length)
                 except Exception as e:
                     log.warning("DVD seek during held skip failed: %s", e)
             self._dvd_skip_cooldown = now + _nav.DVD_SKIP_COOLDOWN_MS
@@ -4635,9 +4620,7 @@ class ExternalGameDeck:
             if _confirm_choice is not None:
                 self.dvd_exit_selection = _confirm_choice
                 self.dvd_exit_confirm_shown_at = pygame.time.get_ticks()
-                log.info(f"[DVD INPUT] Quit-confirm: selection -> {_confirm_choice}")
             elif _nav.is_accept(key):
-                log.info(f"[DVD INPUT] Quit-confirm: committing '{self.dvd_exit_selection}'")
                 if self.dvd_exit_selection == "Yes":
                     if vlc:
                         try:
@@ -4666,18 +4649,13 @@ class ExternalGameDeck:
                     self.dvd_exit_confirm = False
             elif _nav.is_back(key):
                 self.dvd_exit_confirm = False
-                log.info("[DVD INPUT] Quit-confirm: Back -> closed as No, the DVD keeps playing.")
-            else:
-                log.info(f"[DVD INPUT] Quit-confirm open: ignoring key {key} (only A/D/Enter/Back are live).")
             return True
 
         if self.dvd_return_menu_confirm:
             if _confirm_choice is not None:
                 self.dvd_return_menu_selection = _confirm_choice
                 self.dvd_return_menu_confirm_shown_at = pygame.time.get_ticks()
-                log.info(f"[DVD INPUT] Back-to-main-confirm: selection -> {_confirm_choice}")
             elif _nav.is_accept(key):
-                log.info(f"[DVD INPUT] Back-to-main-confirm: committing '{self.dvd_return_menu_selection}'")
                 if self.dvd_return_menu_selection == "Yes":
                     self.dvd_return_menu_confirm = False
                     self.dvd_in_menu = True
@@ -4689,15 +4667,10 @@ class ExternalGameDeck:
                             vlc.navigate("menu")
                         except Exception as e:
                             log.warning("DVD return-to-menu navigate failed: %s", e)
-                    log.info("[DVD INPUT] Back-to-main confirmed "
-                          "(WASD now controls menu navigation).")
                 else:
                     self.dvd_return_menu_confirm = False
             elif _nav.is_back(key):
                 self.dvd_return_menu_confirm = False
-                log.info("[DVD INPUT] Back-to-main-confirm: Back -> closed as No, the DVD keeps playing.")
-            else:
-                log.info(f"[DVD INPUT] Back-to-main-confirm open: ignoring key {key} (only A/D/Enter/Back are live).")
             return True
 
         if self.dvd_splash_playing:
@@ -4710,13 +4683,11 @@ class ExternalGameDeck:
             self.dvd_exit_confirm = True
             self.dvd_exit_selection = "No"
             self.dvd_exit_confirm_shown_at = pygame.time.get_ticks()
-            log.info(f"[DVD INPUT] ESC -> opening quit-to-TV confirm (is_iso={is_iso}).")
             return True
 
         if _nav.dvd_action(key) == _nav.DVD_RETURN_MENU:
             _return_step = _nav.dvd_return_menu_step(is_iso, menu_up)
             if _return_step == _nav.DVD_RETURN_IGNORE:
-                log.info("[DVD INPUT] Backspace ignored (regular video file has no disc menu).")
                 return True
             if _return_step == _nav.DVD_RETURN_REISSUE:
                 self.dvd_in_menu = True
@@ -4728,12 +4699,10 @@ class ExternalGameDeck:
                         vlc.navigate("menu")
                     except Exception as e:
                         log.warning("DVD return-to-menu navigate failed: %s", e)
-                log.info("[DVD INPUT] Backspace -- already on a menu, re-issued return-to-root.")
             else:
                 self.dvd_return_menu_confirm = True
                 self.dvd_return_menu_selection = "No"
                 self.dvd_return_menu_confirm_shown_at = pygame.time.get_ticks()
-                log.info("[DVD INPUT] Backspace -> opening back-to-main-menu confirm.")
             return True
 
         if _nav.key_to_direction(key) is not None or _nav.is_accept(key):
@@ -4769,7 +4738,6 @@ class ExternalGameDeck:
                     self._set_dvd_osd(f">> +{_nav.DVD_SKIP_TAP_MS // 1000}s")
                     self._dvd_skip_hold_start = _now_ff
                     self._dvd_skip_cooldown = _now_ff + _nav.DVD_SKIP_COOLDOWN_MS
-                    log.info("[DVD SEEK] +30s: %sms -> %sms (length=%sms)", t, new_t, length)
                 except Exception as e:
                     log.warning("DVD +30s skip failed: %s", e)
             return True
@@ -4786,12 +4754,10 @@ class ExternalGameDeck:
                     self._set_dvd_osd(f"<< -{_nav.DVD_SKIP_TAP_MS // 1000}s")
                     self._dvd_skip_hold_start = _now_rw
                     self._dvd_skip_cooldown = _now_rw + _nav.DVD_SKIP_COOLDOWN_MS
-                    log.info("[DVD SEEK] -30s: %sms -> %sms", t, new_t)
                 except Exception as e:
                     log.warning("DVD -30s skip failed: %s", e)
             return True
 
-        log.info(f"[DVD INPUT] Ignored key {key} (no DVD action bound to it).")
         return True
 
     # ========================================================================
@@ -6066,7 +6032,6 @@ class ExternalGameDeck:
             self._gameplay_ctrl_mapping_cache.clear()
             if getattr(self, "_active_mapping_console", None) and "stick_as_dpad" in self.ctrl_mapping:
                 self.ctrl_mapping["stick_as_dpad"] = bool(value)
-            log.info("[GAMEDECK MAPPING] L-stick as D-pad set to %s for every console", bool(value))
         except Exception as e:
             log.warning(f"[GAMEDECK MAPPING] Setting L-stick as D-pad everywhere failed: {e}")
 
@@ -6085,7 +6050,6 @@ class ExternalGameDeck:
             if console == "GBA" and (not player or player <= 1):
                 data["GBA_mapping"] = serialised
             write_emulator_config_file(cfg_path, data)
-            log.info(f"[GAMEDECK MAPPING] Saved {console} (player {player or 1}): {serialised}")
             self._gameplay_ctrl_mapping_cache.get(console, {}).pop(player or 1, None)
         except Exception as e:
             log.warning(f"[GAMEDECK MAPPING] Save failed for {console} player {player}: {e}")
@@ -6171,7 +6135,6 @@ class ExternalGameDeck:
         if not hasattr(self, "_ctrl_labels"):
             self._ctrl_labels = {}
         self._ctrl_labels[active] = "---"
-        log.info(f"[GAMEDECK MAPPING] Skipped {active} -- left unbound.")
         if active in BTN_SEQ:
             idx = BTN_SEQ.index(active)
             if idx + 1 < len(BTN_SEQ):
@@ -6855,7 +6818,6 @@ class ExternalGameDeck:
             self._ctrl_labels = {}
         self._remap_used_bits = []
         self._remap_reject_flash = None
-        log.info(f"[GAMEDECK MAPPING] Sequential remap started for {console} — press controller button for: {BTN_SEQ[0]}")
 
     def poll_xinput_for_remap(self, console=None):
         """Capture one physical button from any supported controller backend."""
@@ -6966,8 +6928,6 @@ class ExternalGameDeck:
         if pressed_bit in getattr(self, "_remap_used_bits", []):
             self._remap_reject_flash = time.monotonic()
             self._remap_reject_label = xi_label
-            log.info(f"[GAMEDECK MAPPING] Rejected {xi_label} for {active} -- "
-                  f"already mapped to another button on {console} this pass.")
             self._remap_await_release = True
             self._remap_last_capture_ts = now
             return
@@ -6987,7 +6947,6 @@ class ExternalGameDeck:
         if not hasattr(self, "_ctrl_labels"):
             self._ctrl_labels = {}
         self._ctrl_labels[active] = xi_label
-        log.info(f"[GAMEDECK MAPPING] {active} → {xi_label} (VK {target_vk:#04x})")
 
         self._remap_await_release = True
         self._remap_last_capture_ts = now
@@ -6999,7 +6958,6 @@ class ExternalGameDeck:
                 if idx + 1 < len(BTN_SEQ):
                     next_btn = BTN_SEQ[idx + 1]
                     self.ctrl_mapping_active_btn = next_btn
-                    log.info(f"[GAMEDECK MAPPING] Next: {next_btn}")
                 else:
                     self._seq_remap_active = False
                     self.ctrl_mapping_active_btn = None
@@ -7007,7 +6965,6 @@ class ExternalGameDeck:
                     self._save_libretro_xinput_map(console)
                     if console == "MENU":
                         self._apply_menu_nav_mapping_from_libretro_map()
-                    log.info(f"[GAMEDECK MAPPING] Sequential remap complete for {console} — saved.")
             else:
                 self._seq_remap_active = False
                 self.ctrl_mapping_active_btn = None
@@ -8369,7 +8326,6 @@ class ExternalGameDeck:
                 if xi_bit in _XI_LABELS
             }
             write_emulator_config_file(cfg_path, data)
-            log.info(f"[GAMEDECK MAPPING] Saved {console} player {player} gamepad map: {data[key]}")
         except Exception as e:
             log.warning(f"[GAMEDECK MAPPING] Gamepad-map save failed for {console} player {player}: {e}")
 
