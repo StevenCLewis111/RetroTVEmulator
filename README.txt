@@ -1,5 +1,4 @@
 Retro TV Emulator - Tutorial
-Text version of the website tutorial (no pictures or video).
 Getting Started
 What You Need
 Retro TV Emulator will turn your own downloaded video and music library into scheduled TV Stations and Music Visualizer Stations on a Windows PC. Channel 03 adds retro games front end and a DVD/media player (need optical drive for DVDs), Channel 04 is a TV Guide, and there are plenty of theme and static options to have fun with.
