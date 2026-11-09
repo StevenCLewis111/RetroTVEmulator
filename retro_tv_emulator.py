@@ -24463,11 +24463,13 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
                             _sg_norm = os.path.normpath(str(_sg_file))
                             _sg_probe = _read_file_probe_facts(_sg_norm)
                             _sg_real_dur = _sg_probe.get("duration") if _sg_probe else None
-                            if not _sg_real_dur:
-                                _sg_real_dur = _probe_duration_seconds_fast(_sg_norm)
-                            if (_sg_real_dur
-                                    and t_state.get("seek", 0) >= _sg_real_dur - _SEEK_GUARD_TAIL_MARGIN_S):
-                                _sg_real_dur = _probe_duration_seconds_fast(_sg_norm) or _sg_real_dur
+                            # WARNING: owner log 2026-11-08: this runs on the channel-load thread, which has the viewer waiting; without the priority scope the file's identity key waited behind the background scans and the load was set aside after 20 s.
+                            with _governor_priority_scope():
+                                if not _sg_real_dur:
+                                    _sg_real_dur = _probe_duration_seconds_fast(_sg_norm)
+                                if (_sg_real_dur
+                                        and t_state.get("seek", 0) >= _sg_real_dur - _SEEK_GUARD_TAIL_MARGIN_S):
+                                    _sg_real_dur = _probe_duration_seconds_fast(_sg_norm) or _sg_real_dur
                             if not _sg_real_dur or t_state.get("seek", 0) < _sg_real_dur - _SEEK_GUARD_TAIL_MARGIN_S:
                                 break
                             
