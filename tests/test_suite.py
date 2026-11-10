@@ -1394,14 +1394,13 @@ def suite_main_hooks():
     text = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
     calls = []
     fake_media = types.SimpleNamespace(release_whisper_model=lambda reason: calls.append(reason) or True)
-    ns = {"media": fake_media, "threading": threading, "_caption_prewarm_lock": threading.Lock(), "_caption_prewarm_started": True,
+    ns = {"media": fake_media, "threading": threading,
           "_tv_caption_cache": {"live_session": None, "pending_path": None},
           "_tv_caption_prefetch": {"session": None, "path": None}}
     exec(extract_source_by_header("_unload_caption_model(", text), ns)
     exec(extract_source_by_header("_maybe_unload_caption_model_after_show(", text), ns)
     ns["_maybe_unload_caption_model_after_show"]("show ended")
     check(calls == ["show ended"], "idle caption state: model released at the end of a show")
-    check(ns["_caption_prewarm_started"] is False, "pre-warm flag reset so the next captions-on warms again")
     for cache, prefetch, label in (
         ({"live_session": object(), "pending_path": None}, {"session": None, "path": None}, "live session running"),
         ({"live_session": None, "pending_path": "a"}, {"session": None, "path": None}, "next show still resolving"),
@@ -2250,7 +2249,6 @@ def make_env():
     return {
         "pygame": pygame, "menu_nav": mn, "log": types.SimpleNamespace(info=boom, warning=boom),
         "get_server_picker_entries": lambda db: list(db.config.get("_picker", [])),
-        "get_server_picker_selectable_count": ui.get_server_picker_selectable_count,
         "get_advanced_settings_menu_rows": ui.get_advanced_settings_menu_rows,
         "dvd_engine": None, "vlc_engine": None, "static_audio": None,
         "_disconnect_remote_server": boom, "_save_audio_track_pref": boom, "_fe_open": boom,
@@ -2281,28 +2279,8 @@ def tab_cases():
 
 def server_menu_cases():
     for role in (None, "server", "user"):
-        for sel in range(-1, 6):
+        for sel in list(range(-1, 8)) + list(range(10, 16)) + list(range(20, 26)):
             yield n6_FakeDb(server_role=role), {"menu_layer": "SERVER_MENU", "menu_selection_index": sel}
-
-
-def picker_cases():
-    for count in range(0, 5):
-        for sel in range(-1, 8):
-            yield n6_FakeDb(_picker=[{"name": "n%d" % i} for i in range(count)]), {"menu_layer": "SERVER_PICKER_MENU", "menu_selection_index": sel}
-
-
-def slots_cases():
-    for named in ({}, {"slot_a": "A"}, {"slot_a": "A", "slot_c": "C", "slot_f": "F"}, {sid: sid for sid in n6_FakeDb.SERVER_SLOT_IDS}):
-        for sel in range(0, 9):
-            yield n6_FakeDb(server_slots=dict(named)), {"menu_layer": "SERVER_SLOTS_MENU", "menu_selection_index": sel}
-
-
-def actions_cases():
-    for pending in (False, True):
-        for sel in range(-1, 6):
-            for target in (0, 2, 5):
-                yield n6_FakeDb(server_slots={"slot_a": "A", "slot_c": "C", "slot_f": "F"}), {
-                    "menu_layer": "SERVER_SLOT_ACTIONS", "menu_selection_index": sel, "server_slot_pending_delete": pending, "server_slot_name_target_row": target}
 
 
 def remap_cases():
@@ -2353,9 +2331,6 @@ def channel_sub_cases():
 LAYER_CASES = (
     ("TAB_SELECTION", None, tab_cases),
     ("SERVER_MENU", "SERVER_MENU", server_menu_cases),
-    ("SERVER_PICKER_MENU", "SERVER_PICKER_MENU", picker_cases),
-    ("SERVER_SLOTS_MENU", "SERVER_SLOTS_MENU", slots_cases),
-    ("SERVER_SLOT_ACTIONS", "SERVER_SLOT_ACTIONS", actions_cases),
     ("REMOTE_REMAP_LIST", "REMOTE_REMAP_LIST", remap_cases),
     ("AUDIO_TRACK_PICKER", "AUDIO_TRACK_PICKER", audio_cases),
     ("HOLIDAY_SUB_MENU", "HOLIDAY_SUB_MENU", holiday_cases),
@@ -4877,8 +4852,9 @@ def suite_menu_nav_numbers_in_governor():
                                  fact_names=("SYSTEM_SERVER_BUTTON_SELECTION", "SYSTEM_CAPTIONS_COLOR_SELECTION", "CHANNELS_COLS",
                                              "CHANNELS_ROWS_PER_PAGE", "CHANNELS_TOTAL", "CHANNELS_FIRST_NUMBER",
                                              "CHANNELS_PAGE_BUTTON_SELECTION", "CHANNELS_SETTINGS_SELECTION", "CHANNELS_CLOSE_SELECTION",
-                                             "GAMES_COLS", "GAMES_ROWS_PER_PAGE", "STICK_DZ_PLAYER_COUNT", "SERVER_SLOTS_COLUMNS",
-                                             "SERVER_SLOTS_ROWS", "COMMERCIALS_ROWS", "HOLIDAY_ROWS", "HOLIDAY_PICK_COLUMN",
+                                             "GAMES_COLS", "GAMES_ROWS_PER_PAGE", "STICK_DZ_PLAYER_COUNT", "SERVER_MENU_BOX_BASE",
+                                             "SERVER_MENU_USER_BASE", "SERVER_MENU_BOX_COLUMNS", "SERVER_MENU_BOX_COUNT", "SERVER_MENU_RENAME",
+                                             "SERVER_MENU_SCAN", "SERVER_MENU_RESET", "SERVER_MENU_CLEAR", "COMMERCIALS_ROWS", "HOLIDAY_ROWS", "HOLIDAY_PICK_COLUMN",
                                              "HOLIDAY_FORCE_COLUMN", "CHANNEL_SUB_MAX_COL", "DIGIT_ENTRY_MAX"),
                                  fact_prefixes=("DVD_CANON_",))
     check(reads >= 14, "menu_nav.py reads its timers from the governor table (%d reads)" % reads)
@@ -7135,7 +7111,7 @@ SCHED_RECORD_GLOBALS = [
     "_SCHED_MEMBERSHIP_CACHE_SECONDS", "_THROTTLED_LOG_INTERVAL_S", "_cold_primed_channels", "_cold_primed_channels_lock",
     "_duration_precache_inflight", "_intro_seed_lock", "_ondemand_duration_probe_next", "_probe_block_timeline_cache",
     "_probe_library_lock",
-    "SCHEDULER_REPEAT_GUARD_SECONDS", "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS", "BLOCK_ROTATION_CACHE_MAX_BLOCKS",
+    "SCHEDULER_REPEAT_GUARD_SECONDS", "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS", "SLOT_TAIL_HOLD_MAX_SECONDS", "BLOCK_ROTATION_CACHE_MAX_BLOCKS",
     "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_PENDING_PROBE_RESTORE_HOLD_SECONDS", "_PENDING_PROBE_RETRY_SECONDS", "_PENDING_PROBE_REQUEST_STALE_SECONDS", "_PENDING_PROBE_URGENT_COUNT", "_PENDING_PROBE_STORE_BATCH_S", "_app_shutting_down", "_pending_probe_state", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
 ]
 
@@ -10121,6 +10097,8 @@ def suite_file_facts_hub():
             os.remove(sidecar)
             check(media.resolve_caption_source(movie)["kind"] is None, "a saved caption file that is gone is not used")
             extracted = make_file("tv_1.srt", 40)
+            with open(extracted, "w", encoding="utf-8") as handle:
+                handle.write("1\n00:00:01,000 --> 00:00:02,000\nhi\n\n")
             check(media.note_caption_source(movie, "embedded", extracted) and media.resolve_caption_source(movie)["kind"] == "cache",
                   "an extracted embedded caption file is found again from the library")
             newer = os.path.join(tmp, "movie.en.srt")
@@ -12283,6 +12261,144 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
             with mock.patch.dict(gov._state, {"captions_memory_ok": None}), mock.patch.object(gov, "caption_memory_check", lambda a=answer: a):
                 self.assertFalse(gov.feature_locked("tv_captions_enabled", "standard"))
                 self.assertFalse(gov.feature_locked("dvd_captions_enabled", "lite"))
+
+    def test_a_pc_with_too_little_total_memory_is_refused_however_much_is_free_at_boot(self):
+        gov = self._gov()
+        with mock.patch.object(gov, "_read_ram_gb", lambda: (gov.CAPTION_MODEL_MIN_TOTAL_RAM_GB - 2.0, 3.0)):
+            self.assertFalse(gov.caption_memory_check()[0])
+        with mock.patch.object(gov, "_read_ram_gb", lambda: (gov.CAPTION_MODEL_MIN_TOTAL_RAM_GB + 8.0, 6.0)):
+            self.assertTrue(gov.caption_memory_check()[0])
+
+    def test_a_load_that_never_finished_locks_captions_on_the_next_boot_until_the_memory_changes(self):
+        gov = self._gov()
+        folder = tempfile.mkdtemp(prefix="rtv-capmark-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        gov.set_caption_load_marker(folder)
+        self.addCleanup(gov.set_caption_load_marker, None)
+        with mock.patch.object(gov, "_read_ram_gb", lambda: (16.0, 10.0)):
+            self.assertFalse(gov.caption_load_interrupted())
+            gov.caption_load_begin()
+            self.assertTrue(gov.caption_load_interrupted(), "the marker left by a killed load locks captions")
+            with mock.patch.dict(gov._state, {"captions_memory_ok": None}):
+                self.assertTrue(gov.feature_locked("tv_captions_enabled", "standard"))
+            gov.caption_load_done()
+            self.assertFalse(gov.caption_load_interrupted(), "a load that finished leaves no marker")
+            gov.caption_load_begin()
+        with mock.patch.object(gov, "_read_ram_gb", lambda: (32.0, 20.0)):
+            self.assertFalse(gov.caption_load_interrupted(), "more memory in the PC ends the lock")
+            self.assertFalse(os.path.exists(os.path.join(folder, gov.CAPTION_LOAD_MARKER_NAME)))
+
+    def test_the_caption_model_load_writes_and_clears_the_marker_and_respects_the_boot_lock(self):
+        text = read(_media_script_path())
+        load = text[text.index("def _get_whisper_model"):text.index("def _live_asr_running")]
+        self.assertIn("caption_load_begin()", load)
+        self.assertEqual(load.count("caption_load_done()"), 1, "cleared on a survived failure")
+        self.assertIn("caption_load_resident()", load)
+        self.assertIn("caption_watch_start(_caption_memory_shed)", load)
+        self.assertIn("caption_memory_locked()", text[text.index("def _caption_memory_allows_load"):text.index("def _get_whisper_model")])
+
+    def test_a_marker_for_a_model_in_memory_locks_captions_only_after_an_unclean_run(self):
+        gov = self._gov()
+        folder = tempfile.mkdtemp(prefix="rtv-capmark-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        gov.set_caption_load_marker(folder)
+        self.addCleanup(gov.set_caption_load_marker, None)
+        self.addCleanup(gov.set_previous_run_unclean, False)
+        with mock.patch.object(gov, "_read_ram_gb", lambda: (16.0, 10.0)):
+            gov.caption_load_begin()
+            gov.caption_load_resident()
+            gov.set_previous_run_unclean(False)
+            self.assertFalse(gov.caption_load_interrupted(), "a clean quit with the model loaded is no reason to lock")
+            self.assertFalse(os.path.exists(os.path.join(folder, gov.CAPTION_LOAD_MARKER_NAME)))
+            gov.caption_load_resident()
+            gov.set_previous_run_unclean(True)
+            self.assertTrue(gov.caption_load_interrupted(), "a crash with the model loaded locks captions on the next boot")
+
+    def test_the_load_needs_room_before_windows_runs_out_of_memory(self):
+        gov = self._gov()
+        with mock.patch.object(gov, "_read_ram_gb", lambda: (16.0, 10.0)):
+            with mock.patch.object(gov, "read_commit_gb", lambda: gov.CAPTION_LOAD_MIN_COMMIT_GB - 0.5):
+                self.assertFalse(gov.caption_memory_check()[0])
+            with mock.patch.object(gov, "read_commit_gb", lambda: gov.CAPTION_LOAD_MIN_COMMIT_GB + 1.0):
+                self.assertTrue(gov.caption_memory_check()[0])
+            with mock.patch.object(gov, "read_commit_gb", lambda: 0.0):
+                self.assertTrue(gov.caption_memory_check()[0], "memory that cannot be read never blocks")
+
+    def test_the_memory_watch_switches_captions_off_when_the_pc_runs_low_and_not_before(self):
+        gov = self._gov()
+        shed = []
+        reads = iter([(16.0, 4.0), (16.0, 0.3), (16.0, 0.3), (16.0, 0.3)])
+        with mock.patch.dict(gov._state, {"captions_memory_ok": True}), \
+                mock.patch.object(gov, "CAPTION_WATCH_INTERVAL_SECONDS", 0.01), \
+                mock.patch.object(gov, "_read_ram_gb", lambda: next(reads, (16.0, 0.3))), \
+                mock.patch.object(gov, "read_commit_gb", lambda: 6.0):
+            gov.caption_watch_start(lambda *a: shed.append(a))
+            for _ in range(200):
+                if shed:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(shed, "two low readings in a row switch captions off")
+            self.assertTrue(gov.feature_locked("tv_captions_enabled", "standard"))
+            self.assertTrue(gov.feature_locked("dvd_captions_enabled", "lite"))
+            gov.caption_watch_stop()
+
+    def test_a_single_dip_in_free_memory_does_not_switch_captions_off(self):
+        gov = self._gov()
+        shed = []
+        reads = iter([(16.0, 0.3), (16.0, 5.0), (16.0, 0.3), (16.0, 5.0)])
+        with mock.patch.dict(gov._state, {"captions_memory_ok": True}), \
+                mock.patch.object(gov, "CAPTION_WATCH_INTERVAL_SECONDS", 0.01), \
+                mock.patch.object(gov, "_read_ram_gb", lambda: next(reads, (16.0, 5.0))), \
+                mock.patch.object(gov, "read_commit_gb", lambda: 6.0):
+            gov.caption_watch_start(lambda *a: shed.append(a))
+            time.sleep(0.3)
+            gov.caption_watch_stop()
+            self.assertEqual(shed, [])
+            self.assertFalse(gov.feature_locked("tv_captions_enabled", "standard"))
+
+    def test_the_unload_stops_the_watch_and_clears_the_marker_and_start_hands_over_the_unclean_flag(self):
+        text = read(_media_script_path())
+        unload = text[text.index("def release_whisper_model"):text.index("# SECTION: Speech-to-text core")]
+        self.assertIn("caption_watch_stop()", unload)
+        self.assertIn("caption_load_done()", unload)
+        main = read(os.path.join(ROOT, "retro_tv_emulator.py"))
+        self.assertLess(main.index("set_previous_run_unclean(_previous_run_unclean)"), main.index("performance_governor.start(\n"))
+
+    def test_the_caption_model_is_not_loaded_at_launch_or_when_the_switch_is_turned_on(self):
+        main = read(os.path.join(ROOT, "retro_tv_emulator.py"))
+        self.assertNotIn("_start_caption_model_prewarm", main)
+        self.assertNotIn("caption-model-prewarm", main)
+        text = read(_media_script_path())
+        self.assertEqual(text.count("= _get_whisper_model()"), 2, "only the two transcription paths load it")
+
+    def test_the_model_load_and_unload_log_the_programs_memory(self):
+        text = read(_media_script_path())
+        self.assertIn("_start_caption_model_process(", text[text.index("def _get_whisper_model"):text.index("def _live_asr_running")])
+        self.assertIn("read_process_memory_mb()", text[text.index("def release_whisper_model"):text.index("# SECTION: Speech-to-text core")])
+
+    def _idle_run(self, busy):
+        freed = []
+        fake = mock.Mock()
+        fake.WHISPER_IDLE_UNLOAD_SECONDS = 0.6
+        fake.WHISPER_IDLE_CHECK_SECONDS = 0.5
+        with mock.patch.object(media, "_whisper_model", object()), mock.patch.object(media, "_perf_governor", fake), \
+                mock.patch.object(media, "_whisper_idle_thread", None), \
+                mock.patch.object(media, "_live_asr_running", lambda: busy), \
+                mock.patch.object(media, "release_whisper_model", lambda reason: freed.append(reason) or media.__dict__.__setitem__("_whisper_model", None)):
+            media._whisper_idle_watch_start()
+            time.sleep(2.2)
+            thread = media._whisper_idle_thread
+            media.__dict__["_whisper_model"] = None
+            thread.join(2.0)
+        return freed
+
+    def test_an_idle_caption_model_is_freed_after_the_governors_idle_time(self):
+        freed = self._idle_run(busy=False)
+        self.assertEqual(len(freed), 1)
+        self.assertIn("idle", freed[0])
+
+    def test_a_running_live_transcription_keeps_the_model(self):
+        self.assertEqual(self._idle_run(busy=True), [])
 
     def test_start_runs_the_caption_memory_scan_with_the_boot_scan(self):
         self.assertIn("scan_caption_memory()", inspect.getsource(self._gov().start))
@@ -16049,7 +16165,7 @@ class TestFailurePointTextGameDeck(_SectionCase):
 
 
 def suite_failure_point_text_other_scripts():
-    for name, expected in (("media.py", 33), ("performance_governor.py", 8), ("ui.py", 12), ("libretro_core.py", 5), ("media_library.py", 31)):
+    for name, expected in (("media.py", 36), ("performance_governor.py", 12), ("ui.py", 12), ("libretro_core.py", 5), ("media_library.py", 31)):
         converted_handler_checks(name, expected)
     check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
 
@@ -18618,6 +18734,535 @@ def _stepping_clock():
     return types.SimpleNamespace(monotonic=monotonic, sleep=lambda seconds: None)
 
 
+class TestCaptionModelRunsInItsOwnProcess(unittest.TestCase):
+    """The caption model lives in a separate copy of the program, so a crash inside the model library cannot take the program down, and a locked Live Captions switch is also saved as off."""
+
+    FAKE_LIBRARY = (
+        "import os\n"
+        "class Seg:\n"
+        "    def __init__(self, text): self.text = text\n"
+        "class Info:\n"
+        "    language = 'en'\n"
+        "class WhisperModel:\n"
+        "    def __init__(self, size, **kwargs):\n"
+        "        if os.environ.get('FAKE_LOAD') == 'crash': os._exit(139)\n"
+        "        if os.environ.get('FAKE_LOAD') == 'error': raise ValueError('no such model')\n"
+        "    def transcribe(self, audio, **kwargs):\n"
+        "        if audio == 'crash': os._exit(139)\n"
+        "        if audio == 'error': raise ValueError('bad audio')\n"
+        "        return iter([Seg('hello ' + str(audio)), Seg('again')]), Info()\n")
+
+    FAKE_VAD = (
+        "import os\n"
+        "class VadOptions:\n"
+        "    def __init__(self, threshold=0.5, min_silence_duration_ms=2000, min_speech_duration_ms=250):\n"
+        "        self.threshold, self.silence, self.speech = threshold, min_silence_duration_ms, min_speech_duration_ms\n"
+        "def get_speech_timestamps(audio, options):\n"
+        "    if audio == 'crash': os._exit(139)\n"
+        "    return [{'start': 0, 'end': 16000, 'options': (options.threshold, options.silence, options.speech)}]\n")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        os.makedirs(os.path.join(self.tmp, "faster_whisper"))
+        with open(os.path.join(self.tmp, "faster_whisper", "__init__.py"), "w", encoding="utf-8") as handle:
+            handle.write(self.FAKE_LIBRARY)
+        with open(os.path.join(self.tmp, "faster_whisper", "vad.py"), "w", encoding="utf-8") as handle:
+            handle.write(self.FAKE_VAD)
+        gov = types.SimpleNamespace(caption_mark_crashed=lambda: self.crashed.append(1), caption_watch_stop=lambda: None,
+                                    _caption_marker={"path": os.path.join(self.tmp, "caption_load.marker")})
+        self.crashed, self.refused = [], []
+        patches = [mock.patch.object(media, "_perf_governor", gov),
+                   mock.patch.object(media, "resolve_whisper_model_dir", lambda: self.tmp),
+                   mock.patch.object(media, "_caption_memory_refusal_handler", lambda *a: self.refused.append(a)),
+                   mock.patch.dict(os.environ, {"PYTHONPATH": self.tmp + os.pathsep + os.environ.get("PYTHONPATH", "")}),
+                   mock.patch.object(sys, "path", [self.tmp] + sys.path)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(sys.modules.pop, "faster_whisper", None)
+
+    def _start(self, load=""):
+        with mock.patch.dict(os.environ, {"FAKE_LOAD": load}):
+            return media._start_caption_model_process(1)
+
+    def test_segments_come_back_from_the_other_process(self):
+        model = self._start()
+        self.addCleanup(model.close)
+        segments, info = model.transcribe("clip", language="en")
+        self.assertEqual([seg.text for seg in segments], ["hello clip", "again"])
+        self.assertEqual(info.language, "en")
+
+    def test_speech_spans_are_found_in_the_other_process(self):
+        model = self._start()
+        self.addCleanup(model.close)
+        spans = model.speech_spans("clip", 0.25, 500, 150)
+        self.assertEqual(spans[0]["options"], (0.25, 500, 150))
+        self.assertEqual(len(list(model.transcribe("clip")[0])), 2)
+
+    def test_a_crash_while_finding_speech_leaves_this_process_running_and_locks_captions(self):
+        model = self._start()
+        media._whisper_model = model
+        self.addCleanup(setattr, media, "_whisper_model", None)
+        self.addCleanup(setattr, media, "_whisper_model_load_failed", False)
+        with self.assertRaises(RuntimeError):
+            model.speech_spans("crash", 0.25, 500, 150)
+        self.assertEqual(self.crashed, [1])
+        self.assertEqual(len(self.refused), 1)
+
+    def test_this_process_never_loads_the_voice_activity_library(self):
+        _chunk = inspect.getsource(media._asr_transcribe_chunk)
+        self.assertNotIn("faster_whisper.vad", _chunk)
+        self.assertNotIn("get_speech_timestamps", _chunk)
+        self.assertIn("model.speech_spans(", _chunk)
+
+    def test_the_library_silence_gate_is_off_so_a_clip_of_speech_is_not_thrown_away(self):
+        import numpy
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def speech_spans(self, audio, threshold, min_silence_ms, min_speech_ms):
+                return [{"start": 0, "end": 32000}]
+
+            def transcribe(self, audio, **kwargs):
+                self.calls.append(kwargs)
+                seg = types.SimpleNamespace(start=0.0, end=1.5, text="hello there", words=[], no_speech_prob=0.1, avg_logprob=-0.2)
+                return iter([seg]), None
+        fake_audio = types.ModuleType("faster_whisper.audio")
+        fake_audio.decode_audio = lambda path: numpy.zeros(32000, dtype="float32")
+        fake_package = types.ModuleType("faster_whisper")
+        fake_package.audio = fake_audio
+        model = FakeModel()
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake_package, "faster_whisper.audio": fake_audio}), \
+                mock.patch.object(media, "_asr_vad_utils_load_failed", False):
+            segments = media._asr_transcribe_chunk(model, "x.wav", "en", 3, temperature=0.0)
+        self.assertIn("no_speech_threshold", model.calls[0])
+        self.assertIsNone(model.calls[0]["no_speech_threshold"])
+        self.assertIsNone(model.calls[0]["log_prob_threshold"])
+        self.assertAlmostEqual(segments.said_sec, 1.5, places=2)
+
+    def test_every_finished_commercial_is_logged_with_its_slot_and_where_it_ended(self):
+        src = open(MAIN_SCRIPT, encoding="utf-8").read()
+        self.assertIn("[AD PLAYED]", src)
+        self.assertIn("_finish_pos_ms, _finish_len_ms = _pos_ms, _len_ms", src)
+        self.assertLess(src.index("_peek_left = None"), src.index("[AD PLAYED]"))
+
+    def test_an_ordinary_error_in_the_other_process_is_raised_here_and_it_keeps_running(self):
+        model = self._start()
+        self.addCleanup(model.close)
+        with self.assertRaises(RuntimeError):
+            model.transcribe("error")
+        self.assertEqual(len(list(model.transcribe("clip")[0])), 2)
+        self.assertEqual(self.crashed, [])
+
+    def test_a_crash_while_transcribing_leaves_this_process_running_and_locks_captions(self):
+        model = self._start()
+        media._whisper_model = model
+        self.addCleanup(setattr, media, "_whisper_model", None)
+        self.addCleanup(setattr, media, "_whisper_model_load_failed", False)
+        with self.assertRaises(RuntimeError):
+            model.transcribe("crash")
+        self.assertEqual(self.crashed, [1])
+        self.assertEqual(len(self.refused), 1)
+        self.assertIsNone(media._whisper_model)
+        self.assertTrue(media._whisper_model_load_failed)
+
+    def test_a_crash_while_loading_locks_captions_without_stopping_this_process(self):
+        self.addCleanup(setattr, media, "_whisper_model_load_failed", False)
+        self.assertIsNone(self._start(load="crash"))
+        self.assertEqual(self.crashed, [1])
+        self.assertEqual(len(self.refused), 1)
+
+    def test_an_ordinary_load_error_does_not_lock_captions(self):
+        self.assertIsNone(self._start(load="error"))
+        self.assertEqual(self.crashed, [])
+
+    def test_the_other_process_reports_itself_and_leaves_a_crash_file(self):
+        with self.assertLogs("media", level="INFO") as logged:
+            model = self._start()
+        self.addCleanup(model.close)
+        _text = "\n".join(logged.output)
+        self.assertIn("caption model process", _text)
+        self.assertIn("is up:", _text)
+        self.assertTrue(os.path.isfile(os.path.join(self.tmp, "caption_worker_crash.txt")))
+        self.assertIn("started", media._caption_worker_crash_tail())
+
+    def test_a_death_logs_the_other_processs_own_crash_report(self):
+        self.addCleanup(setattr, media, "_whisper_model_load_failed", False)
+        model = self._start()
+        media._whisper_model = model
+        self.addCleanup(setattr, media, "_whisper_model", None)
+        with self.assertLogs("media", level="WARNING") as logged:
+            with self.assertRaises(RuntimeError):
+                model.transcribe("crash")
+        self.assertIn("Its own crash report", "\n".join(logged.output))
+
+    def test_the_program_lists_its_native_libraries_before_it_starts_the_other_process(self):
+        media.set_native_libraries_reporter(lambda: "3 libraries: a.dll")
+        self.addCleanup(media.set_native_libraries_reporter, None)
+        with self.assertLogs("media", level="INFO") as logged:
+            model = self._start()
+        self.addCleanup(model.close)
+        self.assertIn("3 libraries: a.dll", "\n".join(logged.output))
+
+    def test_the_debugging_hooks_are_wired(self):
+        _src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        for _needle in ("media.set_native_libraries_reporter(_loaded_native_libraries_note)", "caption_worker_crash.txt", "[VOLUME] %s: saved volume", "faulthandler.enable(file=_worker_crash_file"):
+            self.assertIn(_needle.replace("faulthandler.enable", "_worker_faulthandler.enable"), _src)
+        self.assertLess(_src.index("def _loaded_native_libraries_note"), _src.index('if "--caption-model-worker" in sys.argv'))
+        self.assertEqual(media.CAPTION_WORKER_CRASH_FILE, "caption_worker_crash.txt")
+
+    def test_source_order_and_boot_switch(self):
+        _src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        self.assertLess(_src.index('if "--caption-model-worker" in sys.argv'), _src.index("_IS_RELAUNCH = "))
+        self.assertLess(_src.index('if "--caption-model-worker" in sys.argv'), _src.index("faulthandler.enable(file=_native_crash_stream"))
+        _media = open(os.path.join(ROOT, "media.py"), encoding="utf-8").read()
+        _body = _media[_media.index("def _get_whisper_model"):_media.index("def _live_asr_running")]
+        self.assertNotIn("WhisperModel(", _body)
+        self.assertIn("_start_caption_model_process(", _body)
+        self.assertIn("def _advance_status_banner_streaks():\n    _switch_off_locked_captions_at_boot()\n    _apply_caption_memory_refusal()", _src)
+
+    def test_a_locked_switch_that_is_still_saved_as_on_is_switched_off_at_boot(self):
+        _flag = {"pending": False}
+        _gov = types.SimpleNamespace(caption_memory_locked=lambda: True)
+        _db = types.SimpleNamespace(config={"tv_captions_enabled": True, "dvd_captions_enabled": False})
+        ns = {"_caption_lock_boot_checked": False, "_caption_memory_refusal_pending": False, "db": _db, "performance_governor": _gov}
+        exec(main_function_code("_switch_off_locked_captions_at_boot"), ns)
+        ns["_switch_off_locked_captions_at_boot"]()
+        self.assertTrue(ns["_caption_memory_refusal_pending"])
+        ns["_caption_memory_refusal_pending"] = False
+        ns["_switch_off_locked_captions_at_boot"]()
+        self.assertFalse(ns["_caption_memory_refusal_pending"])
+
+
+class TestCrashRestartAndModelFilesNote(unittest.TestCase):
+    """A crash inside native code is restarted by Windows, fullscreen, and the caption model's files are named in the log before it loads."""
+
+    def test_crash_restart_helpers_are_defined_before_the_governor_thread_can_call_them(self):
+        _src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "retro_tv_emulator.py"), encoding="utf-8").read()
+        _call_at = _src.index("def _start_performance_governor")
+        for _name in ("def _register_crash_restart", "def _build_relaunch_command", "CRASH_RESTART_FLAGS ="):
+            self.assertLess(_src.index(_name), _call_at, _name + " must come before the background thread that calls it")
+
+    def _register(self, platform, result=0):
+        import subprocess
+        calls = []
+        kernel = types.SimpleNamespace(RegisterApplicationRestart=lambda line, flags: calls.append((line.value, flags.value)) or result)
+        fake_ctypes = types.SimpleNamespace(windll=types.SimpleNamespace(kernel32=kernel), c_wchar_p=lambda v: types.SimpleNamespace(value=v),
+                                            c_ulong=lambda v: types.SimpleNamespace(value=v))
+        ns = {"sys": types.SimpleNamespace(platform=platform, argv=["app.exe", "--as-shell", "--relaunched"]),
+              "subprocess": subprocess, "log": logging.getLogger("crash_restart_test"), "CRASH_RESTART_FLAGS": 14}
+        with mock.patch.dict(sys.modules, {"ctypes": fake_ctypes}):
+            exec(main_function_code("_register_crash_restart"), ns)
+            return ns["_register_crash_restart"](), calls
+
+    def test_windows_is_asked_to_restart_the_app_with_the_relaunched_flag_once(self):
+        ok, calls = self._register("win32")
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("--as-shell --relaunched", 14)])
+
+    def test_nothing_is_asked_of_other_systems_and_a_refusal_is_reported_not_raised(self):
+        ok, calls = self._register("linux")
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+        ok, _calls = self._register("win32", result=1)
+        self.assertFalse(ok)
+
+    def test_the_restart_is_asked_for_at_start_up_and_only_after_a_crash(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        body = src[src.index("def _start_performance_governor():"):]
+        self.assertTrue(body[:body.index("\n    if performance_governor is None:")].count("_register_crash_restart()") == 1)
+        gov = open(os.path.join(ROOT, "assets", "performance_governor.py"), encoding="utf-8").read()
+        self.assertIn("CRASH_RESTART_FLAGS = 14", gov)
+
+    def test_the_model_files_note_lists_sizes_and_unfinished_downloads(self):
+        import media
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, f"models--Systran--faster-whisper-{media._ASR_MODEL_SIZE}")
+            os.makedirs(os.path.join(repo, "snapshots", "abc"))
+            os.makedirs(os.path.join(repo, "blobs"))
+            with open(os.path.join(repo, "snapshots", "abc", "model.bin"), "wb") as handle:
+                handle.write(b"x" * 2048)
+            with open(os.path.join(repo, "blobs", "deadbeef.incomplete"), "wb") as handle:
+                handle.write(b"y" * 1024)
+            with mock.patch.object(media, "resolve_whisper_model_dir", return_value=tmp):
+                note = media._whisper_model_files_note()
+            self.assertIn("model.bin=0.0MB", note)
+            self.assertIn(".incomplete", note)
+            with mock.patch.object(media, "resolve_whisper_model_dir", return_value=os.path.join(tmp, "nothing")):
+                self.assertIn("no files found", media._whisper_model_files_note())
+
+    def test_the_note_is_logged_before_the_model_is_built(self):
+        import media
+        src = open(os.path.join(ROOT, "media.py"), encoding="utf-8").read()
+        body = src[src.index("def _get_whisper_model():"):]
+        self.assertLess(body.index("_whisper_model_files_note()"), body.index("_start_caption_model_process("))
+
+
+class TestCaptionFilesAreCheckedWhenMade(unittest.TestCase):
+    """A caption file the app makes with ffmpeg is checked before it is used, and made again when it is bad."""
+
+    GOOD = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n"
+
+    def _run_build(self, outputs, existing_final=None):
+        import media
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "x.srt")
+            if existing_final is not None:
+                with open(out_path, "w", encoding="utf-8") as handle:
+                    handle.write(existing_final)
+            queue = list(outputs)
+            calls = []
+
+            def fake_run(command, **kwargs):
+                calls.append(list(command))
+                text = queue.pop(0)
+                if text is not None:
+                    with open(command[-1], "w", encoding="utf-8") as handle:
+                        handle.write(text)
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            with mock.patch("subprocess.run", fake_run), mock.patch.object(media, "_resolve_ffmpeg_path", return_value="ffmpeg"):
+                ok = media._extract_embedded_subtitle_to_file("v.mkv", 2, out_path)
+            final = open(out_path, encoding="utf-8").read() if os.path.isfile(out_path) else None
+            return ok, calls, final, os.path.exists(os.path.join(tmp, "x.part.srt"))
+
+    def test_a_good_file_is_moved_into_place_and_no_part_file_is_left(self):
+        ok, calls, final, part = self._run_build([self.GOOD])
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(final, self.GOOD)
+        self.assertFalse(part)
+        self.assertEqual(calls[0][-3:-1], ["-f", "srt"])
+
+    def test_a_bad_first_try_is_deleted_and_built_again(self):
+        ok, calls, final, part = self._run_build(["garbage with no cues", self.GOOD])
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(final, self.GOOD)
+        self.assertFalse(part)
+
+    def test_two_bad_tries_give_up_without_leaving_a_file(self):
+        ok, calls, final, part = self._run_build([None, ""])
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(final)
+        self.assertFalse(part)
+
+    def test_a_bad_saved_file_does_not_stop_a_good_one_replacing_it(self):
+        ok, _calls, final, _part = self._run_build([self.GOOD], existing_final="cut short")
+        self.assertTrue(ok)
+        self.assertEqual(final, self.GOOD)
+
+    def test_a_saved_embedded_caption_file_that_is_unreadable_is_not_trusted(self):
+        import media
+        with tempfile.TemporaryDirectory() as tmp:
+            video = os.path.join(tmp, "v.mkv")
+            saved = os.path.join(tmp, "saved.srt")
+            for path, text in ((video, "video"), (saved, "cut short")):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            facts = {"caption_kind": "embedded", "caption_srt_path": saved}
+            with mock.patch.object(media, "file_facts", return_value=facts), \
+                    mock.patch.object(media, "_find_sidecar_caption_file", return_value=None), \
+                    mock.patch.object(media, "_probe_embedded_subtitle_streams", return_value=[{"index": 3, "is_text": True}]), \
+                    mock.patch.object(media, "filename_says_captions_baked_in", return_value=False):
+                info = media.resolve_caption_source(video)
+            self.assertEqual(info["kind"], "embedded")
+            with open(saved, "w", encoding="utf-8") as handle:
+                handle.write(self.GOOD)
+            with mock.patch.object(media, "file_facts", return_value=facts), \
+                    mock.patch.object(media, "_find_sidecar_caption_file", return_value=None):
+                self.assertEqual(media.resolve_caption_source(video)["kind"], "cache")
+
+
+class TestCaptionsKeepTheirSpotOnTheScreen(unittest.TestCase):
+    """Captions sit the same share of the screen's height above its bottom edge however the picture is boxed."""
+
+    def _source(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        start = src.index("def _draw_caption_overlay(")
+        return src[start:src.index("\n\n\n_channel_playback_failures", start)]
+
+    def test_the_caption_box_is_as_tall_as_the_whole_screen_and_only_as_wide_as_the_content_box(self):
+        body = self._source()
+        self.assertIn("caption_rect = pygame.Rect(content_rect.x, 0, content_rect.width, sh)", body)
+        self.assertNotIn("caption_rect = content_rect", body)
+
+    def test_the_block_is_centred_between_the_badge_bottom_and_the_screen_bottom_for_two_rows(self):
+        body = self._source()
+        self.assertIn("_badge_bottom = _watermark_badge_bottom(content_rect)", body)
+        self.assertIn("line1_y = _badge_bottom + (_band_h - _block_h) // 2", body)
+        self.assertIn("_block_h = _row_h * 2 + line_gap", body)
+
+    def test_one_row_keeps_the_top_rows_place_and_a_second_row_sits_under_it(self):
+        body = self._source()
+        self.assertIn("line2_y = line1_y + _row_h + line_gap", body)
+        one_row = body[body.index("if surf2 is None:"):body.index("else:", body.index("if surf2 is None:"))]
+        self.assertIn("line1_y", one_row)
+        self.assertNotIn("surf1.get_height()", body[body.index("line1_y = _badge_bottom"):])
+
+    def test_the_position_does_not_depend_on_the_watermark_being_on_or_on_how_many_rows_show(self):
+        body = self._source()
+        placement = body[body.index("_badge_bottom ="):body.index("_outline_px")]
+        self.assertNotIn("watermark_enabled", placement)
+        self.assertNotIn("surf2", placement.split("surf2 = ")[0] if "surf2 = " in placement else placement)
+
+    def test_the_text_shrinks_to_fit_when_two_rows_are_taller_than_the_band(self):
+        body = self._source()
+        self.assertIn("if _block_h > _fit_h and font_size > 10:", body)
+
+    def test_the_badge_bottom_is_worked_out_from_the_rectangle_the_watermark_is_drawn_in(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        helper = src[src.index("def _watermark_badge_bottom("):src.index("def _draw_caption_overlay(")]
+        self.assertIn("_watermark_bounds_rect(content_rect)", helper)
+        self.assertNotIn("content_rect.bottom", helper)
+        self.assertIn("_wm_bounds = _watermark_bounds_rect(content_rect)", src)
+
+    def test_captions_and_watermark_agree_on_the_badge_bottom_on_a_boxed_screen(self):
+        src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+        helper_src = src[src.index("def _watermark_badge_bottom("):src.index("def _draw_caption_overlay(")]
+        picture = pygame.Rect(0, 108, 1152, 648)
+        space = {"_watermark_bounds_rect": lambda fallback: picture, "_active_bezel_stem_if_on": lambda: None,
+                 "_WATERMARK_BEZEL_EXTRA_OFFSET": {}, "_WATERMARK_MARGIN_FRAC": 0.12}
+        exec(helper_src, space)
+        box = pygame.Rect(0, 0, 1152, 864)
+        bottom = space["_watermark_badge_bottom"](box)
+        margin = max(6, int(picture.height * 0.12))
+        self.assertEqual(bottom, picture.bottom - margin)
+        self.assertNotEqual(bottom, box.bottom - max(6, int(box.height * 0.12)))
+
+class TestWatermarkStaysOnThroughAShow(unittest.TestCase):
+    """The Water Mark badge hides for a moment only while a file's picture settles, and says why when it goes away later."""
+
+    def _src(self):
+        return open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+
+    def test_a_move_of_the_picture_later_in_the_show_does_not_hide_the_badge(self):
+        src = self._src()
+        body = src[src.index("def _draw_watermark("):src.index("_STARTUP_REG_PATH")]
+        self.assertIn('state_key != "main" or _wm_now - app_state.get("last_video_play_started_at", 0) < _WATERMARK_SETTLE_MS', body)
+        hide = body.index('_wm_state["hide_until"] = _wm_now + _WATERMARK_REPOSITION_HIDE_MS')
+        self.assertLess(body.index("_WATERMARK_SETTLE_MS"), hide)
+        self.assertIn("the badge followed it without hiding", body)
+
+    def test_the_settle_time_lives_in_the_governor_and_matches_its_fallback(self):
+        import performance_governor as gov
+        src = self._src()
+        self.assertIn("_WATERMARK_SETTLE_MS = performance_governor.WATERMARK_SETTLE_MS if performance_governor is not None else %d" % gov.WATERMARK_SETTLE_MS, src)
+
+    def test_a_badge_that_goes_away_names_the_condition_that_hid_it(self):
+        src = self._src()
+        self.assertIn("_wm_blockers", src)
+        self.assertIn("the badge was on screen a moment ago and is now hidden because", src)
+        self.assertIn('app_state["_watermark_drawn_at"] = _wm_now', src)
+
+
+class TestBurnedInScanLogsItsReason(unittest.TestCase):
+    """The burned-in caption scan says what it saw, so a wrong verdict can be traced from the log."""
+
+    def test_a_found_verdict_names_the_seconds_and_heights_it_was_based_on(self):
+        import numpy
+        import media_library as ml
+        frame = numpy.zeros((ml._BI_FRAME_H, ml._BI_FRAME_W), dtype=numpy.uint8)
+        diag = {}
+        with mock.patch.object(ml, "_bi_grab_frame", return_value=frame), \
+                mock.patch.object(ml, "_bi_frame_text_bands_safe", side_effect=lambda f, _n=iter(range(1000)): [(0.9, 0.20 + 0.03 * (next(_n) % 6), 0.80)]), \
+                mock.patch.object(ml, "_resolve_ffmpeg", return_value="ffmpeg"):
+            verdict = ml.detect_burned_in_captions("x.mkv", duration=1000.0, diag=diag)
+        self.assertTrue(verdict)
+        self.assertEqual(diag["reason"], "text_band_found")
+        self.assertEqual(len(diag["seconds"]), diag["positive_frames"])
+        self.assertTrue(all(h == 0.9 for h in diag["heights"]))
+
+    def _frame(self, ml, boxes):
+        import numpy
+        frame = numpy.full((ml._BI_FRAME_H, ml._BI_FRAME_W), 40, dtype=numpy.uint8)
+        for top, bottom, left, right in boxes:
+            for row in range(top, bottom):
+                frame[row, left:right] = 20
+                for start in range(left + 2, right - 4, 6):
+                    frame[row, start:start + 2] = 250
+        return frame
+
+    def test_a_graphic_that_reaches_the_bottom_right_is_not_a_caption_but_centred_text_is(self):
+        import media_library as ml
+        h, w = ml._BI_FRAME_H, ml._BI_FRAME_W
+        graphic = self._frame(ml, [(int(h * 0.85), int(h * 0.92), int(w * 0.50), int(w * 0.97))])
+        centred = self._frame(ml, [(int(h * 0.85), int(h * 0.92), int(w * 0.30), int(w * 0.70))])
+        self.assertEqual(ml._bi_frame_text_bands(graphic), [])
+        self.assertTrue(ml._bi_frame_text_bands(centred))
+        old = (ml._BI_REGION_LEFT_FRAC, ml._BI_REGION_RIGHT_FRAC, ml._BI_BAND_CENTER_RANGE)
+        try:
+            ml._BI_REGION_LEFT_FRAC, ml._BI_REGION_RIGHT_FRAC, ml._BI_BAND_CENTER_RANGE = 0.0, 1.0, (0.25, 0.75)
+            self.assertTrue(ml._bi_frame_text_bands(graphic), "the old whole-width search called this a caption")
+        finally:
+            ml._BI_REGION_LEFT_FRAC, ml._BI_REGION_RIGHT_FRAC, ml._BI_BAND_CENTER_RANGE = old
+
+    def test_a_logo_beside_a_centre_line_does_not_widen_it_past_the_search_area(self):
+        import media_library as ml
+        h, w = ml._BI_FRAME_H, ml._BI_FRAME_W
+        both = self._frame(ml, [(int(h * 0.85), int(h * 0.92), int(w * 0.30), int(w * 0.70)),
+                                (int(h * 0.85), int(h * 0.92), int(w * 0.88), int(w * 0.98))])
+        self.assertTrue(ml._bi_frame_text_bands(both))
+
+    def test_the_scan_writes_one_log_line_with_the_verdict_and_its_details(self):
+        src = open(os.path.join(ROOT, "media_library.py"), encoding="utf-8").read()
+        self.assertIn("[BURNED-IN SCAN]", src)
+        self.assertGreaterEqual(src.count("BURNED_IN_DETECTOR_VERSION = 4"), 1)
+
+
+class TestBurnedInIgnoresBannersLogosAndOneOffText(unittest.TestCase):
+    """Text that is not subtitles (a promo banner, a big corner logo, a one-off gag, a few foreign lines in an English show) must not mark a whole show as having burned-in subtitles."""
+
+    def _agree(self, positives, decoded, early=False):
+        import media_library as ml
+        return ml._bi_positions_agree(positives, decoded, early)
+
+    def _lines(self, count):
+        return [[(0.90, 0.20 + 0.04 * (i % 5), 0.80 - 0.03 * (i % 4))] for i in range(count)]
+
+    def test_lines_that_change_in_a_fair_share_of_frames_are_subtitles(self):
+        self.assertTrue(self._agree(self._lines(6), 12))
+
+    def test_the_same_fixed_banner_in_most_frames_is_not_subtitles(self):
+        banner = [[(0.90, 0.25, 0.75)] for _ in range(16)]
+        self.assertFalse(self._agree(banner, 24))
+
+    def test_a_few_lines_in_a_long_show_are_not_subtitles(self):
+        self.assertFalse(self._agree(self._lines(3), 24))
+        self.assertFalse(self._agree(self._lines(4), 24, early=True))
+
+    def test_a_band_that_runs_into_one_edge_of_the_search_area_is_a_logo_not_a_line(self):
+        import media_library as ml
+        h, w = ml._BI_FRAME_H, ml._BI_FRAME_W
+        frame = TestBurnedInScanLogsItsReason()._frame(ml, [(int(h * 0.70), int(h * 0.95), int(w * 0.45), int(w * 0.99))])
+        self.assertEqual(ml._bi_frame_text_bands(frame), [])
+        both = TestBurnedInScanLogsItsReason()._frame(ml, [(int(h * 0.85), int(h * 0.92), int(w * 0.30), int(w * 0.70))])
+        self.assertTrue(ml._bi_frame_text_bands(both))
+
+    def test_the_scan_says_when_text_was_seen_but_was_not_subtitles(self):
+        import numpy
+        import media_library as ml
+        frame = numpy.zeros((ml._BI_FRAME_H, ml._BI_FRAME_W), dtype=numpy.uint8)
+        diag = {}
+        with mock.patch.object(ml, "_bi_grab_frame", return_value=frame), \
+                mock.patch.object(ml, "_bi_frame_text_bands_safe", return_value=[(0.9, 0.25, 0.75)]), \
+                mock.patch.object(ml, "_resolve_ffmpeg", return_value="ffmpeg"):
+            verdict = ml.detect_burned_in_captions("x.mkv", duration=1000.0, diag=diag)
+        self.assertFalse(verdict)
+        self.assertEqual(diag["reason"], "text_seen_not_subtitles")
+
+    def test_the_new_numbers_live_in_the_governor_and_match_the_fallbacks(self):
+        import performance_governor as gov
+        import media_library as ml
+        self.assertEqual(ml._BI_MIN_POSITIVE_SHARE, gov.BURNED_IN_MIN_POSITIVE_SHARE)
+        self.assertEqual(ml._BI_STATIC_BAND_TOLERANCE_FRAC, gov.BURNED_IN_STATIC_BAND_TOLERANCE_FRAC)
+        self.assertEqual(ml._BI_STATIC_BAND_MAX_SHARE, gov.BURNED_IN_STATIC_BAND_MAX_SHARE)
+        src = open(os.path.join(ROOT, "media_library.py"), encoding="utf-8").read()
+        self.assertIn("_BI_MIN_POSITIVE_SHARE = _governor.BURNED_IN_MIN_POSITIVE_SHARE if _governor is not None else %s" % gov.BURNED_IN_MIN_POSITIVE_SHARE, src)
+
+
 class TestUpdateHelperSwap(unittest.TestCase):
     """update_helper.apply_update on a temp install folder: renamed exe, version stamp, old exe cleanup, rollback."""
 
@@ -18966,7 +19611,8 @@ class TestUpdateOnlyTouchesItsArea(unittest.TestCase):
         for name in ("dropped.dll", os.path.join("old_dir", "deep", "dropped_too.dll")):
             self._write(self.install, os.path.join("_internal", name), "old build file")
         self._write(self.install, os.path.join("_internal", "not_listed.dll"), "not from any build list")
-        with open(os.path.join(self.install, "installed_files.json"), "w", encoding="utf-8") as handle:
+        os.makedirs(os.path.join(self.install, "logs"), exist_ok=True)
+        with open(os.path.join(self.install, "logs", "installed_files.json"), "w", encoding="utf-8") as handle:
             json.dump({"files": [p.replace(os.sep, "/") for p in shipped_before]}, handle)
         self.assertEqual(self._run(), 0)
         self.assertFalse(os.path.exists(os.path.join(self.install, "_internal", "dropped.dll")), "a dropped file is removed")
@@ -18974,7 +19620,7 @@ class TestUpdateOnlyTouchesItsArea(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.install, "_internal", "not_listed.dll")), "a file no build list names stays")
         self.assertFalse(os.path.exists(os.path.join(self.install, "_internal", "main", "scans", "mine.json")), "never listed, never touched")
         self.assertEqual(self._read(self.install, "retro_config.json"), "owner config")
-        listed = json.load(open(os.path.join(self.install, "installed_files.json"), encoding="utf-8"))["files"]
+        listed = json.load(open(os.path.join(self.install, "logs", "installed_files.json"), encoding="utf-8"))["files"]
         self.assertIn("_internal/lib.dll", listed)
         self.assertNotIn("_internal/dropped.dll", listed)
 
@@ -18983,18 +19629,31 @@ class TestUpdateOnlyTouchesItsArea(unittest.TestCase):
         before = self._snapshot()
         self.assertEqual(self._run(), 0)
         self.assertEqual(set(before) - set(self._snapshot()), set())
-        self.assertTrue(os.path.isfile(os.path.join(self.install, "installed_files.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.install, "logs", "installed_files.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.install, "installed_files.json")))
+
+    def test_a_list_an_older_build_left_in_the_install_folder_is_used_once_then_moved_to_logs(self):
+        self._ship_everything()
+        self._write(self.install, os.path.join("_internal", "dropped.dll"), "old build file")
+        with open(os.path.join(self.install, "installed_files.json"), "w", encoding="utf-8") as handle:
+            json.dump({"files": ["_internal/dropped.dll", "_internal/lib.dll"]}, handle)
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.install, "_internal", "dropped.dll")))
+        self.assertFalse(os.path.exists(os.path.join(self.install, "installed_files.json")))
+        listed = json.load(open(os.path.join(self.install, "logs", "installed_files.json"), encoding="utf-8"))["files"]
+        self.assertIn("_internal/lib.dll", listed)
 
     def test_a_failed_update_puts_a_dropped_file_and_the_old_list_back(self):
         self._ship_everything()
         self._write(self.install, os.path.join("_internal", "dropped.dll"), "old build file")
         old_list = {"files": ["_internal/dropped.dll", "_internal/lib.dll"]}
-        with open(os.path.join(self.install, "installed_files.json"), "w", encoding="utf-8") as handle:
+        os.makedirs(os.path.join(self.install, "logs"), exist_ok=True)
+        with open(os.path.join(self.install, "logs", "installed_files.json"), "w", encoding="utf-8") as handle:
             json.dump(old_list, handle)
         with self.assertRaises(RuntimeError):
             self._run(exit_codes=(1, None))
         self.assertEqual(self._read(self.install, os.path.join("_internal", "dropped.dll")), "old build file")
-        self.assertEqual(json.load(open(os.path.join(self.install, "installed_files.json"), encoding="utf-8")), old_list)
+        self.assertEqual(json.load(open(os.path.join(self.install, "logs", "installed_files.json"), encoding="utf-8")), old_list)
 
     def test_nothing_is_deleted(self):
         before = self._snapshot()
@@ -21462,7 +22121,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "1.4.0", "build_info.py says 1.4.0 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "1.5.0", "build_info.py says 1.5.0 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -21866,17 +22525,82 @@ class TestGovernorOwnLoad(_SectionCase):
 class TestThemeColourSkipsTheButtonBlue(unittest.TestCase):
     """Owner 2026-11-08: the theme colour slider steps over the blue of the menu buttons, and a saved colour in that blue is moved out of it."""
 
-    def test_the_slider_steps_over_the_blue(self):
-        up, down = {"theme_ui_hue": 190}, {"theme_ui_hue": 245}
-        mn.slider_adjust(up, "ui_hue", mn.RIGHT)
-        mn.slider_adjust(down, "ui_hue", mn.LEFT)
-        self.assertEqual((up["theme_ui_hue"], down["theme_ui_hue"]), (245, 190))
+    def test_the_slider_moves_one_step_at_a_time_and_never_lands_in_the_blue(self):
+        config, seen = {"theme_ui_hue": 0}, []
+        for _ in range(80):
+            mn.slider_adjust(config, "ui_hue", mn.RIGHT)
+            seen.append(gov.theme_ui_hue_to_position(config["theme_ui_hue"]))
+        self.assertTrue(all(b - a in (0, gov.SLIDER_STEP, gov.THEME_UI_POSITION_MAX - a) for a, b in zip(seen, seen[1:])))
+        for _ in range(80):
+            mn.slider_adjust(config, "ui_hue", mn.LEFT)
+            self.assertFalse(gov.THEME_UI_HUE_SKIP_LOW <= config["theme_ui_hue"] <= gov.THEME_UI_HUE_SKIP_HIGH)
+        self.assertEqual(config["theme_ui_hue"], 0)
+
+    def test_the_track_and_knob_use_the_same_cut_out_blue(self):
+        ui_text = read(os.path.join(ROOT, "ui.py"))
+        self.assertIn("_theme_track_hue(i / float(slider_width))", ui_text)
+        self.assertIn("_theme_track_fraction(ui_hue)", ui_text)
+        for hue in (0, 190, 241, 360):
+            self.assertEqual(gov.theme_ui_position_to_hue(gov.theme_ui_hue_to_position(hue)), hue)
 
     def test_a_saved_colour_in_the_blue_is_moved_out(self):
         for hue in range(gov.THEME_UI_HUE_SKIP_LOW, gov.THEME_UI_HUE_SKIP_HIGH + 1):
             cleared = gov.theme_ui_hue_clear(hue)
             self.assertTrue(cleared < gov.THEME_UI_HUE_SKIP_LOW or cleared > gov.THEME_UI_HUE_SKIP_HIGH)
         self.assertEqual(gov.theme_ui_hue_clear(140), 140)
+
+
+class TestClipEndingBeforeItsSlotWaits(unittest.TestCase):
+    """Owner 2026-11-09: commercials start on their second, play whole, and nothing is reopened at the end; a clip that ends a little before its slot waits, and the next item opens at its first second."""
+
+    def _guard(self):
+        ns = {"os": os, "SCHEDULER_REPEAT_GUARD_SECONDS": 60, "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS": 900, "SLOT_TAIL_HOLD_MAX_SECONDS": 3.0}
+        exec(compile(get_function_source("_apply_repeat_guard"), "<extracted:_apply_repeat_guard>", "exec"), ns)
+        return ns["_apply_repeat_guard"]
+
+    def _timeline(self):
+        return [{"path": "A", "start_time": 0.0, "duration": 164, "is_commercial": True},
+                {"path": "B", "start_time": 164.0, "duration": 32, "is_commercial": True},
+                {"path": "C", "start_time": 196.0, "duration": 30, "is_commercial": True}]
+
+    def _armed(self, file_name):
+        now = datetime.datetime(2026, 11, 9, 4, 0, 0)
+        return now, {"last_ended_commercial": {"file": file_name, "block": "Full Day", "armed_ts": now.timestamp()}}
+
+    def test_the_repeat_guard_lands_on_the_next_items_first_second(self):
+        now, log_ = self._armed("a")
+        show, position = self._guard()("05", log_, "Full Day", self._timeline(), 226, 163.5, now)
+        self.assertEqual((show["path"], position), ("B", 164.0))
+
+    def test_a_short_clip_found_in_its_last_seconds_is_not_reopened(self):
+        now, log_ = self._armed("b")
+        show, position = self._guard()("05", log_, "Full Day", self._timeline(), 226, 194.66, now)
+        self.assertEqual((show["path"], position), ("C", 196.0))
+
+    def test_a_clip_with_more_than_the_tail_left_is_left_alone(self):
+        now, log_ = self._armed("b")
+        show, position = self._guard()("05", log_, "Full Day", self._timeline(), 226, 190.0, now)
+        self.assertEqual((show["path"], position), ("B", 190.0))
+
+    def test_the_numbers_are_in_the_governor(self):
+        self.assertEqual((gov.SLOT_TAIL_HOLD_MAX_SECONDS, gov.SLOT_START_GRACE_SECONDS, gov.SLOT_OPEN_LEAD_SECONDS), (3.0, 0.3, 0.2))
+
+    def test_the_hold_asks_the_schedule_before_the_guard_is_armed_and_ends_on_the_clock(self):
+        text = read(os.path.join(ROOT, "retro_tv_emulator.py"))
+        peek = text.index("_peek = calculate_slotted_playback_state(ch, snap_internal_advance=True)")
+        self.assertIn("0 < _peek_left <= SLOT_TAIL_HOLD_MAX_SECONDS", text[peek:peek + 900])
+        self.assertLess(peek, text.index("_guard_key = \"last_ended_commercial\" if _anchor.get(\"mode\")"))
+        hold = text.index("_tail_hold = app_state.get(\"_slot_tail_hold\")")
+        self.assertIn("broadcast_clock.now().timestamp() < _tail_hold.get(\"until\", 0)", text[hold:hold + 600])
+        self.assertIn("_tail_hold_just_ended = True", text[hold:hold + 900])
+        self.assertIn("and not _tail_hold_active", text[hold:hold + 1200])
+        self.assertLess(hold, text.index("change_channel(ch, is_surfing=False, internal_advance=True, snap_internal_advance=is_video_finished)"))
+
+    def test_an_item_found_just_inside_its_slot_starts_at_its_first_second(self):
+        text = read(os.path.join(ROOT, "retro_tv_emulator.py"))
+        start = text.index("if 0 < _into_slot <= _SLOT_START_GRACE_S:")
+        self.assertIn("t_state[\"seek\"] = float(t_state.get(\"seek\") or 0) - _into_slot", text[start:start + 200])
+        self.assertIn("if internal_advance and t_state.get(\"mode\") in (\"Video\", \"Commercial\")", text[start - 400:start])
 
 
 class TestEveryGovernorNameIsDefined(unittest.TestCase):
@@ -21902,7 +22626,7 @@ class TestEveryGovernorNameIsDefined(unittest.TestCase):
 
 
 class TestBuildNumber(_SectionCase):
-    """This build is 1.4.0"""
+    """This build is 1.4.1"""
 
     def test_build_number(self):
         self.run_section(suite_build_number)
@@ -23041,6 +23765,7 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         self.h.HEALTH_CHECK_SECONDS = 0.6
         self.h.PROGRESS_DONE_HOLD_SECONDS = 0
         self.h.PROGRESS_ERROR_SHOW_SECONDS = 0
+        self.h.PROGRESS_STARTING_SECONDS = 0
         self.events = []
         outer = self
 
@@ -23049,6 +23774,8 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
                 outer.events.append(("update", label, fraction))
             def finish(self):
                 outer.events.append(("finish",))
+            def starting(self):
+                outer.events.append(("starting",))
             def fail(self, label):
                 outer.events.append(("fail", label))
             def close(self):
@@ -23081,7 +23808,7 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         self.assertNotIn("fail", [e[0] for e in self.events])
         self.assertNotIn("STARTING THE UPDATED APP...", labels, "the bar ends with the install; there is no starting-app stage")
 
-    def test_the_bar_is_closed_before_the_app_is_launched(self):
+    def test_the_app_is_launched_after_the_bar_finishes_and_the_starting_text_shows_before_the_window_closes(self):
         order = []
         self.events = order
         def popen(command, **kwargs):
@@ -23094,8 +23821,24 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
         with mock.patch.object(self.h.subprocess, "Popen", popen), mock.patch.object(self.h, "_open_progress", lambda *a: self.recorder):
             self.assertEqual(self.h.apply_update(path), 0)
         kinds = [e[0] for e in order]
-        self.assertLess(kinds.index("close"), kinds.index("launch"))
-        self.assertLess(kinds.index("finish"), kinds.index("close"))
+        self.assertLess(kinds.index("finish"), kinds.index("launch"))
+        self.assertLess(kinds.index("launch"), kinds.index("starting"))
+        self.assertLess(kinds.index("starting"), kinds.index("close"))
+        self.assertEqual(kinds.count("close"), 1)
+
+    def test_the_starting_text_stays_up_for_its_seconds_even_when_the_start_up_check_is_shorter(self):
+        self.h.PROGRESS_STARTING_SECONDS = 1.2
+        self.h.HEALTH_CHECK_SECONDS = 0.3
+        started = time.monotonic()
+        self.assertEqual(self._run(), 0)
+        self.assertGreaterEqual(time.monotonic() - started, 1.1)
+        self.assertEqual(self.events[-1], ("close",))
+
+    def test_the_starting_text_is_drawn_in_place_of_the_caption_only_after_the_bar_is_full(self):
+        src = open(os.path.join(ROOT, "updater", "update_helper.py"), encoding="utf-8").read()
+        self.assertIn('PROGRESS_STARTING_TEXT = "PROGRAM STARTING NOW"', src)
+        self.assertIn("if starting and not failed:", src)
+        self.assertLess(src.index("progress.finish()"), src.index("progress.starting()"))
 
     def test_a_failed_install_shows_the_failure_and_still_closes_the_bar(self):
         with mock.patch.object(self.h, "_apply_payload", side_effect=OSError("disk full")):
@@ -23156,3 +23899,174 @@ class TestUpdateHelperProgressBar(unittest.TestCase):
 
 
 
+
+
+# ============================================================================
+# SECTION: Server Menu (roles, server and user boxes, buttons, popups) and menu titles
+# ============================================================================
+
+
+class TestServerMenuFlow(unittest.TestCase):
+    """The Server Menu: arrow keys, highlight versus switch, per-server folders, popups and the draw."""
+
+    def _main(self):
+        return open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
+
+    def _move(self, sel, role, direction, results=False):
+        return mn.server_menu_move({}, sel, role, direction, results)
+
+    def test_arrow_keys_follow_the_picture_for_the_server_role(self):
+        self.assertEqual(self._move(0, "server", mn.DOWN), mn.SERVER_MENU_BOX_BASE)
+        self.assertEqual(self._move(mn.SERVER_MENU_BOX_BASE + 2, "server", mn.RIGHT), 2)
+        self.assertEqual(self._move(mn.SERVER_MENU_BOX_BASE + 5, "server", mn.RIGHT), mn.SERVER_MENU_RENAME)
+        self.assertEqual(self._move(2, "server", mn.DOWN), mn.SERVER_MENU_RENAME)
+        self.assertEqual(self._move(mn.SERVER_MENU_RENAME, "server", mn.DOWN), mn.SERVER_MENU_RESET)
+        self.assertEqual(self._move(mn.SERVER_MENU_RESET, "server", mn.DOWN), 1)
+
+    def test_user_boxes_are_reachable_only_after_a_scan_found_servers(self):
+        self.assertEqual(self._move(1, "user", mn.DOWN, False), mn.SERVER_MENU_SCAN)
+        self.assertEqual(self._move(1, "user", mn.DOWN, True), mn.SERVER_MENU_USER_BASE)
+        self.assertEqual(self._move(mn.SERVER_MENU_SCAN, "user", mn.DOWN), 2)
+        self.assertEqual(self._move(2, "user", mn.DOWN), mn.SERVER_MENU_CLEAR)
+        self.assertEqual(self._move(mn.SERVER_MENU_USER_BASE + 2, "user", mn.RIGHT, True), mn.SERVER_MENU_SCAN)
+        self.assertEqual(self._move(mn.SERVER_MENU_USER_BASE + 5, "user", mn.RIGHT, True), 2)
+        self.assertEqual(self._move(0, "server", mn.UP), 0)
+
+    def test_the_server_boxes_cannot_be_reached_while_the_role_is_user(self):
+        for sel in (0, 1, 2, mn.SERVER_MENU_SCAN, mn.SERVER_MENU_CLEAR, 3):
+            for direction in (mn.UP, mn.DOWN, mn.LEFT, mn.RIGHT):
+                to = self._move(sel, "user", direction, True)
+                self.assertFalse(mn.SERVER_MENU_BOX_BASE <= to < mn.SERVER_MENU_BOX_BASE + mn.SERVER_MENU_BOX_COUNT, (sel, direction, to))
+
+    def test_enter_on_a_server_box_only_moves_the_dot_and_manage_server_switches(self):
+        src = self._main()
+        begin = src.index("elif _srv_manage_visible and menu_nav.SERVER_MENU_BOX_BASE <= srv_sel")
+        branch = src[begin:src.index("elif _srv_manage_visible and srv_sel == menu_nav.SERVER_MENU_RENAME", begin)]
+        self.assertIn('db.config["server_menu_pick"]', branch)
+        self.assertNotIn("make_server_slot_active", branch)
+        self.assertNotIn("create_server_slot", branch)
+        manage = src[src.index("def _execute_manage_server():"):src.index("def _local_server_entries():")]
+        self.assertIn("create_server_slot", manage)
+        self.assertIn("make_server_slot_active", manage)
+
+    def test_clicking_user_gives_back_the_own_json(self):
+        src = self._main()
+        begin = src.index("elif srv_sel == 1:", src.index('elif app_state["menu_layer"] == "SERVER_MENU":'))
+        branch = src[begin:src.index("elif _srv_pick_visible and srv_sel == 2:", begin)]
+        self.assertIn("leave_server_slot()", branch)
+        self.assertIn('db.config["server_role"] = "user"', branch)
+
+    def test_reset_and_clear_user_choice_ask_first(self):
+        src = self._main()
+        self.assertIn('"user_choice_clear" if srv_sel == menu_nav.SERVER_MENU_CLEAR else "server_reset"', src)
+        self.assertIn('elif _cc_target == "server_reset":\n                            _execute_server_reset()', src)
+        self.assertIn('elif _cc_target == "user_choice_clear":\n                            _execute_clear_user_choice()', src)
+        ui_src = open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+        self.assertIn('"server_reset": "RESET THIS SERVER?"', ui_src)
+        self.assertIn('"user_choice_clear": "CLEAR USER CHOICE?"', ui_src)
+        for target in ("server_reset", "user_choice_clear"):
+            surf = pygame.Surface((1152, 864))
+            ui.render_clear_confirm_popup(surf, ui._DEFAULT_THEME, None, {"clear_confirm_target": target, "clear_confirm_selection": "No"})
+
+    def test_the_old_slot_and_picker_screens_are_gone(self):
+        for name in ("ui.py", "retro_tv_emulator.py", "menu_nav.py"):
+            text = open(os.path.join(ROOT, name), encoding="utf-8").read()
+            for old in ("SERVER_SLOTS_MENU", "SERVER_SLOT_ACTIONS", "SERVER_PICKER_MENU"):
+                self.assertNotIn(old, text, (name, old))
+
+    def test_a_new_server_gets_its_own_folders_seeded_from_the_main_ones(self):
+        import sqlite3
+        tmp = tempfile.mkdtemp()
+        rdb, restore = _settings_writer_db(tmp, 0.4)
+        old_main = media._resolved_main_dir
+        try:
+            media._resolved_main_dir = os.path.join(tmp, "main")
+            os.makedirs(os.path.join(tmp, "main", "loudness"), exist_ok=True)
+            library = ml.default_db_path()
+            con = sqlite3.connect(library)
+            con.execute("create table t(x)")
+            con.execute("insert into t values (42)")
+            con.commit()
+            con.close()
+            with open(os.path.join(tmp, "main", "loudness", "gains.json"), "w") as handle:
+                handle.write("{}")
+            self.assertEqual(rdb.create_server_slot("Den", "server2"), "server2")
+            folder = os.path.dirname(rdb.get_server_slot_path("server2"))
+            self.assertTrue(os.path.isfile(os.path.join(folder, "retro.config.json")))
+            self.assertTrue(os.path.isfile(os.path.join(folder, "loudness", "gains.json")))
+            seeded = sqlite3.connect(os.path.join(folder, "media_library", "library.sqlite3"))
+            self.assertEqual(seeded.execute("select x from t").fetchall(), [(42,)])
+            seeded.close()
+            self.assertIsNone(rdb.create_server_slot("Again", "server2"))
+            self.assertTrue(rdb.make_server_slot_active("server2"))
+            self.assertTrue(rdb.channels_db["05"]["active"])
+            self.assertFalse(rdb.channels_db["06"]["active"])
+        finally:
+            media._resolved_main_dir = old_main
+            restore()
+
+    def test_the_menu_draws_in_every_state_and_empty_user_boxes_have_no_circle(self):
+        class Db:
+            SERVER_SLOT_IDS = tuple("server%d" % i for i in range(1, 7))
+            server_listener = None
+
+            def __init__(self, role, **config):
+                self.config = {"server_role": role, "game_channel_enabled": True, "menu_opacity": 85}
+                self.config.update(config)
+                self.channels_db = {}
+
+            def __getattr__(self, name):
+                return None
+
+        def render(role, sel, **app):
+            ui._settings_menu_frame_cache.update(key=None, stamp=None)
+            surf = pygame.Surface((1152, 864))
+            state = {"active_menu_tab": "System", "menu_layer": "SERVER_MENU", "menu_selection_index": sel}
+            state.update(app)
+            ui.render_settings_overlay_menu(surf, ui._DEFAULT_THEME, state, Db(role, server_slots={"server1": "Den"}, server_menu_pick="server2", active_server_slot="server1"))
+            return surf
+
+        for role in (None, "server", "user"):
+            for sel in (0, 1, 2, 4, 5, 6, 7, 10, 20):
+                render(role, sel)
+        render("server", 4, editing_server_slot_name=True, server_slot_name_all_selected=True, server_slot_name_buffer="Den", server_slot_name_target_slot_id="server1")
+        render("user", 20, user_scan_entries=[{"name": "Mom"}, {"name": "Dad"}], user_scan_pick=1)
+        empty = render("user", 5)
+        full = render("user", 5, user_scan_entries=[{"name": "Mom"}])
+        spot = (76 + 20, 600 + 12)
+        self.assertEqual(empty.get_at(spot)[:3], empty.get_at((76 + 100, 600 + 12))[:3], "an empty user box shows no circle")
+        self.assertNotEqual(full.get_at(spot)[:3], empty.get_at(spot)[:3], "a named user box shows its circle")
+
+
+class TestMenuTitlesMatch(unittest.TestCase):
+    """Every menu and sub-menu title is gold, one size, at one height and underlined, the top MENU too."""
+
+    def _ui(self):
+        return open(os.path.join(ROOT, "ui.py"), encoding="utf-8").read()
+
+    def test_titles_go_through_one_gold_underlined_routine(self):
+        src = self._ui()
+        self.assertIn("def _menu_title_surface(text):", src)
+        self.assertIn("def _blit_menu_title(canvas, surf, x, y):", src)
+        for title in ("Advanced Settings", "Remote Remapping", "Number Remapping", "Server Menu", "Scheduling Settings", "Audio Settings", "Commercials", "Holiday Schedule", "Channels \\u2014 Settings"):
+            self.assertIn(title, src)
+        self.assertIn('_menu_title_surface("DVD BUTTON MAPPING")', src)
+        self.assertIn('f_title.render("CONTROLS MENU", True, ARCADE_GOLD)', src)
+        self.assertIn("lbl = f_sect.render(text, True, ARCADE_GOLD)", src)
+        self.assertNotIn("f_sub_title", src)
+        self.assertNotIn("f_sub_header", src)
+        self.assertIn('_blit_menu_title(menu_canvas, lbl_title, box_x + (box_w // 2)', src)
+
+    def test_title_numbers_live_in_the_governor_and_match_the_fallbacks(self):
+        src = self._ui()
+        for name in ("MENU_TITLE_FONT_SIZE", "MENU_TITLE_TOP_PX", "MENU_TITLE_UNDERLINE_GAP_PX", "MENU_TITLE_UNDERLINE_THICKNESS_PX"):
+            self.assertTrue(hasattr(gov, name), name)
+            self.assertEqual(getattr(ui, name), getattr(gov, name), name)
+            self.assertIn("%s = performance_governor.%s" % (name, name), src)
+
+    def test_a_title_draws_gold_with_an_underline_beneath(self):
+        surf = pygame.Surface((400, 100))
+        title = ui._menu_title_surface("Test")
+        ui._blit_menu_title(surf, title, 10, 10)
+        line_y = 10 + title.get_height() + ui.MENU_TITLE_UNDERLINE_GAP_PX
+        self.assertEqual(surf.get_at((10 + title.get_width() // 2, line_y))[:3], tuple(ui.COLOR_ARCADE_GOLD))

@@ -283,21 +283,34 @@ def _apply_payload(install_dir, files, on_file=None):
 INSTALLED_FILES_NAME = "installed_files.json"
 
 
+def _installed_files_path(install_dir):
+    """Where the list lives: with the other test and status files in the logs folder."""
+    return os.path.join(install_dir, "logs", INSTALLED_FILES_NAME)
+
+
 def _read_installed_files(install_dir):
-    """The list of relative paths the last update installed, or None when there is no readable list (an install from before the list existed)."""
-    try:
-        with open(os.path.join(install_dir, INSTALLED_FILES_NAME), "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        files = data.get("files") if isinstance(data, dict) else None
-        return [str(item) for item in files] if isinstance(files, list) else None
-    except (OSError, ValueError):
-        return None
+    """The list of relative paths the last update installed, or None when there is no readable list (an install from before the list existed). A list left in the install folder by an older build is read too."""
+    for path in (_installed_files_path(install_dir), os.path.join(install_dir, INSTALLED_FILES_NAME)):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            files = data.get("files") if isinstance(data, dict) else None
+            if isinstance(files, list):
+                return [str(item) for item in files]
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _write_installed_files(install_dir, relatives):
-    path = os.path.join(install_dir, INSTALLED_FILES_NAME)
+    """Writes the list into the logs folder and removes the copy an older build left in the install folder."""
+    path = _installed_files_path(install_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump({"files": sorted(relatives)}, handle)
+    legacy = os.path.join(install_dir, INSTALLED_FILES_NAME)
+    if os.path.isfile(legacy):
+        os.unlink(legacy)
 
 
 def _stale_files(install_dir, previous, files):
@@ -528,6 +541,9 @@ PROGRESS_WAIT_BAR = 0.05
 PROGRESS_PREPARE_BAR = (0.08, 0.30)
 PROGRESS_COPY_BAR = (0.30, 0.95)
 PROGRESS_DONE_HOLD_SECONDS = 0.7
+PROGRESS_STARTING_TEXT = "PROGRAM STARTING NOW"
+# VALUES CHANGE HERE: seconds the starting text stays up after the bar reaches 100%; the app is already launching while it shows, and it closes by itself after this long (or when the 15 second start-up check ends, whichever is later).
+PROGRESS_STARTING_SECONDS = 2.0
 PROGRESS_ERROR_SHOW_SECONDS = 4.0
 
 
@@ -538,6 +554,9 @@ class _NullProgress:
         pass
 
     def finish(self):
+        pass
+
+    def starting(self):
         pass
 
     def fail(self, label):
@@ -578,6 +597,7 @@ class _ProgressWindow(_NullProgress):
         self._label = ""
         self._fraction = 0.0
         self._failed = False
+        self._starting = False
         self._closing = False
         self._ready = threading.Event()
         self._ok = False
@@ -605,7 +625,7 @@ class _ProgressWindow(_NullProgress):
 
         def tick():
             with self._lock:
-                label, fraction, failed, closing = self._label, self._fraction, self._failed, self._closing
+                label, fraction, failed, closing, starting = self._label, self._fraction, self._failed, self._closing, self._starting
             if closing:
                 root.destroy()
                 return
@@ -619,7 +639,10 @@ class _ProgressWindow(_NullProgress):
             fill_w = int((track[2] - track[0]) * max(0.0, min(1.0, fraction)))
             if fill_w > 0:
                 canvas.create_rectangle(track[0], track[1], track[0] + fill_w, track[3], fill=accent, outline=accent)
-            canvas.create_text(w // 2, 108, text=PROGRESS_CAPTION, fill=self._hex(PROGRESS_CAPTION_RGB), font=("Courier New", 9), width=w - 40)
+            if starting and not failed:
+                canvas.create_text(w // 2, 108, text=PROGRESS_STARTING_TEXT, fill=accent, font=("Courier New", 13, "bold"))
+            else:
+                canvas.create_text(w // 2, 108, text=PROGRESS_CAPTION, fill=self._hex(PROGRESS_CAPTION_RGB), font=("Courier New", 9), width=w - 40)
             root.after(PROGRESS_REFRESH_MS, tick)
 
         tick()
@@ -640,6 +663,10 @@ class _ProgressWindow(_NullProgress):
     def finish(self):
         self.update("READY", 1.0)
         time.sleep(PROGRESS_DONE_HOLD_SECONDS)
+
+    def starting(self):
+        with self._lock:
+            self._starting = True
 
     def fail(self, label):
         with self._lock:
@@ -667,6 +694,8 @@ def preview_progress_bar(seconds=20.0, install_dir=None):
         window.update(label, fraction)
         time.sleep(seconds / len(steps))
     window.finish()
+    window.starting()
+    time.sleep(PROGRESS_STARTING_SECONDS)
     window.close()
     return 0
 
@@ -863,10 +892,8 @@ def apply_update(metadata_path):
             else:
                 log.info("[UPDATE DIAG] Install folder renamed: %s -> %s", install_dir, where)
                 launch_command[0] = _rebase(launch_command[0], install_dir, where)
-        # WARNING: owner 2026-11-08: the bar ends when the install is done and closes before the app is launched, so it is never up beside the app's own loading screen.
+        # WARNING: owner 2026-11-09: the bar ends when the install is done; the app is then launched and PROGRAM STARTING NOW stays up for PROGRESS_STARTING_SECONDS to cover the gap before the app's own loading screen, then the window closes.
         progress.finish()
-        progress.close()
-        progress = _NullProgress()
         process = subprocess.Popen(
             launch_command,
             cwd=where,
@@ -879,10 +906,21 @@ def apply_update(metadata_path):
         # NOTE: a spawn that dies immediately is usually a bad executable or
         # path. Give normal startup a little time, then restore the old files.
         started = time.monotonic()
+        progress.starting()
+        starting_until = started + PROGRESS_STARTING_SECONDS
+        starting_open = True
         while time.monotonic() < started + HEALTH_CHECK_SECONDS:
             if process.poll() is not None:
                 raise RuntimeError("Updated application exited during startup")
+            if starting_open and time.monotonic() >= starting_until:
+                progress.close()
+                progress = _NullProgress()
+                starting_open = False
             time.sleep(0.25)
+        if starting_open:
+            time.sleep(max(0.0, starting_until - time.monotonic()))
+            progress.close()
+            progress = _NullProgress()
         _repoint_shortcuts(old_exe_path or command[0], launch_command[0], install_dir, where)
         if old_exe_path and not _remove_with_retry(_rebase(old_exe_path, install_dir, where)):
             log.warning("[UPDATE DIAG] Could not delete the old exe %s; the new version is running",
@@ -903,7 +941,7 @@ def apply_update(metadata_path):
         _restore_stamp(where, previous_stamp)
         try:
             if previous_files is None:
-                os.unlink(os.path.join(where, INSTALLED_FILES_NAME))
+                os.unlink(_installed_files_path(where))
             else:
                 _write_installed_files(where, previous_files)
         except OSError:

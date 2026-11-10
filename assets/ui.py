@@ -32,6 +32,26 @@ except Exception:
 
 
 # ============================================================================
+# SECTION: Theme colour slider track
+# ============================================================================
+# WARNING: the fallback numbers below must match THEME_UI_HUE_SKIP_LOW and THEME_UI_HUE_SKIP_HIGH in performance_governor.py; they are used only when that module fails to import.
+_THEME_SKIP_LOW = performance_governor.THEME_UI_HUE_SKIP_LOW if performance_governor is not None else 195
+_THEME_SKIP_WIDTH = performance_governor.THEME_UI_HUE_SKIP_WIDTH if performance_governor is not None else 46
+
+
+def _theme_track_hue(fraction):
+    """Returns the hue drawn at a point along the border colour track (0.0 to 1.0), which has the skipped blue cut out."""
+    position = fraction * (360 - _THEME_SKIP_WIDTH)
+    return position if position < _THEME_SKIP_LOW else position + _THEME_SKIP_WIDTH
+
+
+def _theme_track_fraction(hue):
+    """Returns where a hue sits along the border colour track (0.0 to 1.0)."""
+    position = hue if hue < _THEME_SKIP_LOW else max(_THEME_SKIP_LOW, hue - _THEME_SKIP_WIDTH)
+    return position / float(360 - _THEME_SKIP_WIDTH)
+
+
+# ============================================================================
 # SECTION: Colours
 # ============================================================================
 # WARNING: the fallback colours below must match the same names in performance_governor.py; they are used only when that module fails to import.
@@ -62,6 +82,10 @@ MENU_CLOSE_BUTTON_PLACE = performance_governor.MENU_CLOSE_BUTTON_PLACE if perfor
 # WARNING: the fallback number below must match GUIDE_HIGHLIGHT_NUDGE_SECONDS in performance_governor.py; it is used only when that module fails to import.
 _GUIDE_HIGHLIGHT_NUDGE_SECONDS = performance_governor.GUIDE_HIGHLIGHT_NUDGE_SECONDS if performance_governor is not None else 0.75
 MENU_CLEAR_BUTTON_PLACE = performance_governor.MENU_CLEAR_BUTTON_PLACE if performance_governor is not None else (25, 52, 240, 40)
+MENU_TITLE_FONT_SIZE = performance_governor.MENU_TITLE_FONT_SIZE if performance_governor is not None else 24
+MENU_TITLE_TOP_PX = performance_governor.MENU_TITLE_TOP_PX if performance_governor is not None else 10
+MENU_TITLE_UNDERLINE_GAP_PX = performance_governor.MENU_TITLE_UNDERLINE_GAP_PX if performance_governor is not None else 2
+MENU_TITLE_UNDERLINE_THICKNESS_PX = performance_governor.MENU_TITLE_UNDERLINE_THICKNESS_PX if performance_governor is not None else 2
 POPUP_YES_NO_OFFSET = performance_governor.POPUP_YES_NO_OFFSET if performance_governor is not None else 100
 POPUP_YES_NO_SIZE = performance_governor.POPUP_YES_NO_SIZE if performance_governor is not None else (110, 36)
 COLOR_MENU_SWITCH_OFF = performance_governor.COLOR_MENU_SWITCH_OFF if performance_governor is not None else (45, 65, 100)
@@ -145,7 +169,6 @@ CONTROLS_SECTION_BODY_GAP_PX = performance_governor.CONTROLS_SECTION_BODY_GAP_PX
 CONTROLS_SUB_BODY_GAP_PX = performance_governor.CONTROLS_SUB_BODY_GAP_PX if performance_governor is not None else 20
 OPTIONS_LEFT_TOGGLE_OFFSET_PX = performance_governor.OPTIONS_LEFT_TOGGLE_OFFSET_PX if performance_governor is not None else 370
 OPTIONS_RIGHT_TOGGLE_OFFSET_PX = performance_governor.OPTIONS_RIGHT_TOGGLE_OFFSET_PX if performance_governor is not None else 260
-SERVER_PICKER_VISIBLE_ROWS = performance_governor.SERVER_PICKER_VISIBLE_ROWS if performance_governor is not None else 6
 CHANNEL_GRID_GROUP_SHIFT_LEFT_PX = performance_governor.CHANNEL_GRID_GROUP_SHIFT_LEFT_PX if performance_governor is not None else 40
 CHANNEL_GRID_LEFT_COL_SHIFT_PX = performance_governor.CHANNEL_GRID_LEFT_COL_SHIFT_PX if performance_governor is not None else 50
 
@@ -186,6 +209,18 @@ def _draw_shared_button(canvas, rect, color, label, focused, font, focus_color, 
         _aa_rounded_rect(canvas, focus_color, rect, SELECTION_BORDER_WIDTH, border_radius=4)
     lbl = font.render(label, True, text_color or COLOR_TEXT_WHITE)
     canvas.blit(lbl, (rect.x + rect.w // 2 - lbl.get_width() // 2, rect.y + rect.h // 2 - lbl.get_height() // 2))
+
+
+def _menu_title_surface(text):
+    """Renders the title of a settings menu or sub-menu: gold, one size everywhere."""
+    return _get_font("Courier New", MENU_TITLE_FONT_SIZE, bold=True).render(text, True, COLOR_ARCADE_GOLD)
+
+
+def _blit_menu_title(canvas, surf, x, y):
+    """Draws a title surface with its gold underline, the same in every menu."""
+    canvas.blit(surf, (x, y))
+    line_y = y + surf.get_height() + MENU_TITLE_UNDERLINE_GAP_PX
+    pygame.draw.rect(canvas, COLOR_ARCADE_GOLD, (x, line_y, surf.get_width(), MENU_TITLE_UNDERLINE_THICKNESS_PX))
 
 
 def _draw_menu_close(canvas, cx, content_w, content_y, content_h, focused, font, focus_color):
@@ -460,20 +495,13 @@ def render_dvd_button_mapping_popup(surface, app_state, db):
     pygame.draw.rect(surface, PANEL_BG, (win_x, win_y, win_w, win_h), border_radius=10)
     _aa_rounded_rect(surface, NEON_GREEN, (win_x, win_y, win_w, win_h), 2, border_radius=10)
 
-    f_title = _get_font("Courier New", 24, bold=True)
     f_body  = _get_font("Courier New", 22, bold=True)
     f_key   = f_body
     f_btn   = _get_font("Courier New", 19, bold=True)
     f_small = _get_font("Courier New", 12, bold=False)
 
-    title = f_title.render("DVD BUTTON MAPPING", True, COLOR_ARCADE_GOLD)
-    surface.blit(title, (win_x + win_w // 2 - title.get_width() // 2, win_y + 18))
-
-    hint_txt = ("Press a button for the highlighted action"
-                if capturing else
-                "Select an action to see its key  •  Close to leave")
-    hint = f_small.render(hint_txt, True, DIM)
-    surface.blit(hint, (win_x + win_w // 2 - hint.get_width() // 2, win_y + 52))
+    title = _menu_title_surface("DVD BUTTON MAPPING")
+    _blit_menu_title(surface, title, win_x + win_w // 2 - title.get_width() // 2, win_y + 18)
 
     _reject_flash = app_state.get("_dvd_map_reject_flash")
     if _reject_flash is not None and (pygame.time.get_ticks() - _reject_flash) < 2000:
@@ -986,7 +1014,7 @@ def get_current_guide_time_idx(app_state, db):
 UPDATER_AND_SERVER_FEATURES_ENABLED = True
 
 # WARNING: the fallback number below must match SERVER_TOGGLE_ENABLED in performance_governor.py; it is used only when that module fails to import.
-SERVER_TOGGLE_ENABLED = performance_governor.SERVER_TOGGLE_ENABLED if performance_governor is not None else False
+SERVER_TOGGLE_ENABLED = performance_governor.SERVER_TOGGLE_ENABLED if performance_governor is not None else True
 
 GPU_RENDER_MODE_ENABLED = True
 
@@ -1083,17 +1111,8 @@ SERVER_MENU_BTN_SEL    = 500
 CAPTIONS_COLOR_BOX_SEL = 502
 
 
-def get_mock_discovered_servers():
-    """Return the hardcoded list of {name, host} entries used as mock server discovery results."""
-    return [
-        {"name": "Mom",   "host": "Living Room PC"},
-        {"name": "Dad",   "host": "Living Room PC"},
-        {"name": "Steve", "host": "Steve-PC"},
-    ]
-
-
 def get_server_picker_entries(db):
-    """Alphabetically-sorted (by display name) *live* discovered-server entries for SERVER_PICKER_MENU."""
+    """Alphabetically-sorted (by display name) live discovered-server entries for the Server Menu scan."""
     listener = getattr(db, "server_listener", None) if db is not None else None
     if listener is None:
         return []
@@ -1103,31 +1122,6 @@ def get_server_picker_entries(db):
         _log_swallowed("get_server_picker_entries: entries = listener.get_discovered_entries()", _swallowed_error)
         entries = []
     return sorted(entries, key=lambda e: e["name"].lower())
-
-
-def get_server_picker_display_rows(entries, include_close=True):
-    """Build the SERVER_PICKER_MENU render list: letter headers, entry rows and, unless windowed, a Close row."""
-    rows = []
-    last_letter = None
-    for entry in entries:
-        letter = entry["name"][:1].upper() if entry["name"] else "#"
-        if letter != last_letter:
-            rows.append({"type": "header", "text": letter})
-            last_letter = letter
-            rows.append({
-                "type": "entry",
-                "name": entry["name"],
-                "host": entry["host"],
-                "slot_id": entry.get("slot_id"),
-            })
-    if include_close:
-        rows.append({"type": "close"})
-    return rows
-
-
-def get_server_picker_selectable_count(entries):
-    """Return the number of selectable SERVER_PICKER_MENU rows: the entries plus Close, headers excluded."""
-    return len(entries) + 1
 
 
 # ============================================================================
@@ -1783,12 +1777,12 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
         return total
 
     def draw_sect_title_centered(text, y):
-        lbl = f_sect.render(text, True, TEXT_WHITE)
+        lbl = f_sect.render(text, True, ARCADE_GOLD)
         canvas.blit(lbl, (CANVAS_W // 2 - lbl.get_width() // 2, y))
         uy = y + lbl.get_height() + 8
         uw = max(lbl.get_width() + 60, 260)
         ux = CANVAS_W // 2 - uw // 2
-        pygame.draw.line(canvas, TEXT_WHITE, (ux, uy), (ux + uw, uy), 1)
+        pygame.draw.line(canvas, ARCADE_GOLD, (ux, uy), (ux + uw, uy), 1)
         return SECT_H
 
     def draw_footer(page_num):
@@ -1846,7 +1840,7 @@ def render_controls_splash(surface, theme, db=None, app_state=None):
     title_lbl = f_title.render("CONTROLS MENU", True, ARCADE_GOLD)
     canvas.blit(title_lbl, (CANVAS_W//2 - title_lbl.get_width()//2, 15))
     title_bottom = 15 + title_lbl.get_height() + 4
-    pygame.draw.line(canvas, ARCADE_GOLD, (40, title_bottom), (CANVAS_W - 40, title_bottom), 1)
+    pygame.draw.line(canvas, NEON_GREEN, (40, title_bottom), (CANVAS_W - 40, title_bottom), 1)
 
     GAP_TITLE_SECTION = CONTROLS_TITLE_SECTION_GAP_PX
     SECTION_TITLE_Y = title_bottom + GAP_TITLE_SECTION
@@ -3710,7 +3704,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
     
     f_header = _get_font("Courier New", 44, bold=True)
     lbl_title = f_header.render("MENU", True, COLOR_ARCADE_GOLD)
-    menu_canvas.blit(lbl_title, (box_x + (box_w // 2) - (lbl_title.get_width() // 2), box_y + 15))
+    _blit_menu_title(menu_canvas, lbl_title, box_x + (box_w // 2) - (lbl_title.get_width() // 2), box_y + 15)
     
     game_ch_on = db.config.get("game_channel_enabled", True) if db is not None else False
     kiosk_on = db.config.get("kiosk_mode_enabled", False) if db is not None else False
@@ -3926,13 +3920,17 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                     _captions_color_val = "white"
                 _ccolor_swatch_size = 18
                 _ccolor_focused = layer == "SYSTEM_ROWS" and cur_sel == CAPTIONS_COLOR_BOX_SEL
-                _ccolor_bg = COLOR_MENU_BUTTON_BLUE if _captions_on else COLOR_MENU_BUTTON_GREYED
+                _ccolor_bg = COLOR_SCREEN_BLACK if _captions_on else COLOR_MENU_BUTTON_GREYED
+                _ccolor_lbl = f_ch_btn.render("Color", True, TEXT_WHITE if _captions_on else COLOR_MENU_TEXT_GREYED)
+                _ccolor_w = 12 + _ccolor_lbl.get_width() + 10 + _ccolor_swatch_size + 12
+                _ccolor_x = _opt_box_x + _opt_box_w - _ccolor_w
                 pygame.draw.rect(menu_canvas, _ccolor_bg,
-                                 (_opt_box_x, toggle_y, _opt_box_w, box_h_43), border_radius=5)
+                                 (_ccolor_x, toggle_y, _ccolor_w, box_h_43), border_radius=5)
                 if _ccolor_focused:
                     pygame.draw.rect(menu_canvas, NEON_GREEN,
-                                     (_opt_box_x, toggle_y, _opt_box_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=5)
-                _ccolor_swatch_x = _opt_box_x + (_opt_box_w - _ccolor_swatch_size) // 2
+                                     (_ccolor_x, toggle_y, _ccolor_w, box_h_43), SELECTION_BORDER_WIDTH, border_radius=5)
+                menu_canvas.blit(_ccolor_lbl, (_ccolor_x + 12, toggle_y + (box_h_43 - _ccolor_lbl.get_height()) // 2))
+                _ccolor_swatch_x = _ccolor_x + _ccolor_w - 12 - _ccolor_swatch_size
                 _ccolor_swatch_y = toggle_y + (box_h_43 - _ccolor_swatch_size) // 2
                 _ccolor_swatch_rgb = LIST_TEXT_COLOR_RGB.get(_captions_color_val, COLOR_TEXT_WHITE) \
                     if _captions_on else COLOR_MENU_SWATCH_EDGE
@@ -4053,8 +4051,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
     elif active_tab == "System" and layer == "SYSTEM_ADVANCED_SUB_MENU":
 
-        f_sub_title = _get_font("Courier New", 20, bold=True)
-        lbl_hdr = f_sub_title.render("Advanced Settings", True, TEXT_WHITE)
+        lbl_hdr = _menu_title_surface("Advanced Settings")
 
         _as_rows = get_advanced_settings_menu_rows(db, app_state)
         _as_cur_row = app_state.get("menu_selection_index", 0)
@@ -4117,7 +4114,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _as_row_gap = max(_as_row_gap_min, min(_as_row_gap_want, _as_room // (_as_count - 1)))
         _as_block_h = lbl_hdr.get_height() + _as_header_gap + _as_count * _as_row_h + max(0, _as_count - 1) * _as_row_gap
         _as_block_top = content_y + max(20, (content_h - _as_bottom_reserved - _as_block_h) // 2)
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, _as_block_top))
+        _blit_menu_title(menu_canvas, lbl_hdr, cx + content_w // 2 - lbl_hdr.get_width() // 2, _as_block_top)
         _as_top_y = _as_block_top + lbl_hdr.get_height() + _as_header_gap
 
         _as_bar_x = cx + content_w // 2 - _as_bar_w // 2
@@ -4231,11 +4228,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         row_top = content_y + 90
         row_h = 36
 
-        f_sub_header = _get_font("Courier New", 24, bold=True)
-        hdr1 = f_sub_header.render("Remote Remapping", True, COLOR_ARCADE_GOLD)
-        menu_canvas.blit(hdr1, (remote_sub1_label_x, content_y + 14))
-        hdr2 = f_sub_header.render("Number Remapping", True, COLOR_ARCADE_GOLD)
-        menu_canvas.blit(hdr2, (number_label_x, content_y + 14))
+        _remote_title = _menu_title_surface("Remote Remapping")
+        _number_title = _menu_title_surface("Number Remapping")
+        _remote_span_mid = (remote_sub1_label_x + remote_sub2_key_x + key_box_w) // 2
+        _blit_menu_title(menu_canvas, _remote_title, _remote_span_mid - _remote_title.get_width() // 2, content_y + MENU_TITLE_TOP_PX)
+        _blit_menu_title(menu_canvas, _number_title, number_label_x, content_y + MENU_TITLE_TOP_PX)
 
         _remap_reject_flash = app_state.get("_remap_reject_flash")
         _remap_reject_active = (
@@ -4361,355 +4358,129 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _srv_extra_btn_visible = _manage_servers_visible or _pick_server_visible
         _srv_close_idx = 3 if _srv_extra_btn_visible else 2
 
-        f_sub_header = _get_font("Courier New", 24, bold=True)
-        hdr = f_sub_header.render("Server Menu", True, COLOR_ARCADE_GOLD)
-        menu_canvas.blit(hdr, (cx + label_padding_x, content_y + 4))
-
-        f_intro = f_ch_label
-        intro_lines = [
-            "Choose how this device takes part in scheduling sync over your WiFi network.",
-        ]
-        intro_y = content_y + 40
-        for line in intro_lines:
-            lbl_intro = f_intro.render(line, True, TEXT_WHITE)
-            menu_canvas.blit(lbl_intro, (cx + label_padding_x, intro_y))
-            intro_y += f_intro.get_height() + 2
-
-        card_top = intro_y + 18
-        card_gap = 20
-        card_w = content_w - (label_padding_x * 2)
-        card_h = 118
-        card_x = cx + label_padding_x
+        hdr = _menu_title_surface("Server Menu")
+        _blit_menu_title(menu_canvas, hdr, cx + (content_w - hdr.get_width()) // 2, content_y + MENU_TITLE_TOP_PX)
 
         f_card_title = _get_font("Courier New", 20, bold=True)
-        f_card_body = _get_font("Courier New", 16)
 
-        def _wrap(text, font, max_w):
-            words = text.split(" ")
-            lines, cur_line = [], ""
-            for word in words:
-                candidate = word if not cur_line else f"{cur_line} {word}"
-                if font.size(candidate)[0] <= max_w or not cur_line:
-                    cur_line = candidate
-                else:
-                    lines.append(cur_line)
-                    cur_line = word
-            if cur_line:
-                lines.append(cur_line)
-            return lines
+        # WARNING: the Server and User buttons share one width, sized for the longest label ("Server (ACTIVE)"); keep their indexes 0 and 1 so the arrow keys still move between them.
+        role_btn_w = max(f_card_title.size(label)[0] for label in ("Server (ACTIVE)", "User (ACTIVE)")) + 90
+        role_btn_h = 56
+        role_btn_x = cx + label_padding_x
+        role_btn_y = content_y + MENU_TITLE_TOP_PX + hdr.get_height() + 16
 
-        def _draw_role_card(y, sel_idx, role_id, title, body_text):
+        def _draw_role_button(y, sel_idx, role_id, title):
             is_focused = srv_sel == sel_idx
             is_selected = server_role == role_id
             bg = COLOR_MENU_BUTTON_BLUE if is_selected else COLOR_MENU_CARD
-            pygame.draw.rect(menu_canvas, bg, (card_x, y, card_w, card_h), border_radius=8)
+            pygame.draw.rect(menu_canvas, bg, (role_btn_x, y, role_btn_w, role_btn_h), border_radius=8)
             border_col = NEON_GREEN if is_focused else (COLOR_MENU_RADIO_SELECTED_EDGE if is_selected else COLOR_MENU_CARD_EDGE)
-            pygame.draw.rect(menu_canvas, border_col, (card_x, y, card_w, card_h), focus_thickness if is_focused else 2, border_radius=8)
-
-            radio_cx, radio_cy, radio_r = card_x + 26, y + 26, 10
-            pygame.draw.circle(menu_canvas, COLOR_MENU_RADIO_FILL, (radio_cx, radio_cy), radio_r)
-            pygame.draw.circle(menu_canvas, NEON_GREEN if is_selected else COLOR_MENU_RADIO_EDGE, (radio_cx, radio_cy), radio_r, SELECTION_BORDER_WIDTH)
+            pygame.draw.rect(menu_canvas, border_col, (role_btn_x, y, role_btn_w, role_btn_h), focus_thickness if is_focused else 2, border_radius=8)
+            _dot_c = (role_btn_x + 24, y + role_btn_h // 2)
             if is_selected:
-                pygame.draw.circle(menu_canvas, NEON_GREEN, (radio_cx, radio_cy), radio_r - 5)
+                pygame.draw.circle(menu_canvas, NEON_GREEN, _dot_c, 8)
+            else:
+                pygame.draw.circle(menu_canvas, COLOR_MENU_CARD_EDGE, _dot_c, 8, 2)
+            label = f_card_title.render(title + (" (ACTIVE)" if is_selected else ""), True, NEON_GREEN if is_selected else TEXT_WHITE)
+            menu_canvas.blit(label, (role_btn_x + 44, y + (role_btn_h - label.get_height()) // 2))
 
-            title_lbl = f_card_title.render(title, True, TEXT_WHITE)
-            menu_canvas.blit(title_lbl, (card_x + 48, y + 14))
-            if is_selected:
-                sel_tag = f_card_body.render("(ACTIVE)", True, NEON_GREEN)
-                menu_canvas.blit(sel_tag, (card_x + 48 + title_lbl.get_width() + 12, y + 18))
+        # SECTION: six boxes under each role button (2 rows x 3 columns, a scroll bar on each); the role that is not active is greyed out
+        _slot_ids = getattr(db, "SERVER_SLOT_IDS", tuple(f"server{i}" for i in range(1, 7))) if db is not None else tuple(f"server{i}" for i in range(1, 7))
+        _slot_names = dict(db.config.get("server_slots", {})) if db is not None else {}
+        _scan_entries = app_state.get("user_scan_entries") or []
+        _scan_pick = app_state.get("user_scan_pick", 0)
+        _slot_cols = 3
+        _slot_visible_rows = 2
+        _slot_gap = 8
+        _slot_h = 40
+        _slot_view_h = _slot_visible_rows * _slot_h + (_slot_visible_rows - 1) * _slot_gap
+        _slot_w = 234
+        _server_pick = (db.config.get("server_menu_pick") if db is not None else None) or _slot_ids[0]
+        _moved_not_applied = db is not None and db.config.get("server_menu_pick") is not None and db.config.get("server_menu_pick") != db.config.get("active_server_slot")
+        _bar_w = 8
+        _span_bottom = content_y + content_h - MENU_CLOSE_BUTTON_PLACE[1] + 40
+        _even_gap = (_span_bottom - role_btn_y - (role_btn_h * 2 + _slot_view_h * 2 + 40)) // 4
+        f_slot = _get_font("Courier New", 17)
+        _side_w = f_ch_btn.size("Manage Server")[0] + 28
 
-            body_lines = _wrap(body_text, f_card_body, card_w - 64)
-            body_y = y + 48
-            for line in body_lines:
-                lbl_body = f_card_body.render(line, True, COLOR_MENU_CARD_TEXT)
-                menu_canvas.blit(lbl_body, (card_x + 48, body_y))
-                body_y += f_card_body.get_height() + 3
+        def _draw_side_button(x, y, label, live, focused, fill=None, lit=False):
+            pygame.draw.rect(menu_canvas, NEON_GREEN if lit else (fill or COLOR_MENU_CARD) if live else COLOR_MENU_CARD_GREYED, (x, y, _side_w, _slot_h), border_radius=box_radius)
+            pygame.draw.rect(menu_canvas, (NEON_GREEN if focused else COLOR_MENU_CARD_EDGE) if live else COLOR_MENU_CARD_EDGE_GREYED, (x, y, _side_w, _slot_h), focus_thickness, border_radius=box_radius)
+            lbl = f_ch_btn.render(label, True, COLOR_MENU_TEXT_ON_LIT if lit else TEXT_WHITE if live else COLOR_MENU_CARD_TEXT_GREYED)
+            menu_canvas.blit(lbl, (x + (_side_w - lbl.get_width()) // 2, y + (_slot_h - lbl.get_height()) // 2))
 
-        _draw_role_card(
-            card_top, 0, "server", "Server",
-            "Saves your TV station and visualizer scheduling to a .json file and streams "
-            "it to other apps on the same WiFi network that are set to User.",
-        )
-        _draw_role_card(
-            card_top + card_h + card_gap, 1, "user", "User",
-            "Looks for a Server on the same WiFi network and receives the TV station and "
-            "visualizer scheduling broadcast from it automatically.",
-        )
+        _group_y = role_btn_y
+        for _role_id, _role_idx in (("server", 0), ("user", 1)):
+            _draw_role_button(_group_y, _role_idx, _role_id, "Server" if _role_id == "server" else "User")
+            _is_server = _role_id == "server"
+            _filled = len(_slot_names) if _is_server else len(_scan_entries)
+            _total = 6 if _filled < 6 else -(-(_filled + 1) // _slot_cols) * _slot_cols
+            _rows = _total // _slot_cols
+            _scrolls = _rows > _slot_visible_rows
+            _first_row = max(0, min(int(app_state.get(f"server_menu_scroll_{_role_id}", 0)), _rows - _slot_visible_rows))
+            _greyed = server_role is not None and server_role != _role_id
+            _view_y = _group_y + role_btn_h + _even_gap
+            _slots_right = role_btn_x + _slot_w * _slot_cols + _slot_gap * (_slot_cols - 1) + 6 + _bar_w
+            for _i in range(_first_row * _slot_cols, min(_total, (_first_row + _slot_visible_rows) * _slot_cols)):
+                _sx = role_btn_x + (_i % _slot_cols) * (_slot_w + _slot_gap)
+                _sy = _view_y + (_i // _slot_cols - _first_row) * (_slot_h + _slot_gap)
+                if _is_server:
+                    _text = (_slot_names.get(_slot_ids[_i]) or f"Server {_i + 1}") if _i < len(_slot_ids) else ""
+                    _chosen = _i < len(_slot_ids) and _slot_ids[_i] == _server_pick
+                    _is_focus = not _greyed and srv_sel == 10 + _i
+                else:
+                    _text = _scan_entries[_i]["name"] if _i < len(_scan_entries) else ""
+                    _chosen = bool(_scan_entries) and _i == _scan_pick
+                    _is_focus = not _greyed and bool(_scan_entries) and _i < len(_scan_entries) and srv_sel == 20 + _i
+                pygame.draw.rect(menu_canvas, COLOR_MENU_CARD_GREYED if _greyed else COLOR_MENU_CARD, (_sx, _sy, _slot_w, _slot_h), border_radius=6)
+                pygame.draw.rect(menu_canvas, COLOR_MENU_CARD_EDGE_GREYED if _greyed else COLOR_MENU_CARD_EDGE, (_sx, _sy, _slot_w, _slot_h), 1, border_radius=6)
+                if _is_focus:
+                    pygame.draw.rect(menu_canvas, NEON_GREEN, (_sx, _sy, _slot_w, _slot_h), focus_thickness, border_radius=6)
+                _renaming_this = _is_server and app_state.get("editing_server_slot_name", False) and _i < len(_slot_ids) and app_state.get("server_slot_name_target_slot_id") == _slot_ids[_i]
+                _all_picked = False
+                if _renaming_this:
+                    _text = app_state.get("server_slot_name_buffer", "")
+                    _all_picked = app_state.get("server_slot_name_all_selected", False)
+                    if _all_picked:
+                        pygame.draw.rect(menu_canvas, NEON_GREEN, (_sx + 34, _sy + 6, f_slot.size(_text)[0] + 8, _slot_h - 12), border_radius=3)
+                    else:
+                        _text += "_" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
+                if _text or _renaming_this:
+                    _dot_c = (_sx + 20, _sy + _slot_h // 2)
+                    if _chosen:
+                        pygame.draw.circle(menu_canvas, COLOR_MENU_CARD_EDGE_GREYED if _greyed else NEON_GREEN, _dot_c, 7)
+                        if _is_server and _moved_not_applied and not _greyed:
+                            pygame.draw.circle(menu_canvas, NEON_GREEN, _dot_c, 11, 2)
+                    else:
+                        pygame.draw.circle(menu_canvas, COLOR_MENU_CARD_EDGE_GREYED if _greyed else COLOR_MENU_CARD_EDGE, _dot_c, 7, 2)
+                if _text:
+                    _lbl = f_slot.render(_text, True, COLOR_MENU_TEXT_ON_LIT if _all_picked else COLOR_MENU_CARD_TEXT_GREYED if _greyed else TEXT_WHITE)
+                    menu_canvas.blit(_lbl, (_sx + 38, _sy + (_slot_h - _lbl.get_height()) // 2))
+            _bar_x = _slots_right - _bar_w
+            pygame.draw.rect(menu_canvas, COLOR_MENU_CARD_EDGE_GREYED, (_bar_x, _view_y, _bar_w, _slot_view_h), border_radius=4)
+            _thumb_h = max(20, _slot_view_h * _slot_visible_rows // max(_rows, _slot_visible_rows))
+            _thumb_y = _view_y + ((_slot_view_h - _thumb_h) * _first_row // (_rows - _slot_visible_rows) if _scrolls else 0)
+            pygame.draw.rect(menu_canvas, COLOR_MENU_CARD_EDGE_GREYED if _greyed else NEON_GREEN, (_bar_x, _thumb_y, _bar_w, _thumb_h), border_radius=4)
 
-        btn_h = 40
-        btn_pad_x = 28
-        btn_text_y_offset = (btn_h // 2) - (f_ch_btn.get_height() // 2)
+            _side_x = _slots_right + 18
+            _row_two_y = _view_y + _slot_h + _slot_gap
+            _btn_live = _srv_extra_btn_visible and (_is_server == _manage_servers_visible)
+            _draw_side_button(_side_x, _view_y, "Manage Server" if _is_server else "Server Scan", _btn_live, srv_sel == (2 if _is_server else menu_nav.SERVER_MENU_SCAN))
+            if _is_server:
+                _draw_side_button(_side_x, _row_two_y, "Rename", _btn_live, srv_sel == menu_nav.SERVER_MENU_RENAME, lit=app_state.get("editing_server_slot_name", False))
+                _draw_side_button(_side_x, _row_two_y + _slot_h + _slot_gap, "Reset Server", _btn_live, srv_sel == menu_nav.SERVER_MENU_RESET, COLOR_BUTTON_CLEAR)
+            else:
+                _draw_side_button(_side_x, _row_two_y, "Pick Server", _btn_live, srv_sel == 2)
+            _group_y = _view_y + _slot_view_h + _even_gap
+
+        _draw_shared_button(menu_canvas, _menu_clear_rect(cx, content_y, content_h), COLOR_BUTTON_CLEAR, "Clear User Choice", srv_sel == menu_nav.SERVER_MENU_CLEAR, f_ch_btn, NEON_GREEN)
+
         btn_y = content_y + content_h - MENU_CLOSE_BUTTON_PLACE[1]
-
-        if _srv_extra_btn_visible:
-            is_ms_focused = srv_sel == 2
-            ms_label = "Manage Servers" if _manage_servers_visible else "Pick a Server"
-            ms_btn_w = f_ch_btn.size(ms_label)[0] + (btn_pad_x * 2)
-            ms_btn_h = btn_h
-            ms_btn_x = cx + label_padding_x
-            ms_btn_y = btn_y
-            pygame.draw.rect(menu_canvas, COLOR_MENU_CARD, (ms_btn_x, ms_btn_y, ms_btn_w, ms_btn_h), border_radius=box_radius)
-            border_col = NEON_GREEN if is_ms_focused else COLOR_MENU_CARD_EDGE
-            pygame.draw.rect(menu_canvas, border_col, (ms_btn_x, ms_btn_y, ms_btn_w, ms_btn_h), focus_thickness, border_radius=box_radius)
-            lbl_ms = f_ch_btn.render(ms_label, True, TEXT_WHITE)
-            menu_canvas.blit(lbl_ms, (ms_btn_x + (ms_btn_w // 2) - (lbl_ms.get_width() // 2), ms_btn_y + btn_text_y_offset))
 
         is_cl_focused = srv_sel == _srv_close_idx
         close_btn_y = btn_y
 
         _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_cl_focused, f_ch_btn, NEON_GREEN)
-
-    # ========================================================================
-    # SECTION: System tab: server slots
-    # ========================================================================
-
-    elif active_tab == "System" and layer == "SERVER_SLOTS_MENU":
-        box_radius = 4
-        focus_thickness = SELECTION_BORDER_WIDTH
-        label_padding_x = 35
-
-        f_sub_header = _get_font("Courier New", 24, bold=True)
-        hdr = f_sub_header.render("Server Slots", True, COLOR_ARCADE_GOLD)
-        menu_canvas.blit(hdr, (cx + label_padding_x, content_y + 4))
-
-        slot_ids = getattr(db, "SERVER_SLOT_IDS", tuple(f"server{i}" for i in range(1, 7))) if db is not None else tuple(f"server{i}" for i in range(1, 7))
-        named = dict(db.config.get("server_slots", {})) if db is not None else {}
-        active_slot_id = db.config.get("active_server_slot") if db is not None else None
-        can_add = len(named) < len(slot_ids)
-
-        SLOT_ROWS = 3
-        SLOT_COLS = 2
-        CREATE_IDX = SLOT_ROWS * SLOT_COLS
-        MANAGE_IDX = CREATE_IDX + 1
-        CLOSE_IDX = MANAGE_IDX + 1
-
-        f_row = _get_font("Courier New", 17)
-        f_btn = f_ch_btn
-
-        side_btn_w = 150
-        side_gap = 24
-        grid_w = content_w - (label_padding_x * 2) - side_btn_w - side_gap
-        col_gap = 16
-        cell_w = (grid_w - col_gap) // SLOT_COLS
-        row_h = 44
-        row_gap = 10
-        grid_x = cx + label_padding_x
-        grid_y = content_y + 46
-
-        editing = app_state.get("editing_server_slot_name", False)
-        edit_buffer = app_state.get("server_slot_name_buffer", "")
-        all_selected = app_state.get("server_slot_name_all_selected", False)
-
-        for i, slot_id in enumerate(slot_ids):
-            col = i // SLOT_ROWS
-            row = i % SLOT_ROWS
-            x = grid_x + col * (cell_w + col_gap)
-            y = grid_y + row * (row_h + row_gap)
-            name = named.get(slot_id)
-            is_named = bool(name)
-            is_focused = cur_sel == i
-
-            bg = COLOR_MENU_CARD if is_named else COLOR_MENU_CARD_GREYED
-            if is_focused:
-                border_col = NEON_GREEN if is_named else COLOR_MENU_EDGE_LOCKED
-            else:
-                border_col = COLOR_MENU_CARD_EDGE if is_named else COLOR_MENU_CARD_EDGE_GREYED
-            pygame.draw.rect(menu_canvas, bg, (x, y, cell_w, row_h), border_radius=6)
-            pygame.draw.rect(menu_canvas, border_col, (x, y, cell_w, row_h), focus_thickness if is_focused else 1, border_radius=6)
-
-            label_prefix = f"Slot {i + 1} -- "
-            text_x = x + 14
-
-            if editing and app_state.get("server_slot_name_target_row") == i:
-                display_text = edit_buffer
-                if all_selected and (pygame.time.get_ticks() // 500) % 2 == 0:
-                    lbl = f_row.render(display_text, True, COLOR_MENU_TEXT_ON_LIT)
-                    sel_rect = pygame.Rect(text_x - 4, y + 6, f_row.size(display_text)[0] + 8, row_h - 12)
-                    _aa_rounded_rect(menu_canvas, NEON_GREEN, sel_rect, border_radius=3)
-                    menu_canvas.blit(lbl, (text_x, y + (row_h // 2) - (lbl.get_height() // 2)))
-                else:
-                    cursor = "_" if (pygame.time.get_ticks() // 500) % 2 == 0 else ""
-                    lbl = f_row.render(display_text + cursor, True, TEXT_WHITE)
-                    menu_canvas.blit(lbl, (text_x, y + (row_h // 2) - (lbl.get_height() // 2)))
-                continue
-
-            if is_named:
-                lbl = f_row.render(f'{label_prefix}"{name}"', True, TEXT_WHITE)
-            else:
-                lbl = f_row.render(f"{label_prefix}unnamed", True, COLOR_MENU_UNNAMED_TEXT)
-            menu_canvas.blit(lbl, (text_x, y + (row_h // 2) - (lbl.get_height() // 2)))
-
-            if is_named and slot_id == active_slot_id:
-                tag = f_row.render("ACTIVE", True, NEON_GREEN)
-                tag_x = x + cell_w - tag.get_width() - 12
-                if tag_x > text_x + lbl.get_width() + 8:
-                    menu_canvas.blit(tag, (tag_x, y + (row_h // 2) - (tag.get_height() // 2)))
-
-        side_x = grid_x + grid_w + side_gap
-        create_y = grid_y
-        manage_y = grid_y + row_h + 16
-
-        def _draw_side_btn(label, y, idx, enabled):
-            is_focused = cur_sel == idx
-            bg = COLOR_MENU_CARD if enabled else COLOR_MENU_CARD_GREYED
-            txt_col = TEXT_WHITE if enabled else COLOR_MENU_CARD_TEXT_GREYED
-            border_col = (NEON_GREEN if is_focused else COLOR_MENU_CARD_EDGE) if enabled else COLOR_MENU_CARD_EDGE_GREYED
-            pygame.draw.rect(menu_canvas, bg, (side_x, y, side_btn_w, row_h), border_radius=box_radius)
-            pygame.draw.rect(menu_canvas, border_col, (side_x, y, side_btn_w, row_h), focus_thickness if (is_focused and enabled) else 1, border_radius=box_radius)
-            lbl = f_btn.render(label, True, txt_col)
-            menu_canvas.blit(lbl, (side_x + (side_btn_w // 2) - (lbl.get_width() // 2), y + (row_h // 2) - (lbl.get_height() // 2)))
-
-        _draw_side_btn("Create", create_y, CREATE_IDX, can_add)
-        _draw_side_btn("Manage", manage_y, MANAGE_IDX, bool(named))
-
-        btn_h = 40
-        btn_pad_x = 28
-        close_btn_y = content_y + content_h - 45
-        is_close_focused = cur_sel == CLOSE_IDX
-
-        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, is_close_focused, f_ch_btn, NEON_GREEN)
-
-    # ========================================================================
-    # SECTION: System tab: server slot actions
-    # ========================================================================
-
-    elif active_tab == "System" and layer == "SERVER_SLOT_ACTIONS":
-        box_radius = 4
-        focus_thickness = SELECTION_BORDER_WIDTH
-        label_padding_x = 35
-
-        target_row = app_state.get("server_slot_name_target_row", 0)
-        slot_ids = getattr(db, "SERVER_SLOT_IDS", tuple(f"server{i}" for i in range(1, 7))) if db is not None else tuple(f"server{i}" for i in range(1, 7))
-        named = dict(db.config.get("server_slots", {})) if db is not None else {}
-        target_slot_id = slot_ids[target_row] if 0 <= target_row < len(slot_ids) else None
-        target_name = named.get(target_slot_id, "") if target_slot_id else ""
-        is_active = db is not None and target_slot_id is not None and \
-            db.config.get("active_server_slot") == target_slot_id
-
-        f_sub_header = _get_font("Courier New", 22, bold=True)
-        hdr = f_sub_header.render(f'"{target_name}"', True, COLOR_ARCADE_GOLD)
-        menu_canvas.blit(hdr, (cx + label_padding_x, content_y + 8))
-        if is_active:
-            f_active_tag = f_ch_label
-            active_tag = f_active_tag.render("(ACTIVE)", True, NEON_GREEN)
-            menu_canvas.blit(active_tag, (cx + label_padding_x + hdr.get_width() + 12, content_y + 12))
-
-        pending_delete = app_state.get("server_slot_pending_delete", False)
-        make_active_label = "Deactivate (back to local)" if is_active else "Make Active"
-        actions = [make_active_label, "Rename", "Delete", "Cancel"]
-        f_row = _get_font("Courier New", 18)
-        row_h = 40
-        row_gap = 8
-        row_w = content_w - (label_padding_x * 2)
-        row_x = cx + label_padding_x
-        row_y = content_y + 50
-
-        for i, label in enumerate(actions):
-            is_focused = cur_sel == i
-            y = row_y + i * (row_h + row_gap)
-            bg = COLOR_MENU_DELETE_ARMED if (label == "Delete" and pending_delete and is_focused) else COLOR_MENU_CARD
-            border_col = NEON_GREEN if is_focused else COLOR_MENU_CARD_EDGE
-            pygame.draw.rect(menu_canvas, bg, (row_x, y, row_w, row_h), border_radius=6)
-            pygame.draw.rect(menu_canvas, border_col, (row_x, y, row_w, row_h), focus_thickness if is_focused else 1, border_radius=6)
-            shown = "Press Enter again to confirm delete" if (label == "Delete" and pending_delete) else label
-            col = OFF_RED if label == "Delete" else TEXT_WHITE
-            lbl = f_row.render(shown, True, col)
-            menu_canvas.blit(lbl, (row_x + 16, y + (row_h // 2) - (lbl.get_height() // 2)))
-
-    # ========================================================================
-    # SECTION: System tab: server picker
-    # ========================================================================
-
-    elif active_tab == "System" and layer == "SERVER_PICKER_MENU":
-        box_radius = 4
-        focus_thickness = SELECTION_BORDER_WIDTH
-        label_padding_x = 35
-
-        f_sub_header = _get_font("Courier New", 24, bold=True)
-        hdr = f_sub_header.render("Pick a Server", True, COLOR_ARCADE_GOLD)
-        menu_canvas.blit(hdr, (cx + label_padding_x, content_y + 4))
-
-        entries = get_server_picker_entries(db)
-
-        _sp_live_count = get_server_picker_selectable_count(entries)
-        if cur_sel >= _sp_live_count:
-            cur_sel = max(0, _sp_live_count - 1)
-            app_state["menu_selection_index"] = cur_sel
-
-        SP_VISIBLE_ROWS = SERVER_PICKER_VISIBLE_ROWS
-        total_entries = len(entries)
-        max_scroll = max(0, total_entries - SP_VISIBLE_ROWS)
-        focus_entry_idx = cur_sel if cur_sel < total_entries else max(0, total_entries - 1)
-        scroll = min(app_state.get("server_picker_scroll", 0), max_scroll)
-        if focus_entry_idx < scroll:
-            scroll = focus_entry_idx
-        elif focus_entry_idx > scroll + SP_VISIBLE_ROWS - 1:
-            scroll = focus_entry_idx - SP_VISIBLE_ROWS + 1
-        scroll = max(0, min(scroll, max_scroll))
-        app_state["server_picker_scroll"] = scroll
-
-        visible_entries = entries[scroll:scroll + SP_VISIBLE_ROWS]
-        _sp_window_reaches_end = (scroll + SP_VISIBLE_ROWS) >= total_entries
-        display_rows = get_server_picker_display_rows(visible_entries, include_close=False)
-
-        f_header_row = _get_font("Courier New", 15, bold=True)
-        f_row = _get_font("Courier New", 18)
-        f_host = _get_font("Courier New", 13)
-        row_h = 42
-        row_gap = 8
-        header_h = 26
-        row_w = content_w - (label_padding_x * 2)
-        row_x = cx + label_padding_x
-        row_y = content_y + 44
-
-        if not entries:
-            f_empty = f_ch_label
-            empty_lbl = f_empty.render("No server found.", True, COLOR_MENU_NO_SERVER_TEXT)
-            menu_canvas.blit(empty_lbl, (row_x, row_y))
-            row_y += empty_lbl.get_height() + 18
-        elif total_entries > SP_VISIBLE_ROWS:
-            f_scroll_hint = _get_font("Courier New", 13)
-            up_txt = "^ more above" if scroll > 0 else ""
-            down_txt = "more below v" if not _sp_window_reaches_end else ""
-            if up_txt:
-                lbl_up = f_scroll_hint.render(up_txt, True, COLOR_MENU_DIM_TEXT)
-                menu_canvas.blit(lbl_up, (row_x + row_w - lbl_up.get_width(), content_y + 6))
-            if down_txt:
-                lbl_down = f_scroll_hint.render(down_txt, True, COLOR_MENU_DIM_TEXT)
-                menu_canvas.blit(lbl_down, (row_x, content_y + content_h - 30))
-
-        y = row_y
-        selectable_i = scroll
-        for disp_row in display_rows:
-            if disp_row["type"] == "header":
-                lbl_h = f_header_row.render(disp_row["text"], True, COLOR_MENU_DIM_TEXT)
-                menu_canvas.blit(lbl_h, (row_x, y + (header_h // 2) - (lbl_h.get_height() // 2)))
-                y += header_h
-                continue
-
-            is_focused = cur_sel == selectable_i
-            bg = COLOR_MENU_CARD
-            border_col = NEON_GREEN if is_focused else COLOR_MENU_CARD_EDGE
-            pygame.draw.rect(menu_canvas, bg, (row_x, y, row_w, row_h), border_radius=6)
-            pygame.draw.rect(menu_canvas, border_col, (row_x, y, row_w, row_h), focus_thickness if is_focused else 1, border_radius=6)
-
-            if disp_row["type"] == "entry":
-                if is_focused:
-                    sel_mark = f_row.render("[*]", True, NEON_GREEN)
-                    menu_canvas.blit(sel_mark, (row_x + 12, y + (row_h // 2) - (sel_mark.get_height() // 2)))
-                    text_x = row_x + 46
-                else:
-                    text_x = row_x + 16
-                lbl = f_row.render(disp_row["name"], True, TEXT_WHITE)
-                name_y = y + (row_h // 2) - lbl.get_height() + 1
-                menu_canvas.blit(lbl, (text_x, name_y))
-                lbl_host = f_host.render(disp_row["host"], True, COLOR_MENU_DIM_TEXT)
-                menu_canvas.blit(lbl_host, (text_x, name_y + lbl.get_height() - 2))
-
-            y += row_h + row_gap
-            selectable_i += 1
-
-        _draw_menu_close(menu_canvas, cx, content_w, content_y, content_h, cur_sel >= total_entries, f_ch_btn, NEON_GREEN)
 
     # ========================================================================
     # SECTION: Channels tab: channel list
@@ -4867,8 +4638,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
 
     elif active_tab == "Channels" and layer == "CHANNEL_SETTINGS_SUB_MENU":
 
-        f_sub_title = _get_font("Courier New", 20, bold=True)
-        lbl_hdr = f_sub_title.render("Channels \u2014 Settings", True, TEXT_WHITE)
+        lbl_hdr = _menu_title_surface("Channels \u2014 Settings")
 
         _cs_row_labels = {
             "scan_lines": "Scan Lines",
@@ -4904,7 +4674,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         _cs_even_gap = (_cs_area_bottom - _cs_area_top - _cs_total_rows * box_h_43) // (_cs_total_rows + 1)
         _cs_gap = max(CHANNEL_SETTINGS_HEADER_GAP_PX // 2, _cs_even_gap)
 
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, _cs_title_y))
+        _blit_menu_title(menu_canvas, lbl_hdr, cx + content_w // 2 - lbl_hdr.get_width() // 2, _cs_title_y)
         _cs_top_y = _cs_area_top + _cs_gap
 
         _cs_block_ws = [
@@ -4993,9 +4763,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         target_ch_str = str(app_state.get("selected_channel_row", 5)).zfill(2)
         ch_info = db.channels_db.get(target_ch_str, {"active": True, "is_visualizer": False, "name": f"STATION {target_ch_str}", "visualizer_style": "Random"})
         
-        lbl_sub = f_ch_label.render(f"Channel {target_ch_str} Scheduling Settings", True, TEXT_WHITE)
-        title_x = cx + (content_w // 2) - (lbl_sub.get_width() // 2)
-        menu_canvas.blit(lbl_sub, (title_x, content_y + 20))
+        lbl_sub = _menu_title_surface(f"Channel {target_ch_str} Scheduling Settings")
+        _blit_menu_title(menu_canvas, lbl_sub, cx + (content_w // 2) - (lbl_sub.get_width() // 2), content_y + MENU_TITLE_TOP_PX)
         
         sub_r = app_state.get("sub_menu_row_index", 0) 
         sub_c = app_state.get("sub_menu_col_index", 0)
@@ -5554,15 +5323,11 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
     elif layer == "AUDIO_TRACK_PICKER" and active_tab in ("Channels", "Games"):
         _audio_ctx = app_state.get("audio_track_context", "channel")
         if _audio_ctx == "dvd":
-            f_sub_title = f_ch_label
-            lbl_hdr = f_sub_title.render("DVD \u2014 Change Audio Selection", True, TEXT_WHITE)
+            lbl_hdr = _menu_title_surface("DVD \u2014 Change Audio Selection")
         else:
             target_ch_str = str(app_state.get("audio_track_source_channel", app_state.get("selected_channel_row", 5))).zfill(2)
-            f_sub_title = f_ch_label
-            lbl_hdr = f_sub_title.render(
-                f"Channel {target_ch_str} \u2014 Audio Settings", True, TEXT_WHITE
-            )
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
+            lbl_hdr = _menu_title_surface(f"Channel {target_ch_str} \u2014 Audio Settings")
+        _blit_menu_title(menu_canvas, lbl_hdr, cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + MENU_TITLE_TOP_PX)
 
         sub_r  = app_state.get("sub_menu_row_index", 0)
         tracks = app_state.get("audio_track_list", [])
@@ -5634,9 +5399,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         sub_r = app_state.get("sub_menu_row_index", 0)
         labels = ("Commercials", "Fade-in", "Fade-out")
         keys = ("Commercials", "Fade-in", "Fade-out")
-        f_sub_title = _get_font("Courier New", 20, bold=True)
-        lbl_hdr = f_sub_title.render(f"Channel {target_ch_str} — Commercials", True, TEXT_WHITE)
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
+        lbl_hdr = _menu_title_surface(f"Channel {target_ch_str} \u2014 Commercials")
+        _blit_menu_title(menu_canvas, lbl_hdr, cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + MENU_TITLE_TOP_PX)
         row_w = int(content_w * SUB_MENU_ROW_WIDTH_SHARE)
         row_x = cx + (content_w - row_w) // 2
         row_h = 44
@@ -5672,11 +5436,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             {"active": True, "is_visualizer": False, "name": f"STATION {target_ch_str}"}
         )
 
-        f_sub_title = _get_font("Courier New", 20, bold=True)
-        lbl_hdr = f_sub_title.render(
-            f"Channel {target_ch_str}  —  Holiday Schedule", True, TEXT_WHITE
-        )
-        menu_canvas.blit(lbl_hdr, (cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + 20))
+        lbl_hdr = _menu_title_surface(f"Channel {target_ch_str} \u2014 Holiday Schedule")
+        _blit_menu_title(menu_canvas, lbl_hdr, cx + content_w // 2 - lbl_hdr.get_width() // 2, content_y + MENU_TITLE_TOP_PX)
 
         sub_r  = app_state.get("sub_menu_row_index", 0)
         sub_c  = app_state.get("sub_menu_col_index", 0)
@@ -5960,7 +5721,8 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _r, _g, _b = colorsys.hsv_to_rgb(hue_val / 360.0, 0.8, 0.9)
                 _pixel_color = (int(_r * 255), int(_g * 255), int(_b * 255))
                 pygame.draw.line(_cached_bg_gradient_surf, _pixel_color, (i, 0), (i, gradient_height))
-                pygame.draw.line(_cached_ui_gradient_surf, _pixel_color, (i, 0), (i, gradient_height))
+                _ur, _ug, _ub = colorsys.hsv_to_rgb(_theme_track_hue(i / float(slider_width)) / 360.0, 0.8, 0.9)
+                pygame.draw.line(_cached_ui_gradient_surf, (int(_ur * 255), int(_ug * 255), int(_ub * 255)), (i, 0), (i, gradient_height))
 
         is_bg_focused = (layer == "THEME_ROWS" and cur_sel == 3)
         title_color = NEON_GREEN if is_bg_focused else TEXT_WHITE
@@ -5985,7 +5747,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         
         menu_canvas.blit(_cached_ui_gradient_surf, (slider_x, ui_slider_y))
         
-        ui_knob_x = slider_x + int((ui_hue / 360.0) * slider_width)
+        ui_knob_x = slider_x + int(_theme_track_fraction(ui_hue) * slider_width)
         pygame.draw.circle(menu_canvas, TEXT_WHITE, (ui_knob_x, ui_slider_y - 5), knob_rad)
         if is_ui_focused:
             pygame.draw.circle(menu_canvas, NEON_GREEN, (ui_knob_x, ui_slider_y - 5), focus_knob_rad, SELECTION_BORDER_WIDTH)
@@ -6307,12 +6069,10 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             menu_canvas.blit(logo_surf, (lx, ly))
             logo_drawn = True
         if not logo_drawn:
-            f_sub_title = _get_font("Courier New", 20, bold=True)
-            lbl_sub = f_sub_title.render(CONSOLE_LABELS.get(console_key, console_key), True, TEXT_WHITE)
-            menu_canvas.blit(lbl_sub, (
-                header_box_x + header_box_w // 2 - lbl_sub.get_width() // 2,
-                header_box_y + header_box_h // 2 - lbl_sub.get_height() // 2
-            ))
+            lbl_sub = _menu_title_surface(CONSOLE_LABELS.get(console_key, console_key))
+            _blit_menu_title(menu_canvas, lbl_sub,
+                             header_box_x + header_box_w // 2 - lbl_sub.get_width() // 2,
+                             header_box_y + header_box_h // 2 - lbl_sub.get_height() // 2)
 
         top_y  = header_box_y + header_box_h + 14
         row_x  = cx + 35
@@ -7140,7 +6900,11 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         "Every setting and everything saved is forgotten.",
         "Your own files stay. The app restarts.",
     ]
-    _has_body = _is_burnin_family or target in ("app_update", "reset_settings")
+    _server_bodies = {
+        "server_reset": ["This server's channels go back to the start:", "all off except 05, no media."],
+        "user_choice_clear": ["You leave the server you picked.", "Your own channels come back."],
+    }
+    _has_body = _is_burnin_family or target in ("app_update", "reset_settings") or target in _server_bodies
 
     if _has_checkbox:
         box_h = 290
@@ -7179,6 +6943,8 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
         "poweroff": "TURN OFF COMPUTER?",
         "boot_on_start": "REPLACE WINDOWS SHELL?",
         "app_update": "UPDATE AND RESTART?",
+        "server_reset": "RESET THIS SERVER?",
+        "user_choice_clear": "CLEAR USER CHOICE?",
     }
     if target == "clear_console_roms":
         from game_deck import CONSOLE_LABELS
@@ -7204,7 +6970,7 @@ def render_clear_confirm_popup(surface, theme, db=None, app_state=None):
 
     if _has_body:
         _body_lines = (_BURNIN_BODY[_burnin_key] if _is_burnin_family
-                       else _update_body if target == "app_update" else _reset_body)
+                       else _update_body if target == "app_update" else _server_bodies.get(target, _reset_body))
         _body_max_w = box_w - 40
         _body_size = 15
         while _body_size > 10:
@@ -7290,10 +7056,7 @@ __all__ = [
     "get_games_sub_menu_rows",
     "get_guide_num_cols",
     "get_guide_visible_rows",
-    "get_mock_discovered_servers",
-    "get_server_picker_display_rows",
-    "get_server_picker_entries",
-    "get_server_picker_selectable_count",
+        "get_server_picker_entries",
     "get_system_menu_rows",
     "guide_preload_tick",
     "invalidate_guide_cache",

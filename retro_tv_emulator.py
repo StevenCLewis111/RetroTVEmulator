@@ -310,6 +310,96 @@ if "--server-service" in sys.argv:
     raise SystemExit(server_service.run_service(
         _service_base_dir or os.path.dirname(os.path.abspath(sys.argv[0]))))
 
+def _loaded_native_libraries_note(limit=90):
+    """One line naming the native libraries loaded in this process outside the Windows folder, so a crash between two libraries that clash can be traced; empty off Windows."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        from ctypes import wintypes
+        psapi, kernel = ctypes.WinDLL("psapi"), ctypes.WinDLL("kernel32")
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        psapi.GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        process = kernel.GetCurrentProcess()
+        handles, needed = (wintypes.HMODULE * 2048)(), wintypes.DWORD()
+        psapi.EnumProcessModules(process, handles, ctypes.sizeof(handles), ctypes.byref(needed))
+        names = []
+        for handle in handles[:min(needed.value // ctypes.sizeof(wintypes.HMODULE), 2048)]:
+            buffer = ctypes.create_unicode_buffer(520)
+            psapi.GetModuleFileNameExW(process, handle, buffer, 520)
+            if buffer.value and "\\windows\\" not in buffer.value.lower():
+                names.append(os.path.basename(buffer.value))
+        return "%d libraries: %s" % (len(names), ", ".join(sorted(names)[:limit]))
+    except Exception as _error:
+        return "could not list the loaded libraries: %r" % (_error,)
+
+
+if "--caption-model-worker" in sys.argv:
+    # WARNING: this copy of the program only holds the caption model and answers transcribe requests; it must run before any log file or crash handler is opened so a native crash here leaves the real logs untouched, and it keeps its own crash file.
+    _worker_args = sys.argv[sys.argv.index("--caption-model-worker") + 1:]
+    try:
+        import faulthandler as _worker_faulthandler
+        _worker_crash_file = open(os.path.join(_worker_args[5], "caption_worker_crash.txt"), "w", encoding="utf-8", buffering=1)
+        _worker_crash_file.write("caption model process %d started %s\n" % (os.getpid(), datetime.datetime.now().isoformat()))
+        _worker_faulthandler.enable(file=_worker_crash_file, all_threads=True)
+        sys.stderr = _worker_crash_file
+    except Exception as _worker_setup_error:
+        sys.stderr = None
+    try:
+        from multiprocessing.connection import Client as _WorkerClient
+        _worker_link = _WorkerClient(("127.0.0.1", int(_worker_args[3])), authkey=bytes.fromhex(_worker_args[4]))
+    except BaseException:
+        os._exit(3)
+    try:
+        from faster_whisper import WhisperModel as _WorkerModel
+        try:
+            _worker_model = _WorkerModel(_worker_args[1], device="cpu", compute_type="int8", cpu_threads=int(_worker_args[2]),
+                                         download_root=_worker_args[0], local_files_only=True)
+        except Exception:
+            _worker_model = _WorkerModel(_worker_args[1], device="cpu", compute_type="int8", cpu_threads=int(_worker_args[2]),
+                                         download_root=_worker_args[0])
+        _worker_facts = []
+        for _worker_module in ("faster_whisper", "ctranslate2", "numpy"):
+            try:
+                _worker_facts.append("%s %s" % (_worker_module, getattr(__import__(_worker_module), "__version__", "?")))
+            except Exception as _worker_fact_error:
+                _worker_facts.append("%s unavailable (%r)" % (_worker_module, _worker_fact_error))
+        try:
+            import ctranslate2 as _worker_ct2
+            _worker_facts.append("cpu compute types %s" % sorted(_worker_ct2.get_supported_compute_types("cpu")))
+        except Exception as _worker_fact_error:
+            _worker_facts.append("compute types unreadable (%r)" % (_worker_fact_error,))
+        _worker_facts.append(_loaded_native_libraries_note())
+        _worker_link.send(("ready", "; ".join(_worker_facts)))
+    except BaseException as _worker_error:
+        try:
+            _worker_link.send(("error", repr(_worker_error)))
+        finally:
+            os._exit(2)
+    while True:
+        try:
+            _worker_request = _worker_link.recv()
+            if _worker_request[0] == "speech_spans":
+                from faster_whisper.vad import get_speech_timestamps as _worker_spans, VadOptions as _WorkerVadOptions
+                _worker_threshold, _worker_silence, _worker_speech = _worker_request[2]
+                try:
+                    _worker_options = _WorkerVadOptions(threshold=_worker_threshold, min_silence_duration_ms=_worker_silence, min_speech_duration_ms=_worker_speech)
+                except TypeError:
+                    _worker_options = _WorkerVadOptions(min_silence_duration_ms=_worker_silence)
+                _worker_link.send(("ok", _worker_spans(_worker_request[1], _worker_options)))
+                continue
+            if _worker_request[0] != "transcribe":
+                os._exit(0)
+            _worker_segments, _worker_info = _worker_model.transcribe(_worker_request[1], **_worker_request[2])
+            _worker_link.send(("ok", list(_worker_segments), _worker_info))
+        except (EOFError, OSError):
+            os._exit(0)
+        except BaseException as _worker_error:
+            try:
+                _worker_link.send(("error", "%r\n%s" % (_worker_error, traceback.format_exc())))
+            except BaseException:
+                os._exit(2)
+
 # WARNING: check this before any log file is opened so the crash and VLC logs of the process that triggered the relaunch survive.
 _IS_RELAUNCH = "--relaunched" in sys.argv
 
@@ -418,6 +508,7 @@ _TESTER_REPORT_MAX_HEALTH_LINES = performance_governor.TESTER_REPORT_MAX_HEALTH_
 # WARNING: the 200 fallback must match TESTER_REPORT_MAX_CRASH_LINES in performance_governor.py; it is used only when that module fails to import.
 _TESTER_REPORT_MAX_CRASH_LINES = performance_governor.TESTER_REPORT_MAX_CRASH_LINES if performance_governor is not None else 200
 from media import resolve_main_dir, resolve_loudness_dir, resolve_bezel_dir, discover_bezel_style_files, LOUDNESS_PROBE_MAX_CONCURRENT, get_music_loudness_gain
+media.set_native_libraries_reporter(_loaded_native_libraries_note)
 media.set_caption_memory_refusal_handler(lambda total_gb, available_gb, needed_gb: _on_caption_memory_refused(total_gb, available_gb, needed_gb))
 
 def _write_crash_log(exc_type, exc_value, exc_tb):
@@ -882,6 +973,9 @@ def _write_tester_report(reason):
             _lines = _tester_report_tail_lines(os.path.join(_dir, _name), _TESTER_REPORT_LOG_TAIL_BYTES)
             _out += ["", "=== %s (last %d lines) ===" % (_name, _TESTER_REPORT_MAX_CRASH_LINES)]
             _out += ["(none) - an empty or missing crash file means the app did not crash"] if not _lines else _lines[-_TESTER_REPORT_MAX_CRASH_LINES:]
+        _lines = _tester_report_tail_lines(os.path.join(os.path.dirname(_dir), "caption_worker_crash.txt"), _TESTER_REPORT_LOG_TAIL_BYTES)
+        _out += ["", "=== caption_worker_crash.txt, the caption model process (last %d lines) ===" % _TESTER_REPORT_MAX_CRASH_LINES]
+        _out += ["(none) - the caption model process has not run"] if not _lines else _lines[-_TESTER_REPORT_MAX_CRASH_LINES:]
         _lines = _tester_report_tail_lines(os.path.join(_dir, "app_log.txt"), _TESTER_REPORT_LOG_TAIL_BYTES)
         _out += ["", "=== app_log.txt warnings, errors and failures (latest %d) ===" % _TESTER_REPORT_MAX_LOG_LINES]
         _kept = [l for l in (_lines or []) if " [WARNING] " in l or " [ERROR] " in l or " [CRITICAL] " in l]
@@ -2601,7 +2695,7 @@ def _tv_border_osd_offset(stem):
 # WARNING: the fallback numbers below must match CH_NUM_TOP_ALIGN_NUDGE_PX in performance_governor.py; they are used only when that module fails to import.
 _CH_NUM_TOP_ALIGN_NUDGE_PX = performance_governor.CH_NUM_TOP_ALIGN_NUDGE_PX if performance_governor is not None else -20
 
-# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_NOISE_REFRESH_MS, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_MEDIUM_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, RECEPTION_LINE_COUNT_WEIGHTS, RECEPTION_LINE_BIG_CHANCE, RECEPTION_LINE_MEDIUM_CHANCE, RECEPTION_LINE_GAP_FRAC_RANGE, RECEPTION_LINE_GAP_MIN_DIFF_FRAC, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match TV_BORDER_SCREEN_EXPAND, TV_BORDER_SCREEN_EXPAND_DEFAULT, RECEPTION_NOISE_BLOCK_PX, RECEPTION_NOISE_VISIBLE_SHARE, RECEPTION_NOISE_BRIGHT_SHARE, RECEPTION_NOISE_BRIGHT_ALPHA, RECEPTION_NOISE_DARK_ALPHA, RECEPTION_NOISE_REFRESH_MS, RECEPTION_LINE_BIG_FRAC_RANGE, RECEPTION_LINE_MEDIUM_FRAC_RANGE, RECEPTION_LINE_SMALL_FRAC_RANGE, RECEPTION_LINE_SPEED_PX_MS, RECEPTION_LINE_COUNT_WEIGHTS, RECEPTION_LINE_BIG_CHANCE, RECEPTION_LINE_MEDIUM_CHANCE, RECEPTION_LINE_GAP_FRAC_RANGE, RECEPTION_LINE_GAP_MIN_DIFF_FRAC, FILE_EXPLORER_EXPAND_TIMEOUT_MS, SEEK_RETRY_INTERVAL_MS, GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS, CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS, SCHEDULER_REPEAT_GUARD_SECONDS, SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS, SLOT_TAIL_HOLD_MAX_SECONDS, BLOCK_ROTATION_CACHE_MAX_BLOCKS in performance_governor.py; they are used only when that module fails to import.
 _TV_BORDER_SCREEN_EXPAND = performance_governor.TV_BORDER_SCREEN_EXPAND if performance_governor is not None else {"bezel": (1.00, 1.00), "bezel1": (1.00, 1.00), "bezel2": (1.00, 1.00)}
 _TV_BORDER_SCREEN_EXPAND_DEFAULT = performance_governor.TV_BORDER_SCREEN_EXPAND_DEFAULT if performance_governor is not None else (1.00, 1.00)
 RECEPTION_NOISE_BLOCK_PX = performance_governor.RECEPTION_NOISE_BLOCK_PX if performance_governor is not None else 2
@@ -2625,6 +2719,7 @@ GUIDE_PRELOAD_WINDOW_SIZE_WAIT_SECONDS = performance_governor.GUIDE_PRELOAD_WIND
 CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS = performance_governor.CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS if performance_governor is not None else 0.3
 SCHEDULER_REPEAT_GUARD_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_SECONDS if performance_governor is not None else 60
 SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS if performance_governor is not None else 900
+SLOT_TAIL_HOLD_MAX_SECONDS = performance_governor.SLOT_TAIL_HOLD_MAX_SECONDS if performance_governor is not None else 3.0
 BLOCK_ROTATION_CACHE_MAX_BLOCKS = performance_governor.BLOCK_ROTATION_CACHE_MAX_BLOCKS if performance_governor is not None else 12
 
 
@@ -5517,9 +5612,10 @@ def _apply_reception_lines_effect(screen, rect):
 _watermark_cache = {"path": None, "raw": None, "target_w": None, "surface": None}
 
 _watermark_transition_state = {}
-# WARNING: the fallback numbers below must match WATERMARK_JUMP_TOLERANCE_PX, WATERMARK_REPOSITION_HIDE_MS, WATERMARK_ALPHA, WATERMARK_WIDTH_FRAC, WATERMARK_MARGIN_FRAC in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match WATERMARK_JUMP_TOLERANCE_PX, WATERMARK_REPOSITION_HIDE_MS, WATERMARK_SETTLE_MS, WATERMARK_ALPHA, WATERMARK_WIDTH_FRAC, WATERMARK_MARGIN_FRAC in performance_governor.py; they are used only when that module fails to import.
 _WATERMARK_JUMP_TOLERANCE_PX = performance_governor.WATERMARK_JUMP_TOLERANCE_PX if performance_governor is not None else 2
 _WATERMARK_REPOSITION_HIDE_MS = performance_governor.WATERMARK_REPOSITION_HIDE_MS if performance_governor is not None else 450
+_WATERMARK_SETTLE_MS = performance_governor.WATERMARK_SETTLE_MS if performance_governor is not None else 4000
 _WATERMARK_ALPHA = performance_governor.WATERMARK_ALPHA if performance_governor is not None else 150
 _WATERMARK_WIDTH_FRAC = performance_governor.WATERMARK_WIDTH_FRAC if performance_governor is not None else 0.091
 _WATERMARK_MARGIN_FRAC = performance_governor.WATERMARK_MARGIN_FRAC if performance_governor is not None else 0.12
@@ -5634,7 +5730,11 @@ def _draw_watermark(screen, bounds_rect=None, apply_bezel_offset=True, state_key
         if _wm_prev_rect is not None and any(
                 abs(_wm_cur_rect[i] - _wm_prev_rect[i]) > _WATERMARK_JUMP_TOLERANCE_PX
                 for i in range(4)):
-            _wm_state["hide_until"] = _wm_now + _WATERMARK_REPOSITION_HIDE_MS
+            # WARNING: only the first moments of a file hide the badge while the picture settles; later in the show the badge follows the picture without blinking out.
+            if state_key != "main" or _wm_now - app_state.get("last_video_play_started_at", 0) < _WATERMARK_SETTLE_MS:
+                _wm_state["hide_until"] = _wm_now + _WATERMARK_REPOSITION_HIDE_MS
+            else:
+                _log_warn_throttled("watermark_moved_mid_show", "[WATERMARK] the picture moved mid-show from %s to %s; the badge followed it without hiding", _wm_prev_rect, _wm_cur_rect)
         _wm_state["last_rect"] = _wm_cur_rect
         if _wm_now < _wm_state["hide_until"]:
             return
@@ -5689,6 +5789,7 @@ def _draw_watermark(screen, bounds_rect=None, apply_bezel_offset=True, state_key
             oy + sh - margin_y - int(extra_y),
         ))
         screen.blit(cache["surface"], wm_rect)
+        app_state["_watermark_drawn_at"] = _wm_now
     except Exception as e:
         log.warning("_draw_watermark: draw failed: %s", e)
 
@@ -5921,6 +6022,8 @@ STATUS_BANNER_DURATION_MS = performance_governor.STATUS_BANNER_DURATION_MS if pe
 # WARNING: the 5000 fallback must match CAPTION_MEMORY_BANNER_SECONDS in performance_governor.py; it is used only when that module fails to import.
 CAPTION_MEMORY_BANNER_MS = int(performance_governor.CAPTION_MEMORY_BANNER_SECONDS * 1000) if performance_governor is not None else 5000
 CAPTION_MEMORY_BANNER_LABEL = performance_governor.CAPTION_MEMORY_BANNER_LABEL if performance_governor is not None else "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
+# WARNING: the fallback text below must match CAPTION_CRASH_BANNER_LABEL in performance_governor.py; it is used only when that module fails to import.
+CAPTION_CRASH_BANNER_LABEL = performance_governor.CAPTION_CRASH_BANNER_LABEL if performance_governor is not None else "LIVE CAPTIONS TURNED OFF: THE CAPTION MODEL CRASHED"
 # WARNING: the 6000 fallback must match NOTICE_BANNER_SECONDS in performance_governor.py; it is used only when that module fails to import.
 NOTICE_BANNER_MS = int(performance_governor.NOTICE_BANNER_SECONDS * 1000) if performance_governor is not None else 6000
 
@@ -5982,9 +6085,26 @@ def _on_caption_memory_refused(total_gb, available_gb, needed_gb):
     _caption_memory_refusal_pending = True
 
 
+_caption_lock_boot_checked = False
+
+
+def _caption_lock_is_crash():
+    return performance_governor is not None and performance_governor.caption_lock_reason() == "crash"
+
+
+def _switch_off_locked_captions_at_boot():
+    """Once per run: if the boot scan locked Live Captions, a Captions switch still saved as on is switched off too, so deleting the marker file cannot turn a failing load back on by itself."""
+    global _caption_lock_boot_checked, _caption_memory_refusal_pending
+    if _caption_lock_boot_checked or db is None or performance_governor is None:
+        return
+    _caption_lock_boot_checked = True
+    if performance_governor.caption_memory_locked() and (db.config.get("tv_captions_enabled", False) or db.config.get("dvd_captions_enabled", False)):
+        _caption_memory_refusal_pending = True
+
+
 def _apply_caption_memory_refusal():
     """Main thread: switches Live Captions off and starts the red banner after the caption model was refused for lack of memory."""
-    global _caption_memory_refusal_pending, _caption_memory_banner_pending, _caption_prewarm_started
+    global _caption_memory_refusal_pending, _caption_memory_banner_pending
     if not _caption_memory_refusal_pending:
         return
     _caption_memory_refusal_pending = False
@@ -6003,14 +6123,12 @@ def _apply_caption_memory_refusal():
                 log.warning("[ASR MEMORY] game deck refresh failed: %s", e)
         if not _was_on:
             return
-    with _caption_prewarm_lock:
-        _caption_prewarm_started = False
     try:
         _release_tv_caption_state_when_off("not enough memory for live captions")
     except Exception as e:
         log.warning("[ASR MEMORY] could not clear the caption state: %s", e)
     _caption_memory_banner_pending = True
-    log.warning("[ASR MEMORY] Live Captions switched off: not enough free memory to load the caption model")
+    log.warning("[ASR MEMORY] Live Captions switched off: %s", "the caption model crashed, so they stay off until the marker file in the logs folder is deleted" if _caption_lock_is_crash() else "not enough free memory for live captions")
 
 
 def _drive_banner_roots():
@@ -6062,6 +6180,7 @@ def _channel_failure_is_drive_wide(ch_key, entry):
 
 
 def _advance_status_banner_streaks():
+    _switch_off_locked_captions_at_boot()
     _apply_caption_memory_refusal()
     global _drive_streak_signature, _drive_streak_consumed, _drive_streak_consumed_at
     global _gamepad_streak_signature, _gamepad_streak_consumed
@@ -6224,7 +6343,7 @@ def _status_banner_label(name):
     if name == "notice":
         return _notice_banner_text
     if name == "captions_memory":
-        return CAPTION_MEMORY_BANNER_LABEL
+        return CAPTION_CRASH_BANNER_LABEL if _caption_lock_is_crash() else CAPTION_MEMORY_BANNER_LABEL
     if name == "server" and _server_streak_signature is not None:
         server_name = _server_streak_signature[0]
         return f"SERVER OFFLINE — {server_name}"
@@ -6351,11 +6470,8 @@ def _stop_tv_caption_prefetch():
 
 
 def _unload_caption_model(reason):
-    """Frees the Whisper model once no caption session needs it, and lets the next captions-on pre-warm it again."""
-    global _caption_prewarm_started
-    if media.release_whisper_model(reason):
-        with _caption_prewarm_lock:
-            _caption_prewarm_started = False
+    """Frees the Whisper model once no caption session needs it; the next live transcription loads it again."""
+    media.release_whisper_model(reason)
 
 
 def _maybe_unload_caption_model_after_show(reason):
@@ -6386,33 +6502,6 @@ def _release_tv_caption_state_when_off(reason="captions off"):
     if live is not None or prefetch_session is not None:
         log.info("[TV CAPTIONS] %s -- live transcription stopped, caption state cleared", reason)
     _unload_caption_model(reason)
-
-
-_caption_prewarm_lock = threading.Lock()
-_caption_prewarm_started = False
-
-
-def _start_caption_model_prewarm(reason):
-    """Load and warm the Whisper model on a background thread; later calls do nothing."""
-    global _caption_prewarm_started
-    with _caption_prewarm_lock:
-        if _caption_prewarm_started:
-            return
-        _caption_prewarm_started = True
-
-    def _job():
-        try:
-            time.sleep(0.5)
-            _t0 = time.monotonic()
-            _model = media._get_whisper_model()
-            if _model is None:
-                log.warning("[ASR] caption model NOT loaded (%s) -- auto-captioning is unavailable this session", reason)
-            else:
-                log.info("[ASR] caption model pre-warmed (%s) in %.1fs", reason, time.monotonic() - _t0)
-        except Exception as _e:
-            log.warning("[ASR] caption model pre-warm failed (%s): %s", reason, _e)
-
-    threading.Thread(target=_job, daemon=True, name="caption-model-prewarm").start()
 
 
 def _maybe_start_tv_caption_prefetch(ch, current_path):
@@ -6779,6 +6868,17 @@ def _suppress_native_subtitles(path, kind):
         log.warning("_suppress_native_subtitles failed (non-fatal): %s", e)
 
 
+def _watermark_badge_bottom(content_rect):
+    """The bottom edge of the Water Mark badge, worked out from the same rectangle and margin _draw_watermark uses, so captions never sit above or over it."""
+    # WARNING: this must keep matching _draw_watermark: it is placed inside _watermark_bounds_rect (the real picture), not inside the content box, and the two differ on a screen with black bars.
+    bounds = _watermark_bounds_rect(content_rect)
+    extra_y = 0.0
+    stem = _active_bezel_stem_if_on()
+    if stem is not None:
+        extra_y = _WATERMARK_BEZEL_EXTRA_OFFSET.get(stem, (0, 0))[1]
+    return bounds.y + bounds.height - max(6, int(bounds.height * _WATERMARK_MARGIN_FRAC)) - int(extra_y)
+
+
 def _draw_caption_overlay(screen, content_rect=None):
     """Draws the current caption cue (if any) for TV-station / visualizer channels."""
     # WARNING: line 2 is hard-clamped so it never paints over the Water Mark badge.
@@ -6844,10 +6944,11 @@ def _draw_caption_overlay(screen, content_rect=None):
             return
 
         # WARNING: do not use the decoded picture's aspect-fit rect for captions; it moves when the aspect ratio changes.
+        sw, sh = screen.get_size()
         if content_rect is None:
-            sw, sh = screen.get_size()
             content_rect = _compute_content_rect(sw, sh)
-        caption_rect = content_rect
+        # WARNING: owner 2026-11-09: captions sit the same share of the whole screen's height above its bottom edge on every display; the content box only sets their width, so black bars above and below a boxed picture never lift them.
+        caption_rect = pygame.Rect(content_rect.x, 0, content_rect.width, sh)
         _cap_side_gap = max(2, round(caption_rect.width * 0.02))
         if caption_rect.width > _cap_side_gap * 2:
             caption_rect = caption_rect.inflate(-_cap_side_gap * 2, 0)
@@ -6857,14 +6958,20 @@ def _draw_caption_overlay(screen, content_rect=None):
         pad_x = max(2, round(ref * (14.0 / 720.0)))
         pad_y = max(1, round(ref * (6.0 / 720.0)))
 
-        _wm_margin_y = max(6, round(ref * _WATERMARK_MARGIN_FRAC))
-        _wm_extra_y = 0.0
-        _wm_stem = _active_bezel_stem_if_on()
-        if _wm_stem is not None:
-            _wm_extra_y = _WATERMARK_BEZEL_EXTRA_OFFSET.get(_wm_stem, (0, 0))[1]
-        margin = max(2, round((_wm_margin_y + _wm_extra_y) / 2.0))
+        # WARNING: owner 2026-11-09: the caption block sits below the bottom of the Water Mark badge, centred between that bottom edge and the bottom of the screen, with room for two rows; one row takes the top row's place and a second row goes under it, so rows never move.
+        _badge_bottom = _watermark_badge_bottom(content_rect)
 
         font = _cached_sys_font("Arial", font_size, bold=True)
+        line_gap = max(1, round(pad_y / 2))
+        _row_h = font.get_height()
+        _block_h = _row_h * 2 + line_gap
+        _band_h = sh - _badge_bottom
+        _fit_h = _band_h - pad_y * 2
+        if _block_h > _fit_h and font_size > 10:
+            font_size = max(10, int(font_size * _fit_h / _block_h))
+            font = _cached_sys_font("Arial", font_size, bold=True)
+            _row_h = font.get_height()
+            _block_h = _row_h * 2 + line_gap
         max_text_width = max(10, round(caption_rect.width * 0.8) - pad_x * 2)
         one_line = " ".join(active_text.split())
         line1_text, line2_text = _wrap_caption_to_two_lines(font, one_line, max_text_width)
@@ -6875,28 +6982,8 @@ def _draw_caption_overlay(screen, content_rect=None):
         surf1 = font.render(line1_text, True, color)
         surf2 = font.render(line2_text, True, color) if line2_text else None
 
-        line1_y = caption_rect.bottom - surf1.get_height() - pad_y - margin
-        line_gap = max(1, round(pad_y / 2))
-
-        _wm_enabled = db is not None and db.channels_db.get(str(app_state.get("current_channel", "")).zfill(2), {}).get("watermark_enabled", False)
-        _wm_raw = _watermark_cache.get("raw")
-        if _wm_enabled and _wm_raw not in (None, False):
-            _wm_target_w = max(24, round(caption_rect.width * _WATERMARK_WIDTH_FRAC))
-            _wm_raw_w, _wm_raw_h = _wm_raw.get_size()
-            _wm_target_h = (max(1, round(_wm_raw_h * (_wm_target_w / _wm_raw_w)))
-                             if _wm_raw_w > 0 else 0)
-            line2_bottom_limit = (caption_rect.bottom - (_wm_margin_y + _wm_extra_y)
-                                   - _wm_target_h - pad_y)
-        else:
-            line2_bottom_limit = caption_rect.bottom - pad_y
-        # WARNING: badge avoidance must never raise line 2's limit above line 1's own box; line 1 always draws.
-        line2_bottom_limit = max(line2_bottom_limit, line1_y + surf1.get_height() + pad_y)
-
-        # WARNING: line 1 never moves.
-        if surf2 is not None:
-            _room_below = (caption_rect.bottom - 1) - (line1_y + surf1.get_height())
-            if _room_below < surf2.get_height() + line_gap:
-                line_gap = max(0, _room_below - surf2.get_height())
+        line1_y = _badge_bottom + (_band_h - _block_h) // 2
+        line1_y = max(0, min(line1_y, sh - 1 - _block_h))
 
         _outline_px = max(1, round(ref * (2.0 / 720.0)))
         _outline_color = (0, 0, 0)
@@ -6917,7 +7004,7 @@ def _draw_caption_overlay(screen, content_rect=None):
         if surf2 is None:
             _blit_outlined(surf1, line1_text, block_x + (_block_w - surf1.get_width()) // 2, line1_y)
         else:
-            line2_y = line1_y + surf1.get_height() + line_gap
+            line2_y = line1_y + _row_h + line_gap
             _blit_outlined(surf1, line1_text, block_x + (_block_w - surf1.get_width()) // 2, line1_y)
             _blit_outlined(surf2, line2_text, block_x + (_block_w - surf2.get_width()) // 2, line2_y)
     except Exception as e:
@@ -7470,6 +7557,9 @@ SEEK_AT_OPEN = True
 
 # WARNING: the fallback numbers below must match SEEK_GUARD_TAIL_MARGIN_SECONDS in performance_governor.py; they are used only when that module fails to import.
 _SEEK_GUARD_TAIL_MARGIN_S = performance_governor.SEEK_GUARD_TAIL_MARGIN_SECONDS if performance_governor is not None else 5.0
+# WARNING: the fallback numbers below must match SLOT_START_GRACE_SECONDS and SLOT_OPEN_LEAD_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_SLOT_START_GRACE_S = performance_governor.SLOT_START_GRACE_SECONDS if performance_governor is not None else 0.3
+_SLOT_OPEN_LEAD_S = performance_governor.SLOT_OPEN_LEAD_SECONDS if performance_governor is not None else 0.2
 
 
 # WARNING: the fallback numbers below must match HEARTBEAT_WATCHDOG_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
@@ -8167,6 +8257,102 @@ def _disconnect_remote_server(reason=""):
              reason or "unspecified", restored)
 
 
+def _connect_remote_server(_picked):
+    """Connect this User to a discovered server entry: drop any earlier connection, then stream that server's schedule."""
+    global server_schedule_client
+    _disconnect_remote_server("switching servers")
+    _sync_status_state = {"value": None}
+    def _on_remote_schedule(message):
+        try:
+            if db.apply_remote_schedule(message.get("channels", {}), message.get("playback")):
+                app_state["_sched_membership_cache"] = {}
+                app_state["_guide_preview_position_cache"] = {}
+                app_state["guide_channel_stamps"] = {}
+                _guide_dirty_event.set()
+                app_state["remote_schedule_revision"] = message.get("revision", 0)
+                log.info(
+                    "Remote schedule applied "
+                    "server=%s slot=%s revision=%s",
+                    _picked["name"], _picked.get("slot_id"),
+                    message.get("revision", 0),
+                )
+        except Exception as e:
+            _server_breadcrumb(
+                log, logging.WARNING,
+                f"remote-schedule-apply:{_picked.get('host')}:{_picked.get('slot_id')}",
+                "Remote schedule apply failed "
+                "server=%s: %s", _picked.get("name"), e,
+            )
+    def _on_sync_status(status):
+        app_state["remote_server_status"] = status
+        if status != _sync_status_state["value"]:
+            log.info(
+                "Remote schedule status "
+                "server=%s status=%s",
+                _picked.get("name"), status,
+            )
+            _sync_status_state["value"] = status
+    server_schedule_client = server_sync.ScheduleClient(
+        _picked.get("host", ""),
+        port=_picked.get("port", 47532),
+        slot_id=_picked.get("slot_id"),
+        on_schedule=_on_remote_schedule, on_status=_on_sync_status)
+    server_schedule_client.start()
+    app_state["user_selected_server_name"] = _picked["name"]
+    app_state["active_remote_server"] = _picked
+
+
+def _execute_server_reset():
+    """Give the picked server a fresh channel file (all channels off except 05, no media), keep its name and make it the active server."""
+    slot_id = db.config.get("server_menu_pick") or db.SERVER_SLOT_IDS[0]
+    name = db.config.get("server_slots", {}).get(slot_id) or "Server %d" % (db.SERVER_SLOT_IDS.index(slot_id) + 1)
+    db.delete_server_slot(slot_id)
+    db.create_server_slot(name, slot_id)
+    db.make_server_slot_active(slot_id)
+    log.info("[SERVER MENU] reset %s to a fresh channel file", slot_id)
+
+
+def _execute_manage_server():
+    """Switch to the highlighted server: make its files first when it is new (all channels off except 05, no media), then load its channels and data."""
+    slot_id = db.config.get("server_menu_pick") or db.SERVER_SLOT_IDS[0]
+    if slot_id not in db.config.get("server_slots", {}):
+        db.create_server_slot("Server %d" % (db.SERVER_SLOT_IDS.index(slot_id) + 1), slot_id)
+        _reconcile_server_service()
+    db.config["server_menu_pick"] = slot_id
+    if not db.make_server_slot_active(slot_id):
+        log.warning("[SERVER MENU] could not switch to %s", slot_id)
+    db.save_settings()
+
+
+def _local_server_entries():
+    """This computer's own named servers, in the shape of a scan result, so they can be used as profiles."""
+    return [{"name": name, "slot_id": slot_id, "host": "", "local": True} for slot_id, name in db.list_server_slots()]
+
+
+def _use_server_entry(entry):
+    """Use a scan result: a server on this computer is loaded as a profile, any other is streamed from its computer."""
+    if entry.get("local"):
+        _disconnect_remote_server("switching to a profile on this computer")
+        db.make_server_slot_active(entry["slot_id"])
+        app_state["user_selected_server_name"] = entry["name"]
+        app_state["active_local_profile"] = entry["slot_id"]
+        return
+    app_state["active_local_profile"] = None
+    db.leave_server_slot()
+    _connect_remote_server(entry)
+
+
+def _execute_clear_user_choice():
+    """Leave the picked server, bring back this computer's own channels and empty the scan results."""
+    _disconnect_remote_server("user cleared their choice")
+    if app_state.get("active_local_profile") is not None:
+        db.leave_server_slot()
+        app_state["active_local_profile"] = None
+        app_state["user_selected_server_name"] = ""
+    app_state["user_scan_entries"] = []
+    app_state["user_scan_pick"] = 0
+
+
 def _server_service_should_run():
     """Whether the detached server owner should be present right now."""
     if db is None:
@@ -8225,7 +8411,7 @@ from media import (
 )
 import ui
 from ui import draw_popup_yes_no, render_loading_screen, render_controls_splash, render_tv_guide_async, guide_preload_tick, render_settings_overlay_menu, render_quit_prompt, render_clear_confirm_popup, menu_panel_rect, get_guide_visible_rows, get_guide_num_cols, get_system_menu_rows, _gpu_render_mode_options, get_games_sub_menu_rows, get_channels_settings_menu_rows, get_advanced_settings_menu_rows, preload_games_tab_assets, REMOTE_REMAP_ACTIONS, NUMBER_REMAP_ACTIONS, DEFAULT_REMOTE_BINDINGS as CANONICAL_REMOTE_KEYS, render_dvd_button_mapping_popup, DVD_MAP_ACTIONS, DVD_MAP_DEFAULTS, clamp_guide_time_idx, render_pick_layout_popup, render_controller_pick_wait_popup, get_cached_row_stops, get_current_guide_time_idx, invalidate_guide_cache, CAPTIONS_COLOR_BOX_SEL, \
-    get_server_picker_entries, get_server_picker_selectable_count, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
+    get_server_picker_entries, _render_tv_guide_impl as _guide_render_row_impl, _guide_build_lock, \
     UPDATER_AND_SERVER_FEATURES_ENABLED, SERVER_TOGGLE_ENABLED, GPU_RENDER_MODE_ENABLED, NUM_CONTROL_PAGES
 from visualizers import VisualizerDeck
 
@@ -14241,6 +14427,9 @@ def initialize_vlc_on_demand():
                                     if pygame.time.get_ticks() >= _reassert_deadline:
                                         break
                                     pygame.time.wait(150)
+                                log.info("[VOLUME] %s: saved volume %s, muted in settings %s; the player reports volume %s, muted %s; held muted for the start-up check %s",
+                                         os.path.basename(filepath), db.config.get("global_volume", 70) if db else 70, db.config.get("is_muted", False) if db else False,
+                                         self.player.audio_get_volume(), self.player.audio_get_mute(), bool(app_state.get("_video_pending_unmute", False)))
                             except Exception as e:
                                 log.warning("_apply_volume_when_ready: set_volume failed: %s", e)
                             return
@@ -18831,7 +19020,51 @@ def _apply_governor_settings_when_db_ready():
         log.warning("[GOVERNOR] boot mode pick skipped: db not ready after 15s")
 
 
+# WARNING: the 14 fallback must match CRASH_RESTART_FLAGS in performance_governor.py; it is used only when that module fails to import.
+CRASH_RESTART_FLAGS = performance_governor.CRASH_RESTART_FLAGS if performance_governor is not None else 14
+
+
+# ============================================================================
+# SECTION: Self-relaunch & update flow
+# ============================================================================
+
+
+def _build_relaunch_command(after_update=False):
+    if getattr(sys, "frozen", False):
+        _cmd = [sys.executable] + sys.argv[1:]
+    else:
+        _cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+    if after_update:
+        # WARNING: a restart after an update is a normal start, so it carries no --relaunched flag (that flag forces fullscreen); the saved kiosk, shell and start-on-boot settings decide the display mode.
+        return [_arg for _arg in _cmd if _arg != "--relaunched"]
+    if "--relaunched" not in _cmd:
+        _cmd.append("--relaunched")
+    return _cmd
+
+
+def _register_crash_restart():
+    """Asks Windows to start the app again, fullscreen, if it ever dies from a crash inside native code, which no Python handler can catch."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        _args = [_arg for _arg in sys.argv[1:] if _arg != "--relaunched"] + ["--relaunched"]
+        _command_line = subprocess.list2cmdline(_args)
+        if len(_command_line) > 1000:
+            _command_line = "--relaunched"
+        _result = ctypes.windll.kernel32.RegisterApplicationRestart(ctypes.c_wchar_p(_command_line), ctypes.c_ulong(CRASH_RESTART_FLAGS))
+        if _result != 0:
+            log.warning("[CRASH RESTART] Windows would not register a restart after a crash (result %s)", _result)
+            return False
+        log.info("[CRASH RESTART] Windows will start the app again fullscreen after a crash inside native code (flags %d, command line %r); it needs the app to have run for 60 seconds", CRASH_RESTART_FLAGS, _command_line)
+        return True
+    except Exception as e:
+        log.warning("[CRASH RESTART] could not ask Windows to restart the app after a crash: %s", e)
+        return False
+
+
 def _start_performance_governor():
+    _register_crash_restart()
     if performance_governor is None:
         log.warning("[GOVERNOR] module not importable, governor off: %s", _PERFORMANCE_GOVERNOR_IMPORT_ERROR)
         return
@@ -18842,6 +19075,8 @@ def _start_performance_governor():
         except Exception as _swallowed_error:
             _log_swallowed("_start_performance_governor: _vlc_ver = vlc.libvlc_get_version().decode('utf-8', 'replace') if v...", _swallowed_error)
             _vlc_ver = ""
+        performance_governor.set_caption_load_marker(_app_logs_dir())
+        performance_governor.set_previous_run_unclean(_previous_run_unclean)
         performance_governor.start(
             gpu_tier=db._detected_gpu_tier, gpu_names=_gpu_names, vlc_version=_vlc_ver,
             pygame_version=pygame.version.ver,
@@ -18965,9 +19200,6 @@ def _background_subsystem_worker():
         _apply_mixer_channels_setting()
     except Exception as _mixer_boot_err:
         log.warning("[SETTINGS] Mono Audio boot-time mixer setup failed: %s", _mixer_boot_err)
-
-    if _setting_on("tv_captions_enabled"):
-        _start_caption_model_prewarm("boot")
 
     db._detected_gpu_tier, db._detected_gpu_adapters = _detect_gpu_tier()
     log.info(
@@ -19732,11 +19964,14 @@ def _apply_repeat_guard(target_clean_key, playback_log, block_label, timeline,
                     _cand_file = target_show.get("pair_ep2_path", _cand_file)
             _guard_file = _lec_file if _cand_is_commercial else _je_file
             _floor_forced_self = _used_floor and _guard_iters == 0
+            _cand_left = float(target_show.get("duration", 0) or 0) - (_cand_seek - target_show.get("seek_offset", 0))
+            _in_tail = 0 < _cand_left <= SLOT_TAIL_HOLD_MAX_SECONDS
             if (not _guard_file
                     or os.path.normpath(str(_cand_file)).lower() != _guard_file
-                    or (_cand_seek <= _REPEAT_GUARD_SEC and not _floor_forced_self)):
+                    or (_cand_seek <= _REPEAT_GUARD_SEC and not _floor_forced_self and not _in_tail)):
                 break
-            position_in_playlist = target_show["start_time"] + target_show["duration"] + 1
+            _next_at = next((_i + 1 for _i, _it in enumerate(timeline) if _it is target_show), len(timeline))
+            position_in_playlist = timeline[_next_at]["start_time"] if _next_at < len(timeline) else total_block_content
             if position_in_playlist >= total_block_content:
                 position_in_playlist = 0
             target_show = None
@@ -24239,6 +24474,11 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
             "reason_detail": f"CH{str(new_ch).zfill(2)}: scheduler raised {type(_sched_err).__name__}: {_sched_err}",
         }
     
+    if internal_advance and t_state.get("mode") in ("Video", "Commercial") and t_state.get("file"):
+        _into_slot = float(t_state.get("seek") or 0) - float(t_state.get("seek_slot_offset") or 0)
+        if 0 < _into_slot <= _SLOT_START_GRACE_S:
+            t_state["seek"] = float(t_state.get("seek") or 0) - _into_slot
+
     if new_ch == "04":
         t_state["mode"] = "Static"
         t_state["file"] = ""
@@ -25340,26 +25580,6 @@ def _reload_visualizer_music_for_loudness_toggle():
 RELAUNCH_MAX_ATTEMPTS = performance_governor.RELAUNCH_MAX_ATTEMPTS if performance_governor is not None else 4
 # WARNING: the fallback numbers below must match RELAUNCH_WINDOW_SECONDS in performance_governor.py; they are used only when that module fails to import.
 RELAUNCH_WINDOW_SEC = performance_governor.RELAUNCH_WINDOW_SECONDS if performance_governor is not None else 600
-
-
-# ============================================================================
-# SECTION: Self-relaunch & update flow
-# ============================================================================
-
-
-def _build_relaunch_command(after_update=False):
-    if getattr(sys, "frozen", False):
-        _cmd = [sys.executable] + sys.argv[1:]
-    else:
-        _cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
-    if after_update:
-        # WARNING: a restart after an update is a normal start, so it carries no --relaunched flag (that flag forces fullscreen); the saved kiosk, shell and start-on-boot settings decide the display mode.
-        return [_arg for _arg in _cmd if _arg != "--relaunched"]
-    if "--relaunched" not in _cmd:
-        _cmd.append("--relaunched")
-    return _cmd
-
-
 def _attempt_self_relaunch():
     import json
     _watchdog_dir = os.path.join(_app_logs_dir(), "watchdog")
@@ -27571,6 +27791,10 @@ while True:
                             app_state["_update_status"] = "No update package is ready."
                             app_state["show_clear_confirm"] = False
                             app_state["clear_confirm_target"] = None
+                        elif _cc_target == "server_reset":
+                            _execute_server_reset()
+                        elif _cc_target == "user_choice_clear":
+                            _execute_clear_user_choice()
                         elif _cc_target == "boot_on_start":
                             if _set_start_on_boot(True):
                                 db.config["start_on_boot"] = True
@@ -27750,6 +27974,8 @@ while True:
                             print(f"[SERVER SLOTS] Could not create slot for '{name}' (6-slot limit reached?)")
                     else:
                         target_slot_id = app_state.get("server_slot_name_target_slot_id")
+                        if target_slot_id not in db.config.get("server_slots", {}):
+                            db.create_server_slot(name, target_slot_id)
                         if db.rename_server_slot(target_slot_id, name):
                             app_state["editing_server_slot_name"] = False
                             app_state["server_slot_name_all_selected"] = False
@@ -27887,9 +28113,6 @@ while True:
                     "GAMES_SAVE_PROFILE":   "GAMES_SUB_MENU",
                     "REMOTE_REMAP_LIST":    "SYSTEM_ADVANCED_SUB_MENU",
                     "SERVER_MENU":          "SYSTEM_ADVANCED_SUB_MENU",
-                    "SERVER_SLOTS_MENU":    "SERVER_MENU",
-                    "SERVER_SLOT_ACTIONS":  "SERVER_SLOTS_MENU",
-                    "SERVER_PICKER_MENU":   "SERVER_MENU",
                     "DVD_BTN_MAP":          "GAMES_SUB_MENU",
                     "SYSTEM_ADVANCED_SUB_MENU": "SYSTEM_ROWS",
                 }.get(_layer)
@@ -27922,13 +28145,6 @@ while True:
                         app_state["menu_selection_index"] = (
                             _sys_rows_now.index("advanced_settings") if "advanced_settings" in _sys_rows_now else 0
                         )
-                    elif _layer == "SERVER_SLOTS_MENU":
-                        app_state["menu_selection_index"] = 2
-                    elif _layer == "SERVER_SLOT_ACTIONS":
-                        app_state["server_slot_pending_delete"] = False
-                        app_state["menu_selection_index"] = app_state.get("server_slot_name_target_row", 0)
-                    elif _layer == "SERVER_PICKER_MENU":
-                        app_state["menu_selection_index"] = 2
                     elif _layer == "DVD_BTN_MAP":
                         _dvd_rows_now = ["status"] + get_games_sub_menu_rows(db, app_state, "DVD", True) + ["close"]
                         app_state["games_sub_row"] = (
@@ -28467,8 +28683,6 @@ while True:
                         elif row_id == "captions_toggle":
                             db.config["tv_captions_enabled"] = not db.config.get("tv_captions_enabled", False)
                             db.save_settings()
-                            if db.config["tv_captions_enabled"]:
-                                _start_caption_model_prewarm("captions switched on")
                         elif row_id == "mono_stereo_toggle":
                             db.config["audio_stereo"] = not db.config.get("audio_stereo", True)
                             db.save_settings()
@@ -28571,7 +28785,7 @@ while True:
 
                     _srv_dir = menu_nav.key_to_direction(event.key)
                     if _srv_dir is not None:
-                        app_state["menu_selection_index"] = menu_nav.column_move(app_state, "SERVER_MENU", srv_sel, _srv_close_idx + 1, _srv_dir)
+                        app_state["menu_selection_index"] = menu_nav.server_menu_move(app_state, srv_sel, _srv_role_now, _srv_dir, bool(app_state.get("user_scan_entries")))
                         continue
 
                     if menu_nav.is_accept(event.key):
@@ -28587,172 +28801,40 @@ while True:
                                 db.leave_server_slot()
                             db.config["server_role"] = "user"
                             db.save_settings()
-                        elif _srv_manage_visible and srv_sel == 2:
-                            app_state["menu_layer"] = "SERVER_SLOTS_MENU"
-                            app_state["menu_selection_index"] = 0
                         elif _srv_pick_visible and srv_sel == 2:
-                            app_state["menu_layer"] = "SERVER_PICKER_MENU"
-                            app_state["menu_selection_index"] = 0
-                        else:
-                            app_state["menu_layer"] = "SYSTEM_ADVANCED_SUB_MENU"
-                            _as_rows_now = get_advanced_settings_menu_rows(db, app_state)
-                            app_state["menu_selection_index"] = (
-                                _as_rows_now.index("server_menu_open") if "server_menu_open" in _as_rows_now else 0
-                            )
-                        pygame.event.clear(pygame.KEYDOWN)
-                        continue
-
-                elif app_state["menu_layer"] == "SERVER_PICKER_MENU":
-                    _sp_entries = get_server_picker_entries(db)
-                    _sp_close_idx = get_server_picker_selectable_count(_sp_entries) - 1
-                    sp_sel = app_state.get("menu_selection_index", 0)
-
-                    _sp_dir = menu_nav.key_to_direction(event.key)
-                    if _sp_dir is not None:
-                        app_state["menu_selection_index"] = menu_nav.column_move(app_state, "SERVER_PICKER_MENU", sp_sel, _sp_close_idx + 1, _sp_dir)
-                        continue
-
-                    if menu_nav.is_accept(event.key):
-                        if sp_sel < len(_sp_entries):
-                            _picked = _sp_entries[sp_sel]
-                            _disconnect_remote_server("switching servers")
-                            _sync_status_state = {"value": None}
-                            def _on_remote_schedule(message):
-                                try:
-                                    if db.apply_remote_schedule(message.get("channels", {}), message.get("playback")):
-                                        app_state["_sched_membership_cache"] = {}
-                                        app_state["_guide_preview_position_cache"] = {}
-                                        app_state["guide_channel_stamps"] = {}
-                                        _guide_dirty_event.set()
-                                        app_state["remote_schedule_revision"] = message.get("revision", 0)
-                                        log.info(
-                                            "Remote schedule applied "
-                                            "server=%s slot=%s revision=%s",
-                                            _picked["name"], _picked.get("slot_id"),
-                                            message.get("revision", 0),
-                                        )
-                                except Exception as e:
-                                    _server_breadcrumb(
-                                        log, logging.WARNING,
-                                        f"remote-schedule-apply:{_picked.get('host')}:{_picked.get('slot_id')}",
-                                        "Remote schedule apply failed "
-                                        "server=%s: %s", _picked.get("name"), e,
-                                    )
-                            def _on_sync_status(status):
-                                app_state["remote_server_status"] = status
-                                if status != _sync_status_state["value"]:
-                                    log.info(
-                                        "Remote schedule status "
-                                        "server=%s status=%s",
-                                        _picked.get("name"), status,
-                                    )
-                                    _sync_status_state["value"] = status
-                            server_schedule_client = server_sync.ScheduleClient(
-                                _picked.get("host", ""),
-                                port=_picked.get("port", 47532),
-                                slot_id=_picked.get("slot_id"),
-                                on_schedule=_on_remote_schedule, on_status=_on_sync_status)
-                            server_schedule_client.start()
-                            app_state["user_selected_server_name"] = _picked["name"]
-                            app_state["active_remote_server"] = _picked
-                            app_state["menu_layer"] = "SYSTEM_ADVANCED_SUB_MENU"
-                            _as_rows_now = get_advanced_settings_menu_rows(db, app_state)
-                            app_state["menu_selection_index"] = (
-                                _as_rows_now.index("server_menu_open") if "server_menu_open" in _as_rows_now else 0
-                            )
-                        else:
-                            app_state["menu_layer"] = "SERVER_MENU"
-                            app_state["menu_selection_index"] = 2
-                        pygame.event.clear(pygame.KEYDOWN)
-                        continue
-
-                elif app_state["menu_layer"] == "SERVER_SLOTS_MENU":
-                    slot_ids = db.SERVER_SLOT_IDS
-                    named = dict(db.config.get("server_slots", {}))
-                    can_add_now = len(named) < len(slot_ids)
-                    ss_sel = app_state.get("menu_selection_index", 0)
-                    CREATE_IDX, MANAGE_IDX, CLOSE_IDX = 6, 7, 8
-
-                    _ss_dir = menu_nav.key_to_direction(event.key)
-                    if _ss_dir is not None:
-                        _ss_to = menu_nav.navigate(app_state, "SERVER_SLOTS_MENU", menu_nav.server_slots_table(), menu_nav.server_slots_cell(ss_sel), _ss_dir)
-                        if _ss_to is not None:
-                            app_state["menu_selection_index"] = menu_nav.server_slots_index(_ss_to)
-                        continue
-
-                    if menu_nav.is_accept(event.key):
-                        if ss_sel < 6:
-                            slot_id = slot_ids[ss_sel]
-                            if slot_id in named:
-                                app_state["menu_layer"] = "SERVER_SLOT_ACTIONS"
-                                app_state["menu_selection_index"] = 0
-                                app_state["server_slot_name_target_row"] = ss_sel
-                                app_state["server_slot_pending_delete"] = False
-                        elif ss_sel == CREATE_IDX:
-                            if can_add_now:
-                                first_free = next((i for i, sid in enumerate(slot_ids) if sid not in named), None)
-                                if first_free is not None:
-                                    app_state["menu_selection_index"] = first_free
-                                    app_state["editing_server_slot_name"] = True
-                                    app_state["server_slot_name_mode"] = "create"
-                                    app_state["server_slot_name_buffer"] = ""
-                                    app_state["server_slot_name_all_selected"] = False
-                                    app_state["server_slot_name_target_row"] = first_free
-                        elif ss_sel == MANAGE_IDX:
-                            if named:
-                                first_named = next((i for i, sid in enumerate(slot_ids) if sid in named), 0)
-                                app_state["menu_selection_index"] = first_named
-                        else:
-                            app_state["menu_layer"] = "SERVER_MENU"
-                            app_state["menu_selection_index"] = 2
-                        pygame.event.clear(pygame.KEYDOWN)
-                        continue
-
-                elif app_state["menu_layer"] == "SERVER_SLOT_ACTIONS":
-                    sa_sel = app_state.get("menu_selection_index", 0)
-                    slot_ids = db.SERVER_SLOT_IDS
-                    named = dict(db.config.get("server_slots", {}))
-                    target_row = app_state.get("server_slot_name_target_row", 0)
-                    target_slot_id = slot_ids[target_row] if 0 <= target_row < len(slot_ids) else None
-                    target_name = named.get(target_slot_id, "") if target_slot_id else ""
-
-                    _sa_dir = menu_nav.key_to_direction(event.key)
-                    if _sa_dir is not None:
-                        app_state["menu_selection_index"] = menu_nav.column_move(app_state, "SERVER_SLOT_ACTIONS", sa_sel, 4, _sa_dir)
-                        if sa_sel != app_state["menu_selection_index"]:
-                            app_state["server_slot_pending_delete"] = False
-                        continue
-
-                    if menu_nav.is_accept(event.key):
-                        if sa_sel == 0:
-                            if target_slot_id is not None:
-                                if db.config.get("active_server_slot") == target_slot_id:
-                                    db.leave_server_slot()
-                                else:
-                                    db.make_server_slot_active(target_slot_id)
-                            app_state["menu_layer"] = "SERVER_SLOTS_MENU"
-                            app_state["menu_selection_index"] = target_row
-                        elif sa_sel == 1:
-                            app_state["menu_layer"] = "SERVER_SLOTS_MENU"
+                            _srv_scan = app_state.get("user_scan_entries") or []
+                            if _srv_scan:
+                                _use_server_entry(_srv_scan[min(app_state.get("user_scan_pick", 0), len(_srv_scan) - 1)])
+                        elif _srv_pick_visible and srv_sel == menu_nav.SERVER_MENU_SCAN:
+                            app_state["user_scan_entries"] = _local_server_entries() + get_server_picker_entries(db)
+                            app_state["user_scan_pick"] = 0
+                            log.info("[SERVER MENU] scan found %d server(s)", len(app_state["user_scan_entries"]))
+                        elif _srv_pick_visible and menu_nav.SERVER_MENU_USER_BASE <= srv_sel < menu_nav.SERVER_MENU_USER_BASE + menu_nav.SERVER_MENU_BOX_COUNT:
+                            app_state["user_scan_pick"] = srv_sel - menu_nav.SERVER_MENU_USER_BASE
+                        elif srv_sel == menu_nav.SERVER_MENU_CLEAR or (_srv_manage_visible and srv_sel == menu_nav.SERVER_MENU_RESET):
+                            app_state["clear_confirm_selection"] = "No"
+                            app_state["clear_confirm_target"] = "user_choice_clear" if srv_sel == menu_nav.SERVER_MENU_CLEAR else "server_reset"
+                            app_state["clear_confirm_focus"] = "buttons"
+                            app_state["clear_confirm_shown_at"] = pygame.time.get_ticks()
+                            app_state["show_clear_confirm"] = True
+                        elif _srv_manage_visible and menu_nav.SERVER_MENU_BOX_BASE <= srv_sel < menu_nav.SERVER_MENU_BOX_BASE + menu_nav.SERVER_MENU_BOX_COUNT:
+                            db.config["server_menu_pick"] = db.SERVER_SLOT_IDS[srv_sel - menu_nav.SERVER_MENU_BOX_BASE]
+                            db.save_settings()
+                        elif _srv_manage_visible and srv_sel == menu_nav.SERVER_MENU_RENAME:
+                            _srv_rename_slot = db.config.get("server_menu_pick") or db.SERVER_SLOT_IDS[0]
                             app_state["editing_server_slot_name"] = True
                             app_state["server_slot_name_mode"] = "rename"
-                            app_state["server_slot_name_buffer"] = target_name
+                            app_state["server_slot_name_buffer"] = db.config.get("server_slots", {}).get(_srv_rename_slot) or "Server %d" % (db.SERVER_SLOT_IDS.index(_srv_rename_slot) + 1)
                             app_state["server_slot_name_all_selected"] = True
-                            app_state["server_slot_name_target_slot_id"] = target_slot_id
-                            app_state["menu_selection_index"] = target_row
-                        elif sa_sel == 2:
-                            if app_state.get("server_slot_pending_delete", False):
-                                if target_slot_id is not None:
-                                    db.delete_server_slot(target_slot_id)
-                                app_state["server_slot_pending_delete"] = False
-                                app_state["menu_layer"] = "SERVER_SLOTS_MENU"
-                                app_state["menu_selection_index"] = 0
-                            else:
-                                app_state["server_slot_pending_delete"] = True
+                            app_state["server_slot_name_target_slot_id"] = _srv_rename_slot
+                        elif _srv_manage_visible and srv_sel == 2:
+                            _execute_manage_server()
                         else:
-                            app_state["server_slot_pending_delete"] = False
-                            app_state["menu_layer"] = "SERVER_SLOTS_MENU"
-                            app_state["menu_selection_index"] = target_row
+                            app_state["menu_layer"] = "SYSTEM_ADVANCED_SUB_MENU"
+                            _as_rows_now = get_advanced_settings_menu_rows(db, app_state)
+                            app_state["menu_selection_index"] = (
+                                _as_rows_now.index("server_menu_open") if "server_menu_open" in _as_rows_now else 0
+                            )
                         pygame.event.clear(pygame.KEYDOWN)
                         continue
 
@@ -30177,6 +30259,8 @@ while True:
     _open_confirm_pending = vlc_engine is not None and (
         getattr(vlc_engine, "_open_confirm_pending_attempt", None) is not None or _engine_open_in_flight(vlc_engine))
     _finish_reason = None
+    _finish_pos_ms = None
+    _finish_len_ms = None
     if vlc_engine is not None and app_state.get("is_playing_video", False) and not _switch_pending and not _open_confirm_pending and not _engine_wedged_this_frame and not _surf_quiet:
         try:
             vlc_state, _len_ms = vlc_engine.get_playback_state()
@@ -30218,6 +30302,7 @@ while True:
             if _finished:
                 is_video_finished = True
                 _finish_reason = _reason
+                _finish_pos_ms, _finish_len_ms = _pos_ms, _len_ms
         except Exception as e: log.warning(f"[PLAYBACK] video-finished check failed: {e}")
     else:
         vlc_engine._media_end_tracking = {} if vlc_engine is not None else None
@@ -30301,8 +30386,23 @@ while True:
             except Exception as e:
                 log.warning("BG WATCHDOG: advance failed for ch%s: %s", _bg_ch, e)
 
+    _tail_hold = app_state.get("_slot_tail_hold")
+    _tail_hold_active = False
+    _tail_hold_just_ended = False
+    if _tail_hold:
+        if _tail_hold.get("ch") != str(ch).zfill(2) or _switch_pending:
+            app_state["_slot_tail_hold"] = None
+        elif broadcast_clock.now().timestamp() < _tail_hold.get("until", 0):
+            _tail_hold_active = True
+        else:
+            app_state["_slot_tail_hold"] = None
+            is_video_finished = True
+            _finish_reason = "ended"
+            _tail_hold_just_ended = True
+            app_state["last_vlc_retry_at"] = 0
     if (ch not in ("03", "04")
             and not _surf_quiet
+            and not _tail_hold_active
             and current_playback_state["mode"] in ("Video", "Commercial")
             and (not app_state.get("is_playing_video", False) or is_video_finished)
             and vlc_engine is not None
@@ -30315,8 +30415,33 @@ while True:
             app_state["last_vlc_retry_at"] = now_watchdog
             _wd_ch_key = str(ch).zfill(2)
             _skip_advance_this_frame = False
+            _tail_hold_left = None
+            _tail_hold_file = ""
+            _tail_hold_done = _tail_hold_just_ended
             if is_video_finished:
                 app_state["is_playing_video"] = False
+
+                _peek_left = None
+                if _finish_reason != "error" and not _tail_hold_done and SLOT_TAIL_HOLD_MAX_SECONDS > 0 and current_playback_state.get("file"):
+                    # WARNING: the schedule is asked here, before the repeat guard is armed for the clip that just ended, so the answer is where the clock is in that clip's slot.
+                    try:
+                        _peek = calculate_slotted_playback_state(ch, snap_internal_advance=True)
+                        _peek_left = float(_peek.get("duration") or 0) - (float(_peek.get("seek") or 0) - float(_peek.get("seek_slot_offset") or 0))
+                        if (_peek.get("file") and os.path.normpath(str(_peek["file"])).lower() == os.path.normpath(str(current_playback_state["file"])).lower()
+                                and _peek.get("seek_slot_offset", 0) == current_playback_state.get("seek_slot_offset", 0)
+                                and 0 < _peek_left <= SLOT_TAIL_HOLD_MAX_SECONDS):
+                            _tail_hold_left = _peek_left - _SLOT_OPEN_LEAD_S
+                            _tail_hold_file = str(_peek["file"])
+                    except Exception as _swallowed_error:
+                        _log_swallowed("main script: tail hold schedule check", _swallowed_error)
+
+                if current_playback_state.get("mode") == "Commercial" and not _tail_hold_done:
+                    log.info("[AD PLAYED] ch%s: %s slot=%.1fs opened at %.2fs, ended at %s ms of the %s ms VLC reports (%s); the clock has %s left in the slot -> %s",
+                             ch, os.path.basename(str(current_playback_state.get("file", ""))), float(current_playback_state.get("duration") or 0),
+                             float(current_playback_state.get("seek", 0) or 0) - float(current_playback_state.get("seek_slot_offset", 0) or 0),
+                             _finish_pos_ms, _finish_len_ms, _finish_reason,
+                             ("n/a" if _peek_left is None else "%.2fs" % _peek_left),
+                             ("last picture held" if _tail_hold_left is not None else "next item opens now"))
 
                 if _finish_reason == "error":
                     _watchdog_consecutive_errors[_wd_ch_key] = (
@@ -30524,6 +30649,13 @@ while True:
                     else:
                         _ch_entry["playback_anchor"] = {}
 
+            if _tail_hold_left is not None and _tail_hold_left > 0.02 and not _skip_advance_this_frame:
+                app_state["_slot_tail_hold"] = {"ch": _wd_ch_key, "until": broadcast_clock.now().timestamp() + _tail_hold_left + 0.02}
+                _hold_until_ms = pygame.time.get_ticks() + int(_tail_hold_left * 1000) + 50
+                app_state["_hold_last_frame_until"] = max(app_state.get("_hold_last_frame_until", 0), _hold_until_ms)
+                app_state["_video_audio_hold_until"] = max(app_state.get("_video_audio_hold_until", 0), _hold_until_ms)
+                _skip_advance_this_frame = True
+                log.info("[TAIL HOLD] ch%s: %s reached its end before its slot does -- the last picture stays up for %.2fs more, then the next item opens so it starts at its first second", ch, os.path.basename(str(_tail_hold_file)), _tail_hold_left)
             if _skip_advance_this_frame:
                 pass
             elif is_video_finished and _watchdog_consecutive_errors.get(_wd_ch_key, 0) >= _WATCHDOG_ERROR_BAIL_AFTER:
@@ -31742,13 +31874,17 @@ while True:
             _wm_cur_ch = app_state.get("current_channel")
             _wm_ch_info = (db.channels_db.get(str(_wm_cur_ch).zfill(2), {})
                            if _is_live_tv_broadcast_channel(_wm_cur_ch) else {})
-            if (_is_live_tv_broadcast_channel(_wm_cur_ch)
-                    and not _wm_ch_info.get("is_visualizer", False)
-                    and current_playback_state.get("mode") == "Video"
-                    and not app_state.get("file_explorer_active", False)
-                    and app_state.get("crt_anim") is None
-                    and not app_state.get("show_splash", False)
-                    and _channel_transition_over()):
+            _wm_blockers = [_name for _name, _ok in (
+                ("not a live TV channel", _is_live_tv_broadcast_channel(_wm_cur_ch)),
+                ("visualizer channel", not _wm_ch_info.get("is_visualizer", False)),
+                ("mode is %s" % current_playback_state.get("mode"), current_playback_state.get("mode") == "Video"),
+                ("file explorer open", not app_state.get("file_explorer_active", False)),
+                ("CRT animation running", app_state.get("crt_anim") is None),
+                ("splash showing", not app_state.get("show_splash", False)),
+                ("channel transition running", _channel_transition_over())) if not _ok]
+            if _wm_blockers and pygame.time.get_ticks() - app_state.get("_watermark_drawn_at", -10**9) < 400:
+                _log_warn_throttled("watermark_blocked", "[WATERMARK] the badge was on screen a moment ago and is now hidden because: %s", ", ".join(_wm_blockers))
+            if not _wm_blockers:
                 _wm_bounds = _watermark_bounds_rect(content_rect)
                 _draw_watermark(screen, bounds_rect=_wm_bounds)
                 if db.config.get("fake_static_noise_enabled", False) and _static_rect is not None:

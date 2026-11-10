@@ -9,7 +9,7 @@ channel_settings_index), the Video tab (video_table, video_cell, video_index) an
 theme_row2_column), the Games tab list (games_table, games_cell, games_index, games_page_of), the Games sub-menu (games_sub_table, games_sub_cell,
 games_sub_index), the DVD button map (dvd_map_table, dvd_map_cell, dvd_map_index), Save Profile (save_profile_rows, save_profile_table, save_profile_cell,
 save_profile_index) and the controller map (ctrl_map_rows, ctrl_map_table, ctrl_map_cell, ctrl_map_index, ctrl_map_squares_step),
-the confirm popups and the controls splash (confirm_cell, confirm_answer, confirm_focus, confirm_table, splash_cell, splash_focus, splash_table), the Channels per-channel sub-menu (channel_sub_layout, channel_sub_close_row, channel_sub_cell, channel_sub_index, channel_sub_table), the tab bar (tabs_cell, tabs_table, TAB_PANEL_LAYERS), the single-column lists of the Server menu, server picker, server slot actions, audio track picker and Holiday sub-menu (column_move), the wrapping Remote Remap list (ring_move), the Server Slots grid (server_slots_cell, server_slots_index, server_slots_table), the TV guide (guide_move, guide_row_step) the game channel (deck_browse_step, deck_list_step, deck_arrows_step, deck_confirm_choice), held-key repeat (HOLD_RULES, HOLD_STUCK_MS, HoldState, hold_rule, hold_due, hold_stuck, hold_step, hold_pick, hold_released, hold_conflict, repeat_allowed, press_is_duplicate, NAV_MOVE_MIN_MS, move_allowed), the joystick (JOY_*, joystick_action), channel number entry (DIGIT_ENTRY_*, key_to_digit, digit_entry_step, digit_entry_due, digit_entry_channel), name entry for the channel name and the server slot name (NAME_*, name_entry_step), the DVD controls (DVD_* ids, canonical codes, default keys and skip numbers, dvd_canonical, dvd_default_binding, dvd_action, dvd_translate, dvd_return_menu_step, dvd_swallows_transport, dvd_skip_blocked, dvd_tap_seek, dvd_hold_seek, dvd_hold_direction, dvd_hold_due), Backspace as PARENT (name boxes and skipping a controller remap button), and the file explorer's mouse rules (the EXPLORER_* numbers, explorer_wheel, explorer_wheel_button, explorer_thumb, explorer_scroll_from_thumb, explorer_scrollbar_press, explorer_scrollbar_drag, explorer_select, explorer_double_click, explorer_drag_moved, explorer_drag_step, explorer_button_at and the row and hit helpers).
+the confirm popups and the controls splash (confirm_cell, confirm_answer, confirm_focus, confirm_table, splash_cell, splash_focus, splash_table), the Channels per-channel sub-menu (channel_sub_layout, channel_sub_close_row, channel_sub_cell, channel_sub_index, channel_sub_table), the tab bar (tabs_cell, tabs_table, TAB_PANEL_LAYERS), the single-column lists of the audio track picker and Holiday sub-menu (column_move), the wrapping Remote Remap list (ring_move), the Server Menu (server_menu_cell, server_menu_index, server_menu_move), the TV guide (guide_move, guide_row_step) the game channel (deck_browse_step, deck_list_step, deck_arrows_step, deck_confirm_choice), held-key repeat (HOLD_RULES, HOLD_STUCK_MS, HoldState, hold_rule, hold_due, hold_stuck, hold_step, hold_pick, hold_released, hold_conflict, repeat_allowed, press_is_duplicate, NAV_MOVE_MIN_MS, move_allowed), the joystick (JOY_*, joystick_action), channel number entry (DIGIT_ENTRY_*, key_to_digit, digit_entry_step, digit_entry_due, digit_entry_channel), name entry for the channel name and the server slot name (NAME_*, name_entry_step), the DVD controls (DVD_* ids, canonical codes, default keys and skip numbers, dvd_canonical, dvd_default_binding, dvd_action, dvd_translate, dvd_return_menu_step, dvd_swallows_transport, dvd_skip_blocked, dvd_tap_seek, dvd_hold_seek, dvd_hold_direction, dvd_hold_due), Backspace as PARENT (name boxes and skipping a controller remap button), and the file explorer's mouse rules (the EXPLORER_* numbers, explorer_wheel, explorer_wheel_button, explorer_thumb, explorer_scroll_from_thumb, explorer_scrollbar_press, explorer_scrollbar_drag, explorer_select, explorer_double_click, explorer_drag_moved, explorer_drag_step, explorer_button_at and the row and hit helpers).
 Does not own: any drawing, any pygame event, any selection number stored in app_state (the callers convert with the cell/index functions), what an explorer button or row does once it is picked.
 """
 from __future__ import annotations
@@ -624,10 +624,13 @@ def _slider_move(store, spec, direction):
     if direction not in (LEFT, RIGHT):
         return False
     key, default, low, high = spec
-    moved = store.get(key, default) + (SLIDER_STEP if direction == RIGHT else -SLIDER_STEP)
-    store[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
+    step = SLIDER_STEP if direction == RIGHT else -SLIDER_STEP
     if key == "theme_ui_hue" and _governor is not None:
-        store[key] = _governor.theme_ui_hue_clear(store[key], 1 if direction == RIGHT else -1)
+        position = _governor.theme_ui_hue_to_position(store.get(key, default)) + step
+        store[key] = _governor.theme_ui_position_to_hue(max(0, (position // SLIDER_STEP) * SLIDER_STEP))
+        return True
+    moved = store.get(key, default) + step
+    store[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
     return True
 
 
@@ -1294,16 +1297,11 @@ def tabs_table(tabs):
 
 
 # ============================================================================
-# SECTION: Single-column lists and the three-by-three Server Slots grid
+# SECTION: Single-column lists
 # ============================================================================
-
-SERVER_SLOT_CELLS = ("slot0", "slot1", "slot2", "slot3", "slot4", "slot5", "create", "manage", CLOSE)
-SERVER_SLOTS_COLUMNS = 3
-SERVER_SLOTS_ROWS = 3
 
 _column_tables = {}
 _ring_tables = {}
-_server_slots_table = None
 
 
 def _column_table(count):
@@ -1470,34 +1468,105 @@ def holiday_move(app_state, row, col, direction):
     return (row, HOLIDAY_FORCE_COLUMN if cell.startswith("force") else HOLIDAY_PICK_COLUMN) if target is None else holiday_position(target)
 
 
-def server_slots_cell(selection):
-    """Returns the cell name for a Server Slots selection number: slot0 to slot5, create, manage or CLOSE."""
-    return SERVER_SLOT_CELLS[selection] if isinstance(selection, int) and 0 <= selection < len(SERVER_SLOT_CELLS) else CLOSE
+# ============================================================================
+# SECTION: Server Menu (role buttons, six server boxes, Manage / Pick a Server)
+# ============================================================================
+
+SERVER_MENU_BOX_BASE = 10
+SERVER_MENU_USER_BASE = 20
+SERVER_MENU_BOX_COLUMNS = 3
+SERVER_MENU_BOX_COUNT = 6
+SERVER_MENU_RENAME = 4
+SERVER_MENU_SCAN = 5
+SERVER_MENU_RESET = 6
+SERVER_MENU_CLEAR = 7
+_SERVER_MENU_FIXED = {"role_server": 0, "role_user": 1, "extra": 2, "rename": SERVER_MENU_RENAME, "scan": SERVER_MENU_SCAN, "reset": SERVER_MENU_RESET, "clear": SERVER_MENU_CLEAR}
 
 
-def server_slots_index(cell):
-    """Returns the Server Slots selection number for a cell name."""
-    return SERVER_SLOT_CELLS.index(cell)
+def server_menu_cell(selection, extra_visible):
+    """Returns the cell name for a Server Menu selection number: a button, a server box (srv0 to srv5), a user box (usr0 to usr5) or CLOSE."""
+    if isinstance(selection, int):
+        if SERVER_MENU_BOX_BASE <= selection < SERVER_MENU_BOX_BASE + SERVER_MENU_BOX_COUNT:
+            return "srv%d" % (selection - SERVER_MENU_BOX_BASE)
+        if SERVER_MENU_USER_BASE <= selection < SERVER_MENU_USER_BASE + SERVER_MENU_BOX_COUNT:
+            return "usr%d" % (selection - SERVER_MENU_USER_BASE)
+        for cell, number in _SERVER_MENU_FIXED.items():
+            if number == selection and (cell != "extra" or extra_visible):
+                return cell
+    return CLOSE if selection == (3 if extra_visible else 2) else "role_server"
 
 
-def server_slots_table():
-    """Returns the cached NavTable of the Server Slots menu: three columns of three, numbered down each column, and every key stops at the edge."""
-    global _server_slots_table
-    if _server_slots_table is None:
-        table = NavTable()
-        table.known(*SERVER_SLOT_CELLS)
-        for i, cell in enumerate(SERVER_SLOT_CELLS):
-            column, row = divmod(i, SERVER_SLOTS_ROWS)
-            if row > 0:
-                table.link(cell, UP, SERVER_SLOT_CELLS[i - 1])
-            if row < SERVER_SLOTS_ROWS - 1:
-                table.link(cell, DOWN, SERVER_SLOT_CELLS[i + 1])
-            if column > 0:
-                table.link(cell, LEFT, SERVER_SLOT_CELLS[i - SERVER_SLOTS_ROWS])
-            if column < SERVER_SLOTS_COLUMNS - 1:
-                table.link(cell, RIGHT, SERVER_SLOT_CELLS[i + SERVER_SLOTS_ROWS])
-        _server_slots_table = table
-    return _server_slots_table
+def server_menu_index(cell, extra_visible):
+    """Returns the Server Menu selection number for a cell name."""
+    if cell.startswith("srv"):
+        return SERVER_MENU_BOX_BASE + int(cell[3:])
+    if cell.startswith("usr"):
+        return SERVER_MENU_USER_BASE + int(cell[3:])
+    return _SERVER_MENU_FIXED.get(cell, 3 if extra_visible else 2)
+
+
+def _server_menu_grid(table, boxes, side_cells, above, below):
+    """Links six boxes as two rows of three: left and right within a row, the right end of each row to its side button, up from the top row to `above` and down from the bottom row to `below`."""
+    cols = SERVER_MENU_BOX_COLUMNS
+    for i, cell in enumerate(boxes):
+        column, row = i % cols, i // cols
+        if column > 0:
+            table.link(cell, LEFT, boxes[i - 1])
+        if column < cols - 1:
+            table.link(cell, RIGHT, boxes[i + 1])
+        else:
+            table.link(cell, RIGHT, side_cells[row])
+            table.link(side_cells[row], LEFT, cell)
+        table.link(cell, UP, boxes[i - cols] if row > 0 else above)
+        table.link(cell, DOWN, boxes[i + cols] if i + cols < len(boxes) else below)
+
+
+def server_menu_move(app_state, selection, role, direction, user_results=False):
+    """Returns the new Server Menu selection number after one key; the server boxes are reachable only while the role is Server, the user boxes only while the role is User and a scan found servers."""
+    extra_visible = role in ("server", "user")
+    table = NavTable()
+    table.known("role_server", "role_user", CLOSE, "clear")
+    server_boxes = ["srv%d" % i for i in range(SERVER_MENU_BOX_COUNT)]
+    user_boxes = ["usr%d" % i for i in range(SERVER_MENU_BOX_COUNT)]
+    table.link("clear", RIGHT, CLOSE)
+    table.link(CLOSE, LEFT, "clear")
+    if role == "server":
+        table.known("extra", "rename", "reset")
+        _server_menu_grid(table, server_boxes, ("extra", "rename"), "role_server", "role_user")
+        table.link("role_server", DOWN, "srv0")
+        table.link("extra", UP, "role_server")
+        table.link("extra", DOWN, "rename")
+        table.link("rename", UP, "extra")
+        table.link("rename", DOWN, "reset")
+        table.link("reset", UP, "rename")
+        table.link("reset", LEFT, "srv5")
+        table.link("reset", DOWN, "role_user")
+        table.link("role_user", UP, "srv3")
+        table.link("role_user", DOWN, "clear")
+    else:
+        table.link("role_server", DOWN, "role_user")
+        table.link("role_user", UP, "role_server")
+        table.link("role_user", DOWN, "clear")
+        table.link("clear", UP, "role_user")
+        table.link(CLOSE, UP, "role_user")
+        if role == "user":
+            table.known("extra", "scan")
+            table.link("scan", UP, "role_user")
+            table.link("scan", DOWN, "extra")
+            table.link("extra", UP, "scan")
+            table.link("extra", DOWN, "clear")
+            table.link("clear", UP, "extra")
+            table.link(CLOSE, UP, "extra")
+            if user_results:
+                _server_menu_grid(table, user_boxes, ("scan", "extra"), "role_user", "clear")
+                table.link("role_user", DOWN, "usr0")
+            else:
+                table.link("role_user", DOWN, "scan")
+    cell = server_menu_cell(selection, extra_visible)
+    if cell not in table.cells:
+        cell = "role_server"
+    target = navigate(app_state, "SERVER_MENU", table, cell, direction)
+    return selection if target is None else server_menu_index(target, extra_visible)
 
 
 # ============================================================================
@@ -2350,7 +2419,7 @@ __all__ = [
     "confirm_cell", "confirm_answer", "confirm_focus", "confirm_table", "splash_cell", "splash_focus", "splash_table",
     "CHANNEL_SUB_MAX_COL", "channel_sub_layout", "channel_sub_close_row", "channel_sub_cell", "channel_sub_index", "channel_sub_table",
     "TAB_PANEL_LAYERS", "tabs_cell", "tabs_table",
-    "SERVER_SLOT_CELLS", "column_move", "ring_move", "server_slots_cell", "server_slots_index", "server_slots_table",
+    "column_move", "ring_move",
     "GUIDE_ROW", "GUIDE_TIME", "guide_move", "guide_row_step",
     "DECK_PREV", "DECK_NEXT", "DECK_TO_ARROWS", "DECK_TO_LIST", "DECK_ACTIVATE", "DECK_SELECT_UP", "DECK_SELECT_DOWN",
     "deck_browse_step", "deck_list_step", "deck_arrows_step", "deck_confirm_choice",

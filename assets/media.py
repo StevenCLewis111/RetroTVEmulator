@@ -6,6 +6,8 @@ import os
 import re
 import sys
 import json
+import importlib.util
+import tempfile
 import contextlib
 import copy
 import hashlib
@@ -6200,6 +6202,8 @@ def resolve_captions_dir():
 
 
 CAPTION_SIDECAR_EXTS = (".srt", ".vtt", ".ass", ".ssa", ".sub", ".smi")
+# WARNING: the fallback number below must match CAPTION_FILE_BUILD_TRIES in performance_governor.py; it is used only when that module fails to import.
+CAPTION_FILE_BUILD_TRIES = _perf_governor.CAPTION_FILE_BUILD_TRIES if _perf_governor is not None else 2
 
 _TEXT_SUBTITLE_CODECS = ("subrip", "ass", "ssa", "webvtt", "mov_text", "text")
 
@@ -6334,24 +6338,53 @@ def filename_says_captions_baked_in(file_path):
     return bool(file_path) and bool(_BAKED_NAME_RE.search(os.path.basename(file_path)))
 
 
-def _extract_embedded_subtitle_to_file(file_path, stream_index, out_path, timeout=30):
-    """Remux one text-based embedded subtitle stream to a standalone .srt with no re-encode."""
+def _caption_file_is_usable(path):
+    """True when a caption file exists, is not empty and holds at least one readable cue."""
+    return bool(path) and os.path.isfile(path) and os.path.getsize(path) > 0 and bool(parse_caption_cues(path))
+
+
+def _build_caption_srt(command_before_output, out_path, timeout, label, use_io_slot):
+    """Builds one .srt with ffmpeg into a part file, checks that it holds readable cues and only then moves it to its final name; a bad one is deleted and the build is done once more. True when out_path holds a good file."""
+    import subprocess
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
+        )
+    _stem, _ext = os.path.splitext(out_path)
+    part_path = _stem + ".part" + _ext
+    for attempt in range(1, CAPTION_FILE_BUILD_TRIES + 1):
+        try:
+            if os.path.isfile(part_path):
+                os.remove(part_path)
+        except OSError as _swallowed_error:
+            _log_swallowed("_build_caption_srt: os.remove(part_path)", _swallowed_error)
+        command = list(command_before_output) + ["-f", "srt", part_path]
+        if use_io_slot:
+            with _fast_disk_io_slot(label):
+                subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs)
+        else:
+            subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs)
+        if _caption_file_is_usable(part_path):
+            os.replace(part_path, out_path)
+            return True
+        log.warning("[CAPTION FILE] %s came out empty or unreadable (try %d of %d)", label, attempt, CAPTION_FILE_BUILD_TRIES)
     try:
-        import subprocess
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
-            )
-        with _fast_disk_io_slot(f"extract_subs({os.path.basename(file_path)})"):
-            subprocess.run(
-                [_resolve_ffmpeg_path(), "-nostdin", "-y", "-i", file_path,
-                 "-map", f"0:{stream_index}", "-c:s", "srt", out_path],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=timeout, stdin=subprocess.DEVNULL,
-                **popen_kwargs
-            )
-        return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+        if os.path.isfile(part_path):
+            os.remove(part_path)
+    except OSError as _swallowed_error:
+        _log_swallowed("_build_caption_srt: os.remove(part_path) after the last try", _swallowed_error)
+    return False
+
+
+def _extract_embedded_subtitle_to_file(file_path, stream_index, out_path, timeout=30):
+    """Remux one text-based embedded subtitle stream to a standalone .srt with no re-encode, checked before it is used."""
+    try:
+        return _build_caption_srt(
+            [_resolve_ffmpeg_path(), "-nostdin", "-y", "-i", file_path, "-map", f"0:{stream_index}", "-c:s", "srt"],
+            out_path, timeout, f"extract_subs({os.path.basename(file_path)})", True)
     except Exception as e:
         log.warning("_extract_embedded_subtitle_to_file: failed for %s: %s", file_path, e)
         return False
@@ -6443,7 +6476,9 @@ def resolve_caption_source(file_path):
 
     facts = file_facts(file_path)
     saved_srt = facts["caption_srt_path"]
-    if facts["caption_kind"] in ("embedded", "sidecar") and saved_srt and _cached_path_exists(saved_srt):
+    if facts["caption_kind"] == "embedded" and saved_srt and _cached_path_exists(saved_srt) and not _caption_file_is_usable(saved_srt):
+        log.warning("[CAPTION FILE] the saved captions %s are empty or unreadable, so they are made again", os.path.basename(saved_srt))
+    elif facts["caption_kind"] in ("embedded", "sidecar") and saved_srt and _cached_path_exists(saved_srt):
         newer_sidecar = None if facts["caption_kind"] == "sidecar" else _find_sidecar_caption_file(file_path)
         if not newer_sidecar:
             result["kind"] = "cache"
@@ -6471,24 +6506,17 @@ def resolve_caption_source(file_path):
 
 
 def _convert_sidecar_to_srt(sidecar_path, timeout=30):
-    """Convert an .ass/.ssa/.smi/.sub text sidecar to a cached .srt with ffmpeg; None when it cannot be converted (for example a bitmap VobSub .sub)."""
+    """Convert an .ass/.ssa/.smi/.sub text sidecar to a cached .srt with ffmpeg, checked before it is used; None when it cannot be converted (for example a bitmap VobSub .sub)."""
     try:
-        import subprocess, hashlib
+        import hashlib
         st = os.stat(sidecar_path)
         digest = hashlib.sha1(f"{os.path.normpath(sidecar_path).lower()}|{st.st_size}|{st.st_mtime}".encode("utf-8", "replace")).hexdigest()[:16]
         out_path = os.path.join(resolve_captions_dir(), f"sidecar_{digest}.srt")
-        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        if _caption_file_is_usable(out_path):
             return out_path
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW
-            )
-        subprocess.run(
-            [_resolve_ffmpeg_path(), "-nostdin", "-y", "-i", sidecar_path, "-c:s", "srt", out_path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs)
-        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        if _build_caption_srt(
+                [_resolve_ffmpeg_path(), "-nostdin", "-y", "-i", sidecar_path, "-c:s", "srt"],
+                out_path, timeout, f"convert_subs({os.path.basename(sidecar_path)})", False):
             return out_path
     except Exception as e:
         log.warning("_convert_sidecar_to_srt: failed for %s: %s", sidecar_path, e)
@@ -6685,11 +6713,13 @@ def _caption_memory_allows_load():
         return True
     try:
         ok, total_gb, avail_gb, needed_gb = _perf_governor.caption_memory_check()
+        if ok and _perf_governor.caption_memory_locked():
+            ok = False
     except Exception as e:
         log.warning("[ASR MEMORY] memory check failed, allowing the load: %s", e)
         return True
-    log.info("[ASR MEMORY] total=%.1fGB available=%.1fGB needed=%.1fGB -> %s",
-             total_gb, avail_gb, needed_gb, "ok" if ok else "REFUSED")
+    log.info("[ASR MEMORY] total=%.1fGB available=%.1fGB needed=%.1fGB room before Windows runs out=%.1fGB -> %s",
+             total_gb, avail_gb, needed_gb, _perf_governor.read_commit_gb(), "ok" if ok else "REFUSED")
     if ok:
         return True
     handler = _caption_memory_refusal_handler
@@ -6699,6 +6729,180 @@ def _caption_memory_allows_load():
         except Exception as e:
             log.warning("[ASR MEMORY] refusal handler failed: %s", e)
     return False
+
+
+def _caption_memory_shed(total_gb, avail_gb, commit_gb):
+    """Called by the memory watch when the PC is running out of memory while captions run: tells the program to switch captions off and free the model."""
+    handler = _caption_memory_refusal_handler
+    if handler is not None:
+        handler(total_gb, avail_gb, float(_perf_governor.CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB))
+
+
+def _whisper_model_files_note():
+    """One line naming the caption model's files with their sizes and any unfinished download beside them, so a crash while loading can be traced to a missing or cut-short file."""
+    root = os.path.join(resolve_whisper_model_dir(), f"models--Systran--faster-whisper-{_ASR_MODEL_SIZE}")
+    found = []
+    try:
+        for folder, _dirs, names in os.walk(root):
+            for name in names:
+                path = os.path.join(folder, name)
+                found.append(f"{os.path.relpath(path, root)}={os.path.getsize(path) / 1048576.0:.1f}MB")
+    except OSError as _swallowed_error:
+        _log_swallowed("_whisper_model_files_note: for folder, _dirs, names in os.walk(root):", _swallowed_error)
+    return "; ".join(sorted(found)) if found else f"no files found under {root}"
+
+
+# WARNING: the fallback number below must match CAPTION_WORKER_START_SECONDS in performance_governor.py; it is used only when that module fails to import.
+CAPTION_WORKER_START_SECONDS = _perf_governor.CAPTION_WORKER_START_SECONDS if _perf_governor is not None else 240
+
+
+_native_libraries_reporter = None
+CAPTION_WORKER_CRASH_FILE = "caption_worker_crash.txt"
+
+
+def set_native_libraries_reporter(reporter):
+    """Registers reporter(), which returns one line naming the native libraries loaded in this program, logged beside the caption process's own list."""
+    global _native_libraries_reporter
+    _native_libraries_reporter = reporter
+
+
+def _caption_worker_log_dir():
+    """The folder that holds the caption-load marker, which is also where the caption process writes its crash file."""
+    marker = _perf_governor._caption_marker.get("path") if _perf_governor is not None else None
+    return os.path.dirname(marker) if marker else tempfile.gettempdir()
+
+
+def _caption_worker_crash_tail(lines=60):
+    """The end of the caption process's own crash file, as one text block for the log."""
+    path = os.path.join(_caption_worker_log_dir(), CAPTION_WORKER_CRASH_FILE)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            tail = handle.read().splitlines()[-lines:]
+    except OSError as _swallowed_error:
+        _log_swallowed("_caption_worker_crash_tail: with open(path, 'r', encoding='utf-8', errors='replace') as handle:", _swallowed_error)
+        return "(no crash file at %s)" % path
+    return "\n".join(tail) if tail else "(the crash file at %s is empty)" % path
+
+
+class _RemoteWhisperModel:
+    """Stands in for the faster-whisper model while the real one lives in a separate copy of the program, so a crash inside the model library cannot take the program down."""
+
+    def __init__(self, process, link):
+        self._process = process
+        self._link = link
+        self._call_lock = threading.Lock()
+        self.dead = False
+
+    def _ask(self, request):
+        """Sends one request to the other process and returns its answer; raises RuntimeError when that process failed or died."""
+        with self._call_lock:
+            if self.dead:
+                raise RuntimeError("the caption model process is not running")
+            try:
+                self._link.send(request)
+                while not self._link.poll(1.0):
+                    if self._process.poll() is not None:
+                        raise EOFError
+                reply = self._link.recv()
+            except (EOFError, OSError):
+                self.dead = True
+                code = self._process.wait()
+                log.warning("[ASR WORKER] the caption model process died with exit code %s (a crash inside the model library); the program keeps running and Live Captions are switched off. Its own crash report:\n%s", hex(code & 0xFFFFFFFF), _caption_worker_crash_tail())
+                _caption_model_process_died()
+                raise RuntimeError("the caption model process died")
+        if reply[0] != "ok":
+            raise RuntimeError(reply[1])
+        return reply
+
+    def transcribe(self, audio, **kwargs):
+        """Same call and answer as WhisperModel.transcribe, with the segments already read out; raises RuntimeError when the other process failed or died."""
+        reply = self._ask(("transcribe", audio, kwargs))
+        return iter(reply[1]), reply[2]
+
+    def speech_spans(self, audio, threshold, min_silence_ms, min_speech_ms):
+        """Finds the spans of speech in the audio inside the other process, because the voice-activity library (onnxruntime) crashed the program when loaded here."""
+        return self._ask(("speech_spans", audio, (threshold, min_silence_ms, min_speech_ms)))[1]
+
+    def close(self):
+        """Ends the other process, which frees the whole model."""
+        self.dead = True
+        try:
+            self._link.send(("close",))
+        except Exception as _swallowed_error:
+            _log_swallowed("_RemoteWhisperModel.close: self._link.send(('close',))", _swallowed_error)
+        try:
+            self._link.close()
+        except Exception as _swallowed_error:
+            _log_swallowed("_RemoteWhisperModel.close: self._link.close()", _swallowed_error)
+        try:
+            self._process.wait(timeout=5)
+        except Exception as _swallowed_error:
+            _log_swallowed("_RemoteWhisperModel.close: self._process.wait(timeout=5)", _swallowed_error)
+            self._process.kill()
+
+
+def _caption_model_process_died():
+    """Frees the dead model, locks Live Captions for this run and the next boot, and tells the program to switch them off."""
+    global _whisper_model, _whisper_model_load_failed
+    _whisper_model = None
+    _whisper_model_load_failed = True
+    if _perf_governor is not None:
+        _perf_governor.caption_watch_stop()
+        _perf_governor.caption_mark_crashed()
+    handler = _caption_memory_refusal_handler
+    if handler is not None:
+        handler(0.0, 0.0, 0.0)
+
+
+def _start_caption_model_process(threads):
+    """Starts the separate process that loads the caption model; returns a _RemoteWhisperModel, or None (reason logged) when it did not come up."""
+    from multiprocessing.connection import Listener
+    key = os.urandom(16)
+    listener = Listener(("127.0.0.1", 0), authkey=key)
+    if getattr(sys, "frozen", False):
+        command = [sys.executable]
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        command = [sys.executable, next((path for path in (os.path.join(here, "retro_tv_emulator.py"), os.path.join(os.path.dirname(here), "retro_tv_emulator.py")) if os.path.isfile(path)), "retro_tv_emulator.py")]
+    command += ["--caption-model-worker", resolve_whisper_model_dir(), _ASR_MODEL_SIZE, str(threads), str(listener.address[1]), key.hex(), _caption_worker_log_dir()]
+    if _native_libraries_reporter is not None:
+        log.info("[ASR WORKER] native libraries in the program before the caption process starts: %s", _native_libraries_reporter())
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    link = []
+
+    def _accept():
+        try:
+            link.append(listener.accept())
+        except Exception as _swallowed_error:
+            _log_swallowed("_start_caption_model_process: link.append(listener.accept())", _swallowed_error)
+    acceptor = threading.Thread(target=_accept, daemon=True, name="CaptionWorkerAccept")
+    acceptor.start()
+    deadline = time.monotonic() + CAPTION_WORKER_START_SECONDS
+    while acceptor.is_alive() and process.poll() is None and time.monotonic() < deadline:
+        acceptor.join(0.5)
+    listener.close()
+    reply = None
+    if link:
+        while time.monotonic() < deadline and process.poll() is None:
+            if link[0].poll(0.5):
+                try:
+                    reply = link[0].recv()
+                except (EOFError, OSError):
+                    reply = None
+                break
+    if reply is not None and reply[0] == "ready":
+        log.info("[ASR WORKER] caption model process %d is up: %s", process.pid, reply[1])
+        return _RemoteWhisperModel(process, link[0])
+    if process.poll() is None:
+        process.kill()
+        log.warning("[ASR WORKER] the caption model process did not load the model in %ds, so Live Captions stay off. Its own crash report:\n%s", CAPTION_WORKER_START_SECONDS, _caption_worker_crash_tail())
+    elif reply is not None:
+        log.warning("[ASR WORKER] the caption model process could not load the model: %s", reply[1])
+    else:
+        log.warning("[ASR WORKER] the caption model process died while loading with exit code %s (a crash inside the model library); the program keeps running and Live Captions are switched off. Its own crash report:\n%s", hex(process.wait() & 0xFFFFFFFF), _caption_worker_crash_tail())
+        _caption_model_process_died()
+    return None
 
 
 def _get_whisper_model():
@@ -6713,9 +6917,7 @@ def _get_whisper_model():
             return _whisper_model
         if not _caption_memory_allows_load():
             return None
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
+        if importlib.util.find_spec("faster_whisper") is None:
             _whisper_model_load_failed = True
             log.warning(
                 "[ASR] faster-whisper is not installed -- auto-captioning is "
@@ -6724,28 +6926,23 @@ def _get_whisper_model():
             )
             return None
         _threads = _asr_thread_count()
+        log.info("[ASR] caption model files: %s", _whisper_model_files_note())
+        _load_started = time.monotonic()
+        if _perf_governor is not None:
+            _perf_governor.caption_load_begin()
         try:
-            try:
-                # WARNING: keep offline mode on or faster-whisper contacts huggingface.co on every launch and delays the first tune-in.
-                _whisper_model = WhisperModel(
-                    _ASR_MODEL_SIZE, device="cpu", compute_type="int8",
-                    cpu_threads=_threads,
-                    download_root=resolve_whisper_model_dir(),
-                    local_files_only=True,
-                )
-            except Exception as _swallowed_error:
-                _log_swallowed("_get_whisper_model: _whisper_model = WhisperModel(_ASR_MODEL_SIZE, device='cpu', comput...", _swallowed_error)
-                _whisper_model = WhisperModel(
-                    _ASR_MODEL_SIZE, device="cpu", compute_type="int8",
-                    cpu_threads=_threads,
-                    download_root=resolve_whisper_model_dir(),
-                )
-            log.info("[ASR] faster-whisper '%s' model ready (CPU, int8, %d threads).",
-                     _ASR_MODEL_SIZE, _threads)
+            _loaded = _start_caption_model_process(_threads)
         except Exception as e:
+            _loaded = None
+            log.warning("[ASR] could not start the caption model process: %s", e)
+        if _loaded is None:
             _whisper_model_load_failed = True
-            log.warning("[ASR] failed to load whisper model: %s", e)
+            if _perf_governor is not None and _perf_governor.caption_lock_reason() != "crash":
+                _perf_governor.caption_load_done()
             return None
+        _whisper_model = _loaded
+        log.info("[ASR] faster-whisper '%s' model ready in its own process (CPU, int8, %d threads) in %.1fs",
+                 _ASR_MODEL_SIZE, _threads, time.monotonic() - _load_started)
         try:
             import numpy as _np
             _silence = _np.zeros(16000, dtype="float32")
@@ -6754,6 +6951,12 @@ def _get_whisper_model():
             list(_segs)
         except Exception as e:
             log.warning("[ASR] model warm-up skipped: %s", e)
+        if _whisper_model is None:
+            return None
+        if _perf_governor is not None:
+            _perf_governor.caption_load_resident()
+            _perf_governor.caption_watch_start(_caption_memory_shed)
+            _whisper_idle_watch_start()
     return _whisper_model
 
 
@@ -6767,6 +6970,38 @@ def _live_asr_running():
 
 _whisper_unload_thread = None
 _whisper_unload_lock = threading.Lock()
+_whisper_idle_thread = None
+
+
+def _whisper_idle_watch_start():
+    """Starts the check that frees the caption model after WHISPER_IDLE_UNLOAD_SECONDS with no live transcription and no transcription holding the slot."""
+    global _whisper_idle_thread
+    if _perf_governor is None:
+        return
+    limit_s = float(_perf_governor.WHISPER_IDLE_UNLOAD_SECONDS)
+    if limit_s <= 0 or (_whisper_idle_thread is not None and _whisper_idle_thread.is_alive()):
+        return
+    every_s = max(0.5, float(_perf_governor.WHISPER_IDLE_CHECK_SECONDS))
+
+    def _job():
+        idle_since = None
+        while _whisper_model is not None:
+            time.sleep(every_s)
+            busy = _live_asr_running()
+            if not busy and _ASR_SEMAPHORE.acquire(blocking=False):
+                _ASR_SEMAPHORE.release()
+            else:
+                busy = True
+            if busy:
+                idle_since = None
+                continue
+            idle_since = idle_since or time.monotonic()
+            if time.monotonic() - idle_since >= limit_s:
+                release_whisper_model("idle for %d seconds" % int(limit_s))
+                idle_since = None
+
+    _whisper_idle_thread = threading.Thread(target=_job, daemon=True, name="whisper-idle-watch")
+    _whisper_idle_thread.start()
 
 
 def release_whisper_model(reason):
@@ -6792,10 +7027,15 @@ def release_whisper_model(reason):
                 with _whisper_model_lock:
                     if _whisper_model is None:
                         return
-                    _whisper_model = None
+                    _closing, _whisper_model = _whisper_model, None
+                _closing.close()
                 import gc as _gc
                 _gc.collect()
-                log.info("[ASR] whisper model unloaded (%s)", reason)
+                _mem_now = _perf_governor.read_process_memory_mb() if _perf_governor is not None else (0.0, 0.0)
+                log.info("[ASR] whisper model unloaded (%s); program memory now %.0fMB in use (private %.0fMB)", reason, _mem_now[0], _mem_now[1])
+                if _perf_governor is not None:
+                    _perf_governor.caption_watch_stop()
+                    _perf_governor.caption_load_done()
             finally:
                 _ASR_SEMAPHORE.release()
 
@@ -7081,6 +7321,7 @@ class _SegList(list):
     recover_sec = 0.0
     music_secs = ()
     audio_secs = 0.0
+    said_sec = 0.0
 
 
 def _asr_uncovered_ranges(a, b, intervals):
@@ -7202,7 +7443,6 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
     if not _asr_vad_utils_load_failed:
         try:
             from faster_whisper.audio import decode_audio
-            from faster_whisper.vad import get_speech_timestamps, VadOptions
         except ImportError:
             _asr_vad_utils_load_failed = True
             log.warning("[ASR] faster-whisper VAD utilities unavailable -- falling back to "
@@ -7224,13 +7464,7 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
 
     audio = decode_audio(wav_path)
     sampling_rate = 16000
-    min_silence = _ASR_VAD_PARAMETERS["min_silence_duration_ms"]
-    try:
-        vad_opts = VadOptions(threshold=_ASR_VAD_THRESHOLD, min_silence_duration_ms=min_silence,
-                              min_speech_duration_ms=_ASR_VAD_MIN_SPEECH_MS)
-    except TypeError:
-        vad_opts = VadOptions(min_silence_duration_ms=min_silence)
-    raw_spans = get_speech_timestamps(audio, vad_opts)
+    raw_spans = model.speech_spans(audio, _ASR_VAD_THRESHOLD, _ASR_VAD_PARAMETERS["min_silence_duration_ms"], _ASR_VAD_MIN_SPEECH_MS)
     out = _SegList()
     out.vad_islands = len(raw_spans)
     out.vad_speech_sec = sum((sp["end"] - sp["start"]) for sp in raw_spans) / sampling_rate
@@ -7245,16 +7479,18 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
             continue
         span_start_sec = span["start"] / sampling_rate
         t_clip = time.monotonic()
+        # WARNING: the library's own silence gate (no_speech_threshold, log_prob_threshold) is switched off because it throws away a whole clip of up to 25 seconds of detected speech when the opening is unsure; _asr_filter_cues decides what to drop.
         segments_iter, _info = model.transcribe(
             clip, language=language, beam_size=beam_size, vad_filter=False,
             condition_on_previous_text=False, initial_prompt=initial_prompt,
-            word_timestamps=True, **temp_kw,
+            word_timestamps=True, no_speech_threshold=None, log_prob_threshold=None, **temp_kw,
         )
         _n_raw = 0
         for seg in segments_iter:
             if _asked_to_stop(should_stop):
                 break
             _n_raw += 1
+            out.said_sec += max(0.0, float(seg.end) - float(seg.start))
             out.extend(_asr_split_segment(seg, span_start_sec))
         t_clip = time.monotonic() - t_clip
         if _n_raw == 0 and not _asked_to_stop(should_stop):
@@ -8318,14 +8554,14 @@ class LiveCaptionSession:
                         _slot_wait = _slot_t0 - t0
                         log.info(
                             "[LIVE ASR] %s pos=%.1fs len=%.1fs audio=%.1fs took=%.1fs wait=%.1fs lead=%s ready=%s "
-                            "chunk=%s(est_30s=%.1fs) vad=%s islands/%.1fs speech cues=+%d "
+                            "chunk=%s(est_30s=%.1fs) vad=%s islands/%.1fs speech, %.1fs of it came back as text, cues=+%d "
                             "dropped(next=%d empty=%d not_speech=%d hallucination=%d) "
                             "recovered=%d/%d(%.1fs)",
                             base_name, pos, length, (audio_end - pos), took, _slot_wait,
                             ("n/a" if now is None else f"{lead:.1f}s"), self.ready,
                             ("BIG" if use_big_chunk else ("first" if (chunks_done == 0 and self._attached) else "startup")), est_big_chunk_sec,
                             getattr(segments, "vad_islands", "?"), getattr(segments, "vad_speech_sec", 0.0),
-                            len(new_cues), drops["next_chunk"], drops["empty"], drops["not_speech"],
+                            getattr(segments, "said_sec", 0.0), len(new_cues), drops["next_chunk"], drops["empty"], drops["not_speech"],
                             drops["hallucination"], getattr(segments, "recover_ok", 0),
                             getattr(segments, "recover_tried", 0), getattr(segments, "recover_sec", 0.0))
                         if self._attached:
@@ -10515,10 +10751,49 @@ class RetroDatabase:
                 return slot_id
         return None
 
-    def create_server_slot(self, name):
-        """Create a new named server slot with an empty channels file and save the name-to-slot mapping in config."""
-        slot_id = self.next_free_server_slot()
+    def prepare_server_slot_folders(self, slot_id):
+        """Make the slot's own loudness and media_library folders, and seed any that are still empty from the main ones so answers already worked out are not worked out again."""
+        slot_dir = os.path.dirname(self.get_server_slot_path(slot_id))
+        loudness_dir = os.path.join(slot_dir, "loudness")
+        library_dir = os.path.join(slot_dir, "media_library")
+        try:
+            os.makedirs(loudness_dir, exist_ok=True)
+            os.makedirs(library_dir, exist_ok=True)
+        except OSError as folder_err:
+            log.warning("[SERVER SLOT] could not make the folders for %s: %s", slot_id, folder_err)
+            return False
+        try:
+            main_loudness = resolve_loudness_dir()
+            for file_name in os.listdir(main_loudness):
+                source = os.path.join(main_loudness, file_name)
+                target = os.path.join(loudness_dir, file_name)
+                if file_name.lower().endswith(".json") and os.path.isfile(source) and not os.path.exists(target):
+                    shutil.copy2(source, target)
+        except OSError as copy_err:
+            _log_swallowed("RetroDatabase.prepare_server_slot_folders: copying the main loudness .json files", copy_err)
+        library_target = os.path.join(library_dir, "library.sqlite3")
+        if not os.path.exists(library_target):
+            try:
+                import sqlite3
+                import media_library as _ml
+                main_library = _ml.default_db_path()
+                if os.path.isfile(main_library):
+                    source_db = sqlite3.connect(main_library)
+                    target_db = sqlite3.connect(library_target)
+                    try:
+                        source_db.backup(target_db)
+                    finally:
+                        target_db.close()
+                        source_db.close()
+            except Exception as library_err:
+                _log_swallowed("RetroDatabase.prepare_server_slot_folders: seeding the slot media library from the main one", library_err)
+        return True
+
+    def create_server_slot(self, name, slot_id=None):
+        """Create a named server slot (the given slot_id, else the first free one) with an empty channels file and save the name-to-slot mapping in config."""
         if slot_id is None:
+            slot_id = self.next_free_server_slot()
+        if slot_id is None or slot_id not in self.SERVER_SLOT_IDS or slot_id in self.config.get("server_slots", {}):
             return None
         path = self.get_server_slot_path(slot_id)
         try:
@@ -10537,6 +10812,7 @@ class RetroDatabase:
         server_slots = dict(self.config.get("server_slots", {}))
         server_slots[slot_id] = name
         self.config["server_slots"] = server_slots
+        self.prepare_server_slot_folders(slot_id)
         self.save_config()
         return slot_id
 
@@ -10589,6 +10865,7 @@ class RetroDatabase:
         server_slots = self.config.get("server_slots", {})
         if slot_id not in server_slots:
             return False
+        self.prepare_server_slot_folders(slot_id)
         self.reload_channels_from(self.get_server_slot_path(slot_id))
         self.config["active_server_slot"] = slot_id
         self.save_config()

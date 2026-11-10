@@ -635,6 +635,8 @@ STATIC_HEAVY = 0.62
 # VALUES CHANGE HERE
 WATERMARK_JUMP_TOLERANCE_PX = 2
 WATERMARK_REPOSITION_HIDE_MS = 450
+# VALUES CHANGE HERE (Water Mark: milliseconds after a file starts during which a move of the picture hides the badge until it settles; later in the show the badge just follows the picture and never blinks out)
+WATERMARK_SETTLE_MS = 4000
 WATERMARK_ALPHA = 150
 WATERMARK_WIDTH_FRAC = 0.091
 WATERMARK_MARGIN_FRAC = 0.12
@@ -1053,7 +1055,7 @@ GUIDE_ROW_CACHE_TTL_S = 20.0
 GUIDE_ROW_CACHE_MAX = 24
 
 # VALUES CHANGE HERE (ui.py, Server Mode toggle: False greys it out in Advanced Settings (the row can still be reached with the keys and controller but cannot be turned on or off); True lets it be switched again)
-SERVER_TOGGLE_ENABLED = False
+SERVER_TOGGLE_ENABLED = True
 # VALUES CHANGE HERE (Server mode: True drops every scheduled entry a server sends that points at a network share (\\host\share) or a web address, so a server on the network can never make this PC reach out to another machine; False accepts them)
 REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS = True
 
@@ -1093,10 +1095,9 @@ CONTROLS_TITLE_SECTION_GAP_PX = 18
 CONTROLS_SECTION_BODY_GAP_PX = 24
 CONTROLS_SUB_BODY_GAP_PX = 20
 
-# VALUES CHANGE HERE (ui.py, settings menu: how far the left and right toggle columns of the options page sit from their column start, the server picker's visible rows, and how far the channel grid moves left and its left column moves back right, in pixels)
+# VALUES CHANGE HERE (ui.py, settings menu: how far the left and right toggle columns of the options page sit from their column start, and how far the channel grid moves left and its left column moves back right, in pixels)
 OPTIONS_LEFT_TOGGLE_OFFSET_PX = 370
 OPTIONS_RIGHT_TOGGLE_OFFSET_PX = 260
-SERVER_PICKER_VISIBLE_ROWS = 6
 CHANNEL_GRID_GROUP_SHIFT_LEFT_PX = 40
 CHANNEL_GRID_LEFT_COL_SHIFT_PX = 50
 
@@ -1144,18 +1145,33 @@ NAV_DUP_PATH_MS = 50
 NAV_MOVE_MIN_MS = 150
 
 # VALUES CHANGE HERE (menu_nav.py, sliders: one left or right press moves SLIDER_STEP; each slider is (config key, value when unset, lowest, highest); the Reactive Strength slider on a music channel's editor the same way; the fastest a value control (slider, volume) may step in milliseconds, however fast the key is pressed or held, kept below the held-key repeat intervals in HOLD_RULES so a hold is never dropped)
-# VALUES CHANGE HERE (theme colour slider: the hues from the lowest to the highest number below are skipped because that blue is the menu button colour and a border or highlight in it cannot be seen; the button is about 217 degrees)
+# VALUES CHANGE HERE (theme colour slider: the hues from the lowest to the highest number below are left off the slider track because that blue is the menu button colour and a border or highlight in it cannot be seen; the button is about 217 degrees)
 THEME_UI_HUE_SKIP_LOW = 195
 THEME_UI_HUE_SKIP_HIGH = 240
+THEME_UI_HUE_SKIP_WIDTH = THEME_UI_HUE_SKIP_HIGH - THEME_UI_HUE_SKIP_LOW + 1
+THEME_UI_POSITION_MAX = 360 - THEME_UI_HUE_SKIP_WIDTH
+
+
+def theme_ui_hue_to_position(hue):
+    """Returns where a theme hue sits on the slider track, which has the skipped blue cut out; a hue inside the blue sits at the nearer edge."""
+    if hue < THEME_UI_HUE_SKIP_LOW:
+        return hue
+    if hue > THEME_UI_HUE_SKIP_HIGH:
+        return hue - THEME_UI_HUE_SKIP_WIDTH
+    if hue - THEME_UI_HUE_SKIP_LOW >= THEME_UI_HUE_SKIP_HIGH - hue:
+        return THEME_UI_HUE_SKIP_LOW
+    return THEME_UI_HUE_SKIP_LOW - 1
+
+
+def theme_ui_position_to_hue(position):
+    """Returns the theme hue at a slider track position (0 up to THEME_UI_POSITION_MAX); never a hue in the skipped blue."""
+    position = max(0, min(THEME_UI_POSITION_MAX, position))
+    return position if position < THEME_UI_HUE_SKIP_LOW else position + THEME_UI_HUE_SKIP_WIDTH
 
 
 def theme_ui_hue_clear(hue, direction=0):
-    """Returns the theme colour hue moved out of the skipped blue band, to the far edge in the direction pressed (1 up, -1 down) or to the nearer edge when no direction is given."""
-    if hue < THEME_UI_HUE_SKIP_LOW or hue > THEME_UI_HUE_SKIP_HIGH:
-        return hue
-    if direction > 0 or (direction == 0 and hue - THEME_UI_HUE_SKIP_LOW >= THEME_UI_HUE_SKIP_HIGH - hue):
-        return THEME_UI_HUE_SKIP_HIGH + SLIDER_STEP
-    return THEME_UI_HUE_SKIP_LOW - SLIDER_STEP
+    """Returns the theme colour hue moved out of the skipped blue band, to the nearer edge."""
+    return theme_ui_position_to_hue(theme_ui_hue_to_position(hue))
 
 
 SLIDER_STEP = 5
@@ -1343,13 +1359,15 @@ LIBRETRO_AUDIO_MAX_BATCH_FRAMES = 500_000
 LIBRETRO_MAX_FRAME_DIM = 4096
 LIBRETRO_PIXEL_ART_SCALE_FACTOR = 2
 
-# VALUES CHANGE HERE (media_library.py, burned-in subtitle check: frame size read; where in the file the frames are taken (shares of the length) and the seconds used when the length is unknown; time limit per frame; the lower share of the picture searched; brightest and darkest levels that count as text and outline, outline reach in pixels; a text row's least text share and colour changes; a text band's least and most height, least width, centre range, least letter clusters, most fill and contrast; how far bands may move between frames; least frames with text, most bands per frame, frames that end the check early, and the share of frames that must agree)
+# VALUES CHANGE HERE (media_library.py, burned-in subtitle check: frame size read; where in the file the frames are taken (shares of the length) and the seconds used when the length is unknown; time limit per frame; the lower share of the picture searched and its left and right edges (the centre only, so a logo in a corner is not read as a caption); brightest and darkest levels that count as text and outline, outline reach in pixels; a text row's least text share and colour changes; a text band's least and most height, least width, centre range, least letter clusters, most fill and contrast; how far bands may move between frames; least frames with text, most bands per frame, frames that end the check early, and the share of frames that must agree; the least share of all frames that must show the text, how far a line's edges may differ and still be the same fixed graphic, and the most share of the agreeing frames that may show that same graphic)
 BURNED_IN_FRAME_W = 480
 BURNED_IN_FRAME_H = 270
 BURNED_IN_SAMPLE_FRACTIONS = (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
 BURNED_IN_FALLBACK_OFFSETS_S = (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
 BURNED_IN_FRAME_TIMEOUT_S = 20.0
 BURNED_IN_REGION_TOP_FRAC = 0.55
+BURNED_IN_REGION_LEFT_FRAC = 0.15
+BURNED_IN_REGION_RIGHT_FRAC = 0.85
 BURNED_IN_BRIGHT_MIN = 205
 BURNED_IN_DARK_MAX = 75
 BURNED_IN_OUTLINE_REACH_PX = 2
@@ -1358,7 +1376,7 @@ BURNED_IN_ROW_MIN_TRANSITIONS = 10
 BURNED_IN_BAND_MIN_H_FRAC = 0.018
 BURNED_IN_BAND_MAX_H_FRAC = 0.10
 BURNED_IN_BAND_MIN_WIDTH_FRAC = 0.12
-BURNED_IN_BAND_CENTER_RANGE = (0.25, 0.75)
+BURNED_IN_BAND_CENTER_RANGE = (0.35, 0.65)
 BURNED_IN_BAND_MIN_GLYPH_CLUSTERS = 6
 BURNED_IN_BAND_MAX_FILL = 0.50
 BURNED_IN_BAND_CONTRAST_RATIO = 4.0
@@ -1367,6 +1385,9 @@ BURNED_IN_MIN_POSITIVE_FRAMES = 3
 BURNED_IN_MAX_BANDS_PER_FRAME = 3
 BURNED_IN_EARLY_STOP_FRAMES = 4
 BURNED_IN_MIN_AGREEING_SHARE = 0.6
+BURNED_IN_MIN_POSITIVE_SHARE = 0.25
+BURNED_IN_STATIC_BAND_TOLERANCE_FRAC = 0.02
+BURNED_IN_STATIC_BAND_MAX_SHARE = 0.7
 
 # VALUES CHANGE HERE (audio_analysis.py, music analysis (raise ANALYSIS_VERSION in audio_analysis.py after changing any number here so cached tracks are rebuilt): sample rate, frames per second, FFT size, spectrum bands and their lowest and highest Hz, top of the low and mid bands in Hz, most seconds analysed, frames per chunk, beat flux bands, frames between beats, beat peak radius in frames)
 AUDIO_ANALYSIS_SAMPLE_RATE = 22050
@@ -1565,6 +1586,53 @@ def _read_cpu_counts():
         except Exception as err:
             log.warning("[GOVERNOR] core count API failed, estimating: %s", err)
     return max(1, logical_os // 2), 0, logical_os, "estimate"
+
+
+def read_process_memory_mb():
+    """Returns (working set MB, private MB) of this program for the log lines around the caption model; (0.0, 0.0) when it cannot be read."""
+    try:
+        if os.name == "nt":
+            class _Counters(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                            ("PrivateUsage", ctypes.c_size_t)]
+            counters = _Counters()
+            counters.cb = ctypes.sizeof(_Counters)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return counters.WorkingSetSize / 1024 ** 2, counters.PrivateUsage / 1024 ** 2
+        else:
+            with open("/proc/self/status", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        value = int(line.split()[1]) / 1024.0
+                        return value, value
+    except Exception as _swallowed_error:
+        _log_swallowed("read_process_memory_mb: reading this program's memory", _swallowed_error)
+    return 0.0, 0.0
+
+
+def read_commit_gb():
+    """Returns the room left before Windows can hand out no more memory (the commit limit less what is promised), in GB; 0.0 when it cannot be read or this is not Windows."""
+    if os.name != "nt":
+        return 0.0
+    try:
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        status = _MemStatus()
+        status.dwLength = ctypes.sizeof(_MemStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullAvailPageFile / 1024 ** 3
+    except Exception as _swallowed_error:
+        _log_swallowed("read_commit_gb: GlobalMemoryStatusEx", _swallowed_error)
+    return 0.0
 
 
 def _read_ram_gb():
@@ -2317,6 +2385,16 @@ GUIDE_PRELOAD_REPORT_COOLDOWN_SECONDS = 10.0
 RELAUNCH_MAX_ATTEMPTS = 4
 RELAUNCH_WINDOW_SECONDS = 600
 
+# VALUES CHANGE HERE (main script, crash restart: the flags handed to Windows when it is asked to restart the app after a crash inside native code; 14 means restart only after a crash, not after a hang, an update patch or a reboot)
+CRASH_RESTART_FLAGS = 14
+
+# VALUES CHANGE HERE (media.py, caption files the app makes with ffmpeg: how many times a file that comes out empty or unreadable is built again before it is given up)
+CAPTION_FILE_BUILD_TRIES = 2
+# VALUES CHANGE HERE (seconds the separate caption-model process may take to load the model before it counts as stuck; owner 2026-11-09)
+CAPTION_WORKER_START_SECONDS = 240
+# VALUES CHANGE HERE (banner shown when Live Captions are switched off because the caption model crashed; 'CAPTION_MEMORY_BANNER_LABEL' is the one for lack of memory)
+CAPTION_CRASH_BANNER_LABEL = "LIVE CAPTIONS TURNED OFF: THE CAPTION MODEL CRASHED"
+
 # VALUES CHANGE HERE (main script, start-up: seconds a new start waits for the app already running to close before it gives up as a second copy; seconds it waits instead when Reset All Settings restarted the app, so the old copy can finish closing before its saved data is wiped)
 SINGLE_INSTANCE_WAIT_SECONDS = 3.0
 FRESH_START_WAIT_FOR_OLD_APP_SECONDS = 30.0
@@ -2423,6 +2501,12 @@ PLAY_SEGMENTED_STOP_FAST_WAIT_SECONDS = 0.05
 PRE_OPEN_DIMS_PROBE_BOUND_SECONDS = 0.35
 SEEK_FRAME_READY_GRACE_MS = 600
 SEEK_GUARD_TAIL_MARGIN_SECONDS = 5.0
+# VALUES CHANGE HERE (when a clip reaches its real end and the schedule still has this many seconds or fewer left of the same clip's slot, the screen waits out those seconds and then goes to the next item instead of reopening the clip's last moment, which was an audio hiccup at the end of every commercial; owner 2026-11-09; 0 = always reopen)
+SLOT_TAIL_HOLD_MAX_SECONDS = 3.0
+# VALUES CHANGE HERE (the most seconds into its slot the next item may be found when it starts after another ends; at or under this the item starts at its first second, so no commercial or bumper loses its opening to the open time; owner 2026-11-09; 0 = start where the clock is)
+SLOT_START_GRACE_SECONDS = 0.3
+# VALUES CHANGE HERE (seconds before a slot ends that the next item is opened, about the time VLC needs to open a file and show its first picture, so the next commercial's first picture appears when its slot begins; owner 2026-11-09)
+SLOT_OPEN_LEAD_SECONDS = 0.2
 PLAY_OPEN_ERROR_CHECK_SECONDS = 0.25
 PLAY_OPEN_CONFIRM_WINDOW_SECONDS = 1.5
 PLAY_OPEN_STOPPED_DEBOUNCE_SECONDS = 0.15
@@ -2759,6 +2843,11 @@ COLOR_BUTTON_AUDIO_TRACK_TEXT = (20, 20, 20)
 # VALUES CHANGE HERE (where the shared buttons sit in every settings menu and popup: Close at the bottom right, Clear Media at the bottom left, as (inset from the panel side, up from the panel bottom, width, height); Yes left and No right of the popup's centre by the offset, both the given size)
 MENU_CLOSE_BUTTON_PLACE = (25, 52, 110, 40)
 MENU_CLEAR_BUTTON_PLACE = (25, 52, 240, 40)
+# VALUES CHANGE HERE (ui.py, the title of every settings menu and sub-menu: the text size, how far below the top of the panel it sits, how far below the text the gold underline sits and how thick it is, in pixels)
+MENU_TITLE_FONT_SIZE = 24
+MENU_TITLE_TOP_PX = 10
+MENU_TITLE_UNDERLINE_GAP_PX = 2
+MENU_TITLE_UNDERLINE_THICKNESS_PX = 2
 POPUP_YES_NO_OFFSET = 100
 POPUP_YES_NO_SIZE = (110, 36)
 COLOR_MENU_SWITCH_OFF = (45, 65, 100)
@@ -2998,12 +3087,137 @@ FIRST_START_PRIORITY_DISK_SLOTS = 3
 # ============================================================================
 # SECTION: Caption memory check
 # ============================================================================
-# VALUES CHANGE HERE (free RAM in GB the caption model needs before it may load; seconds the red "no memory" banner stays up)
+# VALUES CHANGE HERE (live captions: the PC must have at least this much memory in total, and this much free right now, before the caption model may load; seconds the red "no memory" banner stays up)
+CAPTION_MODEL_MIN_TOTAL_RAM_GB = 8.0
 CAPTION_MODEL_MIN_AVAILABLE_RAM_GB = 1.5
 CAPTION_MEMORY_BANNER_SECONDS = 5.0
+# VALUES CHANGE HERE (captions while they run: the memory watch looks every interval; when the free memory, or the room left before Windows runs out of memory to hand out (the commit limit), stays under the numbers below for the strikes in a row, Live Captions are switched off and greyed out for the rest of the run and the model is freed, so the PC is never taken down by captions; the load also needs the commit room in CAPTION_LOAD_MIN_COMMIT_GB; owner 2026-11-09)
+CAPTION_LOAD_MIN_COMMIT_GB = 2.5
+CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB = 0.6
+CAPTION_RUNTIME_MIN_COMMIT_GB = 1.0
+CAPTION_WATCH_INTERVAL_SECONDS = 2.0
+CAPTION_WATCH_STRIKES = 2
+# VALUES CHANGE HERE (the caption model is loaded only when a live transcription needs it, and freed when none has run for this many seconds; the check looks every WHISPER_IDLE_CHECK_SECONDS; owner 2026-11-09; 0 = never free it by idle)
+WHISPER_IDLE_UNLOAD_SECONDS = 60.0
+WHISPER_IDLE_CHECK_SECONDS = 5.0
 
 
 CAPTION_LOCK_KEYS = ("tv_captions_enabled", "dvd_captions_enabled")
+CAPTION_LOAD_MARKER_NAME = "caption_load.marker"
+_caption_marker = {"path": None}
+
+
+def set_caption_load_marker(folder):
+    """Says which folder holds the caption-load marker, the file that exists only while the caption model is loading."""
+    _caption_marker["path"] = os.path.join(folder, CAPTION_LOAD_MARKER_NAME) if folder else None
+
+
+def set_previous_run_unclean(value):
+    """Tells the governor whether the run before this one ended by a crash, kill or power loss instead of a quit."""
+    _caption_marker["unclean"] = bool(value)
+
+
+def _write_caption_marker(state):
+    path = _caption_marker["path"]
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("%s %.2f" % (state, _read_ram_gb()[0]))
+    except Exception as error:
+        log.warning("[GOVERNOR] could not write the caption marker: %s", error)
+
+
+def caption_load_begin():
+    """Writes the marker just before the caption model loads; a program killed by a lack of memory leaves it behind."""
+    _write_caption_marker("loading")
+
+
+def caption_load_resident():
+    """Changes the marker to say the caption model is in memory; it stays until the model is freed, so a crash while captions run is found on the next boot."""
+    _write_caption_marker("resident")
+
+
+def caption_load_done():
+    """Removes the marker once the caption model has been freed, or failed to load in a way the program survived."""
+    path = _caption_marker["path"]
+    if not path:
+        return
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as error:
+        log.warning("[GOVERNOR] could not remove the caption marker: %s", error)
+
+
+def caption_load_interrupted():
+    """True when an earlier run died with the caption model loading, or in memory when that run did not end by a quit; the lock ends when the PC's total memory changes or the owner deletes the marker file."""
+    path = _caption_marker["path"]
+    if not path or not os.path.exists(path):
+        return False
+    state, then_gb = "loading", 0.0
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            words = handle.read().split()
+        if words and words[0] in ("loading", "resident"):
+            state = words.pop(0)
+        then_gb = float(words[0]) if words else 0.0
+    except Exception as _swallowed_error:
+        _log_swallowed("caption_load_interrupted: reading the marker", _swallowed_error)
+        return True
+    if state == "resident" and not _caption_marker.get("unclean"):
+        caption_load_done()
+        return False
+    now_gb = _read_ram_gb()[0]
+    if then_gb > 0.0 and now_gb > 0.0 and abs(now_gb - then_gb) >= 0.5:
+        caption_load_done()
+        log.info("[GOVERNOR BOOT SCAN] the PC's memory changed from %.1fGB to %.1fGB, so the earlier caption failure no longer blocks live captions", then_gb, now_gb)
+        return False
+    return True
+
+
+_caption_watch = {"thread": None, "stop": None}
+
+
+def caption_watch_start(on_shed):
+    """Starts the memory watch for the time the caption model is in memory; on_shed(total_gb, available_gb, commit_gb) is called once when captions have to go."""
+    with _state_lock:
+        thread, running_stop = _caption_watch["thread"], _caption_watch["stop"]
+        if thread is not None and thread.is_alive() and running_stop is not None and not running_stop.is_set():
+            return
+        stop = threading.Event()
+
+        def _run():
+            strikes = 0
+            while not stop.wait(CAPTION_WATCH_INTERVAL_SECONDS):
+                total_gb, avail_gb = _read_ram_gb()
+                commit_gb = read_commit_gb()
+                low_ram = 0.0 < avail_gb < CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB
+                low_commit = 0.0 < commit_gb < CAPTION_RUNTIME_MIN_COMMIT_GB
+                strikes = strikes + 1 if (low_ram or low_commit) else 0
+                if strikes < CAPTION_WATCH_STRIKES:
+                    continue
+                with _state_lock:
+                    _state["captions_memory_ok"] = False
+                    _state["captions_lock_reason"] = "memory"
+                log.warning("[ASR MEMORY] free memory %.1fGB (needs %.1fGB), room before Windows runs out %.1fGB (needs %.1fGB): Live Captions are switched off and greyed out for the rest of this run so the PC keeps running",
+                            avail_gb, CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB, commit_gb, CAPTION_RUNTIME_MIN_COMMIT_GB)
+                try:
+                    on_shed(total_gb, avail_gb, commit_gb)
+                except Exception as _swallowed_error:
+                    _log_swallowed("caption_watch_start: on_shed", _swallowed_error)
+                return
+
+        _caption_watch["stop"] = stop
+        _caption_watch["thread"] = threading.Thread(target=_run, daemon=True, name="CaptionMemoryWatch")
+        _caption_watch["thread"].start()
+
+
+def caption_watch_stop():
+    """Stops the memory watch; called when the caption model has been freed."""
+    stop = _caption_watch.get("stop")
+    if stop is not None:
+        stop.set()
 
 
 def scan_caption_memory():
@@ -3012,17 +3226,35 @@ def scan_caption_memory():
     if known is not None:
         return known
     ok, total_gb, avail_gb, needed_gb = caption_memory_check()
+    interrupted = caption_load_interrupted()
+    if interrupted:
+        ok = False
     with _state_lock:
         if _state.get("captions_memory_ok") is None:
             _state["captions_memory_ok"] = bool(ok)
+            _state["captions_lock_reason"] = "crash" if interrupted else "memory"
             first = True
         else:
             first = False
         result = _state["captions_memory_ok"]
     if first:
-        log.info("[GOVERNOR BOOT SCAN] memory total=%.1fGB available=%.1fGB captions need %.1fGB free -> live captions %s",
-                 total_gb, avail_gb, needed_gb, "available" if result else "greyed out (not enough memory)")
+        log.info("[GOVERNOR BOOT SCAN] memory total=%.1fGB available=%.1fGB captions need %.1fGB in total and %.1fGB free -> live captions %s",
+                 total_gb, avail_gb, CAPTION_MODEL_MIN_TOTAL_RAM_GB, needed_gb,
+                 "available" if result else "greyed out (%s)" % ("the last caption load never finished, delete %s to try again" % CAPTION_LOAD_MARKER_NAME if interrupted else "not enough memory"))
     return result
+
+
+def caption_mark_crashed():
+    """Switches Live Captions off and greys them out for this run because the caption model crashed, and leaves the marker so they stay locked on the next boot until the marker file is deleted."""
+    with _state_lock:
+        _state["captions_memory_ok"] = False
+        _state["captions_lock_reason"] = "crash"
+    _write_caption_marker("loading")
+
+
+def caption_lock_reason():
+    """'crash' when the caption model crashed, 'memory' when there is not enough memory, '' when captions are not locked."""
+    return str(_state.get("captions_lock_reason", "")) if _state.get("captions_memory_ok") is False else ""
 
 
 def caption_memory_locked():
@@ -3036,7 +3268,9 @@ def caption_memory_check():
     needed_gb = float(CAPTION_MODEL_MIN_AVAILABLE_RAM_GB)
     if total_gb <= 0.0 or avail_gb <= 0.0:
         return True, total_gb, avail_gb, needed_gb
-    return avail_gb >= needed_gb, total_gb, avail_gb, needed_gb
+    commit_gb = read_commit_gb()
+    commit_ok = commit_gb <= 0.0 or commit_gb >= float(CAPTION_LOAD_MIN_COMMIT_GB)
+    return (total_gb >= float(CAPTION_MODEL_MIN_TOTAL_RAM_GB) and avail_gb >= needed_gb and commit_ok), total_gb, avail_gb, needed_gb
 
 
 # ============================================================================
@@ -4066,6 +4300,7 @@ _state = {
     "boot_scan": None,
     "boot_scan_failed": False,
     "captions_memory_ok": None,
+    "captions_lock_reason": "",
 }
 _state_lock = threading.Lock()
 
@@ -4239,7 +4474,7 @@ __all__ = [
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
-    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
+    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "caption_mark_crashed", "caption_lock_reason", "set_caption_load_marker", "set_previous_run_unclean", "caption_load_begin", "caption_load_resident", "caption_load_done", "caption_load_interrupted", "caption_watch_start", "caption_watch_stop", "read_commit_gb", "read_process_memory_mb", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
     "quiet_seconds", "pc_is_quiet", "quiet_lane_bonus", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
     "music_scan_class", "music_analysis_class", "music_scan_falling_behind",
 ]

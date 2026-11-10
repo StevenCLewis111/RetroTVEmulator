@@ -1,6 +1,5 @@
-Retro TV Emulator - Tutorial
-Text version of the website tutorial (no pictures or video).
-Getting Started
+Tutorial
+Start Here - Watch or Read Below
 What You Need
 Retro TV Emulator will turn your own downloaded video and music library into scheduled TV Stations and Music Visualizer Stations on a Windows PC. Channel 03 adds retro games front end and a DVD/media player (need optical drive for DVDs), Channel 04 is a TV Guide, and there are plenty of theme and static options to have fun with.
 Computer: A 64-bit Windows 10 or 11 PC. The app checks your hardware at every start and adjusts itself to run its best on any PC that can run windows 10 or 11. Linux and Mac can run Windows programs through compatibility tools; how well depends on the tool and your setup but you can run this on Linux and Mac with those tools.
@@ -15,20 +14,20 @@ Your media stays put: Shows, movies, music and commercials can stay where they a
 Organize Your Media & Supported Files
 Before adding media, keep each show in its own folder with season folders inside it. Clear folder and file names help the app recognize shows and fill in the guide. There are things in place that hide (dvdrip) type tags, but the clearer your naming and sorting, the better it will run.
 ```
-TV Shows/
-  Show Name/
-    Season 1/
+TV Shows
+  Show Name
+    Season 1
       Show Name S01E01.mkv
       Show Name S01E02.mkv
-    Season 2/
+    Season 2
       Show Name S02E01.mkv
 ```
 ```
-Movies/
-  Comedy/
+Movies
+  Comedy
     Movie Name.mp4
     Movie Name.mp4
-    Movie Name/
+    Movie Name
       1. Movie Name The Rising.mp4
       2. Movie Name The Falling.mp4
 ```
@@ -46,7 +45,7 @@ Booting Up
 Each start shows a loading screen while the app gets everything ready. It will build the proper cache files so the first channel plays straight away. It will find your computers hardware specs to adapt to your computer. The first time you boot the program has no channels yet, so every station shows static until you add media.
 Drives: Internal and external media drives are woken up so a sleeping drive does not delay the first show.
 Hardware check: The app counts your CPU cores, threads, and memory. It finds your graphics cards and picks the best one. With this information it will pick your performance mode (Lite, Standard or Performance). It will throttle and adapt as needed to keep things running smoothly.
-	Lite	Standard	Performance
+	LITE	STANDARD	PERFORMANCE
 Menu and list speed	30 FPS	60 FPS	60 FPS
 Warp Screen and Scan Lines	Greyed out	Available	Available
 Background scans	Slower	Normal	Faster
@@ -85,9 +84,12 @@ Remote Remapping: Changes which key controls what. This is where you would chang
 Performance Mode: On boot a performance mode is chosen for you but you can change it. Lite has menus at 30 fps, greyed out options that wont work, and slower scans. Standard is all normal scans and access to anything that is not performance. Performance unlocks faster scanning, more games, and higher fps. You can change this manually but if you are booted as a Lite computer, you will not have a performance mode.
 GPU/CPU: The best options is chosen on boot but you can change the GPU at any time, even change to CPU only. Performance mode has to use a GPU though so any CPU only computer also will not have a performance mode.
 Custom Shell Launcher: This option will start the emulator in place of the Windows desktop so Windows can no longer be accessed. This option combined with Kiosk mode turns the computer into a cable box instead of a computer.
-Server Mode: Server Mode allows you to schedule the program and share that scheduling over your wifi with any other computer in the house that has this program on it.
 Advanced Settings - Remote Remapping
 The Remote Remapping will show every action and the key it uses now. Remap Remote goes through the actions one by one. Press the key or PC remote button you want for each. Remap Numbers does the same for the number keys 0 to 9, these are here for any keyboard or remote not registering the number keys.
+Advanced Settings - Server Menu
+Server Mode lets your computer share its channels schedule over your wifi with other computers on that network. All they need is a copy of the program on their device and to scan the network for servers. Turn on the Server option and open its menu.
+Server: Click on Server to select/name/edit/reset a server profile. Your stations will be reset (this will not affect your current scheduling, just replace it while editing), and you can set up your server scheduling. When done you can scan for the server and stream those stations and their scheduled media.
+User: Click on User to select a Server or leave server mode. Scan for servers and pick one, or leave the menu to go back to your regular scheduling. If you pick a server to stream, select Clear User Choice to remove that server choice. While using a server you can still use your own media on channels not set up on that server.
 Channels Tab
 Channels Menu
 Set up your stations here. You have 40 channels over two pages to choose from and schedule.

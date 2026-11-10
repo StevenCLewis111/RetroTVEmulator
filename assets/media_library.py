@@ -1096,17 +1096,19 @@ def _pb_no_video() -> dict:
 # ============================================================================
 # SECTION: Burned-in (hard-coded) caption detection
 # ============================================================================
-BURNED_IN_DETECTOR_VERSION = 1
+BURNED_IN_DETECTOR_VERSION = 4
 _BI_SOURCE_BAKED = "baked"
 _BI_SOURCE_CLEAN = "clean"
 
-# WARNING: the fallback numbers below must match BURNED_IN_FRAME_W, BURNED_IN_FRAME_H, BURNED_IN_SAMPLE_FRACTIONS, BURNED_IN_FALLBACK_OFFSETS_S, BURNED_IN_FRAME_TIMEOUT_S, BURNED_IN_REGION_TOP_FRAC, BURNED_IN_BRIGHT_MIN, BURNED_IN_DARK_MAX, BURNED_IN_OUTLINE_REACH_PX, BURNED_IN_ROW_MIN_TEXT_FRAC, BURNED_IN_ROW_MIN_TRANSITIONS, BURNED_IN_BAND_MIN_H_FRAC, BURNED_IN_BAND_MAX_H_FRAC, BURNED_IN_BAND_MIN_WIDTH_FRAC, BURNED_IN_BAND_CENTER_RANGE, BURNED_IN_BAND_MIN_GLYPH_CLUSTERS, BURNED_IN_BAND_MAX_FILL, BURNED_IN_BAND_CONTRAST_RATIO, BURNED_IN_POSITION_TOLERANCE_FRAC, BURNED_IN_MIN_POSITIVE_FRAMES, BURNED_IN_MAX_BANDS_PER_FRAME, BURNED_IN_EARLY_STOP_FRAMES, BURNED_IN_MIN_AGREEING_SHARE in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match BURNED_IN_FRAME_W, BURNED_IN_FRAME_H, BURNED_IN_SAMPLE_FRACTIONS, BURNED_IN_FALLBACK_OFFSETS_S, BURNED_IN_FRAME_TIMEOUT_S, BURNED_IN_REGION_TOP_FRAC, BURNED_IN_REGION_LEFT_FRAC, BURNED_IN_REGION_RIGHT_FRAC, BURNED_IN_BRIGHT_MIN, BURNED_IN_DARK_MAX, BURNED_IN_OUTLINE_REACH_PX, BURNED_IN_ROW_MIN_TEXT_FRAC, BURNED_IN_ROW_MIN_TRANSITIONS, BURNED_IN_BAND_MIN_H_FRAC, BURNED_IN_BAND_MAX_H_FRAC, BURNED_IN_BAND_MIN_WIDTH_FRAC, BURNED_IN_BAND_CENTER_RANGE, BURNED_IN_BAND_MIN_GLYPH_CLUSTERS, BURNED_IN_BAND_MAX_FILL, BURNED_IN_BAND_CONTRAST_RATIO, BURNED_IN_POSITION_TOLERANCE_FRAC, BURNED_IN_MIN_POSITIVE_FRAMES, BURNED_IN_MAX_BANDS_PER_FRAME, BURNED_IN_EARLY_STOP_FRAMES, BURNED_IN_MIN_AGREEING_SHARE, BURNED_IN_MIN_POSITIVE_SHARE, BURNED_IN_STATIC_BAND_TOLERANCE_FRAC, BURNED_IN_STATIC_BAND_MAX_SHARE in performance_governor.py; they are used only when that module fails to import.
 _BI_FRAME_W = _governor.BURNED_IN_FRAME_W if _governor is not None else 480
 _BI_FRAME_H = _governor.BURNED_IN_FRAME_H if _governor is not None else 270
 _BI_SAMPLE_FRACTIONS = _governor.BURNED_IN_SAMPLE_FRACTIONS if _governor is not None else (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
 _BI_FALLBACK_OFFSETS_S = _governor.BURNED_IN_FALLBACK_OFFSETS_S if _governor is not None else (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
 _BI_FRAME_TIMEOUT_S = _governor.BURNED_IN_FRAME_TIMEOUT_S if _governor is not None else 20.0
 _BI_REGION_TOP_FRAC = _governor.BURNED_IN_REGION_TOP_FRAC if _governor is not None else 0.55
+_BI_REGION_LEFT_FRAC = _governor.BURNED_IN_REGION_LEFT_FRAC if _governor is not None else 0.15
+_BI_REGION_RIGHT_FRAC = _governor.BURNED_IN_REGION_RIGHT_FRAC if _governor is not None else 0.85
 _BI_BRIGHT_MIN = _governor.BURNED_IN_BRIGHT_MIN if _governor is not None else 205
 _BI_DARK_MAX = _governor.BURNED_IN_DARK_MAX if _governor is not None else 75
 _BI_OUTLINE_REACH_PX = _governor.BURNED_IN_OUTLINE_REACH_PX if _governor is not None else 2
@@ -1115,7 +1117,7 @@ _BI_ROW_MIN_TRANSITIONS = _governor.BURNED_IN_ROW_MIN_TRANSITIONS if _governor i
 _BI_BAND_MIN_H_FRAC = _governor.BURNED_IN_BAND_MIN_H_FRAC if _governor is not None else 0.018
 _BI_BAND_MAX_H_FRAC = _governor.BURNED_IN_BAND_MAX_H_FRAC if _governor is not None else 0.10
 _BI_BAND_MIN_WIDTH_FRAC = _governor.BURNED_IN_BAND_MIN_WIDTH_FRAC if _governor is not None else 0.12
-_BI_BAND_CENTER_RANGE = _governor.BURNED_IN_BAND_CENTER_RANGE if _governor is not None else (0.25, 0.75)
+_BI_BAND_CENTER_RANGE = _governor.BURNED_IN_BAND_CENTER_RANGE if _governor is not None else (0.35, 0.65)
 _BI_BAND_MIN_GLYPH_CLUSTERS = _governor.BURNED_IN_BAND_MIN_GLYPH_CLUSTERS if _governor is not None else 6
 _BI_BAND_MAX_FILL = _governor.BURNED_IN_BAND_MAX_FILL if _governor is not None else 0.50
 _BI_BAND_CONTRAST_RATIO = _governor.BURNED_IN_BAND_CONTRAST_RATIO if _governor is not None else 4.0
@@ -1124,6 +1126,9 @@ _BI_MIN_POSITIVE_FRAMES = _governor.BURNED_IN_MIN_POSITIVE_FRAMES if _governor i
 _BI_MAX_BANDS_PER_FRAME = _governor.BURNED_IN_MAX_BANDS_PER_FRAME if _governor is not None else 3
 _BI_EARLY_STOP_FRAMES = _governor.BURNED_IN_EARLY_STOP_FRAMES if _governor is not None else 4
 _BI_MIN_AGREEING_SHARE = _governor.BURNED_IN_MIN_AGREEING_SHARE if _governor is not None else 0.6
+_BI_MIN_POSITIVE_SHARE = _governor.BURNED_IN_MIN_POSITIVE_SHARE if _governor is not None else 0.25
+_BI_STATIC_BAND_TOLERANCE_FRAC = _governor.BURNED_IN_STATIC_BAND_TOLERANCE_FRAC if _governor is not None else 0.02
+_BI_STATIC_BAND_MAX_SHARE = _governor.BURNED_IN_STATIC_BAND_MAX_SHARE if _governor is not None else 0.7
 
 
 def _bi_dilate(mask, reach):
@@ -1140,12 +1145,14 @@ def _bi_dilate(mask, reach):
     return out
 
 
-def _bi_frame_text_bottoms(gray):
-    """Returns the bottom edge, as a fraction of frame height, of every band in one 8-bit gray frame that looks like a subtitle line."""
+def _bi_frame_text_bands(gray):
+    """Returns (bottom, left, right), as fractions of the frame, of every band in one 8-bit gray frame that looks like a subtitle line."""
     import numpy as np
     frame_h, frame_w = gray.shape
     y0 = int(frame_h * _BI_REGION_TOP_FRAC)
-    crop = gray[y0:, :]
+    x0 = int(frame_w * _BI_REGION_LEFT_FRAC)
+    x1 = int(frame_w * _BI_REGION_RIGHT_FRAC)
+    crop = gray[y0:, x0:x1]
     bright = crop >= _BI_BRIGHT_MIN
     dark = crop <= _BI_DARK_MAX
     text = bright & _bi_dilate(dark, _BI_OUTLINE_REACH_PX)
@@ -1175,7 +1182,7 @@ def _bi_frame_text_bottoms(gray):
     outside = row_count[~in_band]
     background = float(np.median(outside)) if outside.size else 0.0
 
-    bottoms = []
+    found = []
     for a, b in bands:
         height = b - a + 1
         if height < min_h or height > max_h:
@@ -1184,26 +1191,29 @@ def _bi_frame_text_bottoms(gray):
         hit = np.flatnonzero(cols)
         if hit.size == 0:
             continue
-        left, right = int(hit[0]), int(hit[-1])
+        left, right = int(hit[0]) + x0, int(hit[-1]) + x0
         extent = right - left + 1
         if extent < _BI_BAND_MIN_WIDTH_FRAC * frame_w:
             continue
         centre = (left + right) / 2.0 / frame_w
         if not (_BI_BAND_CENTER_RANGE[0] <= centre <= _BI_BAND_CENTER_RANGE[1]):
             continue
+        # WARNING: a band that runs into only one edge of the search area carries on past it (a big logo or a banner), so it is not a centred line.
+        if (left <= x0 + 1) != (right >= x1 - 2):
+            continue
         clusters = int(((cols[1:].astype(np.int8) - cols[:-1].astype(np.int8)) == 1).sum()) + int(bool(cols[0]))
         if clusters < _BI_BAND_MIN_GLYPH_CLUSTERS:
             continue
-        box = bright[a:b + 1, left:right + 1]
+        box = bright[a:b + 1, left - x0:right - x0 + 1]
         if box.mean() > _BI_BAND_MAX_FILL:
             continue
         band_mean = float(row_count[a:b + 1].mean())
         if band_mean < _BI_BAND_CONTRAST_RATIO * max(background, 1.0):
             continue
-        bottoms.append((y0 + b + 1) / float(frame_h))
-    if len(bottoms) > _BI_MAX_BANDS_PER_FRAME:
+        found.append(((y0 + b + 1) / float(frame_h), left / float(frame_w), (right + 1) / float(frame_w)))
+    if len(found) > _BI_MAX_BANDS_PER_FRAME:
         return []
-    return bottoms
+    return found
 
 
 def _bi_grab_frame(file_path, ffmpeg, t, timeout):
@@ -1238,15 +1248,22 @@ def _bi_grab_frame(file_path, ffmpeg, t, timeout):
     return np.frombuffer(data, dtype=np.uint8).reshape(_BI_FRAME_H, _BI_FRAME_W)
 
 
-def _bi_positions_agree(bottoms_per_positive_frame, early=False):
-    """True when enough positive frames put their lowest text band at the same height (the same spot, frame after frame, is what separates subtitles from scrolling credits or a one-off graphic)."""
-    lows = [max(b) for b in bottoms_per_positive_frame]
-    best = 0
+def _bi_positions_agree(positive_frames, decoded, early=False):
+    """True when the frames with text read as subtitles: enough of them put their lowest band at the same height, they are a fair share of all frames read, and the line is not the same fixed graphic (a logo, a banner or a one-off gag) every time."""
+    lows = [max(bands) for bands in positive_frames]
+    group = []
     for ref in lows:
-        near = sum(1 for v in lows if abs(v - ref) <= _BI_POSITION_TOLERANCE_FRAC)
-        best = max(best, near)
+        near = [v for v in lows if abs(v[0] - ref[0]) <= _BI_POSITION_TOLERANCE_FRAC]
+        if len(near) > len(group):
+            group = near
     need = _BI_EARLY_STOP_FRAMES if early else _BI_MIN_POSITIVE_FRAMES
-    return best >= need and best >= _BI_MIN_AGREEING_SHARE * len(lows)
+    if len(group) < need or len(group) < _BI_MIN_AGREEING_SHARE * len(lows):
+        return False
+    if len(group) < _BI_MIN_POSITIVE_SHARE * decoded:
+        return False
+    tol = _BI_STATIC_BAND_TOLERANCE_FRAC
+    same = max(sum(1 for w in group if abs(w[1] - v[1]) <= tol and abs(w[2] - v[2]) <= tol) for v in group)
+    return same < _BI_STATIC_BAND_MAX_SHARE * len(group)
 
 
 def _bi_sample_times(duration, extra=False):
@@ -1273,6 +1290,7 @@ def detect_burned_in_captions(file_path, duration=None, ffmpeg_path=None,
     ffmpeg = _resolve_ffmpeg(ffmpeg_path)
 
     positives = []
+    positive_times = []
     decoded = 0
     timeouts = 0
     planned = 0
@@ -1289,19 +1307,24 @@ def detect_burned_in_captions(file_path, duration=None, ffmpeg_path=None,
             if frame is None:
                 continue
             decoded += 1
-            bottoms = _bi_frame_text_bands_safe(frame)
-            if bottoms:
-                positives.append(bottoms)
-                if _bi_positions_agree(positives, early=True):
+            bands = _bi_frame_text_bands_safe(frame)
+            if bands:
+                positives.append(bands)
+                positive_times.append(t)
+                if _bi_positions_agree(positives, decoded, early=True):
                     if diag is not None:
-                        diag.update(positive_frames=len(positives), decoded=decoded, reason="text_band_found")
+                        diag.update(positive_frames=len(positives), decoded=decoded, reason="text_band_found",
+                                    seconds=list(positive_times), heights=[round(max(b)[0], 2) for b in positives])
                     return True
-        if _bi_positions_agree(positives):
+        if _bi_positions_agree(positives, decoded):
             if diag is not None:
-                diag.update(positive_frames=len(positives), decoded=decoded, reason="text_band_found")
+                diag.update(positive_frames=len(positives), decoded=decoded, reason="text_band_found",
+                            seconds=list(positive_times), heights=[round(max(b)[0], 2) for b in positives])
             return True
     if diag is not None:
         diag.update(positive_frames=len(positives), decoded=decoded, timeouts=timeouts)
+        if positives:
+            diag["reason"] = "text_seen_not_subtitles"
     if decoded == 0:
         if diag is not None:
             diag["reason"] = "no_frames"
@@ -1314,7 +1337,7 @@ def detect_burned_in_captions(file_path, duration=None, ffmpeg_path=None,
 
 def _bi_frame_text_bands_safe(frame):
     try:
-        return _bi_frame_text_bottoms(frame)
+        return _bi_frame_text_bands(frame)
     except Exception as e:
         log.warning("[MEDIA LIBRARY] burned-in frame analysis failed: %s", e)
         return []
@@ -1624,6 +1647,8 @@ class ProbeLibrary:
         stored = self.get_burned_in_verdict(file_path)
         if stored is not None:
             return stored
+        if diag is None:
+            diag = {}
         entry = self.library.get_entry(content_key)
         if entry is None or not entry.get("header_probed_at"):
             entry = self.get_or_probe_sync(file_path)
@@ -1633,6 +1658,9 @@ class ProbeLibrary:
             verdict = detect_burned_in_captions(
                 file_path, duration=(entry or {}).get("duration"),
                 ffmpeg_path=self.ffmpeg_path, diag=diag)
+        log.info("[BURNED-IN SCAN] %s -> %s (%s)", os.path.basename(file_path),
+                 {True: "captions are part of the picture", False: "no captions in the picture", None: "could not tell, will retry"}[verdict],
+                 ", ".join(f"{key}={value}" for key, value in diag.items()) or "no details")
         if verdict is None:
             return None
         self.library.upsert_fields(
