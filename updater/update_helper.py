@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import shutil
@@ -42,7 +43,15 @@ def _add_server_path():
 
 
 _add_server_path()
-from server_diagnostics import breadcrumb as _server_breadcrumb
+try:
+    from server_diagnostics import breadcrumb as _server_breadcrumb
+except Exception:
+    def _server_breadcrumb(logger, level, key, message, *args, **kwargs):
+        """Fallback used only when server_diagnostics cannot be imported: the line is written without its once-per-interval limit."""
+        try:
+            logger.log(level, message, *args)
+        except Exception:
+            pass
 
 WAIT_FOR_PARENT_SECONDS = 120
 HEALTH_CHECK_SECONDS = 15
@@ -72,6 +81,36 @@ def _configure_logging(install_dir):
         log.propagate = False
     except Exception:
         pass
+
+
+def _write_error_note(message, include_traceback=False):
+    """Writes why the helper failed to a plain file in the temp folder and, when the log is set up, into it; works even when the log cannot be opened."""
+    try:
+        import traceback
+        text = "%s %s\n%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), message, traceback.format_exc() if include_traceback else "")
+        with open(os.path.join(tempfile.gettempdir(), "retro_tv_update_helper_error.txt"), "a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+        log.error("[UPDATE DIAG] %s", message)
+    except Exception:
+        pass
+
+
+def _sweep_update_leftovers(install_dir):
+    """After a good swap, removes every download-* folder left in logs/.retro_tv_updates by earlier updates that never finished (each holds a whole unpacked copy of the app, close to 1 GiB). The app is closed and no download is running, so all of them are leftovers; the staged and pending records are removed by the caller."""
+    try:
+        update_dir = os.path.join(install_dir, "logs", ".retro_tv_updates")
+        for name in os.listdir(update_dir):
+            full = os.path.join(update_dir, name)
+            if name.startswith("download-") and os.path.isdir(full):
+                shutil.rmtree(_long(full), ignore_errors=True)
+        stale_record = os.path.join(update_dir, "staged_update.json")
+        if os.path.exists(stale_record):
+            os.remove(stale_record)
+    except Exception as err:
+        try:
+            log.warning("[UPDATE DIAG] could not clear earlier update folders: %s", err)
+        except Exception:
+            pass
 
 
 def _read_json(path):
@@ -148,6 +187,7 @@ UPDATE_WRITABLE_FOLDERS = ("_internal",)
 UPDATABLE_MAIN_FOLDERS = (
     "_internal/main/licenses",
     "_internal/main/models",
+    "_internal/main/images/banners",
     "_internal/main/images/bezel",
     "_internal/main/images/loading",
     "_internal/main/images/logos",
@@ -199,11 +239,9 @@ def _payload_files(staged_path, install_dir=None):
                 continue
             # WARNING: only the exe at the top of the install folder and the files under _internal may be written; every other top-level file (settings, logs, device id) and folder belongs to the owner's install and must never be touched by an update.
             if not _in_update_area(relative):
-                log.info("[UPDATE DIAG] Skipped %s (outside the update area: an exe at the top of the install or a file under _internal)", relative)
                 continue
             # WARNING: a shipped copy of a saved setup file must never overwrite the user's own, or every setting, device id and server slot they made is lost on update.
             if install_dir is not None and _is_user_state(relative) and os.path.isfile(_long(os.path.join(install_dir, relative))):
-                log.info("[UPDATE DIAG] Kept the existing %s (saved setup is never overwritten)", relative)
                 continue
             files.append((source, relative))
     return files
@@ -227,17 +265,45 @@ def _backup_targets(install_dir, files, on_file=None):
     return backup_dir, copied, absent
 
 
+def _same_file(first, second):
+    """True when both files exist and hold the same bytes, so a restore can leave a file that was never replaced alone."""
+    try:
+        if os.path.getsize(_long(first)) != os.path.getsize(_long(second)):
+            return False
+        with open(_long(first), "rb") as one, open(_long(second), "rb") as two:
+            while True:
+                block = one.read(1 << 20)
+                if block != two.read(1 << 20):
+                    return False
+                if not block:
+                    return True
+    except OSError:
+        return False
+
+
 def _restore(install_dir, backup_dir, copied, absent):
+    # WARNING: owner 2026-11-14: one locked file (numpy's .pyd held by the server service) used to stop this loop half way and leave the install part new, part old, which crash-looped the CRT PC at boot; every file is tried, a file that was never replaced is skipped, and a locked one is retried.
+    failed = []
     for relative in copied:
         backup = os.path.join(backup_dir, relative)
         target = os.path.join(install_dir, relative)
-        os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
-        shutil.copy2(_long(backup), _long(target))
+        if _same_file(backup, target):
+            continue
+        try:
+            os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
+            _copy_with_retry(backup, target)
+        except OSError as exc:
+            failed.append(relative)
+            log.error("[UPDATE DIAG] Could not put back %s: %s", relative, exc)
     for relative in absent:
         try:
             os.unlink(_long(os.path.join(install_dir, relative)))
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            failed.append(relative)
+            log.error("[UPDATE DIAG] Could not remove %s: %s", relative, exc)
+    return failed
 
 
 def _move_running_helper_aside(target):
@@ -261,16 +327,52 @@ def _copy_with_retry(source, target, attempts=40, delay=0.25):
             return
         except PermissionError:
             if attempt == attempts - 1:
+                log.error("[UPDATE DIAG] Could not replace %s: another program still has it open", target)
                 raise
             time.sleep(delay)
 
 
+VLC_PLUGINS_MARK = "tools/vlc/plugins/"
+VLC_PLUGIN_CACHE_NAME = "plugins.dat"
+
+
+def _vlc_plugin_files_to_keep(install_dir, files):
+    """The relative paths of VLC plugin files an update must leave alone: each plugin file already installed with the same bytes, and the plugin cache too when every plugin file is unchanged (owner 2026-11-15: VLC took 18 s to start after an update; copying the plugins gives them new modified times, VLC's cache goes stale and it reads every plugin again)."""
+    plugin_files = []
+    cache_relative = None
+    for source, relative in files:
+        marker = relative.replace("\\", "/").lower()
+        if VLC_PLUGINS_MARK not in marker:
+            continue
+        if marker.endswith("/" + VLC_PLUGIN_CACHE_NAME):
+            cache_relative = relative
+        else:
+            plugin_files.append((source, relative))
+    keep = set()
+    for source, relative in plugin_files:
+        if _same_file(source, os.path.join(install_dir, relative)):
+            keep.add(relative)
+    if cache_relative is not None and len(keep) == len(plugin_files) and os.path.isfile(_long(os.path.join(install_dir, cache_relative))):
+        keep.add(cache_relative)
+    return keep
+
+
 def _apply_payload(install_dir, files, on_file=None):
+    keep = _vlc_plugin_files_to_keep(install_dir, files)
     for index, (source, relative) in enumerate(files):
+        if relative in keep:
+            if on_file is not None:
+                on_file(index + 1, len(files))
+            continue
         target = os.path.join(install_dir, relative)
         os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
         _move_running_helper_aside(target)
-        _copy_with_retry(source, target)
+        try:
+            _copy_with_retry(source, target, attempts=24)
+        except PermissionError:
+            # WARNING: owner 2026-11-14: the server service can be started again by the computer's own watchdog after it was ended once; end it again and try the file once more before giving up.
+            _stop_server_service(install_dir)
+            _copy_with_retry(source, target)
         if on_file is not None:
             on_file(index + 1, len(files))
 
@@ -340,7 +442,6 @@ def _remove_stale_files(install_dir, stale, backup_dir, copied):
         copied.append(relative)
         try:
             os.unlink(_long(target))
-            log.info("[UPDATE DIAG] Removed %s (the new build no longer ships it)", relative)
         except OSError as exc:
             log.warning("[UPDATE DIAG] Could not remove %s: %s", relative, exc)
             continue
@@ -522,7 +623,14 @@ def _restore_stamp(install_dir, previous):
 # The bar the owner sees between the app closing and the app coming back: a small dark box like the update bar inside the app, so the minute or so of installing and restarting never looks like nothing is happening.
 
 PROGRESS_WINDOW_TITLE = "Retro TV Emulator Update"
-PROGRESS_WINDOW_SIZE = (440, 150)
+# VALUES CHANGE HERE: the box is the same as the app's own download bar (performance_governor BUSY_OVERLAY_*): text 22 pixels bold, at least 440 wide and 120 tall, bar 20 tall; the box grows wider if the longest label needs it. Only the loading text and the bar show.
+PROGRESS_WINDOW_MIN_WIDTH = 440
+PROGRESS_WINDOW_HEIGHT = 120
+PROGRESS_TITLE_PX = 22
+PROGRESS_BAR_HEIGHT = 20
+PROGRESS_SIDE_PAD = 20
+PROGRESS_LABEL_PAD = 60
+PROGRESS_LONGEST_LABELS = ("WAITING FOR THE APP TO CLOSE... 100%", "PREPARING THE UPDATE... 100%", "INSTALLING UPDATE... 100%", "PROGRAM STARTING NOW", "DOWNLOADING UPDATE... 100%", "INSTALL COMPLETE 100%", "PREPARING INSTALL... 100%")
 PROGRESS_PANEL_RGB = (20, 28, 46)
 PROGRESS_TRACK_RGB = (10, 15, 30)
 PROGRESS_ACCENT_RGB = (0, 255, 128)
@@ -534,8 +642,6 @@ PROGRESS_THEME_UI_SV = (0.9, 1.0)
 PROGRESS_THEME_BG_S = 0.6
 PROGRESS_THEME_PANEL_V = 0.18
 PROGRESS_THEME_TRACK_V = 0.12
-PROGRESS_CAPTION_RGB = (190, 200, 215)
-PROGRESS_CAPTION = "The app closes, installs and reopens by itself. This takes about a minute."
 PROGRESS_REFRESH_MS = 50
 PROGRESS_WAIT_BAR = 0.05
 PROGRESS_PREPARE_BAR = (0.08, 0.30)
@@ -612,7 +718,10 @@ class _ProgressWindow(_NullProgress):
             root.title(PROGRESS_WINDOW_TITLE)
             root.overrideredirect(True)
             root.attributes("-topmost", True)
-            w, h = PROGRESS_WINDOW_SIZE
+            import tkinter.font as tkfont
+            _font = tkfont.Font(root=root, family="Courier New", size=-PROGRESS_TITLE_PX, weight="bold")
+            w = max(PROGRESS_WINDOW_MIN_WIDTH, max(_font.measure(t) for t in PROGRESS_LONGEST_LABELS) + PROGRESS_LABEL_PAD)
+            h = PROGRESS_WINDOW_HEIGHT
             root.geometry("%dx%d+%d+%d" % (w, h, (root.winfo_screenwidth() - w) // 2, (root.winfo_screenheight() - h) // 2))
             canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=self._hex(self._panel_rgb))
             canvas.pack()
@@ -632,17 +741,16 @@ class _ProgressWindow(_NullProgress):
             accent = self._hex(PROGRESS_FAIL_RGB if failed else self._accent_rgb)
             canvas.delete("all")
             canvas.create_rectangle(1, 1, w - 2, h - 2, outline=accent, width=2)
-            text = label if failed else "%s %d%%" % (label, int(max(0.0, min(1.0, fraction)) * 100))
-            canvas.create_text(w // 2, 34, text=text, fill=accent, font=("Courier New", 13, "bold"))
-            track = (20, 62, w - 20, 76)
+            if starting and not failed:
+                text = PROGRESS_STARTING_TEXT
+            else:
+                text = label if failed else "%s %d%%" % (label, int(max(0.0, min(1.0, fraction)) * 100))
+            canvas.create_text(w // 2, 22 + PROGRESS_TITLE_PX // 2 + 2, text=text, fill=accent, font=("Courier New", -PROGRESS_TITLE_PX, "bold"))
+            track = (PROGRESS_SIDE_PAD, h - 22 - PROGRESS_BAR_HEIGHT, w - PROGRESS_SIDE_PAD, h - 22)
             canvas.create_rectangle(*track, fill=self._hex(self._track_rgb), outline=accent)
             fill_w = int((track[2] - track[0]) * max(0.0, min(1.0, fraction)))
             if fill_w > 0:
                 canvas.create_rectangle(track[0], track[1], track[0] + fill_w, track[3], fill=accent, outline=accent)
-            if starting and not failed:
-                canvas.create_text(w // 2, 108, text=PROGRESS_STARTING_TEXT, fill=accent, font=("Courier New", 13, "bold"))
-            else:
-                canvas.create_text(w // 2, 108, text=PROGRESS_CAPTION, fill=self._hex(PROGRESS_CAPTION_RGB), font=("Courier New", 9), width=w - 40)
             root.after(PROGRESS_REFRESH_MS, tick)
 
         tick()
@@ -700,13 +808,171 @@ def preview_progress_bar(seconds=20.0, install_dir=None):
     return 0
 
 
+# VALUES CHANGE HERE: the Yes/No box of the server tray's Check for updates; the button size, the gap and the line height in pixels, and the exit codes it returns.
+ASK_BUTTON_WIDTH = 110
+ASK_BUTTON_HEIGHT = 36
+ASK_BUTTON_GAP = 30
+ASK_LINE_PX = 30
+ASK_PAD = 30
+ASK_YES, ASK_NO, ASK_FAILED = 0, 1, 2
+
+
+def ask_yes_no(text, install_dir=None):
+    """Shows a small always-on-top Yes/No box in the progress bar's colours and returns ASK_YES, ASK_NO or ASK_FAILED (no screen). Mouse: click a button. Keys: A or Left picks Yes, D or Right picks No, Enter or Space answers with the picked button, Escape answers No."""
+    try:
+        import tkinter as tk
+        import tkinter.font as tkfont
+        accent_rgb, panel_rgb, track_rgb = _theme_progress_colors(install_dir) or (PROGRESS_ACCENT_RGB, PROGRESS_PANEL_RGB, PROGRESS_TRACK_RGB)
+        accent, panel, track = (_ProgressWindow._hex(c) for c in (accent_rgb, panel_rgb, track_rgb))
+        root = tk.Tk()
+        root.title(PROGRESS_WINDOW_TITLE)
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        font = tkfont.Font(root=root, family="Courier New", size=-PROGRESS_TITLE_PX, weight="bold")
+        lines = [line for line in str(text).split("\n")]
+        w = max(PROGRESS_WINDOW_MIN_WIDTH, max(font.measure(line) for line in lines) + 2 * ASK_PAD, 2 * ASK_BUTTON_WIDTH + ASK_BUTTON_GAP + 2 * ASK_PAD)
+        h = ASK_PAD + ASK_LINE_PX * len(lines) + ASK_PAD + ASK_BUTTON_HEIGHT + ASK_PAD
+        root.geometry("%dx%d+%d+%d" % (w, h, (root.winfo_screenwidth() - w) // 2, (root.winfo_screenheight() - h) // 2))
+        canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=panel)
+        canvas.pack()
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] The Yes/No box could not open: %s", exc)
+        return ASK_FAILED
+    result = {"answer": None, "pick": 0}
+    top = h - ASK_PAD - ASK_BUTTON_HEIGHT
+    left = (w - 2 * ASK_BUTTON_WIDTH - ASK_BUTTON_GAP) // 2
+    boxes = [(left, "YES"), (left + ASK_BUTTON_WIDTH + ASK_BUTTON_GAP, "NO")]
+
+    def draw():
+        canvas.delete("all")
+        canvas.create_rectangle(1, 1, w - 2, h - 2, outline=accent, width=2)
+        for index, line in enumerate(lines):
+            canvas.create_text(w // 2, ASK_PAD + ASK_LINE_PX * index + ASK_LINE_PX // 2, text=line, fill=accent, font=("Courier New", -PROGRESS_TITLE_PX, "bold"))
+        for index, (x, label) in enumerate(boxes):
+            picked = result["pick"] == index
+            canvas.create_rectangle(x, top, x + ASK_BUTTON_WIDTH, top + ASK_BUTTON_HEIGHT, fill=accent if picked else track, outline=accent, width=2)
+            canvas.create_text(x + ASK_BUTTON_WIDTH // 2, top + ASK_BUTTON_HEIGHT // 2, text=label, fill=track if picked else accent, font=("Courier New", -PROGRESS_TITLE_PX, "bold"))
+
+    def answer(value):
+        result["answer"] = value
+        root.destroy()
+
+    def button_at(x, y):
+        if top <= y <= top + ASK_BUTTON_HEIGHT:
+            for index, (bx, _label) in enumerate(boxes):
+                if bx <= x <= bx + ASK_BUTTON_WIDTH:
+                    return index
+        return None
+
+    def on_move(event):
+        index = button_at(event.x, event.y)
+        if index is not None and index != result["pick"]:
+            result["pick"] = index
+            draw()
+
+    def on_click(event):
+        index = button_at(event.x, event.y)
+        if index is not None:
+            answer(ASK_YES if index == 0 else ASK_NO)
+
+    def on_key(event):
+        key = (event.keysym or "").lower()
+        if key in ("a", "left"):
+            result["pick"] = 0
+            draw()
+        elif key in ("d", "right"):
+            result["pick"] = 1
+            draw()
+        elif key in ("return", "kp_enter", "space"):
+            answer(ASK_YES if result["pick"] == 0 else ASK_NO)
+        elif key == "escape":
+            answer(ASK_NO)
+
+    canvas.bind("<Motion>", on_move)
+    canvas.bind("<Button-1>", on_click)
+    root.bind("<Key>", on_key)
+    draw()
+    try:
+        root.focus_force()
+        root.mainloop()
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] The Yes/No box stopped: %s", exc)
+        return ASK_FAILED
+    return ASK_NO if result["answer"] is None else result["answer"]
+
+
+# VALUES CHANGE HERE: the OK box of the server tray's plain update messages (up to date, check failed, etc); the button size and exit codes it returns.
+INFORM_BUTTON_WIDTH = 110
+INFORM_OK, INFORM_FAILED = 0, 1
+
+
+def show_info(text, install_dir=None):
+    """Shows a small always-on-top OK box in the progress bar's colours and returns INFORM_OK or INFORM_FAILED (no screen). Mouse: click OK. Keys: Enter, Space or Escape dismiss it."""
+    try:
+        import tkinter as tk
+        import tkinter.font as tkfont
+        accent_rgb, panel_rgb, track_rgb = _theme_progress_colors(install_dir) or (PROGRESS_ACCENT_RGB, PROGRESS_PANEL_RGB, PROGRESS_TRACK_RGB)
+        accent, panel, track = (_ProgressWindow._hex(c) for c in (accent_rgb, panel_rgb, track_rgb))
+        root = tk.Tk()
+        root.title(PROGRESS_WINDOW_TITLE)
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        font = tkfont.Font(root=root, family="Courier New", size=-PROGRESS_TITLE_PX, weight="bold")
+        lines = [line for line in str(text).split("\n")]
+        w = max(PROGRESS_WINDOW_MIN_WIDTH, max(font.measure(line) for line in lines) + 2 * ASK_PAD, INFORM_BUTTON_WIDTH + 2 * ASK_PAD)
+        h = ASK_PAD + ASK_LINE_PX * len(lines) + ASK_PAD + ASK_BUTTON_HEIGHT + ASK_PAD
+        root.geometry("%dx%d+%d+%d" % (w, h, (root.winfo_screenwidth() - w) // 2, (root.winfo_screenheight() - h) // 2))
+        canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bg=panel)
+        canvas.pack()
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] The OK box could not open: %s", exc)
+        return INFORM_FAILED
+    top = h - ASK_PAD - ASK_BUTTON_HEIGHT
+    left = (w - INFORM_BUTTON_WIDTH) // 2
+    result = {"answered": False}
+
+    def draw():
+        canvas.delete("all")
+        canvas.create_rectangle(1, 1, w - 2, h - 2, outline=accent, width=2)
+        for index, line in enumerate(lines):
+            canvas.create_text(w // 2, ASK_PAD + ASK_LINE_PX * index + ASK_LINE_PX // 2, text=line, fill=accent, font=("Courier New", -PROGRESS_TITLE_PX, "bold"))
+        canvas.create_rectangle(left, top, left + INFORM_BUTTON_WIDTH, top + ASK_BUTTON_HEIGHT, fill=accent, outline=accent, width=2)
+        canvas.create_text(left + INFORM_BUTTON_WIDTH // 2, top + ASK_BUTTON_HEIGHT // 2, text="OK", fill=track, font=("Courier New", -PROGRESS_TITLE_PX, "bold"))
+
+    def dismiss():
+        result["answered"] = True
+        root.destroy()
+
+    def button_at(x, y):
+        return top <= y <= top + ASK_BUTTON_HEIGHT and left <= x <= left + INFORM_BUTTON_WIDTH
+
+    def on_click(event):
+        if button_at(event.x, event.y):
+            dismiss()
+
+    def on_key(event):
+        key = (event.keysym or "").lower()
+        if key in ("return", "kp_enter", "space", "escape"):
+            dismiss()
+
+    canvas.bind("<Button-1>", on_click)
+    root.bind("<Key>", on_key)
+    draw()
+    try:
+        root.focus_force()
+        root.mainloop()
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] The OK box stopped: %s", exc)
+        return INFORM_FAILED
+    return INFORM_OK if result["answered"] else INFORM_FAILED
+
+
 def _open_progress(install_dir=None):
     """Returns the progress window when this is the packaged helper exe and a screen is there, else one that does nothing; a window that fails to open never stops the update."""
     if not getattr(sys, "frozen", False):
         return _NullProgress()
     try:
         window = _ProgressWindow(install_dir)
-        log.info("[UPDATE DIAG] Progress window %s", "opened" if window._ok else "could not open (see the line above)")
         return window if window._ok else _NullProgress()
     except Exception as exc:
         log.warning("[UPDATE DIAG] Progress window not shown: %s", exc)
@@ -799,13 +1065,11 @@ def _repoint_shortcuts(old_exe, new_exe, old_dir, new_dir):
         for line in (result.stdout or "").splitlines():
             if line.startswith("UPDATED|"):
                 updated += 1
-                log.info("[UPDATE DIAG] Shortcut repointed: %s", line.split("|", 1)[1])
             elif line.startswith("FAILED|"):
                 log.warning("[UPDATE DIAG] Shortcut could not be repointed: %s", line.split("|", 1)[1])
         if result.returncode != 0:
             log.warning("[UPDATE DIAG] Shortcut repair exited with code %s: %s",
                         result.returncode, (result.stderr or "").strip()[:300])
-        log.info("[UPDATE DIAG] Shortcut repair finished: %d shortcut(s) repointed", updated)
     except Exception as exc:
         log.warning("[UPDATE DIAG] Shortcut repair failed: %s", exc)
     finally:
@@ -813,21 +1077,209 @@ def _repoint_shortcuts(old_exe, new_exe, old_dir, new_dir):
             shutil.rmtree(script_dir, ignore_errors=True)
 
 
+SERVER_SERVICE_PID_NAME = ".retro_tv_server_service.pid"
+
+
+def _stop_server_service(install_dir):
+    """Ends the server service of this install folder (it is the same exe running in the background and holds it open, which made the install fail with WinError 32); the updated app starts it again. Never raises."""
+    try:
+        with open(os.path.join(install_dir, "logs", SERVER_SERVICE_PID_NAME), "r", encoding="ascii") as fh:
+            pid = int(fh.read().strip())
+        if pid == os.getpid() or not _pid_alive(pid):
+            return
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        deadline = time.monotonic() + 5.0
+        while _pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.2)
+    except Exception as exc:
+        log.info("[UPDATE DIAG] Server service not stopped (%s)", exc)
+
+
+# VALUES CHANGE HERE: shell-mode updates end by restarting the whole computer; the seconds the "restarting" bar is held before the restart command runs, and the seconds the helper keeps the bar up waiting for Windows to take the PC down before it gives up and starts the new build itself.
+UPDATE_REBOOT_HOLD_SECONDS = 1.5
+UPDATE_REBOOT_WAIT_SECONDS = 45.0
+SHELL_REG_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+SHELL_REG_NAME = "Shell"
+
+
+class _ContinuedProgress(_NullProgress):
+    """Wraps the real progress window so the helper's bar carries on from where the app's download bar stopped (one bar from download to restart): fractions are squeezed into [start, 1] and the wait for the app to close reads PREPARING THE UPDATE like the prepare step after it."""
+
+    def __init__(self, inner, start):
+        self._inner = inner
+        self._start = max(0.0, min(0.99, float(start or 0.0)))
+
+    def update(self, label, fraction):
+        if label == "WAITING FOR THE APP TO CLOSE...":
+            label = "PREPARING THE UPDATE..."
+        self._inner.update(label, self._start + (1.0 - self._start) * max(0.0, min(1.0, float(fraction))))
+
+    def finish(self):
+        self._inner.finish()
+
+    def starting(self):
+        self._inner.starting()
+
+    def fail(self, label):
+        self._inner.fail(label)
+
+    def close(self):
+        self._inner.close()
+
+
+# VALUES CHANGE HERE: the server tray's update bar. The download fills the bar up to TRAY_DOWNLOAD_BAR, the unpacking eases from there toward TRAY_UNPACK_BAR (time constant TRAY_UNPACK_EASE_SECONDS), and the install carries on from TRAY_UNPACK_BAR to full; the longest the helper follows the download before giving up, and how often it reads the progress file.
+TRAY_DOWNLOAD_BAR = 0.45
+TRAY_UNPACK_BAR = 0.50
+TRAY_UNPACK_EASE_SECONDS = 10.0
+TRAY_FOLLOW_MAX_SECONDS = 2 * 3600.0
+TRAY_FOLLOW_POLL_SECONDS = 0.2
+
+
+class _TrayProgress(_NullProgress):
+    """The one bar of the server tray's update: the helper's own stages are squeezed into [TRAY_UNPACK_BAR, 1] after the download, and the words are DOWNLOADING UPDATE (UPDATE FAILED if it does not finish), PREPARING INSTALL, INSTALLING, then INSTALL COMPLETE or INSTALL FAILED."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._installing = False
+
+    def update(self, label, fraction):
+        if label == "INSTALLING UPDATE...":
+            label = "INSTALLING..."
+        elif label in ("WAITING FOR THE APP TO CLOSE...", "PREPARING THE UPDATE..."):
+            label = "PREPARING INSTALL..."
+        self._installing = True
+        self._inner.update(label, TRAY_UNPACK_BAR + (1.0 - TRAY_UNPACK_BAR) * max(0.0, min(1.0, float(fraction))))
+
+    def download(self, label, fraction):
+        self._inner.update(label, fraction)
+
+    def finish(self):
+        self._inner.update("INSTALL COMPLETE", 1.0)
+        time.sleep(PROGRESS_DONE_HOLD_SECONDS)
+
+    def starting(self):
+        pass
+
+    def fail(self, label):
+        # WARNING: owner 2026-11-16: UPDATE FAILED means the download did not finish; INSTALL FAILED means the files could not be installed (it is set once the helper's own stages have begun).
+        self._inner.fail("INSTALL FAILED" if self._installing else "UPDATE FAILED")
+
+    def close(self):
+        self._inner.close()
+
+
+def _follow_tray_download(progress, progress_path, parent_pid):
+    """Shows the download the server service is making and returns the staged folder when it is done; raises (after showing UPDATE FAILED) when the service reports a failure, ends without finishing, or the wait runs out."""
+    started = time.monotonic()
+    unpack_from = None
+    failure = ""
+    while True:
+        try:
+            state = _read_json(progress_path)
+        except Exception:
+            state = {}
+        stage = str(state.get("stage", "")) if isinstance(state, dict) else ""
+        if stage == "staged" and state.get("staged_path"):
+            return os.path.abspath(str(state["staged_path"]))
+        if stage == "failed":
+            failure = str(state.get("error", "") or "the download failed")
+            break
+        if parent_pid and not _pid_alive(parent_pid):
+            # NOTE: the service writes "staged" before it ends, so the file is read once more before the end counts as a failure.
+            try:
+                state = _read_json(progress_path)
+            except Exception:
+                state = {}
+            if isinstance(state, dict) and state.get("stage") == "staged" and state.get("staged_path"):
+                return os.path.abspath(str(state["staged_path"]))
+            failure = "the server service ended before the download was done"
+            break
+        if time.monotonic() - started > TRAY_FOLLOW_MAX_SECONDS:
+            failure = "the download took too long"
+            break
+        if stage == "preparing":
+            if unpack_from is None:
+                unpack_from = time.monotonic()
+            ease = 1.0 - math.exp(-(time.monotonic() - unpack_from) / TRAY_UNPACK_EASE_SECONDS)
+            progress.download("PREPARING INSTALL...", TRAY_DOWNLOAD_BAR + (TRAY_UNPACK_BAR - TRAY_DOWNLOAD_BAR) * ease)
+        else:
+            try:
+                fraction = max(0.0, min(1.0, float(state.get("fraction", 0.0))))
+            except (TypeError, ValueError):
+                fraction = 0.0
+            progress.download("DOWNLOADING UPDATE...", TRAY_DOWNLOAD_BAR * fraction)
+        time.sleep(TRAY_FOLLOW_POLL_SECONDS)
+    log.error("[UPDATE DIAG] The tray update stopped before the install: %s", failure)
+    progress.fail("UPDATE FAILED")
+    progress.close()
+    raise RuntimeError("Tray update download failed: " + failure)
+
+
+def _windows_system_exe(name):
+    """Full path of a program that ships with Windows' System32 folder, so a file of the same name in the app folder is never started instead."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or ""
+    return os.path.join(root, "System32", name) if root else name
+
+
+def _restart_computer():
+    """Asks Windows to restart now, closing anything still open; True when the command was accepted."""
+    try:
+        result = subprocess.run([_windows_system_exe("shutdown.exe"), "/r", "/t", "0", "/f", "/c", "Retro TV Emulator update installed"],
+                                capture_output=True, text=True, timeout=30,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] The restart command could not run: %s", exc)
+        return False
+    if result.returncode != 0:
+        log.warning("[UPDATE DIAG] The restart command was refused (code %s): %s", result.returncode, (result.stdout or result.stderr or "").strip()[:200])
+        return False
+    return True
+
+
+def _repoint_shell_entry(new_exe):
+    """When this PC runs Retro TV as its Windows shell (the Winlogon Shell value holds --as-shell) and the update renamed the exe, points the value at the new exe so the restart loads it; never raises."""
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, SHELL_REG_PATH, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            value, _kind = winreg.QueryValueEx(key, SHELL_REG_NAME)
+            if "--as-shell" not in str(value):
+                return
+            wanted = '"%s" --as-shell' % new_exe
+            if str(value) != wanted:
+                winreg.SetValueEx(key, SHELL_REG_NAME, 0, winreg.REG_SZ, wanted)
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] Could not check the shell entry: %s", exc)
+
+
 def apply_update(metadata_path):
     metadata = _read_json(metadata_path)
     install_dir = os.path.abspath(metadata["install_dir"])
-    staged_path = os.path.abspath(metadata["staged_path"])
+    tray_progress = str(metadata.get("tray_progress") or "")
+    staged_path = os.path.abspath(metadata["staged_path"]) if metadata.get("staged_path") else ""
     parent_pid = int(metadata.get("parent_pid") or 0)
     command = metadata.get("relaunch_command")
     _configure_logging(install_dir)
-    log.info("[UPDATE DIAG] Helper starting version=%s install_dir=%s",
-             metadata.get("version", ""), install_dir)
-    if not os.path.isdir(install_dir) or not os.path.isdir(_long(staged_path)):
+    if not os.path.isdir(install_dir) or (not tray_progress and not os.path.isdir(_long(staged_path))):
         raise RuntimeError("Update install directory or staged payload is missing")
     if not isinstance(command, list) or not command:
         raise RuntimeError("Update relaunch command is missing")
 
     progress = _open_progress(install_dir)
+    # WARNING: owner 2026-11-13: in shell mode the app's download bar and this one are one bar (this one starts at bar_start, where the download left off) and the update ends by restarting the whole computer, so the new build loads from the shell entry on the way back up.
+    reboot_after = bool(metadata.get("reboot_after"))
+    if reboot_after:
+        progress = _ContinuedProgress(progress, metadata.get("bar_start", 0.0))
+    if tray_progress:
+        # WARNING: owner 2026-11-16: the server tray's update; the service is still downloading, so the one bar follows it first and the staged folder comes from its progress file.
+        progress = _TrayProgress(progress)
+        staged_path = _follow_tray_download(progress, tray_progress, parent_pid)
+        if not os.path.isdir(_long(staged_path)):
+            progress.fail("UPDATE FAILED")
+            progress.close()
+            raise RuntimeError("Update install directory or staged payload is missing")
     progress.update("WAITING FOR THE APP TO CLOSE...", PROGRESS_WAIT_BAR)
     deadline = time.monotonic() + WAIT_FOR_PARENT_SECONDS
     while _pid_alive(parent_pid) and time.monotonic() < deadline:
@@ -838,10 +1290,11 @@ def apply_update(metadata_path):
             "[UPDATE DIAG] Timed out waiting for pid=%s to exit", parent_pid,
             interval=0.0,
         )
-        progress.fail("UPDATE FAILED - THE APP WOULD NOT CLOSE")
+        progress.fail("INSTALL FAILED - THE APP WOULD NOT CLOSE")
         progress.close()
         raise RuntimeError("Timed out waiting for the old application to exit")
 
+    _stop_server_service(install_dir)
     files = _payload_files(staged_path, install_dir)
     if not files:
         raise RuntimeError("Staged update contains no files")
@@ -849,8 +1302,6 @@ def apply_update(metadata_path):
     launch_command = list(command)
     if new_exe_name:
         launch_command[0] = os.path.join(install_dir, new_exe_name)
-        log.info("[UPDATE DIAG] Payload ships a renamed exe: %s replaces %s",
-                 new_exe_name, os.path.basename(old_exe_path))
     new_version = str(metadata.get("version", "") or "").strip()
     previous_stamp = _read_stamp(install_dir)
     previous_files = _read_installed_files(install_dir)
@@ -878,9 +1329,26 @@ def apply_update(metadata_path):
                 log.warning("[UPDATE DIAG] Could not write %s (version=%s): %s",
                             VERSION_STAMP_NAME, new_version, stamp_exc)
         # WARNING: the folder is renamed before the new app starts and only when this helper is running from outside it; settings files are never touched, and a failed rename just leaves the old folder name.
-        target_dir = _new_install_dir(install_dir, new_version) if UPDATE_RENAMES_INSTALL_FOLDER else None
+        if reboot_after:
+            progress.update("RESTARTING...", 1.0)
+            if new_exe_name:
+                _repoint_shell_entry(os.path.join(install_dir, new_exe_name))
+            # NOTE: the clean-up the finally block does is done first, because the restart ends this helper before that block could run.
+            shutil.rmtree(_long(backup_dir), ignore_errors=True)
+            shutil.rmtree(_long(os.path.dirname(staged_path)), ignore_errors=True)
+            try:
+                os.unlink(metadata_path)
+            except FileNotFoundError:
+                pass
+            _sweep_update_leftovers(install_dir)
+            time.sleep(UPDATE_REBOOT_HOLD_SECONDS)
+            if _restart_computer():
+                time.sleep(UPDATE_REBOOT_WAIT_SECONDS)
+                log.warning("[UPDATE DIAG] Windows did not restart within %.0f s; starting the new version instead", UPDATE_REBOOT_WAIT_SECONDS)
+            else:
+                log.warning("[UPDATE DIAG] Restart not possible; starting the new version instead")
+        target_dir = _new_install_dir(install_dir, new_version) if (UPDATE_RENAMES_INSTALL_FOLDER and not reboot_after) else None
         if target_dir and _helper_runs_inside(install_dir):
-            log.info("[UPDATE DIAG] Folder rename skipped: this helper runs from inside the install folder")
             target_dir = None
         if target_dir:
             _close_log()
@@ -890,7 +1358,6 @@ def apply_update(metadata_path):
             if where == install_dir:
                 log.warning("[UPDATE DIAG] Could not rename the install folder to %s; keeping the old name", target_dir)
             else:
-                log.info("[UPDATE DIAG] Install folder renamed: %s -> %s", install_dir, where)
                 launch_command[0] = _rebase(launch_command[0], install_dir, where)
         # WARNING: owner 2026-11-09: the bar ends when the install is done; the app is then launched and PROGRAM STARTING NOW stays up for PROGRESS_STARTING_SECONDS to cover the gap before the app's own loading screen, then the window closes.
         progress.finish()
@@ -926,7 +1393,7 @@ def apply_update(metadata_path):
             log.warning("[UPDATE DIAG] Could not delete the old exe %s; the new version is running",
                         old_exe_path)
     except Exception as exc:
-        progress.fail("UPDATE FAILED - RESTORING THE OLD VERSION")
+        progress.fail("INSTALL FAILED - RESTORING THE OLD VERSION")
         _server_breadcrumb(
             log, logging.ERROR, "update-apply-failed",
             "[UPDATE DIAG] Update apply failed, restoring backup: %s", exc,
@@ -937,6 +1404,7 @@ def apply_update(metadata_path):
             if _rename_folder_with_retry(where, install_dir):
                 where = install_dir
             _configure_logging(where)
+        _stop_server_service(where)
         _restore(where, backup_dir, copied, absent)
         _restore_stamp(where, previous_stamp)
         try:
@@ -967,8 +1435,7 @@ def apply_update(metadata_path):
             os.unlink(_rebase(metadata_path, install_dir, where))
         except FileNotFoundError:
             pass
-    log.info("[UPDATE DIAG] Helper finished successfully version=%s",
-             metadata.get("version", ""))
+    _sweep_update_leftovers(where)
     return 0
 
 
@@ -977,18 +1444,46 @@ def apply_update(metadata_path):
 # ============================================================================
 
 
+def _theme_install_dir():
+    """The install folder whose retro_config.json holds the theme, for the Yes/No and OK boxes: the helper sits beside the exe, in updater/ or in _internal/updater/, so the folders above it are looked at too; the helper's own folder when none holds the file."""
+    # WARNING: owner 2026-11-18: the tray's boxes read the theme from the helper's own folder, where retro_config.json never is, so they always showed the default colours.
+    here = os.path.dirname(os.path.abspath(sys.argv[0]))
+    folder = here
+    for _level in range(4):
+        if os.path.isfile(os.path.join(folder, "retro_config.json")):
+            return folder
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    return here
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", dest="metadata_path")
     parser.add_argument("--preview-bar", action="store_true", dest="preview_bar")
+    parser.add_argument("--ask", dest="ask_text")
+    parser.add_argument("--inform", dest="inform_text")
     args = parser.parse_args(argv)
+    if args.ask_text is not None:
+        return ask_yes_no(args.ask_text, install_dir=_theme_install_dir())
+    if args.inform_text is not None:
+        return show_info(args.inform_text, install_dir=_theme_install_dir())
     if args.preview_bar:
         return preview_progress_bar(install_dir=os.path.dirname(os.path.abspath(sys.argv[0])))
     if not args.metadata_path:
         parser.error("--apply is required")
+    # WARNING: written before anything that can fail, so an update that dies early still leaves a line saying the helper started and what it was told; the 1.5.1 update on a second computer left no trace at all.
+    try:
+        _early_install_dir = os.path.abspath(_read_json(args.metadata_path)["install_dir"])
+        _configure_logging(_early_install_dir)
+    except Exception as early_exc:
+        _write_error_note("could not read the update record %s: %s" % (args.metadata_path, early_exc))
     try:
         return apply_update(args.metadata_path)
     except Exception as exc:
+        _write_error_note("%s: %s" % (type(exc).__name__, exc), include_traceback=True)
         # NOTE: apply_update already logs the underlying failure via
         # breadcrumb; this line is the terminal outcome for a run with no console.
         try:

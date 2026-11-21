@@ -9,6 +9,7 @@ WARNING: the render loop fills the surface with (1, 1, 1), never pure black.
 (0, 0, 0) is the game-overlay transparency key.
 """
 import pygame
+import hashlib
 import random
 import colorsys
 import math
@@ -234,6 +235,14 @@ class VisualizerDeck:
         next_style = self.shuffle_queue.pop(0)
         self.last_random_style = next_style
         return next_style
+
+    def style_for_key(self, key):
+        """The style a streamed song gets, worked out from the channel and the song name alone, so every PC on one server shows the same style for the same song."""
+        styles = sorted(self.render_styles)
+        if not styles:
+            return self.current_running_style
+        digest = hashlib.md5(str(key).encode("utf-8")).hexdigest()
+        return styles[int(digest[:12], 16) % len(styles)]
 
     # ========================================================================
     # SECTION: Lightning geometry helpers

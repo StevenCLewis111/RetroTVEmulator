@@ -28,6 +28,10 @@ _last_resync = _mono_anchor
 _raw_anchor = _time.time()
 _offset_anchor = _time.localtime(_raw_anchor).tm_gmtoff
 _last_returned: _datetime.datetime | None = None
+# WARNING: while a server's schedule is on screen this holds the server's UTC offset in seconds, and now() reads the time in that zone so every streaming computer cuts its days and blocks at the same moment as the server; None means this computer's own zone.
+_server_utc_offset: int | None = None
+# WARNING: owner 2026-11-18: while a server's schedule is on screen this holds how many seconds the server's clock is ahead of this computer's (negative when behind), and now() adds it so this computer airs on the server's time; None means this computer's own clock. The program changes it only at a channel change or inside a commercial break, never in the middle of a show.
+_server_skew_s: float | None = None
 
 
 # ============================================================================
@@ -51,6 +55,10 @@ def now() -> _datetime.datetime:
             _raw_anchor = raw
             _offset_anchor = _time.localtime(raw).tm_gmtoff
         result = _wall_anchor + _datetime.timedelta(seconds=mono - _mono_anchor)
+        if _server_skew_s:
+            result = result + _datetime.timedelta(seconds=_server_skew_s)
+        if _server_utc_offset is not None:
+            result = result.astimezone(_datetime.timezone(_datetime.timedelta(seconds=_server_utc_offset)))
         if _last_returned is not None:
             regression = (_last_returned - result).total_seconds()
             if 0 < regression <= _JITTER_TOLERANCE_SECONDS:
@@ -60,6 +68,46 @@ def now() -> _datetime.datetime:
         else:
             _last_returned = result
         return result
+
+
+def set_server_utc_offset(seconds) -> None:
+    """Follows the zone of the server being streamed (seconds east of UTC); None goes back to this computer's own zone."""
+    global _server_utc_offset, _last_returned
+    new = None
+    if seconds is not None:
+        try:
+            new = int(seconds)
+        except (TypeError, ValueError):
+            return
+        if abs(new) > 14 * 3600:
+            return
+    with _lock:
+        if new != _server_utc_offset:
+            _server_utc_offset = new
+            _last_returned = None
+
+
+def server_utc_offset():
+    return _server_utc_offset
+
+
+def set_server_skew(seconds) -> None:
+    """Follows the server's own clock: seconds the server is ahead of this computer (negative when behind); None goes back to this computer's own clock."""
+    global _server_skew_s, _last_returned
+    new = None
+    if seconds is not None:
+        try:
+            new = float(seconds)
+        except (TypeError, ValueError):
+            return
+    with _lock:
+        if new != _server_skew_s:
+            _server_skew_s = new
+            _last_returned = None
+
+
+def server_skew():
+    return _server_skew_s
 
 
 def seconds_since_midnight(value: _datetime.datetime | None = None) -> float:
@@ -101,6 +149,6 @@ def strftime(fmt: str) -> str:
 # ============================================================================
 # SECTION: Exports & import-time init
 # ============================================================================
-__all__ = ["now", "date", "seconds_since_midnight", "force_resync", "isoformat", "strftime"]
+__all__ = ["now", "date", "seconds_since_midnight", "force_resync", "isoformat", "strftime", "set_server_utc_offset", "server_utc_offset", "set_server_skew", "server_skew"]
 
 force_resync()

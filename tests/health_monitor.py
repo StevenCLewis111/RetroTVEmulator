@@ -40,10 +40,14 @@ _REPORT_S = _governor.HEALTH_REPORT_SECONDS if _governor is not None else 60.0
 _RING_S = _governor.HEALTH_RING_SECONDS if _governor is not None else 15.0
 _EXPLAIN_GAP_MS = _governor.HEALTH_EXPLAIN_GAP_MS if _governor is not None else 100
 _EXPLAIN_MAX_PER_MINUTE = _governor.HEALTH_EXPLAIN_MAX_PER_MINUTE if _governor is not None else 20
+# VALUES CHANGE HERE (health monitor: the same thread stuck again within this many seconds of its last full report is only counted)
+_STUCK_REPEAT_S = 600.0
 _STUCK_S = _governor.HEALTH_STUCK_SECONDS if _governor is not None else 10.0
 _SCREEN_STUCK_S = _governor.HEALTH_SCREEN_STUCK_SECONDS if _governor is not None else 3.0
 _JOB_WAIT_WARN_S = _governor.HEALTH_JOB_WAIT_WARN_SECONDS if _governor is not None else 120.0
 _DUMP_MIN_GAP_S = _governor.HEALTH_DUMP_MIN_GAP_SECONDS if _governor is not None else 60.0
+# WARNING: the fallback below must match HEALTH_LOCKS_SLOW_BY_DESIGN in performance_governor.py; it is used only when that module fails to import.
+_LOCKS_SLOW_BY_DESIGN = tuple(_governor.HEALTH_LOCKS_SLOW_BY_DESIGN) if _governor is not None else ("_share_files_lock",)
 _LOCK_HOLD_WARN_S = (_governor.HEALTH_LOCK_HOLD_WARN_MS if _governor is not None else 500) / 1000.0
 _PROFILE_TOP = _governor.HEALTH_PROFILE_TOP if _governor is not None else 5
 _VITALS_TIMEOUT_S = _governor.HEALTH_VITALS_QUERY_TIMEOUT_SECONDS if _governor is not None else 10.0
@@ -51,7 +55,7 @@ _VITALS_RETRY_S = _governor.HEALTH_VITALS_RETRY_SECONDS if _governor is not None
 _VITALS_TOP_PROGRAMS = _governor.HEALTH_VITALS_TOP_PROGRAMS if _governor is not None else 3
 _SHUTDOWN_EVENTS_READ = _governor.HEALTH_SHUTDOWN_EVENTS_READ if _governor is not None else 6
 _NEVER_STUCK = tuple(_governor.HEALTH_NEVER_STUCK_THREADS) if _governor is not None else (
-    "OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep")
+    "OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep", "_drive_probe_worker", "PathExistsProbe")
 _JOB_STARTS = tuple(_governor.HEALTH_JOB_THREAD_STARTS) if _governor is not None else (
     "content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "HubRowSync",
     "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
@@ -61,7 +65,7 @@ _APP_MODULES = frozenset((
     "performance_governor", "broadcast_clock", "audio_analysis", "health_monitor", "d3d11_gpu_frame", "d3d11_gpu_gate",
     "d3d11_gpu_reference", "server_discovery", "server_sync", "server_service", "auto_updater", "update_helper"))
 _WAIT_FILES = frozenset(("threading", "queue", "selectors", "subprocess", "socket", "socketserver", "ssl", "asyncio"))
-_WAIT_NAMES = frozenset(("sleep", "wait", "join", "get", "acquire", "accept", "recv", "recv_into", "recvfrom", "select", "readline",
+_WAIT_NAMES = frozenset(("sleep", "wait", "join", "get", "acquire", "accept", "recv", "recv_into", "recvfrom", "send", "sendall", "select", "readline",
                          "communicate", "tick", "wait_for", "GetMessageW", "GetMessage", "WaitForSingleObject", "WaitForMultipleObjects"))
 
 # ============================================================================
@@ -476,6 +480,7 @@ class _Monitor:
         self.last_names = 0.0
         self.last_slow_checks = 0.0
         self.stuck_reports = 0
+        self._stuck_last = {}
         self.worst_gap = (0, "")
         self.peak_threads = 0
         self.peak_rss = 0
@@ -497,24 +502,34 @@ class _Monitor:
         self.natives = {t.ident: getattr(t, "native_id", None) for t in threads}
 
     def sample(self, now, keep=True):
-        """One look at every thread; returns the frames only when keep is true, otherwise none are kept."""
+        """One look at every thread; returns each thread's (place, kind) when keep is true, otherwise nothing; no frame is kept past the look."""
+        # WARNING: owner log 2026-11-18 (virtual screen locked at frame 1913 on Static): a frame held by this thread keeps the locals of a screen-thread function that returns meanwhile, and a pixel view among them keeps the screen locked; the screen thread is read first and its frame dropped at once, and the others are read without keeping any.
         frames = sys._current_frames()
+        frames.pop(self.ident, None)
+        order = [_main_ident] if _main_ident in frames else []
+        order.extend(ident for ident in frames if ident != _main_ident)
+        looks = {}
+        frame = None
+        try:
+            for ident in order:
+                frame = frames.pop(ident)
+                key = (id(frame), frame.f_lasti)
+                seen = self.seen.get(ident)
+                if seen is None or seen[0] != key:
+                    place, kind = where(frame)
+                    seen = self.seen[ident] = [key, now, False, place, kind, None]
+                frame = None
+                looks[ident] = (seen[3], seen[4])
+        finally:
+            frame = None
+            frames.clear()
+        screen = looks.get(_main_ident)
         running = []
-        screen = None
-        for ident, frame in frames.items():
-            if ident == self.ident:
-                continue
-            key = (id(frame), frame.f_lasti)
-            seen = self.seen.get(ident)
-            if seen is None or seen[0] != key:
-                place, kind = where(frame)
-                seen = self.seen[ident] = [key, now, False, place, kind, None]
-            place, kind = seen[3], seen[4]
-            if ident == _main_ident:
-                screen = (place, kind)
-                self.profile[("screen", place)] += 1
-                self.profile_total["screen"] += 1
-            elif kind == "call":
+        if screen is not None:
+            self.profile[("screen", screen[0])] += 1
+            self.profile_total["screen"] += 1
+        for ident, (place, kind) in looks.items():
+            if ident != _main_ident and kind == "call":
                 group = thread_group(self.names.get(ident, "?"))
                 running.append((group, place))
                 self.profile[(group, place)] += 1
@@ -522,10 +537,7 @@ class _Monitor:
         self.ring.append((now, screen, running))
         while self.ring and now - self.ring[0][0] > _RING_S:
             self.ring.popleft()
-        if not keep:
-            frames.clear()
-            return None
-        return frames
+        return looks if keep else None
 
     def thread_cpu(self):
         """Seconds of CPU each thread has used, by thread id, or None without psutil."""
@@ -538,13 +550,13 @@ class _Monitor:
             return None
         return {ident: per_native.get(native) for ident, native in self.natives.items()}
 
-    def slow_checks(self, now, frames):
+    def slow_checks(self, now, looks):
         """Once a second: stuck threads, long-held locks, ended threads forgotten."""
         for ident in list(self.seen):
-            if ident not in frames:
+            if ident not in looks:
                 del self.seen[ident]
         cpu = None
-        for ident, frame in frames.items():
+        for ident in looks:
             seen = self.seen.get(ident)
             if ident == self.ident or seen is None or seen[2]:
                 continue
@@ -553,7 +565,7 @@ class _Monitor:
             if ident == _main_ident:
                 if still >= _SCREEN_STUCK_S:
                     seen[2] = True
-                    self.report_stuck(name, frame, still, "the screen thread")
+                    self.report_stuck_now(ident, name, still, "the screen thread")
                 continue
             kind = seen[4]
             limit = _JOB_WAIT_WARN_S if kind == "wait" else _STUCK_S
@@ -575,20 +587,38 @@ class _Monitor:
                         seen[1] = now
                         continue
             seen[2] = True
-            self.report_stuck(name, frame, still, {"call": "a thread", "lock": "a thread waiting for a lock", "wait": "a job thread waiting"}[kind])
+            self.report_stuck_now(ident, name, still, {"call": "a thread", "lock": "a thread waiting for a lock", "wait": "a job thread waiting"}[kind])
         for lock in _watched_locks:
             held = lock.held_now()
-            if held is None or held[0] < _LOCK_HOLD_WARN_S or lock.warned_since == lock._since:
+            if held is None or held[0] < _LOCK_HOLD_WARN_S or lock.warned_since == lock._since or lock.name in _LOCKS_SLOW_BY_DESIGN:
                 continue
             lock.warned_since = lock._since
-            owner_frame = frames.get(held[1])
+            owner_look = looks.get(held[1])
             log.warning("[HEALTH LOCK] %s held %.1fs so far by %s, taken at %s, now at %s; %d thread(s) waiting for it",
                         lock.name, held[0], self.names.get(held[1], "?"), held[2],
-                        where(owner_frame)[0] if owner_frame is not None else "?", lock.waiting)
+                        owner_look[0] if owner_look is not None else "?", lock.waiting)
+
+    def report_stuck_now(self, ident, name, still, what):
+        """Reads one thread's frame only for its stuck report and drops it straight after."""
+        frame = sys._current_frames().get(ident)
+        try:
+            if frame is not None:
+                self.report_stuck(name, frame, still, what)
+        finally:
+            frame = None
 
     def report_stuck(self, name, frame, still, what):
         self.stuck_reports += 1
-        log.warning("[HEALTH STUCK] %s, %s, has not moved for %.0fs. Where it is:\n%s", what, name, still, _stack_text(frame))
+        # WARNING: owner 2026-11-15: a thread that gets stuck again and again (the share relay on a slow share: 106 reports and 33 stack dumps in one log) is written in full once every _STUCK_REPEAT_S; the times in between are only counted and the count is in the next full report.
+        _now = time.monotonic()
+        _last = self._stuck_last.get(name)
+        if _last is not None and _now - _last[0] < _STUCK_REPEAT_S:
+            self._stuck_last[name] = (_last[0], _last[1] + 1)
+            return
+        _more = _last[1] if _last is not None else 0
+        self._stuck_last[name] = (_now, 0)
+        log.warning("[HEALTH STUCK] %s, %s, has not moved for %.0fs%s. Where it is:\n%s", what, name, still,
+                    "" if not _more else " (it was stuck %d more time(s) since the last report)" % _more, _stack_text(frame))
         self.dump_all("%s %s has not moved for %.0fs" % (what, name, still))
 
     def dump_all(self, reason):
@@ -597,10 +627,15 @@ class _Monitor:
             return
         self.last_dump = now
         parts = []
-        for ident, frame in sys._current_frames().items():
-            if ident == self.ident:
-                continue
-            parts.append("--- %s:\n%s" % (self.names.get(ident, "?"), _stack_text(frame, limit=12)))
+        frames = sys._current_frames()
+        try:
+            for ident, frame in frames.items():
+                if ident == self.ident:
+                    continue
+                parts.append("--- %s:\n%s" % (self.names.get(ident, "?"), _stack_text(frame, limit=12)))
+        finally:
+            frame = None
+            frames.clear()
         log.warning("[HEALTH DUMP] %s; every thread's stack follows:\n%s", reason, "\n".join(parts))
 
     def explain(self, end, gap_ms, label):
@@ -778,6 +813,11 @@ class _Monitor:
         try:
             memory = _psutil.virtual_memory()
             swap = _psutil.swap_memory()
+            # WARNING: owner 2026-11-15: the average of ALL cores (100% = every core full) since the previous vitals line; the per-program figures below are percent of ONE core. psutil's first call has no earlier call to measure from, so the first line leaves it out.
+            _load = _psutil.cpu_percent(interval=None)
+            if getattr(self, "_cpu_load_primed", False):
+                parts.append("PC load %.0f%% of all cores over the last minute" % _load)
+            self._cpu_load_primed = True
             parts.append("memory %.0f%% used, %.1f GB free, page file %.0f%% used" % (memory.percent, memory.available / 1073741824.0, swap.percent))
             parts.append("busiest other programs: %s" % (self.busiest_programs(span) or "none above 3%"))
             root = os.path.abspath(os.sep) if os.name != "nt" else os.path.splitdrive(os.path.abspath(sys.argv[0]))[0] + "\\"
@@ -885,17 +925,13 @@ class _Monitor:
                     self.refresh_names()
                     self.last_names = now
                 checks_due = now - self.last_slow_checks >= 1.0
-                # WARNING: a thread frame kept after the look keeps every local of its function alive, including a pixel array that locks the screen surface; frames are kept only for the once-a-second checks and dropped in the finally.
-                frames = self.sample(now, keep=checks_due)
-                try:
-                    while self.gap_requests:
-                        end, gap_ms, label = self.gap_requests.popleft()
-                        self.explain(end, gap_ms, label)
-                    if checks_due:
-                        self.last_slow_checks = now
-                        self.slow_checks(now, frames)
-                finally:
-                    frames = None
+                looks = self.sample(now, keep=checks_due)
+                while self.gap_requests:
+                    end, gap_ms, label = self.gap_requests.popleft()
+                    self.explain(end, gap_ms, label)
+                if checks_due:
+                    self.last_slow_checks = now
+                    self.slow_checks(now, looks)
                 if now - self.last_report >= _REPORT_S and (self.report_thread is None or not self.report_thread.is_alive()):
                     # WARNING: the report reads every thread's CPU time and every store's size; written on its own thread so the looks (and the stall explanations) never pause for it.
                     snap = self.take_snapshot(now)

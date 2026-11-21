@@ -395,7 +395,8 @@ HANDHELD_CONSOLES = {"GB", "GBC", "GBA", "GG", "NGP", "NES", "SNES", "GENESIS", 
 BIOS_REQUIRED_CONSOLES = {"PSX"}
 
 DVD_SPLASH_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif"}
-DVD_SPLASH_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg"}
+# WARNING: the splash screen takes every video type the rest of the app plays; the one list lives in media.py.
+DVD_SPLASH_VIDEO_EXTS = set(_media_listing.VIDEO_DISPLAY_EXTS)
 
 CONSOLE_SCROLL_STYLES = ["carousel", "side", "updown"]
 CONSOLE_SCROLL_STYLE_LABELS = {

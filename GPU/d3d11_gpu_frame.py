@@ -699,16 +699,15 @@ class GPUFramePipeline:
         raise GPUFrameError("screen surface channel masks %s are not BGRX or RGBX" % (masks,))
 
     def _upload_surface(self, texture, surface):
-        px = pygame.surfarray.pixels2d(surface)
+        # WARNING: owner log 2026-11-18: the screen is read through its own lock and pixel address, never a pixel array; an array left in a frame another thread was looking at kept the virtual screen locked after this returned.
+        if surface.get_bytesize() != 4:
+            raise GPUFrameError("surface pixels are not tightly packed")
+        surface.lock()
         try:
-            address = px.ctypes.data
-            pitch = px.strides[1]
-            if px.strides[0] != 4:
-                raise GPUFrameError("surface pixels are not tightly packed")
             call(self._context, CTX_UpdateSubresource, None, [VOIDP, UINT, VOIDP, VOIDP, UINT, UINT],
-                 texture, 0, None, address, pitch, 0)
+                 texture, 0, None, surface._pixels_address, surface.get_pitch(), 0)
         finally:
-            del px
+            surface.unlock()
 
     def _update_constants(self, buffer, data, last_attr):
         if getattr(self, last_attr) == data:

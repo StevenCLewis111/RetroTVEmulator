@@ -64,6 +64,48 @@ def get_or_create_device_id(state_dir: str) -> str:
     return value
 
 
+_NOT_PROGRAMS = ("Commercials", "Intros", "Outros")
+
+
+def slot_has_media(path) -> bool:
+    """True when the server's channel file at `path` has at least one station (05-44) that is on and has something scheduled; commercials, intros and outros alone are not a station's programs."""
+    # WARNING: owner 2026-11-14: a server with no station that has media was listed to pick, and picking it opened the guide with every channel on Static.
+    try:
+        stat = os.stat(path)
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        held = _slot_media_answers.get(path)
+        if held is not None and held[0] == stamp:
+            return held[1]
+        # WARNING: owner 2026-11-18: the answer is worked out again only when the file changed; the announcer asks every 2 s and the whole file used to be parsed each time.
+        answer = _slot_file_has_media(path)
+        _slot_media_answers[path] = (stamp, answer)
+        return answer
+    except OSError:
+        return True
+
+
+_slot_media_answers = {}
+
+
+def _slot_file_has_media(path) -> bool:
+    """Reads the channel file and answers slot_has_media for it."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        channels = data.get("channels", {}) if isinstance(data, dict) else {}
+        for key, channel in channels.items():
+            if not (str(key).isdigit() and 5 <= int(key) <= 44) or not isinstance(channel, dict) or not channel.get("active", False):
+                continue
+            for table in ("schedules", "holiday_schedules"):
+                items = channel.get(table, {})
+                if isinstance(items, dict) and any(isinstance(v, (list, tuple)) and len(v) > 0 for k, v in items.items() if k not in _NOT_PROGRAMS):
+                    return True
+        return False
+    except (OSError, ValueError, AttributeError, TypeError):
+        # A file that cannot be read now is not reported as empty: the server stays listed.
+        return True
+
+
 def slot_provider_from_db(db) -> Callable[[], list[tuple[str, str]]]:
     return lambda: list(db.list_server_slots()) if db is not None else []
 
@@ -101,12 +143,16 @@ class ServerAnnouncer:
         slots = []
         try:
             for item in self.get_slots() or []:
+                ready = True
                 if isinstance(item, dict):
                     slot_id, name = item.get("slot_id"), item.get("name")
+                    ready = item.get("ready", True) is not False
                 else:
                     slot_id, name = item[0], item[1]
+                    if len(item) > 2:
+                        ready = bool(item[2])
                 if slot_id and str(name).strip():
-                    slots.append({"slot_id": str(slot_id), "name": str(name).strip()})
+                    slots.append({"slot_id": str(slot_id), "name": str(name).strip(), "ready": bool(ready)})
         except Exception as exc:
             _server_breadcrumb(
                 log, logging.WARNING, "discovery-slot-provider",
@@ -197,6 +243,7 @@ class ServerListener:
                             "slot_id": str(s.get("slot_id", "")).strip(),
                             "name": str(s.get("name", "")).strip(),
                             "host": host,
+                            "ready": s.get("ready", True) is not False,
                         }
                         for s in data.get("slots", [])
                         if str(s.get("name", "")).strip()
@@ -219,11 +266,6 @@ class ServerListener:
                     stale = [k for k, v in self._entries.items() if now - v["last_seen"] > self.entry_timeout]
                     for key in stale:
                         self._entries.pop(key, None)
-                    if stale:
-                        log.info(
-                            "[SERVER DIAG] Discovery entries expired count=%d",
-                            len(stale),
-                        )
         except OSError as exc:
             _server_breadcrumb(
                 log, logging.ERROR, f"discovery-listener:{self.port}",
@@ -248,5 +290,5 @@ class ServerListener:
 # ============================================================================
 # SECTION: Exports
 # ============================================================================
-__all__ = ["ServerAnnouncer", "ServerListener", "get_or_create_device_id", "slot_provider_from_db"]
+__all__ = ["slot_has_media", "ServerAnnouncer", "ServerListener", "get_or_create_device_id", "slot_provider_from_db"]
 

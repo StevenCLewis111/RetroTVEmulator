@@ -179,6 +179,9 @@ FLIGHT_TUNNEL_MIN_SPEED = 0.40
 FLIGHT_TUNNEL_MAX_SPEED = 1.10
 FLIGHT_MAX_STEP_SECONDS = 0.1
 
+# VALUES CHANGE HERE (a WEAK PC whose CPU is decoding the playing video, because the graphics card has no decoder for that file: the most ffmpeg background scans that may run at once, so the scans do not fight the decoder for the cores; the scans are slowed to this many at a time, never stopped)
+WEAK_CPU_DECODE_MAX_SCANS_AT_ONCE = 1
+
 # VALUES CHANGE HERE (throttle level -> allowance factor; level 4 pauses everything non-priority)
 LEVEL_FACTOR = (1.0, 0.75, 0.5, 0.25, 0.0)
 MAX_LEVEL = 4
@@ -189,7 +192,7 @@ PACE_FACTOR_FLOOR = 0.25
 # VALUES CHANGE HERE (pressure thresholds, all relative to the frame budget)
 BUSY_RATIO_LEVELS = ((1.00, 1), (1.20, 2), (1.50, 3), (2.00, 4))
 WORST_BUMP_RATIO = 3.0
-SYSTEM_CPU_LEVELS = ((90.0, 1), (96.0, 2))
+SYSTEM_CPU_LEVELS = ((90.0, 1), (95.0, 2))
 LOST_PICTURE_LEVELS = ((3, 1), (10, 2))
 LOST_AUDIO_IMMEDIATE_LEVEL = 3
 DRIVE_DEGRADED_LEVEL = 1
@@ -202,9 +205,10 @@ EVENT_WINDOW_SECONDS = 1.5
 # VALUES CHANGE HERE (learning the wait before the level comes down, from how this PC behaves: when the level climbs again within RELAX_RELAPSE_SECONDS of a step down, the calm wait before the next step down doubles, up to RELAX_COOLDOWN_MAX_SECONDS; each step down that holds that long halves it back toward RELAX_COOLDOWN_SECONDS)
 RELAX_RELAPSE_SECONDS = 30.0
 RELAX_COOLDOWN_MAX_SECONDS = 120.0
-# VALUES CHANGE HERE (after a tuned channel's show starts, background work stays held until the picture has run TUNE_STEADY_SECONDS with no frames over their time and no lost pictures, and at most TUNE_STEADY_MAX_SECONDS; a tuned channel's first loudness scan starts only once the channel has stayed on screen TUNE_LOUDNESS_SETTLE_SECONDS, so flipping through channels does not start a scan on each one passed)
-TUNE_STEADY_SECONDS = 3.0
+# VALUES CHANGE HERE (owner 2026-11-15, staged release after a tune: live captions start TUNE_CAPTION_START_DELAY_SECONDS after the new channel's first picture, and every other background job when the picture has run TUNE_STEADY_SECONDS (5 s, so 4 s after the captions start), counted from the first picture and never before it) (after a tuned channel's show starts, background work stays held until the picture has run TUNE_STEADY_SECONDS with no frames over their time and no lost pictures, and at most TUNE_STEADY_MAX_SECONDS; a tuned channel's first loudness scan starts only once the channel has stayed on screen TUNE_LOUDNESS_SETTLE_SECONDS, so flipping through channels does not start a scan on each one passed)
+TUNE_STEADY_SECONDS = 5.0
 TUNE_STEADY_MAX_SECONDS = 15.0
+TUNE_CAPTION_START_DELAY_SECONDS = 1.0
 TUNE_LOUDNESS_SETTLE_SECONDS = 1.5
 
 # VALUES CHANGE HERE (event kinds that do NOT restart the calm timer; the frames inside them are already not counted)
@@ -236,9 +240,23 @@ FEED_INTERVAL_SECONDS = 1.0
 LOSS_WINDOW_SECONDS = 5.0
 MEDIA_START_GRACE_SECONDS = 3.0
 
+# VALUES CHANGE HERE (schedule keeper, owner 2026-11-11, always on schedule is rule 1: while a file plays, every CHECK seconds the picture's real position is compared with the schedule's position; when the picture is more than TOLERANCE seconds behind (every stall of the drive or network leaves it further behind and nothing else pulls it back), it is moved to the schedule; after a move it waits COOLDOWN seconds, and after a file or channel change it waits GRACE seconds)
+SCHEDULE_KEEPER_CHECK_SECONDS = 5.0
+SCHEDULE_KEEPER_TOLERANCE_SECONDS = 2.5
+SCHEDULE_KEEPER_COOLDOWN_SECONDS = 30.0
+SCHEDULE_KEEPER_GRACE_SECONDS = 8.0
+# VALUES CHANGE HERE (owner 2026-11-14: a TV station never jumps its show forward to get back on time, so the schedule keeper only writes a log line when the picture is behind the schedule and never moves it; True brings the old forward jump back)
+SCHEDULE_KEEPER_MOVES_PICTURE = False
+# VALUES CHANGE HERE (owner 2026-11-14: when a frozen channel is re-tuned from the clock, the show reopens this many seconds ahead of where the clock says it is now, so the picture is on time when it appears instead of a second or two behind it and being jumped later)
+STALL_RETUNE_LEAD_SECONDS = 1.5
+
 # VALUES CHANGE HERE (burn-in idle close: seconds with no input before the controls splash, the settings menu with every sub-menu in it, the file explorer and the TV guide close (the guide goes to the channel it was previewing); seconds before every popup closes by itself as if No or Cancel was picked: Quit, the shared Yes/No popup (clear media, reset, burn-in warnings, update), Restart, DVD exit, DVD back to menu, game exit, the controller Pick Layout popup and the wait for a controller button)
 MENU_IDLE_CLOSE_SECONDS = 60.0
 CONFIRM_POPUP_IDLE_CLOSE_SECONDS = 30.0
+# VALUES CHANGE HERE (burn-in idle close for the server feature popups and the update popup: seconds with no input before the update popup, the share-files Yes/No, the clear-choice Yes/No and the reset-server Yes/No close by themselves as if No was picked)
+SERVER_POPUP_IDLE_CLOSE_SECONDS = 60.0
+# VALUES CHANGE HERE (Server menu: pixels of gap between the Under Construction banner and the edge of the open server's name box, the same on all four sides)
+MANAGE_BANNER_GAP_PX = 4
 # VALUES CHANGE HERE
 UPDATE_POPUP_MAX_OPEN_SECONDS = 60.0
 # VALUES CHANGE HERE (Channel Static colour button: the shortest gap between two steps, in seconds, so one press cannot jump over White)
@@ -268,6 +286,7 @@ BOOT_BAR_DEFAULT_PATHS_SECONDS = 0.5
 BOOT_BAR_DEFAULT_READY_SECONDS = 6.0
 BOOT_BAR_DEFAULT_PER_TARGET_SECONDS = 0.6
 BOOT_BAR_DEFAULT_OTHERS_SECONDS = 6.0
+BOOT_BAR_DEFAULT_PRIME_SECONDS = 8.0
 BOOT_BAR_LEARN_BLEND = 0.5
 BOOT_BAR_MIN_PHASE_SECONDS = 0.05
 BOOT_BAR_MAX_PHASE_SECONDS = 120.0
@@ -287,18 +306,59 @@ TESTER_REPORT_MAX_CRASH_LINES = 200
 # VALUES CHANGE HERE (boot stall watchdog: seconds into boot before one [BOOT STALL] report names what is unfinished, 0 = off; seconds before the optional boot warm-up stops holding the loading screen, 0 = never)
 BOOT_STALL_REPORT_SECONDS = 8.0
 BOOT_PREWARM_MAX_SECONDS = 20.0
+# VALUES CHANGE HERE (seconds boot may wait on readying the airing show of every streamed channel before the loading screen leaves; the rest carries on in the background, 0 = off)
+BOOT_PRIME_MAX_SECONDS = 30.0
+# VALUES CHANGE HERE (boot priming of the streamed channels: the files readied at once, and the share of the whole PC's processor the rush may use before it pauses a moment, owner 2026-11-17)
+BOOT_PRIME_WORKERS = 6
+# VALUES CHANGE HERE (boot server check: the most seconds boot waits for the saved server to connect and its channels to come in before the priming starts, owner 2026-11-17)
+BOOT_SERVER_CONNECT_WAIT_SECONDS = 10.0
+BOOT_PRIME_CPU_CEILING_PERCENT = 97.0
 # VALUES CHANGE HERE (boot bar weighting and file holds: how much of each file's slice of the bar follows its size, 0 = every file the same slice, 1 = slice follows size only; the most of its slice an unfinished file may fill; the fewest seconds one file may hold the bar before it is skipped (the real limit is the time the whole bar is expected to take); files probed at once; threads reading file sizes; seconds allowed to read one file's size)
 BOOT_BAR_FILE_SIZE_WEIGHT = 0.5
 BOOT_BAR_INFLIGHT_CAP = 0.9
 BOOT_UNIT_HOLD_MIN_SECONDS = 5.0
 BOOT_PREWARM_OTHER_WORKERS = 4
+# VALUES CHANGE HERE (retro_tv_emulator.py _warm_airing_files_pass, owner 2026-11-14: after boot, after a server profile is opened and after a server is connected, every other channel's airing file gets its picture box and then its gain, one file at a time, resting AIRING_WARM_GAP_SECONDS between two files and starting AIRING_WARM_START_DELAY_SECONDS after the trigger so the channel being tuned comes first)
+AIRING_WARM_GAP_SECONDS = 0.5
+AIRING_WARM_START_DELAY_SECONDS = 3.0
 BOOT_FILE_SIZE_WORKERS = 8
 BOOT_FILE_SIZE_TIMEOUT_SECONDS = 1.5
 # VALUES CHANGE HERE (boot drive wake-up: the most seconds boot waits for a sleeping media hard drive to spin up before it carries on without it, 0 = do not wake drives at boot)
 BOOT_DRIVE_WAKE_SECONDS = 15.0
 # VALUES CHANGE HERE (keep-awake: seconds between the reads that keep every media hard drive awake while the app is up, owner 2026-11-06, 0 = off; the most seconds one drive may take to answer before the next round)
-DRIVE_KEEP_AWAKE_INTERVAL_SECONDS = 300.0
+DRIVE_KEEP_AWAKE_INTERVAL_SECONDS = 120.0
 DRIVE_KEEP_AWAKE_READ_TIMEOUT_SECONDS = 10.0
+# VALUES CHANGE HERE (owner 2026-11-17, how often the program looks for a media drive it has not measured yet, so a new drive or the first media on a drive is measured within seconds instead of at the next keep-awake round)
+DRIVE_WATCH_SECONDS = 10.0
+# VALUES CHANGE HERE (owner 2026-11-17, drive profile: MB read from a real file on each drive to measure its read speed, seconds before a drive's speed is measured again, MB read from the start and from the end of each airing file at every keep-awake round so its index is in the PC's file cache, seconds before the same file is read that way again, how many such files are remembered)
+DRIVE_PROFILE_SAMPLE_MB = 8
+DRIVE_PROFILE_MAX_AGE_SECONDS = 604800.0
+DRIVE_READY_HEAD_MB = 6
+DRIVE_READY_TAIL_MB = 2
+DRIVE_READY_RENEW_SECONDS = 300.0
+DRIVE_READY_KEEP_FILES = 256
+# VALUES CHANGE HERE (owner 2026-11-17, first-run scan capacity test: seconds after the program is up before it first looks for a quiet moment, seconds between tries when the PC was busy, days before it is measured again; most scans tried at once; seconds of sound and of picture each test scan works through; the most seconds one step may take; a step must be this much faster than the one before to count; the processor use at which the test stops adding scans)
+SCAN_CAPACITY_START_DELAY_SECONDS = 30.0
+SCAN_CAPACITY_RETRY_SECONDS = 600.0
+SCAN_CAPACITY_MAX_AGE_DAYS = 60.0
+SCAN_CAPACITY_MAX_WORKERS = 6
+SCAN_CAPACITY_AUDIO_SECONDS = 900
+SCAN_CAPACITY_VIDEO_SECONDS = 45
+SCAN_CAPACITY_STEP_TIMEOUT_SECONDS = 20.0
+SCAN_CAPACITY_MIN_GAIN = 0.15
+SCAN_CAPACITY_CPU_CEILING_PERCENT = 97.0
+# VALUES CHANGE HERE (owner 2026-11-17, the scan capacity test on the very first start: the longest the loading screen waits for it, and the share of the loading bar the test fills after the real loading, so a quick load of a few seconds sits near the first fifth and the test fills the rest)
+BOOT_CAPACITY_MAX_SECONDS = 20.0
+BOOT_CAPACITY_BAR_SHARE = 0.8
+# VALUES CHANGE HERE (owner 2026-11-17, the most seconds the first-start capacity test waits for the other loading steps (the media engine and the decks) to finish before it starts, so it never slows them)
+BOOT_CAPACITY_WAIT_FOR_BOOT_SECONDS = 20.0
+# VALUES CHANGE HERE (owner 2026-11-17, files the boot priming reads at once from one drive: for a drive measured fast, for one measured slow; a drive is fast at or above this MB/s and at or under this first-byte ms, slow at or under this MB/s or at or above this first-byte ms; a drive not measured yet uses BOOT_PRIME_WORKERS)
+BOOT_PRIME_WORKERS_FAST = 8
+BOOT_PRIME_WORKERS_SLOW = 2
+DRIVE_PROFILE_FAST_MB_S = 150.0
+DRIVE_PROFILE_SLOW_MB_S = 40.0
+DRIVE_PROFILE_FAST_FIRST_BYTE_MS = 30.0
+DRIVE_PROFILE_SLOW_FIRST_BYTE_MS = 400.0
 
 # VALUES CHANGE HERE (Advanced Settings menu: width of every bar in pixels; text padding inside a bar; gap between a bar and its side pill or button; preferred gap between rows, the smallest gap rows may shrink to when the list is tall, gap under the title, space kept free above the Close button; how fast a too-long label scrolls in pixels per second, the pause in seconds at each end of the scroll, and how many times per second the menu is redrawn while one scrolls)
 ADVANCED_MENU_BAR_WIDTH = 360
@@ -315,8 +375,8 @@ ADVANCED_MENU_SCROLL_STEPS_PER_SECOND = 20
 # VALUES CHANGE HERE (Step 8 gates: how often a job waiting at a gate looks again)
 GATE_POLL_SECONDS = 0.25
 
-# VALUES CHANGE HERE (tuning to a channel: background work that has not started yet waits up to this many seconds, or until the channel's first show is playing, so the tune gets the PC to itself)
-TUNE_BACKGROUND_HOLD_SECONDS = 3.0
+# VALUES CHANGE HERE (owner 2026-11-15, tuning to a channel: from the channel button, background work that has not started yet (scans, schedule rows, probes, warm-ahead reads and live captions) waits until the channel's show is playing and its picture has run TUNE_STEADY_SECONDS, so the tune gets the PC to itself; this is only the longest the wait may last when the show never starts)
+TUNE_BACKGROUND_HOLD_SECONDS = 20.0
 BOOT_PREWARM_GATE_WAIT_SECONDS = 5.0
 WHISPER_GATE_KEEP_LEAD_SECONDS = 10.0
 WHISPER_GATE_MAX_HOLD_SECONDS = 30.0
@@ -421,9 +481,11 @@ SEASON_GUESS_CACHE_SECONDS = 30.0
 
 # VALUES CHANGE HERE (schedule hub: seconds before the hub asks the library again about a file that has no measured length yet)
 HUB_UNMEASURED_RECHECK_SECONDS = 30.0
+# VALUES CHANGE HERE (owner log 2026-11-20: files read from the library per turn when a thread goes through a channel's list; one at a time, 1,873 new files kept a new channel's first show waiting 67 s; SQLite takes at most 999 values per query)
+LIBRARY_ROWS_PER_READ = 400
 
 # VALUES CHANGE HERE (milliseconds a channel must stay on Static for the file-scanning reason before the "SCANNING FILES" / "SCANNING MUSIC" banner shows; the banner is for a scan that is taking too long, not for every normal tune-in)
-FIRST_FILE_SCANNING_BANNER_DELAY_MS = 8000
+FIRST_FILE_SCANNING_BANNER_DELAY_MS = 10000
 
 # VALUES CHANGE HERE (milliseconds a channel stays on the static snow while it cannot play yet before the screen turns to the grey background; the grey then holds, so a channel that needs a little longer never flashes snow again)
 STATIC_TO_GREY_MS = 2000
@@ -455,6 +517,9 @@ UPDATE_INSTALL_ERROR_SHOW_MS = 4000
 # VALUES CHANGE HERE (update install: the download fills the bar up to this fraction; the rest of the bar moves on its own while the file is checked and unpacked, so the bar never looks stuck)
 UPDATE_INSTALL_DOWNLOAD_CAP = 0.80
 
+# VALUES CHANGE HERE (update install in shell mode: the download and the install share one bar; the download fills this fraction of it, 0.5 being the first half, and the update helper's install fills the rest before the computer restarts)
+UPDATE_SHELL_DOWNLOAD_SHARE = 0.5
+
 # VALUES CHANGE HERE (update install: milliseconds the bar takes to cover about two thirds of what is left of it while the file is checked and unpacked; it stops just short of full until the unpacking is done)
 UPDATE_INSTALL_UNPACK_EASE_MS = 2500
 
@@ -467,8 +532,12 @@ HUB_FUTURE_BETWEEN_CHANNELS_SECONDS = 4.0
 # VALUES CHANGE HERE (schedule hub future rows: seconds after boot before the background step starts, so the future is never worked out during boot)
 HUB_FUTURE_START_DELAY_SECONDS = 45.0
 
-# VALUES CHANGE HERE (schedule hub future rows: a channel whose inputs have not changed is still worked out again after this many seconds, so a newly found file length reaches rows that are still ahead)
-HUB_FUTURE_REFRESH_SECONDS = 900.0
+# VALUES CHANGE HERE (schedule hub future rows, owner 2026-11-18: a channel's guide is worked out again only when one of its files got a length, measured or estimated, as the last step of that file's scan; it waits this many seconds after the last such length before it does, so a run of scans makes one update, and it saves this many rows per turn on the database, letting go between turns)
+HUB_FUTURE_SETTLE_SECONDS = 20.0
+HUB_FUTURE_ROWS_PER_TURN = 200
+
+# VALUES CHANGE HERE (library: how many last-seen answers the library keeps for the screen thread to use while the database is busy)
+SCREEN_LIBRARY_MEMO_MAX = 20000
 
 # VALUES CHANGE HERE (schedule hub future rows: seconds the background step sleeps when every channel is up to date)
 HUB_FUTURE_IDLE_SECONDS = 30.0
@@ -487,9 +556,18 @@ HUB_MODE_SWITCH_SETTLE_SECONDS = 0.5
 
 # VALUES CHANGE HERE (fall back to Static: milliseconds a playing channel may go without a new picture before the screen shows Static; it must stay below the stall recovery time in retro_tv_emulator.py, PLAYBACK_STALL_TIMEOUT_MS)
 STALL_FORCES_STATIC_MS = 7000
+# VALUES CHANGE HERE (main script: a picture that has played and then stops stays frozen for this many ms, a short hitch; after that the screen goes grey and silent until the Static comes at STALL_FORCES_STATIC_MS; owner 2026-11-16)
+STALL_GREY_AFTER_MS = 2000
 
-# VALUES CHANGE HERE (fall back to Static on a channel's first load: milliseconds the channel you just tuned to may go without its first picture before the screen shows Static and the red banner; longer than STALL_FORCES_STATIC_MS because the first show is still being measured and opened (owner log 2026-11-06 08:31: ch05 first picture took about 8 s on a cold start); it must stay below PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS)
+# VALUES CHANGE HERE (fall back to Static on a channel's first load, server side only (a server profile on screen, or a channel streamed from a server): milliseconds the channel you just tuned to may go without its first picture before the screen shows Static and the red banner; longer than STALL_FORCES_STATIC_MS because the first show is still being measured and opened (owner log 2026-11-06 08:31: ch05 first picture took about 8 s on a cold start); it must stay below PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS)
 STALL_FORCES_STATIC_FIRST_LOAD_MS = 10000
+# VALUES CHANGE HERE (owner 2026-11-18: the same first-load wait for a Regular-mode channel, which needs no server's extra time: milliseconds of the loading background (black or grey) from the tune, or from media arriving on a channel that sat on Static, before Static and the reason's banner; it also replaces FIRST_FILE_SCANNING_BANNER_DELAY_MS for a Regular channel whose first file is still being measured)
+REGULAR_FIRST_LOAD_STATIC_MS = 7000
+
+# VALUES CHANGE HERE (server catch-up, owner 2026-11-11: only while a User catches up after the server changed what it shares, for SERVER_CATCHUP_WINDOW_SECONDS after the last such schedule: milliseconds a playing channel may go without a new picture before Static and the banner, and before the stall recovery; every other time STALL_FORCES_STATIC_MS and PLAYBACK_STALL_TIMEOUT_MS apply unchanged; the recovery stays later than the Static)
+SERVER_CATCHUP_WINDOW_SECONDS = 120.0
+SERVER_CATCHUP_STATIC_MS = 10000
+SERVER_CATCHUP_RECOVERY_MS = 12000
 
 # VALUES CHANGE HERE (loudness scan sampling: each sample window is this many seconds of audio (how many windows a file gets is LOUDNESS_SCAN_WINDOW_COUNTS below); a file up to the whole-file length is scanned whole)
 LOUDNESS_SCAN_WINDOW_SECONDS = 60.0
@@ -567,6 +645,19 @@ PIXEL_ORBITER_INITIAL_DELAY_MS = 2 * 60 * 1000
 
 # VALUES CHANGE HERE
 PIXEL_ORBITER_PERIOD_MS = 60 * 1000
+# VALUES CHANGE HERE (retro_tv_emulator.py, the green banner for a controller connecting or leaving, owner 2026-11-14: no banner this many milliseconds after the program starts, because the pads already plugged in announce themselves then; the same pad's same news is not shown again within the repeat time, so a Bluetooth pad that drops and returns does not flood the banner bar)
+CONTROLLER_BANNER_QUIET_AFTER_BOOT_MS = 8000
+CONTROLLER_BANNER_REPEAT_MS = 3000
+# VALUES CHANGE HERE (retro_tv_emulator.py, the audio output follow, owner 2026-11-14: the watcher asks Windows which playback device is the default this often; a new default must be seen on this many polls in a row before the program follows it (a Bluetooth headset can flicker while it connects); two follows are at least this far apart; the sound system is reopened right away only when no music or Static noise is playing, else it waits at most this long for them to end; the picture's sound is muted this long while its output restarts so no pop is heard)
+AUDIO_FOLLOW_POLL_SECONDS = 2.0
+AUDIO_FOLLOW_SETTLE_POLLS = 2
+AUDIO_FOLLOW_MIN_GAP_SECONDS = 5.0
+AUDIO_FOLLOW_MIXER_WAIT_SECONDS = 20.0
+AUDIO_FOLLOW_MUTE_SECONDS = 0.8
+WAKE_LOCK_REFRESH_SECONDS = 30.0
+# VALUES CHANGE HERE (retro_tv_emulator.py, going back to the Windows desktop from shell mode, owner 2026-11-14: after the program starts Windows' own desktop it waits at most this long for the taskbar to appear, looking this often)
+EXPLORER_START_WAIT_SECONDS = 12.0
+EXPLORER_START_POLL_SECONDS = 0.25
 
 # VALUES CHANGE HERE
 PICTURE_BOX_FIT_RETRY_SECONDS = 2.0
@@ -615,11 +706,11 @@ STATIC_NOISE_POOL_SIZES = 3
 # VALUES CHANGE HERE (Static Noise grain: the size in screen pixels of one speck of snow, 1 is the finest and costs the most to make, 3 was the snow until 2026-11-06, 4 is a little bigger so it can be seen; at most one new picture is made every STATIC_NOISE_BUILD_GAP_MS while the set fills, so the screen thread is never given a burst of them)
 STATIC_NOISE_GRAIN_PX = 4
 STATIC_NOISE_BUILD_GAP_MS = 80
-# VALUES CHANGE HERE (Static Noise in Rainbow and Theme colour only: how often the snow changes to another picture, in ms, slower than the 40 of the other colours so the coloured snow does not buzz; and the share of the plain snow's speckle density it keeps, 1.0 is as dense as white and grey snow)
-STATIC_NOISE_TINT_AMBIENT_REFRESH_MS = 100
-STATIC_NOISE_TINT_DENSITY_SCALE = 0.7
-# VALUES CHANGE HERE (Static transition and no-media Static in Rainbow and Theme colour only: how often the snow picture is made again, in ms, slower than the 110 of the other colours)
-STATIC_NOISE_TINT_REFRESH_MS = 170
+# VALUES CHANGE HERE (Static Noise in Rainbow and Theme colour only: how often the snow changes to another picture, in ms, 40 is the same as White and Grey (since 2026-11-11, so the coloured snow looks like the white snow); and the share of the plain snow's speckle density it keeps, 1.0 is as dense as white and grey snow)
+STATIC_NOISE_TINT_AMBIENT_REFRESH_MS = 40
+STATIC_NOISE_TINT_DENSITY_SCALE = 1.0
+# VALUES CHANGE HERE (Static transition and no-media Static in Rainbow and Theme colour only: how often the snow picture is made again, in ms, 110 is the same as White and Grey since 2026-11-11)
+STATIC_NOISE_TINT_REFRESH_MS = 110
 # VALUES CHANGE HERE (Static Noise: the snow's strength is baked into each picture's own see-through values in this many steps, because a picture with both its own see-through values and an overall strength drew about 8 times slower; how many baked pictures are kept, all sizes and strengths together)
 STATIC_NOISE_STRENGTH_STEPS = 16
 STATIC_NOISE_BAKED_MAX = 24
@@ -629,7 +720,7 @@ STATIC_NOISE_FIXED_SEVERITY = 0.30
 # VALUES CHANGE HERE (Static Noise Color Grey: the grey level, 0 to 255, of the grains of the snow and the reception lines; White uses full white)
 STATIC_GREY_GRAIN_LEVEL = 150
 # VALUES CHANGE HERE (Static Noise Color Rainbow and Theme: how see-through the coloured specks of the snow are, from 0 (not there) to 255 (solid), picked at random in this range per speck; the reception lines use 180 to 255, and the snow's own strength is applied on top)
-STATIC_NOISE_TINT_SPECK_ALPHA = (180, 255)
+STATIC_NOISE_TINT_SPECK_ALPHA = (35, 115)
 STATIC_HEAVY = 0.62
 
 # VALUES CHANGE HERE
@@ -640,6 +731,8 @@ WATERMARK_SETTLE_MS = 4000
 WATERMARK_ALPHA = 150
 WATERMARK_WIDTH_FRAC = 0.091
 WATERMARK_MARGIN_FRAC = 0.12
+# VALUES CHANGE HERE (Water Mark of a server channel: the biggest image file, in bytes, a server sends with a channel; a bigger one is left out and the server logs it)
+WATERMARK_SERVER_MAX_BYTES = 131072
 
 # VALUES CHANGE HERE
 GAME_CORE_FPS_FALLBACK = 60.0
@@ -651,15 +744,8 @@ STATUS_BANNER_DURATION_MS = 30000
 CAPTION_MEMORY_BANNER_LABEL = "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
 # VALUES CHANGE HERE (one-line warnings in the shared banner bar, such as Game Music Not Found: seconds the bar stays up)
 NOTICE_BANNER_SECONDS = 6.0
-
-# VALUES CHANGE HERE
-DRIVE_BANNER_REARM_MS = 5 * 60 * 1000
-
-# VALUES CHANGE HERE
-MISSING_MEDIA_BANNER_REARM_MS = 5 * 60 * 1000
-
-# VALUES CHANGE HERE
-CAPTION_MIN_FIRST_SHOW_MS = 600
+# VALUES CHANGE HERE (seconds a green good-news banner stays up)
+NOTICE_BANNER_GOOD_SECONDS = 10.0
 
 # VALUES CHANGE HERE
 NATIVE_SUB_WATCH_MS = 20000
@@ -671,6 +757,9 @@ WATCHDOG_SPURIOUS_RESUME_WINDOW_MS = 20000
 
 # VALUES CHANGE HERE
 START_TIME_CONFIRM_MS = 800
+
+# VALUES CHANGE HERE (a picture that opens within this many milliseconds of the start asked for is left where it is and never sought again: a file with few keyframes (an .avi) lands a little before the time asked, and a seek only takes it back to the same keyframe, which is a visible skip)
+START_TIME_ACCEPT_MS = 10000
 
 # VALUES CHANGE HERE
 START_TIME_POLL_MS = 150
@@ -740,6 +829,8 @@ SCAN_SNAPSHOT_STALE_S = 15.0
 # VALUES CHANGE HERE (the scan snapshot thread: after each rebuild it rests this many times as long as the rebuild took, so it never uses more than about 1 part in this number plus 1 of a core, however many files are being added; the longest that rest may be in seconds, which must stay below SCAN_SNAPSHOT_STALE_S)
 SCAN_SNAPSHOT_DUTY_FACTOR = 8.0
 SCAN_SNAPSHOT_MAX_REST_S = 10.0
+# VALUES CHANGE HERE (owner 2026-11-18, audit A4: the scan snapshot is rebuilt only when something it reads changed, and at least this often in any case, in seconds)
+SCAN_SNAPSHOT_MAX_SKIP_S = 60.0
 SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD = 200
 
 # VALUES CHANGE HERE
@@ -846,12 +937,31 @@ SHOW_NAME_MEMO_MAX = 60000
 # VALUES CHANGE HERE (channel-ready thread: seconds between passes, pause between channels, re-checks and first checks per pass, seconds between its log lines)
 CHANNEL_READY_INTERVAL_SECONDS = 2.0
 CHANNEL_READY_CHANNEL_PAUSE_SECONDS = 0.05
+WARM_REST_MAX_WAIT_SECONDS = 30.0
+SWEEP_SLOW_STAT_SECONDS = 2.0
+WARM_READ_HANG_EXTRA_SECONDS = 3.0
+CHANNEL_READY_REST_CHANNELS = 2
 CHANNEL_READY_REFRESH_BATCH = 400
 CHANNEL_READY_WARM_BATCH = 400
 CHANNEL_READY_LOG_SECONDS = 60.0
 # VALUES CHANGE HERE (seconds between [MUSIC SCAN] lines)
 MUSIC_SCAN_LOG_SECONDS = 60.0
 PATH_EXISTS_PROBE_TIMEOUT_MS = 2500
+# VALUES CHANGE HERE (media.py path checks, owner 2026-11-18: a folder is listed once instead of checking its files one by one when at least PATH_CHECK_LIST_MIN_PATHS of its files are due, counting a held file of that folder as due once PATH_CHECK_SIBLING_DUE_FRACTION of its time has passed)
+PATH_CHECK_LIST_MIN_PATHS = 2
+PATH_CHECK_SIBLING_DUE_FRACTION = 0.5
+# VALUES CHANGE HERE (media.py, the screen thread's first look at a path it holds no status for: milliseconds it waits for the drive's answer, milliseconds a drive that did not answer in time is skipped by the screen thread's first looks)
+SCREEN_THREAD_FIRST_LOOK_MS = 150
+SCREEN_THREAD_SLOW_DRIVE_HOLD_MS = 10000
+# VALUES CHANGE HERE (retro_tv_emulator.py, the focus watchdog in windowed mode: seconds after the main loop starts during which the window takes focus back if another window has it)
+WINDOWED_LAUNCH_FOCUS_SECONDS = 20.0
+# VALUES CHANGE HERE (retro_tv_emulator.py, a picked server: seconds the screen stays black after the pick instead of showing Static while the server's copy loads)
+SERVER_PICK_BLANK_SECONDS = 3.0
+
+# VALUES CHANGE HERE (main script, a change of channel file: a server picked, Manage Server, a profile opened or left; the most seconds the screen stays black while the new channel's first picture has not come)
+SERVER_PICK_BLANK_MAX_SECONDS = 10.0
+# VALUES CHANGE HERE (retro_tv_emulator.py, a streamed server channel on screen: seconds between the [SYNC CHECK] log lines that let two PCs on one server be compared)
+SERVER_SYNC_CHECK_SECONDS = 60.0
 
 # VALUES CHANGE HERE (media.py, disk and scan slots: fast-disk reads at once, loudness scans at once, loudness sample windows read side by side, music loudness scans at once; seconds background work waits for the playing file's reads before going on)
 FAST_DISK_IO_MAX_CONCURRENT = 3
@@ -909,8 +1019,29 @@ ASR_MAX_CLIP_SEC = 25.0
 ASR_CUE_MAX_SEC = 5.0
 ASR_CUE_MAX_CHARS = 84
 ASR_CUE_GAP_BREAK_SEC = 0.8
-ASR_CUE_MIN_SHOW_SEC = 1.2
-ASR_CUE_TRAIL_HOLD_SEC = 0.3
+CAPTION_CLOCK_INTERPOLATE_MAX_MS = 700
+# VALUES CHANGE HERE (main script, caption layout: the caption block is laid out once at this screen height and every other height gets it scaled; the font's pixel size, the gap between the two rows and the space under the bottom row at that height)
+CAPTION_REF_HEIGHT = 1080
+CAPTION_REF_FONT_PX = 46
+CAPTION_REF_LINE_GAP_PX = 4
+CAPTION_REF_BOTTOM_MARGIN_PX = 24
+# VALUES CHANGE HERE (main script, caption timing: how many milliseconds the captions trail VLC's clock; owner 2026-11-16: 0, a caption shows when the clock reaches the start time stamp of its cue; the config key caption_clock_lag_ms can still set a delay on one PC)
+CAPTION_CLOCK_LAG_MS = 0
+# VALUES CHANGE HERE (main script, caption display: the fewest milliseconds a caption stays up once it shows, used only when nothing else needs its row; the mark put before the text on each row when two captions share the screen (a dash); cues whose words are this share the same or more are one sentence heard twice and are shown once)
+CAPTION_MIN_SHOW_MS = 1200
+CAPTION_ROW_MARK = "- "
+# VALUES CHANGE HERE (server clock: how many of a channel's next shows the server keeps in its clock and scans right after the show on air)
+SERVER_CLOCK_NEXT_SHOWS = 2
+# VALUES CHANGE HERE (server_clock.py and server_service.py, owner 2026-11-18, audit A8: seconds one reading of a slot's channel clocks is shared by the clocks sent to Users, the scan order and the scanner's show on air)
+SERVER_CLOCK_KEEP_S = 5.0
+# VALUES CHANGE HERE (main script, caption speaker marks: the mark put before a caption that starts after a gap with nothing said, and the fewest milliseconds between the end of one caption and the start of the next for that gap)
+CAPTION_NEW_SPEAKER_MARK = ">> "
+CAPTION_NEW_SPEAKER_GAP_MS = 1500
+# VALUES CHANGE HERE (main script, caption log: a caption first drawn more than this many milliseconds after its start time stamp is written to the log as [CAPTION LATE])
+CAPTION_LATE_LOG_MS = 400
+# VALUES CHANGE HERE (media.py, caption word times: how many live cues keep the time each of their words is said)
+CUE_WORD_STARTS_MAX = 4000
+CAPTION_SAME_SPEECH_FRAC = 0.6
 
 # VALUES CHANGE HERE (media.py, generated captions, guards: hallucination guard (highest no-speech chance, lowest average log chance); prompt-echo guard (word chance, repeats); gap recovery (on or off, gap, padding, windows, join, window length, beam, most seconds, share of a chunk, lead kept, word chance, log chance, no-speech chance, words per second, overlap share); runaway character and word runs; repetition-loop guard (fewest characters, highest compression))
 ASR_NO_SPEECH_PROB_MAX = 0.75
@@ -918,6 +1049,8 @@ ASR_AVG_LOGPROB_MIN = -1.5
 ASR_ECHO_MAX_WORD_PROB = 0.5
 ASR_ECHO_REPEAT_MIN = 3
 ASR_ECHO_REPEAT_MAX_WORD_PROB = 0.75
+# VALUES CHANGE HERE (media.py, generated captions: a short stock line Whisper invents over quiet or music, such as I love you, Thank you or Bye, is dropped when the model's word confidence is below this; clear spoken lines are above it; raise it to drop more, lower it to keep more)
+ASR_SHORT_PHRASE_MAX_WORD_PROB = 0.8
 ASR_RECOVER_ENABLED = True
 ASR_RECOVER_MIN_GAP_SEC = 0.9
 ASR_RECOVER_PAD_SEC = 0.3
@@ -954,6 +1087,9 @@ ASR_NAME_MAX_LEARNED = 6
 ASR_NAME_SIMILAR_MIN = 0.75
 ASR_CARRY_COVER_FRAC = 0.4
 ASR_CARRY_NEAR_SEC = 1.5
+# VALUES CHANGE HERE (media.py, caption diagnostics: a stretch of detected speech at least this many seconds long that came back as fewer than this many words per second is logged as [ASR THIN] with its text, so missing words can be found in the logs)
+ASR_THIN_MIN_SEC = 3.0
+ASR_THIN_WORDS_PER_SEC = 0.8
 ASR_FIRST_CHUNK_SEC = 60.0
 ASR_CHUNK_SEC = 300.0
 ASR_CHUNK_OVERLAP_SEC = 8.0
@@ -965,25 +1101,45 @@ ASR_ACCURATE_SEEK_MARGIN_SEC = 15.0
 
 # VALUES CHANGE HERE (media.py, live captions: lead, ready deadline and chunk in seconds; startup overlap and first-chunk head start; next-file prefetch (fewest seconds of lead, chunk, longest wait, cap); big-chunk safety margin and default estimate; lead cap; jump-back detection (lead, pace poll, skip behind, resume ahead); cues kept (seconds of past, most cues); most failures in a row; live beam size and accurate seek margin; clock check (shortest step, tolerance))
 LIVE_CAPTION_LEAD_SEC = 5.0
+ASR_SYNC_EARLY_SEC = 0.25
+ASR_SYNC_LATE_SEC = 1.0
 LIVE_CAPTION_READY_DEADLINE_SEC = 10.0
 LIVE_CAPTION_CHUNK_SEC = 30.0
 LIVE_CAPTION_STARTUP_CHUNK_OVERLAP_SEC = 5.0
-LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC = 3.0
+LIVE_CAPTION_FIRST_CHUNK_AHEAD_SEC = 5.0
 LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC = 15.0
-LIVE_CAPTION_PREFETCH_CHUNK_SEC = 10.0
+LIVE_CAPTION_PREFETCH_CHUNK_SEC = 30.0
 LIVE_CAPTION_PREFETCH_MAX_WAIT_SEC = 120.0
-LIVE_CAPTION_PREFETCH_CAP_SEC = 60.0
+LIVE_CAPTION_PREFETCH_CAP_SEC = 120.0
 LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC = 3.0
 LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC = 15.0
-LIVE_CAPTION_MAX_LEAD_SEC = 60.0
-LIVE_CAPTION_JUMP_BACK_LEAD_SEC = 120.0
+LIVE_CAPTION_MAX_LEAD_SEC = 150.0
+LIVE_CAPTION_JUMP_BACK_LEAD_SEC = 240.0
 LIVE_CAPTION_PACE_POLL_SEC = 1.0
-LIVE_CAPTION_SKIP_BEHIND_SEC = 15.0
-LIVE_CAPTION_RESUME_AHEAD_SEC = 2.0
+LIVE_CAPTION_SKIP_BEHIND_SEC = 10.0
+LIVE_CAPTION_RESUME_AHEAD_SEC = 15.0
 LIVE_CAPTION_KEEP_PAST_SEC = 20.0
 LIVE_CAPTION_MAX_CUES = 500
+# VALUES CHANGE HERE (media.py, live captions, owner 2026-11-15: the first chunks of every file, local or streamed, are short fast-beam chunks of the profile's first-chunk length (CAPTION_CADENCE), so captions are up quickly; this many chunks)
+LIVE_CAPTION_FAST_START_CHUNKS = 3
+# VALUES CHANGE HERE (media.py, live captions, owner 2026-11-14: when a channel is left, the text already made for the picture is kept this many seconds; on a return it is reused only when at least this many seconds of it are still ahead of the picture, so the next chunk lands before it runs out; at most this many files are kept)
+LIVE_CAPTION_SALVAGE_MAX_AGE_SEC = 600.0
+LIVE_CAPTION_SALVAGE_MIN_AHEAD_SEC = 10.0
+LIVE_CAPTION_SALVAGE_MAX_FILES = 8
 LIVE_CAPTION_MAX_FAILURES = 3
+# VALUES CHANGE HERE (live captions: after that many failed windows in a row the session waits this long and goes on from where the picture is, this many times, before it gives up)
+LIVE_CAPTION_FAILURE_PAUSE_SECONDS = 60.0
+LIVE_CAPTION_FAILURE_RETRIES = 3
+# VALUES CHANGE HERE (media.py, live caption pace, owner 2026-11-12: below the minimum lead in seconds the scan runs flat out (fast beam, no gap recovery, nothing else ahead of it); from the ease lead to the high lead it eases from the ease-start speed down to the slow speed, as a multiple of the picture's own speed, by waiting after each chunk; past the high lead it holds the slow speed, so the lead shrinks slowly and the CPU cools, and below the ease lead it is not slowed at all)
+LIVE_CAPTION_MIN_LEAD_SEC = 20.0
+LIVE_CAPTION_EASE_LEAD_SEC = 60.0
+LIVE_CAPTION_HIGH_LEAD_SEC = 120.0
+LIVE_CAPTION_EASE_START_SPEED = 1.3
+LIVE_CAPTION_SLOW_SPEED = 0.6
 ASR_LIVE_BEAM_SIZE = 3
+# VALUES CHANGE HERE (media.py, live captions, owner 2026-11-11: while the transcription is less than this many seconds ahead of the picture, a chunk is decoded with this smaller beam (1 is the fastest) so the captions catch up; with more lead the usual ASR_LIVE_BEAM_SIZE gives the better text)
+ASR_LIVE_BEAM_SIZE_BEHIND = 1
+LIVE_CAPTION_FAST_BEAM_BELOW_LEAD_SEC = 30.0
 ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC = 4.0
 LIVE_CAPTION_CLOCK_MIN_DT = 0.75
 LIVE_CAPTION_CLOCK_TOLERANCE = 0.4
@@ -1025,6 +1181,13 @@ BREAK_MAX_PER_HALF_HOUR = 2
 SETTINGS_SAVE_DELAY_SECONDS = 2.0
 # VALUES CHANGE HERE (how many dated copies of retro_config.json the app keeps in logs/config_backups, one made each time the app starts with a file that loaded)
 CONFIG_BACKUPS_KEPT = 5
+# VALUES CHANGE HERE (updater/auto_updater.py, the update folder logs/.retro_tv_updates: a leftover download folder younger than this many seconds is never removed because a download may still be running; a pending-install record older than this many seconds is a hand-off that failed and is removed; after the swap helper is started the app waits this many seconds and stays open with an error if the helper has already ended)
+UPDATE_LEFTOVER_MIN_AGE_S = 1800.0
+UPDATE_PENDING_MAX_AGE_S = 600.0
+UPDATE_HELPER_ALIVE_CHECK_S = 3.0
+# VALUES CHANGE HERE (tests/log_manager.py, the logs folder: how many rotated app logs (app_log1.txt and so on) are kept, and the days after which a file in logs/temp is removed)
+LOGS_ROTATED_APP_LOGS_KEPT = 2
+LOGS_TEMP_FILE_MAX_AGE_DAYS = 7
 SETTINGS_SAVE_REPORT_SECONDS = 60.0
 # VALUES CHANGE HERE (media.py, N13 owner 2026-11-03: the settings text is made in pieces of at most this many schedule entries, and the screen gets a turn between pieces, so a big library never holds the picture for the whole save)
 SETTINGS_SAVE_PIECE_ENTRIES = 500
@@ -1056,6 +1219,110 @@ GUIDE_ROW_CACHE_MAX = 24
 
 # VALUES CHANGE HERE (ui.py, Server Mode toggle: False greys it out in Advanced Settings (the row can still be reached with the keys and controller but cannot be turned on or off); True lets it be switched again)
 SERVER_TOGGLE_ENABLED = True
+# VALUES CHANGE HERE (Server service: seconds the app waits after starting the detached server service before it may start another, so a failed liveness check can never start a copy every second)
+SERVER_SERVICE_RELAUNCH_COOLDOWN_S = 15.0
+# VALUES CHANGE HERE (retro_tv_emulator.py, a User streaming from a server: seconds the server may stay unreachable before the User is put back on their own channel file with a red Disconnected From Server banner (a short network drop does not trigger it), and seconds the server's computer may keep announcing itself without the picked server before the same fall-back happens (the owner removed or reset it)
+SERVER_OFFLINE_FALLBACK_S = 20.0
+# VALUES CHANGE HERE (owner 2026-11-11: after a server is picked, on boot or from the menu, its channel file is empty until its first schedule arrives, a second or so; for this many seconds a channel with nothing scheduled shows a blank screen with no Static noise instead of snow; when the schedule has still not come after this long, Static shows as before; a channel with no media still shows Static as soon as the schedule has arrived)
+SERVER_FIRST_SCHEDULE_WAIT_SECONDS = 10.0
+SERVER_SLOT_GONE_FALLBACK_S = 15.0
+# VALUES CHANGE HERE (retro_tv_emulator.py, owner 2026-11-20: VLC writes its own log file with no buffering, line by line, and VlcLogReader reads it on its own thread this often, in seconds, so each line's time is at most this late; the file is emptied once it passes this many bytes)
+VLC_NATIVE_LOG_POLL_SECONDS = 0.01
+VLC_NATIVE_LOG_MAX_BYTES = 8000000
+# VALUES CHANGE HERE (retro_tv_emulator.py, owner 2026-11-11: every call into one VLC player is made one at a time, because the crash logs show several threads inside libvlc at once; a call that has to wait for another thread's call gives up waiting after these many seconds so the program can never hang on it: a read (get_time, get_state, ...) then returns the last answer it had, a call that changes something made on the main thread goes ahead after the main-thread wait, and the same call made on any other thread goes ahead after the other-thread wait, exactly as calls ran before this lock existed)
+VLC_GETTER_WAIT_SECONDS = 0.25
+VLC_MAIN_CALL_WAIT_SECONDS = 0.5
+VLC_CALL_WAIT_SECONDS = 5.0
+# VALUES CHANGE HERE (retro_tv_emulator.py, the Send Logs button at the bottom left of Advanced Settings: the Discord webhook address the zipped logs are posted to, which the owner makes in Discord (a private channel, Edit Channel, Integrations, Webhooks, New Webhook, Copy Webhook URL) and pastes between the quotes; empty means the button says Not Set Up and nothing is sent; a send_logs_webhook_url entry in retro_config.json, when present, wins over this one)
+SEND_LOGS_WEBHOOK_URL = "https://discord.com/api/webhooks/1570101167835455601/QNzkevIeJ82sJA5LqtcE6SNHa6gIzc54WrR32-skg4eGuNKGtsxtOZYPcgf6DWeu2Tg5"
+# VALUES CHANGE HERE (retro_tv_emulator.py, Send Logs: the biggest zip in bytes that is posted, 9 MB because Discord refuses bigger files on a server with no boost; a log longer than the per-file number below keeps only its newest part, and when the zip is still too big the per-file number is halved and the zip is built again, down to the least number below)
+SEND_LOGS_MAX_ZIP_BYTES = 9000000
+SEND_LOGS_FILE_TAIL_BYTES = 3000000
+SEND_LOGS_FILE_TAIL_BYTES_LEAST = 60000
+# VALUES CHANGE HERE (retro_tv_emulator.py, Send Logs: the most letters of the tester note, seconds the post may take before it is called failed, seconds after a send before another is allowed, and seconds the button keeps showing Logs Sent or Send Failed before it says Send Logs again)
+SEND_LOGS_NOTE_MAX_CHARS = 120
+SEND_LOGS_TIMEOUT_SECONDS = 60.0
+SEND_LOGS_COOLDOWN_SECONDS = 20.0
+SEND_LOGS_STATUS_SHOW_SECONDS = 6.0
+# VALUES CHANGE HERE (server_sync.py, the link between a server and a User: seconds between the small keep-alive messages a server sends even when the schedule has not changed, and seconds a User waits for any message before treating the link as dropped; the wait must stay well above the keep-alive)
+SERVER_KEEPALIVE_S = 5.0
+CLIENT_READ_TIMEOUT_S = 15.0
+# VALUES CHANGE HERE (server file facts: seconds between the server's looks at its media library for new facts to send, and how many files go in one message; mirrored in server/server_sync.py)
+SERVER_FILES_REFRESH_S = 30.0
+# VALUES CHANGE HERE (server_sync.py, owner 2026-11-14: a User tells the server which channel it is watching every WATCHING_REPORT_S seconds, and the server treats a report as current for WATCHING_FRESH_S seconds; the server scans a watched channel's files first)
+WATCHING_REPORT_S = 5.0
+# VALUES CHANGE HERE (retro_tv_emulator.py _write_program_scan_state and server_scanner.py read_program_scan_state, owner 2026-11-14: while the program shows regular mode it tells the tray every WATCHING_REPORT_S seconds whether its own quick scans (airing now, commercials, next shows) are done, re-checking that every PROGRAM_CAUGHT_UP_CHECK_S seconds; the tray scans a server profile at full pace once they are done, and holds back until then; a report older than PROGRAM_STATE_FRESH_S seconds counts as unknown, which holds the tray back)
+PROGRAM_CAUGHT_UP_CHECK_S = 15.0
+PROGRAM_STATE_FRESH_S = 45.0
+WATCHING_FRESH_S = 30.0
+# VALUES CHANGE HERE (server_sync.py, owner 2026-11-18: with each watching report a User names at most this many files of the channel it watches (the show on air, the next shows and the files its schedule waits to have measured), so the server scans them first while its own program is closed)
+WATCHING_NEXT_FILES = 12
+# VALUES CHANGE HERE (server_sync.py, owner 2026-11-16: a User asks the server to read the airing part of its channels' files into the server's own memory every SERVER_WARM_REPORT_S seconds; the server reads at most SERVER_WARM_RANGE_MAX_MB of one file and SERVER_WARM_MAX_FILES files per ask and ignores asks from one User closer than SERVER_WARM_MIN_GAP_S)
+SERVER_WARM_REPORT_S = 30.0
+SERVER_WARM_RANGE_MAX_MB = 48
+SERVER_WARM_MAX_FILES = 60
+SERVER_WARM_MIN_GAP_S = 10.0
+# VALUES CHANGE HERE (main script, server warm: how many seconds of each channel's airing show past the position the User asks the server to hold in its memory; owner 2026-11-16)
+SERVER_WARM_AHEAD_SECONDS = 60.0
+# VALUES CHANGE HERE: the server service (program closed) looks for unscanned scheduled files this often (seconds), waits this long between two files, and gives up on a file after this many failed reads (mirrored in server_scanner.py).
+SERVER_SCAN_LOOK_S = 20.0
+SERVER_SCAN_PAUSE_S = 0.5
+SERVER_SCAN_OPEN_PAUSE_S = 1.0
+SERVER_SCAN_REORDER_S = 60.0
+# VALUES CHANGE HERE (server_scanner.py, owner 2026-11-14: the server service reads files one at a time and, so it never loads the PC while the program plays or Users stream, it waits while the whole PC is busy above SERVER_SCAN_BUSY_CPU_PERCENT (re-looking every SERVER_SCAN_BUSY_WAIT_S seconds, at most SERVER_SCAN_BUSY_MAX_WAIT_S seconds for one file; a file airing now never waits) and rests SERVER_SCAN_STREAMING_PAUSE_FACTOR times as long between two files that no User is watching while a User is watching)
+SERVER_SCAN_BUSY_CPU_PERCENT = 70.0
+SERVER_SCAN_BUSY_WAIT_S = 10.0
+SERVER_SCAN_BUSY_MAX_WAIT_S = 120.0
+SERVER_SCAN_STREAMING_PAUSE_FACTOR = 3.0
+SERVER_SCAN_MAX_TRIES = 3
+# VALUES CHANGE HERE (server service, program closed, owner 2026-11-11: seconds between the service's reads of a small piece of one scheduled file on every drive that holds shared media, so a hard drive never spins down between two streams; the read gives up after the second number of seconds; mirrored in server_scanner.py)
+SERVER_KEEP_AWAKE_INTERVAL_SECONDS = 120.0
+SERVER_KEEP_AWAKE_READ_TIMEOUT_SECONDS = 10.0
+SERVER_FILES_BATCH = 300
+# VALUES CHANGE HERE (server_sync.py: how often the server sends every User the channel clocks, and how many times a minute a User may ask for its whole file list again before it reads the missing files itself)
+SERVER_CLOCKS_REFRESH_S = 5.0
+CLIENT_RESYNC_MAX_PER_MIN = 3
+# VALUES CHANGE HERE (server_service.py: how often the server service writes its heartbeat, and how old a heartbeat may be before the program ends that service and starts it again; main script: how often a User checks its own hub against the server's clocks, how many seconds the two may differ, and how long the clocks may be missing before they are called stale; a difference is only written to the log, the User keeps playing and catches up at a channel change or in a commercial break)
+SERVER_HEARTBEAT_EVERY_S = 5.0
+SERVER_HEARTBEAT_STALE_S = 90.0
+SERVER_CHECKIN_EVERY_S = 10.0
+SERVER_CHECKIN_START_TOLERANCE_S = 8.0
+SERVER_CLOCKS_STALE_S = 20.0
+SERVER_PREPARING_NOTICE_EVERY_S = 60.0
+# VALUES CHANGE HERE (server sharing: seconds between the server's checks for scheduled files that sit outside every shared folder; mirrored in retro_tv_emulator.py)
+SERVER_SHARE_WATCH_S = 60.0
+# VALUES CHANGE HERE (server tray Stop: two readings of the computer's start time this many seconds apart count as the same boot; mirrored in server/server_service.py)
+SAME_BOOT_TOLERANCE_S = 120
+# VALUES CHANGE HERE (server tray icon's right-click menu, mirrored in server/server_tray.py: text size in pixels, and the space in pixels left and right of the text and above and below it)
+TRAY_MENU_FONT_PX = 16
+TRAY_MENU_PAD_X_PX = 10
+TRAY_MENU_PAD_Y_PX = 5
+# VALUES CHANGE HERE (server tray icon's menu, mirrored in server/server_tray.py: pixels of clear space between the menu's bottom edge and the top of the icon, and how far above the pointer the menu sits when Windows will not say where the icon is)
+TRAY_MENU_GAP_PX = 6
+TRAY_MENU_FALLBACK_LIFT_PX = 28
+# VALUES CHANGE HERE (server tray icon's menu, mirrored in server/server_tray.py: the side in pixels of the Launch on boot checkbox drawn at the right of its row; its unticked centre is COLOR_MENU_BUTTON_GREYED and a tick fills it with the theme's border colour)
+TRAY_MENU_CHECKBOX_PX = 12
+# VALUES CHANGE HERE (owner 2026-11-18, a User keeping time with its server; mirrored in retro_tv_emulator.py: seconds the two clocks may differ before anything is corrected, and how many of the server's time stamps are kept to take the middle one, so one slow network moment does not move the clock)
+SERVER_CLOCK_DRIFT_TOLERANCE_S = 2.0
+SERVER_CLOCK_SAMPLES = 5
+# VALUES CHANGE HERE (owner 2026-11-18, a User catching up with its server between commercials; mirrored in retro_tv_emulator.py: the longest flash of the transition screen between two commercials, the most flash time one break may add, and how far back a commercial counts as aired for the one added to a break)
+SERVER_BREAK_FLASH_EACH_S = 0.5
+SERVER_BREAK_FLASH_TOTAL_S = 2.0
+SERVER_BREAK_RECENT_ADS_S = 3600.0
+# VALUES CHANGE HERE (a file played from the server's shared folder, a path starting with two backslashes: milliseconds of picture and sound VLC reads ahead before and while it plays, so a slow moment on the network does not show as a glitch; a file on this PC keeps the player's own small read-ahead; mirrored in retro_tv_emulator.py)
+NETWORK_FILE_CACHING_MS = 10000
+# VALUES CHANGE HERE (a file on a local drive other than the Windows drive, such as a plugged-in hard drive: milliseconds VLC reads ahead; the player fills this much as fast as the drive allows, then keeps it full by reading as fast as it plays and faster whenever it drops, so a pause of a few seconds in the drive never shows; 0 keeps the player's own small read-ahead; mirrored in retro_tv_emulator.py)
+LOCAL_DISK_FILE_CACHING_MS = 10000
+# VALUES CHANGE HERE (owner 2026-11-14, share relay in share_relay.py: a streamed mkv, mp4, m4v, mov, avi, webm or flv is played through a loopback address that keeps the file's first and last megabytes on this PC's disk and reads the rest of the share in large blocks ahead of the player; False plays every file straight from the share as before; the app setting share_relay_enabled can also turn it off; mirrored in retro_tv_emulator.py)
+SHARE_RELAY_ENABLED = True
+# VALUES CHANGE HERE (milliseconds the player waits to fill before it shows a file served by the relay; the relay's own read-ahead is the deep buffer, so this stays short for a quick channel change; mirrored in retro_tv_emulator.py)
+SHARE_RELAY_VLC_CACHING_MS = 2000
+# VALUES CHANGE HERE (retro_tv_emulator.py _server_pick_restore_tick, mirrored there: after a start the User waits this many seconds, then looks for the server they picked last time once a second for this many seconds; a server not found by then is left alone)
+SERVER_PICK_RESTORE_DELAY_S = 4.0
+SERVER_PICK_RESTORE_WINDOW_S = 40.0
+# VALUES CHANGE HERE (media.py, saving settings and channel files: how many times a save is tried again when Windows reports the file busy, and the seconds between tries)
+CONFIG_REPLACE_RETRIES = 5
+CONFIG_REPLACE_RETRY_DELAY_S = 0.05
 # VALUES CHANGE HERE (Server mode: True drops every scheduled entry a server sends that points at a network share (\\host\share) or a web address, so a server on the network can never make this PC reach out to another machine; False accepts them)
 REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS = True
 
@@ -1084,6 +1351,15 @@ CONTROLS_PAD_LONG_BUTTON_SCALE = 0.62
 # VALUES CHANGE HERE (ui.py, TV guide and controls splash: channel rows shown in 16:9 and in 4:3, time columns in 16:9 and in 4:3, the guide header, clock and smallest font sizes, the controls splash body font size, width of an icon key, and the gaps under the title, between a section title and its body and between sub rows, in pixels)
 GUIDE_VISIBLE_ROWS_16_9 = 8
 GUIDE_VISIBLE_ROWS_4_3 = 5
+GUIDE_ROW_WARN_GAP_SECONDS = 2.0
+SCHEDULER_TRANSIENT_WARN_GAP_SECONDS = 600.0
+CHANNEL_LOADING_WINDOW_MS = 15000
+DRIVE_SLOW_STRIKE_WINDOW_SECONDS = 15.0
+SERVER_RECONNECT_CHECK_SECONDS = 2.0
+MISSING_FILE_CHECK_WAIT_SECONDS = 2.0
+MOVED_FILE_SEARCH_SECONDS = 8.0
+MOVED_FILE_SEARCH_MAX_FOLDERS = 4000
+MOVED_FILE_SEARCH_MAX_ROOTS = 200
 GUIDE_NUM_COLS_16_9 = 5
 GUIDE_NUM_COLS_4_3 = 4
 GUIDE_HDR_FONT_PX = 17
@@ -1360,21 +1636,25 @@ LIBRETRO_MAX_FRAME_DIM = 4096
 LIBRETRO_PIXEL_ART_SCALE_FACTOR = 2
 
 # VALUES CHANGE HERE (media_library.py, burned-in subtitle check: frame size read; where in the file the frames are taken (shares of the length) and the seconds used when the length is unknown; time limit per frame; the lower share of the picture searched and its left and right edges (the centre only, so a logo in a corner is not read as a caption); brightest and darkest levels that count as text and outline, outline reach in pixels; a text row's least text share and colour changes; a text band's least and most height, least width, centre range, least letter clusters, most fill and contrast; how far bands may move between frames; least frames with text, most bands per frame, frames that end the check early, and the share of frames that must agree; the least share of all frames that must show the text, how far a line's edges may differ and still be the same fixed graphic, and the most share of the agreeing frames that may show that same graphic)
-BURNED_IN_FRAME_W = 480
-BURNED_IN_FRAME_H = 270
+BURNED_IN_FRAME_W = 960
+BURNED_IN_FRAME_H = 540
+# VALUES CHANGE HERE: a file at least this long (seconds) is scanned only between these fractions of its length, so the studio logo pages at the start and the credits at the end are never read; a shorter file (a commercial) is scanned end to end.
+BURNED_IN_LONG_FILE_S = 600.0
+BURNED_IN_LONG_START_FRAC = 0.12
+BURNED_IN_LONG_END_FRAC = 0.86
 BURNED_IN_SAMPLE_FRACTIONS = (0.06, 0.14, 0.22, 0.30, 0.38, 0.46, 0.54, 0.62, 0.70, 0.78, 0.86, 0.94)
 BURNED_IN_FALLBACK_OFFSETS_S = (20.0, 60.0, 120.0, 180.0, 240.0, 300.0)
 BURNED_IN_FRAME_TIMEOUT_S = 20.0
 BURNED_IN_REGION_TOP_FRAC = 0.55
-BURNED_IN_REGION_LEFT_FRAC = 0.15
-BURNED_IN_REGION_RIGHT_FRAC = 0.85
+BURNED_IN_REGION_LEFT_FRAC = 0.125
+BURNED_IN_REGION_RIGHT_FRAC = 0.875
 BURNED_IN_BRIGHT_MIN = 205
 BURNED_IN_DARK_MAX = 75
 BURNED_IN_OUTLINE_REACH_PX = 2
 BURNED_IN_ROW_MIN_TEXT_FRAC = 0.025
 BURNED_IN_ROW_MIN_TRANSITIONS = 10
 BURNED_IN_BAND_MIN_H_FRAC = 0.018
-BURNED_IN_BAND_MAX_H_FRAC = 0.10
+BURNED_IN_BAND_MAX_H_FRAC = 0.06
 BURNED_IN_BAND_MIN_WIDTH_FRAC = 0.12
 BURNED_IN_BAND_CENTER_RANGE = (0.35, 0.65)
 BURNED_IN_BAND_MIN_GLYPH_CLUSTERS = 6
@@ -1388,6 +1668,30 @@ BURNED_IN_MIN_AGREEING_SHARE = 0.6
 BURNED_IN_MIN_POSITIVE_SHARE = 0.25
 BURNED_IN_STATIC_BAND_TOLERANCE_FRAC = 0.02
 BURNED_IN_STATIC_BAND_MAX_SHARE = 0.7
+BURNED_IN_REFERENCE_FRAME_H = 270
+BURNED_IN_BAND_GAP_ROWS = 2
+# VALUES CHANGE HERE: letters this big are a logo, not a subtitle: when any run of joined letters in a band is wider than this fraction of the search area's width, the band is skipped.
+BURNED_IN_BAND_MAX_GLYPH_RUN_FRAC = 0.33
+# VALUES CHANGE HERE: text that ends within this fraction of the search area's width from its side counts as running off that side (a word gap right at the edge must not make a cut-off line look like it stops short).
+BURNED_IN_EDGE_MARGIN_FRAC = 0.02
+# VALUES CHANGE HERE: a caption symbol (a music note) is one small bright shape, caption-sized, alone and centred: at most this fraction of the picture's width, between these width-to-height ratios, filling this share of its box, at least this share of the picture's area in bright pixels, and with its middle within this distance of the picture's middle (fractions of the picture's width).
+BURNED_IN_SYMBOL_MAX_WIDTH_FRAC = 0.10
+BURNED_IN_SYMBOL_ASPECT = (0.3, 1.0)
+BURNED_IN_SYMBOL_FILL = (0.1, 0.65)
+BURNED_IN_SYMBOL_MIN_AREA_FRAC = 0.0002
+BURNED_IN_SYMBOL_CENTRE_TOLERANCE = 0.08
+# VALUES CHANGE HERE: shapes closer together than this fraction of the picture's width are one shape; other bright specks in the search area may add up to at most this many times the symbol's own bright pixels.
+BURNED_IN_SYMBOL_JOIN_FRAC = 0.02
+BURNED_IN_SYMBOL_OTHERS_RATIO = 2.0
+# VALUES CHANGE HERE: a subtitle's lowest band ends at least this far down the picture (a fraction of its height); a band that ends higher is a title card or a caption of the scene.
+BURNED_IN_BAND_MIN_BOTTOM_FRAC = 0.76
+# VALUES CHANGE HERE: a row whose brightest pixel is at or under this is a black bar; bars shorter than the first fraction are ignored, and when the bars would take more than the second fraction of the frame (a black scene) they are ignored too.
+BURNED_IN_BAR_ROW_MAX = 28
+BURNED_IN_BAR_MIN_FRAC = 0.03
+BURNED_IN_BAR_MAX_TOTAL_FRAC = 0.45
+# VALUES CHANGE HERE: a picture that is almost all black (its middle brightness at or under the first number and at least the second fraction of it dark) is a title card or a logo page on black, not a scene with subtitles.
+BURNED_IN_BLACK_CARD_MEDIAN = 3
+BURNED_IN_BLACK_CARD_DARK_FRAC = 0.8
 
 # VALUES CHANGE HERE (audio_analysis.py, music analysis (raise ANALYSIS_VERSION in audio_analysis.py after changing any number here so cached tracks are rebuilt): sample rate, frames per second, FFT size, spectrum bands and their lowest and highest Hz, top of the low and mid bands in Hz, most seconds analysed, frames per chunk, beat flux bands, frames between beats, beat peak radius in frames)
 AUDIO_ANALYSIS_SAMPLE_RATE = 22050
@@ -1812,6 +2116,17 @@ def vlc_decoder_threads(profile=None):
     return value
 
 
+# VALUES CHANGE HERE (which measured scan kind limits each lane: the sound scans follow the sound test, the picture scans the picture test)
+SCAN_LANE_KIND = {"loudness_and_bake": "audio", "music_loudness": "audio", "probe_and_duration": "video", "cropdetect_threads": "video"}
+_measured_capacity = {}
+
+
+def set_measured_capacity(workers_by_kind):
+    """Replaces the measured scan capacity ({"audio": n, "video": n}) the lane ceilings are held to."""
+    _measured_capacity.clear()
+    _measured_capacity.update({str(k): int(v) for k, v in (workers_by_kind or {}).items() if v})
+
+
 def lane_ceiling(lane, mode=None):
     mode = _limit_mode("caption" if lane == "whisper_slots" else "scan", _resolve_mode(mode))
     value = CEILINGS[lane][mode]
@@ -1827,6 +2142,10 @@ def lane_ceiling(lane, mode=None):
         value += SHELL_LANE_BONUS.get(lane, 0)
     if mode == "performance" or shell:
         value = min(value, affordable_threads(profile, mode))
+    # WARNING: owner 2026-11-17: a measured scan capacity only ever lowers a lane, so a slow PC stops asking for more scans than it can run, and a fast PC keeps the limits above.
+    _measured = _measured_capacity.get(SCAN_LANE_KIND.get(lane, ""))
+    if _measured:
+        value = min(value, _measured)
     return max(1, value)
 
 
@@ -2326,6 +2645,9 @@ LISTING_DRIVE_PUSH_OUT_SECONDS = 6.0
 LISTING_DRIVE_RETEST_SECONDS = 5.0
 # VALUES CHANGE HERE (seconds the "why you were pushed out" banner stays up)
 LISTING_PUSH_OUT_BANNER_SECONDS = 4.0
+# VALUES CHANGE HERE (owner log 2026-11-18 18:08: an add walked the picked folders and found 0 files, the same add 9 s later found 1128; a walk that finds nothing while a folder could not be read or its drive was not answering walks again this many times, this many seconds apart)
+FILE_EXPLORER_EMPTY_WALK_RETRIES = 2
+FILE_EXPLORER_EMPTY_WALK_RETRY_SECONDS = 2.0
 
 
 # ============================================================================
@@ -2378,6 +2700,7 @@ THROTTLED_LOG_INTERVAL_S = 30.0
 KEY_HOOK_REINSTALL_SECONDS = 45
 WATCHDOG_ERROR_BAIL_AFTER = 2
 HEARTBEAT_WATCHDOG_TIMEOUT_MS = 45000
+WATCHDOG_SUSPEND_GAP_MS = 30000
 VLC_LOG_STALL_WARN_MS = 30000
 VLC_LOG_MISSING_FILE_GRACE_MS = 15000
 GUIDE_PRELOAD_STALL_SECONDS = 2.0
@@ -2394,9 +2717,12 @@ CAPTION_FILE_BUILD_TRIES = 2
 CAPTION_WORKER_START_SECONDS = 240
 # VALUES CHANGE HERE (banner shown when Live Captions are switched off because the caption model crashed; 'CAPTION_MEMORY_BANNER_LABEL' is the one for lack of memory)
 CAPTION_CRASH_BANNER_LABEL = "LIVE CAPTIONS TURNED OFF: THE CAPTION MODEL CRASHED"
+# VALUES CHANGE HERE (banner shown when Live Captions are switched off because this PC decodes them slower than the show plays)
+CAPTION_SPEED_BANNER_LABEL = "LIVE CAPTIONS TURNED OFF: THIS PC CANNOT KEEP UP WITH THEM"
 
 # VALUES CHANGE HERE (main script, start-up: seconds a new start waits for the app already running to close before it gives up as a second copy; seconds it waits instead when Reset All Settings restarted the app, so the old copy can finish closing before its saved data is wiped)
 SINGLE_INSTANCE_WAIT_SECONDS = 3.0
+SINGLE_INSTANCE_RELAUNCH_WAIT_SECONDS = 30.0
 FRESH_START_WAIT_FOR_OLD_APP_SECONDS = 30.0
 
 # VALUES CHANGE HERE (main script, the Reset All Settings button: seconds between its looks at the disk for game saves and the app's own work folders, so the System tab never reads the disk every frame)
@@ -2454,6 +2780,8 @@ HEALTH_SCREEN_STUCK_SECONDS = 3.0
 HEALTH_JOB_WAIT_WARN_SECONDS = 120.0
 HEALTH_DUMP_MIN_GAP_SECONDS = 60.0
 HEALTH_LOCK_HOLD_WARN_MS = 500
+# VALUES CHANGE HERE (locks that are held across a slow command by design, so a long hold is never reported: _share_files_lock holds while Windows is asked to share folders)
+HEALTH_LOCKS_SLOW_BY_DESIGN = ("_share_files_lock",)
 HEALTH_PROFILE_TOP = 5
 
 # VALUES CHANGE HERE (health_monitor.py, the PC vitals line: seconds a Windows sensor or event-log question may take before it is given up; seconds before the sensor question is asked again after it came back with nothing; how many of the busiest other programs are named; how many Windows shutdown events are read at the start after an unclean exit)
@@ -2463,13 +2791,18 @@ HEALTH_VITALS_TOP_PROGRAMS = 3
 HEALTH_SHUTDOWN_EVENTS_READ = 6
 
 # VALUES CHANGE HERE (health_monitor.py: threads whose long waits are normal and are never reported stuck; name starts of short job threads, which are reported when they wait too long)
-HEALTH_NEVER_STUCK_THREADS = ("OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep")
+HEALTH_NEVER_STUCK_THREADS = ("OsKeyHookPump", "ScanCapacity", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep", "_drive_probe_worker", "PathExistsProbe")
 HEALTH_JOB_THREAD_STARTS = ("content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "HubRowSync", "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
 
-# VALUES CHANGE HERE (main script, playback: ms of Static between channels; ms of black while a guide preview settles; ms a guide preview may take to load; ms a playing file may stall before it is called stalled, and the longer limit for its first buffering; ms the sound is held after a seek; ms from the end that counts as ending; seconds a stuck stop may take; seconds of the short wait for a quick stop; seconds the picture-size probe may hold up an open; ms of grace for the first frame after a seek; seconds from the end a seek is kept away from; seconds an open is checked for an error, the longer window when it may be retried, seconds Stopped must last to count as a failed open, and the seconds before each retry; failed plays on one drive before that drive is held; seconds the sound is muted while stereo or mono is switched; failures before a file is set aside as unplayable; ms a channel's failure message stays; ms between sweeps for dead drives; seconds a DVD's audio track count is kept)
-STATIC_TRANSITION_MS = 1500
-GUIDE_PREVIEW_SETTLE_MS = 500
+# VALUES CHANGE HERE (main script, playback: ms a guide preview may take to load; ms a playing file may stall before it is called stalled, and the longer limit for its first buffering; ms the sound is held after a seek; ms from the end that counts as ending; seconds a stuck stop may take; seconds of the short wait for a quick stop; seconds the picture-size probe may hold up an open; ms of grace for the first frame after a seek; seconds from the end a seek is kept away from; seconds an open is checked for an error, the longer window when it may be retried, seconds Stopped must last to count as a failed open, and the seconds before each retry; failed plays on one drive before that drive is held; seconds the sound is muted while stereo or mono is switched; failures before a file is set aside as unplayable; ms a channel's failure message stays; ms between sweeps for dead drives; seconds a DVD's audio track count is kept)
+# VALUES CHANGE HERE (owner 2026-11-17: the one length of the cover between channels in every mode, profile, server and regular, whether a channel is typed, surfed, or reached from the guide: ms of Black; ms of Static)
+BLACK_TRANSITION_MS = 350
+STATIC_TRANSITION_MS = 1050
 GUIDE_PREVIEW_LOAD_TIMEOUT_MS = 2500
+# VALUES CHANGE HERE (owner 2026-11-14: when the show previewed in the guide ends and the next one starts on the same channel, the last picture stays on the preview for up to this many milliseconds until the next show's first picture arrives, like a station cutting to the next show, instead of falling to grey or Static; a channel that failed, or a row the viewer moved to, never gets the held picture; mirrored in retro_tv_emulator.py)
+GUIDE_PREVIEW_BOUNDARY_HOLD_MS = 5000
+# VALUES CHANGE HERE (owner 2026-11-14: the red SERVER OFFLINE banner waits until the picture on screen has had no new frame for this many milliseconds, or the channel has fallen to Static; while the show is still playing the banner stays away; mirrored in retro_tv_emulator.py)
+SERVER_OFFLINE_BANNER_PICTURE_GRACE_MS = 3000
 PLAYBACK_STALL_TIMEOUT_MS = 10000
 PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = 20000
 # VALUES CHANGE HERE (media_library.py, header probe: seconds the file's whole length may run past the length of its picture before the picture's length is taken as the file's length; the sound of a file whose picture stops early plays on over nothing, and the schedule must not put a channel in that part; owner log 2026-11-06 16:40, Gone In Sixty Seconds.mkv)
@@ -2513,8 +2846,15 @@ PLAY_OPEN_STOPPED_DEBOUNCE_SECONDS = 0.15
 PLAY_OPEN_RETRY_DELAYS_SECONDS = (0.5, 1.0)
 PLAY_RETRY_DRIVE_BAIL_AFTER = 2
 STEREO_TOGGLE_MUTE_SECONDS = 0.2
+# VALUES CHANGE HERE: dB added to the playing sound while Mono Audio is on, because VLC's mono mix plays quieter than the same stereo mix; raise it if mono is still quieter, lower it if mono is louder.
+MONO_LOUDNESS_MAKEUP_DB = 6.0
+# VALUES CHANGE HERE: seconds between two [PLAYBACK PULSE] lines in the log.
+PLAYBACK_PULSE_EVERY_SECONDS = 10.0
 UNPLAYABLE_STRIKE_THRESHOLD = 3
 CHANNEL_FAILURE_MESSAGE_MS = 30000
+DRIVE_LATCH_RETRY_SECONDS = 2.0
+MISSING_DIAG_GAP_SECONDS = 60.0
+MISSING_DIAG_LEVEL_WAIT_SECONDS = 3.0
 DEAD_DRIVE_SWEEP_INTERVAL_MS = 2000
 DVD_AUDIO_TRACK_COUNT_TTL_SECONDS = 1.0
 
@@ -2525,9 +2865,8 @@ VLC_GAIN_MIN_DB = -18.0
 STATIC_AUDIO_GAIN_PRECACHED = 0.25
 SHOW_SMOOTH_TOLERANCE_DB = 0.3
 
-# VALUES CHANGE HERE (main script, captions: seconds before a TV caption lookup is tried again; ms one caption may stay on screen)
+# VALUES CHANGE HERE (main script, captions: seconds before a TV caption lookup is tried again)
 TV_CAPTION_RETRY_SECONDS = 8.0
-CAPTION_MAX_HOLD_MS = 7000
 
 # VALUES CHANGE HERE (main script, picture and bezel drawing: seconds between checks of a bezel file for changes; pixels the channel number is nudged at the top; the menu's shrink inside each bezel and by default, and its extra shrink when warp is off; each bezel's channel LED box, gap, upward nudge, tilt, cover-up stretches and trims, cover-up nudge, text nudges, number scale, text scale and text gap, each with its default for a bezel not listed; the watermark's extra offset inside each bezel; how much of the frame an overlay border may fill and how much of the bezel's screen the picture may fill; CRT power-on: ms the picture grows, ms it settles, and its peak brightness; scan lines drawn on the screen)
 TV_BORDER_MTIME_RECHECK_TTL_SECONDS = 2.0
@@ -2689,6 +3028,17 @@ FILE_EXPLORER_LEFT_ITEM_FONT = 21
 GUIDE_TIME_STEP_MAX_SHIFTS = 8
 # VALUES CHANGE HERE (guide highlight: how many seconds apart two drawings of the same show's start may be and still count as the same stop, so the highlight does not jump back when a start time drifts a fraction of a second)
 GUIDE_STOP_MATCH_SECONDS = 2.0
+# VALUES CHANGE HERE (guide highlight: a show the window edge cuts down to fewer half-hour columns than this is a sliver; the highlight stops before it and the next press scrolls it in)
+GUIDE_MIN_VISIBLE_COLUMNS = 0.4
+# VALUES CHANGE HERE (media.py warnings: the same warning for the same file is written once, then not again until this many seconds have passed)
+MEDIA_WARNING_REPEAT_SECONDS = 600.0
+# VALUES CHANGE HERE (the main loop: one slow-frame warning is written at most this often, with a count of the slow frames that came with it)
+FRAME_GAP_LOG_GAP_MS = 10000
+# VALUES CHANGE HERE (captions: a guard that holds captions back this long on one channel is written to the log once)
+CAPTION_BLOCKED_WARN_MS = 15000
+# VALUES CHANGE HERE (temporary loudness diagnostic: how many files a User PC measures again to compare with the Server's gains, and how long a file plays first)
+LOCAL_SCAN_COMPARE_MAX_FILES = 3
+LOCAL_SCAN_COMPARE_DELAY_SECONDS = 45.0
 # VALUES CHANGE HERE (guide highlight: the seconds the drawn highlight time is nudged forward so a show start that drifted just past it still holds the highlight)
 GUIDE_HIGHLIGHT_NUDGE_SECONDS = 0.75
 KEY_CAPTURE_SAME_PRESS_MS = 250
@@ -2718,6 +3068,9 @@ COLOR_ACTION_RED = (255, 60, 60)
 COLOR_BANNER_TEXT = (255, 255, 255)
 COLOR_BANNER_FILL = (120, 20, 20, 210)
 COLOR_BANNER_EDGE = (255, 90, 90, 255)
+# VALUES CHANGE HERE (the green status banner for good news, such as the server's folders being shared: its fill and edge)
+COLOR_BANNER_GOOD_FILL = (20, 100, 40, 210)
+COLOR_BANNER_GOOD_EDGE = (90, 220, 120, 255)
 COLOR_CAPTION_DEFAULT = (255, 255, 255)
 COLOR_VOLUME_OSD_TRACK = (80, 80, 80)
 COLOR_SCREENSAVER_FALLBACK = (255, 255, 255, 200)
@@ -2843,6 +3196,11 @@ COLOR_BUTTON_AUDIO_TRACK_TEXT = (20, 20, 20)
 # VALUES CHANGE HERE (where the shared buttons sit in every settings menu and popup: Close at the bottom right, Clear Media at the bottom left, as (inset from the panel side, up from the panel bottom, width, height); Yes left and No right of the popup's centre by the offset, both the given size)
 MENU_CLOSE_BUTTON_PLACE = (25, 52, 110, 40)
 MENU_CLEAR_BUTTON_PLACE = (25, 52, 240, 40)
+# VALUES CHANGE HERE (ui.py, Advanced Settings: pixels between the version label and the Send Logs button under it)
+MENU_VERSION_ABOVE_GAP_PX = 6
+# VALUES CHANGE HERE (ui.py, Advanced Settings: the Send Logs button is as wide as its longest label plus this padding on each side, and this many pixels from the left edge of the panel; the version is centred above it)
+MENU_SEND_LOGS_PAD_PX = 14
+MENU_SEND_LOGS_INSET_PX = 12
 # VALUES CHANGE HERE (ui.py, the title of every settings menu and sub-menu: the text size, how far below the top of the panel it sits, how far below the text the gold underline sits and how thick it is, in pixels)
 MENU_TITLE_FONT_SIZE = 24
 MENU_TITLE_TOP_PX = 10
@@ -2850,6 +3208,16 @@ MENU_TITLE_UNDERLINE_GAP_PX = 2
 MENU_TITLE_UNDERLINE_THICKNESS_PX = 2
 POPUP_YES_NO_OFFSET = 100
 POPUP_YES_NO_SIZE = (110, 36)
+# VALUES CHANGE HERE (ui.py popup body text and retro_tv_emulator.py busy/update bar: the body text of the Yes/No popups starts at this size and may shrink to the minimum, which is the smallest text the menus use so a CRT can read it (the popup grows wider instead of shrinking the text further); the busy bar's text size, its smallest width, its height and its bar height)
+POPUP_BODY_FONT_START = 19
+POPUP_BODY_FONT_MIN = 17
+BUSY_OVERLAY_FONT = 22
+BUSY_OVERLAY_MIN_WIDTH = 440
+BUSY_OVERLAY_HEIGHT = 120
+BUSY_OVERLAY_BAR_HEIGHT = 20
+# VALUES CHANGE HERE (ui.py Server Menu: the size of the Server and User button text and of the server names and side buttons, in pixels; the smallest menu text is 17)
+MENU_LABEL_FONT_PX = 22
+MENU_BUTTON_FONT_PX = 19
 COLOR_MENU_SWITCH_OFF = (45, 65, 100)
 COLOR_MENU_SWITCH_GREYED = (35, 35, 45)
 COLOR_MENU_TRACK_OFF = (55, 55, 60)
@@ -2899,6 +3267,18 @@ COLOR_MENU_RADIO_FILL = (15, 15, 20)
 COLOR_MENU_RADIO_EDGE = (140, 140, 160)
 COLOR_MENU_RADIO_SELECTED_EDGE = (90, 160, 230)
 COLOR_MENU_NO_SERVER_TEXT = (200, 160, 60)
+# VALUES CHANGE HERE: how bright a server channel's button is in the channel list compared with a normal channel button (1.0 = the same, lower = duller); the same colour, just dimmer, with SERVER stamped on it.
+CHANNEL_SERVER_CELL_BRIGHTNESS = 0.6
+
+# VALUES CHANGE HERE: when the show or song under an open Loudness Gain row changes, the row blinks for this many milliseconds and cannot be changed, then shows the new file's gain; and how long each blink on or off lasts.
+GAIN_CHANGE_BLINK_MS = 3000
+GAIN_BLINK_HALF_PERIOD_MS = 250
+
+# VALUES CHANGE HERE: how dark a greyed channel-sub-menu button is (each colour channel of the grey picture is multiplied by this out of 255; lower is darker).
+LOCK_GREY_MULTIPLY = (140, 140, 140)
+
+# VALUES CHANGE HERE: how many numbers the Kiosk PIN has.
+KIOSK_PIN_LENGTH = 4
 COLOR_MENU_LOCKED_CELL = (48, 48, 55)
 COLOR_MENU_LOCKED_TEXT = (150, 150, 160)
 COLOR_MENU_EDGE_LOCKED = (145, 145, 155)
@@ -2973,6 +3353,8 @@ OPEN_WAIT_JOIN_CLOCK_MIN_SECONDS = 0.5
 
 # VALUES CHANGE HERE
 PICTURE_BOX_PRE_SHOW_BUDGET_S = 8.0
+# VALUES CHANGE HERE (main script, before a server's file is shown on a User PC: the most seconds to wait for its picture box; a slower scan lands behind the picture)
+PICTURE_BOX_SERVER_FILE_BUDGET_S = 1.5
 PICTURE_BOX_PRE_SHOW_PARALLEL = 6
 
 # VALUES CHANGE HERE (next-item prep: when a file starts on the channel on air, the picture boxes of the next this-many items of its block are scanned ahead, nearest first, as priority work, so each one opens without a picture-box wait; on a PC whose plan runs first-start scans in sequence it first waits up to the wait seconds for the playing file's own first-start scans)
@@ -2980,6 +3362,54 @@ NEXT_ITEM_PREP_ITEMS = 3
 NEXT_ITEM_PREP_FIRST_START_WAIT_SECONDS = 60.0
 # VALUES CHANGE HERE (N16 owner 2026-11-03: when the next items are a commercial break, the look-ahead keeps going through the whole break and the item after it, up to this many items in all; while a break is on or next it does not wait for the playing file's first-start scans, since its items are seconds apart)
 NEXT_ITEM_PREP_BREAK_MAX_ITEMS = 12
+# VALUES CHANGE HERE (server-streamed channels only, owner 2026-11-11: when this many seconds are left of a show or a commercial that is streamed from a server, the start of the next this-many items is read ahead from the server's share, so the next one opens at once instead of waiting on the share and falling to Static; each file's first and last megabytes are read (the start is what plays, the end holds the index of some formats), and the read is given up after the longest-seconds limit; a break's items are short, so each one begins this read as soon as it starts)
+SERVER_NEXT_BUFFER_LEAD_SECONDS = 45.0
+SERVER_NEXT_BUFFER_ITEMS = 2
+SERVER_NEXT_BUFFER_HEAD_MB = 16
+SERVER_NEXT_BUFFER_TAIL_MB = 2
+SERVER_NEXT_BUFFER_MAX_SECONDS = 20.0
+# VALUES CHANGE HERE (owner 2026-11-14: the CRT log showed a share file opening in 0.4 s right after a visit and in 10 s about 35 s later, so a file read once every 10-30 minutes is cold again when the viewer tunes to it; every streamed channel's airing file is now touched every few seconds in small reads to keep it hot) (server-streamed channels only, owner 2026-11-13: the first visit to a streamed channel took 3-5 s and the next was smooth, because the share had never opened that channel's file; every other streamed channel's airing file is read this many megabytes in (from where it is airing), one file at a time on a background thread, with a pause between files; a pass runs every interval seconds, a file read in the last re-read seconds is not read again, and each read is given up after the longest-seconds limit)
+SERVER_CHANNEL_WARM_HEAD_MB = 1.5
+SERVER_CHANNEL_WARM_MAX_SECONDS = 6.0
+SERVER_CHANNEL_WARM_PAUSE_SECONDS = 0.1
+SERVER_CHANNEL_WARM_INTERVAL_SECONDS = 8.0
+SERVER_CHANNEL_WARM_REREAD_SECONDS = 12.0
+# VALUES CHANGE HERE (owner 2026-11-15, channel priming: every streamed channel's airing file and this many shows after it (a whole commercial break when one is on or next) have their header and index copies kept on this PC, their open handles held, and their picture size and box in memory, before the viewer tunes to them)
+CHANNEL_PRIME_NEXT_ITEMS = 2
+PRIME_LEAD_SECONDS = 180.0
+LIVE_CAPTION_STREAM_RATE = 16000
+LIVE_CAPTION_STREAM_SLACK_AHEAD_SEC = 10.0
+PRIME_RECHECK_SECONDS = 600.0
+PRIME_NOT_READY_RETRY_SECONDS = 5.0
+PRIME_KEEPALIVE_SECONDS = 25.0
+# VALUES CHANGE HERE (main script, priming: a held file's share handle and index are renewed when the last renewal is older than this; owner 2026-11-16)
+PRIME_INDEX_RENEW_SECONDS = 20.0
+# VALUES CHANGE HERE (main script, priming: the most files per pass that get a missing picture size or picture box made; owner 2026-11-16)
+PRIME_FACTS_PER_PASS = 3
+# VALUES CHANGE HERE (main script, priming: channels readied ahead of the viewer in the direction they are stepping, and behind them; owner 2026-11-16)
+PRIME_RUSH_AHEAD = 3
+PRIME_RUSH_BEHIND = 1
+# VALUES CHANGE HERE (main script, priming: the most channels waiting in the rush queue at once; a full queue drops the oldest; owner 2026-11-16)
+PRIME_RUSH_QUEUE_MAX = 12
+# VALUES CHANGE HERE (main script, channel snapshots: seconds of the airing show kept in memory ahead of the position for a channel the viewer may reach next; a tune that arrives inside it is answered from memory; owner 2026-11-16)
+PRIME_SNAPSHOT_SECONDS = 15.0
+# VALUES CHANGE HERE (main script, channel snapshots: how often the zone's snapshots are extended while the viewer is changing channels; owner 2026-11-16)
+PRIME_SNAPSHOT_REFRESH_SECONDS = 10.0
+# VALUES CHANGE HERE (main script, channel snapshots: how long a channel stays in the zone after the viewer last moved near it, then its snapshot is freed; owner 2026-11-16)
+PRIME_SNAPSHOT_ZONE_SECONDS = 60.0
+# VALUES CHANGE HERE (main script, channel snapshots: the most channels kept as snapshots at once; owner 2026-11-16)
+PRIME_SNAPSHOT_CHANNELS_MAX = 40
+# VALUES CHANGE HERE: the most often, in seconds, the [PRIME SNAPSHOT] line is written (it lists every streamed channel and whether its airing spot is held).
+PRIME_SNAPSHOT_LOG_EVERY_SECONDS = 30.0
+# VALUES CHANGE HERE (owner 2026-11-15, channel priming: how many files' picture size and picture box are kept in memory for the tune to read, the oldest dropped first)
+PRIMED_FACTS_LIMIT = 600
+# VALUES CHANGE HERE (owner 2026-11-14, channel warm: the file's own start and end hold the container header and index the player reads first on every open, and they never move, so each streamed channel's file gets its first and last blocks read once and again only after this many seconds)
+SERVER_CHANNEL_WARM_INDEX_HEAD_MB = 0.5
+SERVER_CHANNEL_WARM_INDEX_TAIL_MB = 1.5
+SERVER_CHANNEL_WARM_INDEX_REREAD_SECONDS = 30.0
+# VALUES CHANGE HERE (owner 2026-11-14: a file whose embedded subtitle pull timed out is not pulled again for this many seconds; each try reads the whole file, which on a share competes with the channels being watched)
+EMBEDDED_SUBTITLE_RETRY_AFTER_FAIL_SECONDS = 1800.0
+EMBEDDED_SUBTITLE_RETRY_BACKOFF_SECONDS = (1800.0, 7200.0, 21600.0, 86400.0)
 
 
 # ============================================================================
@@ -3000,11 +3430,21 @@ PICTURE_BOX_SAMPLE_SECONDS = 2.0
 PICTURE_BOX_SAMPLE_TIMEOUT_S = 25.0
 PICTURE_BOX_MIN_GOOD_SAMPLES = 3
 PICTURE_BOX_CROPDETECT_LIMIT = 32
-PICTURE_BOX_MIN_BAR_FRACTION = 0.015
-PICTURE_BOX_MIN_BAR_PX = 4
+PICTURE_BOX_MIN_BAR_FRACTION = 0.004
+PICTURE_BOX_MIN_BAR_PX = 2
 
 # VALUES CHANGE HERE (media_library.py, seconds between the two size reads that tell whether a file is still being copied in)
 LIBRARY_GROWING_FILE_CHECK_DELAY_S = 0.05
+
+# VALUES CHANGE HERE (screen thread file checks on a share, owner 2026-11-13: a file on a server's share that cannot be reached made the screen thread wait for Windows to give up, so Static, channel changes and the guide froze): the most seconds the screen thread waits for one such check, and the seconds a share that did not answer is then treated as down without asking it again.
+SCREEN_THREAD_SHARE_CHECK_WAIT_S = 0.4
+SCREEN_THREAD_SHARE_DOWN_FOR_S = 4.0
+# VALUES CHANGE HERE (media_library.py stat_for_screen_thread, owner 2026-11-14: a share file's size and modified time are kept this many seconds so the screen thread asks the share once per file per minute at most; at most this many files are kept; mirrored in media_library.py)
+SCREEN_THREAD_STAT_CACHE_S = 60.0
+SCREEN_THREAD_STAT_CACHE_MAX = 2048
+
+# VALUES CHANGE HERE (server boot cache, owner 2026-11-13): the most seconds the boot channel's warm-up waits for the saved server schedule to be applied before it carries on with what it has.
+BOOT_SERVER_CACHE_WAIT_SECONDS = 8.0
 
 
 # ============================================================================
@@ -3097,9 +3537,15 @@ CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB = 0.6
 CAPTION_RUNTIME_MIN_COMMIT_GB = 1.0
 CAPTION_WATCH_INTERVAL_SECONDS = 2.0
 CAPTION_WATCH_STRIKES = 2
+# VALUES CHANGE HERE (media.py, live captions that cannot keep pace: how many of the picture's own caption chunks, across shows, are looked at; when their middle decode time is more than the ratio times their own length Live Captions switch off for the run; the shortest chunk in seconds that counts; owner logs 2026-11-09 to 11-11 on the CRT TV computer peak at 1.24 over 40 chunks, so the ratio stays well above that)
+CAPTION_TOO_SLOW_CHUNKS = 40
+CAPTION_TOO_SLOW_RATIO = 1.6
+CAPTION_TOO_SLOW_MIN_CHUNK_SEC = 8.0
 # VALUES CHANGE HERE (the caption model is loaded only when a live transcription needs it, and freed when none has run for this many seconds; the check looks every WHISPER_IDLE_CHECK_SECONDS; owner 2026-11-09; 0 = never free it by idle)
 WHISPER_IDLE_UNLOAD_SECONDS = 60.0
 WHISPER_IDLE_CHECK_SECONDS = 5.0
+# VALUES CHANGE HERE (after a loudness scan could not get the caption model for its voice detector, it waits this many seconds before asking again; owner 2026-11-16)
+SPEECH_LISTENER_RETRY_SECONDS = 60.0
 
 
 CAPTION_LOCK_KEYS = ("tv_captions_enabled", "dvd_captions_enabled")
@@ -3174,6 +3620,17 @@ def caption_load_interrupted():
         log.info("[GOVERNOR BOOT SCAN] the PC's memory changed from %.1fGB to %.1fGB, so the earlier caption failure no longer blocks live captions", then_gb, now_gb)
         return False
     return True
+
+
+def caption_forgive_if_memory_ok():
+    """Removes the caption marker when the PC has plenty of memory now, for a run the program ended itself because the screen stopped answering (owner 2026-11-15: a Windows sleep made the watchdog relaunch the program and the next start blamed captions); True when it was removed."""
+    path = _caption_marker["path"]
+    if not path or not os.path.exists(path):
+        return False
+    ok = caption_memory_check()[0]
+    if ok:
+        caption_load_done()
+    return bool(ok)
 
 
 _caption_watch = {"thread": None, "stop": None}
@@ -3252,8 +3709,15 @@ def caption_mark_crashed():
     _write_caption_marker("loading")
 
 
+def caption_mark_too_slow():
+    """Switches Live Captions off and greys them out for this run because this PC decodes them slower than the show plays; nothing is left on disk, so the next start tries again."""
+    with _state_lock:
+        _state["captions_memory_ok"] = False
+        _state["captions_lock_reason"] = "speed"
+
+
 def caption_lock_reason():
-    """'crash' when the caption model crashed, 'memory' when there is not enough memory, '' when captions are not locked."""
+    """'crash' when the caption model crashed, 'memory' when there is not enough memory, 'speed' when this PC could not keep up, '' when captions are not locked."""
     return str(_state.get("captions_lock_reason", "")) if _state.get("captions_memory_ok") is False else ""
 
 
@@ -3294,7 +3758,6 @@ class Throttle:
         self._unattributed_reason = ""
         self._last_unattributed_log = 0.0
         self._quiet_since = None
-        self._quiet_announced = False
         self._own_load = {}
         self._own_load_logged = {}
         self._top_since = None
@@ -3493,16 +3956,8 @@ class Throttle:
         if quiet:
             if self._quiet_since is None:
                 self._quiet_since = now
-            if not self._quiet_announced and now - self._quiet_since >= SCAN_QUIET_AFTER_SECONDS:
-                self._quiet_announced = True
-                log.info("[GOVERNOR] PC quiet for %.0fs (system_cpu=%.0f%%): scans speed up x%.2f",
-                         now - self._quiet_since, cpu, 1.0 / max(0.01, SCAN_QUIET_PACE_MULTIPLIER))
         else:
-            if self._quiet_announced:
-                log.info("[GOVERNOR] PC busy again (system_cpu=%s, level=%d): scans back to their normal pace",
-                         "%.0f%%" % cpu if cpu is not None else "unknown", self.level)
             self._quiet_since = None
-            self._quiet_announced = False
 
     def quiet_seconds(self, now=None):
         """Seconds this throttle has seen the PC quiet, 0 when it is not."""
@@ -3741,7 +4196,7 @@ class ActivityTracker:
 
 _activity = ActivityTracker()
 _gate_tls = threading.local()
-_gate_state = {"throttle": None, "enabled": True, "waits": 0, "last_wait_log": 0.0, "tune_until": 0.0}
+_gate_state = {"throttle": None, "enabled": True, "waits": 0, "last_wait_log": 0.0, "tune_until": 0.0, "caption_until": 0.0, "tune_picture_at": None, "cpu_decoding": False}
 
 
 @contextlib.contextmanager
@@ -3756,8 +4211,11 @@ def background_activity(lane):
 
 def hold_background_for_tune():
     """Holds every background gate that has not admitted its work yet while a channel is being tuned, for at most TUNE_BACKGROUND_HOLD_SECONDS."""
-    _gate_state["tune_until"] = time.monotonic() + TUNE_BACKGROUND_HOLD_SECONDS
+    now = time.monotonic()
+    _gate_state["tune_until"] = now + TUNE_BACKGROUND_HOLD_SECONDS
+    _gate_state["caption_until"] = now + TUNE_BACKGROUND_HOLD_SECONDS
     _gate_state["tune_settling_since"] = None
+    _gate_state["tune_picture_at"] = None
 
 
 def release_tune_hold(now=None):
@@ -3768,12 +4226,32 @@ def release_tune_hold(now=None):
     _gate_state["tune_steady_since"] = None
 
 
+def note_tune_first_picture(now=None):
+    """The new channel's first picture is up: live captions may start TUNE_CAPTION_START_DELAY_SECONDS from now and the other background work once the picture has run TUNE_STEADY_SECONDS (the steady count starts here, never earlier)."""
+    now = time.monotonic() if now is None else now
+    if _gate_state.get("tune_picture_at") is not None:
+        return
+    _gate_state["tune_picture_at"] = now
+    if _gate_state.get("caption_until", 0.0) > now:
+        _gate_state["caption_until"] = now + TUNE_CAPTION_START_DELAY_SECONDS
+    if _gate_state.get("tune_settling_since") is not None:
+        _gate_state["tune_steady_since"] = None
+
+
+def caption_tune_hold(now=None):
+    """True from the channel button until TUNE_CAPTION_START_DELAY_SECONDS after the new channel's first picture: live caption chunks wait."""
+    now = time.monotonic() if now is None else now
+    return now < _gate_state.get("caption_until", 0.0)
+
+
 def note_tune_steady(steady, now=None):
     """Called by the throttle on each update after a tune: steady is true when this update saw no frames over their time and no lost pictures; TUNE_STEADY_SECONDS of steady updates end the hold."""
     started = _gate_state.get("tune_settling_since")
     if started is None:
         return
     now = time.monotonic() if now is None else now
+    if _gate_state.get("tune_picture_at") is None and now < _gate_state["tune_until"]:
+        return
     if now >= _gate_state["tune_until"]:
         _gate_state["tune_until"] = 0.0
         _gate_state["tune_settling_since"] = None
@@ -3790,11 +4268,19 @@ def note_tune_steady(steady, now=None):
         log.info("[GOVERNOR] picture steady for %.0fs after the tune (%.1fs after the show started); background work goes on", TUNE_STEADY_SECONDS, now - started)
 
 
+def set_cpu_decoding(value):
+    """Called by the app: True while the playing video is decoded by the CPU (the graphics card has no decoder for it), False once a card decodes or the channel changes."""
+    _gate_state["cpu_decoding"] = bool(value)
+
+
 def ffmpeg_scans_at_once(level=None):
-    """How many ffmpeg scans the background gates let run at once: this PC's peak (the threads its mode affords) at load level 0, narrowed with the level by LEVEL_FACTOR, never below 1."""
+    """How many ffmpeg scans the background gates let run at once: this PC's peak (the threads its mode affords) at load level 0, narrowed with the level by LEVEL_FACTOR, never below 1; on a WEAK PC whose CPU is decoding the playing video, at most WEAK_CPU_DECODE_MAX_SCANS_AT_ONCE."""
     level = current_level() if level is None else level
     level = max(0, min(MAX_LEVEL, int(level)))
-    return max(1, int(affordable_threads() * LEVEL_FACTOR[level]))
+    value = max(1, int(affordable_threads() * LEVEL_FACTOR[level]))
+    if _gate_state.get("cpu_decoding") and get_profile().tier == "WEAK":
+        value = min(value, max(1, int(WEAK_CPU_DECODE_MAX_SCANS_AT_ONCE)))
+    return value
 
 
 def tune_loudness_settle_seconds():
@@ -3942,7 +4428,7 @@ def gate(lane, priority=False, timeout=None, label=""):
 
         def _may_start():
             level = current_level()
-            return (not tune_in_progress() and scan_throttle_mode() != "stopped"
+            return ((lane == "whisper_slots" or not tune_in_progress()) and scan_throttle_mode() != "stopped"
                     and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))
                     and _activity.try_begin(lane, _lane_limit(lane, level)))
         admitted = _may_start()
@@ -4474,7 +4960,32 @@ __all__ = [
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
-    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "caption_mark_crashed", "caption_lock_reason", "set_caption_load_marker", "set_previous_run_unclean", "caption_load_begin", "caption_load_resident", "caption_load_done", "caption_load_interrupted", "caption_watch_start", "caption_watch_stop", "read_commit_gb", "read_process_memory_mb", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
+    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "caption_mark_crashed", "caption_mark_too_slow", "caption_lock_reason", "set_caption_load_marker", "set_previous_run_unclean", "caption_load_begin", "caption_load_resident", "caption_load_done", "caption_forgive_if_memory_ok", "caption_load_interrupted", "caption_watch_start", "caption_watch_stop", "read_commit_gb", "read_process_memory_mb", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
     "quiet_seconds", "pc_is_quiet", "quiet_lane_bonus", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
     "music_scan_class", "music_analysis_class", "music_scan_falling_behind",
 ]
+
+# VALUES CHANGE HERE: the least time between two automatic re-tunes of a channel that has produced no picture.
+STALL_RETUNE_GAP_MS = 8000
+
+
+# VALUES CHANGE HERE: the PREPARING SERVER bar and the link test it runs.
+SERVER_PREP_MAX_SECONDS = 30.0
+SERVER_PREP_LINGER_SECONDS = 0.6
+SERVER_LINK_HEAVY_BELOW_MB_S = 40.0
+DRIVE_SAMPLE_SEARCH_SECONDS = 4.0
+DRIVE_SAMPLE_SEARCH_FOLDERS = 400
+DRIVE_SAMPLE_RETRY_SECONDS = 300.0
+DRIVE_TEST_FILE_MB = 16
+SERVER_PERMISSION_LOCK_MAX_SECONDS = 120.0
+# VALUES CHANGE HERE (owner 2026-11-18: seconds the controls stay locked after the Server menu click while Windows' permission box is still on its way; past this with no box on screen they are let go and the set-up goes on in the background)
+SERVER_PERMISSION_BOX_WAIT_SECONDS = 8.0
+# VALUES CHANGE HERE (owner log 2026-11-18 13:57: on the screen thread, an answer of the scheduler that the hub does not keep (Static, or no hub) is used again for this many seconds while a background thread asks again; the screen thread asks the scheduler itself only the first time it sees a channel)
+SCREEN_SCHEDULER_ASK_GAP_S = 0.5
+
+# VALUES CHANGE HERE: how much the end of one Static loop and the start of the next overlap, so the loop point is heard as a blend, not a restart.
+STATIC_LOOP_CROSSFADE_MS = 200.0
+
+# VALUES CHANGE HERE: reading a file's audio-stream header (os.stat plus ffmpeg) is bounded to this long, and a failure (a broken or slow network share) is remembered for this long before it is tried again, so a share problem can't pile up overlapping blocked threads every time a file is retried.
+AUDIO_HEADER_STAT_TIMEOUT_MS = 2500.0
+AUDIO_HEADER_FAIL_TTL_MS = 30000.0

@@ -57,6 +57,11 @@ def _add_server_path():
 _add_server_path()
 from server_diagnostics import breadcrumb as _server_breadcrumb
 
+try:
+    import performance_governor as _perf_governor
+except Exception:
+    _perf_governor = None
+
 
 # ============================================================================
 # SECTION: Constants & errors
@@ -68,6 +73,10 @@ log = logging.getLogger("retro_tv.auto_updater")
 UPDATE_DIR_NAME = ".retro_tv_updates"
 STAGED_RECORD_NAME = "staged_update.json"
 PENDING_RECORD_NAME = "pending_update.json"
+# WARNING: the fallback numbers below must match UPDATE_LEFTOVER_MIN_AGE_S, UPDATE_PENDING_MAX_AGE_S, UPDATE_HELPER_ALIVE_CHECK_S in performance_governor.py; they are used only when that module fails to import.
+UPDATE_LEFTOVER_MIN_AGE_S = _perf_governor.UPDATE_LEFTOVER_MIN_AGE_S if _perf_governor is not None else 1800.0
+UPDATE_PENDING_MAX_AGE_S = _perf_governor.UPDATE_PENDING_MAX_AGE_S if _perf_governor is not None else 600.0
+UPDATE_HELPER_ALIVE_CHECK_S = _perf_governor.UPDATE_HELPER_ALIVE_CHECK_S if _perf_governor is not None else 3.0
 # VALUES CHANGE HERE: the largest package the app will download (the build is close to 1 GiB, so a 1 GiB ceiling would reject it as it grows) and the seconds the download waits on the connection before giving up
 MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB safety ceiling
 DOWNLOAD_TIMEOUT_SECONDS = 60
@@ -180,12 +189,14 @@ def _set_stamp_attributes(path, protected):
     ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2 | 0x4 if protected else 0x80)
 
 
-def write_version_stamp(base_dir, version, build=""):
-    """Writes version.json with the version and build type and protects it from accidental deletion; returns True when written."""
+def write_version_stamp(base_dir, version, build="", from_exe=False):
+    """Writes version.json with the version and build type and protects it from accidental deletion; returns True when written. from_exe marks a stamp the app wrote from the number built into its own exe; the update helper's stamp never has the mark."""
     path = os.path.join(base_dir, VERSION_STAMP_NAME)
     payload = {"version": str(version)}
     if build:
         payload["build"] = build
+    if from_exe:
+        payload["from_exe"] = True
     try:
         _set_stamp_attributes(path, False)
         with open(path, "w", encoding="utf-8") as handle:
@@ -198,10 +209,41 @@ def write_version_stamp(base_dir, version, build=""):
         _set_stamp_attributes(path, True)
 
 
-def _heal_version_stamp(base_dir):
-    """Rewrites version.json from the version and build type built into this exe when the file is missing or differs."""
+_stamp_ahead_warned = set()
+
+
+def _stamp_ahead_of_exe(base_dir):
+    """Returns the version in version.json when the update helper wrote it (no from_exe mark) and it is newer than the number built into this exe, else an empty string.
+
+    WARNING: this is the guard against an update loop. A package built with the wrong number inside its exe (the V1.5.4 zip carried 1.5.3) installs fine, then the exe calls itself the old version and the same release is offered again at every start. The helper's stamp holds the version it really installed, so that number wins and the mistake is logged loudly."""
     baked_version = _baked("BUILD_VERSION")
     if not VERSION_RE.fullmatch(baked_version):
+        return ""
+    stamp = _read_json(os.path.join(base_dir, VERSION_STAMP_NAME), {})
+    if not isinstance(stamp, dict) or stamp.get("from_exe"):
+        return ""
+    stamped = str(stamp.get("version", "") or "").strip()
+    if not VERSION_RE.fullmatch(stamped):
+        return ""
+    try:
+        ahead = parse_version(stamped) > parse_version(baked_version)
+    except UpdateError:
+        return ""
+    if not ahead:
+        return ""
+    if stamped not in _stamp_ahead_warned:
+        _stamp_ahead_warned.add(stamped)
+        log.warning("[UPDATE DIAG] This exe says it is %s but the update that was installed is %s (version.json, written by the update helper): the package was built with the wrong number inside it. Treating the install as %s so the same update is not offered again; rebuild with write_build_info.py %s.",
+                    baked_version, stamped, stamped, stamped)
+    return stamped
+
+
+def _heal_version_stamp(base_dir):
+    """Rewrites version.json from the version and build type built into this exe when the file is missing or differs (never over a newer version the update helper recorded)."""
+    baked_version = _baked("BUILD_VERSION")
+    if not VERSION_RE.fullmatch(baked_version):
+        return
+    if _stamp_ahead_of_exe(base_dir):
         return
     baked_build = _baked("BUILD_TYPE").capitalize()
     baked_build = baked_build if baked_build in BUILD_TYPES else ""
@@ -209,7 +251,7 @@ def _heal_version_stamp(base_dir):
     stamp = stamp if isinstance(stamp, dict) else {}
     if str(stamp.get("version", "") or "").strip() == baked_version and (not baked_build or stamp.get("build") == baked_build):
         return
-    write_version_stamp(base_dir, baked_version, baked_build)
+    write_version_stamp(base_dir, baked_version, baked_build, from_exe=True)
 
 
 # ============================================================================
@@ -238,7 +280,7 @@ def current_version(base_dir, config=None):
 
     baked_version = _baked("BUILD_VERSION")
     if VERSION_RE.fullmatch(baked_version):
-        return baked_version
+        return _stamp_ahead_of_exe(base_dir) or baked_version
 
     value = _read_json(os.path.join(base_dir, VERSION_STAMP_NAME), {})
     if isinstance(value, dict):
@@ -448,8 +490,6 @@ def check_github_for_update(installed, repo, api_base=GITHUB_API_BASE, timeout=D
         "notes": str(release.get("body", "") or "").strip()[:500],
     })
     available = version_is_newer(version, installed)
-    log.info("[UPDATE] source=github repo=%s zips_with_a_version=%d newest_posted=%s installed=%s available=%s",
-             repo, zips_seen, version, installed, available)
     return {
         "available": available,
         "configured": True,
@@ -486,6 +526,20 @@ def check_for_update(base_dir, config=None, timeout=DEFAULT_TIMEOUT_SECONDS):
 # ============================================================================
 
 
+def lower_this_thread_priority():
+    """Puts the calling thread in Windows background mode (low CPU and low disk priority) so a big download cannot starve the playing video; returns True when it took effect."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        # WARNING: 0x00010000 is THREAD_MODE_BACKGROUND_BEGIN; it lowers the disk priority as well as the CPU priority of this thread only.
+        return bool(kernel.SetThreadPriority(kernel.GetCurrentThread(), 0x00010000))
+    except Exception as exc:
+        log.warning("[UPDATE DIAG] could not lower the download thread priority: %s", exc)
+        return False
+
+
 def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progress_callback=None):
     _validate_url(url, "Update package URL")
     request = urllib.request.Request(
@@ -494,11 +548,17 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progres
     )
     total = 0
     digest = hashlib.sha256()
+    blocks = 0
+    slowest_read = slowest_write = 0.0
+    started = time.monotonic()
     try:
         with _urlopen(request, timeout) as response:
+            content_length = int(response.headers.get("Content-Length", "0") or 0)
             with open(destination, "wb") as output:
                 while True:
-                    block = response.read(1024 * 1024)
+                    t0 = time.monotonic()
+                    block = response.read(256 * 1024)
+                    t1 = time.monotonic()
                     if not block:
                         break
                     total += len(block)
@@ -506,9 +566,14 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progres
                         raise UpdateError("Update package exceeds the 4 GiB safety limit")
                     digest.update(block)
                     output.write(block)
+                    t2 = time.monotonic()
+                    blocks += 1
+                    slowest_read = max(slowest_read, t1 - t0)
+                    slowest_write = max(slowest_write, t2 - t1)
                     if progress_callback is not None:
-                        content_length = int(response.headers.get("Content-Length", "0") or 0)
                         progress_callback(total, content_length)
+                    # WARNING: a short pause after every block hands the CPU and the disk back to the playing video and the main loop.
+                    time.sleep(0.002)
     except UpdateError:
         raise
     except (urllib.error.URLError, OSError) as exc:
@@ -517,6 +582,8 @@ def _download_package(url, destination, timeout=DEFAULT_TIMEOUT_SECONDS, progres
             "[UPDATE DIAG] Update package download failed url=%s: %s", url, exc,
         )
         raise UpdateError(f"Could not download update package: {exc}") from exc
+    log.info("[UPDATE DIAG] download done: %.0f MB in %.1f s, %d blocks, slowest network read %.2f s, slowest disk write %.2f s",
+             total / 1048576.0, time.monotonic() - started, blocks, slowest_read, slowest_write)
     return total, digest.hexdigest()
 
 
@@ -590,11 +657,90 @@ def _extract_package(package_path, stage_root):
 # ============================================================================
 
 
+def _tree_size(path):
+    """Total bytes of the files under a folder (0 when it cannot be read)."""
+    total = 0
+    for root, _dirs, files in os.walk(_long(path)):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def prune_update_folder(base_dir, now=None, min_age=None, keep_staged=True):
+    """Removes what earlier updates left in root/logs/.retro_tv_updates: download folders nothing needs (each holds a whole unpacked copy of the app, close to 1 GiB), a staged record for a version that is already installed, and a pending-install record from a hand-off that failed. Keeps the folder of a staged update that is still newer than the installed version (unless `keep_staged` is False), and any folder younger than `min_age` seconds (a download may be running). Returns (folders removed, bytes freed)."""
+    update_dir = _update_dir(base_dir)
+    if not os.path.isdir(update_dir):
+        return 0, 0
+    now = time.time() if now is None else now
+    min_age = UPDATE_LEFTOVER_MIN_AGE_S if min_age is None else min_age
+    keep_name = None
+    record_path = os.path.join(update_dir, STAGED_RECORD_NAME)
+    try:
+        with open(record_path, "r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        record = None
+    if isinstance(record, dict):
+        payload = str(record.get("staged_path", ""))
+        try:
+            still_wanted = bool(payload) and os.path.isdir(_long(payload)) and version_is_newer(str(record.get("version", "")), current_version(base_dir))
+        except Exception:
+            still_wanted = False
+        if still_wanted and keep_staged:
+            relative = os.path.relpath(os.path.abspath(payload), update_dir)
+            keep_name = relative.split(os.sep)[0]
+        else:
+            try:
+                os.remove(record_path)
+            except OSError:
+                pass
+    pending_path = os.path.join(update_dir, PENDING_RECORD_NAME)
+    try:
+        if now - os.path.getmtime(pending_path) > UPDATE_PENDING_MAX_AGE_S:
+            os.remove(pending_path)
+    except OSError:
+        pass
+    removed, freed = 0, 0
+    try:
+        names = os.listdir(update_dir)
+    except OSError:
+        return 0, 0
+    for name in names:
+        if not (name.startswith("download-") or (name.startswith(".update-") and name.endswith(".tmp"))):
+            continue
+        if name == keep_name:
+            continue
+        full = os.path.join(update_dir, name)
+        try:
+            if now - os.path.getmtime(full) < min_age:
+                continue
+        except OSError:
+            continue
+        size = _tree_size(full) if os.path.isdir(full) else 0
+        if os.path.isdir(full):
+            shutil.rmtree(_long(full), ignore_errors=True)
+        else:
+            try:
+                size = os.path.getsize(full)
+                os.remove(full)
+            except OSError:
+                pass
+        if not os.path.exists(full):
+            removed += 1
+            freed += size
+    return removed, freed
+
+
 def stage_update(base_dir, manifest, timeout=DEFAULT_TIMEOUT_SECONDS, progress_callback=None):
     """Download, hash-check, zip-check, and atomically record a staged update."""
     manifest = validate_manifest(manifest)
     update_dir = _update_dir(base_dir)
     os.makedirs(update_dir, exist_ok=True)
+    # WARNING: this is the only place a download starts, so every older download folder is a leftover; clearing them first keeps the folder from growing by a full copy of the app on each attempt.
+    prune_update_folder(base_dir, min_age=0.0, keep_staged=False)
     work_dir = tempfile.mkdtemp(prefix="download-", dir=update_dir)
     package_path = os.path.join(work_dir, manifest["package_name"])
     stage_path = os.path.join(work_dir, "payload")
@@ -732,13 +878,16 @@ def _helper_outside_install(command):
         return command
 
 
-def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
-    """Hand a staged payload to the detached swap helper and return its PID."""
+def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None, reboot_after=False, bar_start=0.0, progress_path=None):
+    """Hand a staged payload to the detached swap helper and return its PID. With progress_path (the server tray's Check for updates) the helper is started before the download and follows that file: it shows one bar for the download, the unpacking and the install, and takes the staged folder from the file when the download is done."""
     if not isinstance(staged, dict):
         raise UpdateError("No staged update is available")
-    staged_path = os.path.abspath(str(staged.get("staged_path", "")))
-    if not os.path.isdir(_long(staged_path)):
-        raise UpdateError("The staged update payload is missing")
+    if progress_path:
+        staged_path = ""
+    else:
+        staged_path = os.path.abspath(str(staged.get("staged_path", "")))
+        if not os.path.isdir(_long(staged_path)):
+            raise UpdateError("The staged update payload is missing")
     if not isinstance(relaunch_command, (list, tuple)) or not relaunch_command:
         raise UpdateError("The application relaunch command is invalid")
 
@@ -752,6 +901,13 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
         "version": staged.get("version", ""),
         "created_at": time.time(),
     }
+    if progress_path:
+        # WARNING: owner 2026-11-16: the server tray's update button starts the helper first and the helper's one bar follows this file through the download and the unpacking.
+        pending["tray_progress"] = os.path.abspath(progress_path)
+    if reboot_after:
+        # WARNING: owner 2026-11-13: set only in shell mode; the helper then continues the app's download bar from bar_start and ends by restarting the computer.
+        pending["reboot_after"] = True
+        pending["bar_start"] = float(bar_start or 0.0)
     _atomic_json_write(pending_path, pending)
     command = _helper_outside_install(_helper_command(base_dir)) + ["--apply", pending_path]
     # WARNING: the helper must not start with the install folder as its working folder, or Windows will not let it rename that folder.
@@ -779,6 +935,23 @@ def launch_staged_update(base_dir, staged, relaunch_command, parent_pid=None):
             "[UPDATE DIAG] Could not start update helper: %s", exc, interval=0.0,
         )
         raise UpdateError(f"Could not start update helper: {exc}") from exc
+    # WARNING: the app quits right after this returns, so a helper that ends at once (blocked, damaged, missing file) used to leave the user with a closed app and nothing installed. Wait a moment and report it instead, so the app stays open.
+    poll = getattr(process, "poll", None)
+    if callable(poll):
+        deadline = time.monotonic() + UPDATE_HELPER_ALIVE_CHECK_S
+        while time.monotonic() < deadline:
+            code = poll()
+            if code is not None:
+                try:
+                    os.remove(pending_path)
+                except OSError:
+                    pass
+                _server_breadcrumb(
+                    log, logging.ERROR, "update-helper-ended",
+                    "[UPDATE DIAG] The update helper ended right after it started (exit code %s); the update was not installed and the app stays open", code, interval=0.0,
+                )
+                raise UpdateError(f"The update helper closed as soon as it started (exit code {code}), so nothing was installed")
+            time.sleep(0.1)
     return process.pid
 
 
@@ -789,5 +962,5 @@ __all__ = [
     "UpdateError", "parse_version", "version_is_newer", "current_version",
     "github_settings", "update_source_configured", "version_from_zip_name",
     "validate_manifest", "check_github_for_update", "check_for_update",
-    "stage_update", "background_check_loop", "launch_staged_update",
+    "stage_update", "background_check_loop", "launch_staged_update", "prune_update_folder",
 ]
