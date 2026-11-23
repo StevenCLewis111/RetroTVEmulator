@@ -464,6 +464,31 @@ STALL_STACK_REPEAT_MS = 2000
 STALL_STACK_MAX_PER_FRAME = 6
 STALL_STACK_DEPTH = 14
 
+# VALUES CHANGE HERE (owner logs 2026-11-20 and 2026-11-21: seconds between the lines that say where a new channel's first-show search is while it takes longer than this)
+NEW_CHANNEL_FIND_STACK_EVERY_S = 3.0
+
+# VALUES CHANGE HERE (owner log 2026-11-21: the longest a background scheduler call of a channel waits for the call of that channel already running before it runs beside it)
+SCHED_ONE_BUILD_WAIT_S = 20.0
+
+# VALUES CHANGE HERE (owner 2026-11-21, the playback thread: a channel change or playback step that runs longer than the first number writes one line naming how long it took; one that runs longer than the second is set aside, its call stack is written, and a fresh playback thread takes over so channel changes never stop)
+PLAYBACK_STEP_SLOW_LOG_S = 1.0
+PLAYBACK_STEP_STUCK_S = 10.0
+
+# VALUES CHANGE HERE (owner 2026-11-21: the longest a background database write (the guide's future rows) waits between its turns for the playback thread to finish a step before it takes its next turn anyway)
+PLAYBACK_STEP_ASIDE_MAX_S = 5.0
+
+# VALUES CHANGE HERE (owner 2026-11-21, "STAY ON SCHEDULE AT ALL TIMES": how far ahead, and how many items at most, the scheduler prepares each station's next items with their clock starts, so the next item, a commercial break and a channel change are answered from them; the block on air and the next blocks, up to these)
+HUB_PREPARED_AHEAD_SECONDS = 3600.0
+HUB_PREPARED_ITEMS_MAX = 240
+# VALUES CHANGE HERE (owner 2026-11-22: how many hours of each station's projected next blocks or cycles are kept in memory, so the prepared items carry on into the next block, the next day or the next Marathon cycle before it starts)
+HUB_NEXT_BLOCKS_KEEP_HOURS = 26.0
+# VALUES CHANGE HERE (owner 2026-11-21: how many of each station's prepared items get their open facts (length, loudness, picture size, file check) read ahead on a background thread, and how often one file's facts are read again)
+OPEN_FACTS_WARM_ITEMS = 4
+OPEN_FACTS_WARM_AGAIN_SECONDS = 60.0
+
+# VALUES CHANGE HERE (owner 2026-11-21: seconds the server finder listens when the Server menu opens or Server Scan is pressed; servers announce every 2 s, so this hears each at least twice)
+SERVER_SCAN_LISTEN_S = 4.5
+
 # VALUES CHANGE HERE (guide history rebuild: most recent missed block occurrences recorded per channel at a block change)
 GUIDE_REPLAY_MAX_BLOCKS = 60
 
@@ -1421,34 +1446,9 @@ NAV_DUP_PATH_MS = 50
 NAV_MOVE_MIN_MS = 150
 
 # VALUES CHANGE HERE (menu_nav.py, sliders: one left or right press moves SLIDER_STEP; each slider is (config key, value when unset, lowest, highest); the Reactive Strength slider on a music channel's editor the same way; the fastest a value control (slider, volume) may step in milliseconds, however fast the key is pressed or held, kept below the held-key repeat intervals in HOLD_RULES so a hold is never dropped)
-# VALUES CHANGE HERE (theme colour slider: the hues from the lowest to the highest number below are left off the slider track because that blue is the menu button colour and a border or highlight in it cannot be seen; the button is about 217 degrees)
-THEME_UI_HUE_SKIP_LOW = 195
-THEME_UI_HUE_SKIP_HIGH = 240
-THEME_UI_HUE_SKIP_WIDTH = THEME_UI_HUE_SKIP_HIGH - THEME_UI_HUE_SKIP_LOW + 1
-THEME_UI_POSITION_MAX = 360 - THEME_UI_HUE_SKIP_WIDTH
-
-
-def theme_ui_hue_to_position(hue):
-    """Returns where a theme hue sits on the slider track, which has the skipped blue cut out; a hue inside the blue sits at the nearer edge."""
-    if hue < THEME_UI_HUE_SKIP_LOW:
-        return hue
-    if hue > THEME_UI_HUE_SKIP_HIGH:
-        return hue - THEME_UI_HUE_SKIP_WIDTH
-    if hue - THEME_UI_HUE_SKIP_LOW >= THEME_UI_HUE_SKIP_HIGH - hue:
-        return THEME_UI_HUE_SKIP_LOW
-    return THEME_UI_HUE_SKIP_LOW - 1
-
-
-def theme_ui_position_to_hue(position):
-    """Returns the theme hue at a slider track position (0 up to THEME_UI_POSITION_MAX); never a hue in the skipped blue."""
-    position = max(0, min(THEME_UI_POSITION_MAX, position))
-    return position if position < THEME_UI_HUE_SKIP_LOW else position + THEME_UI_HUE_SKIP_WIDTH
-
-
-def theme_ui_hue_clear(hue, direction=0):
-    """Returns the theme colour hue moved out of the skipped blue band, to the nearer edge."""
-    return theme_ui_position_to_hue(theme_ui_hue_to_position(hue))
-
+# VALUES CHANGE HERE (theme colour, owner 2026-11-21: the border/text colour slider has every hue; the blue, red, green and yellow buttons turn away from that colour instead, so a border or highlight is never the colour of the button it is on; the hue each colour of button sits at, and the fewest degrees kept between the highlight and the buttons: as the highlight comes nearer than that, the buttons of that colour move to keep the gap, and they jump to the far side when the highlight crosses their resting hue)
+THEME_BUTTON_FAMILY_REST = {"blue": 218, "red": 354, "green": 134, "yellow": 47}
+THEME_BUTTON_HUE_SAFE_GAP = 30
 
 SLIDER_STEP = 5
 SLIDER_SPECS = {
@@ -2715,6 +2715,8 @@ CRASH_RESTART_FLAGS = 14
 CAPTION_FILE_BUILD_TRIES = 2
 # VALUES CHANGE HERE (seconds the separate caption-model process may take to load the model before it counts as stuck; owner 2026-11-09)
 CAPTION_WORKER_START_SECONDS = 240
+# VALUES CHANGE HERE (seconds the program waits for a caption process whose link closed without an answer to end, so a crash while loading is told apart from a process that is still running)
+CAPTION_WORKER_EXIT_WAIT_S = 3.0
 # VALUES CHANGE HERE (banner shown when Live Captions are switched off because the caption model crashed; 'CAPTION_MEMORY_BANNER_LABEL' is the one for lack of memory)
 CAPTION_CRASH_BANNER_LABEL = "LIVE CAPTIONS TURNED OFF: THE CAPTION MODEL CRASHED"
 # VALUES CHANGE HERE (banner shown when Live Captions are switched off because this PC decodes them slower than the show plays)
@@ -4298,6 +4300,44 @@ def tune_in_progress():
     return time.monotonic() < _gate_state["tune_until"]
 
 
+# ============================================================================
+# SECTION: Time-critical threads (the screen thread and the playback thread)
+# ============================================================================
+
+_time_critical_idents = set()
+
+
+def mark_time_critical_thread(on=True):
+    """Marks the calling thread as one that never waits on background work (the playback thread), or takes the mark off again; the screen thread always is one."""
+    if on:
+        _time_critical_idents.add(threading.get_ident())
+    else:
+        _time_critical_idents.discard(threading.get_ident())
+
+
+def is_time_critical_thread():
+    """True on the screen thread and on any thread marked with mark_time_critical_thread."""
+    return threading.current_thread() is threading.main_thread() or threading.get_ident() in _time_critical_idents
+
+
+def is_marked_time_critical_thread():
+    """True only on a thread marked with mark_time_critical_thread (the playback thread)."""
+    return threading.get_ident() in _time_critical_idents
+
+
+_playback_step = {"running": False}
+
+
+def note_playback_step(running):
+    """Called by the playback thread: True while it changes a channel or opens the next item, False when that step is done."""
+    _playback_step["running"] = bool(running)
+
+
+def playback_needs_the_pc():
+    """True while background work should step aside for playback: the playback thread is working on a step, or a channel tune holds background work."""
+    return _playback_step["running"] or tune_in_progress()
+
+
 def register_throttle(throttle):
     _gate_state["throttle"] = throttle
 
@@ -4386,7 +4426,7 @@ def lane_held(lane):
 
 def _is_priority_context():
     # WARNING: the UI thread must never wait on a gate; it must count as priority.
-    return getattr(_gate_tls, "depth", 0) > 0 or threading.current_thread() is threading.main_thread()
+    return getattr(_gate_tls, "depth", 0) > 0 or is_time_critical_thread()
 
 
 @contextlib.contextmanager
@@ -4428,7 +4468,7 @@ def gate(lane, priority=False, timeout=None, label=""):
 
         def _may_start():
             level = current_level()
-            return ((lane == "whisper_slots" or not tune_in_progress()) and scan_throttle_mode() != "stopped"
+            return ((lane == "whisper_slots" or not playback_needs_the_pc()) and scan_throttle_mode() != "stopped"
                     and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))
                     and _activity.try_begin(lane, _lane_limit(lane, level)))
         admitted = _may_start()

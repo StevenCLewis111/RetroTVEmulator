@@ -641,10 +641,6 @@ def _slider_move(store, spec, direction):
         return False
     key, default, low, high = spec
     step = SLIDER_STEP if direction == RIGHT else -SLIDER_STEP
-    if key == "theme_ui_hue" and _governor is not None:
-        position = _governor.theme_ui_hue_to_position(store.get(key, default)) + step
-        store[key] = _governor.theme_ui_position_to_hue(max(0, (position // SLIDER_STEP) * SLIDER_STEP))
-        return True
     moved = store.get(key, default) + step
     store[key] = max(low, min(high, (moved // SLIDER_STEP) * SLIDER_STEP))
     return True

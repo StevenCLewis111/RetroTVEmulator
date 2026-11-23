@@ -4772,7 +4772,7 @@ def suite_static_sound_on_grey():
     check("_stop_transition_static()" not in grey_branch and "_static_sound_stop(" not in grey_branch,
           "the grey screen of a channel airing Static does not stop its noise (it fought the Static sound play every frame and cut the sound)")
     play = src.index("# WARNING: a channel airing Static keeps its noise under menus")
-    check("_static_sound_play()" in src[play:play + 800] and 'current_playback_state.get("mode") == "Static"' in src[play:play + 800],
+    check("_static_sound_play()" in src[play:play + 1000] and 'current_playback_state.get("mode") == "Static"' in src[play:play + 1000],
           "a channel airing Static still plays its noise every frame it is on air")
 
 
@@ -4902,7 +4902,9 @@ def suite_tune_priority():
     check(pg._gate_state["tune_settling_since"] is None, "and the settling ends then")
     pg._gate_state["tune_until"] = 0.0
     gate_src = read(_script("performance_governor.py"))
-    check("return ((lane == \"whisper_slots\" or not tune_in_progress()) and scan_throttle_mode() != \"stopped\"" in gate_src, "a background gate does not admit new work while a tune is in progress")
+    check("return ((lane == \"whisper_slots\" or not playback_needs_the_pc()) and scan_throttle_mode() != \"stopped\"" in gate_src
+          and "return _playback_step[\"running\"] or tune_in_progress()" in gate_src,
+          "a background gate does not admit new work while a tune is in progress or the playback thread works on a step")
     cc = MAIN_SRC[MAIN_SRC.index("def change_channel("):]
     check(cc.index("performance_governor.hold_background_for_tune()") < cc.index("t_state = calculate_slotted_playback_state("),
           "a channel change starts the hold before the show is opened")
@@ -4937,7 +4939,8 @@ def suite_new_channel_first_show():
     ns = {"threading": threading, "time": time, "os": os, "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None),
           "_app_shutting_down": threading.Event(), "_cached_path_exists": lambda p: True,
           "_read_file_probe_facts": lambda p: {}, "_scan_duration_reported": lambda facts, has: False,
-          "_governor_priority_scope": lambda: contextlib.nullcontext(), "_note_scan_work_added": lambda: None}
+          "_governor_priority_scope": lambda: contextlib.nullcontext(), "_note_scan_work_added": lambda: None,
+          "performance_governor": None, "sys": sys}
     exec(code, ns)
     ns["calculate_slotted_playback_state"] = lambda ch: {"file": "D:/movies/%s_first.mp4" % ch, "block": "Full Day"}
     def _dur(kind, ch, block, path):
@@ -5095,7 +5098,7 @@ def suite_scan_turns():
         pg.set_game_active(False)
     check(not pg.game_needs_all() and pg.scan_threads() >= 1, "leaving the game returns to normal")
     gate_src = read(_script("performance_governor.py"))
-    check("and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))" in gate_src and "not tune_in_progress()" in gate_src,
+    check("and (lane not in FFMPEG_SCAN_LANES or ffmpeg_scans_running() < ffmpeg_scans_at_once(level))" in gate_src and "not playback_needs_the_pc()" in gate_src,
           "background scan work may not start past the overall cap (the PC's peak, narrowed with the level) or during a tune; priority work never waits")
     slot = gate_src[gate_src.index("def scan_thread_slot"):]
     slot = slot[:slot.index("def scan_gpu_decode_allowed")]
@@ -5111,7 +5114,7 @@ def suite_scan_turns():
     check('performance_governor.scan_throttle_mode() == "stopped"' in pause and "or _is_game_actively_playing()" in MAIN_SRC[MAIN_SRC.index("def _python_heavy_should_pause"):MAIN_SRC.index("def _background_scan_pace_seconds")],
           "scans stop for a game only when the governor says stopped; Python-heavy work still waits for the whole game")
     fut = MAIN_SRC[MAIN_SRC.index("def _hub_future_worker"):]
-    check("if _python_heavy_should_pause():" in fut[:3000], "the future guide rows wait for the whole game")
+    check("if _python_heavy_should_pause() or _server_work_should_yield():" in fut[:3000], "the future guide rows wait for the whole game")
     check("performance_governor.set_game_active(_is_game_actively_playing())" in MAIN_SRC
           and "_gov.note_game_tick(self._gft_runs > 1)" in read(_script("game_deck.py")),
           "the governor knows when a game runs and how its frames keep up")
@@ -6671,6 +6674,12 @@ SCHED_RECORD_FUNCS = [
 ]
 
 SCHED_RECORD_ENGINE_STUBS = {
+    "_time_critical_thread": lambda: False,
+    "_publish_prepared_items": lambda *a, **k: None,
+    "_keep_next_blocks": lambda *a, **k: None,
+    "_scheduler_prepared": {},
+    "_warm_open_facts": lambda *a, **k: None,
+    "OPEN_FACTS_WARM_ITEMS": 4,
     "_background_scan_should_pause": lambda: False,
     "_governor_level_if_enforcing": lambda: None,
     "_is_game_actively_playing": lambda: False,
@@ -7461,7 +7470,8 @@ def _surf_ns(active, current="05", game=True, guide=True, music_busy=False, mode
           "calculate_slotted_playback_state": lambda ch: {"mode": mode, "file": "/m/song.mp3"},
           "_drop_channel_loads": lambda reason: calls.setdefault("dropped", []).append(reason),
           "change_channel": lambda ch, **k: (calls["change"].append((ch, k)),
-                                             state.update(surf_origin="", surf_leave_position=None))}
+                                             state.update(surf_origin="", surf_leave_position=None)),
+          "_post_to_playback_thread": lambda *a, **k: False, "playback_busy": lambda: False}
     for name in ("_vlc_mrl_path", "_surf_allowed_channels", "_surf_origin_active", "_surf_cancel", "_surf_capture_leave_position",
                  "_surf_begin_quiet", "_surf_step", "_surf_digit_typed", "_typed_channel_valid", "_tune_after_flip", "_surf_commit_if_due",
                  "_surf_recover_if_stuck", "_bezel_led_channel_text", "_configured_transition_style"):
@@ -7577,7 +7587,7 @@ def suite_channel_surf():
     cc = get_function_source("change_channel")
     check(cc.count('app_state["surf_target"] = ""') == 1 and cc.index('app_state["osd_channel_pending"] = False') < cc.index('app_state["surf_target"] = ""')
           and 'app_state["surf_origin"] = ""' in cc, "any real tune clears a flip in progress")
-    check('app_state.get("surf_origin") != "03"' in cc and "_quiet_game_channel()" in cc, "leaving the game channel after a flip does not pause it a second time")
+    check('app_state.get("surf_origin") != "03"' in cc and "_run_on_screen_thread(_quiet_game_channel)" in cc, "leaving the game channel after a flip does not pause it a second time")
     check("pre_captured_position.get(\"wall_start\"" in cc and "pre_captured_position.get(\"written_at\"" in cc, "a flip's saved leave time is the one written into the anchor")
 
     loop = src[src.index("while True:"):]
@@ -11049,9 +11059,9 @@ def suite_hub_airing_entry():
             def __getattr__(self, name):
                 return getattr(real_hub, name)
 
-            def at(self, channel, epoch):
+            def at(self, channel, epoch, busy=None):
                 asked.append((channel, epoch))
-                return real_hub.at(channel, epoch)
+                return real_hub.at(channel, epoch, busy=busy)
 
         ml.shared_schedule_hub = lambda: CountingHub()
         infos, warnings = [], []
@@ -11578,12 +11588,12 @@ def suite_hub_future_worker():
               "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]),
               "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
               "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
-              "_HUB_FUTURE_HOURS_AHEAD": 24.0, "_hub_future_lengths_due": lambda info, since: lengths_due["now"]}
+              "_HUB_FUTURE_HOURS_AHEAD": 24.0, "_hub_future_lengths_due": lambda info, since: lengths_due["now"], "_hub_next_blocks": {}, "HUB_NEXT_BLOCKS_KEEP_HOURS": 26.0}
         _hub_mode_ns(ns)
         ns["db"] = sns["db"]
         ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
         ns["_GUIDE_LIVE_HOURS"] = 24.0
-        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel"):
+        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel", "_keep_next_blocks"):
             exec(main_function_code(name), ns)
         ns["_missed_block_day_seeds"] = sns["_missed_block_day_seeds"]
         ns["_hub_future_state"] = {}
@@ -11653,12 +11663,12 @@ def suite_hub_future_holiday_rows():
                   "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]),
                   "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: warnings.append(a)),
                   "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
-                  "_HUB_FUTURE_HOURS_AHEAD": 70.0, "_hub_future_lengths_due": lambda info, since: False}
+                  "_HUB_FUTURE_HOURS_AHEAD": 70.0, "_hub_future_lengths_due": lambda info, since: False, "_hub_next_blocks": {}, "HUB_NEXT_BLOCKS_KEEP_HOURS": 26.0}
             _hub_mode_ns(ns)
             ns["db"] = sns["db"]
             ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
             ns["_GUIDE_LIVE_HOURS"] = 24.0
-            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel"):
+            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel", "_keep_next_blocks"):
                 exec(main_function_code(name), ns)
             ns["_hub_future_state"], ns["_hub_future_logged"] = {}, {}
             run = ns["_hub_future_for_channel"]
@@ -11750,7 +11760,7 @@ class TestHubPlaybackDoor(unittest.TestCase):
     def _ns(self, calls, clock):
         import types, time, logging
         hub = __import__("media_library").ScheduleHub.__new__(__import__("media_library").ScheduleHub)
-        hub._show_facts = {}
+        hub._show_facts, hub._upcoming = {}, {}
         ml = types.SimpleNamespace(shared_schedule_hub=lambda: hub)
         def sched(ch, a=False, b=False, c=False):
             calls.append((ch, a, b, c))
@@ -11758,11 +11768,21 @@ class TestHubPlaybackDoor(unittest.TestCase):
         ns = {"app_state": {}, "time": time, "log": logging.getLogger("t"), "db": None, "_log_warn_throttled": lambda *a, **k: None,
               "broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: clock[0], toordinal=lambda: 1)),
               "_scheduler_playback_state": sched, "_hub_miss_logged": {}, "threading": threading,
-              "_screen_scheduler_answers": {}, "SCREEN_SCHEDULER_ASK_GAP_S": 0.5, "_log_swallowed": lambda *a: None}
+              "_screen_scheduler_answers": {}, "SCREEN_SCHEDULER_ASK_GAP_S": 0.5, "_log_swallowed": lambda *a: None,
+              "_scheduler_prepared": {}}
         import sys
         sys.modules.setdefault("media_library", __import__("media_library"))
         for name in ("_hub_playback_guard", "calculate_slotted_playback_state", "_hub_miss_log_once", "_hub_remember_state", "_screen_scheduler_answer"):
             exec(get_function_source(name), ns)
+        _door = ns["calculate_slotted_playback_state"]
+
+        def _off_screen(*a, **k):
+            out = []
+            t = threading.Thread(target=lambda: out.append(_door(*a, **k)))
+            t.start()
+            t.join()
+            return out[0]
+        ns["calculate_slotted_playback_state"] = _off_screen
         return ns, hub, ml
 
     def test_hit_is_clock_math_and_miss_asks_the_scheduler(self):
@@ -11780,10 +11800,12 @@ class TestHubPlaybackDoor(unittest.TestCase):
             self.assertAlmostEqual(second["seek"], 130.0)
             clock[0] = 1030.0
             ns["calculate_slotted_playback_state"]("05", snap_internal_advance=True)
-            self.assertEqual(len(calls), 2, "an advance request always reaches the scheduler")
+            self.assertEqual(len(calls), 1, "an advance reads the hub too (owner 2026-11-21: prepared, never looked up at the last minute)")
+            ns["calculate_slotted_playback_state"]("05", trust_recent_stop=True)
+            self.assertEqual(len(calls), 2, "a recent-stop request reaches the scheduler, which reads the player")
             clock[0] = 1000.0 + 1500.0
             ns["calculate_slotted_playback_state"]("05")
-            self.assertEqual(len(calls), 3, "when the show runs out the hub asks the scheduler again")
+            self.assertEqual(len(calls), 3, "when the show runs out with nothing prepared the hub asks the scheduler again")
         finally:
             media_library.shared_schedule_hub = orig
 
@@ -11820,11 +11842,12 @@ class TestHubWriterTick(unittest.TestCase):
     def test_writer_step_refreshes_the_hubs_record(self):
         import types, media_library
         hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
-        hub._show_facts = {}
+        hub._show_facts, hub._upcoming = {}, {}
         calls = []
         ns = {"broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 500.0, toordinal=lambda: 1)),
               "_scheduler_playback_state": lambda ch: (calls.append(ch), {"mode": "Video", "file": "/m/a.mkv", "seek": 10.0, "duration": 1500.0})[1],
-              "_hub_playback_guard": lambda ch: ("g",), "_log_warn_throttled": lambda *a, **k: None, "time": __import__("time"), "_hub_writer_checked": {}}
+              "_hub_playback_guard": lambda ch: ("g",), "_log_warn_throttled": lambda *a, **k: None, "time": __import__("time"), "_hub_writer_checked": {},
+              "_scheduler_prepared": {}, "_warm_open_facts": lambda *a: None, "OPEN_FACTS_WARM_ITEMS": 4}
         for name in ("_hub_remember_state", "_hub_writer_step"):
             exec(get_function_source(name), ns)
         orig = media_library.shared_schedule_hub
@@ -11843,7 +11866,7 @@ class TestHubWriterSkipsValidChannels(unittest.TestCase):
     def test_next_stale_skips_valid_and_recently_checked(self):
         import types, media_library
         hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
-        hub._show_facts = {}
+        hub._show_facts, hub._upcoming = {}, {}
         hub.remember_show_facts("06", {"mode": "Video", "file": "x", "seek": 0.0, "duration": 1500.0}, 100.0, ("g",))
         import time
         ns = {"time": time, "db": types.SimpleNamespace(channels_db={c: {"active": True} for c in ("05", "06", "07", "08")}),
@@ -11878,7 +11901,7 @@ class TestGridFollowsTheHub(unittest.TestCase):
         src = get_function_source("_replan_hub_future_soon")
         self.assertLess(src.index("_hub_writer_step(ch_str)"), src.index("_hub_future_for_channel(ch_str, force=True)"))
         self.assertIn("_guide_dirty_event.set()", src)
-        self.assertIn("_replan_hub_future_soon(ch_str)", get_function_source("_request_schedule_rebuild"))
+        self.assertIn("_hub_future_check_soon()", get_function_source("_request_schedule_rebuild"))
 
 
 
@@ -12738,7 +12761,7 @@ class TestTheFirstShowGetsAllThreeScansAhead(unittest.TestCase):
             self.assertEqual(calls, [])
 
     def test_the_first_show_worker_starts_it_after_length_and_picture_box(self):
-        worker = MAIN_SRC[MAIN_SRC.index("first show %s scanned ahead of the other scans"):][:400]
+        worker = MAIN_SRC[MAIN_SRC.index("first show %s scanned ahead of the other scans"):][:600]
         self.assertIn("_first_show_loudness(_ch, _block, _path)", worker)
 
 
@@ -16056,7 +16079,8 @@ def suite_schedule_rebuild_in_flight():
     start = MAIN_SRC.index("# SECTION: Schedule rebuild in-flight guard")
     start = MAIN_SRC.rfind("# ====", 0, start)
     end = MAIN_SRC.index("def _apply_scheduling_mode_change(ch_info, new_mode, target_ch_str):")
-    guard_ns = {"threading": _threading, "functools": _functools}
+    guard_ns = {"threading": _threading, "functools": _functools, "performance_governor": None, "log": logging.getLogger("t"),
+                "_time_critical_thread": lambda: _threading.current_thread() is _threading.main_thread()}
     exec(compile(MAIN_SRC[start:end], "<extracted:in-flight guard>", "exec"), guard_ns)
     guard = guard_ns["_sched_rebuild_guard"]
     running = guard_ns["_sched_rebuild_is_running"]
@@ -20263,6 +20287,7 @@ def suite_next_item_prep():
            "performance_governor": types.SimpleNamespace(first_start_scan_plan=lambda: (False, "weak PC")),
            "_log_swallowed": lambda where, error: None, "_picture_box_done": {norm("/tv/done.mkv")}, "_scan_pb_has_box": set(),
            "_cached_path_exists": lambda p: True, "_season_guess_warm": lambda p: None,
+           "_warm_open_facts": lambda ch, paths: None, "OPEN_FACTS_WARM_ITEMS": 4,
            "_next_item_prep_plan": lambda ch, f: ([norm("/ads/a.mp4"), norm("/tv/done.mkv"), norm("/tv/next.mkv")], ns2.get("_break_near_for_test", False)),
            "_picture_box_before_loudness": lambda p: scanned.append((p, threading.current_thread().name)),
            "log": types.SimpleNamespace(info=lambda msg, *a: infos.append(msg % a), warning=lambda msg, *a: infos.append(msg % a))}
@@ -20711,7 +20736,7 @@ def suite_stages_b_to_f():
     """V295 stages B to F (owner 2026-11-02 audit items N3, N5, N6, N8, N9, N10, N11, N12 and the slot mode display)."""
     src = MAIN_SRC
     check("_dispatch_content_activation(_ms_open)" in src, "N5: the next item of a channel on air opens on the content-activate thread")
-    check("_dispatch_content_activation(\n                        lambda _f=_bg_file" in src, "N5: a background advance under a menu opens there too")
+    check("_dispatch_content_activation(\n                lambda _f=_bg_file" in get_function_source("_advance_background_channel"), "N5: a background advance under a menu opens there too")
     import pygame as _pg
     calls = []
     real_ss = _pg.transform.smoothscale
@@ -20924,32 +20949,86 @@ class TestGovernorOwnLoad(_SectionCase):
         self.run_section(suite_governor_own_load)
 
 
-class TestThemeColourSkipsTheButtonBlue(unittest.TestCase):
-    """Owner 2026-11-08: the theme colour slider steps over the blue of the menu buttons, and a saved colour in that blue is moved out of it."""
+class TestThemeColourHasEveryHueAndTheButtonsTurnAway(unittest.TestCase):
+    """Owner 2026-11-21: the border/text colour slider has every hue again; the blue menu buttons turn inside the blue to stay a safe distance from it, jumping to the far side when it crosses their resting hue."""
 
-    def test_the_slider_moves_one_step_at_a_time_and_never_lands_in_the_blue(self):
+    def test_the_slider_steps_through_every_hue(self):
         config, seen = {"theme_ui_hue": 0}, []
         for _ in range(80):
             mn.slider_adjust(config, "ui_hue", mn.RIGHT)
-            seen.append(gov.theme_ui_hue_to_position(config["theme_ui_hue"]))
-        self.assertTrue(all(b - a in (0, gov.SLIDER_STEP, gov.THEME_UI_POSITION_MAX - a) for a, b in zip(seen, seen[1:])))
-        for _ in range(80):
-            mn.slider_adjust(config, "ui_hue", mn.LEFT)
-            self.assertFalse(gov.THEME_UI_HUE_SKIP_LOW <= config["theme_ui_hue"] <= gov.THEME_UI_HUE_SKIP_HIGH)
-        self.assertEqual(config["theme_ui_hue"], 0)
+            seen.append(config["theme_ui_hue"])
+        self.assertEqual(seen[:72], list(range(5, 365, 5)))
+        self.assertEqual(seen[-1], 360)
+        self.assertIn(215, seen)
 
-    def test_the_track_and_knob_use_the_same_cut_out_blue(self):
+    def test_the_track_draws_every_hue_and_a_saved_blue_is_kept(self):
         ui_text = read(_script("ui.py"))
-        self.assertIn("_theme_track_hue(i / float(slider_width))", ui_text)
-        self.assertIn("_theme_track_fraction(ui_hue)", ui_text)
-        for hue in (0, 190, 241, 360):
-            self.assertEqual(gov.theme_ui_position_to_hue(gov.theme_ui_hue_to_position(hue)), hue)
+        self.assertNotIn("_cached_ui_gradient_surf", ui_text)
+        self.assertIn("ui_knob_x = slider_x + int((ui_hue / 360.0) * slider_width)", ui_text)
+        self.assertNotIn("theme_ui_hue_clear", read(_script("media.py")))
+        self.assertFalse(hasattr(gov, "THEME_UI_HUE_SKIP_LOW"))
 
-    def test_a_saved_colour_in_the_blue_is_moved_out(self):
-        for hue in range(gov.THEME_UI_HUE_SKIP_LOW, gov.THEME_UI_HUE_SKIP_HIGH + 1):
-            cleared = gov.theme_ui_hue_clear(hue)
-            self.assertTrue(cleared < gov.THEME_UI_HUE_SKIP_LOW or cleared > gov.THEME_UI_HUE_SKIP_HIGH)
-        self.assertEqual(gov.theme_ui_hue_clear(140), 140)
+    def test_every_colour_of_button_keeps_the_safe_gap_from_every_hue(self):
+        import ui
+        rests, gap = gov.THEME_BUTTON_FAMILY_REST, gov.THEME_BUTTON_HUE_SAFE_GAP
+        self.assertEqual((ui.THEME_BUTTON_FAMILY_REST, ui.THEME_BUTTON_HUE_SAFE_GAP), (rests, gap))
+        self.assertEqual(set(rests), set(ui._BUTTON_FAMILIES))
+        for family, rest in rests.items():
+            for tenth in range(0, 3600, 7):
+                hue = tenth / 10.0
+                shift = ui.theme_button_hue_shift(hue, rest)
+                apart = abs(((hue - (rest + shift) + 180) % 360) - 180)
+                self.assertGreaterEqual(apart + 1e-9, gap, (family, hue))
+                self.assertLessEqual(abs(shift), gap, (family, hue))
+        self.assertEqual(ui.theme_button_hue_shift(140, 218), 0, "far from blue: plain button blue")
+        self.assertEqual(ui.theme_button_hue_shift(208, 218), 20, "a highlight just under pushes the buttons up")
+        self.assertEqual(ui.theme_button_hue_shift(218, 218), -gap, "the jump at the resting hue")
+        self.assertEqual(ui.theme_button_hue_shift(4, 354), -20, "red wraps past 360")
+
+    def test_each_rest_is_the_hue_of_its_buttons(self):
+        import ui, colorsys
+        for family, names in ui._BUTTON_FAMILIES.items():
+            for name in names:
+                h = colorsys.rgb_to_hsv(*[c / 255.0 for c in ui._BUTTON_BASE[name]])[0] * 360
+                self.assertLess(abs(((h - gov.THEME_BUTTON_FAMILY_REST[family]) + 180) % 360 - 180), 12, name)
+
+    def test_the_colours_follow_the_shift_and_come_back(self):
+        import ui, colorsys
+        base = dict(ui._BUTTON_BASE)
+        try:
+            for family, names in ui._BUTTON_FAMILIES.items():
+                ui.sync_button_colors(100 if family != "green" else 300)
+                ui.sync_button_colors(gov.THEME_BUTTON_FAMILY_REST[family] + 5)
+                for name in names:
+                    h0, s0, v0 = colorsys.rgb_to_hsv(*[c / 255.0 for c in base[name]])
+                    h1, s1, v1 = colorsys.rgb_to_hsv(*[c / 255.0 for c in getattr(ui, name)])
+                    self.assertAlmostEqual(((h1 - h0) * 360 + 180) % 360 - 180, -25, delta=2.5, msg=name)
+                    self.assertAlmostEqual(v1, v0, delta=0.01)
+            ui.sync_button_colors(gov.THEME_BUTTON_FAMILY_REST["blue"] + 5)
+            self.assertEqual(ui._system_row_color("send_logs", None), ui.COLOR_MENU_BUTTON_BLUE)
+            self.assertNotEqual(ui.COLOR_MENU_BUTTON_BLUE, base["COLOR_MENU_BUTTON_BLUE"])
+            self.assertEqual(ui._system_row_color("exit_program", "red"), "red")
+            self.assertEqual(ui.COLOR_BUTTON_CLOSE, base["COLOR_BUTTON_CLOSE"], "red is far from blue and stays")
+        finally:
+            ui.sync_button_colors(140)
+        ui.sync_button_colors(100)
+        for name in ui._BUTTON_BASE:
+            self.assertEqual(getattr(ui, name), base[name], name)
+
+    def test_the_main_loop_sets_them_every_frame(self):
+        self.assertIn('ui.sync_button_colors(db.config.get("theme_ui_hue", 140))', MAIN_SRC)
+
+    def test_every_yes_no_popup_is_the_shared_one_with_the_theme_border(self):
+        ui_text = read(_script("ui.py"))
+        body = ui_text[ui_text.index("def draw_popup_yes_no("):]
+        body = body[:body.index("\n\n\n")]
+        self.assertNotIn("COLOR_TEXT_WHITE", body.split('"""')[2])
+        deck = read(_script("game_deck.py"))
+        self.assertEqual(deck.count("_ui.draw_popup_yes_no(screen, cx, btn_y, self."), 3)
+        for name in ("COLOR_BUTTON_YES", "COLOR_BUTTON_NO", "COLOR_BUTTON_CLOSE", "COLOR_GAME_SWITCH_ON", "COLOR_GAME_SWITCH_OFF",
+                     "COLOR_GAME_OFF_RED", "COLOR_GAME_PLAYER_BOX_ARMED", "COLOR_GAME_VALUE_BOX_ACTIVE"):
+            self.assertNotIn("_gov." + name, deck)
+        self.assertEqual(deck.count("import ui as _ui"), 1)
 
 
 class TestClipEndingBeforeItsSlotWaits(unittest.TestCase):
@@ -21108,7 +21187,7 @@ class TestHubInteriorCutAndRepeatStores(unittest.TestCase):
     def _hub(self):
         import media_library
         hub = media_library.shared_schedule_hub()
-        hub._show_facts = {}
+        hub._show_facts, hub._upcoming = {}, {}
         return hub
 
     def test_interior_cut_show_is_answered_by_the_hub(self):
@@ -22734,6 +22813,7 @@ class TestUserFallsBackWhenTheServerIsLost(unittest.TestCase):
         ns["post_status_notice"] = lambda text: ns["calls"].append(("notice", text))
         ns["_remember_channel_on_server"] = lambda: None
         ns["_arm_server_reconnect"] = lambda name: ns.setdefault("armed", []).append(name)
+        ns["_discovered_server_entries"] = lambda: (ns["db"].server_listener.get_discovered_entries() if ns["db"].server_listener is not None else [])
         ns.update(extra)
         for name in ("_remote_slot_missing_from_discovery", "_fall_back_from_remote_server", "_remote_server_lost_tick"):
             match = re.search(r"^def %s\(.*?(?=^\S)" % name, MAIN_SRC, re.S | re.M)
@@ -23974,6 +24054,7 @@ class TestResetServerRemovesTheServerAndNeverOpensEditing(unittest.TestCase):
         body = re.search(r"^def _execute_server_reset\(.*?(?=^\S)", MAIN_SRC, re.S | re.M).group(0)
         ns = {"db": rdb, "app_state": {"active_local_profile": "server1" if open_it else None}, "log": logging.getLogger("t_reset"),
               "_set_scanned_servers": lambda e: calls.append("scan"), "_local_server_entries": lambda: [], "get_server_picker_entries": lambda d: [],
+              "request_server_scan": lambda why: calls.append("scan"),
               "_log_swallowed": lambda *a, **k: None, "_remove_server_sharing": lambda *a, **k: None,
               "_forget_server_pick": lambda: calls.append("forget"), "_reconcile_server_service": lambda *a, **k: calls.append("reconcile"),
               "_restart_playback_after_source_change": lambda reason, restore_channel=False, target_channel=None: calls.append(("restart", restore_channel))}
@@ -24036,6 +24117,7 @@ class TestAServerNameAnotherBuildUsesIsRedAndRefused(unittest.TestCase):
             config = {"server_slots": dict(slots)}
             server_listener = _L()
         ns = {"db": _Db(), "app_state": {}, "_log_swallowed": lambda *a, **k: None}
+        ns["_discovered_server_entries"] = lambda: ns["db"].server_listener.get_discovered_entries()
         for fn in ("_server_name_in_use_elsewhere", "_default_server_name", "_server_name_taken_tick"):
             body = re.search(r"^def %s\(.*?(?=^\S)" % fn, MAIN_SRC, re.S | re.M).group(0)
             exec(compile(body, fn, "exec"), ns)
@@ -25958,7 +26040,7 @@ class TestTuneHoldPausesEverythingUntilTheChannelHasPlayed(unittest.TestCase):
     def test_the_caption_lane_is_not_held_by_the_other_work_hold(self):
         import inspect
         import performance_governor as pg
-        self.assertIn('lane == "whisper_slots" or not tune_in_progress()', inspect.getsource(pg.gate))
+        self.assertIn('lane == "whisper_slots" or not playback_needs_the_pc()', inspect.getsource(pg.gate))
 
     def test_a_caption_chunk_waits_out_the_tune_hold_then_goes(self):
         calls = {"n": 0}
@@ -26023,7 +26105,7 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
     def _prime_ns(self, states, plans, calls, now_holder=None):
         src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
         start = src.index("_prime_wake = threading.Event()")
-        end = src.index("def _server_channel_warm_worker():")
+        end = src.index("def _server_channel_warm_worker(stop):")
 
         class _Relay:
             @staticmethod
@@ -26167,7 +26249,7 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
 
     def test_the_warm_worker_primes_every_interval_and_when_woken(self):
         src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
-        worker = src[src.index("def _server_channel_warm_worker():"):][:2600]
+        worker = src[src.index("def _server_channel_warm_worker(stop):"):][:2600]
         self.assertIn("_prime_channels_pass()", worker)
         self.assertIn("_prime_wake.wait(", worker)
         self.assertIn("_prime_wake.set()", src[src.index("def _start_airing_warm("):][:600])
@@ -27083,7 +27165,7 @@ class TestNoStaticWhileAPickedServersFirstScheduleIsOnItsWay(unittest.TestCase):
     def test_wired_into_the_picture_and_the_static_sound_and_the_governor(self):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
         self.assertIn('elif current_playback_state["mode"] == "Static" and (_awaiting_first_server_schedule()\n                or _local_profile_still_loading(("live", str(ch)), current_playback_state.get("reason"))):\n            screen.fill(COLOR_SCREEN_BLACK)', src)
-        self.assertIn("and not _awaiting_first_server_schedule()\n            and not _local_profile_still_loading((\"live\", str(ch)), current_playback_state.get(\"reason\"))\n            and not (_regular_channel_still_loading(ch, current_playback_state.get(\"reason\")) and _configured_transition_style() != \"static\")\n            and pygame.time.get_ticks() >= app_state.get(\"channel_switch_black_until\", 0)", src)
+        self.assertIn("and not _awaiting_first_server_schedule()\n            and not _local_profile_still_loading((\"live\", str(ch)), current_playback_state.get(\"reason\"))\n            and not (_regular_channel_still_loading(ch, current_playback_state.get(\"reason\")) and _configured_transition_style() != \"static\")\n            and not (current_playback_state.get(\"reason\") == SCHEDULE_PENDING_REASON and _configured_transition_style() != \"static\")\n            and pygame.time.get_ticks() >= app_state.get(\"channel_switch_black_until\", 0)", src)
         self.assertIn('app_state["_remote_schedule_received"] = True\n            log.info(\n                "Remote schedule applied "', src)
         self.assertEqual(gov.SERVER_FIRST_SCHEDULE_WAIT_SECONDS, 10.0)
 
@@ -27627,7 +27709,8 @@ class TestVlcPlayerCallsAreMadeOneAtATime(unittest.TestCase):
         warnings = []
         ns = {"threading": threading, "time": time, "health_monitor": health, "_VLC_GETTER_WAIT_S": getter_wait,
               "_VLC_MAIN_CALL_WAIT_S": main_wait, "_VLC_CALL_WAIT_S": call_wait,
-              "_log_warn_throttled": lambda key, msg, *a, **k: warnings.append(key)}
+              "_log_warn_throttled": lambda key, msg, *a, **k: warnings.append(key),
+              "_time_critical_thread": lambda: threading.current_thread() is threading.main_thread()}
         exec(body, ns)
         return ns["_SerializedVlcPlayer"], warnings
 
@@ -28230,7 +28313,7 @@ class TestShellModeRestartRecovery(unittest.TestCase):
     def test_the_crop_call_cannot_hold_the_screen_thread(self):
         body = MAIN_SRC[MAIN_SRC.index("def _set_crop_geometry(self, geometry):"):][:1400]
         self.assertIn('getattr(self, "_wedged", False)', body)
-        self.assertIn("_t.join(0.15 if threading.current_thread() is threading.main_thread() else 1.5)", body)
+        self.assertIn("_t.join(0.15 if _time_critical_thread() else 1.5)", body)
 
 
 class TestShellModeUpdateRestartsTheComputer(unittest.TestCase):
@@ -28670,7 +28753,7 @@ class TestOtherServerChannelsAreWarmedBeforeAVisit(unittest.TestCase):
         src = self._src()
         run = src.split("def _warm_remote_schedule_paths", 1)[1].split("def _warm_now_playing_share_file", 1)[0]
         self.assertIn("_warm_other_server_channels_pass()", run)
-        self.assertIn('target=_server_channel_warm_worker, daemon=True, name="ServerChannelWarm"', src)
+        self.assertIn('_server_worker_set("ServerChannelWarm", _server_channel_warm_worker,', src)
 
     def test_the_governor_numbers_match_the_fallbacks(self):
         import performance_governor as pg
@@ -29586,7 +29669,7 @@ class TestProfileViewedHereIsAWatchingUser(unittest.TestCase):
         self.assertIn("server_scanner.read_local_watching(base_dir)", src)
         self.assertIn("is not None)", src[src.index("streaming_fn="):][:200])
         main = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
-        self.assertIn('name="LocalProfileWatch"', main)
+        self.assertIn('_server_worker_set("LocalProfileWatch", _local_profile_watch_worker,', main)
 
 
 class TestOneMusicScanOrderForEveryPlace(unittest.TestCase):
@@ -29702,7 +29785,7 @@ class TestTrayFollowsWhatTheProgramIsShowing(unittest.TestCase):
 
     def _ns(self, tmp, app_state, tiers):
         calls = []
-        ns = {"db": object(), "app_state": app_state, "os": os, "time": time, "_log_swallowed": lambda *a, **k: None,
+        ns = {"db": object(), "app_state": app_state, "os": os, "time": time, "_log_swallowed": lambda *a, **k: None, "_server_work_should_yield": lambda: False,
               "PROGRAM_CAUGHT_UP_CHECK_S": 15.0, "_program_scan_state_cache": {"checked": -1e9, "caught_up": False},
               "_program_scan_state_path": lambda: os.path.join(tmp, "state.json"),
               "_gather_probe_priority_queue": lambda: calls.append(1) or tiers}
@@ -29762,7 +29845,8 @@ class TestProgramScansServerProfilesWhenTheServerIsOff(unittest.TestCase):
             ns = {"_scan_files_added_generation": [0], "time": time, "PROGRAM_CAUGHT_UP_CHECK_S": 15.0,
                   "_idle_server_scan_state": {"checked": -1e9, "generation": -1, "regular_done": False},
                   "_gather_probe_priority_queue": lambda: tiers, "_gather_deep_backlog_queue": lambda: deep,
-                  "_gather_music_probe_queue": lambda: music, "_log_swallowed": lambda *a, **k: None}
+                  "_gather_music_probe_queue": lambda: music, "_log_swallowed": lambda *a, **k: None,
+                  "_server_work_should_yield": lambda: False}
             exec(compile(get_function_source("_regular_scans_all_done"), "<x>", "exec"), ns)
             return ns["_regular_scans_all_done"]()
         self.assertTrue(run([[], [], [], []], [], []))
@@ -29776,7 +29860,7 @@ class TestProgramScansServerProfilesWhenTheServerIsOff(unittest.TestCase):
         ns = {"_scan_files_added_generation": gen, "time": time, "PROGRAM_CAUGHT_UP_CHECK_S": 15.0,
               "_idle_server_scan_state": {"checked": -1e9, "generation": -1, "regular_done": False},
               "_gather_probe_priority_queue": lambda: [pending, [], [], []], "_gather_deep_backlog_queue": lambda: [],
-              "_gather_music_probe_queue": lambda: [], "_log_swallowed": lambda *a, **k: None}
+              "_gather_music_probe_queue": lambda: [], "_log_swallowed": lambda *a, **k: None, "_server_work_should_yield": lambda: False}
         exec(compile(get_function_source("_regular_scans_all_done"), "<x>", "exec"), ns)
         self.assertTrue(ns["_regular_scans_all_done"]())
         pending.append(1)
@@ -29812,7 +29896,7 @@ class TestProgramScansServerProfilesWhenTheServerIsOff(unittest.TestCase):
         body = src[src.index("def _idle_server_scan_worker"):][:1500]
         self.assertIn("server_scanner.FactsScanner(", body)
         self.assertIn("server_scanner.measure_loudness", body)
-        self.assertIn('name="IdleServerScan"', src)
+        self.assertIn('_server_worker_set("IdleServerScan", _idle_server_scan_worker,', src)
 
 
 class TestCaptionsKeepWhatTheyHaveMade(unittest.TestCase):
@@ -31418,7 +31502,7 @@ class TestPrimingFollowsTheViewer(unittest.TestCase):
         self.assertIn("_prime_note_viewer_at(new_ch, old_ch)", change)
         step = src[src.index("def _guide_step_row("):][:1500]
         self.assertIn("_prime_note_viewer_at(_target[0], _prime_old_hl)", step)
-        worker = src[src.index("def _server_channel_warm_worker():"):][:1800]
+        worker = src[src.index("def _server_channel_warm_worker(stop):"):][:1800]
         self.assertLess(worker.index("_prime_rush_pass()"), worker.index("_prime_channels_pass()"))
 
     def test_a_rush_never_moves_the_clock_of_the_full_pass(self):
@@ -33478,6 +33562,257 @@ class TestServerSendsTheClocksOnlyWhenTheyChange(unittest.TestCase):
         self.assertIn("self._pending_clock_clients.add(client)", admit)
 
 
+class TestStaticIsDrawnOnceAFrame(unittest.TestCase):
+    """Owner log 2026-11-20 15:57: media added on Static never showed its loading black and the Static noise cut in and out, because a second render section painted Static over the first every frame."""
+
+    def test_the_game_deck_section_leaves_static_to_the_video_section(self):
+        start = MAIN_SRC.index("# SECTION: Game deck render (CH 03)")
+        branch = MAIN_SRC[start:]
+        branch = branch[branch.index('if current_state["mode"] == "Static":'):]
+        branch = branch[:branch.index('elif current_state["mode"] in ("Video", "Commercial")')]
+        self.assertNotIn("_render_transition_static", branch)
+        self.assertNotIn("screen.fill", branch)
+        self.assertIn("pygame.mixer.music.stop()", branch)
+
+    def test_the_video_section_draws_the_regular_loading_black_silently(self):
+        start = MAIN_SRC.index("# SECTION: Video render (TV channels)")
+        section = MAIN_SRC[start:MAIN_SRC.index("# SECTION: Game deck render (CH 03)")]
+        loading = section[section.index('_regular_channel_still_loading(ch, current_playback_state.get("reason")):'):]
+        loading = loading[:loading.index('elif current_playback_state["mode"] == "Static":')]
+        self.assertIn("_static_sound_stop(", loading)
+        self.assertIn("screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)", loading)
+
+
+class TestTheScanningBannerShowsWithTheStatic(unittest.TestCase):
+    """Owner log 2026-11-21 05:31: after the 7 s black wait the Static came with no reason, because the banner's own wait only started then."""
+
+    def test_the_loading_black_keeps_the_banner_clock_running(self):
+        start = MAIN_SRC.index("# SECTION: Video render (TV channels)")
+        section = MAIN_SRC[start:MAIN_SRC.index("# SECTION: Game deck render (CH 03)")]
+        loading = section[section.index('_regular_channel_still_loading(ch, current_playback_state.get("reason")):'):]
+        loading = loading[:loading.index('elif current_playback_state["mode"] == "Static":')]
+        self.assertIn('_static_banner_ready(("live", str(ch)), current_playback_state.get("reason"))', loading)
+
+    def test_one_clock_from_the_black_wait_to_the_banner(self):
+        clock = {"t": 100.0}
+        ns = {"time": types.SimpleNamespace(monotonic=lambda: clock["t"])}
+        exec(get_function_source("_banner_phase"), ns)
+        ns["_banner_phase_seen"] = {}
+        key = (("live", "05"), "first_file_scanning")
+        for _ in range(70):
+            self.assertEqual(ns["_banner_phase"](key, 7.0), "wait")
+            clock["t"] += 0.1
+        clock["t"] += 0.05
+        self.assertEqual(ns["_banner_phase"](key, 7.0), "show", "the banner is due the moment the 7 s black wait ends")
+
+
+class TestNewChannelSearchSaysWhereItIs(unittest.TestCase):
+    """Owner logs 2026-11-20 and 2026-11-21: finding a new channel's first show took 14 s and 20 s with no line saying where."""
+
+    def test_a_slow_search_writes_where_it_is_and_who_else_is_in_the_scheduler(self):
+        import performance_governor as gov
+        self.assertEqual(gov.NEW_CHANNEL_FIND_STACK_EVERY_S, 3.0)
+        src = get_function_source("_new_channel_airing_paths")
+        self.assertIn("still finding the show after", src)
+        self.assertIn("_scheduler_threads_on(_key)", src)
+        self.assertIn("_done.set()", src)
+
+    def test_other_threads_in_the_scheduler_are_named(self):
+        import threading as _th
+        ns = {"threading": _th, "sys": sys, "_sched_rebuild_gate": _th.Lock(), "_sched_rebuild_running": {"05": 2}}
+        exec(get_function_source("_scheduler_threads_on"), ns)
+        inside, stop = [], _th.Event()
+
+        def _scheduler_playback_state():
+            stop.wait(5)
+
+        t = _th.Thread(target=_scheduler_playback_state, name="ScreenScheduleAsk")
+        t.start()
+        try:
+            for _ in range(50):
+                inside, running = ns["_scheduler_threads_on"]("05")
+                if inside:
+                    break
+                time.sleep(0.01)
+            self.assertEqual((inside, running), (["ScreenScheduleAsk"], 2))
+        finally:
+            stop.set()
+            t.join()
+
+
+class TestNothingOfTheServerRunsWhileServersAreOff(unittest.TestCase):
+    """Owner 2026-11-21: with servers off or not set up nothing of the server runs; the finder listens only while Server Mode needs it, and the server's background work steps aside for what is on now."""
+
+    def _ns(self, config, state=None):
+        app_state = dict(state or {})
+        listener = types.SimpleNamespace(start=lambda: None, stop=lambda: None, get_discovered_entries=lambda: [])
+        db = types.SimpleNamespace(config=config, server_listener=listener, list_server_slots=lambda: list(config.get("server_slots", {}).items()))
+        started = []
+
+        class _T:
+            def __init__(self, target=None, args=(), daemon=None, name=None):
+                self.name, self._alive = name, False
+            def start(self):
+                self._alive = True
+                started.append(self.name)
+            def is_alive(self):
+                return self._alive
+
+        ns = {"db": db, "app_state": app_state, "time": time, "log": logging.getLogger("t"), "started": started,
+              "threading": types.SimpleNamespace(Thread=_T, Event=threading.Event, Lock=threading.Lock),
+              "_prime_wake": threading.Event(), "performance_governor": None,
+              "_NEW_CHANNEL_SCAN_ACTIVE": threading.Event(), "_FILE_WALK_ACTIVE": threading.Event(), "playback_busy": lambda: False,
+              "_local_profile_watch_worker": None, "_idle_server_scan_worker": None, "_server_channel_warm_worker": None}
+        start = MAIN_SRC.index("# SECTION: Server workers, running only while servers need them")
+        code = MAIN_SRC[MAIN_SRC.rindex("# ====", 0, start):MAIN_SRC.index("def _local_profile_watch_worker(stop):")]
+        exec(code, ns)
+        return ns
+
+    def test_regular_mode_starts_no_server_worker(self):
+        ns = self._ns({"server_mode_enabled": False})
+        ns["_supervise_server_workers"](False)
+        self.assertEqual(ns["started"], [])
+        self.assertFalse(ns["_server_finder_wanted"](time.monotonic()))
+        ns["request_server_scan"]("Server menu opened")
+        self.assertEqual(ns["_server_finder_state"]["scan_until"], 0.0, "no scan with Server Mode off")
+
+    def test_each_worker_runs_only_for_its_job(self):
+        ns = self._ns({"server_mode_enabled": True, "server_slots": {"1": "Den"}})
+        ns["_supervise_server_workers"](True)
+        self.assertEqual(ns["started"], ["LocalProfileWatch"])
+        ns["_supervise_server_workers"](False)
+        self.assertIn("IdleServerScan", ns["started"])
+        self.assertNotIn("LocalProfileWatch", ns["_server_worker_threads"])
+        ns["app_state"]["active_remote_server"] = {"name": "Den"}
+        ns["_supervise_server_workers"](False)
+        self.assertIn("ServerChannelWarm", ns["started"])
+
+    def test_the_finder_listens_for_a_scan_window_then_stops(self):
+        ns = self._ns({"server_mode_enabled": True})
+        now = time.monotonic()
+        self.assertFalse(ns["_server_finder_wanted"](now))
+        ns["request_server_scan"]("Server Scan pressed")
+        self.assertTrue(ns["_server_finder_wanted"](now))
+        self.assertFalse(ns["_server_finder_wanted"](now + ns["SERVER_SCAN_LISTEN_S"] + 0.1))
+        ns["app_state"]["_server_reconnect"] = {"name": "Den"}
+        self.assertTrue(ns["_server_finder_wanted"](now + 99), "a lost server is listened for")
+
+    def test_server_work_steps_aside(self):
+        ns = self._ns({"server_mode_enabled": True})
+        self.assertFalse(ns["_server_work_should_yield"]())
+        ns["_NEW_CHANNEL_SCAN_ACTIVE"].set()
+        self.assertTrue(ns["_server_work_should_yield"]())
+
+    def test_the_boot_starts_none_of_them_and_the_finder_is_not_started(self):
+        self.assertNotIn("db.server_listener.start()", MAIN_SRC)
+        for name in ("ServerChannelWarm", "LocalProfileWatch", "IdleServerScan"):
+            self.assertNotIn('name="%s"' % name, MAIN_SRC)
+        self.assertIn("_supervise_server_workers(want_server)", MAIN_SRC)
+        self.assertIn('request_server_scan("Server menu opened")', MAIN_SRC)
+        self.assertIn('request_server_scan("Server Scan pressed")', MAIN_SRC)
+        self.assertIn("_server_finder_tick()", MAIN_SRC)
+
+
+class TestOneLineupBuildOfAChannelAtATime(unittest.TestCase):
+    """Owner log 2026-11-21 11:59: five threads built channel 05's lineup at once and queued 15 s on per-file locks."""
+
+    def _guard(self):
+        start = MAIN_SRC.rfind("# ====", 0, MAIN_SRC.index("# SECTION: Schedule rebuild in-flight guard"))
+        end = MAIN_SRC.index("def _apply_scheduling_mode_change(ch_info, new_mode, target_ch_str):")
+        ns = {"threading": threading, "functools": __import__("functools"), "performance_governor": None, "log": logging.getLogger("t"),
+              "_time_critical_thread": lambda: threading.current_thread() is threading.main_thread()}
+        exec(compile(MAIN_SRC[start:end], "<guard>", "exec"), ns)
+        return ns
+
+    def test_background_calls_of_a_channel_take_turns(self):
+        ns = self._guard()
+        inside, most, lock = [0], [0], threading.Lock()
+
+        @ns["_sched_rebuild_guard"]
+        def build(channel_id):
+            with lock:
+                inside[0] += 1
+                most[0] = max(most[0], inside[0])
+            time.sleep(0.05)
+            with lock:
+                inside[0] -= 1
+
+        threads = [threading.Thread(target=build, args=("05",)) for _ in range(4)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(most[0], 1, "one build of a channel at a time")
+
+    def test_the_screen_thread_never_waits(self):
+        ns = self._guard()
+        started, release = threading.Event(), threading.Event()
+
+        @ns["_sched_rebuild_guard"]
+        def build(channel_id, hold=False):
+            if hold:
+                started.set()
+                release.wait(5)
+            return "ok"
+
+        t = threading.Thread(target=build, args=("05",), kwargs={"hold": True})
+        t.start()
+        started.wait(2)
+        t0 = time.monotonic()
+        self.assertEqual(build("05"), "ok")
+        self.assertLess(time.monotonic() - t0, 0.5, "the main thread runs beside it")
+        release.set()
+        t.join()
+
+    def test_the_season_memo_takes_no_lock(self):
+        body = MAIN_MEDIA_SRC if "MAIN_MEDIA_SRC" in globals() else read(_script("media.py"))
+        facts = body[body.index("def _flex_path_facts("):body.index("def group_shows_flexible(")]
+        self.assertNotIn("_show_name_memo_lock", body)
+        self.assertNotIn("with ", facts)
+
+
+class TestAPlayerIsNeverCalledAfterItsRelease(unittest.TestCase):
+    """Owner crash log 2026-11-21 12:00:26: at quit the volume thread called audio_set_volume after the player was released and libvlc crashed."""
+
+    def test_calls_after_release_are_skipped(self):
+        start = MAIN_SRC.index("class _SerializedVlcPlayer:")
+        end = MAIN_SRC.index("_VLCEngineWrapperClass = None")
+        calls = []
+
+        class _Real:
+            def audio_set_volume(self, v):
+                calls.append(("set", v))
+            def audio_get_volume(self):
+                return 70
+            def release(self):
+                calls.append("release")
+
+        ns = {"threading": threading, "time": time, "health_monitor": None, "_VLC_GETTER_WAIT_S": 0.1,
+              "_VLC_MAIN_CALL_WAIT_S": 0.1, "_VLC_CALL_WAIT_S": 0.1, "_log_warn_throttled": lambda *a, **k: None,
+              "_time_critical_thread": lambda: threading.current_thread() is threading.main_thread()}
+        exec(compile(MAIN_SRC[start:end], "<player>", "exec"), ns)
+        p = ns["_SerializedVlcPlayer"](_Real())
+        p.audio_set_volume(50)
+        self.assertEqual(p.audio_get_volume(), 70)
+        p.release()
+        p.audio_set_volume(60)
+        self.assertEqual(calls, [("set", 50), "release"])
+        self.assertEqual(p.audio_get_volume(), 70, "a read after release gives its last answer")
+
+
+class TestALoadingChannelShowsWhyOnItsStatic(unittest.TestCase):
+    """Owner 2026-11-21: after the black wait the channel falls to Static with the reason (SCANNING FILES) and stays on Static, never grey, until its picture."""
+
+    def test_the_banner_marks_the_static_it_explains(self):
+        start = MAIN_SRC.index("# SECTION: Video render (TV channels)")
+        section = MAIN_SRC[start:MAIN_SRC.index("# SECTION: Game deck render (CH 03)")]
+        branch = section[section.index('_draw_static_channel(screen, _full_window_rect, ("live", str(ch))'):]
+        branch = branch[:branch.index("_report_missing_media(")]
+        self.assertIn("_mark_fault_static()", branch)
+
+    def test_a_loading_static_does_not_go_grey(self):
+        body = get_function_source("_draw_static_channel")
+        self.assertIn("reason in SILENT_STATIC_REASONS or reason in _PROFILE_LOADING_REASONS", body)
+
+
 class TestRegularAndServerFirstLoadWaitsStaySeparate(unittest.TestCase):
     """Owner 2026-11-18: media added to a Regular channel sitting on Static goes to the loading background at once and has 7 s to play before Static and the reason; the server side keeps its own 10 s; the stall clock never counts the time the channel sat empty."""
 
@@ -33499,7 +33834,8 @@ class TestRegularAndServerFirstLoadWaitsStaySeparate(unittest.TestCase):
     def test_media_arriving_on_empty_static_starts_a_fresh_load_clock(self):
         state = {"_last_new_frame_ticks": 0, "_had_first_frame_this_tune": True, "_static_hold_until_frame": True, "last_vlc_retry_at": 99}
         ns = {"app_state": state, "SILENT_STATIC_REASONS": {"no_media_scheduled", "channel_inactive", "awaiting_server_pick"},
-              "_first_load_static_ms": lambda ch=None: 7000, "log": logging.getLogger("t")}
+              "_PROFILE_LOADING_REASONS": ("first_file_scanning", "visualizer_scanning", "not_scanned"),
+              "_first_load_static_ms": lambda ch=None: 7000, "log": logging.getLogger("t"), "SCHEDULE_PENDING_REASON": "schedule_pending"}
         exec(get_function_source("_note_media_arrived"), ns)
         f = ns["_note_media_arrived"]
         self.assertFalse(f("05", {"mode": "Static", "reason": "no_media_scheduled"}, 1000))
@@ -33507,16 +33843,25 @@ class TestRegularAndServerFirstLoadWaitsStaySeparate(unittest.TestCase):
         self.assertTrue(f("05", {"mode": "Static", "reason": "first_file_scanning"}, 91000))
         self.assertEqual((state["_last_new_frame_ticks"], state["_had_first_frame_this_tune"], state["_static_hold_until_frame"], state["last_vlc_retry_at"]),
                          (91000, False, False, 0))
-        state["_last_new_frame_ticks"] = 5
-        self.assertFalse(f("05", {"mode": "Video", "reason": None}, 95000), "the first file getting its length keeps the same clock")
-        self.assertEqual(state["_last_new_frame_ticks"], 5)
-        self.assertFalse(f("06", {"mode": "Video", "reason": None}, 96000), "a channel change is not media arriving")
+        state["_had_first_frame_this_tune"] = True
+        self.assertTrue(f("05", {"mode": "Video", "reason": None}, 95000), "owner 2026-11-20: the first show's open gets its own load wait")
+        self.assertEqual((state["_last_new_frame_ticks"], state["_had_first_frame_this_tune"], state["_static_hold_until_frame"]), (95000, False, False),
+                         "named inside the 7 s black wait: the black goes on into the open")
+        f("05", {"mode": "Static", "reason": "first_file_scanning"}, 96000)
+        self.assertTrue(f("05", {"mode": "Video", "reason": None}, 105000))
+        self.assertEqual((state["_last_new_frame_ticks"], state["_static_hold_until_frame"]), (105000, True),
+                         "owner 2026-11-21: fallen to Static after 7 s, the open stays under the Static, never back to black")
+        self.assertFalse(f("05", {"mode": "Video", "reason": None}, 106000), "a show already on air keeps its clock")
+        self.assertEqual(state["_last_new_frame_ticks"], 105000)
+        self.assertFalse(f("06", {"mode": "Video", "reason": None}, 107000), "a channel change is not media arriving")
+        f("06", {"mode": "Static", "reason": "picture_stalled"}, 108000)
+        self.assertFalse(f("06", {"mode": "Video", "reason": None}, 109000), "only a scanning Static hands over a fresh clock")
 
     def test_the_wait_is_the_loading_background_and_silent(self):
         src = MAIN_SRC
         self.assertIn("_note_media_arrived(ch, current_playback_state, pygame.time.get_ticks())", src)
         at = src.index('elif current_playback_state["mode"] == "Static" and _regular_channel_still_loading(ch, current_playback_state.get("reason")):')
-        self.assertIn("screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)", src[at:at + 700])
+        self.assertIn("screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)", src[at:at + 1100])
         self.assertIn('and not (_regular_channel_still_loading(ch, current_playback_state.get("reason")) and _configured_transition_style() != "static")', src)
         self.assertIn("if reason not in _PROFILE_LOADING_REASONS or _server_rules_apply(ch_key):", get_function_source("_regular_channel_still_loading"))
 
@@ -34114,7 +34459,7 @@ class TestTheScreenThreadDoesNotRunTheSchedulerEveryFrame(unittest.TestCase):
             def show_facts(self, key, epoch, guard):
                 return None
 
-            def remember_show_facts(self, *a):
+            def remember_show_facts(self, *a, **k):
                 pass
 
             def forget_show_facts(self, key):
@@ -34128,10 +34473,19 @@ class TestTheScreenThreadDoesNotRunTheSchedulerEveryFrame(unittest.TestCase):
         ns = {"app_state": {}, "_prime_context": threading.local(), "broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 1.0)),
               "_hub_playback_guard": lambda key: None, "_hub_miss_log_once": lambda key: None, "_log_warn_throttled": lambda *a: None,
               "_scheduler_playback_state": scheduler, "threading": threading, "time": types.SimpleNamespace(monotonic=lambda: clock[0]),
-              "SCREEN_SCHEDULER_ASK_GAP_S": 0.5, "_screen_scheduler_answers": {}, "_log_swallowed": lambda *a: None}
-        for name in ("calculate_slotted_playback_state", "_screen_scheduler_answer", "_hub_remember_state"):
+              "SCREEN_SCHEDULER_ASK_GAP_S": 0.5, "_screen_scheduler_answers": {}, "_log_swallowed": lambda *a: None,
+              "SCHEDULE_PENDING_REASON": "schedule_pending", "_app_shutting_down": threading.Event(),
+              "_screen_ask": {"wanted": {}, "thread": None, "wake": threading.Event()}, "_scheduler_prepared": {}}
+        self.addCleanup(ns["_app_shutting_down"].set)
+        for name in ("calculate_slotted_playback_state", "_screen_scheduler_answer", "_hub_remember_state", "_schedule_pending_state",
+                     "_ask_scheduler_for_screen", "_screen_ask_loop"):
             exec(get_function_source(name), ns)
         return ns, calls, clock, fake_ml
+
+    def _wait_calls(self, calls, count):
+        deadline = time.monotonic() + 3
+        while len(calls) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     def test_a_static_answer_is_reused_and_asked_again_off_the_screen_thread(self):
         static = {"mode": "Static", "file": "", "seek": 0, "reason": "first_file_scanning"}
@@ -34139,16 +34493,21 @@ class TestTheScreenThreadDoesNotRunTheSchedulerEveryFrame(unittest.TestCase):
         ns, calls, clock, fake_ml = self._ns([static, show])
         with patch.dict(sys.modules, {"media_library": fake_ml}):
             f = ns["calculate_slotted_playback_state"]
-            self.assertEqual(f("05"), static)
+            self.assertEqual(f("05")["reason"], "schedule_pending", "the first frame draws the channel-change cover while the schedule is asked")
+            self._wait_calls(calls, 1)
+            deadline = time.monotonic() + 3
+            while "05" not in ns["_screen_scheduler_answers"] and time.monotonic() < deadline:
+                time.sleep(0.01)
             for _ in range(20):
                 self.assertEqual(f("05"), static)
-            self.assertEqual(calls, [(True, "05")], "only the first frame asked the scheduler on the screen thread")
+            self.assertEqual(calls, [(False, "05")], "the screen thread never asked the scheduler itself")
             clock[0] += 0.6
             f("05")
-            deadline = time.monotonic() + 2
-            while len(calls) < 2 and time.monotonic() < deadline:
-                time.sleep(0.01)
+            self._wait_calls(calls, 2)
             self.assertEqual(calls[1], (False, "05"), "the next ask runs on a background thread")
+            deadline = time.monotonic() + 3
+            while ns["_screen_scheduler_answers"]["05"]["state"] != show and time.monotonic() < deadline:
+                time.sleep(0.01)
             self.assertEqual(ns["_screen_scheduler_answers"]["05"]["state"], show)
 
     def test_other_threads_still_ask_the_scheduler_themselves(self):
@@ -35041,6 +35400,391 @@ class TestSharingUpkeepAndRemoveTasks(unittest.TestCase):
     def test_the_tray_has_no_remove_sharing_item(self):
         tray = open(os.path.join(ROOT, "server", "server_tray.py"), encoding="utf-8").read()
         self.assertNotIn("Remove sharing", tray)
+
+
+
+class TestOneDedicatedPlaybackThread(unittest.TestCase):
+    """Owner 2026-11-21: one dedicated thread does channel changes and opens what airs, so playback works whatever else struggles."""
+
+    def _ns(self, stuck_s=10.0):
+        start = MAIN_SRC.rfind("# ====", 0, MAIN_SRC.index("# SECTION: Playback thread (channel changes and opening what airs)"))
+        end = MAIN_SRC.index("def change_channel(new_ch,")
+        ns = {"threading": threading, "collections": collections, "time": time, "sys": sys, "traceback": __import__("traceback"),
+              "log": logging.getLogger("t"), "performance_governor": None, "_app_shutting_down": threading.Event(), "app_state": {}}
+        exec(compile(MAIN_SRC[start:end], "<playback>", "exec"), ns)
+        ns["PLAYBACK_STEP_STUCK_S"] = stuck_s
+        self.addCleanup(ns["_app_shutting_down"].set)
+        return ns
+
+    def _wait(self, test, seconds=3.0):
+        until = time.monotonic() + seconds
+        while time.monotonic() < until and not test():
+            time.sleep(0.01)
+        return test()
+
+    def test_without_the_thread_the_caller_does_the_work(self):
+        ns = self._ns()
+        self.assertFalse(ns["_post_to_playback_thread"]("tune", lambda: None, label="t"))
+        ran = []
+        ns["_run_on_screen_thread"](lambda: ran.append(1))
+        self.assertEqual(ran, [1], "with no playback thread (tests, tools) the screen job runs at once")
+
+    def test_tunes_run_on_the_playback_thread_newest_first_and_the_viewer_wins(self):
+        ns = self._ns()
+        ns["start_playback_thread"]()
+        gate = threading.Event()
+        ran = []
+        ns["_post_to_playback_thread"]("tune", lambda: (ran.append(("first", threading.current_thread().name)), gate.wait(3)), label="first")
+        self.assertTrue(self._wait(lambda: ran))
+        self.assertTrue(ns["playback_busy"]())
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append(("viewer 1",)), label="viewer 1")
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append(("viewer 2",)), label="viewer 2")
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append(("app re-tune",)), internal=True, label="app re-tune")
+        ns["_post_to_playback_thread"]("job", lambda: ran.append(("job",)), label="job")
+        gate.set()
+        self.assertTrue(self._wait(lambda: not ns["playback_busy"]()))
+        self.assertEqual(ran, [("first", "Playback"), ("viewer 2",), ("job",)],
+                         "a newer tune replaces one that has not started, the app's own re-tune never replaces the viewer's, tunes go before other steps")
+
+    def test_an_app_re_tune_never_replaces_a_waiting_tune_and_a_viewer_tune_replaces_it(self):
+        ns = self._ns()
+        ns["start_playback_thread"]()
+        gate = threading.Event()
+        ran = []
+        ns["_post_to_playback_thread"]("tune", lambda: gate.wait(3), label="busy")
+        self.assertTrue(self._wait(lambda: ns["_playback_queue"]["running"] is not None))
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append("source change re-tune"), internal=True, label="a")
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append("item end of the old channel"), internal=True, label="b")
+        gate.set()
+        self.assertTrue(self._wait(lambda: not ns["playback_busy"]()))
+        self.assertEqual(ran, ["source change re-tune"])
+        gate.clear()
+        ns["_post_to_playback_thread"]("tune", lambda: gate.wait(3), label="busy")
+        self.assertTrue(self._wait(lambda: ns["_playback_queue"]["running"] is not None))
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append("app"), internal=True, label="c")
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append("viewer"), label="d")
+        gate.set()
+        self.assertTrue(self._wait(lambda: not ns["playback_busy"]()))
+        self.assertEqual(ran[1:], ["viewer"])
+
+    def test_a_stuck_step_is_set_aside_and_a_fresh_thread_takes_over(self):
+        ns = self._ns(stuck_s=0.3)
+        ns["start_playback_thread"]()
+        first = ns["_playback_thread"]["thread"]
+        ns["_post_to_playback_thread"]("job", lambda: time.sleep(2.0), label="stuck open")
+        self.assertTrue(self._wait(lambda: ns["_playback_thread"]["thread"] is not first, 3.0), "the watch starts a fresh playback thread")
+        ran = []
+        ns["_post_to_playback_thread"]("tune", lambda: ran.append(threading.current_thread()), label="next tune")
+        self.assertTrue(self._wait(lambda: ran, 1.5), "the next tune runs while the stuck step is still waiting")
+        self.assertIsNot(ran[0], first)
+
+    def test_screen_jobs_from_the_playback_thread_wait_for_the_next_frame(self):
+        ns = self._ns()
+        ns["start_playback_thread"]()
+        ran = []
+        ns["_post_to_playback_thread"]("job", lambda: ns["_run_on_screen_thread"](lambda: ran.append(threading.current_thread() is threading.main_thread())), label="j")
+        self.assertTrue(self._wait(lambda: ns["_screen_thread_jobs"]))
+        self.assertEqual(ran, [])
+        ns["_drain_screen_thread_jobs"]()
+        self.assertEqual(ran, [True], "the game channel's core is only touched on the screen thread")
+
+    def test_change_channel_hands_itself_to_the_playback_thread(self):
+        cc = get_function_source("change_channel")
+        self.assertLess(cc.index('_post_to_playback_thread("tune", change_channel,'), cc.index("old_ch = app_state.get"))
+        self.assertIn("_run_on_screen_thread(_quiet_game_channel)", cc)
+        self.assertIn("if threading.current_thread() is threading.main_thread():\n        pygame.event.pump()", cc)
+        flip = get_function_source("_tune_after_flip")
+        self.assertIn('if not _post_to_playback_thread("tune", _tune_and_end_the_flip,', flip)
+        self.assertLess(flip.index("change_channel(target_ch"), flip.index('app_state["surf_origin"] = ""'),
+                        "the flip ends only after its tune ran on the playback thread")
+        boot = MAIN_SRC[MAIN_SRC.index("start_playback_thread()\n"):]
+        self.assertTrue(boot.startswith("start_playback_thread()\n            change_channel(_last_ch, is_boot=True)"))
+
+    def test_the_screen_loop_waits_for_the_playback_thread(self):
+        self.assertIn('_switch_pending = app_state.get("_pending_channel_activation") is not None or playback_busy()', MAIN_SRC)
+        self.assertIn('if not _post_to_playback_thread("job", _advance_background_channel, (_bg_ch, ch)', MAIN_SRC)
+        self.assertIn("            and not _switch_pending\n            and current_playback_state[\"mode\"] in (\"Video\", \"Commercial\")", MAIN_SRC)
+        self.assertIn("_drain_screen_thread_jobs()\n    ch = app_state[\"current_channel\"]", MAIN_SRC)
+
+    def test_the_governor_marks_the_playback_thread_time_critical(self):
+        seen = []
+
+        def body():
+            seen.append(gov.is_time_critical_thread())
+            gov.mark_time_critical_thread()
+            seen.append((gov.is_time_critical_thread(), gov.is_marked_time_critical_thread()))
+            gov.mark_time_critical_thread(False)
+            seen.append(gov.is_time_critical_thread())
+        t = threading.Thread(target=body)
+        t.start()
+        t.join()
+        self.assertEqual(seen, [False, (True, True), False])
+        self.assertTrue(gov.is_time_critical_thread(), "the screen thread always is one")
+        gov.note_playback_step(True)
+        try:
+            self.assertTrue(gov.playback_needs_the_pc())
+        finally:
+            gov.note_playback_step(False)
+
+
+class TestTheScreenThreadNeverRunsTheScheduler(unittest.TestCase):
+    """Owner 2026-11-21: the screen thread only draws; it reads what the hub and the scheduler's last answer hold."""
+
+    def _ns(self, epoch):
+        start = MAIN_SRC.index("def calculate_slotted_playback_state(")
+        end = MAIN_SRC.index("def _hub_remember_state(")
+        calls = []
+        clock = {"t": epoch}
+
+        class _Now:
+            def timestamp(self):
+                return clock["t"]
+
+        class _Hub:
+            def show_facts(self, *a):
+                return None
+
+        fake_ml = types.SimpleNamespace(shared_schedule_hub=lambda: _Hub())
+
+        def sched(ch, *a):
+            calls.append((threading.current_thread() is threading.main_thread(), ch, a))
+            return {"mode": "Video", "file": "a.mp4", "seek": 100.0, "duration": 1800}
+        ns = {"threading": threading, "time": time, "app_state": {"current_channel": "05"}, "_prime_context": threading.local(),
+              "broadcast_clock": types.SimpleNamespace(now=lambda: _Now()), "_hub_playback_guard": lambda k: None,
+              "_hub_miss_log_once": lambda k: None, "_log_warn_throttled": lambda *a, **k: None, "performance_governor": None,
+              "SCHEDULE_PENDING_REASON": "schedule_pending", "_hub_remember_state": lambda *a: None,
+              "_scheduler_playback_state": sched, "_app_shutting_down": threading.Event(), "_log_swallowed": lambda *a: None}
+        self.addCleanup(ns["_app_shutting_down"].set)
+        exec(compile(MAIN_SRC[start:end], "<door>", "exec"), ns)
+        patcher = mock.patch.dict(sys.modules, {"media_library": fake_ml})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return ns, calls, clock
+
+    def test_screen_asks_never_run_the_scheduler_on_the_screen_thread(self):
+        ns, calls, clock = self._ns(1000.0)
+        first = ns["calculate_slotted_playback_state"]("05", snap_internal_advance=True)
+        self.assertEqual((first["mode"], first["reason"]), ("Static", "schedule_pending"))
+        until = time.monotonic() + 3
+        while time.monotonic() < until and "05" not in ns["_screen_scheduler_answers"]:
+            time.sleep(0.01)
+        self.assertEqual([c[:2] for c in calls], [(False, "05")], "the ScreenScheduleAsk thread asked, the screen did not")
+        clock["t"] = 1003.0
+        later = ns["calculate_slotted_playback_state"]("05")
+        self.assertEqual((later["mode"], later["file"], later["seek"]), ("Video", "a.mp4", 103.0),
+                         "the held show's seek moves on with the clock")
+        self.assertFalse(any(c[0] for c in calls))
+
+    def test_other_threads_still_ask_the_scheduler_and_keep_the_answer(self):
+        ns, calls, clock = self._ns(500.0)
+        out = []
+        t = threading.Thread(target=lambda: out.append(ns["calculate_slotted_playback_state"]("07", snap_internal_advance=True)))
+        t.start()
+        t.join()
+        self.assertEqual(out[0]["file"], "a.mp4")
+        self.assertEqual(calls[0][2][0], True, "the playback thread's advance reaches the scheduler")
+        self.assertIn("07", ns["_screen_scheduler_answers"])
+
+    def test_the_pending_answer_draws_as_the_channel_change_cover(self):
+        self.assertIn('elif current_playback_state["mode"] == "Static" and current_playback_state.get("reason") == SCHEDULE_PENDING_REASON:\n            _draw_schedule_pending(screen, _full_window_rect)', MAIN_SRC)
+        self.assertIn('if reason == SCHEDULE_PENDING_REASON:\n        _draw_schedule_pending(screen, rect, target_aspect=target_aspect)', MAIN_SRC)
+        self.assertLess(get_function_source("_note_media_arrived").index("SCHEDULE_PENDING_REASON"),
+                        get_function_source("_note_media_arrived").index('app_state["_air_seen"] = _seen'))
+
+
+class TestTheLibraryNeverHoldsUpPlayback(unittest.TestCase):
+    """Owner log 2026-11-21 12:31: the playback path waited on the library behind future-row writes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.library = ml.MediaLibrary(os.path.join(self.tmp, "lib.sqlite3"))
+        self.hub = ml.ScheduleHub(self.library)
+
+    def tearDown(self):
+        self.library.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _on_marked_thread(self, fn):
+        out = []
+
+        def body():
+            gov.mark_time_critical_thread()
+            try:
+                began = time.monotonic()
+                out.append((fn(), time.monotonic() - began))
+            finally:
+                gov.mark_time_critical_thread(False)
+        t = threading.Thread(target=body)
+        t.start()
+        t.join(5)
+        return out[0]
+
+    def _hold_library(self, seconds):
+        taken = threading.Event()
+
+        def holder():
+            with self.library._lock:
+                taken.set()
+                time.sleep(seconds)
+        t = threading.Thread(target=holder)
+        t.start()
+        taken.wait(2)
+        return t
+
+    def test_the_playback_thread_uses_prepared_answers_and_reads_the_rest_for_real(self):
+        self.assertEqual(self.library.context_series_rows("ctx", "series"), [], "read ahead on this thread: now prepared")
+        holder = self._hold_library(0.6)
+        rows, took = self._on_marked_thread(lambda: self.library.context_series_rows("ctx", "series"))
+        self.assertEqual(rows, [])
+        self.assertLess(took, 0.3, "a prepared answer is used at once while the library is busy")
+        row, took = self._on_marked_thread(lambda: self.hub.at("05", 1000.0, busy=ml.LIBRARY_BUSY))
+        self.assertIsNone(row, "nothing prepared: the playback thread waited and read the real answer, never a guess")
+        self.assertGreaterEqual(took, 0.2)
+        holder.join()
+        holder = self._hold_library(0.5)
+        self.assertIs(self.hub.at("05", 1000.0, busy=ml.LIBRARY_BUSY), ml.LIBRARY_BUSY, "the screen thread still never waits")
+        holder.join()
+
+    def test_future_rows_give_each_turn_to_a_playback_step_first(self):
+        gov.note_playback_step(True)
+        threading.Timer(0.3, gov.note_playback_step, (False,)).start()
+        began = time.monotonic()
+        writer = threading.Thread(target=self.hub.replace_future_rows,
+                                  args=("05", [{"slot_key": "a", "position": 0, "path": "x.mp4", "planned_start": 10.0, "used_length": 30.0}]))
+        try:
+            writer.start()
+            writer.join(5)
+        finally:
+            gov.note_playback_step(False)
+        self.assertGreaterEqual(time.monotonic() - began, 0.25, "the background write waited for the playback step")
+        self.assertEqual(len(self.hub.future_rows_between("05", 0.0, 100.0)), 1)
+
+
+class TestScansNoLongerReplanTheFutureFileByFile(unittest.TestCase):
+    """Owner log 2026-11-21 12:31: every scanned file re-planned 192 hours of the channel and dropped the show on air from the hub."""
+
+    def test_a_scan_patch_asks_for_one_look_after_the_scans_settle(self):
+        src = get_function_source("_request_schedule_rebuild")
+        self.assertNotIn("_replan_hub_future_soon(", src)
+        self.assertNotIn("forget_show_facts", src)
+        self.assertIn("_hub_future_check_soon()", src)
+        worker = get_function_source("_hub_future_worker")
+        self.assertIn("_python_heavy_should_pause() or _server_work_should_yield()", worker)
+        self.assertIn("_hub_future_idle_sleep()", worker)
+        self.assertIn("playback_busy()", get_function_source("_server_work_should_yield"))
+
+    def test_the_idle_sleep_ends_when_the_settled_look_is_due(self):
+        ns = {"time": time, "_app_shutting_down": threading.Event(), "_HUB_FUTURE_IDLE_SECONDS": 30.0, "_HUB_FUTURE_SETTLE_SECONDS": 0.2,
+              "_hub_future_wake": {"at": None}}
+        exec(get_function_source("_hub_future_check_soon") + "\n" + get_function_source("_hub_future_idle_sleep"), ns)
+        ns["_hub_future_check_soon"]()
+        began = time.monotonic()
+        self.assertFalse(ns["_hub_future_idle_sleep"]())
+        self.assertLess(time.monotonic() - began, 3.0)
+        self.assertIsNone(ns["_hub_future_wake"]["at"])
+
+
+class TestALagShiftsTheJoinPoint(unittest.TestCase):
+    """Owner 2026-11-21: if an open lags 3 s, the item joins 3 s in, counted from when the start was worked out."""
+
+    def test_the_open_counts_from_the_schedule_answer(self):
+        play = MAIN_SRC[MAIN_SRC.index("def play_file_segmented(self, filepath"):MAIN_SRC.index("def _display_dims_from_player(self)")]
+        self.assertIn("follow_clock=False, clock_from=None):", play)
+        self.assertIn("_requested_at = time.monotonic() if clock_from is None else min(time.monotonic(), float(clock_from))", play)
+        cc = get_function_source("change_channel")
+        self.assertIn("_seek_worked_out_at=_t_state_at):", cc)
+        self.assertIn("clock_from=_seek_worked_out_at,", cc)
+        self.assertIn("_seek_worked_out_at = time.monotonic()", cc)
+
+
+class TestNothingToLoadEndsTheBlackCover(unittest.TestCase):
+    """Owner 2026-11-21 12:31: going to the server setup, a channel with no media stayed black until the menu was left."""
+
+    def _ns(self, **state):
+        ns = {"app_state": dict(state)}
+        exec(get_function_source("_end_loading_cover_with_nothing_to_load"), ns)
+        return ns
+
+    def test_a_channel_with_no_media_shows_its_static_at_once(self):
+        ns = self._ns(_server_pick_loading_until_ms=99999)
+        ns["_end_loading_cover_with_nothing_to_load"]({"mode": "Static", "reason": "no_media_scheduled"})
+        self.assertEqual(ns["app_state"]["_server_pick_loading_until_ms"], 0)
+
+    def test_a_channel_still_loading_or_a_schedule_on_its_way_keeps_the_cover(self):
+        for state, answer in (({}, {"mode": "Static", "reason": "not_scanned"}),
+                              ({"active_remote_server": {"name": "Den"}, "_remote_schedule_received": False}, {"mode": "Static", "reason": "no_media_scheduled"}),
+                              ({}, {"mode": "Video", "file": "a.mp4"})):
+            ns = self._ns(_server_pick_loading_until_ms=99999, **state)
+            ns["_end_loading_cover_with_nothing_to_load"](answer)
+            self.assertEqual(ns["app_state"]["_server_pick_loading_until_ms"], 99999)
+
+
+
+class TestTheHubPreparesTheNextItems(unittest.TestCase):
+    """Owner 2026-11-21: "it precaches information so it never needs to look last min ... STAY ON SCHEDULE AT ALL TIMES"."""
+
+    def test_the_next_item_and_a_break_are_answered_from_prepared_items(self):
+        hub = ml.ScheduleHub.__new__(ml.ScheduleHub)
+        hub._show_facts, hub._upcoming = {}, {}
+        show = {"mode": "Video", "file": "show.mkv", "seek": 0.0, "duration": 100.0, "block": "Morning", "seek_slot_offset": 0, "interior_cut": False}
+        ad = {"mode": "Commercial", "file": "ad.mp4", "seek": 0.0, "duration": 30.0, "block": "Morning", "seek_slot_offset": 0, "interior_cut": False}
+        nxt = dict(show, file="next.mkv", duration=1200.0)
+        hub.remember_show_facts("05", dict(show, seek=40.0), 1040.0, "g", upcoming=[(1000.0, show), (1100.0, ad), (1130.0, nxt)])
+        self.assertEqual(hub.show_facts("05", 1050.0, "g")["seek"], 50.0)
+        at_ad = hub.show_facts("05", 1102.5, "g")
+        self.assertEqual((at_ad["file"], at_ad["seek"]), ("ad.mp4", 2.5), "the commercial is already known with its clock start")
+        self.assertEqual(hub.show_facts("05", 1131.0, "g")["file"], "next.mkv")
+        self.assertIsNone(hub.show_facts("05", 1131.0, "other guard"), "a change under the station drops the prepared items")
+        hub.forget_show_facts("05")
+        self.assertIsNone(hub.show_facts("05", 1131.0, "g"))
+
+    def test_prepared_starts_come_from_the_block_timeline_and_the_clock(self):
+        ns = {"media": media, "HUB_PREPARED_AHEAD_SECONDS": 3600.0, "HUB_PREPARED_ITEMS_MAX": 80, "_scheduler_prepared": {}, "_hub_next_blocks": {}}
+        exec(get_function_source("_publish_prepared_items") + "\n" + get_function_source("_entry_parts"), ns)
+        timeline = [{"path": "a.mkv", "start_time": 0.0, "duration": 600.0},
+                    {"path": "ad1.mp4", "start_time": 600.0, "duration": 30.0, "is_commercial": True},
+                    {"path": "p1.mkv", "start_time": 630.0, "duration": 1200.0, "is_pair": True,
+                     "pair_ep1_path": "p1.mkv", "pair_ep1_duration": 500.0, "pair_ep2_path": "p2.mkv", "pair_ep2_duration": 700.0}]
+        answer = {}
+        ns["_publish_prepared_items"]("05", timeline, timeline[0], 250.0, "Morning", 10000.0, answer)
+        made_for, records = ns["_scheduler_prepared"]["05"]
+        self.assertEqual(made_for, id(answer))
+        self.assertEqual([(start, item["file"], item["mode"]) for start, item in records],
+                         [(9750.0, "a.mkv", "Video"), (10350.0, "ad1.mp4", "Commercial"), (10380.0, "p1.mkv", "Video"), (10880.0, "p2.mkv", "Video")])
+        self.assertEqual((records[3][1]["seek"], records[3][1]["duration"]), (0.0, 700.0))
+
+    def test_prepared_items_carry_on_into_the_next_block_of_every_block_mode(self):
+        ns = {"media": media, "HUB_PREPARED_AHEAD_SECONDS": 3600.0, "HUB_PREPARED_ITEMS_MAX": 240, "_scheduler_prepared": {},
+              "_hub_next_blocks": {}, "HUB_NEXT_BLOCKS_KEEP_HOURS": 26.0}
+        for name in ("_publish_prepared_items", "_entry_parts", "_keep_next_blocks"):
+            exec(get_function_source(name), ns)
+        evening = [{"path": "e1.mkv", "start_time": 0.0, "duration": 1500.0},
+                   {"path": "ad9.mp4", "start_time": 1500.0, "duration": 30.0, "is_commercial": True}]
+        ns["_keep_next_blocks"]("05", [(10000.0 - 3600.0, "Morning", [{"path": "old.mkv", "start_time": 0.0, "duration": 3600.0}], 3600.0),
+                                       (10600.0, "Evening", evening, 1530.0),
+                                       (10000.0 + 30 * 3600.0, "Morning", evening, 1530.0)], 10000.0)
+        self.assertEqual([b[1] for b in ns["_hub_next_blocks"]["05"]], ["Evening"], "blocks already over or past the kept hours are dropped")
+        timeline = [{"path": "m9.mkv", "start_time": 0.0, "duration": 600.0}]
+        ns["_publish_prepared_items"]("05", timeline, timeline[0], 0.0, "Morning", 10000.0, {})
+        records = ns["_scheduler_prepared"]["05"][1]
+        self.assertEqual([(start, item["file"], item["block"]) for start, item in records],
+                         [(10000.0, "m9.mkv", "Morning"), (10600.0, "e1.mkv", "Evening"), (12100.0, "ad9.mp4", "Evening")],
+                         "the next block's first items are prepared with their clock starts before it starts")
+        guard = get_function_source("_hub_playback_guard")
+        self.assertNotIn("toordinal", guard)
+        self.assertNotIn("sched_block_key", guard)
+        self.assertIn('_info.get("block_mode", "full_day")', guard)
+        self.assertIn("_keep_next_blocks(_channel, _blocks_ahead, _now_epoch)", get_function_source("_hub_future_for_channel"))
+        self.assertIn("_keep_next_blocks(channel_key,", get_function_source("_hub_future_for_loop_channel"))
+
+    def test_an_advance_reads_the_hub_and_open_facts_are_read_ahead(self):
+        door = get_function_source("calculate_slotted_playback_state")
+        self.assertIn("_plain = not (trust_recent_stop or allow_cold_anchor_resume)", door)
+        self.assertIn("_publish_prepared_items(target_clean_key, timeline, target_show, position_in_playlist, current_block, _now_epoch, _answer)",
+                      get_function_source("_scheduler_playback_state"))
+        self.assertIn("upcoming=_prepared", get_function_source("_hub_remember_state"))
+        self.assertIn("_warm_open_facts(channel_key,", get_function_source("_hub_writer_step"))
+        self.assertIn("_warm_open_facts(ch_key, paths[:OPEN_FACTS_WARM_ITEMS])", get_function_source("_next_item_prep_worker"))
 
 
 if __name__ == "__main__":

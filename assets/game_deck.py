@@ -20,6 +20,7 @@ import pygame
 import pygame.gfxdraw
 import menu_nav as _nav
 import performance_governor as _gov
+import ui as _ui
 import media as _media_listing
 
 from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info, console_splash_file,
@@ -2323,7 +2324,7 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
     left = center_x - group_w // 2
     panel.blit(lbl, (left, row_y))
     sw_x, sw_y = left + lbl.get_width() + 14, row_y + lbl.get_height() // 2 - sw_h // 2
-    pygame.draw.rect(panel, _gov.COLOR_GAME_SWITCH_ON if enabled else _gov.COLOR_GAME_SWITCH_OFF, (sw_x, sw_y, sw_w, sw_h), border_radius=12)
+    pygame.draw.rect(panel, _ui.COLOR_GAME_SWITCH_ON if enabled else _ui.COLOR_GAME_SWITCH_OFF, (sw_x, sw_y, sw_w, sw_h), border_radius=12)
     pygame.draw.circle(panel, _gov.COLOR_TEXT_WHITE, (sw_x + sw_w - 14 if enabled else sw_x + 14, sw_y + sw_h // 2), 9)
     if selected == _nav.STICK_DZ_SWITCH:
         pygame.draw.rect(panel, ui_color, (sw_x, sw_y, sw_w, sw_h), SELECTION_BORDER_WIDTH, border_radius=12)
@@ -2339,9 +2340,9 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
             text = f_opt.render(labels[name], True, option_color(name))
             panel.blit(text, (label_x, y_pos))
             bar_y = y_pos + text.get_height() // 2 - bar_h // 2
-            pygame.draw.rect(panel, _gov.COLOR_GAME_SWITCH_OFF, (bar_x, bar_y, bar_w, bar_h), border_radius=5)
+            pygame.draw.rect(panel, _ui.COLOR_GAME_SWITCH_OFF, (bar_x, bar_y, bar_w, bar_h), border_radius=5)
             fill = int(bar_w * (value - low) / float(high - low))
-            pygame.draw.rect(panel, _gov.COLOR_GAME_SWITCH_ON, (bar_x, bar_y, fill, bar_h), border_radius=5)
+            pygame.draw.rect(panel, _ui.COLOR_GAME_SWITCH_ON, (bar_x, bar_y, fill, bar_h), border_radius=5)
             pygame.draw.circle(panel, _gov.COLOR_TEXT_WHITE, (bar_x + fill, bar_y + bar_h // 2), 9)
             if selected == name:
                 pygame.draw.circle(panel, ui_color, (bar_x + fill, bar_y + bar_h // 2), 9, SELECTION_BORDER_WIDTH)
@@ -2376,7 +2377,7 @@ def render_stick_deadzone_ui(surface, rect, ui_color, db, cursor, rows, sticks=N
     who = f_small.render("PLAYER %d SETTINGS" % player, True, option_color(_nav.STICK_DZ_PLAYERS))
     panel.blit(who, (squares_right + 14, sq_y + sq_size // 2 - who.get_height() // 2))
 
-    off_red = _gov.COLOR_GAME_OFF_RED
+    off_red = _ui.COLOR_GAME_OFF_RED
     close_w, close_h = 110, 40
     close_x = base_w - close_w - 25
     close_y = base_h - 52
@@ -6532,7 +6533,7 @@ class ExternalGameDeck:
 
             surface.blit(name_surf, (name_x, name_y))
 
-            box_bg = _gov.COLOR_GAME_VALUE_BOX_ACTIVE if is_active else _gov.COLOR_GAME_VALUE_BOX
+            box_bg = _ui.COLOR_GAME_VALUE_BOX_ACTIVE if is_active else _gov.COLOR_GAME_VALUE_BOX
             pygame.draw.rect(surface, box_bg, (box_x, box_y, VAL_BOX_W, VAL_BOX_H), border_radius=4)
             box_border = ui_color if is_active else _gov.COLOR_GAME_VALUE_BOX_EDGE
             pygame.draw.rect(surface, box_border, (box_x, box_y, VAL_BOX_W, VAL_BOX_H), SELECTION_BORDER_WIDTH, border_radius=4)
@@ -6685,7 +6686,7 @@ class ExternalGameDeck:
                              and (p == nav_player))
                 is_armed  = (reassign_pending_player == p)
                 if is_armed:
-                    fill = _gov.COLOR_GAME_PLAYER_BOX_ARMED
+                    fill = _ui.COLOR_GAME_PLAYER_BOX_ARMED
                 elif is_active:
                     fill = ui_color
                 elif connected:
@@ -6767,7 +6768,7 @@ class ExternalGameDeck:
         is_n64 = (console == "N64")
         if not is_n64:
             sad      = self.ctrl_mapping.get("stick_as_dpad", False)
-            sw_bg    = _gov.COLOR_GAME_SWITCH_ON if sad else _gov.COLOR_GAME_SWITCH_OFF
+            sw_bg    = _ui.COLOR_GAME_SWITCH_ON if sad else _ui.COLOR_GAME_SWITCH_OFF
             sw_w, sw_h = 55, 24
             sw_surf  = pygame.Surface((sw_w, sw_h), pygame.SRCALPHA)
             pygame.draw.rect(sw_surf, sw_bg, (0, 0, sw_w, sw_h), border_radius=12)
@@ -6782,7 +6783,7 @@ class ExternalGameDeck:
         close_x = x + w - close_w - _close_inset
         close_y = y + h - _close_up
         is_close_sel = (cursor == close_idx)
-        pygame.draw.rect(surface, _gov.COLOR_BUTTON_CLOSE, (close_x, close_y, close_w, close_h), border_radius=4)
+        pygame.draw.rect(surface, _ui.COLOR_BUTTON_CLOSE, (close_x, close_y, close_w, close_h), border_radius=4)
         if is_close_sel:
             pygame.draw.rect(surface, ui_color, (close_x, close_y, close_w, close_h), SELECTION_BORDER_WIDTH, border_radius=4)
         lbl_close = f_opt.render("Close", True, _gov.COLOR_TEXT_WHITE)
@@ -6791,7 +6792,6 @@ class ExternalGameDeck:
 
         if seq_running and active_btn:
             ctrl_bottom = y + h - 6
-            import ui as _ui
             # WARNING: the skip key is the Select action, so the hint shows whatever key Select is remapped to (its picture when it is Enter, its name otherwise).
             _skip_bound = _ui._get_remote_binding(db, "enter")
             _skip_name = "enter" if _skip_bound == pygame.K_RETURN else _ui._remote_key_label(_skip_bound).lower()
@@ -7062,7 +7062,6 @@ class ExternalGameDeck:
 
     def _draw_legend(self, screen, cx, y, h, groups):
         """Draws the legend under a game menu: one section per action, its name centred above its controller button, a slash, then its keyboard key, as pictures (as text when a picture is missing); the sections sit side by side, centred on cx."""
-        import ui as _ui
         f     = self._font_small
         key_h = _gov.GAME_LEGEND_KEY_H_PX
         gap   = _gov.GAME_LEGEND_ROW_GAP_PX
@@ -8147,27 +8146,8 @@ class ExternalGameDeck:
             lbl_q = f_title.render("EXIT DVD PLAYER?", True, _gov.COLOR_ARCADE_GOLD)
             screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
 
-            box_radius      = 4
-            focus_thickness = SELECTION_BORDER_WIDTH
-            btn_w, btn_h    = 110, 36
-            btn_y           = box_y + 85
-
-            yes_btn_x = cx - 100 - btn_w // 2
-            no_btn_x  = cx + 100 - btn_w // 2
-
-            pygame.draw.rect(screen, _gov.COLOR_BUTTON_YES, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
-            if self.dvd_exit_selection == "Yes":
-                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
-            screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
-
-            pygame.draw.rect(screen, _gov.COLOR_BUTTON_NO, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
-            if self.dvd_exit_selection == "No":
-                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
-            screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
-
-            import ui as _ui
+            btn_y = box_y + 85
+            _ui.draw_popup_yes_no(screen, cx, btn_y, self.dvd_exit_selection, True, f_btn, accent_col)
             _ui.draw_key_hint_fitted(screen, [("a", "d"), "SELECT", ("enter",), "CONFIRM"], cx,
                                      box_y + box_h - 35 + f_hint2.get_height() // 2, "Courier New", 17,
                                      _gov.COLOR_GAME_POPUP_HINT, box_w - 20)
@@ -8204,27 +8184,8 @@ class ExternalGameDeck:
             lbl_q = f_title.render("RETURN TO MAIN MENU?", True, _gov.COLOR_ARCADE_GOLD)
             screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
 
-            box_radius      = 4
-            focus_thickness = SELECTION_BORDER_WIDTH
-            btn_w, btn_h    = 110, 36
-            btn_y           = box_y + 85
-
-            yes_btn_x = cx - 100 - btn_w // 2
-            no_btn_x  = cx + 100 - btn_w // 2
-
-            pygame.draw.rect(screen, _gov.COLOR_BUTTON_YES, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
-            if self.dvd_return_menu_selection == "Yes":
-                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
-            screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
-
-            pygame.draw.rect(screen, _gov.COLOR_BUTTON_NO, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
-            if self.dvd_return_menu_selection == "No":
-                pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-            lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
-            screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
-
-            import ui as _ui
+            btn_y = box_y + 85
+            _ui.draw_popup_yes_no(screen, cx, btn_y, self.dvd_return_menu_selection, True, f_btn, accent_col)
             _ui.draw_key_hint_fitted(screen, [("a", "d"), "SELECT", ("enter",), "CONFIRM"], cx,
                                      box_y + box_h - 35 + f_hint2.get_height() // 2, "Courier New", 17,
                                      _gov.COLOR_GAME_POPUP_HINT, box_w - 20)
@@ -9315,27 +9276,8 @@ class ExternalGameDeck:
         lbl_q = f_title.render("EXIT GAME?", True, _gov.COLOR_ARCADE_GOLD)
         screen.blit(lbl_q, (cx - lbl_q.get_width() // 2, box_y + 25))
 
-        box_radius      = 4
-        focus_thickness = SELECTION_BORDER_WIDTH
-        btn_w, btn_h    = 110, 36
-        btn_y           = box_y + 85
-
-        yes_btn_x = cx - 100 - btn_w // 2
-        no_btn_x  = cx + 100 - btn_w // 2
-
-        pygame.draw.rect(screen, _gov.COLOR_BUTTON_YES, (yes_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
-        if self.game_exit_selection == "Yes":
-            pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (yes_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-        lbl_yes = f_btn.render("YES", True, _gov.COLOR_TEXT_WHITE)
-        screen.blit(lbl_yes, (yes_btn_x + btn_w // 2 - lbl_yes.get_width() // 2, btn_y + btn_h // 2 - lbl_yes.get_height() // 2))
-
-        pygame.draw.rect(screen, _gov.COLOR_BUTTON_NO, (no_btn_x, btn_y, btn_w, btn_h), border_radius=box_radius)
-        if self.game_exit_selection == "No":
-            pygame.draw.rect(screen, _gov.COLOR_TEXT_WHITE, (no_btn_x, btn_y, btn_w, btn_h), focus_thickness, border_radius=box_radius)
-        lbl_no = f_btn.render("NO", True, _gov.COLOR_TEXT_WHITE)
-        screen.blit(lbl_no, (no_btn_x + btn_w // 2 - lbl_no.get_width() // 2, btn_y + btn_h // 2 - lbl_no.get_height() // 2))
-
-        import ui as _ui
+        btn_y = box_y + 85
+        _ui.draw_popup_yes_no(screen, cx, btn_y, self.game_exit_selection, True, f_btn, accent_col)
         _ui.draw_key_hint_fitted(screen, [("pad_left", "pad_right"), ["OR"], ("a", "d"), "SELECT", ("pad_a",), "CONFIRM", ("pad_b",), "CANCEL"],
                                  cx, box_y + box_h - 35 + f_hint2.get_height() // 2, "Courier New", 17,
                                  _gov.COLOR_GAME_POPUP_HINT, box_w - 20)

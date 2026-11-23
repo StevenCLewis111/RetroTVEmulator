@@ -32,26 +32,6 @@ except Exception:
 
 
 # ============================================================================
-# SECTION: Theme colour slider track
-# ============================================================================
-# WARNING: the fallback numbers below must match THEME_UI_HUE_SKIP_LOW and THEME_UI_HUE_SKIP_HIGH in performance_governor.py; they are used only when that module fails to import.
-_THEME_SKIP_LOW = performance_governor.THEME_UI_HUE_SKIP_LOW if performance_governor is not None else 195
-_THEME_SKIP_WIDTH = performance_governor.THEME_UI_HUE_SKIP_WIDTH if performance_governor is not None else 46
-
-
-def _theme_track_hue(fraction):
-    """Returns the hue drawn at a point along the border colour track (0.0 to 1.0), which has the skipped blue cut out."""
-    position = fraction * (360 - _THEME_SKIP_WIDTH)
-    return position if position < _THEME_SKIP_LOW else position + _THEME_SKIP_WIDTH
-
-
-def _theme_track_fraction(hue):
-    """Returns where a hue sits along the border colour track (0.0 to 1.0)."""
-    position = hue if hue < _THEME_SKIP_LOW else max(_THEME_SKIP_LOW, hue - _THEME_SKIP_WIDTH)
-    return position / float(360 - _THEME_SKIP_WIDTH)
-
-
-# ============================================================================
 # SECTION: Colours
 # ============================================================================
 # WARNING: the fallback colours below must match the same names in performance_governor.py; they are used only when that module fails to import.
@@ -187,6 +167,55 @@ CHANNEL_GRID_LEFT_COL_SHIFT_PX = performance_governor.CHANNEL_GRID_LEFT_COL_SHIF
 
 
 # ============================================================================
+# SECTION: Button colours that turn away from the border/text colour
+# ============================================================================
+# WARNING: the fallback numbers below must match THEME_BUTTON_FAMILY_REST and THEME_BUTTON_HUE_SAFE_GAP in performance_governor.py; they are used only when that module fails to import.
+THEME_BUTTON_FAMILY_REST = performance_governor.THEME_BUTTON_FAMILY_REST if performance_governor is not None else {"blue": 218, "red": 354, "green": 134, "yellow": 47}
+THEME_BUTTON_HUE_SAFE_GAP = performance_governor.THEME_BUTTON_HUE_SAFE_GAP if performance_governor is not None else 30
+# WARNING: the fallback colours below must match the same names in performance_governor.py; they are used only when that module fails to import.
+COLOR_GAME_SWITCH_ON = performance_governor.COLOR_GAME_SWITCH_ON if performance_governor is not None else (40, 167, 69)
+COLOR_GAME_SWITCH_OFF = performance_governor.COLOR_GAME_SWITCH_OFF if performance_governor is not None else (45, 65, 100)
+COLOR_GAME_OFF_RED = performance_governor.COLOR_GAME_OFF_RED if performance_governor is not None else (220, 53, 69)
+COLOR_GAME_PLAYER_BOX_ARMED = performance_governor.COLOR_GAME_PLAYER_BOX_ARMED if performance_governor is not None else (200, 160, 30)
+COLOR_GAME_VALUE_BOX_ACTIVE = performance_governor.COLOR_GAME_VALUE_BOX_ACTIVE if performance_governor is not None else (90, 30, 30)
+_BUTTON_FAMILIES = {
+    "blue": ("COLOR_MENU_BUTTON", "COLOR_MENU_BUTTON_BLUE", "COLOR_MENU_BUTTON_BLUE_DIM", "COLOR_MENU_ON_BLUE", "COLOR_MENU_ON_BLUE_EDGE", "COLOR_GAME_SWITCH_OFF"),
+    "red": ("COLOR_BUTTON_CLOSE", "COLOR_BUTTON_NO", "COLOR_BUTTON_CLEAR", "COLOR_MENU_OFF_RED", "COLOR_GAME_OFF_RED", "COLOR_GAME_VALUE_BOX_ACTIVE"),
+    "green": ("COLOR_BUTTON_YES", "COLOR_BUTTON_ADD", "COLOR_MENU_ON_GREEN", "COLOR_GAME_SWITCH_ON"),
+    "yellow": ("COLOR_BUTTON_AUDIO_TRACK", "COLOR_GAME_PLAYER_BOX_ARMED"),
+}
+_BUTTON_BASE = {_name: globals()[_name] for _names in _BUTTON_FAMILIES.values() for _name in _names}
+_button_shift_now = {_family: 0 for _family in _BUTTON_FAMILIES}
+
+
+def theme_button_hue_shift(ui_hue, rest):
+    """Returns how many degrees a colour of button resting at `rest` turns for a border/text hue: 0 while the hue is at least the safe gap away, otherwise the turn that keeps the gap, on the far side of the hue from where it is."""
+    apart = ((ui_hue - rest + 180) % 360) - 180
+    if abs(apart) >= THEME_BUTTON_HUE_SAFE_GAP:
+        return 0
+    return apart + THEME_BUTTON_HUE_SAFE_GAP if apart < 0 else apart - THEME_BUTTON_HUE_SAFE_GAP
+
+
+def _turn_hue(color, degrees):
+    """Returns the colour with its hue turned by the degrees, its strength and brightness kept."""
+    import colorsys
+    h, s, v = colorsys.rgb_to_hsv(color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
+    r, g, b = colorsys.hsv_to_rgb((h + degrees / 360.0) % 1.0, s, v)
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def sync_button_colors(ui_hue):
+    """Sets the blue, red, green and yellow button colours for the border/text hue, each colour turned away from it when it is near; a colour whose turn is unchanged is left alone."""
+    for _family, _names in _BUTTON_FAMILIES.items():
+        shift = theme_button_hue_shift(ui_hue, THEME_BUTTON_FAMILY_REST[_family])
+        if shift == _button_shift_now[_family]:
+            continue
+        _button_shift_now[_family] = shift
+        for _name in _names:
+            globals()[_name] = _turn_hue(_BUTTON_BASE[_name], shift) if shift else _BUTTON_BASE[_name]
+
+
+# ============================================================================
 # SECTION: Drawing & canvas-fit helpers
 # ============================================================================
 
@@ -300,9 +329,8 @@ def popup_yes_no_rects(center_x, btn_y):
             pygame.Rect(center_x + POPUP_YES_NO_OFFSET - w // 2, btn_y, w, h))
 
 
-def draw_popup_yes_no(surface, center_x, btn_y, selection, focused, font, focus_color=None):
-    """Draws the Yes and No buttons of a popup in their one place and colours: Yes green on the left, No red (the Close colour) on the right; the picked one has a white edge, which shows on both colours."""
-    focus_color = COLOR_TEXT_WHITE
+def draw_popup_yes_no(surface, center_x, btn_y, selection, focused, font, focus_color):
+    """Draws the Yes and No buttons of a popup in their one place and colours: Yes green on the left, No red (the Close colour) on the right; the picked one has the border/text colour edge, like every other button."""
     yes_rect, no_rect = popup_yes_no_rects(center_x, btn_y)
     _draw_shared_button(surface, yes_rect, COLOR_BUTTON_YES, "YES", focused and selection == "Yes", font, focus_color)
     _draw_shared_button(surface, no_rect, COLOR_BUTTON_NO, "NO", focused and selection == "No", font, focus_color)
@@ -1190,17 +1218,22 @@ SYSTEM_ROW_META = {
     "static_noise":       {"kind": "toggle", "label": "Static Noise:"},
     "reception_lines":    {"kind": "toggle", "label": "Reception Lines:"},
     "scan_lines":         {"kind": "toggle", "label": "Scan Lines:"},
-    "bezel_style_select": {"kind": "button", "label": "Bezel Style: Option 1", "color": COLOR_MENU_BUTTON_BLUE},
-    "update_check":       {"kind": "button", "label": "Look for Updates", "color": COLOR_MENU_BUTTON_BLUE},
-    "send_logs":          {"kind": "button", "label": "Send Logs", "color": COLOR_MENU_BUTTON_BLUE},
-    "remote_remap":       {"kind": "button", "label": "Remote Remapping", "color": COLOR_MENU_BUTTON_BLUE},
-    "gpu_render_mode":    {"kind": "button", "label": "GPU/CPU: Disabled (CPU Only)", "color": COLOR_MENU_BUTTON_BLUE},
-    "performance_mode":   {"kind": "button", "label": "Performance Mode: Standard", "color": COLOR_MENU_BUTTON_BLUE},
-    "advanced_settings":  {"kind": "button", "label": "Advanced Settings", "color": COLOR_MENU_BUTTON_BLUE},
+    "bezel_style_select": {"kind": "button", "label": "Bezel Style: Option 1", "blue": True},
+    "update_check":       {"kind": "button", "label": "Look for Updates", "blue": True},
+    "send_logs":          {"kind": "button", "label": "Send Logs", "blue": True},
+    "remote_remap":       {"kind": "button", "label": "Remote Remapping", "blue": True},
+    "gpu_render_mode":    {"kind": "button", "label": "GPU/CPU: Disabled (CPU Only)", "blue": True},
+    "performance_mode":   {"kind": "button", "label": "Performance Mode: Standard", "blue": True},
+    "advanced_settings":  {"kind": "button", "label": "Advanced Settings", "blue": True},
     "reset_settings":     {"kind": "button", "label": "Reset All Settings"},
     "exit_program":       {"kind": "button", "label": "Exit Program"},
     "poweroff":           {"kind": "button", "label": "Turn Off Computer"},
 }
+
+
+def _system_row_color(row_id, default):
+    """Returns a system row button's colour: the button blue of the moment for a blue row, otherwise the default."""
+    return COLOR_MENU_BUTTON_BLUE if SYSTEM_ROW_META.get(row_id, {}).get("blue") else default
 
 
 def _gpu_render_mode_options(db):
@@ -3694,7 +3727,6 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
 
 
 _cached_bg_gradient_surf = None
-_cached_ui_gradient_surf = None
 _cached_gradient_width = -1
 
 # WARNING: the cache key must include everything that can change what is on screen.
@@ -3904,7 +3936,7 @@ THEME_SLIDER_FIRST_GAP_TRIM_PX = performance_governor.THEME_SLIDER_FIRST_GAP_TRI
 
 def _build_settings_overlay_menu(surface, theme, app_state, db):
     """Does the actual (expensive) menu build: every tab, every row, then fit-scale to the target surface."""
-    global _cached_bg_gradient_surf, _cached_ui_gradient_surf, _cached_gradient_width
+    global _cached_bg_gradient_surf, _cached_gradient_width
     real_w, real_h = surface.get_size()
 
     # ========================================================================
@@ -4221,7 +4253,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 b_color = COLOR_MENU_BUTTON_GREYED
                 btn_txt_col = COLOR_MENU_TEXT_GREYED
             else:
-                b_color = SYSTEM_ROW_META[row_id].get("color", OFF_RED)
+                b_color = _system_row_color(row_id, OFF_RED)
                 btn_txt_col = TEXT_WHITE
             lbl_b = f_ch_btn.render(btn_txt, True, btn_txt_col)
             btn_w = lbl_b.get_width() + (btn_pad_x * 2)
@@ -4251,7 +4283,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _txt_col = COLOR_MENU_TEXT_GREYED if _row_disabled else TEXT_WHITE
                 _lbl = f_ch_btn.render(_lbl_txt, True, _txt_col)
                 _w = _lbl.get_width() + (btn_pad_x * 2)
-                _color = COLOR_MENU_BUTTON_GREYED if _row_disabled else SYSTEM_ROW_META[_row_id].get("color", OFF_RED)
+                _color = COLOR_MENU_BUTTON_GREYED if _row_disabled else _system_row_color(_row_id, OFF_RED)
                 pygame.draw.rect(menu_canvas, _color, (_x, _y, _w, _h), border_radius=box_radius)
                 if _focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (_x, _y, _w, _h), focus_thickness, border_radius=box_radius)
@@ -4271,7 +4303,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
             _po_x = right_col_x + label_padding_x
             if _po_x < _close_rect.right + btn_gap and _po_x + _po_w > _close_rect.left - btn_gap:
                 _po_x = _close_rect.left - btn_gap - _po_w
-            _po_color = SYSTEM_ROW_META["poweroff"].get("color", OFF_RED)
+            _po_color = _system_row_color("poweroff", OFF_RED)
             pygame.draw.rect(menu_canvas, _po_color, (_po_x, _po_y, _po_w, _po_h), border_radius=box_radius)
             if _po_focused:
                 _aa_rounded_rect(menu_canvas, NEON_GREEN, (_po_x, _po_y, _po_w, _po_h), focus_thickness, border_radius=box_radius)
@@ -4429,7 +4461,7 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
                 _as_upd_disabled = (_as_row_id == "update_check" and not UPDATER_AND_SERVER_FEATURES_ENABLED)
                 _as_btn_disabled = _as_gpu_disabled or _as_upd_disabled or kiosk_greys_advanced_row(db, _as_row_id)
                 _as_txt_col = COLOR_MENU_TEXT_GREYED if _as_btn_disabled else TEXT_WHITE
-                _as_btn_color = COLOR_MENU_BUTTON_GREYED if _as_btn_disabled else SYSTEM_ROW_META.get(_as_row_id, {}).get("color", COLOR_MENU_BUTTON_BLUE)
+                _as_btn_color = COLOR_MENU_BUTTON_GREYED if _as_btn_disabled else _system_row_color(_as_row_id, COLOR_MENU_BUTTON_BLUE)
                 pygame.draw.rect(menu_canvas, _as_btn_color, (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), border_radius=5)
                 if _as_focused:
                     _aa_rounded_rect(menu_canvas, NEON_GREEN, (_as_bar_x, _as_bar_y, _as_bar_w, btn_h), SELECTION_BORDER_WIDTH, border_radius=5)
@@ -6001,15 +6033,12 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         if _cached_bg_gradient_surf is None or _cached_gradient_width != slider_width:
             _cached_gradient_width = slider_width
             _cached_bg_gradient_surf = pygame.Surface((slider_width, gradient_height))
-            _cached_ui_gradient_surf = pygame.Surface((slider_width, gradient_height))
             
             for i in range(slider_width):
                 hue_val = (i / float(slider_width)) * 360
                 _r, _g, _b = colorsys.hsv_to_rgb(hue_val / 360.0, 0.8, 0.9)
                 _pixel_color = (int(_r * 255), int(_g * 255), int(_b * 255))
                 pygame.draw.line(_cached_bg_gradient_surf, _pixel_color, (i, 0), (i, gradient_height))
-                _ur, _ug, _ub = colorsys.hsv_to_rgb(_theme_track_hue(i / float(slider_width)) / 360.0, 0.8, 0.9)
-                pygame.draw.line(_cached_ui_gradient_surf, (int(_ur * 255), int(_ug * 255), int(_ub * 255)), (i, 0), (i, gradient_height))
 
         is_bg_focused = (layer == "THEME_ROWS" and cur_sel == 4)
         title_color = NEON_GREEN if is_bg_focused else TEXT_WHITE
@@ -6032,9 +6061,9 @@ def _build_settings_overlay_menu(surface, theme, app_state, db):
         ui_title_x = cx + (content_w // 2) - (lbl_ui.get_width() // 2)
         menu_canvas.blit(lbl_ui, (ui_title_x, ui_title_y))
         
-        menu_canvas.blit(_cached_ui_gradient_surf, (slider_x, ui_slider_y))
+        menu_canvas.blit(_cached_bg_gradient_surf, (slider_x, ui_slider_y))
         
-        ui_knob_x = slider_x + int(_theme_track_fraction(ui_hue) * slider_width)
+        ui_knob_x = slider_x + int((ui_hue / 360.0) * slider_width)
         pygame.draw.circle(menu_canvas, TEXT_WHITE, (ui_knob_x, ui_slider_y - 5), knob_rad)
         if is_ui_focused:
             pygame.draw.circle(menu_canvas, NEON_GREEN, (ui_knob_x, ui_slider_y - 5), focus_knob_rad, SELECTION_BORDER_WIDTH)

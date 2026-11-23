@@ -58,6 +58,14 @@ except Exception as _governor_import_error:
     _perf_governor = None
 
 
+def _time_critical():
+    """True on the screen thread and the playback thread, which never wait on background work or a slow drive."""
+    _check = getattr(_perf_governor, "is_time_critical_thread", None)
+    if _check is not None:
+        return _check()
+    return threading.current_thread() is threading.main_thread()
+
+
 # WARNING: the fallback number below must match SELECTION_BORDER_WIDTH in performance_governor.py; it is used only when that module fails to import.
 SELECTION_BORDER_WIDTH = _perf_governor.SELECTION_BORDER_WIDTH if _perf_governor is not None else 3
 # WARNING: the fallback below must match REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS in performance_governor.py; it is used only when that module fails to import.
@@ -982,8 +990,8 @@ def _yield_to_live_playback(label=""):
     # WARNING: first-scan work in a priority scope is the live open itself and must never wait on the flag it is clearing.
     if _perf_governor is not None and _perf_governor.in_priority_scope():
         return
-    # WARNING: the main thread is the live playback itself (and the menus); it must never sleep waiting on a flag it owns. Only background threads yield.
-    if threading.current_thread() is threading.main_thread():
+    # WARNING: the screen thread and the playback thread are the live playback itself (and the menus); they must never sleep waiting on a flag they own. Only background threads yield.
+    if _time_critical():
         return
     _wait_start = _now_ms()
     _deadline_ms = _wait_start + (_LIVE_PLAYBACK_PRIORITY_MAX_WAIT_S * 1000)
@@ -1307,7 +1315,7 @@ def _path_status(p):
         _cached_status, _cached_at = cached
         if now_ms - _cached_at < _path_status_ttl_ms(_cached_status):
             return _cached_status
-        if threading.current_thread() is threading.main_thread():
+        if _time_critical():
             # WARNING: the screen thread never waits on a drive for a path it has a status for (owner 2026-11-02, N1: 13.8 s freezes); the re-check runs on the channel-ready thread.
             with _path_exists_cache_lock:
                 _path_refresh_queue[p] = True
@@ -1323,7 +1331,7 @@ def _path_status(p):
             _path_refresh_queue[p] = True
         return PATH_UNKNOWN
 
-    if threading.current_thread() is threading.main_thread():
+    if _time_critical():
         # WARNING: the screen thread never waits long on a drive for a path it holds no status for (owner logs 2026-11-10 18:07, a 24 s freeze on one probe after another; 2026-11-11 08:31, 7.6 s on a share); it waits the first-look time (none for a network path), and a path whose drive did not answer in time reads as unknown (present) while the check finishes on a background thread, and that drive's first looks are skipped for a while.
         return _screen_thread_first_look(p, now_ms)
 
@@ -2266,11 +2274,11 @@ def _flex_name_facts(path):
 
 def _folder_name_tally(folder):
     """({show key: [files, show name, Counter of seasons]}, number of known files) for one folder, counted again only when the folder's known files changed."""
+    version = _folder_version.get(folder, 0)
+    held = _folder_tally_cache.get(folder)
+    if held is not None and held[0] == version:
+        return held[1], held[2]
     with _path_exists_cache_lock:
-        version = _folder_version.get(folder, 0)
-        held = _folder_tally_cache.get(folder)
-        if held is not None and held[0] == version:
-            return held[1], held[2]
         members = list(_path_folder_index.get(folder, ()))
     tally = {}
     for member in members:
@@ -2279,10 +2287,9 @@ def _folder_name_tally(folder):
             entry = tally.setdefault(key, [0, own, collections.Counter()])
             entry[0] += 1
             entry[2][season] += 1
-    with _path_exists_cache_lock:
-        if len(_folder_tally_cache) >= _GUESS_CLASS_MEMO_MAX:
-            _folder_tally_cache.clear()
-        _folder_tally_cache[folder] = (version, tally, len(members))
+    if len(_folder_tally_cache) >= _GUESS_CLASS_MEMO_MAX:
+        _folder_tally_cache.clear()
+    _folder_tally_cache[folder] = (version, tally, len(members))
     return tally, len(members)
 
 
@@ -2291,8 +2298,7 @@ def _flex_sibling_show_name(path):
     path = str(path)
     folder = os.path.dirname(path)
     tally, known = _folder_name_tally(folder)
-    with _path_exists_cache_lock:
-        counted = path in _path_folder_index.get(folder, ())
+    counted = path in _path_folder_index.get(folder, ())
     mine = _flex_name_facts(path) if counted else ("", "", None)
     siblings = known - (1 if counted else 0)
     best = None
@@ -2404,14 +2410,13 @@ def _flex_episode_sort_key(item):
 # WARNING: the fallback number below must match SHOW_NAME_MEMO_MAX in performance_governor.py; it is used only when that module fails to import.
 _SHOW_NAME_MEMO_MAX = _perf_governor.SHOW_NAME_MEMO_MAX if _perf_governor is not None else 60000
 _show_name_memo = {}
-_show_name_memo_lock = threading.Lock()
 
 
 def _flex_path_facts(path):
     """What group_shows_flexible reads from one file's path, worked out once per path: (extra, title, season, episode, show key, copy-free name key)."""
+    # WARNING: owner log 2026-11-21 11:59: a lock taken twice per file held five lineup builds of 1873 files in a queue for 15 s; the memo is read and written one entry at a time, which needs no lock, and two threads working out the same path store the same facts.
     path = str(path)
-    with _show_name_memo_lock:
-        held = _show_name_memo.get(path)
+    held = _show_name_memo.get(path)
     if held is not None:
         return held
     track = {"path": path}
@@ -2421,10 +2426,9 @@ def _flex_path_facts(path):
     stem = os.path.splitext(os.path.basename(path))[0]
     stem = re.sub(r"(?i)(?:\.ia|[\s._-]+copy(?:[\s._-]+\d+)?|\s*\(\d+\))+$", "", stem)
     facts = (extra, title, season, episode, key, _normalize_show_key(stem))
-    with _show_name_memo_lock:
-        if len(_show_name_memo) >= _SHOW_NAME_MEMO_MAX:
-            _show_name_memo.clear()
-        _show_name_memo[path] = facts
+    if len(_show_name_memo) >= _SHOW_NAME_MEMO_MAX:
+        _show_name_memo.clear()
+    _show_name_memo[path] = facts
     return facts
 
 
@@ -2593,8 +2597,8 @@ def whole_seconds_up(seconds):
 
 
 def read_file_rows_ahead(paths):
-    """Has the length and facts hubs read every listed file they do not hold yet in a few turns of the library, before a background thread asks about the files one by one; the screen thread reads nothing ahead."""
-    if threading.current_thread() is threading.main_thread():
+    """Has the length and facts hubs read every listed file they do not hold yet in a few turns of the library, before a background thread asks about the files one by one; the screen thread and the playback thread read nothing ahead."""
+    if _time_critical():
         return
     for hub in (_duration_hub, get_file_facts_hub()):
         if hub is not None:
@@ -7325,6 +7329,8 @@ def _whisper_model_files_note():
 
 # WARNING: the fallback number below must match CAPTION_WORKER_START_SECONDS in performance_governor.py; it is used only when that module fails to import.
 CAPTION_WORKER_START_SECONDS = _perf_governor.CAPTION_WORKER_START_SECONDS if _perf_governor is not None else 240
+# WARNING: the fallback number below must match CAPTION_WORKER_EXIT_WAIT_S in performance_governor.py; it is used only when that module fails to import.
+CAPTION_WORKER_EXIT_WAIT_S = getattr(_perf_governor, "CAPTION_WORKER_EXIT_WAIT_S", 3.0)
 
 
 _native_libraries_reporter = None
@@ -7465,6 +7471,12 @@ def _start_caption_model_process(threads):
     if reply is not None and reply[0] == "ready":
         log.info("[ASR WORKER] caption model process %d is up: %s", process.pid, reply[1])
         return _RemoteWhisperModel(process, link[0])
+    if reply is None and link and time.monotonic() < deadline:
+        # WARNING: the link closes a moment before a crashing process has fully ended; it is given CAPTION_WORKER_EXIT_WAIT_S to end, or a crash was taken for a process that did not load in time and Live Captions were not locked.
+        try:
+            process.wait(timeout=CAPTION_WORKER_EXIT_WAIT_S)
+        except subprocess.TimeoutExpired:
+            pass
     if process.poll() is None:
         process.kill()
         log.warning("[ASR WORKER] the caption model process did not load the model in %ds, so Live Captions stay off. Its own crash report:\n%s", CAPTION_WORKER_START_SECONDS, _caption_worker_crash_tail())
@@ -11599,8 +11611,6 @@ class RetroDatabase:
         """Fill in defaults/migrations on top of a raw 'config' dict loaded from disk."""
         config = dict(raw_config)
         config["is_muted"] = False
-        if _perf_governor is not None and isinstance(config.get("theme_ui_hue"), (int, float)):
-            config["theme_ui_hue"] = _perf_governor.theme_ui_hue_clear(config["theme_ui_hue"])
         if "screen_mode" not in config:
             config["screen_mode"] = "normal"
         if "dvd_screen_mode" not in config:

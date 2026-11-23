@@ -44,6 +44,14 @@ except Exception as _governor_import_error:
     _governor = None
     logging.getLogger(__name__).warning("[MEDIA LIBRARY] could not import performance_governor, using the fallback values written in media_library.py: %s", _governor_import_error)
 
+
+def _time_critical():
+    """True on the screen thread and the playback thread, which never wait for the database."""
+    _check = getattr(_governor, "is_time_critical_thread", None)
+    if _check is not None:
+        return _check()
+    return threading.current_thread() is threading.main_thread()
+
 # ============================================================================
 # SECTION: Storage location & database
 # ============================================================================
@@ -340,27 +348,35 @@ class MediaLibrary:
             self._conn.commit()
 
     def get_context_off_gain(self, content_key: str, context: str):
-        """The saved Loudness-Scan-off dB for one file in one context, or None."""
-        with self._lock:
-            row = self._conn.execute("SELECT off_db FROM context_off_gain WHERE content_key=? AND context=?",
-                                     (content_key, context)).fetchone()
-        return None if row is None else float(row[0])
+        """The saved Loudness-Scan-off dB for one file in one context, or None; on the screen thread while the database is busy, the answer last seen (the playback thread gets it only when it was prepared ahead, and otherwise reads)."""
+        found = self._read_or_last_seen(("context_off_gain", content_key, context), None, lambda: self._conn.execute(
+            "SELECT off_db FROM context_off_gain WHERE content_key=? AND context=?", (content_key, context)).fetchone())
+        return None if found is None else float(found[0])
 
     def context_series_rows(self, context: str, series_key: str):
-        """(change dB, change time) of every counted owner change in one series inside one context, oldest first."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT change_db, change_at FROM context_gain WHERE context=? AND series_key=? AND change_db IS NOT NULL "
-                "ORDER BY change_at", (context, series_key)).fetchall()
+        """(change dB, change time) of every counted owner change in one series inside one context, oldest first; on the screen thread while the database is busy, the answer last seen (the playback thread gets it only when it was prepared ahead, and otherwise reads)."""
+        rows = self._read_or_last_seen(("context_series", context, series_key), [], lambda: self._conn.execute(
+            "SELECT change_db, change_at FROM context_gain WHERE context=? AND series_key=? AND change_db IS NOT NULL "
+            "ORDER BY change_at", (context, series_key)).fetchall())
         return [(float(r[0]), float(r[1] or 0.0)) for r in rows]
 
     def series_learning_rows(self, series_key: str):
-        """(change dB, change time) of every file of one series that holds an owner loudness change, oldest first."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT learn_change_db, learn_change_at FROM library WHERE learn_series_key=? AND learn_change_db IS NOT NULL "
-                "ORDER BY learn_change_at", (series_key,)).fetchall()
+        """(change dB, change time) of every file of one series that holds an owner loudness change, oldest first; on the screen thread while the database is busy, the answer last seen (the playback thread gets it only when it was prepared ahead, and otherwise reads)."""
+        rows = self._read_or_last_seen(("series_learning", series_key), [], lambda: self._conn.execute(
+            "SELECT learn_change_db, learn_change_at FROM library WHERE learn_series_key=? AND learn_change_db IS NOT NULL "
+            "ORDER BY learn_change_at", (series_key,)).fetchall())
         return [(float(r[0]), float(r[1] or 0.0)) for r in rows]
+
+    def _read_or_last_seen(self, memo_key, never_seen, read):
+        """Runs one read with the database taken (see _take_for_reading) and keeps its answer; when the database is busy on the screen thread, the answer last seen, or never_seen when there is none (see _take_for_reading for the playback thread)."""
+        if not self._take_for_reading(memo_key):
+            return self._screen_memo.get(memo_key, never_seen)
+        try:
+            found = read()
+        finally:
+            self._lock.release()
+        self._remember_for_screen(memo_key, found)
+        return found
 
     def _ensure_schedule_row_columns(self):
         """Adds the bundle, row_files and guide_entry columns to a hub_schedule_row table an older database file lacks, keeping every row."""
@@ -370,13 +386,19 @@ class MediaLibrary:
             if name not in have:
                 self._conn.execute(f"ALTER TABLE hub_schedule_row ADD COLUMN {name} TEXT")
 
-    def _take_for_reading(self):
-        """Takes the database for a read: any thread waits its turn; the screen thread only takes it when nobody else holds it and gets False otherwise."""
+    def _take_for_reading(self, memo_key=None):
+        """Takes the database for a read: any background thread waits its turn; the screen thread only takes it when nobody else holds it and gets False otherwise; the playback thread gets False while the database is busy only when the answer for memo_key was prepared ahead, and otherwise waits its turn and reads it."""
         # WARNING: owner log 2026-11-18: the screen thread waited up to 3.7 s here behind the guide's background writes; it never waits, and reads the answer it last saw instead.
-        if threading.current_thread() is not threading.main_thread():
+        # WARNING: owner 2026-11-21: "it precaches information so it never needs to look last min"; the playback thread uses what was prepared ahead, and a fact nobody prepared is read for real, never guessed, because a wrong fact takes the channel off schedule.
+        if not _time_critical():
             self._lock.acquire()
             return True
-        return self._lock.acquire(blocking=False)
+        if self._lock.acquire(blocking=False):
+            return True
+        if threading.current_thread() is threading.main_thread() or (memo_key is not None and memo_key in self._screen_memo):
+            return False
+        self._lock.acquire()
+        return True
 
     def _remember_for_screen(self, key, value):
         """Keeps the last answer of a read, for the screen thread to use while the database is busy."""
@@ -386,7 +408,7 @@ class MediaLibrary:
 
     def path_duration_row(self, norm_path: str):
         """The measured length and saved estimate for one keyed path, as (duration, estimated_duration), or None when the path has no library row; on the screen thread while the database is busy, the answer last seen, or LIBRARY_BUSY when none was."""
-        if not self._take_for_reading():
+        if not self._take_for_reading(("duration", norm_path)):
             return self._screen_memo.get(("duration", norm_path), LIBRARY_BUSY)
         try:
             row = self._conn.execute(
@@ -402,7 +424,7 @@ class MediaLibrary:
     def _read_one_row(self, memo_name, norm_path, sql):
         """One row for one keyed path; on the screen thread while the database is busy, the row last seen, or LIBRARY_BUSY when none was."""
         # WARNING: owner log 2026-11-20: the screen thread waited 16 s for the database inside a channel change (file facts); like the length reads, it never waits and reads the answer it last saw instead.
-        if not self._take_for_reading():
+        if not self._take_for_reading((memo_name, norm_path)):
             return self._screen_memo.get((memo_name, norm_path), LIBRARY_BUSY)
         try:
             row = self._conn.execute(sql, (norm_path,)).fetchone()
@@ -507,7 +529,7 @@ class MediaLibrary:
 
     def get_entry(self, content_key: str) -> Optional[dict]:
         """The library row of one content key as a dictionary, or None; on the screen thread while the database is busy, the row last seen (None when none was)."""
-        if not self._take_for_reading():
+        if not self._take_for_reading(("entry", content_key)):
             held = self._screen_memo.get(("entry", content_key))
             return dict(held) if held is not None else None
         try:
@@ -583,6 +605,17 @@ _GROWING_FILE_CHECK_DELAY_S = _governor.LIBRARY_GROWING_FILE_CHECK_DELAY_S if _g
 _SCREEN_MEMO_MAX = _governor.SCREEN_LIBRARY_MEMO_MAX if _governor is not None else 20000
 # WARNING: the fallback number below must match HUB_FUTURE_ROWS_PER_TURN in performance_governor.py; it is used only when that module fails to import.
 _FUTURE_ROWS_PER_TURN = _governor.HUB_FUTURE_ROWS_PER_TURN if _governor is not None else 200
+# WARNING: the fallback number below must match PLAYBACK_STEP_ASIDE_MAX_S in performance_governor.py; it is used only when that module fails to import.
+_PLAYBACK_STEP_ASIDE_MAX_S = _governor.PLAYBACK_STEP_ASIDE_MAX_S if _governor is not None else 5.0
+
+
+def _step_aside_for_playback():
+    """On a background thread, waits (at most PLAYBACK_STEP_ASIDE_MAX_S) while the playback thread is working on a step, so its next database turn comes first."""
+    if _governor is None or _time_critical():
+        return
+    _until = time.monotonic() + _PLAYBACK_STEP_ASIDE_MAX_S
+    while _governor.playback_needs_the_pc() and time.monotonic() < _until:
+        time.sleep(0.05)
 
 # WARNING: the fallback numbers below must match SCREEN_THREAD_SHARE_CHECK_WAIT_S and SCREEN_THREAD_SHARE_DOWN_FOR_S in performance_governor.py; they are used only when that module fails to import.
 _SHARE_CHECK_WAIT_S = _governor.SCREEN_THREAD_SHARE_CHECK_WAIT_S if _governor is not None else 0.4
@@ -627,9 +660,11 @@ def _stat_cache_put(path, st):
 
 
 def _is_screen_critical_thread():
-    """True on the screen thread and on the thread that opens a channel (content-activate): neither may sit inside a share call, because the first picture and the Static wait on them."""
+    """True on the screen thread, the playback thread and the thread that opens a channel (content-activate): none may sit inside a share call, because the first picture and the Static wait on them."""
     # WARNING: owner 2026-11-16 (CRT log, a channel change stuck 5 s in os.stat under _decide_picture_box_before_show > get_cached > resolve on content-activate): the bounded share check only covered the screen thread, so a tune on a share that had stopped answering waited out the whole network timeout and went to Static with the banner.
     if _UI_THREAD_IDENT is not None and threading.get_ident() == _UI_THREAD_IDENT:
+        return True
+    if _governor is not None and _governor.is_marked_time_critical_thread():
         return True
     return threading.current_thread().name == "content-activate"
 
@@ -2270,7 +2305,7 @@ class DurationHub(_PathMemoHub):
         if held is not None and not force and (held[0] or now - held[2] < _UNMEASURED_RECHECK_SECONDS):
             return held
         if (held is not None and not force and not background
-                and threading.current_thread() is threading.main_thread()):
+                and _time_critical()):
             # WARNING: the screen thread never waits on the library for an answer it already holds (owner 2026-11-02, N1); the due recheck runs on the channel-ready thread.
             with self._lock:
                 self._recheck_queue[key] = str(path)
@@ -2297,7 +2332,7 @@ class DurationHub(_PathMemoHub):
 
     def read_ahead(self, paths):
         """Reads from the library, in a few turns, the length of every path whose answer is not held or is due to be asked again, and remembers each answer as a one-file look-up would. For background threads; the screen thread does nothing here."""
-        if threading.current_thread() is threading.main_thread():
+        if _time_critical():
             return
         wanted = _keys_to_read(self, paths, lambda held, now: not held[0] and now - held[2] >= _UNMEASURED_RECHECK_SECONDS)
         if not wanted:
@@ -2799,7 +2834,7 @@ class FileFactsHub(_PathMemoHub):
 
     def read_ahead(self, paths):
         """Reads from the library, in a few turns, the facts of every path whose answer is not held or is due to be asked again, and remembers each answer as a one-file look-up would. For background threads; the screen thread does nothing here."""
-        if threading.current_thread() is threading.main_thread():
+        if _time_critical():
             return
         wanted = _keys_to_read(self, paths, lambda held, now: not any(held[name] is not None for name in FILE_FACT_COLUMNS) and now - held["at"] >= _GAIN_MISS_RECHECK_SECONDS)
         if not wanted:
@@ -3050,6 +3085,7 @@ class ScheduleHub:
 
     def __init__(self, library: "MediaLibrary"):
         self._show_facts = {}
+        self._upcoming = {}
         self.library = library
 
     @staticmethod
@@ -3328,7 +3364,7 @@ class ScheduleHub:
     def replace_future_rows(self, channel, rows):
         """Saves the channel's projected future rows, replacing the ones saved before; only rows that differ are written, a few at a time with the database let go between turns; each row is a dictionary with slot_key, position, path, kind, planned_start, used_length and guide_entry. Returns how many rows were written."""
         # WARNING: these rows are a plan worked out from the prebuilt order, never history: they live in their own table, so no airing, aired, static or planned row of the schedule is read, changed or removed here (R26), and nothing that asks "what is on air" can pick one up.
-        # WARNING: owner log 2026-11-18: one change that deleted and wrote thousands of rows held the database up to 8 s while 15 jobs and the screen waited; rows that did not change are left alone, and the rest go in turns of HUB_FUTURE_ROWS_PER_TURN.
+        # WARNING: owner log 2026-11-18: one change that deleted and wrote thousands of rows held the database up to 8 s while 15 jobs and the screen waited; rows that did not change are left alone, and the rest go in turns of HUB_FUTURE_ROWS_PER_TURN, each turn after the playback thread's step.
         stamp = time.time()
         wanted = {}
         for row in rows:
@@ -3347,12 +3383,14 @@ class ScheduleHub:
             part = gone[start:start + _FUTURE_ROWS_PER_TURN]
             if not part:
                 break
+            _step_aside_for_playback()
             with self.library._lock:
                 with self.library._conn as conn:
                     conn.executemany("DELETE FROM hub_future_row WHERE channel = ? AND slot_key = ? AND position = ?",
                                      [(channel, k[0], k[1]) for k in part])
         for start in range(0, len(changed), _FUTURE_ROWS_PER_TURN):
             part = changed[start:start + _FUTURE_ROWS_PER_TURN]
+            _step_aside_for_playback()
             with self.library._lock:
                 with self.library._conn as conn:
                     conn.executemany(
@@ -3366,21 +3404,21 @@ class ScheduleHub:
         sql = ("SELECT channel, slot_key, position, path, kind, planned_start, used_length, guide_entry FROM hub_future_row "
                "WHERE channel = ? AND planned_start < ? AND planned_start + used_length > ? ORDER BY planned_start, slot_key, position")
         memo_key = ("future", channel, float(start_epoch), float(end_epoch))
-        if not self.library._take_for_reading():
+        if not self.library._take_for_reading(memo_key):
             found = self.library._screen_memo.get(memo_key) or []
         else:
             try:
                 found = self.library._conn.execute(sql, (channel, float(end_epoch), float(start_epoch))).fetchall()
             finally:
                 self.library._lock.release()
-            if threading.current_thread() is threading.main_thread():
+            if _time_critical():
                 self.library._remember_for_screen(memo_key, found)
         return [{"channel": r[0], "slot_key": r[1], "position": r[2], "path": r[3], "kind": r[4], "planned_start": r[5],
                  "used_length": r[6], "guide_entry": self._decode_guide_entry(r[7])} for r in found]
 
     def future_signature(self, channel):
         """A small value that changes whenever the channel's projected future rows are replaced, so the guide can tell its saved future is out of date."""
-        if not self.library._take_for_reading():
+        if not self.library._take_for_reading(("future_signature", channel)):
             return self.library._screen_memo.get(("future_signature", channel), (0, 0.0))
         try:
             count, newest = self.library._conn.execute(
@@ -3398,38 +3436,64 @@ class ScheduleHub:
                 "SELECT COUNT(*), MAX(updated_at) FROM hub_schedule_row WHERE channel = ? AND state != 'planned'", (channel,)).fetchone()
         return (int(count or 0), float(newest or 0.0))
 
-    def remember_show_facts(self, channel, facts, epoch, guard=None):
-        """Records the playback facts the scheduler worked out for the show on air (file, length, block, seek at that moment); guard is a small value that must still match for the facts to be trusted."""
+    def remember_show_facts(self, channel, facts, epoch, guard=None, upcoming=None):
+        """Records the playback facts the scheduler worked out for the show on air (file, length, block, seek at that moment); guard is a small value that must still match for the facts to be trusted. upcoming, when given, replaces the station's prepared items: (clock start, playback facts at that start) of the item on air and the items after it, in start order."""
         # WARNING: only the scheduler's door writes these; readers use show_facts().
         self._show_facts[channel] = {"facts": dict(facts), "epoch": float(epoch), "guard": guard}
+        if upcoming is not None:
+            self._upcoming[channel] = {"records": [(float(start), dict(item)) for start, item in upcoming], "guard": guard}
 
     def forget_show_facts(self, channel=None):
-        """Drops the remembered playback facts of one station, or of all stations."""
+        """Drops the remembered playback facts and the prepared items of one station, or of all stations."""
         if channel is None:
             self._show_facts.clear()
+            self._upcoming.clear()
         else:
             self._show_facts.pop(channel, None)
+            self._upcoming.pop(channel, None)
 
     def show_facts(self, channel, epoch, guard=None):
-        """The remembered playback facts for the show on air with the seek moved forward by the clock, or None when nothing is remembered, the guard changed, or the show has run out; the caller then asks the scheduler through the hub's miss path."""
+        """The remembered playback facts for the show on air with the seek moved forward by the clock; once that show has run out, the prepared item whose clock slot holds epoch (which then becomes the show on air); None when nothing is remembered or prepared for epoch or the guard changed, and the caller then asks the scheduler through the hub's miss path."""
         kept = self._show_facts.get(channel)
-        if kept is None or kept["guard"] != guard:
+        if kept is not None and kept["guard"] == guard:
+            elapsed = float(epoch) - kept["epoch"]
+            if elapsed >= 0:
+                facts = dict(kept["facts"])
+                seek = float(facts.get("seek", 0) or 0) + elapsed
+                duration = float(facts.get("duration", 0) or 0)
+                # WARNING: for a show cut out of the inside of a longer file the seek is a place in the whole file and the duration is only the slot, so the slot's own start is taken off before asking whether the show has run out (owner log 2026-11-06: ch08, ch18 and ch19 always missed the hub).
+                slot_start = float(facts.get("seek_slot_offset", 0) or 0) if facts.get("interior_cut") else 0.0
+                if duration > 0 and seek - slot_start < duration - 1.0:
+                    facts["seek"] = seek
+                    return facts
+        return self._prepared_item(channel, float(epoch), guard)
+
+    def _prepared_item(self, channel, epoch, guard):
+        """The prepared item whose clock slot holds epoch, with its seek moved forward by the time since its start, kept as the show on air; None when none is prepared for epoch or the guard changed."""
+        # WARNING: owner 2026-11-21: "STAY ON SCHEDULE AT ALL TIMES"; the next item, a commercial break and a channel change are answered from the items the scheduler prepared ahead with their clock starts, never looked up at the last minute.
+        ahead = self._upcoming.get(channel)
+        if ahead is None or ahead["guard"] != guard:
             return None
-        elapsed = float(epoch) - kept["epoch"]
-        if elapsed < 0:
-            return None
-        facts = dict(kept["facts"])
-        seek = float(facts.get("seek", 0) or 0) + elapsed
-        duration = float(facts.get("duration", 0) or 0)
-        # WARNING: for a show cut out of the inside of a longer file the seek is a place in the whole file and the duration is only the slot, so the slot's own start is taken off before asking whether the show has run out (owner log 2026-11-06: ch08, ch18 and ch19 always missed the hub).
-        slot_start = float(facts.get("seek_slot_offset", 0) or 0) if facts.get("interior_cut") else 0.0
-        if duration <= 0 or seek - slot_start >= duration - 1.0:
-            return None
-        facts["seek"] = seek
-        return facts
+        for start, item in ahead["records"]:
+            if start > epoch:
+                break
+            elapsed = epoch - start
+            if elapsed < float(item.get("duration", 0) or 0) - 0.05:
+                self._show_facts[channel] = {"facts": dict(item), "epoch": start, "guard": guard}
+                facts = dict(item)
+                facts["seek"] = float(item.get("seek", 0) or 0) + elapsed
+                return facts
+        return None
+
+    def prepared_items(self, channel, guard=None):
+        """The station's prepared items as (clock start, playback facts at that start), in start order; empty when none are prepared or the guard changed."""
+        ahead = self._upcoming.get(channel)
+        if ahead is None or ahead["guard"] != guard:
+            return []
+        return [(start, dict(item)) for start, item in ahead["records"]]
 
     def upcoming(self, channel, after_epoch, count=2, kinds=("episode", "movie", "music")):
-        """The next count shows of a channel that start at or after after_epoch, in start order; rows that have aired or went to Static and rows of a set put aside are left out."""
+        """The next count shows of a channel that start at or after after_epoch, in start order; rows that have aired or went to Static and rows of a set put aside are left out. On the screen thread while the database is busy, the rows last seen that still start after after_epoch (the playback thread gets them only when they were prepared ahead, and otherwise reads)."""
         marks = ",".join("?" for _ in kinds)
         sql = ("SELECT channel, slot_key, position, path, kind, pass_no, planned_start, used_length, length_source, state "
                "FROM hub_schedule_row WHERE channel = ? AND planned_start IS NOT NULL AND planned_start >= ? "
@@ -3437,20 +3501,32 @@ class ScheduleHub:
                "AND NOT EXISTS (SELECT 1 FROM hub_schedule_set s WHERE s.channel = hub_schedule_row.channel "
                "AND s.slot_key = hub_schedule_row.slot_key AND s.state = 'set_aside') "
                "ORDER BY planned_start, slot_key, position LIMIT ?")
-        with self.library._lock:
-            found = self.library._conn.execute(sql, (channel, float(after_epoch) - 0.5) + tuple(kinds) + (int(count),)).fetchall()
+        memo_key = ("upcoming", channel, int(count), tuple(kinds))
+        if not self.library._take_for_reading(memo_key):
+            found = [row for row in self.library._screen_memo.get(memo_key, []) if float(row[6]) >= float(after_epoch) - 0.5]
+        else:
+            try:
+                found = self.library._conn.execute(sql, (channel, float(after_epoch) - 0.5) + tuple(kinds) + (int(count),)).fetchall()
+            finally:
+                self.library._lock.release()
+            if _time_critical():
+                self.library._remember_for_screen(memo_key, found)
         return [self._as_dict(row) for row in found]
 
-    def at(self, channel, epoch):
-        """The channel's row that covers one clock moment (planned start up to planned start plus length), or None; a row that has aired, is airing or went to Static is preferred over a planned one, then the latest start."""
+    def at(self, channel, epoch, busy=None):
+        """The channel's row that covers one clock moment (planned start up to planned start plus length), or None; a row that has aired, is airing or went to Static is preferred over a planned one, then the latest start. On the screen thread while the database is busy, busy is returned instead; the playback thread reads."""
         sql = ("SELECT channel, slot_key, position, path, kind, pass_no, planned_start, used_length, length_source, state "
                "FROM hub_schedule_row WHERE channel = ? AND planned_start IS NOT NULL AND planned_start <= ? "
                "AND planned_start + COALESCE(used_length, 0) > ? "
                "AND NOT (state = 'planned' AND EXISTS (SELECT 1 FROM hub_schedule_set s WHERE s.channel = hub_schedule_row.channel "
                "AND s.slot_key = hub_schedule_row.slot_key AND s.state = 'set_aside')) "
                "ORDER BY (state = 'planned'), planned_start DESC, updated_at DESC LIMIT 1")
-        with self.library._lock:
+        if not self.library._take_for_reading():
+            return busy
+        try:
             found = self.library._conn.execute(sql, (channel, float(epoch), float(epoch))).fetchone()
+        finally:
+            self.library._lock.release()
         return self._as_dict(found) if found else None
 
     def mark(self, channel, slot_key, position, state, used_length=None, length_source=None):
