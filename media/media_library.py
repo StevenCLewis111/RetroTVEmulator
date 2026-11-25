@@ -136,6 +136,9 @@ CREATE TABLE IF NOT EXISTS library (
 
     caption_kind        TEXT,       -- where the overlay captions come from: "embedded" | "sidecar"
     caption_srt_path    TEXT,       -- the .srt file those captions are read from
+    saved_captions_file TEXT,       -- the file in main/saved captions holding this file's saved captions (saved_captions.py)
+    saved_captions_covered REAL,    -- seconds of the file those saved captions cover
+    saved_captions_complete INTEGER, -- 1 once they cover the whole file
     unplayable_strikes  INTEGER,    -- playability probe failures so far
     unplayable_reason   TEXT,
     confirmed_unplayable INTEGER,   -- 1 once the file is confirmed corrupt or broken
@@ -202,6 +205,14 @@ CREATE TABLE IF NOT EXISTS hub_future_row (
 
 CREATE INDEX IF NOT EXISTS idx_hub_future_start ON hub_future_row(channel, planned_start);
 
+CREATE TABLE IF NOT EXISTS hub_plan_state (
+    channel        TEXT NOT NULL,
+    name           TEXT NOT NULL,      -- what the planner keeps: a Visualizer's lineup of the day, a Marathon's clock anchor
+    value          TEXT NOT NULL,      -- JSON
+    updated_at     REAL NOT NULL,
+    PRIMARY KEY (channel, name)
+);
+
 CREATE TABLE IF NOT EXISTS hub_schedule_set (
     channel        TEXT NOT NULL,
     slot_key       TEXT NOT NULL,      -- the set of rows this label belongs to
@@ -245,6 +256,11 @@ CREATE TABLE IF NOT EXISTS hub_part_group_gain (
     convergence_db REAL,
     updated_at     REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS library_once (
+    name           TEXT PRIMARY KEY,   -- a one-time change to the stored rows that has been made
+    done_at        REAL NOT NULL
+);
 """
 
 
@@ -272,6 +288,9 @@ _LIBRARY_ADDED_COLUMNS = (
     ("learn_watch_at", "REAL"),
     ("caption_kind", "TEXT"),
     ("caption_srt_path", "TEXT"),
+    ("saved_captions_file", "TEXT"),
+    ("saved_captions_covered", "REAL"),
+    ("saved_captions_complete", "INTEGER"),
     ("unplayable_strikes", "INTEGER"),
     ("unplayable_reason", "TEXT"),
     ("confirmed_unplayable", "INTEGER"),
@@ -308,6 +327,46 @@ class MediaLibrary:
         self._ensure_library_columns()
         self._ensure_schedule_row_columns()
         self._conn.commit()
+        self._clear_peak_held_content_gains()
+
+    def _clear_peak_held_content_gains(self):
+        """Once per library (owner 2026-11-24: "if the dialogue is the same volume as the tv series, the explosions will be as loud as they are meant to be"): shows and movies are no longer held under the true-peak ceiling, so every stored show or movie gain the ceiling held back more than 1 dB is cleared and measured again by the new rule; the file plays with its season's guess or unity until then. Gains it did not hold back, commercials, music and the owner's own gains are kept."""
+        # WARNING: version 10 is the scan version these held-back gains were written under; the row's sample windows say what the station level wanted, as the GAIN APPLIED line reports it. A failure leaves every gain as it was and tries again on the next start.
+        name = "peak_held_content_gains_cleared"
+        try:
+            if self._conn.execute("SELECT 1 FROM library_once WHERE name=?", (name,)).fetchone():
+                return
+            try:
+                import performance_governor as _gov
+                level = float(_gov.LOUDNESS_TARGET_LUFS) + float(_gov.LOUDNESS_STATION_LEVEL_DB)
+            except Exception:
+                level = -24.0 + 7.0
+            cleared = []
+            for key, gain, windows, learned in self._conn.execute(
+                    "SELECT content_key, gain, gain_windows, learn_applied_db FROM library "
+                    "WHERE gain > 0 AND gain_scan_version = 10 AND gain_windows IS NOT NULL").fetchall():
+                values = [float(w[1]) for w in json.loads(windows) if isinstance(w, (list, tuple)) and len(w) >= 2]
+                if len(values) < 2:
+                    continue
+                power = sum(10 ** (v / 10.0) for v in values) / len(values)
+                if power <= 0:
+                    continue
+                wanted_db = level - 10 * math.log10(power)
+                stored_db = 20 * math.log10(float(gain)) - float(learned or 0.0)
+                if wanted_db - stored_db > 1.0:
+                    cleared.append(key)
+            for key in cleared:
+                self._conn.execute("UPDATE library SET gain=NULL, gain_checked=0 WHERE content_key=?", (key,))
+            groups = self._conn.execute("DELETE FROM hub_part_group_gain WHERE scan_version = 10").rowcount
+            self._conn.execute("INSERT INTO library_once(name, done_at) VALUES (?,?)", (name, time.time()))
+            self._conn.commit()
+            log.info("[GAIN HUB] shows and movies are no longer held under the true-peak ceiling: %d held-back gain(s) and %d multi-part title gain(s) cleared to be measured again", len(cleared), groups)
+        except Exception as _swallowed_error:
+            _log_swallowed("_clear_peak_held_content_gains", _swallowed_error)
+            try:
+                self._conn.rollback()
+            except Exception as _rollback_error:
+                _log_swallowed("_clear_peak_held_content_gains: rollback", _rollback_error)
 
     def _ensure_library_columns(self):
         """Adds any library column an older database file lacks, so an existing library keeps all its rows."""
@@ -2269,6 +2328,18 @@ def _keys_to_read(hub, paths, due):
     return wanted
 
 
+# WARNING: owner 2026-11-24: callables told whenever a length is queued to be asked again, so the channel-ready thread is woken for it instead of looking on a timer; each must return at once.
+RECHECK_LISTENERS = []
+
+
+def _tell_recheck_listeners():
+    for _listener in list(RECHECK_LISTENERS):
+        try:
+            _listener()
+        except Exception as _swallowed_error:
+            _log_swallowed("_tell_recheck_listeners: a listener", _swallowed_error)
+
+
 class DurationHub(_PathMemoHub):
     """Answers one file at a time: looks the file up in the library when it is asked about and remembers the answer; nothing is read in advance. The one place the scheduler, guide and catch-up read a file's length from."""
 
@@ -2309,6 +2380,7 @@ class DurationHub(_PathMemoHub):
             # WARNING: the screen thread never waits on the library for an answer it already holds (owner 2026-11-02, N1); the due recheck runs on the channel-ready thread.
             with self._lock:
                 self._recheck_queue[key] = str(path)
+            _tell_recheck_listeners()
             return held
         measured = estimate = None
         try:
@@ -2319,6 +2391,7 @@ class DurationHub(_PathMemoHub):
             # WARNING: owner log 2026-11-18: the screen thread never waits for a busy library; it goes on without a length this frame, nothing is remembered, and the channel-ready thread asks again.
             with self._lock:
                 self._recheck_queue[key] = str(path)
+            _tell_recheck_listeners()
             return held if held is not None else [None, None, now]
         with self._lock:
             self._must_resolve.discard(key)
@@ -3338,6 +3411,23 @@ class ScheduleHub:
             rows.append(row)
         return rows
 
+    def planned_rows_between(self, channel, start_epoch, end_epoch):
+        """The channel's planned rows (episodes, movies and commercials) that overlap a time span, from sets that were not put aside, in start order; each carries guide_entry like rows_between with full."""
+        sql = ("SELECT channel, slot_key, position, path, kind, pass_no, planned_start, used_length, length_source, state, guide_entry "
+               "FROM hub_schedule_row WHERE channel = ? AND kind IN ('episode', 'movie', 'commercial') AND state = 'planned' "
+               "AND planned_start IS NOT NULL AND planned_start < ? AND planned_start + COALESCE(used_length, 0) > ? "
+               "AND NOT EXISTS (SELECT 1 FROM hub_schedule_set s WHERE s.channel = hub_schedule_row.channel "
+               "AND s.slot_key = hub_schedule_row.slot_key AND s.state = 'set_aside') "
+               "ORDER BY planned_start, slot_key, position")
+        with self.library._lock:
+            found = self.library._conn.execute(sql, (channel, float(end_epoch), float(start_epoch))).fetchall()
+        rows = []
+        for record in found:
+            row = self._as_dict(record[:10])
+            row["guide_entry"] = self._decode_guide_entry(record[10])
+            rows.append(row)
+        return rows
+
     @staticmethod
     def _decode_guide_entry(raw):
         """The dictionary saved in a row's guide_entry column, or None when the column is empty or cannot be read."""
@@ -3357,8 +3447,39 @@ class ScheduleHub:
         removed = {}
         with self.library._lock:
             with self.library._conn as conn:
-                for table in ("hub_schedule_row", "hub_future_row", "hub_schedule_set", "hub_play_order", "hub_play_state"):
+                for table in ("hub_schedule_row", "hub_future_row", "hub_schedule_set", "hub_plan_state", "hub_play_order", "hub_play_state"):
                     removed[table] = conn.execute("DELETE FROM %s" % table).rowcount
+        return removed
+
+    def plan_state(self, channel, name):
+        """A value the server's planner keeps for a channel (decoded from JSON), or None when none is kept."""
+        with self.library._lock:
+            found = self.library._conn.execute("SELECT value FROM hub_plan_state WHERE channel = ? AND name = ?", (channel, str(name))).fetchone()
+        if not found:
+            return None
+        try:
+            return json.loads(found[0])
+        except ValueError as _swallowed_error:
+            _log_swallowed("ScheduleHub.plan_state: the kept value is unreadable and is worked out again", _swallowed_error)
+            return None
+
+    def set_plan_state(self, channel, name, value):
+        """Keeps a value of the server's planner for a channel (any JSON value)."""
+        with self.library._lock:
+            with self.library._conn as conn:
+                conn.execute("INSERT OR REPLACE INTO hub_plan_state (channel, name, value, updated_at) VALUES (?, ?, ?, ?)",
+                             (channel, str(name), json.dumps(value), time.time()))
+
+    def clear_channel(self, channel):
+        """Removes every schedule row of one channel (planned, airing, aired and Static rows, its future rows and its set labels) and what is remembered of its show on air; returns {table: rows removed}."""
+        # WARNING: owner 2026-11-24: "one time removal of the old style of user schedule". Only a clear of the whole app or of one channel may delete rows (R26); this one is called once per channel when a User moves over to the server's rows.
+        removed = {}
+        with self.library._lock:
+            with self.library._conn as conn:
+                for table in ("hub_schedule_row", "hub_future_row", "hub_schedule_set", "hub_plan_state"):
+                    removed[table] = conn.execute("DELETE FROM %s WHERE channel = ?" % table, (channel,)).rowcount
+        self._show_facts.pop(channel, None)
+        self._upcoming.pop(channel, None)
         return removed
 
     def replace_future_rows(self, channel, rows):
@@ -3400,12 +3521,15 @@ class ScheduleHub:
         return len(changed)
 
     def future_rows_between(self, channel, start_epoch, end_epoch):
-        """The channel's projected future rows that overlap a time span, in start order, each with the facts the guide draws its cell from (a dictionary, or None when unreadable)."""
+        """The channel's projected future rows that overlap a time span, in start order, each with the facts the guide draws its cell from (a dictionary, or None when unreadable); on the screen thread while the database is busy, the answer last seen for that span, or LIBRARY_BUSY when none was."""
         sql = ("SELECT channel, slot_key, position, path, kind, planned_start, used_length, guide_entry FROM hub_future_row "
                "WHERE channel = ? AND planned_start < ? AND planned_start + used_length > ? ORDER BY planned_start, slot_key, position")
         memo_key = ("future", channel, float(start_epoch), float(end_epoch))
         if not self.library._take_for_reading(memo_key):
-            found = self.library._screen_memo.get(memo_key) or []
+            # WARNING: owner log 2026-11-23: an empty answer while the database was busy was taken for "no future" and the guide kept OFF AIR for that window; LIBRARY_BUSY tells the caller the rows were not read.
+            found = self.library._screen_memo.get(memo_key)
+            if found is None:
+                return LIBRARY_BUSY
         else:
             try:
                 found = self.library._conn.execute(sql, (channel, float(end_epoch), float(start_epoch))).fetchall()
@@ -3455,7 +3579,7 @@ class ScheduleHub:
     def show_facts(self, channel, epoch, guard=None):
         """The remembered playback facts for the show on air with the seek moved forward by the clock; once that show has run out, the prepared item whose clock slot holds epoch (which then becomes the show on air); None when nothing is remembered or prepared for epoch or the guard changed, and the caller then asks the scheduler through the hub's miss path."""
         kept = self._show_facts.get(channel)
-        if kept is not None and kept["guard"] == guard:
+        if kept is not None and kept["guard"] == guard and not self._newer_item_began(channel, kept["epoch"], float(epoch), guard):
             elapsed = float(epoch) - kept["epoch"]
             if elapsed >= 0:
                 facts = dict(kept["facts"])
@@ -3474,16 +3598,30 @@ class ScheduleHub:
         ahead = self._upcoming.get(channel)
         if ahead is None or ahead["guard"] != guard:
             return None
+        # WARNING: owner test 2026-11-23: the item on air is the one that began last; an earlier item whose length runs past the next one's start must never take that one's place.
+        began = None
         for start, item in ahead["records"]:
             if start > epoch:
                 break
-            elapsed = epoch - start
-            if elapsed < float(item.get("duration", 0) or 0) - 0.05:
-                self._show_facts[channel] = {"facts": dict(item), "epoch": start, "guard": guard}
-                facts = dict(item)
-                facts["seek"] = float(item.get("seek", 0) or 0) + elapsed
-                return facts
-        return None
+            began = (start, item)
+        if began is None:
+            return None
+        start, item = began
+        elapsed = epoch - start
+        # WARNING: owner log 2026-11-23 02:41: no margin at the end; the next item begins the moment this one ends, and a gap there sent the screen to an answer 16 minutes old, which reopened a file that had aired long before for a moment in every break.
+        if elapsed >= float(item.get("duration", 0) or 0):
+            return None
+        self._show_facts[channel] = {"facts": dict(item), "epoch": start, "guard": guard}
+        facts = dict(item)
+        facts["seek"] = float(item.get("seek", 0) or 0) + elapsed
+        return facts
+
+    def _newer_item_began(self, channel, since_epoch, epoch, guard):
+        """True when a prepared item of the station began after since_epoch and by epoch, so the facts kept from before it are out of date."""
+        ahead = self._upcoming.get(channel)
+        if ahead is None or ahead["guard"] != guard:
+            return False
+        return any(since_epoch < start <= epoch for start, _item in ahead["records"])
 
     def prepared_items(self, channel, guard=None):
         """The station's prepared items as (clock start, playback facts at that start), in start order; empty when none are prepared or the guard changed."""
@@ -3663,9 +3801,53 @@ def _scoped_to_setup(method):
     return wrapper
 
 
-for _scoped_name in ("put_rows", "set_info", "sets", "place_rows", "put_aired_rows", "rows", "rows_between", "replace_future_rows", "future_rows_between",
+# WARNING: owner 2026-11-23: the guide's table is built again only when the hub says a channel's schedule changed; every hub call that writes rows notes its channel and what kind of rows it wrote, and the guide's table worker takes the notes.
+_schedule_changes = {}
+_schedule_changes_lock = threading.Lock()
+schedule_changed = threading.Event()
+SCHEDULE_CHANGE_ALL = "*"
+_SCHEDULE_CHANGE_KINDS = {"put_rows": "plan", "place_rows": "plan", "put_aired_rows": "history", "replace_future_rows": "future",
+                          "mark": "progress", "mark_airing_static": "progress", "restore_static_to_airing": "progress",
+                          "close_passed_rows": "progress", "clear_all_schedule_data": "all", "clear_channel": "history"}
+
+
+def note_schedule_change(channel, kind):
+    """Records that a channel's rows of this kind ("plan", "history", "future", "progress" or "all") were written; channel SCHEDULE_CHANGE_ALL for every channel."""
+    key = SCHEDULE_CHANGE_ALL if channel is None or channel == SCHEDULE_CHANGE_ALL else str(channel).rsplit(":", 1)[-1].zfill(2)
+    with _schedule_changes_lock:
+        _schedule_changes.setdefault(key, set()).add(kind)
+    schedule_changed.set()
+
+
+def take_schedule_changes():
+    """The schedule changes noted since the last call, as {channel: set of kinds}, and clears them."""
+    with _schedule_changes_lock:
+        taken = dict(_schedule_changes)
+        _schedule_changes.clear()
+        schedule_changed.clear()
+    return taken
+
+
+def _notes_schedule_change(method, kind):
+    """Makes a hub call that writes rows note the change for the guide's table, whether it wrote one row or many."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            note_schedule_change(SCHEDULE_CHANGE_ALL if kind == "all" else (args[0] if args else kwargs.get("channel")), kind)
+    return wrapper
+
+
+for _noted_name, _noted_kind in _SCHEDULE_CHANGE_KINDS.items():
+    setattr(ScheduleHub, _noted_name, _notes_schedule_change(getattr(ScheduleHub, _noted_name), _noted_kind))
+
+
+for _scoped_name in ("put_rows", "set_info", "sets", "place_rows", "put_aired_rows", "rows", "rows_between", "planned_rows_between", "replace_future_rows", "future_rows_between",
                      "future_signature", "past_signature", "remember_show_facts", "forget_show_facts", "show_facts", "upcoming", "at", "mark",
-                     "mark_airing_static", "restore_static_to_airing", "close_passed_rows", "counts"):
+                     "mark_airing_static", "restore_static_to_airing", "close_passed_rows", "counts", "clear_channel", "plan_state", "set_plan_state"):
     setattr(ScheduleHub, _scoped_name, _scoped_to_setup(getattr(ScheduleHub, _scoped_name)))
 
 
@@ -3692,6 +3874,6 @@ __all__ = [
     "probe_duration_with_fallback", "PICTURE_BOX_DETECTOR_VERSION", "detect_picture_box",
     "ProbeLibrary",
     "BURNED_IN_DETECTOR_VERSION", "detect_burned_in_captions", "shared_probe_library",
-    "GainHub", "shared_gain_hub", "FileFactsHub", "shared_file_facts_hub", "FILE_FACT_COLUMNS", "PlayOrderHub", "shared_play_order_hub", "ScheduleHub", "shared_schedule_hub", "set_schedule_scope", "schedule_scope_for", "schedule_scope_of_slot", "SCHEDULE_ROW_STATES", "DurationHub", "shared_duration_hub", "DURATION_KIND_MEASURED", "DURATION_KIND_ESTIMATED",
+    "GainHub", "shared_gain_hub", "FileFactsHub", "shared_file_facts_hub", "FILE_FACT_COLUMNS", "PlayOrderHub", "shared_play_order_hub", "ScheduleHub", "shared_schedule_hub", "note_schedule_change", "take_schedule_changes", "schedule_changed", "set_schedule_scope", "schedule_scope_for", "schedule_scope_of_slot", "SCHEDULE_ROW_STATES", "DurationHub", "shared_duration_hub", "DURATION_KIND_MEASURED", "DURATION_KIND_ESTIMATED",
     "ESTIMATE_BASIS_SERIES_AVERAGE", "ESTIMATE_BASIS_MOVIE_DEFAULT",
 ]

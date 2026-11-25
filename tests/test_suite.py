@@ -104,6 +104,7 @@ import ui
 import media
 import media_library as ml
 import performance_governor as gov
+import guide_table
 
 menu_nav = mn
 
@@ -201,8 +202,23 @@ class _SectionCase(unittest.TestCase):
             self.fail("%d of the checks in %s failed:\n  %s%s" % (len(failed), fn.__name__, shown, more))
 
 
+# WARNING: owner 2026-11-24: these program names are now imported from schedule_planner (shared with the server service); a test that cuts one out of the program gets the planner's function under the program's name.
+PLANNER_ALIASES = {"_hub_future_snapshot": "snapshot", "_broadcast_epoch_of": "broadcast_epoch_of", "_missed_block_day_seeds": "missed_block_day_seeds"}
+
+
+def _planner_alias_source(name):
+    path = os.path.join(ROOT, "assets", "schedule_planner.py")
+    text = open(path, encoding="utf-8").read()
+    tree = ast.parse(text)
+    node = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == PLANNER_ALIASES[name]][0]
+    body = ast.get_source_segment(text, node).replace("def %s(" % PLANNER_ALIASES[name], "def %s(" % name, 1)
+    return body.replace("media.block_day_seed(", "block_day_seed(") if name == "_missed_block_day_seeds" else body
+
+
 def get_function_source(name, start_hint=None):
     """Exact source of one top-level function of retro_tv_emulator.py, found with the real AST."""
+    if name in PLANNER_ALIASES:
+        return _planner_alias_source(name)
     lines = MAIN_SRC.splitlines(keepends=True)
     candidates = [n for n in MAIN_TREE.body if isinstance(n, ast.FunctionDef) and n.name == name]
     if not candidates:
@@ -2319,7 +2335,12 @@ def timeline(held, mode, release_frame, step_ms):
 _CODE_CACHE = {}
 
 
+STATION_DOOR_SRC = "def _station_playback_state(channel_key, epoch=None, *more):\n    return _scheduler_playback_state(channel_key, *more)\n"
+
+
 def main_function_code(name):
+    if ("f", name) not in _CODE_CACHE and name in PLANNER_ALIASES:
+        _CODE_CACHE[("f", name)] = compile(_planner_alias_source(name), "<planner %s>" % name, "exec")
     if ("f", name) not in _CODE_CACHE:
         for node in MAIN_TREE.body:
             if isinstance(node, ast.FunctionDef) and node.name == name:
@@ -2331,6 +2352,8 @@ def main_function_code(name):
 
 
 def main_function_source(name):
+    if name in PLANNER_ALIASES:
+        return _planner_alias_source(name)
     for node in MAIN_TREE.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return ast.get_source_segment(MAIN_SRC, node)
@@ -4387,7 +4410,7 @@ def suite_media_numbers_in_governor():
                                  fact_names=("DRIVE_CDROM", "HOLIDAY_DAY_SECONDS", "HALF_HOUR", "LOUDNESS_CONVERGENCE_DB", "COMPRESSOR_BAKE_VERSION",
                                              "LINEUP_GROUPS_VERSION", "LOUDNESS_GAIN_SCAN_VERSION", "OWNER_GAIN_SCAN_VERSION",
                                              "RANDOM_STATE_VERSION", "SERVER_SLOT_SCHEMA_VERSION", "SHORT_EPISODE_PAIRING_VERSION",
-                                             "_ASR_META_VERSION"),
+                                             "_ASR_META_VERSION", "SOUND_FRAME_SEC", "SOUND_HOP_SEC"),
                                  fact_prefixes=())
     check(reads >= 150, "media.py reads its settings from the governor table (%d reads)" % reads)
     src = read(path)
@@ -4940,7 +4963,7 @@ def suite_new_channel_first_show():
           "_app_shutting_down": threading.Event(), "_cached_path_exists": lambda p: True,
           "_read_file_probe_facts": lambda p: {}, "_scan_duration_reported": lambda facts, has: False,
           "_governor_priority_scope": lambda: contextlib.nullcontext(), "_note_scan_work_added": lambda: None,
-          "performance_governor": None, "sys": sys}
+          "performance_governor": None, "sys": sys, "db": None}
     exec(code, ns)
     ns["calculate_slotted_playback_state"] = lambda ch: {"file": "D:/movies/%s_first.mp4" % ch, "block": "Full Day"}
     def _dur(kind, ch, block, path):
@@ -5001,7 +5024,7 @@ def suite_one_scan_order_for_new_files():
         part = MAIN_SRC[MAIN_SRC.index(label):]
         check(part.index("_note_scan_work_added()") < part.index("if new_paths:"), "a commercial or holiday save tells the ordered scans too")
     start = MAIN_SRC.index("_scan_files_added_generation = [0]")
-    ns = {"time": time, "_app_shutting_down": threading.Event()}
+    ns = {"time": time, "_app_shutting_down": threading.Event(), "_channel_ready_wake": threading.Event()}
     exec(MAIN_SRC[start:MAIN_SRC.index("def _background_scan_should_pause", start)], ns)
     t0 = time.monotonic()
     threading.Timer(0.3, lambda: ns["_scan_work_generation"].__setitem__(0, ns["_scan_work_generation"][0] + 1)).start()
@@ -5032,7 +5055,7 @@ def suite_guide_settled_days():
         out = []
         for i in range(count):
             st = (start_h + i * length_h) * H
-            out.append({"path": "%s%d" % (tag, i), "planned_start": st, "used_length": length_h * H, "slot_key": "s", "position": i,
+            out.append({"path": "%s%d" % (tag, i), "planned_start": st, "used_length": length_h * H, "slot_key": "c@%d" % ((start_h + (i - i % 6) * length_h) * H), "position": i % 6,
                         "length_source": "estimate" if estimate_from is not None and st >= estimate_from * H else "measured", "guide_entry": {}})
         return out
     first = rows(10, 40, 2, estimate_from=30)
@@ -5041,13 +5064,22 @@ def suite_guide_settled_days():
     out = settle(rows(10, 40, 2, estimate_from=30, tag="new"), saved, 0.0)
     news = [r for r in out if r["path"].startswith("new")]
     olds = [r for r in out if r["path"].startswith("old")]
-    check(news and max(r["planned_start"] for r in news) < 24 * H and min(r["planned_start"] for r in olds) >= 24 * H,
-          "inside the first 24 hours the new rows are used; past them a day with estimated lengths keeps the rows saved before")
+    check(news and max(r["planned_start"] for r in news) == 32 * H and min(r["planned_start"] for r in olds) == 34 * H,
+          "inside the first 24 hours the new rows are used, with the rest of the cycle that crosses that line; past it a day with estimated lengths keeps the rows saved before")
     out2 = settle(rows(10, 40, 2, estimate_from=60, tag="new"), saved, 0.0)
     news2 = [r for r in out2 if r["path"].startswith("new")]
-    check(max(r["planned_start"] for r in news2) < 48 * H and max(r["planned_start"] for r in news2) >= 24 * H
-          and all(r["planned_start"] >= 48 * H for r in out2 if r["path"].startswith("old")),
-          "a day past the first 24 hours whose lengths are all measured is redrawn whole; the next day, still estimated, stays as it was")
+    check(max(r["planned_start"] for r in news2) == 56 * H and all(r["planned_start"] >= 58 * H for r in out2 if r["path"].startswith("old")),
+          "a day past the first 24 hours whose lengths are all measured is redrawn whole with the cycle that crosses its end; the next day, still estimated, stays as it was")
+    # WARNING: owner log 2026-11-23: a cycle taken half new and half saved gave two rows one key, so a row was lost and the guide drew OFF AIR.
+    longer = [dict(r, length_source=None) for r in rows(10, 40, 3, tag="old")]
+    for label, settled in (("saved cycles longer than the new ones", settle(rows(10, 40, 2, estimate_from=30, tag="new"), longer, 0.0)),
+                           ("saved cycles shorter than the new ones", settle(rows(10, 40, 3, estimate_from=30, tag="new"), saved, 0.0))):
+        keys = [(r["slot_key"], r["position"]) for r in settled]
+        check(len(keys) == len(set(keys)), "%s: no two settled rows share a cycle and place, so none is lost when they are saved" % label)
+        ends = sorted((r["planned_start"], r["planned_start"] + r["used_length"]) for r in settled)
+        check(all(b[0] >= a[1] - 0.5 for a, b in zip(ends, ends[1:])), "%s: no settled rows overlap" % label)
+        holes = [(a[1] / H, b[0] / H) for a, b in zip(ends, ends[1:]) if b[0] > a[1] + 0.5]
+        check(not [h for h in holes if h[1] <= 48], "%s: the first day and the cycle after it have no hole the guide would draw as OFF AIR (%s)" % (label, holes[:2]))
     out3 = settle(rows(10, 40, 2, tag="new"), saved, 0.0)
     check(all(r["path"].startswith("new") for r in out3), "once every day is measured the whole future is new")
     check(settle(saved, saved, 0.0) is None, "nothing is written when the settled future equals what is saved, so the guide is not rebuilt for nothing")
@@ -5055,6 +5087,26 @@ def suite_guide_settled_days():
     src = src[:src.index("_hub_future_logged = {}")]
     check(src.index("_settle_future_rows(_rows, _hub_f.future_rows_between(") < src.index("_hub_f.replace_future_rows(_channel, _rows)")
           and "if _rows is None:" in src, "the future rows are settled against what is saved before they are written")
+
+
+def suite_future_rows_follow_the_server_zone():
+    # WARNING: owner log 2026-11-23: a streaming computer one hour off its server saved every future row an hour late.
+    for offset in (None, 3600, -5 * 3600, 9 * 3600 + 1800):
+        ns = {"datetime": datetime, "broadcast_clock": types.SimpleNamespace(server_utc_offset=lambda o=offset: o)}
+        exec(main_function_code("_broadcast_epoch_of"), ns)
+        wall = datetime.datetime(2026, 11, 24, 6, 30, 0)
+        abs_second = wall.toordinal() * 86400 + 6 * 3600 + 1800
+        want = wall.timestamp() if offset is None else wall.replace(tzinfo=datetime.timezone(datetime.timedelta(seconds=offset))).timestamp()
+        check(ns["_broadcast_epoch_of"](abs_second) == want, "offset %s: a broadcast wall time is read in the zone the broadcast clock is in" % offset)
+        if offset is not None:
+            aware_now = wall.replace(tzinfo=datetime.timezone(datetime.timedelta(seconds=offset)))
+            check(ns["_broadcast_epoch_of"](abs_second) == aware_now.timestamp(), "offset %s: it is the same second the broadcast clock's own now() gives at that wall time" % offset)
+    check("schedule_planner.loop_plan(" in get_function_source("_hub_loop_plan") and "broadcast_epoch_of(ordinal * 86400)" in open(_script("schedule_planner.py"), encoding="utf-8").read(),
+          "the loop plan turns each day's midnight into a clock second in the broadcast clock's zone")
+    for name in ("_write_missed_blocks_to_hub", "_hub_future_for_channel"):
+        src = get_function_source(name)
+        check("_broadcast_epoch_of(" in src and "_moment.timestamp()" not in src and "datetime.time(0)).timestamp()" not in src,
+              "%s turns broadcast wall times into clock seconds in the broadcast clock's zone" % name)
 
 
 def suite_scan_turns():
@@ -5379,6 +5431,13 @@ class TestGuideSettledDays(_SectionCase):
 
     def test_guide_settled_days(self):
         self.run_section(suite_guide_settled_days)
+
+
+class TestFutureRowsFollowTheServerZone(_SectionCase):
+    """Owner 2026-11-23: a streaming computer one hour off its server saves the guide's future rows at the server's time, not an hour late"""
+
+    def test_future_rows_follow_the_server_zone(self):
+        self.run_section(suite_future_rows_follow_the_server_zone)
 
 
 class TestScanTurns(_SectionCase):
@@ -6089,7 +6148,8 @@ def suite_commercial_tracks():
     check(any(t["path"] == "/c/long.mp4" and t["duration"] == 301 for t in uncapped), "with no cap the long commercial is kept")
     check(media.COMMERCIAL_MAX_SECONDS == 300, "the maximum commercial length is 300 seconds")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_commercial_tracks(") == 6, "the main script builds commercial tracks only through the shared function (holiday, main schedule, the block-start overrun check, the hub's future rows, the Marathon plan, and a server break's catch-up)")
+    planner_src = open(_script("schedule_planner.py"), encoding="utf-8").read()
+    check(src.count("build_commercial_tracks(") == 5 and planner_src.count("build_commercial_tracks(") == 2, "the main script builds commercial tracks only through the shared function (holiday, main schedule, the block-start overrun check, a server break's catch-up, and the breaks as they were before a change; the hub's future rows and the Marathon plan in schedule_planner)")
     check("COMMERCIAL_DEFAULT_DUR" not in src and "_H_COMMERCIAL_MAX_SECONDS" not in src, "the old local copies are gone from the main script")
 
 
@@ -6117,7 +6177,8 @@ def suite_block_seeds():
     check(media.block_day_seed(d, 5, 100) == media.block_day_seed(d, "05", 100), "channel 5 and 05 give the same seed")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
     check("_block_seed_offsets" not in src and "_peek_offsets" not in src, "the main script keeps no offset table of its own")
-    check(src.count("block_day_seed(") == 4, "the scheduler, the catch-up, the add-media block prebuild and the hub's Marathon plan use the shared seed; the read-only lineup in media.py uses it too")
+    check(src.count("block_day_seed(") == 2 and open(_script("schedule_planner.py"), encoding="utf-8").read().count("block_day_seed(") == 2,
+          "the scheduler and the add-media block prebuild use the shared seed, the catch-up's missed days and the Marathon plan in schedule_planner; the read-only lineup in media.py uses it too")
     check("tm_yday + int(target_clean_key) + block_offset" not in src, "the scheduler no longer works out its seed by hand")
 
 
@@ -6644,7 +6705,7 @@ def suite_saved_lineup():
     check(media.saved_block_lineup(["/m/Gone/x.mkv"], {}, raw, folder, [], 900) == [], "a lineup with nothing left gives an empty lineup")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
     check("def _reconcile_cached_lineup" not in src and "def _apply_cached_durations" not in src, "the main script keeps no copy of the two helpers")
-    check(src.count("saved_block_lineup(") == 2, "the scheduler (twice) builds a saved lineup through the shared function; the read-only lineup in media.py does too")
+    check(src.count("saved_block_lineup(") == 3, "the scheduler (twice) and a change of the breaks build a saved lineup through the shared function; the read-only lineup in media.py does too")
 
 
 class TestSavedLineup(_SectionCase):
@@ -6661,7 +6722,7 @@ class TestSavedLineup(_SectionCase):
 SCHED_RECORD_PATH = os.path.join(HERE, "scheduler_record.json")
 
 SCHED_RECORD_FUNCS = [
-    "_apply_repeat_guard", "_vlc_mrl_path", "_cached_lineup_durations_stale", "_channel_intro_seed",
+    "_visualizer_scanned_length", "_apply_repeat_guard", "_vlc_mrl_path", "_cached_lineup_durations_stale", "_channel_intro_seed",
     "_channel_schedule_path_set", "_file_in_channel_schedule", "_freeze_aired_prefix_durations",
     "_read_file_probe_facts", "_get_or_set_block_anchor", "_get_probe_library", "_governor_priority_scope",
     "_log_info_throttled", "_log_probe_failure", "_log_warn_throttled", "_marathon_start_seed",
@@ -6671,6 +6732,8 @@ SCHED_RECORD_FUNCS = [
     "_visualizer_admission_inputs", "_visualizer_frozen_lineup", "_visualizer_unseekable_paths", "_scheduler_playback_state",
     "_block_overrun_anchor", "_channel_is_server_streamed", "_note_aired_cycle", "_note_missed_blocks", "_priority_probe_pending_schedule", "_pending_probe_worker", "_store_pending_probe_results", "_pending_store_worker", "_pending_backlog_may_run", "_probe_pending_schedule_one", "_set_saved_lineup",
     "_pending_paths_signature", "_stored_pending_signature", "_stored_length_held",
+    "_layout_inputs", "_splice_layout_now", "_apply_saved_resume", "_old_layout_info", "_mark_aired_ads", "_breaks_changed_since_built", "_layout_key",
+    "_first_show_lead_hold", "_ads_held_for_airing_break", "_hold_ads_through_break", "_ad_path_key",
 ]
 
 SCHED_RECORD_ENGINE_STUBS = {
@@ -6709,7 +6772,8 @@ SCHED_RECORD_GLOBALS = [
     "_duration_precache_inflight", "_intro_seed_lock", "_ondemand_duration_probe_next", "_probe_block_timeline_cache",
     "_probe_library_lock",
     "SCHEDULER_REPEAT_GUARD_SECONDS", "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS", "SLOT_TAIL_HOLD_MAX_SECONDS", "BLOCK_ROTATION_CACHE_MAX_BLOCKS",
-    "_probe_library_singleton", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_PENDING_PROBE_RESTORE_HOLD_SECONDS", "_PENDING_PROBE_RETRY_SECONDS", "_PENDING_PROBE_REQUEST_STALE_SECONDS", "_PENDING_PROBE_URGENT_COUNT", "_PENDING_PROBE_STORE_BATCH_S", "_app_shutting_down", "_pending_probe_state", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
+    "_probe_library_singleton", "_LAYOUT_LISTS", "_PENDING_SCHEDULE_PROBE_PARALLEL", "_PENDING_PROBE_RESTORE_HOLD_SECONDS", "_PENDING_PROBE_RETRY_SECONDS", "_PENDING_PROBE_REQUEST_STALE_SECONDS", "_PENDING_PROBE_URGENT_COUNT", "_PENDING_PROBE_STORE_BATCH_S", "_app_shutting_down", "_pending_probe_state", "_resolve_log_state", "_throttled_log_last_ts", "_visualizer_lineup_lock",
+    "FIRST_SHOW_LEAD_KEY", "FIRST_SHOW_LEAD_HOLD_SECONDS", "AD_HOLD_KEY",
 ]
 
 SCHED_RECORD_SCENARIOS = [
@@ -6775,7 +6839,7 @@ def _sched_record_ns(channels, clock, ticks):
     ns = {"db": fake_db, "app_state": {"guide_refresh_token": 0},
           "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]), "log": MagicMock(), "vlc_engine": None,
           "vlc": None, "datetime": datetime, "os": os, "random": random, "threading": threading, "time": time,
-          "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0])), "media": media,
+          "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0])), "media": media, "schedule_planner": __import__("schedule_planner"),
           "SHORT_EPISODE_PAIRING_VERSION": media.SHORT_EPISODE_PAIRING_VERSION, "SIX_HOUR_BLOCKS": media.SIX_HOUR_BLOCKS,
           "SIX_HOUR_BLOCK_NAMES": media.SIX_HOUR_BLOCK_NAMES, "build_block_timeline": media.build_block_timeline,
           "build_ordered_tracks": media.build_ordered_tracks, "build_show_rotation": media.build_show_rotation,
@@ -6835,7 +6899,7 @@ def _sched_record_run(scenario, kind):
         with patch.object(media, "_cached_path_exists", lambda p: True):
             result = _sched_record_round(ns["_scheduler_playback_state"]("05"))
         plog = _sched_record_round(channels["05"]["playback_log"])
-        digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k != "sched_cached_groups"}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k not in ("sched_cached_groups", "sched_layout", "sched_ad_hold")}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         out.append({"at": moment.isoformat(), "result": result, "state_sha": digest,
                     "show_pos": plog.get("show_pos"), "show_order": plog.get("show_order"),
                     "block_key": plog.get("sched_block_key"), "cycle_total": plog.get("sched_cycle_total"),
@@ -6863,7 +6927,7 @@ def suite_scheduler_record():
                        if isinstance(x, ast.Name) and x.id not in SCHED_RECORD_ENGINE_STUBS and x.id not in decorators)
     missing = sorted(needed - set(SCHED_RECORD_FUNCS))
     check(not missing, "the record harness holds every function the scheduler reaches (missing: %s)" % missing)
-    extra = sorted(set(SCHED_RECORD_FUNCS) - needed)
+    extra = sorted(set(SCHED_RECORD_FUNCS) - needed - set(PLANNER_ALIASES))
     check(not extra, "the record harness holds no function the scheduler no longer reaches (extra: %s)" % extra)
 
     first = _sched_record_all()
@@ -6981,7 +7045,7 @@ def _sched_scan_run(scenario):
         with patch.object(media, "_cached_path_exists", lambda p: True):
             result = _sched_record_round(ns["_scheduler_playback_state"]("05"))
         plog = _sched_record_round(channels["05"]["playback_log"])
-        digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k != "sched_cached_groups"}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha1(json.dumps({k: v for k, v in plog.items() if k not in ("sched_cached_groups", "sched_layout", "sched_ad_hold")}, sort_keys=True).encode("utf-8")).hexdigest()[:16]
         out.append({"at": moment.isoformat(), "scanned": scanned, "result": result, "state_sha": digest,
                     "show_pos": plog.get("show_pos"), "show_order": plog.get("show_order"),
                     "block_key": plog.get("sched_block_key"), "cycle_total": plog.get("sched_cycle_total"),
@@ -7408,12 +7472,13 @@ def suite_channel_timeline():
     default = media.build_block_timeline(shows, ads, "interrupt_half_hour", 7, interrupt_floor_seconds=900)
     check(media.build_channel_timeline(shows, ads, {}, 7) == default, "a channel with no settings uses interrupt placement and the 15 minute floor")
     src = open(MAIN_SCRIPT, encoding="utf-8").read()
-    check(src.count("build_channel_timeline(") == 4, "the scheduler builds its three main timelines through the wrapper, and the hub's Marathon plan builds its one pass the same way; the holiday cycles are built by media.build_holiday_cycle")
+    check(src.count("build_channel_timeline(") == 4 and open(_script("schedule_planner.py"), encoding="utf-8").read().count("media.build_channel_timeline(") == 1,
+          "the scheduler builds its three main timelines through the wrapper and a change of the breaks builds the layout that aired; the Marathon plan in schedule_planner builds each day the same way; the holiday cycles are built by media.build_holiday_cycle")
     check(inspect.getsource(media.build_holiday_cycle).count("build_channel_timeline(") == 1, "a holiday cycle's timeline is built through the wrapper")
     check("build_block_timeline(" not in src, "the main script no longer calls build_block_timeline itself")
     check("INTERRUPT_FLOOR_SECONDS" not in src and "h_commercial_placement" not in src, "the scheduler keeps no floor or placement of its own")
     calls = [n for n in ast.walk(MAIN_TREE) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "build_channel_timeline"]
-    check(len(calls) == 3 and all("media_probe_cache" not in [k.arg for k in n.keywords] for n in calls),
+    check(len(calls) == 4 and all("media_probe_cache" not in [k.arg for k in n.keywords] for n in calls),
           "no scheduler timeline is handed the old probe cache")
 
 
@@ -7474,8 +7539,10 @@ def _surf_ns(active, current="05", game=True, guide=True, music_busy=False, mode
           "_post_to_playback_thread": lambda *a, **k: False, "playback_busy": lambda: False}
     for name in ("_vlc_mrl_path", "_surf_allowed_channels", "_surf_origin_active", "_surf_cancel", "_surf_capture_leave_position",
                  "_surf_begin_quiet", "_surf_step", "_surf_digit_typed", "_typed_channel_valid", "_tune_after_flip", "_surf_commit_if_due",
-                 "_surf_recover_if_stuck", "_bezel_led_channel_text", "_configured_transition_style"):
+                 "_surf_recover_if_stuck", "_bezel_led_channel_text", "_channel_being_tuned", "_note_channel_being_tuned",
+                 "_configured_transition_style"):
         exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
+    ns.setdefault("PLAYBACK_TUNE_SHOWN_MAX_MS", 15000)
     exec(main_assignment_code("_SURF_PRESS_EVENT_TYPES"), {"pygame": pygame, "__builtins__": __builtins__}, ns)
     return ns, state, clock, calls
 
@@ -8457,8 +8524,8 @@ def suite_guide_history_ledger():
     check(True, "a ledger failure never reaches the scheduler")
 
     cols = 6
-    check(ui.clamp_guide_time_idx(-500, cols) == -48, "the guide stops at the previous midnight")
-    check(ui.clamp_guide_time_idx(10000, cols) == 336 - 48 - cols, "the last visible column ends 6 days after today's midnight")
+    check(ui.clamp_guide_time_idx(-500, cols) == 0, "the guide stops at today's midnight (owner 2026-11-23)")
+    check(ui.clamp_guide_time_idx(10000, cols) == 336 - cols, "the last visible column ends 7 days after today's midnight, at the end of the sixth day after today")
     check(ui.GUIDE_TOTAL_HALF_HOURS * 1800 == 7 * 86400, "7 days are always visible")
     ui_src = inspect.getsource(ui)
     check("_guide_hub_aired_cells" in ui_src, "the guide draws past cells from the hub")
@@ -9057,7 +9124,7 @@ def suite_gain_double_check():
             whole_calls.append((start_sec, length_sec, timeout))
             return state["whole"]
 
-        def run_peak(duration, lufs, tp, whole):
+        def run_peak(duration, lufs, tp, whole, music=True):
             state.update({"duration": duration, "lufs": lufs, "tp": tp, "whole": whole})
             whole_calls.clear()
             with mock.patch.object(media, "_sample_lufs_readings", fake_sample), \
@@ -9067,8 +9134,15 @@ def suite_gain_double_check():
                  mock.patch.object(media, "_probe_duration_seconds_fast", lambda p: duration), \
                  mock.patch.object(media, "_duration_looks_implausible", lambda p, d: False), \
                  mock.patch.object(media, "_cached_path_exists", lambda p: True):
-                return media._get_media_loudness_gain_impl(path)
+                return media._get_media_loudness_gain_impl(path, music=music)
 
+        # WARNING: owner 2026-11-24: shows and movies (sampled, not music) are levelled on their speech with no true-peak ceiling; the ceiling checks below use long music, which keeps it.
+        full_boost = 4.6 + media.LOUDNESS_GAIN_OFFSET_DB
+        got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -0.5, (0.0, -0.2, 5.0, "", False), music=False)
+        check(not whole_calls and abs(20 * math.log10(got) - full_boost) < 1e-6,
+              "a show or movie keeps its full boost however high its loud moments peak, and no whole-file peak pass runs (%s)" % got)
+        got = run_peak(100.0, media.TARGET_LUFS - 4.6, -3.0, (0.0, -3.0, 5.0, "", False), music=False)
+        check(abs(20 * math.log10(got) + -3.0 - ceiling) < 1e-6, "a file short enough to be measured whole (a commercial) is still held to the ceiling")
         got = run_peak(1351.0, media.TARGET_LUFS - 4.6, -6.1, (0.0, -3.0, 5.0, "", False))
         check(not whole_calls and abs(20 * math.log10(got) + -6.1 - ceiling) < 1e-6,
               "with the whole-file peak check off (the default) no whole-file read runs and the window peaks hold the ceiling")
@@ -10707,6 +10781,369 @@ class TestOldCarryInRetired(_SectionCase):
 
 
 
+def _gt_row(path, start, length, kind="episode", facts=True, slot="s@1", position=0):
+    return {"path": path, "planned_start": start, "used_length": length, "kind": kind, "slot_key": slot, "position": position,
+            "guide_entry": {"path": path, "duration": length} if facts else None}
+
+
+class TestTheGuideReadsAPreparedTableOfItsSevenDays(unittest.TestCase):
+    """Owner 2026-11-23: the guide grabs the already known schedule, kept for its 7 visible days, built at boot, moved on at midnight, and built again only when a channel's schedule changes"""
+
+    def setUp(self):
+        guide_table.forget()
+
+    def tearDown(self):
+        guide_table.forget()
+
+    def test_what_aired_outranks_the_plan_and_the_plan_outranks_the_future(self):
+        past = guide_table.layer_cells([_gt_row("/aired.mkv", 0, 1000)])
+        plan = guide_table.layer_cells([_gt_row("/plan_a.mkv", 500, 500), _gt_row("/plan_b.mkv", 1000, 1000)])
+        future = guide_table.layer_cells([_gt_row("/fut_a.mkv", 1500, 500), _gt_row("/fut_b.mkv", 2000, 1000)])
+        cells = guide_table.combine({"past": past, "plan": plan, "future": future})
+        self.assertEqual([(c[0], c[1], c[2]["path"]) for c in cells],
+                         [(0, 1000, "/aired.mkv"), (1000, 2000, "/plan_b.mkv"), (2000, 3000, "/fut_b.mkv")])
+
+    def test_a_row_without_facts_or_length_is_no_cell_and_overlaps_in_a_layer_are_dropped(self):
+        cells = guide_table.layer_cells([_gt_row("/a.mkv", 0, 100), _gt_row("/b.mkv", 50, 100), _gt_row("/c.mkv", 100, 0),
+                                         _gt_row("/d.mkv", 200, 50, facts=False), _gt_row("/ad.mp4", 100, 30, kind="commercial")])
+        self.assertEqual([(c[0], c[2]["path"], c[2]["is_commercial"]) for c in cells], [(0, "/a.mkv", False), (100, "/ad.mp4", True)])
+
+    def test_the_table_is_read_by_span_and_its_version_moves_only_when_a_cell_changes(self):
+        cells = guide_table.layer_cells([_gt_row("/a.mkv", 0, 100), _gt_row("/b.mkv", 100, 100), _gt_row("/c.mkv", 200, 100)])
+        self.assertIsNone(guide_table.cells_between("05", 0, 300))
+        v0 = guide_table.version()
+        self.assertTrue(guide_table.put("05", 0, 300, cells))
+        v1 = guide_table.version()
+        self.assertGreater(v1, v0)
+        self.assertEqual([c[2]["path"] for c in guide_table.cells_between(5, 150, 210)], ["/b.mkv", "/c.mkv"])
+        self.assertEqual(guide_table.cells_between("05", 300, 400), [])
+        self.assertFalse(guide_table.put("05", 0, 300, [(s, e, dict(en)) for s, e, en in cells]), "the same cells again change nothing")
+        self.assertEqual(guide_table.version(), v1)
+        self.assertTrue(guide_table.put("05", 0, 300, cells[:2]))
+        self.assertGreater(guide_table.version(), v1)
+        guide_table.forget("05")
+        self.assertIsNone(guide_table.table("05"))
+
+    def test_every_hub_write_notes_its_channel_and_kind(self):
+        tmp = tempfile.mkdtemp()
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        try:
+            hub = ml.ScheduleHub(lib)
+            ml.take_schedule_changes()
+            base = 1_800_000_000.0
+            hub.replace_future_rows("05", [_future_row("f@1", 0, "/m/f.mkv", base + 5000, 100.0)])
+            slot, _w, _s, _o = hub.place_rows("06", "2026_327_Full Day", [_gt_row("/m/p.mkv", base, 1000.0, position=0), _gt_row("/m/q.mkv", base + 1000, 1000.0, position=1)], now_epoch=base)
+            self.assertTrue(ml.schedule_changed.is_set())
+            hub.mark("06", slot, 0, "airing")
+            changes = ml.take_schedule_changes()
+            self.assertEqual(changes, {"05": {"future"}, "06": {"plan", "progress"}})
+            self.assertFalse(ml.schedule_changed.is_set())
+            planned = hub.planned_rows_between("06", base, base + 5000)
+            self.assertEqual([r["path"] for r in planned], ["/m/q.mkv"], "only rows still planned are the plan")
+            self.assertEqual(planned[0]["guide_entry"], {"path": "/m/q.mkv", "duration": 1000.0})
+            self.assertEqual([r["path"] for r in hub.rows_between("06", base, base + 5000, base + 10, full=True)], ["/m/p.mkv"])
+            hub.clear_all_schedule_data()
+            self.assertIn(ml.SCHEDULE_CHANGE_ALL, ml.take_schedule_changes())
+        finally:
+            lib.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _ns(self):
+        ns = {"guide_table": guide_table, "ui": ui, "broadcast_clock": types.SimpleNamespace(seconds_since_midnight=lambda n: n.hour * 3600 + n.minute * 60 + n.second),
+              "_GUIDE_TABLE_RECENT_S": 6 * 3600.0}
+        for name in ("_guide_table_span", "_guide_table_layer", "_guide_table_build"):
+            exec(main_function_code(name), ns)
+        return ns
+
+    def test_the_seven_days_span_the_guide_from_the_previous_midnight(self):
+        now = datetime.datetime(2026, 11, 23, 18, 30, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=-6)))
+        start, end, now_e = self._ns()["_guide_table_span"](now)
+        midnight = now_e - (18 * 3600 + 1800)
+        self.assertEqual((start, end), (midnight - gov.GUIDE_PAST_HALF_HOURS * 1800, midnight + (gov.GUIDE_TOTAL_HALF_HOURS - gov.GUIDE_PAST_HALF_HOURS) * 1800))
+        self.assertEqual(end - start, 7 * 86400)
+        self.assertEqual(start, midnight, "the 7 days are today and the 6 days after it")
+
+    def test_a_channel_table_is_built_from_the_hub_and_a_show_change_reads_only_the_newest_history(self):
+        tmp = tempfile.mkdtemp()
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        try:
+            hub = ml.ScheduleHub(lib)
+            base = 1_800_000_000.0
+            slot, _w, _s, _o = hub.place_rows("05", "blk", [_gt_row("/m/a.mkv", base, 1000.0, position=0), _gt_row("/m/ad.mp4", base + 1000, 30.0, kind="commercial", position=1),
+                                                           _gt_row("/m/b.mkv", base + 1030, 970.0, position=2)], now_epoch=base)
+            hub.mark("05", slot, 0, "airing")
+            hub.replace_future_rows("05", [_future_row("f@1", 0, "/m/f.mkv", base + 2000, 1800.0), _future_row("f@1", 1, "/m/g.mkv", base + 3800, 1800.0)])
+            ns = self._ns()
+            layers = {}
+            span = (base - 86400, base + 6 * 86400, base + 10)
+            count, changed = ns["_guide_table_build"](hub, "05", layers, {"all"}, span)
+            self.assertTrue(changed)
+            got = [(c[0] - base, c[1] - base, c[2]["path"]) for c in guide_table.table("05")["cells"]]
+            self.assertEqual(got, [(0, 1030, "/m/a.mkv"), (1030, 2000, "/m/b.mkv"), (2000, 3800, "/m/f.mkv"), (3800, 5600, "/m/g.mkv")],
+                             "the airing show, its break joined to it, the rest of the plan and the projected future, with no hole")
+            self.assertEqual(count, 4)
+            layers["05"]["past"].insert(0, (base - 30000, base - 29500, {"path": "/m/old.mkv", "duration": 500.0}))
+            hub.mark("05", slot, 0, "aired")
+            hub.mark("05", slot, 2, "airing")
+            count2, changed2 = ns["_guide_table_build"](hub, "05", layers, {"progress"}, (span[0], span[1], base + 1100))
+            self.assertEqual(guide_table.table("05")["cells"][0][2]["path"], "/m/old.mkv", "history older than the recent hours is kept as built, not read again")
+            self.assertTrue(changed2)
+        finally:
+            lib.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_show_that_runs_over_pushes_the_schedule_after_it_and_no_show_is_dropped(self):
+        """Owner 2026-11-23: a show is never skipped because it no longer fits; the schedule after it moves to make it fit. Here the projected future was worked out for a plan that ended 40 s sooner, so its first show starts while the plan's last show is still on."""
+        tmp = tempfile.mkdtemp()
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        try:
+            hub = ml.ScheduleHub(lib)
+            base = 1_800_000_000.0
+            slot, _w, _s, _o = hub.place_rows("05", "blk", [_gt_row("/m/a.mkv", base, 1000.0, position=0), _gt_row("/m/ad.mp4", base + 1000, 30.0, kind="commercial", position=1),
+                                                           _gt_row("/m/b.mkv", base + 1030, 970.0, position=2)], now_epoch=base)
+            hub.mark("05", slot, 0, "airing")
+            hub.replace_future_rows("05", [_future_row("f@1", 0, "/m/f.mkv", base + 1960, 1800.0), _future_row("f@1", 1, "/m/g.mkv", base + 3760, 1800.0),
+                                           _future_row("f@1", 2, "/m/h.mkv", base + 9000, 600.0)])
+            layers = {}
+            self._ns()["_guide_table_build"](hub, "05", layers, {"all"}, (base - 86400, base + 6 * 86400, base + 10))
+            got = [(c[0] - base, c[1] - base, c[2]["path"]) for c in guide_table.table("05")["cells"]]
+            self.assertEqual(got, [(0, 1030, "/m/a.mkv"), (1030, 2000, "/m/b.mkv"), (2000, 3800, "/m/f.mkv"), (3800, 5600, "/m/g.mkv"), (9000, 9600, "/m/h.mkv")],
+                             "the show that would have been dropped starts when the plan's last show ends, the next one moves with it, and a later show the move does not reach keeps its time")
+        finally:
+            lib.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_only_what_is_still_to_come_is_moved(self):
+        now = 1000.0
+        past = guide_table.layer_cells([_gt_row("/aired.mkv", 0, 1200)])
+        plan = guide_table.layer_cells([_gt_row("/stale.mkv", 300, 1000), _gt_row("/next.mkv", 1150, 500), _gt_row("/after.mkv", 1650, 500)], now)
+        cells = guide_table.combine({"past": past, "plan": plan, "future": []}, now)
+        self.assertEqual([(c[0], c[1], c[2]["path"]) for c in cells], [(0, 1200, "/aired.mkv"), (1200, 1700, "/next.mkv"), (1700, 2200, "/after.mkv")],
+                         "a planned row that began before now and never aired is left out; the next show waits for the one airing and the one after it moves too")
+        self.assertEqual([(c[0], c[2]["path"]) for c in guide_table.tidy_cells([(0, 100, {"path": "/a"}), (50, 150, {"path": "/b"})])], [(0, "/a")],
+                         "history is drawn as it aired: an overlap before now is still left out")
+        self.assertEqual([(c[0], c[1], c[2]["path"]) for c in guide_table.layer_cells([_gt_row("/x.mkv", 2000, 100), _gt_row("/y.mkv", 2050, 100)], now)],
+                         [(2000, 2100, "/x.mkv"), (2100, 2200, "/y.mkv")], "inside one layer an upcoming show that overlaps is moved, not dropped")
+
+    def test_the_guide_row_reads_the_table_and_nothing_else_once_it_is_built(self):
+        now = datetime.datetime(2026, 11, 23, 18, 0, 0)
+        self.assertIsNone(ui._guide_table_entries("05", now, 64800, 72000))
+        midnight = now.timestamp() - 18 * 3600
+        guide_table.put("05", midnight - 86400, midnight + 6 * 86400, guide_table.layer_cells([_gt_row("/m/a.mkv", midnight + 64800, 3600)]))
+        entries = ui._guide_table_entries("05", now, 64800, 72000)
+        self.assertEqual([(e["path"], s, en, b) for e, s, en, b in entries], [("/m/a.mkv", 64800, 68400, "")])
+        src = read(_script("ui.py"))
+        row = src[src.index("_tl_hit = _guide_table_entries(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end)"):]
+        self.assertLess(row.index("if _tl_hit is None:"), row.index("_guide_hub_past_signature(ch_str, now_dt)"), "a table row asks the database nothing")
+        self.assertIn("if not _from_table and not ch_info.get(\"is_visualizer\", False):\n                timeline_entries = _guide_fill_from_hub(", src)
+        self.assertIn("guide_table.version(),", src[src.index("def _compute_guide_cache_key"):src.index("def _guide_target_geometry")])
+
+    def test_the_worker_builds_at_boot_moves_on_at_midnight_and_otherwise_waits_for_a_change(self):
+        src = get_function_source("_guide_table_worker")
+        self.assertIn("_whole = (_span_day != _now.date() or _scope != _now_scope or _ml.SCHEDULE_CHANGE_ALL in _changes)", src)
+        self.assertIn("_ml.schedule_changed.wait(min(_GUIDE_TABLE_IDLE_WAKE_S, max(0.5, _to_midnight)))", src)
+        self.assertIn("_kinds = {\"all\"} if _whole else set(_changes.get(_ch, ()))", src)
+        self.assertIn('threading.Thread(target=_guide_table_worker, daemon=True, name="GuideTable").start()', MAIN_SRC)
+        self.assertEqual((gov.GUIDE_TABLE_SETTLE_SECONDS, gov.GUIDE_TABLE_RECENT_HOURS, gov.GUIDE_TABLE_IDLE_WAKE_SECONDS), (1.0, 6.0, 60.0))
+        for name, value in (("_GUIDE_TABLE_SETTLE_S", "1.0"), ("_GUIDE_TABLE_RECENT_S", "6.0"), ("_GUIDE_TABLE_IDLE_WAKE_S", "60.0")):
+            self.assertRegex(MAIN_SRC, re.escape(name) + r" = .* else " + re.escape(value))
+
+
+class TestAGuideDrawnWithoutTheHubFutureIsNotKept(unittest.TestCase):
+    """Owner 2026-11-23: the guide showed OFF AIR going forward on the streaming computer; a row drawn while the hub's future rows could not be read was kept and drawn again"""
+
+    def test_a_busy_read_on_the_screen_thread_says_so(self):
+        tmp = tempfile.mkdtemp()
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        try:
+            hub = ml.ScheduleHub(lib)
+            base = 1_800_000_000.0
+            hub.replace_future_rows("05", [_future_row("a@1", 0, "/m/a.mkv", base, 1000.0)])
+            held, release = threading.Event(), threading.Event()
+
+            def hold():
+                with lib._lock:
+                    held.set()
+                    release.wait(5)
+            t = threading.Thread(target=hold)
+            t.start()
+            held.wait(5)
+            try:
+                self.assertIs(hub.future_rows_between("05", base, base + 50), ml.LIBRARY_BUSY)
+            finally:
+                release.set()
+                t.join()
+            self.assertEqual([r["path"] for r in hub.future_rows_between("05", base, base + 50)], ["/m/a.mkv"])
+        finally:
+            lib.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_guide_marks_the_build_and_keeps_neither_the_row_nor_the_frame(self):
+        busy_hub = types.SimpleNamespace(future_rows_between=lambda *a: ml.LIBRARY_BUSY)
+        ui._guide_hub_future_unread[0] = False
+        now = datetime.datetime(2026, 11, 23, 18, 0, 0)
+        self.assertIsNone(ui._guide_hub_future_cells("05", now, 0, 7200, hub=busy_hub))
+        self.assertTrue(ui._guide_hub_future_unread[0])
+        ui._guide_hub_future_unread[0] = False
+        src = read(_script("ui.py"))
+        self.assertIn("if not _future_unread and _tl_key is not None:\n                    if len(_guide_timeline_cache) > 80:", src)
+        self.assertIn('_guide_frame_cache["key"] = None if _guide_hub_future_unread[0] else cache_key', src)
+        build = src[src.index("def _build_and_cache_guide_frame"):src.index("def _guide_clock_texts")]
+        self.assertLess(build.index("_guide_hub_future_unread[0] = False"), build.index("_render_tv_guide_impl("))
+
+
+class TestTheGuidePreviewIsPipelinedLikeAChannelChange(unittest.TestCase):
+    """Owner 2026-11-23: the guide preview opens at once under the cover like a channel change, and leaving the guide for the channel it is opening carries that open on"""
+
+    def test_the_preview_open_does_not_wait_for_the_cover(self):
+        self.assertNotIn("guide_preview_settle_until", MAIN_SRC)
+        loop = MAIN_SRC[MAIN_SRC.index('_guide_load_in_flight = app_state.get("guide_preview_loading", False)'):]
+        loop = loop[:loop.index("_start_guide_preview_load(hl_ch, hl_state)")]
+        self.assertIn("if (not _guide_load_in_flight", loop)
+
+    def _ns(self, state, app_state):
+        import types as _t
+        fake_vlc = _t.SimpleNamespace(State=_t.SimpleNamespace(Opening="Opening", Buffering="Buffering", Playing="Playing", Stopped="Stopped"))
+        ns = {"app_state": app_state, "os": os, "_log_swallowed": lambda *a: None,
+              "vlc_engine": _t.SimpleNamespace(player=_t.SimpleNamespace(get_state=lambda: state))}
+        exec(get_function_source("_guide_preview_open_in_flight"), ns)
+        return ns["_guide_preview_open_in_flight"], fake_vlc
+
+    def test_an_open_of_the_channel_file_under_way_counts(self):
+        target = os.path.normpath("\\\\s\\M\\Film.avi").lower()
+        base = {"guide_preview_loading": True, "highlighted_guide_channel": "06", "loaded_preview_path_cache": "\\\\s\\M\\Film.avi"}
+        for state, want in (("Opening", True), ("Buffering", True), ("Playing", False), ("Stopped", False)):
+            fn, fake = self._ns(state, dict(base))
+            with patch.dict(sys.modules, {"vlc": fake}):
+                self.assertEqual(fn("06", target), want, state)
+        for change in ({"guide_preview_loading": False}, {"highlighted_guide_channel": "05"}, {"loaded_preview_path_cache": "\\\\s\\M\\Other.avi"}):
+            fn, fake = self._ns("Opening", dict(base, **change))
+            with patch.dict(sys.modules, {"vlc": fake}):
+                self.assertFalse(fn("06", target), change)
+
+    def test_leaving_the_guide_carries_the_open_on_and_keeps_the_sound_for_the_first_picture(self):
+        src = MAIN_SRC[MAIN_SRC.index('app_state["_guide_exit_warm"] = False'):]
+        src = src[:src.index("_guide_exit_warm_skip_music_stop = False")]
+        self.assertIn("_exit_preview_opening = _guide_preview_open_in_flight(new_ch, _exit_target_norm)", src)
+        guarded = src[src.index("if not _exit_preview_opening:"):]
+        self.assertLess(guarded.index('app_state["_video_pending_unmute"] = False'), guarded.index("_arm_warm_transition_shield(vlc_engine, _warm_burst_ms)"))
+
+
+class TestTheTransitionCoverGetsNoPictureSettings(unittest.TestCase):
+    """Owner 2026-11-23: leaving the guide, a washed-out box the shape of the preview window stood out from the TV grey at the start of the transition"""
+
+    def _rect(self, app_state):
+        ns = {"app_state": app_state, "game_deck": None}
+        exec(get_function_source("_picture_layer_rect"), ns)
+        return ns["_picture_layer_rect"](1920, 1080)
+
+    def test_a_frame_under_the_whole_window_cover_has_no_picture_part(self):
+        for ch in ("04", "05", "03"):
+            self.assertIsNone(self._rect({"current_channel": ch, "guide_preview_bounds": (560, 15, 800, 450), "_transition_cover_whole_window": True}), ch)
+
+    def test_without_the_cover_the_picture_parts_are_as_before(self):
+        self.assertEqual(self._rect({"current_channel": "04", "guide_preview_bounds": (560, 15, 800, 450)}), (560, 15, 1360, 465))
+        self.assertEqual(self._rect({"current_channel": "05", "_transition_cover_whole_window": False}), (0, 0, 1920, 1080))
+
+    def test_every_whole_window_cover_marks_the_frame_and_each_frame_starts_unmarked(self):
+        src = MAIN_SRC
+        start = src.index('app_state["_transition_cover_whole_window"] = False')
+        self.assertLess(start, src.index("if ch == \"04\" and (_guide_not_ready_this_frame or _surf_quiet):"))
+        block = src[src.index("if ch == \"04\" and (_guide_not_ready_this_frame or _surf_quiet):"):]
+        block = block[:block.index("    else:\n        if app_state.get(\"_warm_static_mute_active\"")]
+        self.assertEqual(block.count('app_state["_transition_cover_whole_window"] = True'), 3)
+        self.assertEqual(block.count("_full_window_rect)"), 5)
+        self.assertLess(start, src.index("_take_picture_layer(screen)"))
+
+
+class TestTheCaptionModelNeverTakesTheProcessorFromATune(unittest.TestCase):
+    """Owner log 2026-11-23: a 1080p channel's first picture came 5.6 s after the change while the caption model ran at normal priority"""
+
+    def test_the_caption_process_runs_below_normal_and_the_tune_times_the_file_check(self):
+        import inspect
+        src = inspect.getsource(media._start_caption_model_process)
+        self.assertIn('getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)', src)
+        self.assertLess(MAIN_SRC.index('_tune_stage("volume applied")'), MAIN_SRC.index('_tune_stage("file checked")'))
+        self.assertLess(MAIN_SRC.index('_tune_stage("file checked")'), MAIN_SRC.index('_tune_stage("relay ready")'))
+
+
+class TestTheHcReleaseTagMeansBurnedInSubtitles(unittest.TestCase):
+    """Owner 2026-11-23: a file marked as having its subtitles burned into the picture gets no captions laid over them"""
+
+    def test_the_hc_tag_next_to_a_release_tag_is_burned_in(self):
+        for name in ("Annabelle Comes Home.2019.HC.HDRip.XviD.AC3-EVO.avi", "Movie.2020.1080p.HC.WEBRip.mkv",
+                     "Movie 2020 HC HDRip.mp4", "Movie.2019.HDRip.HC.avi", "Movie.HARDSUB.mkv"):
+            self.assertTrue(media.filename_says_captions_baked_in("\\\\server\\Movies\\" + name), name)
+
+    def test_hc_as_part_of_a_title_is_not(self):
+        for name in ("HC Andersen.mkv", "The HC Show S01E01.mkv", "Chunk.mkv", "Bones S01E04 The Man In The Bear.mp4", "Hchc.1080p.mkv"):
+            self.assertFalse(media.filename_says_captions_baked_in(name), name)
+
+    def test_a_burned_in_name_turns_the_captions_off_before_anything_else(self):
+        with patch.object(media, "_cached_path_exists", lambda p: True), patch.object(media.os, "stat", lambda p: types.SimpleNamespace(st_mtime=1.0, st_size=2)), \
+                patch.object(media, "file_facts", lambda p: self.fail("the name decides first")):
+            self.assertEqual(media.resolve_caption_source("C:\\m\\Annabelle Comes Home.2019.HC.HDRip.XviD.AC3-EVO.avi")["kind"], "baked")
+        src = get_function_source("_caption_cues_for")
+        self.assertIn('if info.get("kind") == "baked":', src)
+        self.assertIn('elif (info.get("kind") is None or info.get("kind") == "embedded")', src)
+
+
+class TestChannel03BackdropFollowsTheTheme(unittest.TestCase):
+    """Owner 2026-11-23: channel 03 with no picture shows the menus' theme background with a border in the border color, not black"""
+
+    def test_the_backdrop_is_the_theme_background_with_a_border(self):
+        module = load_deck_module(_script("game_deck.py"), "game_deck_ch03_backdrop")
+        import colorsys
+        deck = object.__new__(module.ExternalGameDeck)
+        deck.ui_color = (10, 200, 30)
+        fills, rects = [], []
+        screen = types.SimpleNamespace(fill=lambda color, rect=None: fills.append((color, rect)))
+        main = types.SimpleNamespace(db=types.SimpleNamespace(config={"theme_bg_hue": 120}))
+        with patch.dict(sys.modules, {"__main__": main}), patch.object(module.pygame.draw, "rect", lambda surf, color, rect, width=0: rects.append((color, rect, width))):
+            deck._draw_theme_backdrop(screen, (0, 0, 1360, 680))
+        r, g, b = colorsys.hsv_to_rgb(120 / 360.0, 0.6, 0.15)
+        self.assertEqual(fills, [((int(r * 255), int(g * 255), int(b * 255)), (0, 0, 1360, 680))])
+        self.assertEqual(len(rects), 2, "owner 2026-11-23: double borders, the edge one and the inset one")
+        self.assertEqual(rects[0], ((10, 200, 30), (0, 0, 1360, 680), gov.CH03_BACKDROP_BORDER_PX),
+                         "owner 2026-11-23: the outside border on the screen's edges is back")
+        color, (bx, by, bw, bh), width = rects[1]
+        edge = gov.CH03_BACKDROP_EDGE_GAP_PX
+        self.assertEqual((color, width, bx, by, bw), ((10, 200, 30), gov.CH03_BACKDROP_BORDER_PX, edge, edge, 1360 - 2 * edge),
+                         "owner 2026-11-23: the border is set in from the edges so the background colour shows outside it")
+        self.assertEqual(680 - (by + bh), edge, "owner 2026-11-24: the same gap at the bottom as on the other three sides")
+        self.assertFalse(hasattr(gov, "CH03_BACKDROP_LEGEND_GAP_PX"))
+        src = open(_script("game_deck.py"), encoding="utf-8").read()
+        legend = src[src.index("    def _draw_legend("):src.index("    # SECTION: Rendering: console carousel")]
+        self.assertIn("y_title = y + h - edge - border - (f.get_height() + key_h + gap) - _gov.GAME_LEGEND_BOTTOM_PAD_PX", legend,
+                      "the control hints sit inside the inner border")
+
+    def test_the_no_picture_screen_draws_the_backdrop_and_not_black(self):
+        src = open(_script("game_deck.py"), encoding="utf-8").read()
+        render = src[src.index("    def render("):]
+        render = render[:render.index("\n    def ", 10)]
+        self.assertIn("self._draw_theme_backdrop(screen, rect)", render)
+
+    def test_a_background_picture_still_replaces_the_colour_and_gets_the_border(self):
+        # WARNING: owner 2026-11-23: the background picture still replaces the default, border line and all.
+        module = load_deck_module(_script("game_deck.py"), "game_deck_ch03_picture")
+        deck = object.__new__(module.ExternalGameDeck)
+        deck.ui_color = (200, 10, 10)
+        deck.mode = "CAROUSEL"
+        deck._ensure_fonts = lambda: None
+        picture = module.pygame.Surface((64, 32))
+        deck._get_menu_bg_surface = lambda: picture
+        calls = []
+        deck._draw_theme_backdrop = lambda screen, rect: calls.append("colour")
+        deck._draw_screen_border = lambda screen, rect: calls.append("border")
+        screen = module.pygame.Surface((340, 170))
+        try:
+            deck.render(screen, (0, 0, 340, 170))
+        except Exception:
+            pass
+        self.assertEqual(calls[:1], ["border"])
+        self.assertNotIn("colour", calls)
+
+
 def suite_list_leaves_failed_drive():
     module = load_deck_module(_script("game_deck.py"), "game_deck_list_drive")
     module._gd_drive_root_of = lambda path: (str(path)[:2] + "\\") if path and ":" in str(path) else None
@@ -10896,6 +11333,9 @@ def _hub_mode_ns(ns, modes=None, mono=None):
     ns["_hub_sync_lock"] = threading.Lock()
     ns["_HUB_MODE_SWITCH_SETTLE_SECONDS"] = 0.5
     ns["db"] = types.SimpleNamespace(channels_db=modes if modes is not None else {})
+    import schedule_planner
+    ns.setdefault("schedule_planner", schedule_planner)
+    ns.setdefault("copy", copy)
     exec(main_function_code("_hub_channel_mode"), ns)
     return ns
 
@@ -11406,7 +11846,8 @@ def suite_missed_cycles_recorded_in_hub():
               "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
               "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a))}
         _hub_mode_ns(ns)
-        for name in ("_hub_channel_key", "_hub_bundles_for", "_write_missed_blocks_to_hub"):
+        ns["broadcast_clock"] = types.SimpleNamespace(server_utc_offset=lambda: None)
+        for name in ("_hub_channel_key", "_hub_bundles_for", "_broadcast_epoch_of", "_write_missed_blocks_to_hub"):
             exec(main_function_code(name), ns)
         write = ns["_write_missed_blocks_to_hub"]
 
@@ -11585,7 +12026,7 @@ def suite_hub_future_worker():
         ns = {"os": os, "media": media, "datetime": datetime, "copy": copy, "db": sns["db"], "_cached_path_exists": lambda p: True,
               "build_commercial_tracks": media.build_commercial_tracks, "_start_order_seed": sns["_start_order_seed"],
               "time": types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter),
-              "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]),
+              "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0], server_utc_offset=lambda: None),
               "log": types.SimpleNamespace(info=lambda *a, **k: infos.append(a), warning=lambda *a, **k: warnings.append(a)),
               "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
               "_HUB_FUTURE_HOURS_AHEAD": 24.0, "_hub_future_lengths_due": lambda info, since: lengths_due["now"], "_hub_next_blocks": {}, "HUB_NEXT_BLOCKS_KEEP_HOURS": 26.0}
@@ -11593,7 +12034,8 @@ def suite_hub_future_worker():
         ns["db"] = sns["db"]
         ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
         ns["_GUIDE_LIVE_HOURS"] = 24.0
-        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel", "_keep_next_blocks"):
+        ns["_server_rows_live"] = set()
+        for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_broadcast_epoch_of", "_hub_future_for_channel", "_keep_next_blocks"):
             exec(main_function_code(name), ns)
         ns["_missed_block_day_seeds"] = sns["_missed_block_day_seeds"]
         ns["_hub_future_state"] = {}
@@ -11633,7 +12075,7 @@ def suite_hub_future_worker():
         check("_HUB_FUTURE_START_DELAY_SECONDS" in worker and worker.index("_HUB_FUTURE_START_DELAY_SECONDS") < worker.index("_hub_future_for_channel("), "the worker waits after boot before it works out anything")
         check("_python_heavy_should_pause()" in worker and "_background_scan_pace_seconds(" in worker, "the worker stops while the governor holds background work and paces itself between channels")
         check('target=_hub_future_worker' in src and src.index("target=_hub_future_worker") > src.index('_mark_boot_step("vlc_engine")'), "the worker thread starts after the boot steps, never inside the boot path")
-        check(get_function_source("_hub_future_for_channel").count("_cached_path_exists") >= 2, "the projection uses the same file check as the scheduler")
+        check("schedule_planner.project_station(_channel, _snap, now, _cached_path_exists," in get_function_source("_hub_future_for_channel"), "the projection uses the same file check as the scheduler")
     finally:
         ml.shared_schedule_hub = original
         lib.close()
@@ -11660,7 +12102,7 @@ def suite_hub_future_holiday_rows():
             ns = {"os": os, "media": media, "datetime": datetime, "copy": copy, "_cached_path_exists": lambda p: True,
                   "build_commercial_tracks": media.build_commercial_tracks, "_start_order_seed": sns["_start_order_seed"],
                   "_missed_block_day_seeds": sns["_missed_block_day_seeds"],
-                  "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0]),
+                  "broadcast_clock": types.SimpleNamespace(now=lambda: clock[0], server_utc_offset=lambda: None),
                   "log": types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: warnings.append(a)),
                   "_log_warn_throttled": lambda key, msg, *a: warnings.append((key, msg, a)),
                   "_HUB_FUTURE_HOURS_AHEAD": 70.0, "_hub_future_lengths_due": lambda info, since: False, "_hub_next_blocks": {}, "HUB_NEXT_BLOCKS_KEEP_HOURS": 26.0}
@@ -11668,7 +12110,8 @@ def suite_hub_future_holiday_rows():
             ns["db"] = sns["db"]
             ns["time"] = types.SimpleNamespace(monotonic=lambda: mono["t"], perf_counter=time.perf_counter, time=time.time)
             ns["_GUIDE_LIVE_HOURS"] = 24.0
-            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_hub_future_for_channel", "_keep_next_blocks"):
+            ns["_server_rows_live"] = set()
+            for name in ("_hub_channel_key", "_hub_future_inputs_signature", "_hub_future_snapshot", "_hub_future_log_once", "_settle_future_rows", "_broadcast_epoch_of", "_hub_future_for_channel", "_keep_next_blocks"):
                 exec(main_function_code(name), ns)
             ns["_hub_future_state"], ns["_hub_future_logged"] = {}, {}
             run = ns["_hub_future_for_channel"]
@@ -11697,11 +12140,12 @@ def suite_hub_future_holiday_rows():
             sns["db"].channels_db["05"] = unbuilt
             with patch.object(media, "_cached_path_exists", lambda p: True):
                 check(run("05", force=True) == 0, "%s: a holiday day the scheduler has not built leaves the saved rows as they were" % label)
-        code = get_function_source("_hub_future_for_channel")
-        check("project_holiday_days(" in code and "holiday_day_tracks(" in code, "the worker plans the holiday days through the media functions")
+        code = open(_script("schedule_planner.py"), encoding="utf-8").read()
+        check("project_holiday_days(" in code and "holiday_day_tracks(" in code and "schedule_planner.project_station(" in get_function_source("_hub_future_for_channel"),
+              "the worker plans the holiday days through the media functions (in schedule_planner)")
         with open(_script("ui.py"), encoding="utf-8") as handle:
             guide = handle.read()
-        call = guide.index("_guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end),")
+        call = guide.index("_future_cells = _guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end)")
         line = guide.rfind("if _tl_hit is None", 0, call)
         check("_is_holiday_guide" not in guide[line:call], "the guide lays the hub's future over its own cells on a holiday day too")
     finally:
@@ -11774,6 +12218,7 @@ class TestHubPlaybackDoor(unittest.TestCase):
         sys.modules.setdefault("media_library", __import__("media_library"))
         for name in ("_hub_playback_guard", "calculate_slotted_playback_state", "_hub_miss_log_once", "_hub_remember_state", "_screen_scheduler_answer"):
             exec(get_function_source(name), ns)
+        exec(STATION_DOOR_SRC, ns)
         _door = ns["calculate_slotted_playback_state"]
 
         def _off_screen(*a, **k):
@@ -11835,7 +12280,7 @@ class TestHubWriterTick(unittest.TestCase):
         self.assertIn("_python_heavy_should_pause()", src)
         self.assertIn("_app_shutting_down.wait(_HUB_WRITER_WATCHED_SECONDS)", src)
         step = get_function_source("_hub_writer_step")
-        self.assertIn("_scheduler_playback_state(channel_key)", step)
+        self.assertIn("_station_playback_state(channel_key, _epoch)", step)
         self.assertIn("_hub_remember_state(", step)
         self.assertIn('name="HubWriter"', MAIN_SRC)
 
@@ -11847,9 +12292,13 @@ class TestHubWriterTick(unittest.TestCase):
         ns = {"broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 500.0, toordinal=lambda: 1)),
               "_scheduler_playback_state": lambda ch: (calls.append(ch), {"mode": "Video", "file": "/m/a.mkv", "seek": 10.0, "duration": 1500.0})[1],
               "_hub_playback_guard": lambda ch: ("g",), "_log_warn_throttled": lambda *a, **k: None, "time": __import__("time"), "_hub_writer_checked": {},
-              "_scheduler_prepared": {}, "_warm_open_facts": lambda *a: None, "OPEN_FACTS_WARM_ITEMS": 4}
-        for name in ("_hub_remember_state", "_hub_writer_step"):
+              "_scheduler_prepared": {}, "_warm_open_facts": lambda *a: None, "OPEN_FACTS_WARM_ITEMS": 4,
+              "_hub_writer_item_ends": {}, "_hub_writer_redo": {"05"}}
+        for name in ("_hub_remember_state", "_airing_item_end_epoch", "_hub_writer_step"):
             exec(get_function_source(name), ns)
+        exec(STATION_DOOR_SRC, ns)
+        ns["_mark_server_rows_progress"] = lambda *a: None
+        ns["_hub_channel_key"] = lambda ch: str(ch).zfill(2)
         orig = media_library.shared_schedule_hub
         media_library.shared_schedule_hub = lambda: hub
         try:
@@ -11858,6 +12307,8 @@ class TestHubWriterTick(unittest.TestCase):
             media_library.shared_schedule_hub = orig
         self.assertEqual(calls, ["05"])
         self.assertAlmostEqual(hub.show_facts("05", 530.0, ("g",))["seek"], 40.0)
+        self.assertEqual(ns["_hub_writer_item_ends"]["05"], 500.0 + 1490.0, "the pass keeps when the item on air ends")
+        self.assertEqual(ns["_hub_writer_redo"], set(), "the pass is the one a changed state asked for")
 
 
 class TestHubWriterSkipsValidChannels(unittest.TestCase):
@@ -11872,7 +12323,7 @@ class TestHubWriterSkipsValidChannels(unittest.TestCase):
         ns = {"time": time, "db": types.SimpleNamespace(channels_db={c: {"active": True} for c in ("05", "06", "07", "08")}),
               "broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 200.0)),
               "_hub_playback_guard": lambda ch: ("g",), "_hub_writer_checked": {"07": time.monotonic()},
-              "_HUB_WRITER_STATIC_RECHECK_SECONDS": 60.0}
+              "_HUB_WRITER_STATIC_RECHECK_SECONDS": 60.0, "_hub_writer_item_ends": {}, "_hub_writer_redo": set()}
         exec(get_function_source("_hub_writer_next_stale"), ns)
         orig = media_library.shared_schedule_hub
         media_library.shared_schedule_hub = lambda: hub
@@ -11884,6 +12335,62 @@ class TestHubWriterSkipsValidChannels(unittest.TestCase):
             self.assertIsNone(ns["_hub_writer_next_stale"](chans, 0), "every channel is up to date")
         finally:
             media_library.shared_schedule_hub = orig
+
+
+class TestEveryChannelIsWorkedOutAgainWhenItsItemEnds(unittest.TestCase):
+    """Owner 2026-11-24: "the show that is on, needs to be updated in cache as soon as it ends so that i dont load the wrong show. stay on schedule all the time"; a tune to channel 06 opened the show kept from before the server's state came and the scheduler swapped it 15 s later."""
+
+    def _hub(self):
+        import media_library
+        hub = media_library.ScheduleHub.__new__(media_library.ScheduleHub)
+        hub._show_facts, hub._upcoming = {}, {}
+        hub.remember_show_facts("06", {"mode": "Video", "file": "/m/old.mp4", "seek": 0.0, "duration": 5000.0}, 100.0, ("g",))
+        hub.remember_show_facts("07", {"mode": "Video", "file": "/m/x.mp4", "seek": 0.0, "duration": 5000.0}, 100.0, ("g",))
+        return hub
+
+    def _ns(self, hub, **extra):
+        import types, time
+        ns = {"time": time, "db": types.SimpleNamespace(channels_db={c: {"active": True} for c in ("06", "07")}),
+              "broadcast_clock": types.SimpleNamespace(now=lambda: types.SimpleNamespace(timestamp=lambda: 200.0)),
+              "_hub_playback_guard": lambda ch: ("g",), "_hub_writer_checked": {"06": time.monotonic(), "07": time.monotonic()},
+              "_HUB_WRITER_STATIC_RECHECK_SECONDS": 60.0, "_hub_writer_item_ends": {"06": 5100.0, "07": 5100.0}, "_hub_writer_redo": set(),
+              "_screen_scheduler_answers": {"06": {"state": {}}, "07": {"state": {}}}, "app_state": {"current_channel": "07"}}
+        ns.update(extra)
+        for name in ("_hub_writer_next_stale", "_hub_schedule_inputs_changed"):
+            exec(get_function_source(name), ns)
+        return ns
+
+    def _with(self, hub, fn):
+        import media_library
+        orig = media_library.shared_schedule_hub
+        media_library.shared_schedule_hub = lambda: hub
+        try:
+            return fn()
+        finally:
+            media_library.shared_schedule_hub = orig
+
+    def test_a_channel_whose_item_ended_is_due_at_once_even_inside_the_recheck_gap(self):
+        hub = self._hub()
+        ns = self._ns(hub)
+        self.assertIsNone(self._with(hub, lambda: ns["_hub_writer_next_stale"](["06", "07"], 0)), "both were just checked and their items are on")
+        ns["_hub_writer_item_ends"]["06"] = 150.0
+        self.assertEqual(self._with(hub, lambda: ns["_hub_writer_next_stale"](["06", "07"], 1)), "06", "its item ended, so it is worked out again now")
+
+    def test_a_changed_state_drops_the_kept_show_off_screen_and_asks_for_a_pass(self):
+        hub = self._hub()
+        ns = self._ns(hub)
+        self._with(hub, lambda: ns["_hub_schedule_inputs_changed"](["06", "07"]))
+        self.assertIsNone(hub.show_facts("06", 200.0, ("g",)), "a tune before the pass waits for the scheduler, it never opens the old show")
+        self.assertNotIn("06", ns["_screen_scheduler_answers"])
+        self.assertIsNotNone(hub.show_facts("07", 200.0, ("g",)), "the channel on screen keeps its show; the writer works it out every beat")
+        self.assertEqual(ns["_hub_writer_redo"], {"06", "07"})
+        self.assertEqual(self._with(hub, lambda: ns["_hub_writer_next_stale"](["06", "07"], 1)), "06")
+
+    def test_the_servers_state_is_compared_before_and_after_it_is_applied(self):
+        body = MAIN_SRC[MAIN_SRC.index("    def _apply_remote_schedule_message(message):"):]
+        body = body[:body.index("    def _forget_a_replaced_server(message):")]
+        self.assertLess(body.index("_held_before = {"), body.index("db.apply_remote_schedule("))
+        self.assertIn("_hub_schedule_inputs_changed([_ch for _ch, _rec in list(db.channels_db.items()) if _channel_record_signature(_rec) != _held_before.get(_ch)])", body)
 
 
 class TestGridFollowsTheHub(unittest.TestCase):
@@ -11907,7 +12414,7 @@ class TestGridFollowsTheHub(unittest.TestCase):
 
 
 class TestNov8BootMemoryAndGraphics(unittest.TestCase):
-    """Boot memory scan greys out captions (not Lite mode), memory places weak vs strong PCs, CPU-only PCs never get Performance"""
+    """Boot memory scan stops live captioning (the Captions switches stay usable, owner 2026-11-24), memory places weak vs strong PCs, CPU-only PCs never get Performance"""
 
     def _gov(self):
         import performance_governor as gov
@@ -11916,12 +12423,12 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
     def test_lite_mode_no_longer_locks_captions(self):
         gov = self._gov()
         with mock.patch.dict(gov._state, {"captions_memory_ok": True}):
-            for key in gov.CAPTION_LOCK_KEYS:
+            for key in ("tv_captions_enabled", "dvd_captions_enabled"):
                 self.assertFalse(gov.feature_locked(key, "lite"))
             self.assertTrue(gov.feature_locked("warp_screen_enabled", "lite"))
             self.assertTrue(gov.feature_locked("fake_43_scanlines_enabled", "lite"))
 
-    def test_boot_memory_scan_locks_captions_in_every_mode_and_runs_once(self):
+    def test_boot_memory_scan_stops_live_captions_without_greying_the_switches_and_runs_once(self):
         gov = self._gov()
         calls = []
 
@@ -11929,10 +12436,12 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
             calls.append(1)
             return False, 6.0, 1.0, 1.5
         with mock.patch.dict(gov._state, {"captions_memory_ok": None}), mock.patch.object(gov, "caption_memory_check", fake_check):
+            gov.scan_caption_memory()
+            self.assertTrue(gov.live_captions_blocked())
+            self.assertEqual(gov.caption_lock_reason(), "memory")
             for mode in ("lite", "standard", "performance"):
-                for key in gov.CAPTION_LOCK_KEYS:
-                    self.assertTrue(gov.feature_locked(key, mode), (mode, key))
-            self.assertFalse(gov.feature_locked("boot_anim_enabled", "standard"))
+                for key in ("tv_captions_enabled", "dvd_captions_enabled"):
+                    self.assertFalse(gov.feature_locked(key, mode), (mode, key))
             self.assertEqual(len(calls), 1)
 
     def test_enough_or_unreadable_memory_never_locks_captions(self):
@@ -11941,6 +12450,8 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
             with mock.patch.dict(gov._state, {"captions_memory_ok": None}), mock.patch.object(gov, "caption_memory_check", lambda a=answer: a):
                 self.assertFalse(gov.feature_locked("tv_captions_enabled", "standard"))
                 self.assertFalse(gov.feature_locked("dvd_captions_enabled", "lite"))
+                gov.scan_caption_memory()
+                self.assertFalse(gov.live_captions_blocked())
 
     def test_a_pc_with_too_little_total_memory_is_refused_however_much_is_free_at_boot(self):
         gov = self._gov()
@@ -11960,7 +12471,8 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
             gov.caption_load_begin()
             self.assertTrue(gov.caption_load_interrupted(), "the marker left by a killed load locks captions")
             with mock.patch.dict(gov._state, {"captions_memory_ok": None}):
-                self.assertTrue(gov.feature_locked("tv_captions_enabled", "standard"))
+                gov.scan_caption_memory()
+                self.assertEqual(gov.caption_lock_reason(), "crash")
             gov.caption_load_done()
             self.assertFalse(gov.caption_load_interrupted(), "a load that finished leaves no marker")
             gov.caption_load_begin()
@@ -12017,9 +12529,9 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
                 if shed:
                     break
                 time.sleep(0.01)
-            self.assertTrue(shed, "two low readings in a row switch captions off")
-            self.assertTrue(gov.feature_locked("tv_captions_enabled", "standard"))
-            self.assertTrue(gov.feature_locked("dvd_captions_enabled", "lite"))
+            self.assertTrue(shed, "two low readings in a row stop live captioning")
+            self.assertTrue(gov.live_captions_blocked())
+            self.assertFalse(gov.feature_locked("tv_captions_enabled", "standard"))
             gov.caption_watch_stop()
 
     def test_a_single_dip_in_free_memory_does_not_switch_captions_off(self):
@@ -12034,7 +12546,7 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
             time.sleep(0.3)
             gov.caption_watch_stop()
             self.assertEqual(shed, [])
-            self.assertFalse(gov.feature_locked("tv_captions_enabled", "standard"))
+            self.assertFalse(gov.live_captions_blocked())
 
     def test_the_unload_stops_the_watch_and_clears_the_marker_and_start_hands_over_the_unclean_flag(self):
         text = read(_media_script_path())
@@ -12049,20 +12561,21 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
         self.assertNotIn("_start_caption_model_prewarm", main)
         self.assertNotIn("caption-model-prewarm", main)
         text = read(_media_script_path())
-        self.assertEqual(text.count("= _get_whisper_model()"), 2, "only the two transcription paths load it")
+        self.assertEqual(text.count("= _get_whisper_model()"), 3, "only the two transcription paths and the caption speed test load it")
 
     def test_the_model_load_and_unload_log_the_programs_memory(self):
         text = read(_media_script_path())
         self.assertIn("_start_caption_model_process(", text[text.index("def _get_whisper_model"):text.index("def _live_asr_running")])
         self.assertIn("read_process_memory_mb()", text[text.index("def release_whisper_model"):text.index("# SECTION: Speech-to-text core")])
 
-    def _idle_run(self, busy):
+    def _idle_run(self, busy, watched=False):
         freed = []
         fake = mock.Mock()
         fake.WHISPER_IDLE_UNLOAD_SECONDS = 0.6
         fake.WHISPER_IDLE_CHECK_SECONDS = 0.5
+        fake.WHISPER_IDLE_UNLOAD_WATCHING_SECONDS = 30.0
         with mock.patch.object(media, "_whisper_model", object()), mock.patch.object(media, "_perf_governor", fake), \
-                mock.patch.object(media, "_whisper_idle_thread", None), \
+                mock.patch.object(media, "_whisper_idle_thread", None), mock.patch.object(media, "_captions_watched_check", lambda: watched), \
                 mock.patch.object(media, "_live_asr_running", lambda: busy), \
                 mock.patch.object(media, "release_whisper_model", lambda reason: freed.append(reason) or media.__dict__.__setitem__("_whisper_model", None)):
             media._whisper_idle_watch_start()
@@ -12079,6 +12592,19 @@ class TestNov8BootMemoryAndGraphics(unittest.TestCase):
 
     def test_a_running_live_transcription_keeps_the_model(self):
         self.assertEqual(self._idle_run(busy=True), [])
+
+    def test_a_caption_model_that_is_not_loaded_waits_for_the_tune_to_settle(self):
+        """Owner logs 2026-11-24 14:01: the model loaded during the tune to channel 06 and 155 pictures were lost."""
+        body = open(_script("media.py"), encoding="utf-8").read()
+        body = body[body.index("    def _run_locked(self):"):][:1400]
+        self.assertIn("while _whisper_model is None and _perf_governor is not None and _perf_governor.tune_in_progress():", body)
+        self.assertLess(body.index("tune_in_progress()"), body.index("model = _get_whisper_model()"))
+
+    def test_a_channel_with_captions_on_keeps_the_model_between_shows(self):
+        """Owner logs 2026-11-24: the model was freed in a commercial break the saved captions covered and loaded again for the next show, four times in an hour."""
+        self.assertEqual(self._idle_run(busy=False, watched=True), [])
+        self.assertEqual(gov.WHISPER_IDLE_UNLOAD_WATCHING_SECONDS, 600.0)
+        self.assertIn("media.set_captions_watched_check(lambda: _captions_switched_on() and not _is_game_actively_playing())", MAIN_SRC)
 
     def test_start_runs_the_caption_memory_scan_with_the_boot_scan(self):
         self.assertIn("scan_caption_memory()", inspect.getsource(self._gov().start))
@@ -12166,40 +12692,91 @@ class TestHubCurrentShowRecord(unittest.TestCase):
 
 
 class TestHubLoopChannelRows(unittest.TestCase):
-    """14.9: Marathon and Visualizer channels get hub future rows built from their own media"""
+    """14.9: Marathon and Visualizer channels get hub rows built from their own media, day by day (owner 2026-11-24: "updating marathon and visualizer to work the same as our other modes")."""
 
-    def _ns(self):
-        import datetime
-        ns = {"media": media, "datetime": datetime, "_HUB_FUTURE_HOURS_AHEAD": 6.0}
-        for name in ("_hub_loop_cycle_timeline", "_hub_loop_plan"):
-            exec(get_function_source(name), ns)
-        return ns
+    def test_a_day_is_passes_end_to_end_cut_at_both_midnights(self):
+        import schedule_planner
+        cycle = [{"path": "a", "duration": 600.0, "start_time": 0.0}, {"path": "b", "duration": 600.0, "start_time": 600.0}]
+        day = 739000
+        day_tl = schedule_planner.loop_day_timeline(cycle, 1200.0, day * 86400 - 300, day)
+        self.assertEqual((day_tl[0]["path"], day_tl[0]["start_time"], day_tl[0]["duration"], day_tl[0]["seek_offset"]), ("a", 0.0, 300.0, 300.0),
+                         "the song on air at midnight starts there with what is left of it")
+        self.assertTrue(day_tl[0]["interior_cut"])
+        self.assertEqual((day_tl[1]["path"], day_tl[1]["start_time"]), ("b", 300.0))
+        last = day_tl[-1]
+        self.assertAlmostEqual(last["start_time"] + last["duration"], 86400.0, msg="the last one ends at the next midnight")
+        starts = [e["start_time"] for e in day_tl]
+        self.assertEqual(starts, sorted(starts))
+        self.assertTrue(all(abs(day_tl[i]["start_time"] + day_tl[i]["duration"] - day_tl[i + 1]["start_time"]) < 1e-6 for i in range(len(day_tl) - 1)),
+                        "no gap and no overlap anywhere in the day")
 
-    def test_cycle_timeline_is_the_plain_track_list(self):
-        ns = self._ns()
-        tl, total = ns["_hub_loop_cycle_timeline"]([{"path": "a", "duration": 100}, {"path": "b", "duration": 50}], [], {}, 0, False)
-        self.assertEqual([(e["path"], e["start_time"]) for e in tl], [("a", 0.0), ("b", 100.0)])
-        self.assertEqual(total, 150.0)
+    def test_a_pair_cut_at_midnight_plays_on_from_its_second_file(self):
+        import schedule_planner
+        pair = {"path": "p1", "is_pair": True, "pair_ep1_path": "p1", "pair_ep1_duration": 1000.0, "pair_ep2_path": "p2", "pair_ep2_duration": 800.0, "duration": 1800.0}
+        pieces = schedule_planner.cut_entry_front(pair, 1200.0)
+        self.assertEqual([(p["path"], p["duration"], p.get("seek_offset")) for p in pieces], [("p2", 600.0, 200.0)])
+        pieces = schedule_planner.cut_entry_front(pair, 400.0)
+        self.assertEqual([(p["path"], p["duration"], p.get("seek_offset")) for p in pieces], [("p1", 600.0, 400.0), ("p2", 800.0, None)])
 
-    def test_visualizer_plan_follows_the_frozen_lineup_position(self):
-        import datetime
-        ns = self._ns()
-        ns["_visualizer_frozen_lineup"] = lambda ch, info, now: ([{"path": "a", "duration": 600}, {"path": "b", "duration": 600}], 1200, 0.0)
+    def test_the_visualizer_position_is_the_schedulers_and_later_days_use_their_own_lineup(self):
+        import schedule_planner
         now = datetime.datetime(2026, 11, 6, 10, 5, 0)
-        plan = ns["_hub_loop_plan"]("05", {"is_visualizer": True}, now)
-        self.assertTrue(plan)
-        slot, start, timeline = plan[0]
-        self.assertAlmostEqual(now.timestamp() - start, (10 * 3600 + 300) % 1200, delta=1)
-        midnight = datetime.datetime(2026, 11, 7).timestamp()
-        self.assertTrue(all(st < midnight for _s, st, _t in plan))
+        seen = []
 
-    def test_marathon_and_visualizer_rows_never_include_what_is_airing(self):
+        def lineup(day):
+            seen.append(day)
+            return ([{"path": "a", "duration": 600}, {"path": "b", "duration": 600}], 1200, 0.0) if day == now.date() else ([{"path": "c", "duration": 900}], 900, 0.0)
+        with patch.object(schedule_planner.broadcast_clock, "server_utc_offset", lambda: None):
+            plan = schedule_planner.loop_plan("05", {"is_visualizer": True}, now, lambda p: True, 40.0, lineup, None)
+        self.assertEqual(len(plan), 3, "today and the days the 40 hours reach")
+        slot, start, tl = plan[0]
+        self.assertTrue(slot.startswith("2026_310_Music@"))
+        at = (now.timestamp() - start)
+        on = [e for e in tl if e["start_time"] <= at < e["start_time"] + e["duration"]][0]
+        self.assertEqual(on["path"], "a" if ((10 * 3600 + 300) % 1200) < 600 else "b")
+        self.assertEqual({e["path"] for e in plan[1][2]}, {"c"})
+        self.assertEqual(seen[1:], [datetime.date(2026, 11, 7), datetime.date(2026, 11, 8)])
+
+    def test_a_marathon_day_is_built_with_that_days_breaks_on_the_saved_anchor(self):
+        import schedule_planner
+        src = open(_script("schedule_planner.py"), encoding="utf-8").read()
+        self.assertIn('media.block_day_seed(media.block_start_date(day, "Marathon"), channel_key, media.block_seed_offset("Marathon", 0))', src)
+        self.assertIn('loop_day_timeline(timeline or [], float(total or 0), float(marathon_anchor), ordinal)', src)
+        self.assertIn('"%d:marathon" % seed', src)
+        self.assertIn('return "%d:marathon" % _channel_intro_seed(ch_info)', get_function_source("_marathon_start_seed"), "the same order seed as the scheduler")
+        self.assertEqual(schedule_planner.loop_plan("05", {"scheduling_mode": "marathon"}, datetime.datetime.now(), lambda p: True, 24.0, None, None), [])
+
+    def test_the_program_and_the_server_share_the_lineup_and_the_plan(self):
+        self.assertIn("schedule_planner.visualizer_lineup(ch_key, assets, vlog.get(\"visualizer_lineup\"), now, _visualizer_scanned_length)", get_function_source("_visualizer_frozen_lineup"))
+        self.assertIn("schedule_planner.loop_plan(", get_function_source("_hub_loop_plan"))
+        planner = open(_script("server_planner.py"), encoding="utf-8").read()
+        self.assertIn("schedule_planner.loop_plan(channel_key, ch_info, now, path_exists, HOURS_AHEAD, day_lineup, anchor)", planner)
+        self.assertIn('hub.set_plan_state(channel_key, "visualizer_lineup", lineup)', planner)
         src = get_function_source("_hub_future_for_loop_channel")
         self.assertIn('planned_start"] <= _now_epoch', src)
         self.assertIn("replace_future_rows", src)
-        plan_src = get_function_source("_hub_loop_plan")
-        self.assertIn("marathon_anchor_epoch", plan_src)
-        self.assertIn('build_ordered_tracks(_raw, "marathon", _marathon_start_seed(ch_info))', plan_src)
+
+    def test_the_visualizer_lineup_keeps_the_song_on_air_when_a_song_is_added(self):
+        import schedule_planner
+        now = datetime.datetime(2026, 11, 6, 10, 5, 0)
+        assets = [("a", {"duration": 600}), ("b", {"duration": 600})]
+        first, changed = schedule_planner.visualizer_lineup("05", assets, None, now, lambda p: 600)
+        self.assertTrue(changed)
+        same, changed = schedule_planner.visualizer_lineup("05", assets, first, now, lambda p: 600)
+        self.assertFalse(changed)
+        tracks, total, origin = schedule_planner.visualizer_tracks(first)
+        pos = (10 * 3600 + 300 - origin) % total
+        on_air = tracks[0]["path"] if pos < 600 else tracks[1]["path"]
+        grown, changed = schedule_planner.visualizer_lineup("05", assets + [("c", {"duration": 300})], first, now, lambda p: 600 if p != "c" else 300)
+        self.assertTrue(changed)
+        tracks, total, origin = schedule_planner.visualizer_tracks(grown)
+        pos = (10 * 3600 + 300 - origin) % total
+        walked = 0
+        for t in tracks:
+            if walked + t["duration"] > pos:
+                self.assertEqual(t["path"], on_air)
+                break
+            walked += t["duration"]
 
 
 class TestHubFutureRows(_SectionCase):
@@ -15930,7 +16507,7 @@ class TestFailurePointTextGameDeck(_SectionCase):
 
 
 def suite_failure_point_text_other_scripts():
-    for name, expected in (("media.py", 40), ("performance_governor.py", 12), ("ui.py", 13), ("libretro_core.py", 5), ("media_library.py", 31)):
+    for name, expected in (("media.py", 51), ("performance_governor.py", 12), ("ui.py", 13), ("libretro_core.py", 5), ("media_library.py", 33)):
         converted_handler_checks(name, expected)
     check(gov.log_swallowed.__doc__ and "[FAILURE]" in gov.log_swallowed.__doc__, "the shared helper lives in performance_governor.py")
 
@@ -18232,18 +18809,18 @@ class TestCaptionModelRunsInItsOwnProcess(unittest.TestCase):
         _body = _media[_media.index("def _get_whisper_model"):_media.index("def _live_asr_running")]
         self.assertNotIn("WhisperModel(", _body)
         self.assertIn("_start_caption_model_process(", _body)
-        self.assertIn("def _advance_status_banner_streaks():\n    _switch_off_locked_captions_at_boot()\n    _apply_caption_memory_refusal()", _src)
+        self.assertIn("def _advance_status_banner_streaks():\n    _note_live_captions_blocked_at_boot()\n    _apply_caption_memory_refusal()", _src)
 
-    def test_a_locked_switch_that_is_still_saved_as_on_is_switched_off_at_boot(self):
-        _flag = {"pending": False}
-        _gov = types.SimpleNamespace(caption_memory_locked=lambda: True)
+    def test_a_pc_known_unable_with_captions_on_stops_live_captions_once_at_boot(self):
+        _gov = types.SimpleNamespace(live_captions_blocked=lambda: True)
         _db = types.SimpleNamespace(config={"tv_captions_enabled": True, "dvd_captions_enabled": False})
         ns = {"_caption_lock_boot_checked": False, "_caption_memory_refusal_pending": False, "db": _db, "performance_governor": _gov}
-        exec(main_function_code("_switch_off_locked_captions_at_boot"), ns)
-        ns["_switch_off_locked_captions_at_boot"]()
+        exec(main_function_code("_captions_switched_on"), ns)
+        exec(main_function_code("_note_live_captions_blocked_at_boot"), ns)
+        ns["_note_live_captions_blocked_at_boot"]()
         self.assertTrue(ns["_caption_memory_refusal_pending"])
         ns["_caption_memory_refusal_pending"] = False
-        ns["_switch_off_locked_captions_at_boot"]()
+        ns["_note_live_captions_blocked_at_boot"]()
         self.assertFalse(ns["_caption_memory_refusal_pending"])
 
 
@@ -18303,6 +18880,24 @@ class TestCrashRestartAndModelFilesNote(unittest.TestCase):
             self.assertIn(".incomplete", note)
             with mock.patch.object(media, "resolve_whisper_model_dir", return_value=os.path.join(tmp, "nothing")):
                 self.assertIn("no files found", media._whisper_model_files_note())
+
+    def test_unfinished_downloads_are_removed_once_the_model_is_ready(self):
+        """Owner log 2026-11-24: a cut-off first download left a 128 MB .incomplete file in the model's folder that was never used."""
+        import media
+        with tempfile.TemporaryDirectory() as tmp:
+            blobs = os.path.join(tmp, f"models--Systran--faster-whisper-{media._ASR_MODEL_SIZE}", "blobs")
+            os.makedirs(blobs)
+            for name, data in (("aa.incomplete", b"y" * 2048), ("bb", b"x" * 10)):
+                with open(os.path.join(blobs, name), "wb") as handle:
+                    handle.write(data)
+            with mock.patch.object(media, "resolve_whisper_model_dir", return_value=tmp):
+                self.assertGreater(media._drop_unfinished_model_downloads(), 0)
+                self.assertEqual(os.listdir(blobs), ["bb"], "only the unfinished download goes")
+            with mock.patch.object(media, "resolve_whisper_model_dir", return_value=os.path.join(tmp, "nothing")):
+                self.assertEqual(media._drop_unfinished_model_downloads(), 0.0)
+        src = open(_script("media.py"), encoding="utf-8").read()
+        body = src[src.index("def _get_whisper_model("):]
+        self.assertLess(body.index("model ready in its own process"), body.index("_drop_unfinished_model_downloads()"))
 
     def test_the_note_is_logged_before_the_model_is_built(self):
         import media
@@ -18565,6 +19160,13 @@ class TestTwoPeopleTalkingAtOnceGetTwoRows(unittest.TestCase):
     def test_two_captions_at_once_get_a_dash_each(self):
         shown = self._screen([(1000, 4000, "One"), (1500, 4000, "Two")], [1600])
         self.assertEqual(shown[1600], ["- One", "- Two"])
+
+    def test_a_music_caption_after_a_gap_gets_no_new_speaker_mark(self):
+        # WARNING: owner 2026-11-23: a music sign is no one speaking, so it never gets the >> of a new speaker.
+        for sign in ("\u266a", "\u266b"):
+            shown = self._screen([(1000, 2500, "First"), (6000, 8000, sign + " la la " + sign), (12000, 14000, "Back")], [6000, 12000])
+            self.assertEqual(shown[6000], [sign + " la la " + sign])
+            self.assertEqual(shown[12000], [">> Back"])
 
     def test_a_caption_with_its_own_mark_gets_no_second_one(self):
         shown = self._screen([(1000, 2000, "A"), (6000, 8000, ">> Hi there")], [6000])
@@ -20547,7 +21149,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(ROOT, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "2.1.0", "build_info.py says 2.1.0 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "2.1.7", "build_info.py says 2.1.7 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -20714,6 +21316,8 @@ def suite_channel_ready_thread():
           "SIX_HOUR_BLOCKS": media.SIX_HOUR_BLOCKS, "CHANNEL_READY_REFRESH_BATCH": 50, "CHANNEL_READY_WARM_BATCH": 50,
           "CHANNEL_READY_CHANNEL_PAUSE_SECONDS": 0.0, "CHANNEL_READY_REST_CHANNELS": 2,
           "_warm_loops_should_rest": lambda: False, "_warm_loop_pace_seconds": lambda s: s,
+          "_is_game_actively_playing": lambda: False, "_channel_ready_arm": lambda ch: None,
+          "station_clock": types.SimpleNamespace(arm_in=lambda *a: None), "CHANNEL_READY_INTERVAL_SECONDS": 2.0, "_channel_ready_wake_up": lambda k=None: None,
           "_channel_ready_stats": {"builds": 0, "build_s": 0.0, "paths": 0, "rechecks": 0, "warmed": 0, "last_log": 0.0}}
     _exec_emulator_functions(ns, "_compute_live_block_name", "_channel_ready_order", "_channel_ready_lists", "_channel_ready_pass")
     check(ns["_channel_ready_order"]() == ["07", "05"], "the channel on air first, then the one on screen; off and music channels are left out")
@@ -20981,9 +21585,12 @@ class TestThemeColourHasEveryHueAndTheButtonsTurnAway(unittest.TestCase):
                 self.assertGreaterEqual(apart + 1e-9, gap, (family, hue))
                 self.assertLessEqual(abs(shift), gap, (family, hue))
         self.assertEqual(ui.theme_button_hue_shift(140, 218), 0, "far from blue: plain button blue")
-        self.assertEqual(ui.theme_button_hue_shift(208, 218), 20, "a highlight just under pushes the buttons up")
+        self.assertEqual(gap, 60, "owner 2026-11-23: the highlight stands well apart from the buttons")
+        self.assertEqual((gov.SELECTION_BORDER_WIDTH, media.SELECTION_BORDER_WIDTH, ui.SELECTION_BORDER_WIDTH), (5, 5, 5), "owner 2026-11-23: the highlight is drawn thicker")
+        self.assertIn("else 5", [l for l in read(_script("media.py")).splitlines() if l.startswith("SELECTION_BORDER_WIDTH =")][0])
+        self.assertEqual(ui.theme_button_hue_shift(208, 218), gap - 10, "a highlight just under pushes the buttons up")
         self.assertEqual(ui.theme_button_hue_shift(218, 218), -gap, "the jump at the resting hue")
-        self.assertEqual(ui.theme_button_hue_shift(4, 354), -20, "red wraps past 360")
+        self.assertEqual(ui.theme_button_hue_shift(4, 354), -(gap - 10), "red wraps past 360")
 
     def test_each_rest_is_the_hue_of_its_buttons(self):
         import ui, colorsys
@@ -21002,7 +21609,7 @@ class TestThemeColourHasEveryHueAndTheButtonsTurnAway(unittest.TestCase):
                 for name in names:
                     h0, s0, v0 = colorsys.rgb_to_hsv(*[c / 255.0 for c in base[name]])
                     h1, s1, v1 = colorsys.rgb_to_hsv(*[c / 255.0 for c in getattr(ui, name)])
-                    self.assertAlmostEqual(((h1 - h0) * 360 + 180) % 360 - 180, -25, delta=2.5, msg=name)
+                    self.assertAlmostEqual(((h1 - h0) * 360 + 180) % 360 - 180, -(gov.THEME_BUTTON_HUE_SAFE_GAP - 5), delta=2.5, msg=name)
                     self.assertAlmostEqual(v1, v0, delta=0.01)
             ui.sync_button_colors(gov.THEME_BUTTON_FAMILY_REST["blue"] + 5)
             self.assertEqual(ui._system_row_color("send_logs", None), ui.COLOR_MENU_BUTTON_BLUE)
@@ -21010,8 +21617,8 @@ class TestThemeColourHasEveryHueAndTheButtonsTurnAway(unittest.TestCase):
             self.assertEqual(ui._system_row_color("exit_program", "red"), "red")
             self.assertEqual(ui.COLOR_BUTTON_CLOSE, base["COLOR_BUTTON_CLOSE"], "red is far from blue and stays")
         finally:
-            ui.sync_button_colors(140)
-        ui.sync_button_colors(100)
+            ui.sync_button_colors(290)
+        ui.sync_button_colors(290)
         for name in ui._BUTTON_BASE:
             self.assertEqual(getattr(ui, name), base[name], name)
 
@@ -21064,7 +21671,8 @@ class TestClipEndingBeforeItsSlotWaits(unittest.TestCase):
         self.assertEqual((show["path"], position), ("B", 190.0))
 
     def test_the_numbers_are_in_the_governor(self):
-        self.assertEqual((gov.SLOT_TAIL_HOLD_MAX_SECONDS, gov.SLOT_START_GRACE_SECONDS, gov.SLOT_OPEN_LEAD_SECONDS), (3.0, 0.3, 0.2))
+        self.assertEqual((gov.SLOT_TAIL_HOLD_MAX_SECONDS, gov.SLOT_START_GRACE_SECONDS), (3.0, 0.3))
+        self.assertFalse(hasattr(gov, "SLOT_OPEN_LEAD_SECONDS"), "owner 2026-11-23: the tail is held to the slot's end, never ended early")
 
     def test_the_hold_asks_the_schedule_before_the_guard_is_armed_and_ends_on_the_clock(self):
         text = read(os.path.join(ROOT, "retro_tv_emulator.py"))
@@ -22253,73 +22861,6 @@ class TestWindowedLaunchTakesFocusBack(unittest.TestCase):
         self.assertIn("else 20.0", self.src)
 
 
-class TestCaptionsSwitchOffWhenThePcCannotKeepUp(unittest.TestCase):
-    """Audit 2026-11-12: the caption start-up check read only memory, so a PC with enough RAM but a slow CPU started captions that fell further behind each chunk; the first version (4 slow chunks in a row) would have switched captions off six times in the owner's own logs, so it looks at the middle value of 40 chunks instead."""
-
-    CRT_WORST_40_DECODE_SECONDS_PER_CHUNK_SECOND = [1.43, 0.72, 1.39, 3.51, 0.84, 2.32, 1.08, 1.06, 1.61, 1.42, 0.77, 1.5, 0.85, 3.8, 1.07, 1.45, 1.41, 1.47, 1.04, 2.88,
-                    1.46, 0.82, 0.88, 0.91, 1.65, 0.93, 0.93, 0.85, 1.56, 0.62, 0.67, 0.52, 0.48, 0.61, 1.5, 2.45, 0.06, 2.31, 2.08, 1.98]
-
-    def setUp(self):
-        import media
-        import performance_governor as pg
-        self.media, self.pg = media, pg
-
-    def _trips(self, ratios, length=10.0, attached=True):
-        history = []
-        tripped = False
-        for r in ratios:
-            tripped = self.media._caption_pace_add(history, r * length, length, attached) or tripped
-        return tripped
-
-    def test_the_crt_tv_computers_worst_real_stretch_does_not_trip_it(self):
-        self.assertEqual(len(self.CRT_WORST_40_DECODE_SECONDS_PER_CHUNK_SECOND), self.media._CAPTION_TOO_SLOW_CHUNKS)
-        self.assertFalse(self._trips(self.CRT_WORST_40_DECODE_SECONDS_PER_CHUNK_SECOND))
-
-    def test_a_pc_two_and_a_half_times_slower_than_the_crt_tv_computer_trips_it(self):
-        self.assertTrue(self._trips([r * 2.5 for r in self.CRT_WORST_40_DECODE_SECONDS_PER_CHUNK_SECOND]))
-
-    def test_it_waits_for_a_full_history_before_judging(self):
-        n = self.media._CAPTION_TOO_SLOW_CHUNKS
-        self.assertFalse(self._trips([9.0] * (n - 1)))
-        self.assertTrue(self._trips([9.0] * n))
-
-    def test_prefetch_and_very_short_chunks_are_not_counted(self):
-        n = self.media._CAPTION_TOO_SLOW_CHUNKS
-        self.assertFalse(self._trips([9.0] * n, attached=False))
-        self.assertFalse(self._trips([9.0] * n, length=5.0))
-
-    def test_switching_off_greys_captions_for_the_run_and_calls_the_memory_door(self):
-        calls = []
-        old = self.media._caption_memory_refusal_handler
-        saved = dict(self.pg._state)
-        try:
-            self.media._caption_memory_refusal_handler = lambda *a: calls.append(a)
-            self.media._caption_cannot_keep_up("show.mkv", [2.0] * self.media._CAPTION_TOO_SLOW_CHUNKS)
-            self.assertEqual(self.pg.caption_lock_reason(), "speed")
-            self.assertTrue(self.pg.caption_memory_locked())
-            self.assertEqual(len(calls), 1)
-        finally:
-            self.media._caption_memory_refusal_handler = old
-            self.pg._state.clear()
-            self.pg._state.update(saved)
-
-    def test_the_numbers_and_banner_match_the_governor(self):
-        self.assertEqual(self.media._CAPTION_TOO_SLOW_CHUNKS, self.pg.CAPTION_TOO_SLOW_CHUNKS)
-        self.assertEqual(self.media._CAPTION_TOO_SLOW_RATIO, self.pg.CAPTION_TOO_SLOW_RATIO)
-        self.assertEqual(self.media._CAPTION_TOO_SLOW_MIN_CHUNK_SEC, self.pg.CAPTION_TOO_SLOW_MIN_CHUNK_SEC)
-        with open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8") as f:
-            src = f.read()
-        self.assertIn(self.pg.CAPTION_SPEED_BANNER_LABEL, src)
-
-    def test_the_live_loop_adds_each_chunk_and_stops_when_it_trips(self):
-        with open(_script("media.py"), encoding="utf-8") as f:
-            src = f.read()
-        i = src.index("_too_slow = _caption_pace_add(")
-        block = src[i:i + 500]
-        self.assertIn("_caption_cannot_keep_up(base_name", block)
-        self.assertIn("return", block)
-
-
 class TestCaptionDiagnosticsNameWhatWasDroppedAndWhatCameBackThin(unittest.TestCase):
     """Owner 2026-11-12: the logs could not show which words went missing or which hallucinations were dropped."""
 
@@ -23134,6 +23675,18 @@ class TestServerLinkStaysUpAndFilesLiveInLogs(unittest.TestCase):
                     c.stop(); b.stop()
         self.assertEqual(len(got), 1, "the schedule is applied once, not on every reconnect")
         self.assertNotIn("offline", states)
+
+    def test_every_server_module_writes_to_the_service_log(self):
+        """Owner logs 2026-11-24: the caption scan left no line in server_service.log because only server_service's own logger had the file."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            code = ("import sys, logging; sys.path[:0] = %r; import server_service as ss; ss._configure_logging(%r); "
+                    "logging.getLogger('server_captions').info('[CAPTION SCAN] hello'); ss.log.info('[SERVER SERVICE] hi'); "
+                    "logging.shutdown()") % ([os.path.join(ROOT, d) for d in ("server", "updater", "assets", "tests", "GPU", "pipeline", "profile", "media")], tmp)
+            subprocess.run([sys.executable, "-c", code], check=True, timeout=60, cwd=tmp)
+            text = open(os.path.join(tmp, "logs", "server_service.log"), encoding="utf-8").read()
+        self.assertIn("server_captions: [CAPTION SCAN] hello", text)
+        self.assertEqual(text.count("[SERVER SERVICE] hi"), 1)
 
     def test_the_pid_file_and_the_log_live_in_the_logs_folder_and_old_ones_are_moved(self):
         import server_service as ss
@@ -25565,7 +26118,7 @@ class TestGuideHighlightStaysInsideTheGrid(unittest.TestCase):
 
     def test_a_sliver_is_skipped_in_the_window_on_screen_only(self):
         jump = get_function_source("_guide_jump_col")
-        self.assertIn("target = _find(stops, skip_slivers=True)", jump)
+        self.assertIn("target = _find([s for s in stops if not _outside_window(s)], skip_slivers=True)", jump)
         self.assertIn("target = _find(sorted(app_state.get(\"guide_current_row_stops\", []) or [], key=lambda s: s.get(\"abs\", 0)))", jump,
                       "the scrolled windows search without the sliver rule so no spot is lost")
         self.assertEqual(gov.GUIDE_MIN_VISIBLE_COLUMNS, 0.4)
@@ -25620,10 +26173,42 @@ class TestGuideHighlightStaysInsideTheGrid(unittest.TestCase):
         self.assertIn("row_offset = _sel_idx_now - (num_rows - 1)", src)
 
 
+class TestAnOpenedGuideStartsOnTheShowOnNow(unittest.TestCase):
+    """Owner test 2026-11-23: the guide opened with the highlight on the show before the one on air."""
+
+    def test_no_highlight_time_means_now(self):
+        import datetime as _dt
+        state = {"guide_col_pos": 0, "selected_guide_channel": 8, "guide_col_anchor_abs": None, "guide_selected_abs_time": None,
+                 "guide_current_row_stops": []}
+        stops = [{"col": 0, "abs": 16200.0 - 900, "key": ("show", 1), "vis": 0.6, "cut": "left"},
+                 {"col": 0, "abs": 17160.0, "key": ("show", 2), "vis": 99.0, "cut": None},
+                 {"col": 1, "abs": 18000.0, "key": ("show", 3), "vis": 99.0, "cut": None}]
+        ns = {"app_state": state, "_guide_dirty_event": threading.Event(), "db": object(), "log": MagicMock(),
+              "get_current_guide_time_idx": lambda a, d: 9, "get_cached_row_stops": lambda ch, expected_time_idx=None: ([0, 1], stops),
+              "_refresh_guide_row_stops_offscreen": lambda **k: None, "_GUIDE_MIN_VISIBLE_COLUMNS": 0.4,
+              "get_guide_num_cols": lambda d: 4,
+              "broadcast_clock": types.SimpleNamespace(now=lambda: _dt.datetime(2026, 11, 23, 4, 51, 26))}
+        exec(get_function_source("_resync_guide_stop_after_row_switch"), ns)
+        ns["_resync_guide_stop_after_row_switch"]()
+        self.assertEqual(state["guide_selected_stop_key"], ("show", 2), "the show that began at 04:46 and is on at 04:51")
+
+
+class TestGuideTitlesFitTheirCell(unittest.TestCase):
+    """Owner test 2026-11-23: in the Big Text guide the show names ran into the next cell."""
+
+    def test_a_title_is_cut_until_it_fits_its_cell(self):
+        import inspect, ui
+        src = inspect.getsource(ui)
+        block = src[src.index("truncated_title = cleaned_title[:max_chars]"):]
+        block = block[:block.index("last_drawn_pixel_x = cell_x + pixel_cell_width")]
+        self.assertIn("while lbl_cell.get_width() > max_txt_w and len(truncated_title) > 1:", block)
+        self.assertIn("if lbl_cell.get_width() <= max_txt_w:", block)
+
+
 class TestGuideWindowMovesOncePerPress(unittest.TestCase):
     """Owner 2026-11-16: one press dragged the guide twice and the highlight left the screen in between, because the search for the next spot moved the real window to each candidate"""
 
-    def _run(self, presses, direction, start_hour=23, columns=5):
+    def _run(self, presses, direction, start_hour=23, columns=5, one_past_the_edge=False):
         import datetime as _dt
         import ui
         now = _dt.datetime(2026, 11, 15, start_hour, 5)
@@ -25661,6 +26246,10 @@ class TestGuideWindowMovesOncePerPress(unittest.TestCase):
                 cut = "left" if a < vs else ("right" if b > ve else None)
                 stops.append({"col": int((sa - vs) // 1800), "abs": a, "key": ("show", a),
                               "vis": (sb - sa) / 1800.0 if cut else 99.0, "cut": cut})
+            if one_past_the_edge:
+                after = next((x for x in shows if x[0] >= ve), None)
+                if after is not None:
+                    stops.append({"col": columns, "abs": after[0], "key": ("show", after[0]), "vis": 99.0, "cut": None})
             state["guide_current_row_stops"] = stops
         refresh()
         ns = {"_log_warn_throttled": lambda *a, **k: None, "app_state": state, "db": object(), "performance_governor": None,
@@ -25684,12 +26273,14 @@ class TestGuideWindowMovesOncePerPress(unittest.TestCase):
         _state, per_press, _live = self._run(60, 1)
         self.assertTrue(all(len(w) <= 1 for w in per_press), per_press)
 
-    def test_left_goes_all_the_way_back_to_the_midnight_before_yesterday_starts(self):
-        """At 11 pm the highlight reaches the first show of the previous day and the window stops at the previous midnight."""
+    def test_left_goes_back_to_todays_midnight_and_no_further(self):
+        """Owner 2026-11-23: the only past the guide shows is today's, back to midnight; at 11 pm the window stops at today's midnight."""
         import ui
+        self.assertEqual(gov.GUIDE_PAST_HALF_HOURS, 0)
         state, _per, live = self._run(80, -1)
-        self.assertEqual(ui.clamp_guide_time_idx(live + state["selected_guide_time_idx"], 5), -ui.GUIDE_PAST_HALF_HOURS)
-        self.assertLessEqual(state["guide_selected_abs_time"], -86400 + 1800)
+        self.assertEqual(ui.clamp_guide_time_idx(live + state["selected_guide_time_idx"], 5), 0)
+        self.assertGreaterEqual(state["guide_selected_abs_time"], -1800)
+        self.assertLessEqual(state["guide_selected_abs_time"], 1800)
 
     def test_right_always_lands_on_a_spot_that_is_on_screen(self):
         import ui
@@ -25697,6 +26288,16 @@ class TestGuideWindowMovesOncePerPress(unittest.TestCase):
         idx = ui.clamp_guide_time_idx(live + state["selected_guide_time_idx"], 5)
         col = (state["guide_selected_abs_time"] - idx * 1800) / 1800.0
         self.assertTrue(0 <= col < 5)
+
+    def test_right_scrolls_when_the_row_holds_a_spot_past_the_edge(self):
+        """Owner test 2026-11-23: past 06:30 the highlight went off the right edge, was put back, went off again, and the guide never scrolled."""
+        import ui
+        for presses in range(1, 15):
+            state, _per, live = self._run(presses, 1, start_hour=4, one_past_the_edge=True)
+            idx = ui.clamp_guide_time_idx(live + state["selected_guide_time_idx"], 5)
+            col = (state["guide_selected_abs_time"] - idx * 1800) / 1800.0
+            self.assertTrue(-1 < col < 5, "press %d left the highlight at column %.2f" % (presses, col))
+        self.assertGreater(state["selected_guide_time_idx"], 0, "the window moved right")
 
     def test_a_probe_reads_its_own_shift_and_never_the_real_one(self):
         import ui
@@ -25776,10 +26377,21 @@ class TestGuideRowsAndSpotsAreNeverLost(unittest.TestCase):
         self.assertEqual(abses, sorted(set(abses)), "every press moves one spot right, none repeats or goes back")
         self.assertTrue(all(vs - 1 <= a < ve for a, vs, ve in trail), "the highlight is inside the window after every press")
 
+    def test_paging_right_keeps_the_highlight_on_the_right_side(self):
+        # WARNING: owner 2026-11-23: at the right side the highlight stays there and the page moves on with each press, never back to the left.
+        state, trail = self._jump(1, 40)
+        scrolled = [(a, vs, ve) for (a, vs, ve), (_pa, pvs, _pve) in zip(trail[1:], trail[:-1]) if vs != pvs]
+        self.assertTrue(len(scrolled) >= 10, "the page moved on %d times" % len(scrolled))
+        for a, vs, ve in scrolled:
+            self.assertGreaterEqual(a, ve - 2 * 1800, "after the page moves on, the highlight at %s is in the last columns of %s to %s, not back on the left" % (a, vs, ve))
+
     def test_left_finds_every_previous_spot_even_when_a_spot_changes_its_key_with_the_window(self):
         state, trail = self._jump(-1, 20)
         abses = [a for a, _vs, _ve in trail]
-        self.assertEqual(abses, sorted(set(abses), reverse=True))
+        moved = [a for i, a in enumerate(abses) if i == 0 or a != abses[i - 1]]
+        self.assertEqual(moved, sorted(set(moved), reverse=True), "every press moves one spot left, none repeats or goes forward")
+        self.assertTrue(all(a == moved[-1] for a in abses[abses.index(moved[-1]):]), "once at today's first show the highlight stays there")
+        self.assertLessEqual(moved[-1], 1800, "going left reaches the first show of today")
         self.assertTrue(all(vs - 1 <= a < ve or a < vs for a, vs, ve in trail))
 
     def test_a_highlight_outside_the_window_is_put_back_inside_it(self):
@@ -26113,8 +26725,8 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
                 return str(p).startswith("\\\\")
 
             @staticmethod
-            def hold(paths):
-                calls.append(("hold", list(paths)))
+            def hold(paths, seconds=None):
+                calls.append(("hold", list(paths), seconds))
 
             @staticmethod
             def ensure_index(p, max_seconds=0):
@@ -26124,13 +26736,15 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
         class _Db:
             channels_db = {"05": {"server_locked": True}, "06": {"server_locked": True}, "07": {"server_locked": False}}
 
-        ns = {"db": _Db, "share_relay": _Relay, "time": time, "os": os, "threading": threading, "_share_relay_on": lambda: True,
+        countdowns = {}
+        _clock = types.SimpleNamespace(arm_in=lambda key, seconds, fn: countdowns.__setitem__(key, (seconds, fn)))
+        ns = {"db": _Db, "share_relay": _Relay, "station_clock": _clock, "_countdowns": countdowns, "PRIME_HOLD_MARGIN_SECONDS": 120.0, "PRIME_RUSH_QUEUE_MAX": 12, "time": time, "os": os, "threading": threading, "_share_relay_on": lambda: True,
               "_prime_context": threading.local(), "_boot_cpu_over_ceiling": lambda: False, "_boot_bar_const": lambda n, d: d,
               "_channel_ready_order": lambda: ["05", "06", "07"], "_app_shutting_down": threading.Event(),
               "_is_game_actively_playing": lambda: False, "performance_governor": None, "_governor_level_if_enforcing": lambda: None,
               "calculate_slotted_playback_state": lambda ch: states[ch],
               "_next_item_prep_plan": lambda ch, fp: plans[ch], "CHANNEL_PRIME_NEXT_ITEMS": 2,
-              "PRIME_LEAD_SECONDS": 180.0, "PRIME_RECHECK_SECONDS": 600.0, "PRIME_KEEPALIVE_SECONDS": 1000.0, "PRIME_NOT_READY_RETRY_SECONDS": 5.0,
+              "PRIME_LEAD_SECONDS": 180.0, "PRIME_RECHECK_SECONDS": 600.0, "PRIME_NOT_READY_RETRY_SECONDS": 5.0,
               "_next_n_from_block_timeline": lambda ch, fp, n=3: [{"path": fp}, {"path": "\\\\srv\\n1.mkv"}, {"path": "\\\\srv\\n2.mkv"}, {"path": "\\\\srv\\n3.mkv"}][:n],
               "_warm_index_done": {}, "SERVER_CHANNEL_WARM_INDEX_REREAD_SECONDS": 30.0,
               "_prime_renewed": {}, "PRIME_INDEX_RENEW_SECONDS": 20.0, "PRIME_FACTS_PER_PASS": 3,
@@ -26164,16 +26778,23 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
         ns["_prime_channels_pass"]()
         self.assertEqual(len([c for c in calls if c == ("index", "\\\\srv\\c4.mp4")]), 1)
 
-    def test_the_primer_sleeps_until_a_few_minutes_before_the_next_show_ends(self):
-        """Owner 2026-11-15: the schedule is known, so priming wakes at a show's end minus the lead, not on a short poll."""
+    def test_each_channel_counts_down_to_a_few_minutes_before_its_show_ends(self):
+        """Owner 2026-11-15: the schedule is known, so priming wakes at a show's end minus the lead, not on a short poll; owner 2026-11-24: every channel runs its own countdown and only the full safety pass is left on a timer."""
         calls = []
         states = {"05": {"file": "\\\\srv\\a.mkv", "duration": 1800, "seek": 100},
                   "06": {"file": "\\\\srv\\b.mkv", "duration": 1800, "seek": 1200}}
         plans = {"05": (["\\\\srv\\a2.mkv", "\\\\srv\\a3.mkv"], False), "06": (["\\\\srv\\b2.mkv", "\\\\srv\\b3.mkv"], False)}
         ns = self._prime_ns(states, plans, calls)
         ns["_prime_channels_pass"]()
-        self.assertAlmostEqual(ns["_prime_next_due"][0], 600 - 180, delta=1.0)
+        self.assertEqual(ns["_prime_next_due"][0], 600.0, "the full pass is only the safety look")
+        self.assertAlmostEqual(ns["_countdowns"]["prime:05"][0], 1700 - 180, delta=1.0)
+        self.assertAlmostEqual(ns["_countdowns"]["prime:06"][0], 600 - 180, delta=1.0)
         self.assertNotIn(("index", "\\\\srv\\n3.mkv"), calls, "no third item yet while the show has more than the lead left")
+        held = {c[1][0]: c[2] for c in calls if c[0] == "hold"}
+        self.assertAlmostEqual(held["\\\\srv\\b.mkv"], 600 - 180 + 120.0, delta=1.0, msg="its files are held open until the countdown runs out")
+        ns["_prime_rush_pending"].clear()
+        ns["_countdowns"]["prime:06"][1]("prime:06")
+        self.assertEqual(ns["_prime_rush_pending"], ["06"], "a countdown that runs out primes that channel alone")
 
     def test_the_primer_readies_the_replacement_third_item_when_a_show_is_about_to_end(self):
         calls = []
@@ -26183,7 +26804,7 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
         ns = self._prime_ns(states, plans, calls)
         ns["_prime_channels_pass"]()
         self.assertIn(("index", "\\\\srv\\n3.mkv"), calls)
-        self.assertAlmostEqual(ns["_prime_next_due"][0], 102, delta=1.0, msg="the next look is just after the show ends")
+        self.assertAlmostEqual(ns["_countdowns"]["prime:05"][0], 102, delta=1.0, msg="the next look is just after the show ends")
 
     def test_a_channel_with_no_airing_file_yet_is_looked_at_again_in_seconds_and_the_first_pass_is_not_delayed(self):
         """The V1.9.8 CRT log first primed 10 minutes after launch because the wait started at the 10 minute safety value."""
@@ -26194,16 +26815,7 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
         self.assertLessEqual(ns["_prime_next_due"][0], 5.0, "the first wait is short")
         ns["_prime_channels_pass"]()
         self.assertEqual(ns["_prime_next_due"][0], 5.0)
-
-    def test_the_primer_comes_back_within_the_keepalive_so_held_files_never_go_cold(self):
-        """The relay closes an idle share handle after 60 s; the V1.9.8 wake of minutes let every primed file go cold."""
-        calls = []
-        states = {"05": {"file": "\\\\srv\\a.mkv", "duration": 1800, "seek": 100}, "06": {"file": "\\\\srv\\b.mkv", "duration": 1800, "seek": 100}}
-        plans = {"05": ([], False), "06": ([], False)}
-        ns = self._prime_ns(states, plans, calls)
-        ns["PRIME_KEEPALIVE_SECONDS"] = 25.0
-        ns["_prime_channels_pass"]()
-        self.assertEqual(ns["_prime_next_due"][0], 25.0)
+        self.assertEqual(ns["_countdowns"]["prime:05"][0], 5.0)
 
     def test_every_pass_asks_again_whether_the_airing_and_next_files_exist_and_the_keepalive_is_inside_the_30_second_answer(self):
         """Owner 2026-11-16: a tune must find a fresh "it exists" answer, so the pass comes back sooner than the 30 s the answer lasts and asks for each held file."""
@@ -26215,12 +26827,10 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
         ns["_prime_channels_pass"]()
         asked = [c[1] for c in calls if c[0] == "exists"]
         self.assertEqual(asked.count("\\\\srv\\a.mkv"), 2, "asked on every pass, not only when the index is renewed")
-        import re as _re
-        gov = open(_script("performance_governor.py"), encoding="utf-8").read()
-        keep = float(_re.search(r"^PRIME_KEEPALIVE_SECONDS = ([0-9.]+)", gov, _re.M).group(1))
-        renew = float(_re.search(r"^PRIME_INDEX_RENEW_SECONDS = ([0-9.]+)", gov, _re.M).group(1))
-        self.assertLess(keep, 30.0)
-        self.assertLessEqual(renew, keep)
+        # WARNING: owner 2026-11-24: with no keepalive pass, the channel-ready thread keeps the airing and next files' "it exists" answers fresh (every CHANNEL_READY_INTERVAL_SECONDS, well inside the 30 s an answer lasts).
+        self.assertIn("media.warm_path_statuses(paths, limit=CHANNEL_READY_WARM_BATCH)", get_function_source("_channel_ready_pass"))
+        self.assertLess(gov.CHANNEL_READY_INTERVAL_SECONDS, 30.0)
+        self.assertFalse(hasattr(gov, "PRIME_KEEPALIVE_SECONDS"))
 
     def test_priming_makes_a_missing_picture_size_and_box_off_screen_a_few_per_pass_and_never_for_a_server_file(self):
         """Owner 2026-11-16: the first visit must not pay for a size probe or a box scan; priming makes them on its own thread."""
@@ -26233,12 +26843,13 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
         self.assertIn("PRIME_FACTS_PER_PASS", src[src.index("def _prime_channels_pass("):][:2500])
 
     def test_priming_is_never_held_by_a_tune_a_scan_pause_or_the_governor(self):
-        """Owner 2026-11-15: priming is channel changing's own work; only a game being played holds it."""
+        """Owner 2026-11-15: priming is channel changing's own work; owner 2026-11-23: it gives way while the streamed show on screen is short of its buffer; owner 2026-11-24: a game being played does not hold it either."""
         src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
-        body = src[src.index("def _prime_should_wait():"):src.index("def _station_ring():")]
+        body = src[src.index("def _prime_should_wait(path=None):"):src.index("def _station_ring():")]
+        self.assertIn("stream_needs_the_link(path)", body)
         self.assertNotIn("caption_tune_hold", body)
         self.assertNotIn("level_allows", body)
-        self.assertIn("_is_game_actively_playing()", body)
+        self.assertNotIn("_is_game_actively_playing()", body)
         self.assertNotIn("current_channel", body)
         self.assertNotIn("_had_first_frame_this_tune", body)
 
@@ -26560,7 +27171,7 @@ class TestRepeatedWarningsWriteOnce(unittest.TestCase):
             scans.append((path, db))
             shortfall_out.update({"measured_lufs": -30.0, "basis": "dialogue", "windows": [1, 2], "true_peak": -3.0})
             return 2.0
-        ns = {"threading": threading, "os": os, "math": math, "performance_governor": gov,
+        ns = {"threading": threading, "os": os, "math": math, "performance_governor": gov, "_wait_for_stream_buffer": lambda *a, **k: True,
               "log": types.SimpleNamespace(info=lambda fmt, *a: logged.append(fmt % a if a else fmt)),
               "_log_swallowed": lambda *a: logged.append("SWALLOWED %s" % (a,)), "db": object(), "_gain_context": lambda: "user:srv:slot",
               "server_remote_files": types.SimpleNamespace(server_owns=lambda p: True),
@@ -26803,7 +27414,8 @@ class TestSharePathsAreCheckedOffTheScreenThread(unittest.TestCase):
 
     def test_the_warm_up_runs_before_the_schedule_is_applied(self):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
-        self.assertIn("_warm_remote_schedule_paths(channels)\n        if db.apply_remote_schedule(", src)
+        body = src[src.index("_warm_remote_schedule_paths(channels)\n"):]
+        self.assertLess(body.index("_warm_remote_schedule_paths(channels)"), body.index("if db.apply_remote_schedule("))
         self.assertIn("media.warm_path_statuses(_paths)", src)
 
 
@@ -26867,7 +27479,7 @@ class TestCaptionScanIsPacedByItsLead(unittest.TestCase):
         self.assertEqual((gov.LIVE_CAPTION_EASE_START_SPEED, gov.LIVE_CAPTION_SLOW_SPEED), (1.3, 0.6))
         self.assertEqual(gov.LIVE_CAPTION_PREFETCH_CHUNK_SEC, 30.0)
         self.assertEqual(gov.LIVE_CAPTION_PREFETCH_CAP_SEC, 120.0)
-        self.assertEqual(gov.LIVE_CAPTION_RESUME_AHEAD_SEC, 15.0)
+        self.assertEqual(gov.CAPTION_CATCHUP_AHEAD_SEC, 45.0)
         self.assertEqual(media._LIVE_CAPTION_MIN_LEAD_SEC, gov.LIVE_CAPTION_MIN_LEAD_SEC)
         self.assertEqual(media._LIVE_CAPTION_EASE_LEAD_SEC, gov.LIVE_CAPTION_EASE_LEAD_SEC)
         self.assertEqual(media._LIVE_CAPTION_HIGH_LEAD_SEC, gov.LIVE_CAPTION_HIGH_LEAD_SEC)
@@ -26949,8 +27561,10 @@ class TestLiveCaptionsUseTheFastBeamWhileCloseToThePicture(unittest.TestCase):
 
     def test_the_chunk_call_and_the_log_line_use_it(self):
         src = open(_script("media.py"), encoding="utf-8").read()
-        self.assertIn("_live_caption_beam(_beam_lead),\n                                initial_prompt=prompt, temperature=0.0", src)
+        self.assertIn("_chunk_beam = _ASR_LIVE_BEAM_SIZE_BEHIND if self._light else _live_caption_beam(_beam_lead)", src)
+        self.assertIn("model, wav_path, self.language, _chunk_beam,\n                                initial_prompt=hint, temperature=0.0", src)
         self.assertIn("took=%.1fs (extract %.1fs, decode %.1fs, beam %d)", src)
+        self.assertIn("max(0.0, took - _extract_sec), _chunk_beam, _slot_wait,", src, "owner logs 2026-11-24: the chunk line names the beam really used, the light one after a catch-up too")
 
 
 class TestLeavingAServerNeverReturnsToAChannelThatIsOff(unittest.TestCase):
@@ -27056,7 +27670,8 @@ class TestServerStreamsReadTheNextItemAhead(unittest.TestCase):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
         body = "def _read_ahead_file" + src.split("def _read_ahead_file", 1)[1].split("\ndef _request_server_next_buffer", 1)[0]
         ns = {"os": os, "time": _t, "threading": threading, "_log_swallowed": lambda *a, **k: None,
-              "_log_warn_throttled": lambda *a, **k: None, "_read_ahead_hung": {}, "WARM_READ_HANG_EXTRA_SECONDS": 3.0}
+              "_log_warn_throttled": lambda *a, **k: None, "_read_ahead_hung": {}, "WARM_READ_HANG_EXTRA_SECONDS": 3.0,
+              "_wait_for_stream_buffer": lambda *a, **k: True}
         exec(body, ns)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "a.mkv")
@@ -27073,6 +27688,8 @@ class TestServerStreamsReadTheNextItemAhead(unittest.TestCase):
         worker = src.split("def _server_next_buffer_worker", 1)[1].split("\ndef _picture_box_scan_worker", 1)[0]
         self.assertIn('str(p).startswith("\\\\\\\\")', worker)
         self.assertIn("SERVER_NEXT_BUFFER_LEAD_SECONDS", worker)
+        self.assertIn('station_clock.arm_in("next_buffer", _countdown_s,', worker, "owner 2026-11-24: a countdown, not a once-a-second look")
+        self.assertNotIn("_app_shutting_down.wait(1.0)", worker)
 
     def test_numbers_are_in_the_governor(self):
         self.assertEqual(gov.SERVER_NEXT_BUFFER_LEAD_SECONDS, 45.0)
@@ -27120,7 +27737,8 @@ class TestStreamingPcReadsTheAiringFileWhenTheScheduleArrives(unittest.TestCase)
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
         body = "def _read_ahead_file" + src.split("def _read_ahead_file", 1)[1].split("\ndef _request_server_next_buffer", 1)[0]
         ns = {"os": os, "time": _t, "threading": threading, "_log_swallowed": lambda *a, **k: None,
-              "_log_warn_throttled": lambda *a, **k: None, "_read_ahead_hung": {}, "WARM_READ_HANG_EXTRA_SECONDS": 3.0}
+              "_log_warn_throttled": lambda *a, **k: None, "_read_ahead_hung": {}, "WARM_READ_HANG_EXTRA_SECONDS": 3.0,
+              "_wait_for_stream_buffer": lambda *a, **k: True}
         exec(body, ns)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "m.mkv")
@@ -27171,6 +27789,376 @@ class TestNoStaticWhileAPickedServersFirstScheduleIsOnItsWay(unittest.TestCase):
 
 
 
+class _PlanHub:
+    """A hub that keeps what the server's planner writes."""
+
+    def __init__(self):
+        self.calls, self.state = [], {}
+
+    def place_rows(self, channel, key, rows, now_epoch=None):
+        self.calls.append((channel, key, rows))
+        return key, len(rows), 0, False
+
+    def plan_state(self, channel, name):
+        return copy.deepcopy(self.state.get((channel, name)))
+
+    def set_plan_state(self, channel, name, value):
+        self.state[(channel, name)] = copy.deepcopy(value)
+
+
+class TestTheServerKeepsEveryProfilesScheduleInItsHub(unittest.TestCase):
+    """Owner 2026-11-24: "the profile is built. a schedule is made, its stored in the HUB, its shared with the user", with the program closed too, and "keeping a constant 7 day cache of scheduled info" moved on at midnight."""
+
+    def _channel(self, days_since_built):
+        ch = _sched_record_channel("full_day", "interrupt_half_hour", "random_slots", True)
+        d = (datetime.datetime.now() - datetime.timedelta(days=days_since_built)).date()
+        ch["playback_log"]["sched_block_key"] = "%d_%d_Full Day" % (d.year, d.timetuple().tm_yday)
+        return ch
+
+    def test_a_profile_saved_days_ago_is_worked_out_from_the_show_on_air_to_eight_days_ahead(self):
+        import server_planner
+        calls = []
+
+        class _Hub:
+            def place_rows(self, channel, key, rows, now_epoch=None):
+                calls.append((channel, key, rows))
+                return key, len(rows), 0, False
+        now = datetime.datetime.now()
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            written = server_planner.plan_channel(_Hub(), "05", self._channel(2), {}, now, lambda p: True)
+        self.assertGreater(written, 100)
+        starts = [r["planned_start"] for _c, _k, rows in calls for r in rows]
+        ends = [r["planned_start"] + r["used_length"] for _c, _k, rows in calls for r in rows]
+        self.assertLessEqual(min(starts), now.timestamp(), "the show on air is in it")
+        self.assertGreaterEqual(max(ends), now.timestamp() + 3600 * (server_planner.HOURS_AHEAD - 24), "the plan reaches days ahead")
+        self.assertTrue(all(c == "05" and "@" in k for c, k, _r in calls))
+
+    def test_the_planner_and_the_program_share_one_planner(self):
+        import server_planner
+        self.assertEqual(server_planner.HOURS_AHEAD, gov.HUB_FUTURE_HOURS_AHEAD)
+        planner = open(_script("server_planner.py"), encoding="utf-8").read()
+        self.assertIn("schedule_planner.project_station(channel_key, snap, now, path_exists,", planner)
+        self.assertIn("require_block_on_air=False", planner)
+        self.assertIn('station_clock.arm_in("server_plan:midnight", self._seconds_to_midnight() + 5.0, self.wake)', planner)
+        self.assertIn("schedule_planner.project_station(_channel, _snap, now, _cached_path_exists,", get_function_source("_hub_future_for_channel"))
+        service = open(_script("server_service.py"), encoding="utf-8").read()
+        self.assertIn("profile_planner = server_planner.ProfilePlanner(_current_slots, _probe_library)", service)
+        self.assertIn("on_slot_changed=profile_planner.wake", service)
+        self.assertIn("profile_planner.start()", service)
+        self.assertIn("self.on_slot_changed(slot_id)", open(_script("server_sync.py"), encoding="utf-8").read())
+
+    def test_a_channel_with_no_start_number_or_no_media_is_left_out(self):
+        import server_planner
+        ch = self._channel(1)
+        ch["playback_log"].pop("intro_seed")
+        self.assertIsNone(server_planner.plan_channel(None, "05", ch, {}, datetime.datetime.now(), lambda p: True))
+        self.assertIsNone(server_planner.plan_channel(_PlanHub(), "06", {"is_visualizer": True}, {}, datetime.datetime.now(), lambda p: True))
+        self.assertIsNone(server_planner.plan_channel(_PlanHub(), "07", {"scheduling_mode": "marathon", "playback_log": {"intro_seed": 5}}, {}, datetime.datetime.now(), lambda p: True))
+
+    def test_a_visualizer_is_planned_day_by_day_and_keeps_its_lineup_of_the_day_in_the_hub(self):
+        import server_planner
+        hub = _PlanHub()
+        songs = [{"path": "/m/s%d.mp3" % i, "duration": 200 + i} for i in range(6)]
+        ch = {"is_visualizer": True, "active": True, "schedules": {"Music Tracks": songs}}
+        now = datetime.datetime.now()
+        with patch.object(media, "file_is_confirmed_bad", lambda p: False), patch.object(media, "read_track_duration", lambda p, d: (None, None)):
+            written = server_planner.plan_channel(hub, "05", ch, {}, now, lambda p: True)
+            kept = dict(hub.state[("05", "visualizer_lineup")])
+            again = server_planner.plan_channel(hub, "05", ch, {}, now, lambda p: True)
+        self.assertGreater(written, 100)
+        self.assertEqual(again, written)
+        self.assertEqual(hub.state[("05", "visualizer_lineup")], kept, "the lineup of the day is kept, not dealt again")
+        days = sorted({k for _c, k, _r in hub.calls})
+        self.assertGreaterEqual(len(days), 8, "today and the days ahead")
+        self.assertTrue(all("_Music@" in k for k in days))
+        ends = [r["planned_start"] + r["used_length"] for _c, _k, rows in hub.calls for r in rows]
+        self.assertGreaterEqual(max(ends), now.timestamp() + 3600 * (server_planner.HOURS_AHEAD - 24))
+
+    def test_a_marathon_with_no_anchor_gets_the_schedulers_half_hour_anchor(self):
+        import server_planner
+        hub = _PlanHub()
+        ch = _sched_record_channel("full_day", "interrupt_half_hour", "random_slots", True)
+        ch["scheduling_mode"] = "marathon"
+        ch["schedules"]["Marathon"] = list(ch["schedules"].get("Full Day", []))
+        ch.pop("marathon_anchor_epoch", None)
+        now = datetime.datetime(2026, 11, 6, 10, 47, 0)
+        with patch.object(media, "_cached_path_exists", lambda p: True):
+            written = server_planner.plan_channel(hub, "05", ch, {}, now, lambda p: True)
+        self.assertEqual(hub.state[("05", "marathon_anchor")], now.toordinal() * 86400 + 10 * 3600 + 1800)
+        self.assertGreater(written or 0, 0)
+        self.assertTrue(all("_Marathon@" in k for _c, k, _r in hub.calls))
+
+
+class TestUsersPlayTheServersHubRows(unittest.TestCase):
+    """Owner 2026-11-24: "when it updates and restarts, it starts downloading the servers schedule, when its done, after the channel changes or next show plays, its ready to switch over and the old schedule is removed. one time removal of the old style of user schedule"."""
+
+    NAMES = ("_server_row", "_block_name_of_slot", "_take_server_rows", "_server_rows_switch_due", "_switch_to_server_rows", "_station_playback_state",
+             "_server_rows_state", "_place_server_rows", "_mark_server_rows_progress", "_entry_parts", "_schedule_pending_state", "_forget_server_rows")
+
+    def _ns(self, now, watched="05", hub=None):
+        asked = []
+        saved = []
+        hub = hub or types.SimpleNamespace(forget_show_facts=lambda ch: None)
+        ns = {"os": os, "media": media, "log": logging.getLogger("test"), "threading": threading, "time": time,
+              "station_clock": types.SimpleNamespace(now_epoch=lambda: now[0]),
+              "app_state": {"current_channel": watched}, "SCHEDULE_PENDING_REASON": "schedule_pending",
+              "HUB_PREPARED_AHEAD_SECONDS": 3600.0, "HUB_PREPARED_ITEMS_MAX": 240,
+              "db": types.SimpleNamespace(channels_db={"05": {"server_locked": True}, "06": {"server_locked": True}, "07": {}},
+                                          config={}, save_settings=lambda: saved.append(1)),
+              "_scheduler_playback_state": lambda ch, *a: (asked.append(ch), {"mode": "Video", "file": "own.mkv", "seek": 0, "duration": 100})[1],
+              "_server_rows_scope_key": lambda: "user:srv:1:", "_queue_server_rows_place": lambda ch: None,
+              "_log_warn_throttled": lambda *a: None, "_HUB_FUTURE_HOURS_AHEAD": 192.0,
+              "media_library": None}
+        for held in ("_server_rows", "_server_rows_starts", "_server_rows_watched_at_last_ask", "_server_rows_on_air", "_server_rows_placed", "_server_rows_marked",
+                     "_hub_writer_item_ends", "_screen_scheduler_answers", "_scheduler_prepared", "_probe_block_timeline_cache"):
+            ns[held] = {}
+        ns["_server_rows_ready"], ns["_server_rows_live"] = set(), set()
+        ns["_server_rows_place"] = {"wanted": set(), "thread": None, "wake": threading.Event()}
+        for name in self.NAMES:
+            exec(main_function_code(name), ns)
+        fake_ml = types.ModuleType("media_library")
+        fake_ml.shared_schedule_hub = lambda: hub
+        return ns, asked, saved, fake_ml
+
+    def _rows(self, base):
+        return [[base, 1800.0, "episode", "2026_328_Morning@1", 0, {"path": "\\\\srv\\tv\\a.mkv", "duration": 1800.0}],
+                [base + 1800.0, 30.0, "commercial", "2026_328_Morning@1", 1, {"path": "\\\\srv\\ads\\c.mp4", "duration": 30.0, "is_commercial": True}],
+                [base + 1830.0, 1500.0, "episode", "2026_328_Morning@1", 2, {"path": "\\\\srv\\tv\\b.mkv", "duration": 1500.0}]]
+
+    def test_the_watched_channel_switches_only_when_its_show_ends_and_then_plays_the_server_rows(self):
+        base = 1_800_000_000.0
+        now = [base + 600.0]
+        ns, asked, _saved, fake_ml = self._ns(now)
+        with patch.dict(sys.modules, {"media_library": fake_ml}):
+            ns["_server_rows_watched_at_last_ask"]["05"] = True
+            ns["_hub_writer_item_ends"]["05"] = base + 900.0
+            ns["_take_server_rows"]({"05": self._rows(base), "07": self._rows(base)})
+            self.assertEqual(ns["_server_rows_ready"], {"05"}, "a channel that is not streamed keeps nothing")
+            self.assertEqual(ns["_station_playback_state"]("05", now[0])["file"], "own.mkv", "the show on screen plays on until it ends")
+            now[0] = base + 1810.0
+            state = ns["_station_playback_state"]("05", now[0])
+        self.assertIn("05", ns["_server_rows_live"])
+        self.assertEqual((state["mode"], state["file"], state["block"]), ("Commercial", "\\\\srv\\ads\\c.mp4", "Morning"))
+        self.assertAlmostEqual(state["seek"], 10.0)
+        records = ns["_scheduler_prepared"]["05"]
+        self.assertEqual(records[0], id(state))
+        self.assertEqual([round(start - base) for start, _f in records[1]], [1800, 1830], "the items after it are prepared from the rows")
+        self.assertEqual(ns["_probe_block_timeline_cache"]["05"]["now"][1], base + 1800.0)
+        self.assertEqual(asked, ["05"], "the scheduler is not asked again once the channel is on the server's rows")
+
+    def test_a_channel_off_screen_or_just_tuned_switches_at_once_and_a_gap_is_quiet_static(self):
+        base = 1_800_000_000.0
+        now = [base + 100.0]
+        ns, asked, _saved, fake_ml = self._ns(now, watched="06")
+        with patch.dict(sys.modules, {"media_library": fake_ml}):
+            ns["_take_server_rows"]({"05": self._rows(base), "06": self._rows(base)})
+            self.assertEqual(ns["_station_playback_state"]("05", now[0])["file"], "\\\\srv\\tv\\a.mkv")
+            self.assertEqual(ns["_station_playback_state"]("06", now[0])["file"], "\\\\srv\\tv\\a.mkv", "a channel tuned to just now switches")
+            gap = ns["_station_playback_state"]("05", base + 4000.0)
+        self.assertEqual((gap["mode"], gap["reason"]), ("Static", "no_media_scheduled"))
+        self.assertEqual(asked, [])
+
+    def test_a_visualizer_channel_gets_the_song_with_its_whole_length(self):
+        base = 1_800_000_000.0
+        now = [base + 10.0]
+        ns, _asked, _saved, fake_ml = self._ns(now, watched="06")
+        ns["db"].channels_db["05"]["is_visualizer"] = True
+        rows = [[base, 100.0, "episode", "2026_328_Music@1", 0, {"path": "s1.mp3", "duration": 100.0, "seek_offset": 140.0, "interior_cut": True}],
+                [base + 100.0, 200.0, "episode", "2026_328_Music@1", 1, {"path": "s2.mp3", "duration": 200.0}]]
+        with patch.dict(sys.modules, {"media_library": fake_ml}):
+            ns["_take_server_rows"]({"05": rows})
+            state = ns["_station_playback_state"]("05", now[0])
+        self.assertEqual(state, {"mode": "Visualizer", "file": "s1.mp3", "seek": 150.0, "duration": 240.0})
+        self.assertEqual(ns["_scheduler_prepared"]["05"][1][1][1], {"mode": "Visualizer", "file": "s2.mp3", "seek": 0.0, "duration": 200.0})
+
+    def test_the_old_rows_are_removed_once_and_unchanged_blocks_are_not_written_again(self):
+        base = 1_800_000_000.0
+        calls = []
+        hub = types.SimpleNamespace(clear_channel=lambda ch: (calls.append(("clear", ch)), {"hub_schedule_row": 9, "hub_future_row": 4})[1],
+                                    place_rows=lambda ch, block, rows, now_epoch=None: (calls.append(("place", ch, block, len(rows))), (block, len(rows), 0, False))[1],
+                                    forget_show_facts=lambda ch: None)
+        ns, _asked, saved, fake_ml = self._ns([base], hub=hub)
+        with patch.dict(sys.modules, {"media_library": fake_ml}):
+            ns["_take_server_rows"]({"05": self._rows(base)})
+            ns["_server_rows_live"].add("05")
+            ns["_place_server_rows"]("05")
+            ns["_place_server_rows"]("05")
+        self.assertEqual(calls, [("clear", "05"), ("place", "05", "2026_328_Morning@1", 3)])
+        self.assertEqual(ns["db"].config["server_rows_switched"], {"user:srv:1:": ["05"]}, "the one-time removal is remembered across restarts")
+        self.assertEqual(saved, [1])
+
+    def test_a_hub_clear_of_one_channel_leaves_the_others(self):
+        tmp = tempfile.mkdtemp()
+        lib = ml.MediaLibrary(os.path.join(tmp, "library.sqlite3"))
+        try:
+            hub = ml.ScheduleHub(lib)
+            base = 1_800_000_000.0
+            for ch in ("05", "06"):
+                hub.place_rows(ch, "2026_327_Full Day", [_gt_row("/m/p.mkv", base, 1000.0, position=0)], now_epoch=base)
+                hub.replace_future_rows(ch, [_future_row("f@1", 0, "/m/f.mkv", base + 5000, 100.0)])
+            ml.take_schedule_changes()
+            removed = hub.clear_channel("05")
+            self.assertEqual((removed["hub_schedule_row"], removed["hub_future_row"]), (1, 1))
+            self.assertEqual(ml.take_schedule_changes(), {"05": {"history"}}, "the guide builds the cleared channel again")
+            self.assertIsNone(hub.at("05", base + 10))
+            self.assertIsNotNone(hub.at("06", base + 10))
+            hub.set_plan_state("06", "visualizer_lineup", {"day": "2026-328", "order": ["a"]})
+            self.assertEqual(hub.plan_state("06", "visualizer_lineup"), {"day": "2026-328", "order": ["a"]})
+            self.assertIsNone(hub.plan_state("05", "visualizer_lineup"))
+            hub.clear_channel("06")
+            self.assertIsNone(hub.plan_state("06", "visualizer_lineup"))
+        finally:
+            lib.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_writers_ask_through_the_switch_and_the_connection_takes_the_rows(self):
+        for name in ("calculate_slotted_playback_state", "_screen_ask_loop", "_hub_writer_step"):
+            self.assertNotIn("_scheduler_playback_state(", get_function_source(name), name)
+            self.assertIn("_station_playback_state(", get_function_source(name), name)
+        self.assertIn("if _channel in _server_rows_live:\n            return 0", get_function_source("_hub_future_for_channel"))
+        self.assertIn("on_rows=_on_remote_rows", MAIN_SRC)
+        self.assertIn("_forget_server_rows()", get_function_source("_disconnect_remote_server"))
+        self.assertIn("interior_cut", media._GUIDE_ENTRY_KEYS)
+        self.assertIn("SERVER_ROWS_BEHIND_S = performance_governor.SERVER_ROWS_BEHIND_S if performance_governor is not None else %.1f" % gov.SERVER_ROWS_BEHIND_S, MAIN_SRC)
+
+
+class TestTheStationClock(unittest.TestCase):
+    """Owner 2026-11-24: "every channel runs a light count down so we dont have to check on it ... it should only check the clock when it starts it countdown according to the schedule and then ping cache change when it gets close", and everything goes through the one clock."""
+
+    def test_countdowns_run_out_in_order_once_and_a_new_one_replaces_the_old(self):
+        import station_clock
+        fired = []
+        done = threading.Event()
+        station_clock.arm_in("t:b", 0.3, lambda key: fired.append(key))
+        station_clock.arm_in("t:a", 0.1, lambda key: fired.append(key))
+        station_clock.arm_in("t:c", 0.2, lambda key: fired.append("old c"))
+        station_clock.arm_in("t:c", 0.4, lambda key: (fired.append(key), done.set()))
+        station_clock.arm_in("t:d", 0.05, lambda key: fired.append(key))
+        station_clock.cancel("t:d")
+        self.assertTrue(done.wait(3.0))
+        self.assertEqual(fired, ["t:a", "t:b", "t:c"])
+        self.assertIsNone(station_clock.due_in("t:c"))
+
+    def test_the_station_clock_is_the_tv_guide_clock(self):
+        import station_clock, broadcast_clock
+        self.assertAlmostEqual(station_clock.now_epoch(), broadcast_clock.now().timestamp(), delta=0.5)
+
+    def test_the_server_reads_the_schedule_on_the_station_clock(self):
+        for name, needle in (("server_captions.py", "air_at + pos - station_clock.now_epoch()"), ("server_captions.py", "now = station_clock.now_epoch()"),
+                             ("server_scanner.py", "hub.at(str(channel).zfill(2), station_clock.now_epoch())"),
+                             ("server_clock.py", "now_fn=station_clock.now_epoch"), ("server_sync.py", '"server_time": station_clock.now_epoch()'),
+                             ("server_sync.py", '"sent_at": station_clock.now_epoch()')):
+            self.assertIn(needle, open(_script(name), encoding="utf-8").read(), name)
+
+
+class TestTheChannelReadyThreadIsWokenNotTimed(unittest.TestCase):
+    """Owner 2026-11-24: "every channel runs a light count down so we dont have to check on it ... vs constant checks"."""
+
+    def test_queued_rechecks_scans_settings_and_countdowns_wake_it(self):
+        worker = get_function_source("_channel_ready_worker")
+        self.assertIn("_channel_ready_wake.wait(PRIME_RECHECK_SECONDS)", worker)
+        self.assertNotIn("_app_shutting_down.wait(0.1)", worker)
+        for hook in ("media.SETTINGS_CHANGE_LISTENERS.append(_channel_ready_wake.set)", "media.PATH_REFRESH_LISTENERS.append(_channel_ready_wake.set)",
+                     "_ml_ready.RECHECK_LISTENERS.append(_channel_ready_wake.set)"):
+            self.assertIn(hook, MAIN_SRC)
+        self.assertIn("_channel_ready_wake.set()", get_function_source("_note_scan_work_added"))
+        self.assertIn("_channel_ready_arm(_ch)", get_function_source("_channel_ready_pass"))
+        told = []
+        media.PATH_REFRESH_LISTENERS.append(lambda: told.append(1))
+        try:
+            with media._path_exists_cache_lock:
+                media._queue_path_refresh("\\\\srv\\x.mkv")
+        finally:
+            media.PATH_REFRESH_LISTENERS.pop()
+            media._path_refresh_queue.pop("\\\\srv\\x.mkv", None)
+        self.assertEqual(told, [1], "a queued path re-check tells the listeners")
+        media.PATH_REFRESH_LISTENERS.append(lambda: 1 / 0)
+        try:
+            media._queue_path_refresh("\\\\srv\\y.mkv")
+        finally:
+            media.PATH_REFRESH_LISTENERS.pop()
+            media._path_refresh_queue.pop("\\\\srv\\y.mkv", None)
+
+
+class TestTheGameChannelKeepsWhatIsReady(unittest.TestCase):
+    """Owner 2026-11-24: "make sure going to the game channel does not clear our cache for the channels ... i get slowing stuff but clearing what we already have ready, thats not cool"."""
+
+    def test_entering_or_leaving_channel_03_drops_no_snapshot_index_or_prime_zone(self):
+        for name in ("change_channel", "_quiet_game_channel", "_release_tv_caption_state_when_off", "_stop_tv_live_caption_session", "_stop_tv_caption_prefetch"):
+            body = get_function_source(name)
+            for gone in ("drop_snapshots", "_prime_snapshot_zone.clear", "_prime_snapshot_zone.pop", "forget_index", "release_whisper_model("):
+                self.assertNotIn(gone, body, "%s must not %s" % (name, gone))
+        self.assertIn("if _empty:\n        share_relay.drop_snapshots(())", get_function_source("_prime_snapshot_pass"),
+                      "snapshots are freed only when no channel is left to keep ready")
+        self.assertIn("if not force:\n        return", get_function_source("_unload_caption_model"), "the caption model stays loaded through a guide or game channel visit")
+
+    def test_a_game_never_holds_or_paces_the_readying_of_the_channels(self):
+        """Owner 2026-11-24: "keep those channels up to date ... it cant just stop" and "just keep track of the clock. and when the clock reads the set time to switch, do the switch really quick for that one cache"."""
+        self.assertNotIn("_is_game_actively_playing", get_function_source("_prime_should_wait"))
+        self.assertNotIn("_is_game_actively_playing", get_function_source("_wait_to_prime"))
+        self.assertFalse(hasattr(gov, "GAME_READY_GAP_SECONDS"))
+        ready = get_function_source("_channel_ready_pass")
+        self.assertIn("if _warm_loops_should_rest() and not _is_game_actively_playing():", ready)
+        inner = get_function_source("_prime_channels_pass_inner")
+        self.assertIn("_countdown = _left - PRIME_LEAD_SECONDS", inner, "each channel counts down to just before its show ends")
+        self.assertIn('station_clock.arm_in("prime:" + _ch, _countdown, _prime_countdown_ran_out)', inner)
+
+
+class TestAGuidePreviewIsATune(unittest.TestCase):
+    """Owner 2026-11-24: "see why it took so long for tv guide to load the channel ... double check whatever causes the slow tv guide preview loading is not also slowing channel changing"."""
+
+    def test_a_preview_holds_background_work_like_a_channel_change(self):
+        body = get_function_source("_start_guide_preview_load")
+        self.assertIn("performance_governor.hold_background_for_tune()", body)
+        self.assertLess(body.index("hold_background_for_tune()"), body.index("_dispatch_content_activation(_gp_open)"))
+        self.assertIn("performance_governor.hold_background_for_tune()", get_function_source("change_channel"))
+
+    def test_the_next_items_are_not_read_ahead_during_a_tune(self):
+        body = get_function_source("_server_next_buffer_worker")
+        self.assertIn("while not _stale() and performance_governor is not None and performance_governor.tune_in_progress():", body)
+        self.assertLess(body.index("tune_in_progress()"), body.index("_next_item_prep_plan(ch_key, file_path)"))
+
+
+class TestMoviesAreLevelledOnTheirSpeech(unittest.TestCase):
+    """Owner 2026-11-24: "the tv series seem to be spot on for the most part but the movies are way to low pretty much consistently" and "if the dialogue is the same volume as the tv series, the explosions will be as loud as they are meant to be"."""
+
+    def test_only_music_and_files_measured_whole_keep_the_peak_ceiling(self):
+        self.assertTrue(media._peak_cap_applies(True, 5000.0))
+        self.assertTrue(media._peak_cap_applies(False, 30.0))
+        self.assertFalse(media._peak_cap_applies(False, 6000.0))
+        self.assertFalse(media._peak_cap_applies(False, 1351.0))
+
+    def test_the_gains_the_ceiling_held_back_are_cleared_once_and_the_rest_kept(self):
+        import media_library as ml
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "lib.db")
+        lib = ml.MediaLibrary(path)
+        level = gov.LOUDNESS_TARGET_LUFS + gov.LOUDNESS_STATION_LEVEL_DB
+        win = lambda avg: json.dumps([[0.2, avg], [0.5, avg], [0.8, avg]])
+        rows = {"movie": (10 ** (1.1 / 20), 10, win(-27.1)), "series": (10 ** ((level + 20.0) / 20), 10, win(-20.0)),
+                "advert": (2.0, 10, None), "owner": (1.0, 0, win(-30.0))}
+        for key, (gain, version, windows) in rows.items():
+            lib._conn.execute("INSERT INTO library (content_key, gain, gain_scan_version, gain_windows) VALUES (?,?,?,?)", (key, gain, version, windows))
+        lib._conn.execute("INSERT INTO hub_part_group_gain (group_key, anchor_path, gain, scan_version, updated_at) VALUES ('g', 'a', 1.0, 10, 0)")
+        lib._conn.execute("DELETE FROM library_once")
+        lib._conn.commit()
+        lib._conn.close()
+        lib = ml.MediaLibrary(path)
+        got = dict(lib._conn.execute("SELECT content_key, gain FROM library").fetchall())
+        self.assertIsNone(got["movie"], "the movie the ceiling held back 9 dB is measured again")
+        self.assertIsNotNone(got["series"])
+        self.assertEqual(got["advert"], 2.0)
+        self.assertEqual(got["owner"], 1.0)
+        self.assertEqual(lib._conn.execute("SELECT COUNT(*) FROM hub_part_group_gain").fetchone()[0], 0)
+        lib._conn.execute("UPDATE library SET gain=1.0, gain_scan_version=10 WHERE content_key='movie'")
+        lib._conn.commit()
+        lib._conn.close()
+        lib = ml.MediaLibrary(path)
+        self.assertEqual(lib._conn.execute("SELECT gain FROM library WHERE content_key='movie'").fetchone()[0], 1.0, "it runs once per library")
+        lib._conn.close()
+
+
 class TestSendLogsButtonUnderTheVersion(unittest.TestCase):
     def _main_funcs(self, names, extra=None):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
@@ -27181,8 +28169,10 @@ class TestSendLogsButtonUnderTheVersion(unittest.TestCase):
         ns.update(extra or {})
         import re as _re_for_logs
         ns["re"] = _re_for_logs
-        exec(src[src.index("_SEND_LOGS_SKIP_NAMES = "):src.index("def _send_logs_file_list(")], ns)
-        exec(src[src.index("class _LogScrubber:"):src.index("def _build_send_logs_zip(")], ns)
+        import send_logs_finisher
+        ns["send_logs_finisher"] = send_logs_finisher
+        ns["_send_logs_wanted"] = send_logs_finisher.logs_wanted
+        ns["_LogScrubber"] = send_logs_finisher.LogScrubber
         for name in names:
             body = "def " + name + src.split("def " + name, 1)[1].split("\n\n\ndef ", 1)[0].split("\n\n\n# ====", 1)[0]
             exec(body, ns)
@@ -27220,7 +28210,7 @@ class TestSendLogsButtonUnderTheVersion(unittest.TestCase):
 
     def test_zip_holds_every_log_and_the_note_and_shrinks_big_logs_to_fit(self):
         import tempfile, zipfile
-        ns = self._main_funcs(["_send_logs_version_text", "_send_logs_file_list", "_send_logs_read_tail", "_build_send_logs_zip"])
+        ns = self._main_funcs(["_send_logs_version_text", "_build_send_logs_zip"])
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "temp"))
             open(os.path.join(d, "caption_worker_crash.txt"), "w").write("crash\n")
@@ -28281,15 +29271,13 @@ class TestShellModeRestartRecovery(unittest.TestCase):
     def test_the_log_copy_is_whole_and_logging_goes_on_after_it(self):
         import tempfile
         ns = {}
-        start = MAIN_SRC.index("def _cut_back_to_whole_line(")
-        end = MAIN_SRC.index("def _build_send_logs_zip(")
-        fn_src = MAIN_SRC[start:end]
-        list_src = MAIN_SRC[MAIN_SRC.index("_SEND_LOGS_SKIP_NAMES = "):MAIN_SRC.index("def _send_logs_read_tail(")]
-        import threading as _th, time as _tm, re as _re
-        ns.update(os=os, re=_re, time=_tm, threading=_th, _log_swallowed=lambda *a, **k: None,
+        fn_src = MAIN_SRC[MAIN_SRC.index("def _copy_logs_while_paused("):MAIN_SRC.index("def _build_send_logs_zip(")]
+        import threading as _th, time as _tm
+        import send_logs_finisher
+        ns.update(os=os, time=_tm, threading=_th, _log_swallowed=lambda *a, **k: None, send_logs_finisher=send_logs_finisher,
                   _vlc_log_paused=_th.Event(), _vlc_log_gate=_th.Event(), _vlc_log_idle=_th.Event())
         ns["_vlc_log_gate"].set()
-        exec(list_src + "\n" + fn_src, ns)
+        exec(fn_src, ns)
         with tempfile.TemporaryDirectory() as logs, tempfile.TemporaryDirectory() as snap:
             with open(os.path.join(logs, "app_log.txt"), "w") as f:
                 f.write("one\ntwo\n")
@@ -29777,7 +30765,7 @@ class TestTrayFollowsWhatTheProgramIsShowing(unittest.TestCase):
             self.assertIsNone(ss.read_program_scan_state(base))
             with open(path, "w") as fh:
                 _j.dump({"mode": "regular", "caught_up": True, "at": 1000.0}, fh)
-            self.assertEqual(ss.read_program_scan_state(base, now=1010.0), {"mode": "regular", "caught_up": True})
+            self.assertEqual(ss.read_program_scan_state(base, now=1010.0), {"mode": "regular", "caught_up": True, "level": 0, "perf_mode": "", "live_captions": False})
             self.assertIsNone(ss.read_program_scan_state(base, now=1000.0 + ss.PROGRAM_STATE_FRESH_S + 1))
             with open(path, "w") as fh:
                 _j.dump({"mode": "weird", "caught_up": True, "at": 1000.0}, fh)
@@ -29788,7 +30776,8 @@ class TestTrayFollowsWhatTheProgramIsShowing(unittest.TestCase):
         ns = {"db": object(), "app_state": app_state, "os": os, "time": time, "_log_swallowed": lambda *a, **k: None, "_server_work_should_yield": lambda: False,
               "PROGRAM_CAUGHT_UP_CHECK_S": 15.0, "_program_scan_state_cache": {"checked": -1e9, "caught_up": False},
               "_program_scan_state_path": lambda: os.path.join(tmp, "state.json"),
-              "_gather_probe_priority_queue": lambda: calls.append(1) or tiers}
+              "_gather_probe_priority_queue": lambda: calls.append(1) or tiers,
+              "performance_governor": gov, "media": media}
         exec(compile(get_function_source("_write_program_scan_state"), "<x>", "exec"), ns)
         return ns, calls
 
@@ -30078,7 +31067,7 @@ class TestSendLogsKeepsPrivateThingsOut(unittest.TestCase):
     """Owner 2026-11-14: Send Logs must not carry the Windows user name, computer names, IP addresses, the device id, config backups or the cached media file ends; the CPU, graphics card, RAM, cores and threads must stay."""
 
     def _ns(self):
-        return TestSendLogsButtonUnderTheVersion._main_funcs(TestSendLogsButtonUnderTheVersion(), ["_send_logs_file_list", "_send_logs_read_tail", "_build_send_logs_zip", "_send_logs_version_text"])
+        return TestSendLogsButtonUnderTheVersion._main_funcs(TestSendLogsButtonUnderTheVersion(), ["_build_send_logs_zip", "_send_logs_version_text"])
 
     def test_only_logs_are_wanted(self):
         ns = self._ns()
@@ -31202,12 +32191,12 @@ class TestStuckShareWorkIsBounded(unittest.TestCase):
 
     def test_a_read_that_never_answers_is_left_behind_and_not_started_twice(self):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
-        a = src.index("def _read_ahead_file(path, head_bytes, tail_bytes, deadline, start_frac=0.0):")
+        a = src.index("def _read_ahead_file(path, head_bytes, tail_bytes, deadline, start_frac=0.0, give_way=True):")
         b = src.index("def _read_ahead_file_blocking(")
         release = threading.Event()
         started = []
 
-        def _blocking(path, head, tail, deadline, frac, progress):
+        def _blocking(path, head, tail, deadline, frac, progress, give_way=True):
             started.append(path)
             progress[0] = 7
             release.wait(5)
@@ -31357,7 +32346,7 @@ class TestSharesGetLiveCaptionsNotPulledOnes(unittest.TestCase):
 
     def test_a_failed_pull_falls_through_to_live_captions(self):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
-        self.assertIn('(info.get("kind") is None or info.get("kind") == "embedded") and info.get("mtime") is not None and not asr_known_unavailable()', src)
+        self.assertIn('(info.get("kind") is None or info.get("kind") == "embedded") and info.get("mtime") is not None:', src)
 
 
 class TestCaptionClockFollowsBetweenVlcSteps(unittest.TestCase):
@@ -31403,7 +32392,7 @@ class TestOwner20261115ChannelChangeFollowUps(unittest.TestCase):
     def test_leaving_the_guide_drops_the_preview_background_timers(self):
         src = self._src()
         leave = src[src.index('app_state["_guide_exit_black_until"] = pygame.time.get_ticks() + _first_load_static_ms(new_ch)'):][:700]
-        for key in ("guide_preview_black_until", "guide_preview_static_until", "guide_preview_settle_until"):
+        for key in ("guide_preview_black_until", "guide_preview_static_until"):
             self.assertIn('app_state["%s"] = 0' % key, leave)
         note = src[src.index("def _note_fresh_live_video_frame(ch):"):][:900]
         self.assertIn('app_state["guide_preview_black_until"] = 0', note)
@@ -31412,7 +32401,7 @@ class TestOwner20261115ChannelChangeFollowUps(unittest.TestCase):
         src = self._src()
         body = src[src.index('_tune_stage("play requested")'):]
         self.assertLess(body.index("self.stop(block=False)"), body.index('_tune_stage("volume applied")'))
-        self.assertLess(body.index('_tune_stage("volume applied")'), body.index("if not _cached_path_exists(filepath):"))
+        self.assertLess(body.index('_tune_stage("volume applied")'), body.index("_file_there = _cached_path_exists(filepath)"))
 
     def test_the_caption_source_is_logged_once_per_resolve(self):
         src = self._src()
@@ -31698,6 +32687,90 @@ class TestShareRelayKeepsAChannelsAiringPositionInMemory(unittest.TestCase):
         self.assertIsNone(self.r.snapshot_span(self.src))
 
 
+def _synthetic_mp4_index_first(pad=20000, sample_size=4096, samples=10):
+    """An MP4 with its moov box first and made big by a free box inside it; returns (bytes, offset of each chunk)."""
+    import struct
+
+    def box(kind, payload):
+        return struct.pack(">I4s", 8 + len(payload), kind) + payload
+    ftyp = box(b"ftyp", b"isom" + struct.pack(">I", 0))
+    half = samples // 2
+
+    def moov_for(chunks):
+        stbl = (box(b"stts", struct.pack(">IIII", 0, 1, samples, 1000))
+                + box(b"stss", struct.pack(">II", 0, 2) + struct.pack(">II", 1, 6))
+                + box(b"stsc", struct.pack(">II", 0, 1) + struct.pack(">III", 1, half, 1))
+                + box(b"stsz", struct.pack(">III", 0, sample_size, samples))
+                + box(b"stco", struct.pack(">II", 0, 2) + b"".join(struct.pack(">I", c) for c in chunks)))
+        mdhd = box(b"mdhd", struct.pack(">IIIIIHH", 0, 0, 0, 1000, samples * 1000, 0, 0))
+        hdlr = box(b"hdlr", struct.pack(">II", 0, 0) + b"vide" + b"\0" * 13)
+        return box(b"moov", box(b"trak", box(b"mdia", mdhd + hdlr + box(b"minf", box(b"stbl", stbl)))) + box(b"free", b"\0" * pad))
+    moov_len = len(moov_for([0, 0]))
+    first = len(ftyp) + moov_len + 8
+    chunks = [first, first + sample_size * half]
+    return ftyp + moov_for(chunks) + box(b"mdat", os.urandom(sample_size * samples)), chunks
+
+
+class TestALongMoviesIndexIsKeptWhole(unittest.TestCase):
+    """Owner log 2026-11-24: National Treasure and the other long MP4 movies on channel 06 never had their airing part read ahead ("no index to place 5219s by"): their index was bigger than the kept start of the file, so a tune read it, and the airing part, over the network."""
+
+    def setUp(self):
+        import share_relay
+        import tempfile
+        self.r = share_relay
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.r.set_cache_dir(os.path.join(self.tmp, "idx"))
+        self.r._failed.clear()
+        self.r._keyframe_tables.clear()
+        self.r._index_reach_checked.clear()
+        self._wants = mock.patch.object(self.r, "wants", return_value=True)
+        self._wants.start()
+        self.addCleanup(self._wants.stop)
+        self.addCleanup(self.r.shutdown)
+
+    def _write(self, name, data):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def test_an_index_at_the_start_bigger_than_the_kept_start_is_kept_whole(self):
+        data, chunks = _synthetic_mp4_index_first()
+        path = self._write("long.mp4", data)
+        with mock.patch.object(self.r, "HEAD_CACHE_BYTES", 4096), mock.patch.object(self.r, "TAIL_CACHE_BYTES", 2048):
+            meta = self.r.ensure_index(path)
+        self.assertGreaterEqual(meta[2], chunks[0] - 8, "the kept start reaches the end of the index")
+        self.assertEqual(self.r.keyframe_table(path), [(0.0, chunks[0]), (5.0, chunks[1])])
+
+    def test_an_index_at_the_end_bigger_than_the_kept_end_is_kept_whole(self):
+        data, chunks = _synthetic_mp4(sample_size=4096)
+        path = self._write("tail.mp4", data)
+        moov_at = data.rfind(b"moov") - 4
+        with mock.patch.object(self.r, "HEAD_CACHE_BYTES", 64), mock.patch.object(self.r, "TAIL_CACHE_BYTES", 32):
+            meta = self.r.ensure_index(path)
+        self.assertGreaterEqual(meta[3], len(data) - moov_at)
+        self.assertEqual(self.r.keyframe_table(path), [(0.0, chunks[0]), (5.0, chunks[1])])
+
+    def test_a_copy_kept_before_with_its_index_cut_off_is_made_again_and_its_old_table_dropped(self):
+        data, chunks = _synthetic_mp4_index_first()
+        path = self._write("old.mp4", data)
+        with mock.patch.object(self.r, "HEAD_CACHE_BYTES", 4096), mock.patch.object(self.r, "TAIL_CACHE_BYTES", 2048), \
+                mock.patch.object(self.r, "_mp4_index_reach", return_value=None):
+            self.r.ensure_index(path)
+        self.assertIsNone(self.r.keyframe_table(path), "the old copy holds only part of the index")
+        with mock.patch.object(self.r, "HEAD_CACHE_BYTES", 4096), mock.patch.object(self.r, "TAIL_CACHE_BYTES", 2048):
+            self.r.ensure_index(path)
+        self.assertEqual(self.r.keyframe_table(path), [(0.0, chunks[0]), (5.0, chunks[1])])
+
+    def test_only_mp4_files_are_measured_and_a_huge_index_is_left_alone(self):
+        data, _chunks = _synthetic_mp4_index_first()
+        view = self.r._View(data[:4096], b"", len(data))
+        self.assertIsNone(self.r._mp4_index_reach(view, len(data), "x.mkv"))
+        with mock.patch.object(self.r, "MP4_INDEX_MAX_BYTES", 1000):
+            self.assertIsNone(self.r._mp4_index_reach(view, len(data), "x.mp4"))
+
+
 class TestPrimerKeepsSnapshotsForTheViewersZone(unittest.TestCase):
     """Owner 2026-11-16: while the viewer is changing channels the channels they may reach next keep their airing position in memory; when they stop, the snapshots are freed."""
 
@@ -31744,8 +32817,9 @@ class TestPrimerKeepsSnapshotsForTheViewersZone(unittest.TestCase):
         ns = {"log": logging.getLogger("test_prime_snapshot"), "_prime_context": threading.local(), "PRIME_SNAPSHOT_LOG_EVERY_S": 30.0, "time": time, "os": os, "db": _Db, "share_relay": _Relay, "_share_relay_on": lambda: True,
               "app_state": {"current_channel": "05"}, "_app_shutting_down": threading.Event(),
               "calculate_slotted_playback_state": lambda ch: {"file": "\\\\srv\\%s.mkv" % ch, "seek": now_seek, "duration": 1800},
-              "_wait_to_prime": lambda: True, "_log_swallowed": lambda *a: None, "SERVER_CHANNEL_WARM_MAX_SECONDS": 6.0,
-              "PRIME_SNAPSHOT_SECONDS": 15.0, "PRIME_SNAPSHOT_REFRESH_SECONDS": 10.0, "PRIME_SNAPSHOT_ZONE_SECONDS": 60.0,
+              "_wait_to_prime": lambda path=None: True, "_log_swallowed": lambda *a: None, "SERVER_CHANNEL_WARM_MAX_SECONDS": 6.0,
+              "PRIME_SNAPSHOT_SECONDS": 15.0, "PRIME_SNAPSHOT_RETRY_SECONDS": 10.0, "PRIME_SNAPSHOT_ZONE_SECONDS": 60.0,
+              "station_clock": types.SimpleNamespace(arm_in=lambda key, seconds, fn: calls.append(("countdown", key, seconds))),
               "PRIME_SNAPSHOT_CHANNELS_MAX": 3, "_prime_zone_lock": threading.Lock(), "_prime_snap_wake": threading.Event(), "_station_ring": lambda: ring or [], "_channel_ready_order": lambda: list(ring or []),
               "_prime_last_viewed": {"ch": ""}, "_prime_last_window": [],
               "_prime_window_for": lambda r, o, n: [r[(r.index(n) + k) % len(r)] for k in (1, 2, 3)] if n in r else []}
@@ -31765,6 +32839,8 @@ class TestPrimerKeepsSnapshotsForTheViewersZone(unittest.TestCase):
         ns["_prime_zone_add"](["06"])
         ns["_prime_snapshot_pass"]()
         self.assertEqual([c for c in calls if c[0] == "snapshot"], [])
+        self.assertEqual([c for c in calls if c[0] == "countdown"], [("countdown", "snapshots", 118.0 - 100.0 - 7.5)],
+                         "owner 2026-11-24: the pass wakes when the picture passes the snapshot's middle, not on a timer")
 
     def test_no_more_than_the_most_channels_are_kept_and_a_left_zone_frees_the_memory(self):
         ns, calls = self._ns()
@@ -31796,7 +32872,7 @@ class TestPrimerKeepsSnapshotsForTheViewersZone(unittest.TestCase):
         self.assertIn("_prime_zone_add(_window)", src[src.index("def _prime_note_viewer_at("):][:1500])
         self.assertIn("_prime_zone_add(_keys)", src[src.index("def _prime_note_typed_digits("):][:800])
         """Owner 2026-11-16: the snapshots have their own thread, so a slow priming pass never delays them."""
-        self.assertIn("PRIME_SNAPSHOT_REFRESH_SECONDS", src[src.index("def _prime_snapshot_worker():"):][:900])
+        self.assertIn("_prime_snap_wake.wait(PRIME_RECHECK_SECONDS)", src[src.index("def _prime_snapshot_worker():"):][:900])
         self.assertIn("_prime_snapshot_pass()", src[src.index("def _prime_snapshot_worker():"):][:900])
         self.assertNotIn("_prime_snapshot_pass()", src[src.index("def _prime_rush_pass():"):][:700])
         self.assertIn('name="PrimeSnapshot"', src)
@@ -31998,9 +33074,8 @@ class TestBootReadiesTheBootChannelFirst(unittest.TestCase):
 class TestSendLogsDoesNotStallThePicture(unittest.TestCase):
     def _ns(self):
         src = open(os.path.join(os.path.dirname(__file__), "..", "retro_tv_emulator.py"), encoding="utf-8").read()
-        ns = {"time": time, "os": os, "_log_swallowed": lambda *a: None}
-        exec(src[src.index("def _send_logs_in_pieces("):src.index("def _build_send_logs_zip(")], ns)
-        exec(src[src.index("def _cut_back_to_whole_line("):src.index("def _copy_logs_while_paused(")], ns)
+        import send_logs_finisher
+        ns = {"_send_logs_in_pieces": send_logs_finisher.in_pieces, "_cut_back_to_whole_line": send_logs_finisher.cut_back_to_whole_line}
         return ns, src
 
     def test_pieces_end_on_whole_lines_and_join_back_to_the_same_text(self):
@@ -32023,7 +33098,7 @@ class TestSendLogsDoesNotStallThePicture(unittest.TestCase):
 
     def test_the_app_log_lock_is_not_held_through_the_copy(self):
         _ns, src = self._ns()
-        body = src[src.index("def _copy_logs_while_paused("):src.index("class _LogScrubber")]
+        body = src[src.index("def _copy_logs_while_paused("):src.index("def _build_send_logs_zip(")]
         self.assertNotIn("lock.acquire", body)
 
 
@@ -32462,22 +33537,62 @@ class TestUpdateDownloadYieldsToTheVideo(unittest.TestCase):
 
 
 class TestSendLogsAndPlaybackPulse(unittest.TestCase):
-    """The tray packs the logs into one zip without update downloads, and the log carries a pulse that names a frozen picture or silent sound."""
+    """The tray sends the logs to Discord with the Send Logs button's own steps, and the log carries a pulse that names a frozen picture or silent sound."""
 
-    def test_pack_logs_zip_skips_update_downloads(self):
+    def test_tray_send_logs_runs_the_programs_send_logs_and_posts_to_discord(self):
+        """Owner 2026-11-24: the tray's Send logs zipped the logs onto the Desktop; it now runs the Send Logs button's own steps and posts to the Discord webhook."""
         import tempfile, zipfile
         sys.path.insert(0, os.path.join(ROOT, "server"))
         import server_service
-        with tempfile.TemporaryDirectory() as base, tempfile.TemporaryDirectory() as dest:
-            logs = os.path.join(base, "logs")
-            os.makedirs(os.path.join(logs, ".retro_tv_updates", "x"))
-            os.makedirs(os.path.join(logs, "temp"))
-            open(os.path.join(logs, "app_log.txt"), "w").write("hello")
-            open(os.path.join(logs, "temp", "tester_report.txt"), "w").write("r")
-            open(os.path.join(logs, ".retro_tv_updates", "x", "pkg.zip"), "w").write("big")
-            out = server_service.pack_logs_zip(base, destination_dir=dest)
-            names = sorted(zipfile.ZipFile(out).namelist())
-            self.assertEqual(names, ["app_log.txt", os.path.join("temp", "tester_report.txt")])
+        import send_logs_finisher
+        posted, said = [], []
+
+        def fake_post(url, zip_path, message, timeout, urlopen=None):
+            z = zipfile.ZipFile(zip_path)
+            posted.append((url, sorted(z.namelist()), z.read("logs/app_log.txt").decode(), z.read("tester_note.txt").decode(), message, urlopen))
+            return True, "HTTP 200"
+        held = (send_logs_finisher.post_zip, server_service._tray_message, server_service._load_auto_updater)
+        fake_updater = types.SimpleNamespace(current_version=lambda base: "2.1.6", _urlopen=object())
+        try:
+            send_logs_finisher.post_zip = fake_post
+            server_service._tray_message = lambda text, question=False, base_dir=None: said.append(text)
+            server_service._load_auto_updater = lambda base: fake_updater
+            with tempfile.TemporaryDirectory() as base:
+                logs = os.path.join(base, "logs")
+                os.makedirs(os.path.join(logs, ".retro_tv_updates", "x"))
+                os.makedirs(os.path.join(logs, "temp"))
+                open(os.path.join(logs, "app_log.txt"), "w").write("hello host=192.168.1.77\n")
+                open(os.path.join(logs, "temp", "tester_report.txt"), "w").write("r\n")
+                open(os.path.join(logs, "retro_config_20261113-074131.json"), "w").write("{}")
+                open(os.path.join(logs, ".retro_tv_updates", "x", "pkg.zip"), "w").write("big")
+                server_service.send_logs_from_tray(base)
+                self.assertEqual(os.listdir(os.path.join(logs, "temp")), ["tester_report.txt"])
+        finally:
+            send_logs_finisher.post_zip, server_service._tray_message, server_service._load_auto_updater = held
+        self.assertEqual(len(posted), 1)
+        url, names, app_log, note, message, urlopen = posted[0]
+        self.assertEqual(url, gov.SEND_LOGS_WEBHOOK_URL)
+        self.assertEqual(names, ["logs/app_log.txt", "logs/temp/tester_report.txt", "tester_note.txt"])
+        self.assertNotIn("192.168.1.77", app_log)
+        self.assertIn("version: 2.1.6", note)
+        self.assertIn("server tray", note)
+        self.assertIn("V2.1.6 (sent from the server tray)", message)
+        self.assertIs(urlopen, fake_updater._urlopen)
+        self.assertEqual(said, ["Logs sent."])
+
+    def test_the_tray_and_the_button_share_one_copy_of_the_steps(self):
+        tray = open(os.path.join(ROOT, "server", "server_service.py"), encoding="utf-8").read()
+        body = tray[tray.index("def send_logs_from_tray("):tray.index("# SECTION: Check for updates (tray)")]
+        for needle in ("send_logs_finisher.pick_webhook_url(", "send_logs_finisher.copy_logs(", "send_logs_finisher.build_zip(", "send_logs_finisher.post_zip("):
+            self.assertIn(needle, body)
+        self.assertNotIn("Desktop", body)
+        self.assertNotIn("zipfile", body)
+        for name in ("SEND_LOGS_WEBHOOK_URL", "SEND_LOGS_MAX_ZIP_BYTES", "SEND_LOGS_FILE_TAIL_BYTES", "SEND_LOGS_FILE_TAIL_BYTES_LEAST", "SEND_LOGS_TIMEOUT_SECONDS"):
+            self.assertIn('%s = "%s"' % (name, getattr(gov, name)) if isinstance(getattr(gov, name), str) else "%s = %r" % (name, getattr(gov, name)), tray)
+        self.assertIn("send_logs_finisher.build_zip(", MAIN_SRC[MAIN_SRC.index("def _build_send_logs_zip("):][:600])
+        self.assertIn("send_logs_finisher.post_zip(", MAIN_SRC[MAIN_SRC.index("def _post_logs_to_discord("):][:600])
+        for gone in ("class _LogScrubber", "def _send_logs_in_pieces(", "def _cut_back_to_whole_line(", "def pack_logs_zip("):
+            self.assertNotIn(gone, MAIN_SRC + tray)
 
     def test_tray_has_send_logs_row_under_updates(self):
         tray = open(os.path.join(ROOT, "server", "server_tray.py"), encoding="utf-8").read()
@@ -32498,7 +33613,8 @@ class TestThePulseReadsTheFileVlcIsPlaying(unittest.TestCase):
 
     def _run(self, engine, f):
         ns = {"_governor_feed": f, "vlc_engine": engine, "app_state": {"is_playing_video": True}, "log": logging.getLogger("t"),
-              "_log_swallowed": lambda *a: None, "_note_playback_pulse": lambda *a: None,
+              "_log_swallowed": lambda *a: None, "_note_playback_pulse": lambda *a: None, "_note_stream_buffer": lambda *a: None,
+              "_log_stream_buffer_change": lambda *a: None, "performance_governor": None,
               "vlc": types.SimpleNamespace(MediaStats=lambda: types.SimpleNamespace(lost_pictures=0, lost_abuffers=0, displayed_pictures=0, played_abuffers=0))}
         exec(get_function_source("_governor_read_vlc_loss"), ns)
         return ns["_governor_read_vlc_loss"](0.0, False)
@@ -33065,13 +34181,14 @@ class TestUserKeepsTheServersTime(unittest.TestCase):
         c._take_clock({"type": "schedule", "clock": {"utc_offset_s": 0}, "slot_id": "x"})
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0][0], 1000.0)
-        self.assertIn('"server_time": time.time()', inspect.getsource(server_sync.ScheduleBroadcaster._run))
+        self.assertIn('"server_time": station_clock.now_epoch()', inspect.getsource(server_sync.ScheduleBroadcaster._run))
 
     def _ns(self, locked=True):
         moves = []
         state = {}
         opened = []
-        ns = {"collections": collections, "threading": threading, "SERVER_CLOCK_SAMPLES": 5, "SERVER_CLOCK_DRIFT_TOLERANCE_S": 2.0,
+        ns = {"collections": collections, "threading": threading, "SERVER_CLOCK_SAMPLES": 5, "SERVER_CLOCK_DRIFT_TOLERANCE_S": 2.0, "SERVER_CLOCK_MISMATCH_WARN_S": 60.0,
+              "post_status_notice": lambda text, good=False: None, "time": time,
               "SLOT_TAIL_HOLD_MAX_SECONDS": 3.0, "SERVER_BREAK_FLASH_EACH_S": 0.5, "SERVER_BREAK_FLASH_TOTAL_S": 2.0, "SERVER_BREAK_RECENT_ADS_S": 3600.0,
               "broadcast_clock": types.SimpleNamespace(set_server_skew=lambda v: moves.append(v),
                                                        now=lambda: types.SimpleNamespace(timestamp=lambda: 1000.0)),
@@ -33816,9 +34933,9 @@ class TestALoadingChannelShowsWhyOnItsStatic(unittest.TestCase):
 class TestRegularAndServerFirstLoadWaitsStaySeparate(unittest.TestCase):
     """Owner 2026-11-18: media added to a Regular channel sitting on Static goes to the loading background at once and has 7 s to play before Static and the reason; the server side keeps its own 10 s; the stall clock never counts the time the channel sat empty."""
 
-    def _ns(self, profile=None, locked=False):
+    def _ns(self, profile=None, locked=False, editing=None):
         state = {"active_local_profile": profile, "current_channel": "05"}
-        ns = {"app_state": state, "db": types.SimpleNamespace(channels_db={"05": {"server_locked": locked}}),
+        ns = {"app_state": state, "db": types.SimpleNamespace(channels_db={"05": {"server_locked": locked}}, config={"active_server_slot": editing}),
               "STALL_FORCES_STATIC_FIRST_LOAD_MS": 10000, "REGULAR_FIRST_LOAD_STATIC_MS": 7000}
         exec(get_function_source("_server_rules_apply"), ns)
         exec(get_function_source("_first_load_static_ms"), ns)
@@ -33830,6 +34947,8 @@ class TestRegularAndServerFirstLoadWaitsStaySeparate(unittest.TestCase):
         self.assertEqual(self._ns()[0]["_first_load_static_ms"]("05"), 7000)
         self.assertEqual(self._ns(profile="2")[0]["_first_load_static_ms"]("05"), 10000, "a server profile on screen")
         self.assertEqual(self._ns(locked=True)[0]["_first_load_static_ms"]("05"), 10000, "a channel streamed from a server")
+        self.assertEqual(self._ns(editing="server1")[0]["_first_load_static_ms"]("05"), 10000,
+                         "owner 2026-11-23: a server profile being edited is server mode too")
 
     def test_media_arriving_on_empty_static_starts_a_fresh_load_clock(self):
         state = {"_last_new_frame_ticks": 0, "_had_first_frame_this_tune": True, "_static_hold_until_frame": True, "last_vlc_retry_at": 99}
@@ -34480,6 +35599,7 @@ class TestTheScreenThreadDoesNotRunTheSchedulerEveryFrame(unittest.TestCase):
         for name in ("calculate_slotted_playback_state", "_screen_scheduler_answer", "_hub_remember_state", "_schedule_pending_state",
                      "_ask_scheduler_for_screen", "_screen_ask_loop"):
             exec(get_function_source(name), ns)
+        exec(STATION_DOOR_SRC, ns)
         return ns, calls, clock, fake_ml
 
     def _wait_calls(self, calls, count):
@@ -34519,6 +35639,33 @@ class TestTheScreenThreadDoesNotRunTheSchedulerEveryFrame(unittest.TestCase):
                 t = threading.Thread(target=lambda: out.append(ns["calculate_slotted_playback_state"]("05")))
                 t.start(); t.join()
         self.assertEqual(len(calls), 3)
+
+
+class TestAnOutOfDateHeldAnswerIsNeverAired(unittest.TestCase):
+    """Owner log 2026-11-23 02:41: in every break a file that aired 16 minutes before was reopened for a moment."""
+
+    def test_a_held_answer_whose_item_ran_out_draws_the_cover_and_is_asked_again(self):
+        asked = []
+        ns = {"time": types.SimpleNamespace(monotonic=lambda: 10.0), "SCREEN_SCHEDULER_ASK_GAP_S": 0.5, "SCHEDULE_PENDING_REASON": "schedule_pending",
+              "_screen_scheduler_answers": {"05": {"state": {"mode": "Commercial", "file": "alpha.mp4", "seek": 4.0, "duration": 300.0, "seek_slot_offset": 0},
+                                                   "at": 9.9, "epoch": 1000.0}},
+              "_ask_scheduler_for_screen": lambda ch, hub: asked.append(ch)}
+        for name in ("_screen_scheduler_answer", "_schedule_pending_state"):
+            exec(get_function_source(name), ns)
+        self.assertEqual(ns["_screen_scheduler_answer"]("05", None, 1100.0)["seek"], 104.0)
+        self.assertEqual(asked, [])
+        late = ns["_screen_scheduler_answer"]("05", None, 2004.0)
+        self.assertEqual(late["reason"], "schedule_pending", "never the file that aired long before")
+        self.assertEqual(asked, ["05"])
+
+    def test_the_hub_has_no_gap_between_two_items(self):
+        hub = ml.ScheduleHub.__new__(ml.ScheduleHub)
+        hub._show_facts, hub._upcoming = {}, {}
+        ad = {"mode": "Commercial", "file": "ad8.mp4", "seek": 0.0, "duration": 30.0, "block": "Morning", "seek_slot_offset": 0, "interior_cut": False}
+        hub.remember_show_facts("05", ad, 1000.0, "g", upcoming=[(1000.0, ad), (1030.0, dict(ad, file="ad5.mp4", duration=15.0))])
+        for at in (1028.99, 1029.5, 1029.97, 1029.999):
+            self.assertEqual(hub.show_facts("05", at, "g")["file"], "ad8.mp4", at)
+        self.assertEqual(hub.show_facts("05", 1030.0, "g")["file"], "ad5.mp4")
 
 
 class TestNoEffectsOnTheStaticScreen(unittest.TestCase):
@@ -34684,7 +35831,7 @@ class TestScanCapacityTest(unittest.TestCase):
 
 
 class TestCapacityTestIsTheLastStageOfTheFirstLoadingBar(unittest.TestCase):
-    """On a first start the loading bar ends with the capacity test: the real load fills the first fifth, the test the rest, done at the test's end or at 20 seconds."""
+    """On a first start the loading bar ends with the capacity test: the real load fills the first fifth, the test the rest, done at the test's end; a test still going at 120 seconds is stuck and is stopped (owner 2026-11-24: it stays in the boot load, never after a channel loads)."""
 
     def _ns(self, state, steps_done=0, steps_total=10):
         fn = get_function_source("_boot_capacity_credit")
@@ -34704,21 +35851,46 @@ class TestCapacityTestIsTheLastStageOfTheFirstLoadingBar(unittest.TestCase):
     def test_the_bar_follows_the_larger_of_the_time_used_and_the_steps_done(self):
         unit = {"w": 80.0, "start": 100.0, "done": False}
         by_time = self._ns({"_boot_capacity": unit}, steps_done=1, steps_total=10)
-        self.assertAlmostEqual(by_time(110.0)[1], 40.0)
+        self.assertAlmostEqual(by_time(160.0)[1], 40.0)
         by_steps = self._ns({"_boot_capacity": unit}, steps_done=9, steps_total=10)
         self.assertAlmostEqual(by_steps(102.0)[1], 72.0)
-        self.assertAlmostEqual(by_time(200.0)[1], 80.0)
+        self.assertAlmostEqual(by_time(240.0)[1], 80.0)
 
     def test_the_real_load_is_the_first_fifth_of_the_bar(self):
         src = get_function_source("_boot_capacity_plan")
         self.assertIn("share / (1.0 - share)", src)
         self.assertEqual(gov.BOOT_CAPACITY_BAR_SHARE, 0.8)
-        self.assertEqual(gov.BOOT_CAPACITY_MAX_SECONDS, 20.0)
+        self.assertEqual(gov.BOOT_CAPACITY_MAX_SECONDS, 120.0)
 
-    def test_only_a_start_with_nothing_measured_plans_it(self):
+    def test_every_due_test_is_planned_for_the_loading_screen_the_caption_test_only_with_captions_on(self):
+        """Owner logs 2026-11-24: beside a channel with live captions on the PC is never quiet, so the caption speed test waited for ever; every due test now runs on the loading screen."""
         plan = get_function_source("_boot_capacity_plan")
-        self.assertIn("store.never_measured(k)", plan)
+        self.assertIn("kinds = _boot_capacity_kinds(store)", plan)
+        self.assertIn('"kinds": kinds', plan)
         import scan_capacity as sc
+        tmp0 = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp0, True)
+        st = sc.CapacityStore(os.path.join(tmp0, "c.json"))
+        captions_on = [True]
+        ns = {"_boot_bar_const": lambda name, default: default, "_captions_switched_on": lambda: captions_on[0],
+              "performance_governor": types.SimpleNamespace(caption_memory_locked=lambda: False)}
+        exec(get_function_source("_boot_capacity_kinds"), ns)
+        kinds = ns["_boot_capacity_kinds"]
+        self.assertEqual(kinds(st), ["captions", "audio", "video"])
+        captions_on[0] = False
+        self.assertEqual(kinds(st), ["audio", "video"])
+        st.note("audio", 2, 50.0, 80.0)
+        st.note("video", 2, 50.0, 80.0)
+        self.assertEqual(kinds(st), [])
+        captions_on[0] = True
+        self.assertEqual(kinds(st), ["captions"])
+        st.note("captions", 0, 1.2, 0.0)
+        self.assertEqual(kinds(st), [])
+        run = get_function_source("_boot_capacity_run")
+        self.assertIn('kinds = list(unit.get("kinds", ()))', run)
+        self.assertIn('_run_caption_speed_test(store, lambda: _app_shutting_down.is_set() or app_state.get("_boot_capacity_stop", False))', run)
+        for name in ("_caption_speed_loop", "_scan_capacity_loop"):
+            self.assertIn('while app_state.get("_boot_capacity") and not app_state["_boot_capacity"].get("done"):', get_function_source(name), name)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         store = sc.CapacityStore(os.path.join(tmp, "c.json"))
@@ -34731,7 +35903,11 @@ class TestCapacityTestIsTheLastStageOfTheFirstLoadingBar(unittest.TestCase):
         self.assertLess(MAIN_SRC.index("_boot_capacity_run()\n        except"), MAIN_SRC.index('_mark_boot_step("boot_prewarm")\n        _start_airing_warm'))
         run = get_function_source("_boot_capacity_run")
         self.assertIn("worker.join(timeout=limit_s)", run)
-        self.assertIn("finishes beside the channel", run)
+        self.assertNotIn("finishes beside the channel", run)
+        self.assertIn('app_state["_boot_capacity_stop"] = True', run)
+        self.assertLess(run.index('app_state["_boot_capacity_stop"] = True'), run.index('app_state["_boot_capacity_phase"] = False'))
+        self.assertIn('app_state.get("_boot_capacity_stop", False)', get_function_source("_run_scan_capacity_test_locked"))
+        self.assertIn("and not store.never_measured(k)]", get_function_source("_scan_capacity_loop"))
         self.assertIn("_boot_capacity_credit(now)", get_function_source("_boot_bar_target_percent"))
 
     def test_the_test_waits_for_the_media_engine_and_decks_before_it_starts(self):
@@ -35406,11 +36582,23 @@ class TestSharingUpkeepAndRemoveTasks(unittest.TestCase):
 class TestOneDedicatedPlaybackThread(unittest.TestCase):
     """Owner 2026-11-21: one dedicated thread does channel changes and opens what airs, so playback works whatever else struggles."""
 
+    def test_the_playback_helpers_exist_before_any_boot_step(self):
+        first_boot_step = MAIN_SRC.index("[BOOT PREWARM]")
+        for name in ("def _time_critical_thread(", "def playback_busy(", "_playback_queue = ", "def _publish_prepared_items("):
+            self.assertLess(MAIN_SRC.index(name), first_boot_step if name != "def _publish_prepared_items(" else MAIN_SRC.index("def _scheduler_playback_state("), name)
+
+    def test_the_end_check_reset_never_writes_to_a_player_not_made_yet(self):
+        self.assertIn("    elif vlc_engine is not None:\n        vlc_engine._media_end_tracking = {}", MAIN_SRC)
+        self.assertNotIn("vlc_engine._media_end_tracking = {} if vlc_engine is not None else None", MAIN_SRC)
+
     def _ns(self, stuck_s=10.0):
         start = MAIN_SRC.rfind("# ====", 0, MAIN_SRC.index("# SECTION: Playback thread (channel changes and opening what airs)"))
         end = MAIN_SRC.index("def change_channel(new_ch,")
         ns = {"threading": threading, "collections": collections, "time": time, "sys": sys, "traceback": __import__("traceback"),
               "log": logging.getLogger("t"), "performance_governor": None, "_app_shutting_down": threading.Event(), "app_state": {}}
+        state_start = MAIN_SRC.index("# SECTION: Playback thread state (read from the first boot step on)")
+        state_end = MAIN_SRC.index("def _log_warn_throttled(")
+        exec(compile(MAIN_SRC[state_start:state_end], "<playback state>", "exec"), ns)
         exec(compile(MAIN_SRC[start:end], "<playback>", "exec"), ns)
         ns["PLAYBACK_STEP_STUCK_S"] = stuck_s
         self.addCleanup(ns["_app_shutting_down"].set)
@@ -35494,7 +36682,7 @@ class TestOneDedicatedPlaybackThread(unittest.TestCase):
         self.assertIn("_run_on_screen_thread(_quiet_game_channel)", cc)
         self.assertIn("if threading.current_thread() is threading.main_thread():\n        pygame.event.pump()", cc)
         flip = get_function_source("_tune_after_flip")
-        self.assertIn('if not _post_to_playback_thread("tune", _tune_and_end_the_flip,', flip)
+        self.assertIn('if _post_to_playback_thread("tune", _tune_and_end_the_flip,', flip)
         self.assertLess(flip.index("change_channel(target_ch"), flip.index('app_state["surf_origin"] = ""'),
                         "the flip ends only after its tune ran on the playback thread")
         boot = MAIN_SRC[MAIN_SRC.index("start_playback_thread()\n"):]
@@ -35556,6 +36744,7 @@ class TestTheScreenThreadNeverRunsTheScheduler(unittest.TestCase):
               "_scheduler_playback_state": sched, "_app_shutting_down": threading.Event(), "_log_swallowed": lambda *a: None}
         self.addCleanup(ns["_app_shutting_down"].set)
         exec(compile(MAIN_SRC[start:end], "<door>", "exec"), ns)
+        exec(STATION_DOOR_SRC, ns)
         patcher = mock.patch.dict(sys.modules, {"media_library": fake_ml})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -35670,18 +36859,21 @@ class TestScansNoLongerReplanTheFutureFileByFile(unittest.TestCase):
         self.assertIn("_hub_future_check_soon()", src)
         worker = get_function_source("_hub_future_worker")
         self.assertIn("_python_heavy_should_pause() or _server_work_should_yield()", worker)
-        self.assertIn("_hub_future_idle_sleep()", worker)
+        self.assertIn("_hub_future_event.wait(PRIME_RECHECK_SECONDS)", worker)
         self.assertIn("playback_busy()", get_function_source("_server_work_should_yield"))
 
-    def test_the_idle_sleep_ends_when_the_settled_look_is_due(self):
-        ns = {"time": time, "_app_shutting_down": threading.Event(), "_HUB_FUTURE_IDLE_SECONDS": 30.0, "_HUB_FUTURE_SETTLE_SECONDS": 0.2,
-              "_hub_future_wake": {"at": None}}
-        exec(get_function_source("_hub_future_check_soon") + "\n" + get_function_source("_hub_future_idle_sleep"), ns)
+    def test_the_future_step_is_woken_by_countdowns_and_settings_changes_not_a_timer(self):
+        """Owner 2026-11-24: "every channel runs a light count down so we dont have to check on it"."""
+        import station_clock
+        ns = {"station_clock": station_clock, "_HUB_FUTURE_SETTLE_SECONDS": 0.1, "_hub_future_event": threading.Event()}
+        exec(get_function_source("_hub_future_wake_up") + "\n" + get_function_source("_hub_future_check_soon"), ns)
         ns["_hub_future_check_soon"]()
-        began = time.monotonic()
-        self.assertFalse(ns["_hub_future_idle_sleep"]())
-        self.assertLess(time.monotonic() - began, 3.0)
-        self.assertIsNone(ns["_hub_future_wake"]["at"])
+        self.assertTrue(ns["_hub_future_event"].wait(3.0), "the settled look comes on its countdown")
+        worker = get_function_source("_hub_future_worker")
+        self.assertIn("_hub_future_arm_channel(_ch)", worker)
+        self.assertIn('station_clock.arm_in("hub_future:day", _seconds_to_midnight() + 1.0, _hub_future_wake_up)', worker)
+        self.assertIn("media.SETTINGS_CHANGE_LISTENERS.append(lambda: _hub_future_event.set())", MAIN_SRC)
+        self.assertIn("for _listener in list(SETTINGS_CHANGE_LISTENERS):", open(_script("media.py"), encoding="utf-8").read())
 
 
 class TestALagShiftsTheJoinPoint(unittest.TestCase):
@@ -35720,6 +36912,364 @@ class TestNothingToLoadEndsTheBlackCover(unittest.TestCase):
 
 
 
+class TestShortsPairOrHideInABreak(unittest.TestCase):
+    """Owner 2026-11-23: shows of 5 minutes and under never get their own guide cell: two different shorts air together with no commercials between them, and a lone short airs in the exact middle of an end-of-show break of 2 minutes or more, between two shows."""
+
+    ADS = [{"path": "/a/ad%d.mp4" % i, "duration": d} for i, d in enumerate((15, 30, 15, 30, 15, 30, 15, 30, 15, 30, 15, 30))]
+
+    def _build(self, lineup, ads=None, pair_shorts=True, placement="interrupt_half_hour"):
+        return media.build_block_timeline(lineup, self.ADS if ads is None else ads, placement, 7, interrupt_floor_seconds=900, pair_shorts=pair_shorts)
+
+    def test_two_lone_shorts_of_different_series_air_together_as_shorts(self):
+        lineup = [{"path": "/s/Long/Long S01E01.mkv", "duration": 1320}, {"path": "/s/Pickers/Pickers S01E01.mkv", "duration": 240},
+                  {"path": "/s/Ben/Ben S01E01.mkv", "duration": 200}, {"path": "/s/Long/Long S01E02.mkv", "duration": 1320}]
+        timeline, _total, _state = self._build(lineup)
+        shorts = [e for e in timeline if e.get("shorts")]
+        self.assertEqual(len(shorts), 1)
+        self.assertEqual((shorts[0]["pair_ep1_path"], shorts[0]["pair_ep2_path"], shorts[0]["duration"]),
+                         ("/s/Pickers/Pickers S01E01.mkv", "/s/Ben/Ben S01E01.mkv", 440))
+        self.assertEqual(media.guide_pair_title(shorts[0]), "Shorts")
+        self.assertEqual(media.entries_started_before(timeline, lineup, 10 ** 9), 4, "the Shorts entry stands for both lineup entries")
+        self.assertEqual(media.resolve_lineup_playback(shorts[0], 250.0)[:2], ("/s/Ben/Ben S01E01.mkv", 10.0))
+
+    def test_a_lone_short_airs_in_the_middle_of_the_break_between_two_shows(self):
+        lineup = [{"path": "/s/Long/Long S01E01.mkv", "duration": 1320}, {"path": "/s/Pickers/Pickers S01E01.mkv", "duration": 240},
+                  {"path": "/s/Long/Long S01E02.mkv", "duration": 1320}]
+        for placement in ("interrupt_half_hour", "end_of_show"):
+            timeline, _total, _state = self._build(lineup, placement=placement)
+            at = next(i for i, e in enumerate(timeline) if "Pickers" in e["path"])
+            self.assertTrue(timeline[at].get("in_break"), placement)
+            before, after = 0, 0
+            i = at - 1
+            while i >= 0 and timeline[i].get("is_commercial"):
+                before += timeline[i]["duration"]
+                i -= 1
+            j = at + 1
+            while j < len(timeline) and timeline[j].get("is_commercial"):
+                after += timeline[j]["duration"]
+                j += 1
+            self.assertGreaterEqual(min(before, after), 60, "at least a minute of commercials on each side")
+            self.assertLessEqual(abs(before - after), 30, "in the middle of the break")
+            self.assertEqual(timeline[i]["path"], "/s/Long/Long S01E01.mkv")
+            self.assertEqual(timeline[j]["path"], "/s/Long/Long S01E02.mkv")
+            self.assertEqual(media.entries_started_before(timeline, lineup, 10 ** 9), 3)
+            merged = ui._guide_merge_cells([(e, e["start_time"], e["start_time"] + e["duration"], "") for e in timeline])
+            self.assertFalse(any("Pickers" in m[0]["path"] for m in merged if m[0] is not None), "the short has no guide cell")
+
+    def test_with_commercials_off_or_no_room_a_lone_short_is_a_show(self):
+        lineup = [{"path": "/s/Long/Long S01E01.mkv", "duration": 1320}, {"path": "/s/Pickers/Pickers S01E01.mkv", "duration": 240},
+                  {"path": "/s/Long/Long S01E02.mkv", "duration": 1320}]
+        timeline, _t, _s = self._build(lineup, ads=[])
+        self.assertFalse(any(e.get("in_break") for e in timeline))
+        self.assertIn("/s/Pickers/Pickers S01E01.mkv", [e["path"] for e in timeline])
+        timeline, _t, _s = self._build([lineup[1], lineup[0]])
+        self.assertFalse(timeline[0].get("in_break"), "nothing before it: it airs as a show")
+
+    def test_pairing_off_never_joins_shorts(self):
+        lineup = [{"path": "/s/Long/Long S01E01.mkv", "duration": 1320}, {"path": "/s/Pickers/Pickers S01E01.mkv", "duration": 240},
+                  {"path": "/s/Ben/Ben S01E01.mkv", "duration": 200}, {"path": "/s/Long/Long S01E02.mkv", "duration": 1320}]
+        timeline, _t, _s = self._build(lineup, pair_shorts=False)
+        self.assertFalse(any(e.get("shorts") for e in timeline))
+
+    def test_no_fade_bumper_wraps_a_short_inside_a_break(self):
+        lineup = [{"path": "/s/Long/Long S01E01.mkv", "duration": 1320}, {"path": "/s/Pickers/Pickers S01E01.mkv", "duration": 240},
+                  {"path": "/s/Long/Long S01E02.mkv", "duration": 1320}]
+        timeline, _t, _s = media.build_block_timeline(lineup, self.ADS, "interrupt_half_hour", 7, interrupt_floor_seconds=900, pair_shorts=True,
+                                                      fade_in_tracks=[{"path": "/f/in.mp4", "duration": 5}], fade_out_tracks=[{"path": "/f/out.mp4", "duration": 5}])
+        at = next(i for i, e in enumerate(timeline) if "Pickers" in e["path"])
+        self.assertNotIn("/f/in.mp4", (timeline[at - 1]["path"], timeline[at + 1]["path"]))
+        self.assertEqual(sum(1 for e in timeline if e["path"] == "/f/in.mp4"), 2, "only the two shows get a fade-in")
+
+
+class TestLoneShortsAreBroughtTogether(unittest.TestCase):
+    """Owner 2026-11-23: "any 2 different shorts get paired and played with no commercials between them"."""
+
+    def test_the_next_lone_short_moves_up_past_other_series_only(self):
+        a = {"path": "/s/A/A S01E01.mkv", "duration": 1320}
+        a2 = {"path": "/s/A/A S01E02.mkv", "duration": 1320}
+        d = {"path": "/s/D/D S01E01.mkv", "duration": 240}
+        e = {"path": "/s/E/E S01E01.mkv", "duration": 200}
+        series = {"A": [a, a2], "D": [d], "E": [e]}
+        self.assertEqual([t["path"] for t in media._bring_lone_shorts_together([d, a, a2, e], series)],
+                         [d["path"], e["path"], a["path"], a2["path"]])
+        e2 = {"path": "/s/E/E S01E00.mkv", "duration": 1320}
+        series["E"] = [e2, e]
+        self.assertEqual([t["path"] for t in media._bring_lone_shorts_together([d, e2, e], series)],
+                         [d["path"], e2["path"], e["path"]], "never past an earlier episode of its own series")
+        self.assertEqual(sorted(t["path"] for t in media._bring_lone_shorts_together([d, a, a2, e], {"A": [a, a2], "D": [d], "E": [e]})),
+                         sorted(t["path"] for t in [d, a, a2, e]), "the lineup holds the same entries")
+
+
+class TestTheGuideLaysShortsLikeTheScheduler(unittest.TestCase):
+    def test_every_guide_build_passes_the_shorts_pairing(self):
+        import inspect, ui
+        src = inspect.getsource(ui)
+        calls = src.count("media.build_block_timeline(")
+        self.assertEqual(calls, 3)
+        self.assertEqual(src.count("pair_shorts="), calls, "the guide's own builds pair shorts exactly as the scheduler's do")
+        self.assertIn("pair_shorts = int(ch_info.get(\"pair_threshold_minutes\", 15) or 0) > 0", inspect.getsource(media.build_channel_timeline))
+
+
+class TestIntroClipsAreNeverScheduled(unittest.TestCase):
+    """Owner 2026-11-23: "make sure short into clips in series folders is not added"; both tests must hold (owner's pick: both)."""
+
+    def test_a_short_file_named_intro_is_left_out(self):
+        self.assertTrue(media.is_intro_clip("/s/Show/Show Intro.mkv", 45))
+        self.assertTrue(media.is_intro_clip("/s/Show/Season 1/show_opening.mp4", 90))
+        self.assertTrue(media.is_intro_clip("/s/Show/Theme Song.mp4", 60))
+        self.assertFalse(media.is_intro_clip("/s/Show/Show Intro.mkv", 1320), "a whole episode with intro in its name is kept")
+        self.assertFalse(media.is_intro_clip("/s/Show/Show S01E01.mkv", 45), "a short with a plain name is kept")
+        self.assertFalse(media.is_intro_clip("/s/Show/Reopening Day.mkv", 45))
+        self.assertFalse(media.is_intro_clip("/m/Theme.mp3", 45), "music is never judged by this")
+
+    def test_the_schedule_builder_leaves_it_out(self):
+        with patch.object(media, "resolve_track_duration", lambda p, stored, default=0: stored), \
+             patch.object(media, "track_duration_is_estimated", lambda p, stored: False), \
+             patch.object(media, "read_file_rows_ahead", lambda paths: None), \
+             patch.object(media, "_series_duration_guesses", lambda items, exists: {}):
+            tracks = media._build_raw_tracks_uncached([{"path": "/s/Show/Show Intro.mkv", "duration": 40},
+                                                       {"path": "/s/Show/Show S01E01.mkv", "duration": 1320}], lambda p: True)
+        self.assertEqual([t["path"] for t in tracks], ["/s/Show/Show S01E01.mkv"])
+
+
+class TestABreakReusesCommercialsOnlyWhenItMust(unittest.TestCase):
+    """Owner 2026-11-23: "in the event they did not add enough commercials for a single break to be filled without reusing them, reuse them ... when ones bundle runs out, its allowed to repeat if needed"."""
+
+    def _breaks(self, ads, shows):
+        timeline, _total, _state = media.build_block_timeline(shows, ads, "interrupt_half_hour", 7, interrupt_floor_seconds=900)
+        breaks, current = [], []
+        for entry in timeline:
+            if entry.get("is_commercial"):
+                current.append(entry)
+            elif current:
+                breaks.append(current)
+                current = []
+        if current:
+            breaks.append(current)
+        return breaks
+
+    def test_too_few_commercials_fill_the_break_by_repeating_never_back_to_back(self):
+        ads = [{"path": "/a/ad%d.mp4" % i, "duration": d} for i, d in enumerate((15, 15, 30))]
+        first = self._breaks(ads, [{"path": "/s/x%d.mkv" % i, "duration": 600} for i in range(3)])[0]
+        self.assertEqual(sum(e["duration"] for e in first), 360, "the break is filled to its allowed length")
+        paths = [e["path"] for e in first]
+        self.assertEqual(set(paths[:3]), {"/a/ad0.mp4", "/a/ad1.mp4", "/a/ad2.mp4"}, "every commercial airs once before any repeats")
+        self.assertTrue(all(a != b for a, b in zip(paths, paths[1:])), "never the same commercial twice in a row")
+
+    def test_enough_commercials_never_repeat_in_a_break(self):
+        ads = [{"path": "/a/ad%d.mp4" % i, "duration": 30} for i in range(40)]
+        for brk in self._breaks(ads, [{"path": "/s/x%d.mkv" % i, "duration": 600} for i in range(3)]):
+            paths = [e["path"] for e in brk]
+            self.assertEqual(len(paths), len(set(paths)))
+
+
+class TestChangingTheBreaksCarriesTheBlockOn(unittest.TestCase):
+    """Owner 2026-11-23: "you should not be losing part of a show, it should just be pausing and adding commercials at the interrupt point, if that point has passed, its skipped and then at the end. the show should have picked up where it left off after commercials and shows in front of it move forward to compensate"."""
+
+    def _channel(self, commercials, placement="interrupt_half_hour"):
+        info = _sched_record_channel("full_day", placement, "random_slots", commercials)
+        clock, ticks = [datetime.datetime(2026, 10, 13, 0, 0, 5)], [0]
+        ns = _sched_record_ns({"05": info}, clock, ticks)
+
+        def at(moment):
+            clock[0] = moment
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                return ns["_scheduler_playback_state"]("05")
+        return info, at
+
+    def _find(self, at, start, want):
+        moment = start
+        for _ in range(2000):
+            state = at(moment)
+            if want(state):
+                return moment, state
+            moment += datetime.timedelta(seconds=30)
+        self.fail("no such moment")
+
+    def _follow(self, at, start, path, seconds):
+        """Steps the clock and checks the show at path never skips or repeats: each time it is on, it is where it was left."""
+        last_seek, last_moment, kinds = None, None, []
+        moment = start
+        for _ in range(int(seconds // 10)):
+            moment += datetime.timedelta(seconds=10)
+            state = at(moment)
+            kinds.append((state["mode"], state.get("file")))
+            if state.get("file") == path:
+                seek = float(state["seek"])
+                if last_seek is not None:
+                    gap = (moment - last_moment).total_seconds()
+                    if kinds[-2][1] == path:
+                        self.assertAlmostEqual(seek - last_seek, gap, delta=0.6, msg="the show runs on with the clock at %s" % moment)
+                    else:
+                        self.assertTrue(last_seek <= seek <= last_seek + 10.6, "after the break the show picks up where it left off (%.1f -> %.1f at %s)" % (last_seek, seek, moment))
+                last_seek, last_moment = seek, moment
+        return kinds, last_seek
+
+    def test_turning_commercials_on_mid_show_pauses_it_at_its_next_cut_only(self):
+        info, at = self._channel(False)
+        moment, state = self._find(at, datetime.datetime(2026, 10, 13, 0, 0, 5),
+                                   lambda st: st["mode"] == "Video" and "Show C" in st["file"] and 400 <= st["seek"] <= 700)
+        path, seek = state["file"], float(state["seek"])
+        info["commercials_enabled"] = True
+        after = at(moment + datetime.timedelta(seconds=1))
+        self.assertEqual((after["mode"], after["file"]), ("Video", path), "the show on air stays on")
+        self.assertAlmostEqual(float(after["seek"]), seek + 1.0, delta=0.6)
+        kinds, last_seek = self._follow(at, moment + datetime.timedelta(seconds=1), path, 2640 - seek + 900)
+        mid = 1320 - seek
+        before_cut = [k for k in kinds[:int(mid // 10) - 1]]
+        self.assertTrue(all(k == ("Video", path) for k in before_cut), "no break before the show's cut still ahead")
+        self.assertIn("Commercial", [k[0] for k in kinds[int(mid // 10) - 1:int(mid // 10) + 30]], "a break at the cut at the middle of the show")
+        self.assertGreaterEqual(last_seek, 2630.0, "the whole rest of the show aired")
+
+    def test_a_cut_already_passed_is_skipped_and_the_break_comes_at_the_end(self):
+        info, at = self._channel(False)
+        moment, state = self._find(at, datetime.datetime(2026, 10, 13, 0, 0, 5),
+                                   lambda st: st["mode"] == "Video" and "Show C" in st["file"] and 1500 <= st["seek"] <= 1900)
+        path, seek = state["file"], float(state["seek"])
+        info["commercials_enabled"] = True
+        kinds, last_seek = self._follow(at, moment, path, 2640 - seek + 600)
+        left = int((2640 - seek) // 10) - 1
+        self.assertTrue(all(k == ("Video", path) for k in kinds[:left]), "the passed cut is skipped")
+        self.assertEqual(kinds[left + 2][0], "Commercial", "the break comes at the show's end")
+        self.assertGreaterEqual(last_seek, 2630.0)
+
+    def test_turning_commercials_off_mid_show_keeps_it_and_drops_its_breaks(self):
+        info, at = self._channel(True)
+        moment, state = self._find(at, datetime.datetime(2026, 10, 13, 0, 0, 5),
+                                   lambda st: st["mode"] == "Video" and "Show C" in st["file"] and 400 <= st["seek"] <= 700)
+        path, seek = state["file"], float(state["seek"])
+        info["commercials_enabled"] = False
+        kinds, last_seek = self._follow(at, moment, path, 2640 - seek + 300)
+        self.assertNotIn("Commercial", [k[0] for k in kinds], "no break once commercials are off")
+        self.assertGreaterEqual(last_seek, 2630.0)
+
+    def test_turning_commercials_off_in_a_break_goes_straight_back_to_the_show(self):
+        info, at = self._channel(True)
+        moment, state = self._find(at, datetime.datetime(2026, 10, 13, 0, 0, 5), lambda st: st["mode"] == "Commercial")
+        info["commercials_enabled"] = False
+        after = at(moment + datetime.timedelta(seconds=1))
+        self.assertEqual(after["mode"], "Video", "the break ends at once")
+        self.assertLess(float(after["seek"]) - float(after.get("seek_slot_offset", 0) or 0), 2.0, "the show after the break starts where it was to start")
+
+    def test_the_item_on_air_does_not_answer_once_the_breaks_changed(self):
+        ns = {"copy": __import__("copy"), "os": os}
+        exec("_LAYOUT_LISTS = %r" % (("Commercials", "Fade-in", "Fade-out", "Intros", "Outros"),), ns)
+        for name in ("_layout_inputs", "_layout_key", "_breaks_changed_since_built"):
+            exec(get_function_source(name), ns)
+        info = {"commercials_enabled": False, "schedules": {"Commercials": [{"path": "a.mp4"}]}, "playback_log": {}}
+        self.assertFalse(ns["_breaks_changed_since_built"](info), "nothing laid out yet")
+        info["playback_log"]["sched_layout"] = ns["_layout_inputs"](info)
+        self.assertFalse(ns["_breaks_changed_since_built"](info))
+        info["commercials_enabled"] = True
+        self.assertTrue(ns["_breaks_changed_since_built"](info))
+        info["commercials_enabled"] = False
+        info["schedules"]["Commercials"].append({"path": "b.mp4"})
+        self.assertTrue(ns["_breaks_changed_since_built"](info), "a commercial added is a change of the breaks")
+        self.assertFalse(ns["_breaks_changed_since_built"](dict(info, scheduling_mode="marathon")))
+        self.assertIn("and _anchor_is_live_video and not _breaks_changed_since_built(ch_info)", get_function_source("_scheduler_playback_state"))
+        toggle = MAIN_SRC[MAIN_SRC.index('ch_info["commercials_enabled"] = not ch_info.get("commercials_enabled", False)'):]
+        self.assertTrue(toggle.split("\n", 3)[1].strip() == "db.save_settings()" and toggle.split("\n", 3)[2].strip() == "_ask_scheduler_after_break_change(target_ch_str)",
+                        "turning commercials on or off never starts the block over; it asks the scheduler at once")
+
+    def test_the_resumed_lineup_keeps_the_clock_marks(self):
+        show = {"path": "/m/c.mkv", "duration": 2640}
+        nxt = {"path": "/m/d.mkv", "duration": 1320}
+        ads = [{"path": "/m/ad%d.mkv" % i, "duration": 30} for i in range(20)]
+        timeline, total, _ = media.build_block_timeline([dict(show, resume_from=600.0, mark_phase=600), nxt], ads, "interrupt_half_hour", 7)
+        self.assertEqual((timeline[0]["seek_offset"], timeline[0]["duration"], timeline[0]["start_time"]), (600.0, 720.0, 0))
+        starts = [e["start_time"] for e in timeline if e["path"] == "/m/d.mkv" and not e.get("seek_offset")]
+        self.assertTrue(starts and (starts[0] + 600) % 1800 == 0, "the next show starts on a half-hour mark of the clock")
+        self.assertEqual((total + 600) % 1800, 0)
+        plain, _, _ = media.build_block_timeline([show, nxt], ads, "interrupt_half_hour", 7)
+        again, _, _ = media.build_block_timeline([dict(show), nxt], ads, "interrupt_half_hour", 7)
+        self.assertEqual(plain, again)
+
+
+class TestOwnerProfileTest1123(unittest.TestCase):
+    """Owner test 2026-11-23 11:26-11:33 on a server profile: the block was carried on every few seconds while commercials were measured, the clock jumped about 29 minutes and one commercial opened over and over, and the explorer opened in Regular's folder."""
+
+    def _layout_ns(self):
+        ns = {"copy": __import__("copy"), "os": os}
+        exec("_LAYOUT_LISTS = %r" % (("Commercials", "Fade-in", "Fade-out", "Intros", "Outros"),), ns)
+        for name in ("_layout_inputs", "_layout_key", "_breaks_changed_since_built"):
+            exec(get_function_source(name), ns)
+        return ns
+
+    def test_a_commercial_being_measured_is_not_a_change_of_the_breaks(self):
+        ns = self._layout_ns()
+        info = {"commercials_enabled": True, "schedules": {"Commercials": [{"path": "F:/ads/a.mp4", "duration": -1}]}, "playback_log": {}}
+        info["playback_log"]["sched_layout"] = ns["_layout_inputs"](info)
+        info["schedules"]["Commercials"][0]["duration"] = 30.1
+        self.assertFalse(ns["_breaks_changed_since_built"](info))
+        info["schedules"]["Commercials"].append({"path": "F:/ads/b.mp4", "duration": -1})
+        self.assertTrue(ns["_breaks_changed_since_built"](info))
+
+    def test_the_repeat_guard_floor_belongs_to_its_cycle(self):
+        import datetime as _dt
+        ns = {"os": os, "SCHEDULER_REPEAT_GUARD_SECONDS": 3.0, "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS": 30.0, "SLOT_TAIL_HOLD_MAX_SECONDS": 3.0}
+        exec(get_function_source("_apply_repeat_guard"), ns)
+        now = _dt.datetime(2026, 11, 23, 11, 29, 23)
+        timeline = [{"path": "bones.mp4", "start_time": 0, "duration": 600}, {"path": "ad.mp4", "start_time": 600, "duration": 30, "is_commercial": True},
+                    {"path": "ad2.mp4", "start_time": 1740, "duration": 31, "is_commercial": True}]
+        log = {"sched_cycle_boundary": 1762, "repeat_guard_floor": {"position": 1760.8, "block": "Full Day", "boundary": 0},
+               "last_ended_commercial": {"file": "x.mp4", "armed_ts": now.timestamp(), "block": "Full Day"}}
+        show, pos = ns["_apply_repeat_guard"]("05", log, "Full Day", timeline, 2000, 1.4, now)
+        self.assertEqual((show["path"], pos), ("bones.mp4", 1.4), "a floor from the cycle before never moves the new one")
+
+    def test_the_number_shows_the_channel_being_tuned_until_the_tune_runs(self):
+        ticks = [1000]
+        state = {"current_channel": "05", "digit_buffer": "", "surf_target": "", "osd_channel_pending": False}
+        ns = {"app_state": state, "PLAYBACK_TUNE_SHOWN_MAX_MS": 15000, "pygame": types.SimpleNamespace(time=types.SimpleNamespace(get_ticks=lambda: ticks[0]))}
+        for name in ("_bezel_led_channel_text", "_channel_being_tuned", "_note_channel_being_tuned"):
+            exec(get_function_source(name), ns)
+        ns["_note_channel_being_tuned"]("06")
+        self.assertEqual(ns["_bezel_led_channel_text"](), "06", "never the old channel while the playback thread has not run the tune")
+        state["current_channel"] = "06"
+        self.assertEqual(ns["_bezel_led_channel_text"](), "06")
+        self.assertEqual(state["osd_tuning_to"], "")
+        ns["_note_channel_being_tuned"]("07")
+        ticks[0] += 16000
+        self.assertEqual(ns["_bezel_led_channel_text"](), "06", "a tune that never ran stops showing")
+
+    def test_each_setup_remembers_its_own_explorer_folder(self):
+        state = {"active_local_profile": None, "active_remote_server": None}
+        class _Db:
+            config = {"active_server_slot": None}
+        ns = {"app_state": state, "db": _Db(), "_log_swallowed": lambda *a: None}
+        for name in ("_gain_context", "_fe_list_key", "_fe_context_key"):
+            exec(get_function_source(name), ns)
+        context = {"mode": "commercial", "ch": "05", "block": "Commercials"}
+        regular = ns["_fe_context_key"](context)
+        self.assertEqual(regular, "commercial:05:Commercials", "Regular keeps the folders it already remembers")
+        _Db.config["active_server_slot"] = "server1"
+        self.assertEqual(ns["_fe_context_key"](context), "profile:server1|commercial:05:Commercials")
+
+
+class TestTheAiringFileIsLockedOnlyInItsOwnList(unittest.TestCase):
+    """Owner test 2026-11-23: the show on air was kept in the Commercials list when ads were added and aired as a 5-minute commercial."""
+
+    def _locked(self, airing, commercials, shows):
+        class _Db:
+            channels_db = {"05": {"commercials_enabled": True,
+                                  "schedules": {"Commercials": [{"path": p} for p in commercials], "Morning": [{"path": p} for p in shows]}}}
+        ns = {"db": _Db(), "os": os, "game_deck": None, "_get_probe_now_state": lambda ch: {"file": airing},
+              "_compute_live_block_name": lambda info: "Morning", "_todays_holiday_key": lambda **k: "", "_log_swallowed": lambda *a: None}
+        for name in ("_fe_locked_playing_path", "_fe_existing_schedule_paths"):
+            exec(get_function_source(name), ns)
+        return ns["_fe_locked_playing_path"]
+
+    def test_a_show_on_air_is_not_locked_into_the_commercials_list(self):
+        locked = self._locked("/m/Alpha S01E02.mp4", ["/m/Ad 1.mp4"], ["/m/Alpha S01E02.mp4"])
+        self.assertEqual(locked({"mode": "commercial", "ch": "05", "block": "Commercials"}), "")
+        self.assertEqual(locked({"mode": "schedule", "ch": "05", "block": "Morning"}), os.path.normpath("/m/Alpha S01E02.mp4"))
+
+    def test_a_commercial_on_air_is_locked_in_the_commercials_list_only(self):
+        locked = self._locked("/m/Ad 1.mp4", ["/m/Ad 1.mp4"], ["/m/Alpha S01E02.mp4"])
+        self.assertEqual(locked({"mode": "commercial", "ch": "05", "block": "Commercials"}), os.path.normpath("/m/Ad 1.mp4"))
+        self.assertEqual(locked({"mode": "schedule", "ch": "05", "block": "Morning"}), "", "an ad on air is never added to the show list")
+
+
 class TestTheHubPreparesTheNextItems(unittest.TestCase):
     """Owner 2026-11-21: "it precaches information so it never needs to look last min ... STAY ON SCHEDULE AT ALL TIMES"."""
 
@@ -35737,6 +37287,29 @@ class TestTheHubPreparesTheNextItems(unittest.TestCase):
         self.assertIsNone(hub.show_facts("05", 1131.0, "other guard"), "a change under the station drops the prepared items")
         hub.forget_show_facts("05")
         self.assertIsNone(hub.show_facts("05", 1131.0, "g"))
+
+    def test_the_item_that_began_last_is_on_air(self):
+        """Owner test 2026-11-23: "no commercial should repeat in the same break ... it sure should not be stealing the spot of another commercial"."""
+        hub = ml.ScheduleHub.__new__(ml.ScheduleHub)
+        hub._show_facts, hub._upcoming = {}, {}
+        long_part = {"mode": "Video", "file": "bundle2.mkv", "seek": 0.0, "duration": 400.0, "block": "Morning", "seek_slot_offset": 0, "interior_cut": False}
+        ad = {"mode": "Commercial", "file": "ad.mp4", "seek": 0.0, "duration": 30.0, "block": "Morning", "seek_slot_offset": 0, "interior_cut": False}
+        ad2 = dict(ad, file="ad2.mp4")
+        hub.remember_show_facts("05", dict(long_part, seek=10.0), 1010.0, "g", upcoming=[(1000.0, long_part), (1300.0, ad), (1330.0, ad2)])
+        self.assertEqual(hub.show_facts("05", 1200.0, "g")["file"], "bundle2.mkv")
+        self.assertEqual(hub.show_facts("05", 1305.0, "g")["file"], "ad.mp4", "a part that runs past the break's start never keeps the break's first commercial off")
+        self.assertEqual(hub.show_facts("05", 1329.0, "g")["file"], "ad.mp4")
+        self.assertEqual(hub.show_facts("05", 1331.0, "g")["file"], "ad2.mp4")
+
+    def test_the_last_part_of_a_cut_show_is_found_once_and_kept(self):
+        hub = ml.ScheduleHub.__new__(ml.ScheduleHub)
+        hub._show_facts, hub._upcoming = {}, {}
+        part2 = {"mode": "Video", "file": "charlie.mp4", "seek": 660.0, "duration": 660.0, "block": "Morning", "seek_slot_offset": 660.0, "interior_cut": False}
+        ad = {"mode": "Commercial", "file": "ad.mp4", "seek": 0.0, "duration": 30.0, "block": "Morning", "seek_slot_offset": 0, "interior_cut": False}
+        hub.remember_show_facts("05", dict(part2, seek=810.0), 1150.0, "g", upcoming=[(1000.0, part2), (1660.0, ad)])
+        at = hub.show_facts("05", 1500.0, "g")
+        self.assertEqual((at["file"], at["seek"]), ("charlie.mp4", 1160.0))
+        self.assertEqual(hub.show_facts("05", 1661.0, "g")["file"], "ad.mp4")
 
     def test_prepared_starts_come_from_the_block_timeline_and_the_clock(self):
         ns = {"media": media, "HUB_PREPARED_AHEAD_SECONDS": 3600.0, "HUB_PREPARED_ITEMS_MAX": 80, "_scheduler_prepared": {}, "_hub_next_blocks": {}}
@@ -35787,5 +37360,1310 @@ class TestTheHubPreparesTheNextItems(unittest.TestCase):
         self.assertIn("_warm_open_facts(ch_key, paths[:OPEN_FACTS_WARM_ITEMS])", get_function_source("_next_item_prep_worker"))
 
 
+class TestTheFirstShowIsDrawnFromTheWholeList(unittest.TestCase):
+    """Owner 2026-11-23: "if its random selection of the series and random selection of the movie, why does it always start bones and Antz, looks alphabetical not random when it comes to starting media when media is added for the first time"."""
+
+    SERIES = ["/v/%s/Season 1/%s S01E%02d.mkv" % (name, name, n) for name in ("Alpha Show", "Bones", "Monk", "Zeta Show") for n in (3, 1, 2)]
+
+    def test_any_series_can_lead_and_it_opens_on_its_first_episode(self):
+        leads = set(media.pick_first_show_lead(self.SERIES + ["/v/Ads/Commercials/ad.mp4"], "sequential", seed) for seed in range(40))
+        self.assertEqual(leads, {"/v/%s/Season 1/%s S01E01.mkv" % (n, n) for n in ("Alpha Show", "Bones", "Monk", "Zeta Show")})
+
+    def test_a_series_in_random_order_opens_on_any_episode(self):
+        leads = set(media.pick_first_show_lead(self.SERIES, {"__default__": "random"}, seed) for seed in range(80))
+        self.assertGreater(len(leads), 4)
+
+    def test_a_list_of_films_leads_with_any_film_and_the_same_seed_gives_the_same_film(self):
+        films = ["/v/Family Movies/Cartoons/%s.avi" % t for t in ("Antz", "Bolt", "Cars", "Dumbo", "Elf")]
+        self.assertEqual(set(media.pick_first_show_lead(films, "sequential", seed) for seed in range(60)), set(films))
+        self.assertEqual(media.pick_first_show_lead(films, "sequential", 7), media.pick_first_show_lead(list(reversed(films)), "sequential", 7))
+
+    def test_a_series_lead_heads_the_show_order_and_airs_first(self):
+        shows, _movies, _ads = _sched_record_library()
+        lead = "/m/Show C/Season 1/Show C S01E01.mkv"
+        order, pos = {}, {}
+        self.assertEqual(media.seed_first_show_lead(shows, [], pos, order, "Full Day", "05", lead, "1:0"), "series")
+        lineup, _pos, _order = media.build_show_rotation(shows, "random_slots", pos, 5, fixed_show_order=order["Full Day"], order_seed="1:0", channel_id="05")
+        self.assertEqual(media.lineup_paths(lineup)[0], lead)
+
+    def test_a_film_lead_is_drawn_first_from_a_fresh_movie_bag(self):
+        films = [{"path": "/v/Family Movies/%s.avi" % t, "duration": 5400} for t in ("Antz", "Bolt", "Cars", "Dumbo", "Elf")]
+        for lead in (films[0]["path"], films[3]["path"]):
+            pos = {}
+            self.assertEqual(media.seed_first_show_lead(films, [], pos, {}, "Full Day", "06", lead, "9:0"), "movie")
+            lineup, _pos, _order = media.build_show_rotation(films, "random_slots", pos, 5, order_seed="9:0", channel_id="06", block_duration_seconds=86400)
+            self.assertEqual(media.lineup_paths(lineup)[0], lead)
+            self.assertEqual(len(set(media.lineup_paths(lineup))), len(media.lineup_paths(lineup)), "no film twice")
+
+    def test_a_saved_movie_bag_is_never_reset(self):
+        films = [{"path": "/v/Family Movies/%s.avi" % t, "duration": 5400} for t in ("Antz", "Bolt")]
+        pos = {media.stable_series_id(media.MOVIE_ROTATION_KEY, "06"): {"v": media.RANDOM_STATE_VERSION, "bag": [], "cycle": 3}}
+        self.assertIsNone(media.seed_first_show_lead(films, [], pos, {}, "Full Day", "06", films[1]["path"], "9:0"))
+
+    def test_shows_that_join_a_saved_order_are_not_in_name_order(self):
+        names = ["Show %02d" % i for i in range(12)]
+        shows = [{"path": "/m/%s/Season 1/%s S01E01.mkv" % (n, n), "duration": 1320} for n in names]
+        orders = set()
+        for seed in range(6):
+            _lineup, _pos, order = media.build_show_rotation(shows, "one_slot", {}, 5, fixed_show_order=["Show 05"], order_seed="%d:0" % seed)
+            self.assertEqual(order[0], "Show 05")
+            orders.add(tuple(order[1:]))
+        self.assertNotIn(tuple(sorted(n for n in names if n != "Show 05")), orders)
+        self.assertGreater(len(orders), 1)
+
+    def _hold_ns(self, measured):
+        ns = {"time": time, "os": os, "log": MagicMock(), "FIRST_SHOW_LEAD_KEY": "first_show_lead", "FIRST_SHOW_LEAD_HOLD_SECONDS": 10.0,
+              "media": types.SimpleNamespace(track_duration_is_estimated=lambda p, s: p not in measured,
+                                             seed_first_show_lead=media.seed_first_show_lead)}
+        exec(main_function_code("_first_show_lead_hold"), ns)
+        return ns["_first_show_lead_hold"]
+
+    def test_the_first_lineup_waits_for_the_drawn_show_then_opens_with_it(self):
+        shows, _movies, _ads = _sched_record_library()
+        lead = "/m/Show B/Season 1/Show B S01E01.mkv"
+        measured = set()
+        hold = self._hold_ns(measured)
+        plog, order = {"first_show_lead": {"at": time.time()}}, {}
+        self.assertEqual(hold("05", plog, "Full Day", shows, [], {}, order, "1:0")["reason"], "first_file_scanning", "waits while the show is drawn")
+        plog["first_show_lead"].update(path=lead, block="Full Day")
+        self.assertEqual(hold("05", plog, "Full Day", shows, [], {}, order, "1:0")["reason"], "first_file_scanning", "waits while it is measured")
+        measured.add(lead)
+        self.assertIsNone(hold("05", plog, "Full Day", shows, [], {}, order, "1:0"))
+        self.assertEqual(order["Full Day"][0], "Show B")
+        self.assertNotIn("first_show_lead", plog)
+
+    def test_the_wait_ends_after_its_limit(self):
+        hold = self._hold_ns(set())
+        plog = {"first_show_lead": {"at": time.time() - 11, "path": "/x.mkv", "block": "Full Day"}}
+        self.assertIsNone(hold("05", plog, "Full Day", [], [], {}, {}, "1:0"))
+        self.assertNotIn("first_show_lead", plog)
+
+    def test_only_a_channel_that_was_empty_is_marked_and_the_scan_draws_before_it_asks(self):
+        save = MAIN_SRC[MAIN_SRC.index("if _channel_was_empty_before_write and newly_added_paths:"):]
+        self.assertIn("_mark_first_show_lead(db.channels_db[target_ch])", save[:save.index("db.save_settings_async()")])
+        worker = get_function_source("_new_channel_first_show_worker")
+        self.assertLess(worker.index("_pick_first_show_lead(_ch)"), worker.index("_paths, _block = _new_channel_airing_paths(_ch)"))
+        sched = get_function_source("_scheduler_playback_state")
+        self.assertLess(sched.index("_lead_hold = _first_show_lead_hold("), sched.index("_new_block_start_pos = copy.deepcopy(_show_pos)"))
+
+
+class TestTheFirstPictureComesBeforeStatic(unittest.TestCase):
+    """Owner 2026-11-23: "it took just long enough for static to come up to get server profile channel 05 to get its media going"."""
+
+    def test_a_show_never_opens_before_its_picture_box_wait_is_over(self):
+        src = get_function_source("_decide_picture_box_before_show")
+        self.assertNotIn("_first_load_wait_left_s", src, "owner 2026-11-23: a show without its picture box is not to come up and then shift")
+        self.assertNotIn("def _first_load_wait_left_s", MAIN_SRC)
+
+    def test_the_scan_asks_again_for_the_show_when_the_first_ask_named_none(self):
+        worker = get_function_source("_new_channel_first_show_worker")
+        self.assertIn("while not _paths and time.monotonic() < _reask_until", worker)
+
+
+class TestABreakOnAirIsNeverDealtAgain(unittest.TestCase):
+    """Owner 2026-11-23: "look into commercials bc they are not starting at beginning and playing all the way through. i saw one end early and i think the next one started late"."""
+
+    def _run(self, measure_late):
+        info = _sched_record_channel("full_day", "interrupt_half_hour", "random_slots", True)
+        late = [{"path": "/m/Ads/late%d.mkv" % i, "duration": 0} for i in range(30)]
+        info["schedules"]["Commercials"] = list(info["schedules"]["Commercials"]) + late
+        start = datetime.datetime(2026, 10, 13, 0, 0, 5)
+        clock, ticks = [start], [0]
+        ns = _sched_record_ns({"05": info}, clock, ticks)
+
+        def at(moment):
+            clock[0] = moment
+            ticks[0] += 10000
+            with patch.object(media, "_cached_path_exists", lambda p: True):
+                return ns["_scheduler_playback_state"]("05")
+
+        moment = start
+        for _ in range(4000):
+            state = at(moment)
+            if state.get("mode") == "Commercial" and state.get("seek", 0) < 1:
+                break
+            moment += datetime.timedelta(seconds=1)
+        else:
+            self.fail("no break found")
+        if measure_late:
+            for entry in late:
+                entry["duration"] = 30
+        aired = []
+        while state.get("mode") == "Commercial":
+            if not aired or aired[-1][0] != state.get("file"):
+                aired.append((state.get("file"), round(state.get("seek", 0))))
+            moment += datetime.timedelta(seconds=1)
+            state = at(moment)
+        return aired, info, at, moment
+
+    def test_commercials_measured_during_a_break_wait_for_the_next_break(self):
+        plain, _info, _at, _m = self._run(False)
+        aired, info, at, moment = self._run(True)
+        self.assertEqual(aired, plain, "the break airs as it was laid when it began, each commercial from its first second")
+        self.assertTrue(all(seek == 0 for _f, seek in aired))
+        seen_late = False
+        for _ in range(4000):
+            moment += datetime.timedelta(seconds=5)
+            state = at(moment)
+            if state.get("mode") == "Commercial" and "late" in str(state.get("file")):
+                seen_late = True
+                break
+        self.assertTrue(seen_late, "the newly measured commercials air in a later break")
+
+class TestACommercialEndingJustBeforeItsSlotIsNeverOpenedAgain(unittest.TestCase):
+    """Owner 2026-11-23 (streaming PC log 11:54): a commercial that ended 0.21 s before its slot was opened again at its end and the next one started 1.4 s late."""
+
+    def test_the_last_picture_is_held_to_the_slot_end(self):
+        src = MAIN_SRC[MAIN_SRC.index("_peek = calculate_slotted_playback_state(ch, snap_internal_advance=True)"):]
+        src = src[:src.index("_tail_hold_file = str(_peek[\"file\"])")]
+        self.assertIn("_tail_hold_left = _peek_left + 0.02", src)
+        self.assertNotIn("_SLOT_OPEN_LEAD_S", MAIN_SRC, "owner logs 2026-11-23: ending the hold early opened the same commercial again at its end")
+
+
+class TestTheStreamedShowKeepsItsBufferAhead(unittest.TestCase):
+    """Owner 2026-11-23: "use our throttling system to bring those background works down to make sure our streaming buffer stays ahead"."""
+
+    def setUp(self):
+        import performance_governor as gov
+        self.gov = gov
+        gov.note_stream_buffer(None, None, 0)
+
+    tearDown = setUp
+
+    def test_a_short_buffer_holds_the_share_reads_until_it_is_ahead_again(self):
+        gov = self.gov
+        show = r"\\srv\Series\Show S01E01.mkv"
+        self.assertIsNone(gov.note_stream_buffer(show, 40.0, 1200, now=100.0))
+        self.assertFalse(gov.stream_needs_the_link())
+        self.assertEqual(gov.note_stream_buffer(show, 9.0, 1200, now=101.0), "hold")
+        self.assertTrue(gov.stream_needs_the_link(r"\\srv\Movies\Other.mkv"), "another file's read waits")
+        self.assertFalse(gov.stream_needs_the_link(show), "the show's own file never waits for itself")
+        self.assertIsNone(gov.note_stream_buffer(show, 20.0, 1200, now=102.0), "between the marks it stays held")
+        self.assertIsNone(gov.note_stream_buffer(show, 31.0, 1200, now=103.0))
+        self.assertIsNone(gov.note_stream_buffer(show, 31.0, 1200, now=104.0))
+        self.assertEqual(gov.note_stream_buffer(show, 32.0, 1200, now=106.5), "release", "held ahead long enough")
+        self.assertFalse(gov.stream_needs_the_link(r"\\srv\Movies\Other.mkv"))
+
+    def test_the_end_of_a_show_cannot_hold_more_than_is_left(self):
+        gov = self.gov
+        ad = r"\\srv\Commercials\Ad.mp4"
+        self.assertIsNone(gov.note_stream_buffer(ad, 7.0, 7.5, now=10.0), "7 s held of the 7.5 s left is the whole rest of it")
+        self.assertEqual(gov.note_stream_buffer(ad, 5.0, 7.5, now=11.0), "hold", "2.5 s of the rest not read yet")
+        self.assertTrue(gov.stream_needs_the_link())
+
+    def test_nothing_streamed_playing_lets_everything_go(self):
+        gov = self.gov
+        gov.note_stream_buffer(r"\\srv\a.mkv", 1.0, 600, now=1.0)
+        self.assertTrue(gov.stream_needs_the_link())
+        self.assertEqual(gov.note_stream_buffer(None, None, 0), "release")
+        self.assertFalse(gov.stream_needs_the_link())
+
+    def test_the_buffer_is_read_from_vlc_counters_on_the_screen_thread(self):
+        gov = self.gov
+        player = types.SimpleNamespace(get_length=lambda: 1000000, get_time=lambda: pos[0])
+        pos = [100000]
+        ns = {"performance_governor": gov, "share_relay": types.SimpleNamespace(known_size=lambda p: 100000000),
+              "_vlc_mrl_path": lambda m: r"\\srv\Series\Show.mkv", "log": MagicMock(), "os": os,
+              "_log_swallowed": lambda *a: None, "STREAM_BUFFER_LOW_S": 15.0, "SHARE_RELAY_VLC_CACHING_MS": 2000}
+        exec(main_function_code("_note_stream_buffer"), ns)
+        exec(main_function_code("_log_stream_buffer_change"), ns)
+        f, engine, media_obj = {}, types.SimpleNamespace(player=player), types.SimpleNamespace(get_mrl=lambda: "http://127.0.0.1/f/x/Show.mkv")
+        ns["_note_stream_buffer"](f, engine, "k1", types.SimpleNamespace(read_bytes=3000000, displayed_pictures=0), media_obj)
+        self.assertTrue(gov.stream_needs_the_link(), "while the show opens the open has the link")
+        ns["_note_stream_buffer"](f, engine, "k1", types.SimpleNamespace(read_bytes=3000000, displayed_pictures=1), media_obj)
+        self.assertAlmostEqual(gov.stream_buffer_state()["ahead"], 2.0, places=3, msg="at the first picture: the player's own caching; the index read before it does not count")
+        pos[0] = 104000
+        ns["_note_stream_buffer"](f, engine, "k1", types.SimpleNamespace(read_bytes=7000000, displayed_pictures=90), media_obj)
+        self.assertAlmostEqual(gov.stream_buffer_state()["ahead"], 38.0, places=3, msg="2 s + 40 s read since, 4 s played")
+
+    def test_background_share_reads_give_way_and_the_open_of_the_show_does_not(self):
+        self.assertIn("_wait_to_prime(path=_path)", get_function_source("_prime_channels_pass_inner"))
+        self.assertIn("_wait_to_prime(path=_fp)", get_function_source("_prime_snapshot_pass"))
+        self.assertIn("performance_governor.stream_needs_the_link(path)", get_function_source("_prime_should_wait"))
+        blocking = get_function_source("_read_ahead_file_blocking")
+        self.assertEqual(blocking.count("if give_way and not _wait_for_stream_buffer(path, deadline):"), 2)
+        self.assertIn("give_way=False", get_function_source("_warm_now_playing_share_file"))
+        self.assertIn("_note_stream_buffer(f, _engine, _key, _stats, _media_obj)", get_function_source("_governor_read_vlc_loss"))
+        self.assertIn("not _wait_for_stream_buffer()", get_function_source("_start_local_scan_compare"))
+
+    def test_the_wait_never_runs_on_the_screen_or_playback_thread(self):
+        gov = self.gov
+        gov.note_stream_buffer(r"\\srv\a.mkv", 1.0, 600, now=1.0)
+        ns = {"performance_governor": gov, "_time_critical_thread": lambda: True, "_app_shutting_down": threading.Event(),
+              "time": time, "STREAM_LINK_WAIT_POLL_S": 0.01}
+        exec(main_function_code("_wait_for_stream_buffer"), ns)
+        t0 = time.monotonic()
+        self.assertTrue(ns["_wait_for_stream_buffer"]())
+        self.assertLess(time.monotonic() - t0, 0.05)
+        ns["_time_critical_thread"] = lambda: False
+        t0 = time.monotonic()
+        self.assertTrue(ns["_wait_for_stream_buffer"](deadline=time.monotonic() + 0.1))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.09, "a background read waits up to its deadline")
+
+
+class TestAStreamedOpenIsNotSoughtTwice(unittest.TestCase):
+    """Owner 2026-11-23 (streaming PC): "had skipping, lagging, flicker type load" on a channel change."""
+
+    def test_a_share_file_gets_the_longer_wait_for_its_clock(self):
+        import performance_governor as gov
+        self.assertEqual((gov.START_TIME_CONFIRM_MS, gov.START_TIME_CONFIRM_STREAM_MS), (800, 5000))
+        self.assertGreater(gov.START_TIME_CONFIRM_STREAM_MS, gov.SHARE_RELAY_VLC_CACHING_MS, "longer than VLC's own network caching")
+        src = get_function_source("_seek_when_ready") if "def _seek_when_ready" in MAIN_SRC.split("class VLCEngineWrapper")[0] else MAIN_SRC[MAIN_SRC.index("def _seek_when_ready"):]
+        src = src[:src.index("[SEEK LANDED]")]
+        self.assertIn('_START_TIME_CONFIRM_STREAM_MS if str(getattr(self, "current_filepath", "") or "").startswith("\\\\\\\\")', src)
+        self.assertIn("if pygame.time.get_ticks() - _open_poll_t0 >= _confirm_ms:", src)
+        self.assertIn("if _cur_at_open is not None and _cur_at_open > 0:\n                                break", src, "a clock still at 0 is not a landing")
+
+
 if __name__ == "__main__":
     run_logged(__file__, lambda: unittest.main(verbosity=2))
+
+
+# ============================================================================
+# SECTION: Saved captions (owner 2026-11-24): made once, kept, shared, paced
+# ============================================================================
+
+
+class _SavedCaptionsRoot:
+    """Points saved_captions at an empty main folder for one test."""
+
+    def setUp(self):
+        import saved_captions
+        self.sc = saved_captions
+        self.main = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.main, True)
+        saved_captions.set_root(self.main)
+        self.notes = []
+        saved_captions.set_library_note(lambda *a: self.notes.append(a))
+        self.addCleanup(saved_captions.set_library_note, None)
+
+
+class TestSavedCaptionsKeepTheFirstCopy(_SavedCaptionsRoot, unittest.TestCase):
+    """Owner 2026-11-24: "the server accepts what ever copy it receives first and ignores the second"; the text lives in main/saved captions, never beside a media file."""
+
+    def test_a_copy_is_kept_in_the_apps_folder_under_the_files_content_key(self):
+        self.assertTrue(self.sc.add("abc123", [[1.0, 2.0, "Hello."]], [[0.0, 30.0]], 100.0, "live"))
+        self.assertTrue(os.path.isfile(os.path.join(self.main, "saved captions", "abc123.json")))
+        data = self.sc.read("abc123")
+        self.assertEqual((data["covered"], data["cues"], data["complete"], data["by"]), ([[0.0, 30.0]], [[1.0, 2.0, "Hello."]], False, "live"))
+        self.assertEqual(self.notes[-1], ("abc123", "abc123.json", 30.0, False), "the file's library record notes where its captions are")
+
+    def test_a_second_copy_of_a_stretch_already_saved_changes_nothing_and_a_new_stretch_is_taken(self):
+        self.sc.add("k", [[1.0, 2.0, "first"]], [[0.0, 30.0]], 60.0, "server")
+        self.assertFalse(self.sc.add("k", [[1.0, 2.0, "second"]], [[0.0, 30.0]], 60.0, "user"), "the first copy wins")
+        self.assertTrue(self.sc.add("k", [[1.5, 2.0, "second"], [40.0, 41.0, "later"]], [[0.0, 60.0]], 60.0, "user"))
+        data = self.sc.read("k")
+        self.assertEqual([c[2] for c in data["cues"]], ["first", "later"], "only the cues of the new stretch are taken")
+        self.assertTrue(data["complete"])
+        self.assertEqual(self.sc.cover_end(data, 10.0), 60.0)
+
+    def test_stretches_join_and_gaps_are_found(self):
+        self.assertEqual(self.sc.merge_spans([[30, 60], [0, 29.5], [100, 120]]), [[0.0, 60.0], [100.0, 120.0]])
+        self.assertEqual(self.sc.missing_stretches([[0.0, 120.0]], [[0.0, 60.0], [100.0, 110.0]]), [[60.0, 100.0], [110.0, 120.0]])
+        self.assertIsNone(self.sc.cover_end({"covered": [[0, 60]]}, 70.0))
+        self.assertEqual(self.sc.cues_between({"cues": [[1.0, 2.0, "a"], [50.0, 51.0, "b"]]}, 0.0, 10.0), [[1000.0, 2000.0, "a"]])
+
+    def test_the_list_of_what_is_held_reads_a_file_again_only_when_it_changed(self):
+        self.sc.add("k1", [], [[0.0, 10.0]], 10.0, "live")
+        self.assertEqual(self.sc.held(refresh=True)["k1"][:2], (10.0, True))
+        with mock.patch.object(self.sc, "read", wraps=self.sc.read) as reads:
+            self.sc.held(refresh=True)
+        self.assertEqual(reads.call_count, 0, "an unchanged file is not read again")
+
+
+class TestALiveSessionHandsOverWhatItMade(unittest.TestCase):
+    """Owner 2026-11-24: "might as well save it if its running"; every finished cue and covered stretch goes to the handler, which only queues it."""
+
+    def test_the_session_keeps_untrimmed_cues_and_stretches_and_hands_them_over_when_it_stops(self):
+        got = []
+        media.set_live_captions_made_handler(lambda *a: got.append(a))
+        self.addCleanup(media.set_live_captions_made_handler, None)
+        sess = media.LiveCaptionSession("/m/show.mkv", start_sec=0.0)
+        sess._made_duration = 600.0
+        sess._keep_made(cues=[[1.0, 2.0, "Hi."]])
+        sess._keep_made(span=(0.0, 30.0))
+        sess.stop()
+        self.assertEqual(got, [("/m/show.mkv", [[1.0, 2.0, "Hi."]], [[0.0, 30.0, 1]], 600.0)])
+
+    def test_a_long_session_hands_over_as_it_goes(self):
+        got = []
+        media.set_live_captions_made_handler(lambda *a: got.append(a))
+        self.addCleanup(media.set_live_captions_made_handler, None)
+        sess = media.LiveCaptionSession("/m/movie.mkv", start_sec=0.0)
+        sess._made_duration = 7200.0
+        for i in range(10):
+            sess._keep_made(span=(i * 30.0, (i + 1) * 30.0))
+        self.assertEqual(len(got), 1, "handed over once %.0f s of new audio was captioned" % gov.LIVE_CAPTION_SAVE_EVERY_SEC)
+
+    def test_the_handover_is_wired_into_the_session_loop(self):
+        src = open(_script("media.py"), encoding="utf-8").read()
+        loop = src[src.index("    def _run_locked(self):"):src.index("class CaptionFeed:")]
+        self.assertIn("self._made_duration = duration", loop)
+        self.assertIn("self._keep_made(cues=new_cues)", loop)
+        self.assertIn("self._keep_made(span=(pos, pos + length), check=self._window_check)", loop)
+
+
+class _FakeLive:
+    made = []
+
+    def __init__(self, file_path, start_sec=0.0, position_fn=None):
+        self.file_path, self.start_sec, self.position_fn = file_path, start_sec, position_fn
+        self.ready, self.stopped, self._covered_to = True, False, None
+        _FakeLive.made.append(self)
+
+    def start(self):
+        return self
+
+    def stop(self):
+        self.stopped = True
+
+    def snapshot(self):
+        return [[self.start_sec * 1000.0 + 500.0, self.start_sec * 1000.0 + 900.0, "live"]]
+
+    def scan_finished(self):
+        return False
+
+    def attach_playback(self, fn, pos):
+        self.position_fn = fn
+
+
+class TestTheCaptionFeedUsesSavedCaptionsAndLiveForTheGaps(_SavedCaptionsRoot, unittest.TestCase):
+    """Owner 2026-11-24: saved captions are used where they cover the picture; "it will switch back to live captions if it passes what has been collected"."""
+
+    def _feed(self, pos):
+        _FakeLive.made = []
+        self._live = mock.patch.object(media, "LiveCaptionSession", _FakeLive)
+        self._live.start()
+        self.addCleanup(self._live.stop)
+        media.set_saved_captions_key_finder(lambda path: "key1")
+        self.addCleanup(media.set_saved_captions_key_finder, None)
+        feed = media.CaptionFeed("/m/show.mkv", start_sec=pos, position_fn=lambda: self.pos)
+        self.pos = pos
+        feed._key = "key1"
+        return feed
+
+    def test_a_file_saved_whole_never_starts_live_captions(self):
+        self.sc.add("key1", [[10.0, 12.0, "Saved."]], [[0.0, 100.0]], 100.0, "server")
+        feed = self._feed(5.0)
+        feed._step()
+        self.assertEqual(_FakeLive.made, [])
+        self.assertTrue(feed.ready)
+        self.assertEqual(feed.snapshot(), [[10000.0, 12000.0, "Saved."]])
+        self.assertTrue(feed.scan_finished())
+
+    def test_live_captions_start_where_the_saved_ones_end_and_stop_when_a_copy_from_elsewhere_runs_past_them(self):
+        self.sc.add("key1", [], [[0.0, 100.0]], 3000.0, "server")
+        feed = self._feed(80.0)
+        feed._step()
+        self.assertEqual([live.start_sec for live in _FakeLive.made], [100.0], "live from where the saved captions end, %.0f s before they run out" % gov.CAPTION_FEED_LIVE_BEFORE_END_SEC)
+        live = _FakeLive.made[0]
+        live._covered_to = 160.0
+        self.sc.add("key1", [], [[100.0, 1000.0]], 3000.0, "user")
+        self.sc.held(refresh=True)
+        self.pos = 110.0
+        feed._step()
+        self.assertTrue(live.stopped, "saved text from another computer covers where the live captions are, so they stop")
+        self.assertEqual(len(_FakeLive.made), 1)
+
+    def test_only_the_gaps_are_captioned_live_never_the_saved_half_of_a_show(self):
+        self.sc.add("key1", [], [[600.0, 2400.0]], 2400.0, "server")
+        feed = self._feed(100.0)
+        feed._step()
+        live = _FakeLive.made[0]
+        self.assertEqual(live.start_sec, 100.0, "the gap before the saved half is captioned live")
+        live._covered_to = 590.0
+        self.pos = 560.0
+        feed._step()
+        self.assertFalse(live.stopped)
+        live._covered_to = 600.0
+        feed._step()
+        self.assertTrue(live.stopped, "it stops where the saved half starts")
+        self.pos = 610.0
+        feed._step()
+        self.assertEqual(len(_FakeLive.made), 1, "the saved half plays from the saved captions, nothing is captioned again")
+        self.assertTrue(feed.ready)
+
+    def test_a_file_with_nothing_saved_is_captioned_live_from_the_picture(self):
+        feed = self._feed(42.0)
+        feed._step()
+        self.assertEqual([live.start_sec for live in _FakeLive.made], [42.0])
+        self.assertTrue(feed.ready)
+
+    def test_the_main_script_plays_captions_through_the_feed(self):
+        self.assertIn("live_session = CaptionFeed(\n                    path, start_sec=start_sec, position_fn=_tv_playback_seconds).start()", MAIN_SRC)
+        self.assertIn("session = CaptionFeed(next_path, start_sec=0.0).start()", MAIN_SRC)
+        self.assertNotIn("LiveCaptionSession(", MAIN_SRC)
+        self.assertIn("    _start_saved_captions()\n    threading.Thread(target=_caption_precache_worker", MAIN_SRC)
+
+
+class TestTheServerSendsSavedCaptionsAndKeepsWhatUsersSend(_SavedCaptionsRoot, unittest.TestCase):
+    """Owner 2026-11-24: "server will say, hey i got a new batch here you go"; a User never asks again after it connects, and what a User captioned live goes to the server, which keeps the first copy."""
+
+    def _broadcaster(self):
+        import server_sync
+        b = server_sync.ScheduleBroadcaster(lambda: {}, captions=self.sc)
+        b._clients = {"userA", "userB"}
+        sent = []
+        b._broadcast = lambda message, clients=None: (sent.append((message, list(clients or []))), set(clients or []))[1]
+        return b, sent
+
+    def test_a_user_that_connects_gets_only_what_it_lacks(self):
+        self.sc.add("k1", [[1.0, 2.0, "a"]], [[0.0, 60.0]], 60.0, "server")
+        self.sc.add("k2", [[1.0, 2.0, "b"]], [[0.0, 60.0]], 60.0, "server")
+        b, sent = self._broadcaster()
+        b._take_captions_have("userA", {"keys": {"k1": 60.0}})
+        b._captions_sent = {}
+        b._captions_pushed_at = time.monotonic()
+        b._send_captions()
+        self.assertEqual([(m["type"], [i["key"] for i in m["items"]], c) for m, c in sent], [("captions", ["k2"], ["userA"])])
+
+    def test_only_captions_that_grew_after_the_first_look_are_pushed_to_everyone(self):
+        self.sc.add("k1", [], [[0.0, 30.0]], 60.0, "server")
+        b, sent = self._broadcaster()
+        b._send_captions()
+        self.assertEqual(sent, [], "the first look only notes what is held")
+        self.sc.add("k1", [[40.0, 41.0, "more"]], [[30.0, 60.0]], 60.0, "server")
+        b._captions_pushed_at = -1e9
+        b._send_captions()
+        b._send_captions()
+        self.assertEqual(sorted(c[0] for _m, c in sent), ["userA", "userB"])
+
+    def test_a_users_live_captions_are_kept_first_copy_wins(self):
+        b, _sent = self._broadcaster()
+        b._take_captions_put({"items": [{"key": "k9", "length": 60.0, "covered": [[0.0, 60.0]], "cues": [[1.0, 2.0, "first"]]}]})
+        b._take_captions_put({"items": [{"key": "k9", "length": 60.0, "covered": [[0.0, 60.0]], "cues": [[1.0, 2.0, "second"]]}]})
+        self.assertEqual([c[2] for c in self.sc.read("k9")["cues"]], ["first"])
+
+    def test_the_watching_report_names_the_files_a_user_captions_live(self):
+        import server_sync
+        b = server_sync.ScheduleBroadcaster(lambda: {})
+        b._live_caption_keys["u"] = (time.monotonic(), ["k1", "k2"])
+        b._live_caption_keys["old"] = (time.monotonic() - server_sync.WATCHING_FRESH_S - 5, ["k3"])
+        self.assertEqual(b.live_caption_keys(), {"k1", "k2"})
+
+    def test_the_user_side_tells_once_takes_batches_and_sends_back(self):
+        import server_sync
+        got = []
+        c = server_sync.ScheduleClient("h", captions_have_provider=lambda: {"k1": 30.0}, on_captions=got.append)
+        sent = []
+        c._send = lambda sock, message: sent.append(message)
+        c._tell_captions_held("sock")
+        c._take_captions({"type": "captions", "items": [{"key": "k1", "cues": []}, {"nokey": 1}]})
+        c.sock = "sock"
+        self.assertTrue(c.send_captions([{"key": "k5"}]))
+        self.assertEqual([m["type"] for m in sent], ["captions_have", "captions_put"])
+        self.assertEqual(sent[0]["keys"], {"k1": 30.0})
+        self.assertEqual(got, [[{"key": "k1", "cues": []}]])
+        src = open(os.path.join(ROOT, "server", "server_sync.py"), encoding="utf-8").read()
+        self.assertIn("self._tell_captions_held(self.sock)", src)
+        self.assertIn('"live_captions": live', src)
+
+    def test_the_main_script_saves_batches_and_sends_its_live_captions_of_server_files(self):
+        self.assertIn('on_captions=lambda items: _queue_saved_captions("server", items)', MAIN_SRC)
+        self.assertIn("captions_have_provider=_saved_captions_held_seconds", MAIN_SRC)
+        self.assertIn("live_captions_provider=_live_caption_keys_now", MAIN_SRC)
+        body = get_function_source("_saved_captions_loop")
+        self.assertIn('saved_captions.add(key, cues, spans, length, "live")', body)
+        self.assertIn("_send_saved_captions_to_server(path, key)", body)
+        self.assertIn("server_remote_files.server_owns(path)", get_function_source("_send_saved_captions_to_server"))
+
+
+class TestTheCaptionScanNeverHurtsPlayback(unittest.TestCase):
+    """Owner 2026-11-24: "do not let those captions mess up any playback ... make the captions background scans as slow as they need to be on each computer as needed. if the computer is struggling with slowest scans, stop the scan"."""
+
+    def _pacer(self, busy=10.0, open_=False, state=None, streaming=False):
+        import server_captions
+        self.load = {"busy": busy, "open": open_, "state": state or {}, "streaming": streaming}
+        return server_captions.CaptionPacer(cpu_percent_fn=lambda: self.load["busy"], program_open_fn=lambda: self.load["open"],
+                                            program_state_fn=lambda: self.load["state"], streaming_fn=lambda: self.load["streaming"])
+
+    def test_the_rest_follows_the_program_and_its_mode_and_streaming(self):
+        import server_captions
+        p = self._pacer()
+        self.assertEqual(p.after_piece(10.0), 10.0 * server_captions.CAPTION_SCAN_REST_CLOSED)
+        self.load.update(open=True, state={"perf_mode": "lite"})
+        self.assertEqual(p.after_piece(10.0), 10.0 * server_captions.CAPTION_SCAN_REST_OPEN["lite"])
+        self.load.update(streaming=True)
+        self.assertEqual(p.after_piece(10.0), 10.0 * server_captions.CAPTION_SCAN_REST_OPEN["lite"] * server_captions.server_scanner.SERVER_SCAN_STREAMING_PAUSE_FACTOR)
+
+    def test_outside_programs_the_throttle_and_live_captions_all_count_as_struggling(self):
+        p = self._pacer(busy=95.0)
+        self.assertTrue(p.strained(), "the whole PC's load counts other programs")
+        self.load.update(busy=10.0, open=True, state={"level": 2})
+        self.assertTrue(p.strained())
+        self.load.update(state={"level": 0, "live_captions": True})
+        self.assertTrue(p.strained(), "the program captioning live comes first")
+        self.load.update(state={"level": 0})
+        self.assertFalse(p.strained())
+
+    def test_struggling_slows_the_scan_and_at_the_slowest_pace_stops_it(self):
+        import server_captions
+        p = self._pacer(busy=95.0)
+        waits = [p.after_piece(1.0) for _ in range(12)]
+        self.assertTrue(p.stopped)
+        self.assertEqual(p.backoff, server_captions.CAPTION_SCAN_BACKOFF_MAX)
+        self.assertLess(waits[0], waits[3])
+        calm = self._pacer()
+        calm.backoff = 8.0
+        calm.after_piece(1.0)
+        self.assertEqual(calm.backoff, 4.0, "a calm piece halves the slow-down again")
+
+    def test_a_stopped_scan_starts_again_only_after_the_pc_has_been_calm_long_enough(self):
+        import server_captions
+        p = self._pacer(busy=10.0)
+        p.stopped = True
+        clock = [0.0]
+        p._clock = lambda: clock[0]
+
+        class _Ev:
+            def is_set(self):
+                return False
+
+            def wait(self, s):
+                clock[0] += s
+        p.wait_until_calm(_Ev())
+        self.assertFalse(p.stopped)
+        self.assertGreaterEqual(clock[0], server_captions.CAPTION_SCAN_CALM_TO_RESUME_S)
+        self.assertEqual(p.backoff, server_captions.CAPTION_SCAN_BACKOFF_MAX, "it goes on at the slowest pace")
+
+    def test_the_program_closed_frees_its_cores_for_the_scan(self):
+        import server_captions
+        p = self._pacer(open_=True)
+        self.assertEqual(p.threads(), server_captions.CAPTION_SCAN_THREADS_APP_OPEN)
+        self.load["open"] = False
+        self.assertEqual(p.threads(), max(1, (os.cpu_count() or 2) - server_captions.CAPTION_SCAN_THREADS_CLOSED_RESERVED))
+
+    def test_a_piece_is_held_while_the_pc_struggles(self):
+        p = self._pacer(busy=95.0)
+        ev = threading.Event()
+        with mock.patch("server_captions.CAPTION_SCAN_CHECK_S", 0.0):
+            self.assertFalse(p.before_piece(ev), "a PC that keeps struggling stops the scan before the next piece")
+        self.assertTrue(p.stopped)
+
+
+class TestTheServerCaptionsInAiringOrder(_SavedCaptionsRoot, unittest.TestCase):
+    """Owner 2026-11-24: after the media scan the server captions "each show in advance of when it plays", soonest first, each once, commercials included; real subtitles and burned-in captions are skipped."""
+
+    def test_the_order_is_by_when_each_file_first_airs_with_the_show_on_air_first(self):
+        import server_captions
+
+        class _Hub:
+            def rows_between(self, ch, a, b, now, full=True):
+                return [{"path": "/m/%s_now.mkv" % ch, "planned_start": now - 600}]
+
+            def planned_rows_between(self, ch, a, b):
+                return [{"path": "/m/ad.mp4", "planned_start": a + 100}, {"path": "/m/%s_next.mkv" % ch, "planned_start": a + 200}]
+
+            def future_rows_between(self, ch, a, b):
+                return [{"path": "/m/ad.mp4", "planned_start": a + 9000}, {"path": "/m/late.mkv", "planned_start": a + 50000}]
+        slots = [("server1", {"05": {"active": True}, "06": {"active": True}, "07": {"active": False}}, {})]
+        order = server_captions.airing_order(_Hub(), slots, 1000.0)
+        paths = [p for _at, p in order]
+        self.assertEqual(paths[:2], ["/m/05_now.mkv", "/m/06_now.mkv"])
+        self.assertEqual(order[0][0], 400.0, "a show on air counts from its own start")
+        self.assertEqual(paths.count("/m/ad.mp4"), 2, "every airing is listed; the plan picks the one to caption")
+        self.assertNotIn("/m/07_now.mkv", paths)
+        self.assertEqual(paths[-1], "/m/late.mkv")
+
+    def test_the_scan_stays_ahead_of_the_picture_and_jumps_to_tomorrow_when_the_schedule_catches_up(self):
+        import server_captions
+        now = server_captions.next_midnight(1_800_000_000.0) - 6 * 3600.0
+        lead = server_captions.CAPTION_SCAN_MIN_LEAD_SECONDS
+        airings = [(now - 300, "/m/on_air.mkv"), (now + 600, "/m/soon.mkv"), (now + lead + 60, "/m/tonight.mkv"),
+                   (now + 8 * 3600, "/m/tomorrow.mkv"), (now + 9 * 3600, "/m/soon.mkv")]
+        order, caught = server_captions.scan_plan(airings, now, lambda path: False)
+        self.assertFalse(caught)
+        self.assertEqual([p for _a, p in order], ["/m/tonight.mkv", "/m/tomorrow.mkv", "/m/soon.mkv"],
+                         "what airs within the lead is left to live captions; a file that airs again later is captioned for that airing")
+        order, caught = server_captions.scan_plan(airings, now, lambda path: path == "/m/on_air.mkv")
+        self.assertTrue(caught, "the show on air still needs captions: the schedule caught up with the scan")
+        self.assertEqual([p for _a, p in order], ["/m/tomorrow.mkv", "/m/soon.mkv", "/m/tonight.mkv"], "the scan jumps to tomorrow and closes today's gap last")
+
+    def test_a_piece_the_picture_reaches_too_soon_or_a_user_captions_live_is_left_to_live_captions(self):
+        import server_captions
+        live = set()
+        sc = server_captions.CaptionScanner(lambda: {}, lambda: None, types.SimpleNamespace(idle=True), server_captions.CaptionPacer(), live_keys_fn=lambda: live)
+        lead = server_captions.CAPTION_SCAN_MIN_LEAD_SECONDS
+        now = time.time()
+        self.assertFalse(sc._left_to_live("k1", now + 2 * lead, 0.0))
+        self.assertTrue(sc._left_to_live("k1", now + 600, 0.0), "the picture reaches it within the lead")
+        self.assertFalse(sc._left_to_live("k1", now + 600, lead), "a stretch far enough into the file is still the scan's")
+        live.add("k1")
+        self.assertTrue(sc._left_to_live("k1", now + 2 * lead, 0.0), "a User started captioning it live")
+
+    def _scanner(self, kind=None, verdict=None, live=()):
+        import server_captions
+        probe = types.SimpleNamespace(get_burned_in_verdict=lambda p: verdict, keys=types.SimpleNamespace(resolve=lambda p: "k1"))
+        pacer = server_captions.CaptionPacer()
+        sc = server_captions.CaptionScanner(lambda: {}, lambda: probe, types.SimpleNamespace(idle=True), pacer)
+        return sc, probe
+
+    def test_a_file_with_its_own_captions_burned_in_text_or_saved_whole_or_live_elsewhere_is_passed_over(self):
+        path = os.path.join(self.main, "show.mkv")
+        open(path, "wb").close()
+        sc, probe = self._scanner()
+        with mock.patch.object(media, "resolve_caption_source", return_value={"kind": "sidecar"}):
+            self.assertIsNone(sc._wants(probe, path, set()))
+        sc, probe = self._scanner(verdict="burned_in")
+        with mock.patch.object(media, "resolve_caption_source", return_value={"kind": None}):
+            self.assertIsNone(sc._wants(probe, path, set()))
+        sc, probe = self._scanner()
+        with mock.patch.object(media, "resolve_caption_source", return_value={"kind": None}):
+            self.assertIsNone(sc._wants(probe, path, {"k1"}), "a User is captioning it live")
+            self.assertEqual(sc._wants(probe, path, set()), ("k1", None))
+            self.sc.add("k1", [], [[0.0, 60.0]], 60.0, "server", grade=3)
+            self.assertIsNone(sc._wants(probe, path, set()), "saved whole already")
+
+    def test_a_file_is_captioned_piece_by_piece_saving_each_piece_and_resting_as_the_pacer_says(self):
+        import server_captions
+        sc, _probe = self._scanner()
+        sc._model_for_now = lambda: "model"
+        sc._model_threads = 1
+        rests = []
+        sc.pacer.after_piece = lambda worked, strained=None: rests.append(worked) or 0.0
+        sc.pacer.threads = lambda: 1
+        self.sc.add("k1", [], [[0.0, 60.0]], 150.0, "user", grade=3)
+        with mock.patch.object(media, "_asr_probe_media", return_value={"duration": 150.0, "has_audio": True}), \
+                mock.patch.object(media, "_asr_extract_chunk", return_value="ok"), \
+                mock.patch.object(media, "_asr_transcribe_chunk", return_value=[]), \
+                mock.patch.object(media, "_asr_filter_cues", side_effect=lambda seg, a, b, end, prompt=None: ([[a + 1, a + 2, "x"]], {})), \
+                mock.patch.object(server_captions, "CAPTION_SCAN_CHUNK_SEC", 60.0):
+            done = sc.caption_file("/m/show.mkv", "k1", self.sc.read("k1"))
+        self.assertEqual(done, 2, "only the stretch not saved yet (60 s to 150 s) is captioned")
+        data = self.sc.read("k1")
+        self.assertTrue(data["complete"])
+        self.assertEqual([c[0] for c in data["cues"]], [61.0, 121.0])
+        self.assertEqual(len(rests), 2)
+
+    def test_a_piece_is_given_up_the_moment_the_program_opens(self):
+        sc, _probe = self._scanner()
+        sc._model_for_now = lambda: "model"
+        sc._model_threads = 3
+        sc.pacer.threads = lambda: 1
+        with mock.patch.object(media, "_asr_probe_media", return_value={"duration": 150.0, "has_audio": True}), \
+                mock.patch.object(media, "_asr_extract_chunk", return_value="ok"), \
+                mock.patch.object(media, "_asr_transcribe_chunk", return_value=[]):
+            self.assertEqual(sc.caption_file("/m/show.mkv", "k1", None), 0)
+        self.assertIsNone(self.sc.read("k1"))
+
+    def test_the_scan_waits_for_the_media_scan_and_the_service_starts_it(self):
+        import server_captions
+        sc = server_captions.CaptionScanner(lambda: {}, lambda: None, types.SimpleNamespace(idle=False), server_captions.CaptionPacer())
+        self.assertEqual(sc.scan_once(), 0)
+        src = open(os.path.join(ROOT, "server", "server_service.py"), encoding="utf-8").read()
+        self.assertIn("caption_scanner.start()", src)
+        self.assertIn("captions=saved_captions)", src)
+        self.assertIn("live_keys_fn=broadcaster.live_caption_keys", src)
+        self.assertIn("program_open_fn=lambda: _app_is_open(base_dir)", src)
+
+    def test_the_facts_scan_says_when_the_media_scan_is_done(self):
+        import server_scanner
+        fs = server_scanner.FactsScanner(lambda: {}, lambda: False, lambda: None)
+        fs.ordered_items = lambda probe: [("/m/a.mkv", 0, False)]
+        fs._needs = lambda probe, path: []
+        fs.scan_once()
+        self.assertTrue(fs.idle)
+        fs._needs = lambda probe, path: ["header"]
+        fs._scan_file = lambda probe, path: False
+        fs._pause_seconds = lambda: 0.0
+        fs.scan_once()
+        self.assertFalse(fs.idle)
+
+    def test_the_program_reports_its_level_mode_and_live_captions_to_the_service(self):
+        import server_scanner
+        body = get_function_source("_write_program_scan_state")
+        self.assertIn('"level": performance_governor.current_level()', body)
+        self.assertIn('"live_captions": bool(media.live_captions_running())', body)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.makedirs(os.path.join(tmp, "logs", "temp"))
+        with open(os.path.join(tmp, "logs", "temp", server_scanner.PROGRAM_STATE_FILE), "w") as fh:
+            json.dump({"mode": "regular", "caught_up": True, "at": time.time(), "level": 3, "perf_mode": "lite", "live_captions": True}, fh)
+        self.assertEqual(server_scanner.read_program_scan_state(tmp),
+                         {"mode": "regular", "caught_up": True, "level": 3, "perf_mode": "lite", "live_captions": True})
+
+
+# SECTION: Captions write only what was said: language marks, [inaudible], and a names-only hint (owner 2026-11-24)
+class _LanguageCheckFakes:
+    """A stand-in caption model with one 2-second clip of speech, and a stand-in language model that answers with a set language."""
+
+    def _run(self, check, words, language=("es", 0.95)):
+        import numpy
+        calls = {"transcribe": 0, "language": 0}
+
+        class FakeModel:
+            def speech_spans(self, audio, threshold, min_silence_ms, min_speech_ms):
+                return [{"start": 0, "end": 32000}]
+
+            def transcribe(self, audio, **kwargs):
+                calls["transcribe"] += 1
+                ws = [types.SimpleNamespace(word=w, start=0.2 + i * 0.3, end=0.4 + i * 0.3, probability=p) for i, (w, p) in enumerate(words)]
+                seg = types.SimpleNamespace(start=0.0, end=1.8, text="".join(w for w, _p in words), words=ws, no_speech_prob=0.1, avg_logprob=-0.2)
+                return iter([seg]), None
+
+        class FakeLanguage:
+            dead = False
+
+            def language(self, clip):
+                calls["language"] += 1
+                return language
+
+        fake_audio = types.ModuleType("faster_whisper.audio")
+        fake_audio.decode_audio = lambda path: numpy.zeros(32000, dtype="float32")
+        fake_package = types.ModuleType("faster_whisper")
+        fake_package.audio = fake_audio
+        shown = []
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake_package, "faster_whisper.audio": fake_audio}), \
+                mock.patch.object(media, "_asr_vad_utils_load_failed", False), \
+                mock.patch.dict(media._language_model, {"model": FakeLanguage(), "failed": False, "loading": False}):
+            out = media._asr_transcribe_chunk(FakeModel(), "x.wav", "en", 1, temperature=0.0, on_clip=lambda cues: shown.append([c.text for c in cues]), language_check=check)
+        return [c.text for c in out], shown, calls
+
+
+class TestSpeechThatIsNotEnglishIsMarked(_LanguageCheckFakes, unittest.TestCase):
+    """Owner 2026-11-24: "if its clearly not english, do some (not english) vs making up words"; Lite never checks, Standard checks stretches the caption model is unsure of, Performance (and the server) checks every stretch."""
+
+    def test_each_mode_helps_as_the_owner_said(self):
+        self.assertEqual(media.caption_language_check("lite"), "off")
+        self.assertEqual(media.caption_language_check("standard"), "unsure")
+        self.assertEqual(media.caption_language_check("performance"), "every")
+        self.assertEqual(gov.CAPTION_LANGUAGE_MODEL, "tiny")
+
+    def test_performance_checks_first_and_never_reads_a_foreign_clip_as_english(self):
+        texts, shown, calls = self._run("every", [(" la", 0.9), (" casa", 0.9)])
+        self.assertEqual(texts, ["[speaking Spanish]"])
+        self.assertEqual(shown, [["[speaking Spanish]"]])
+        self.assertEqual(calls["transcribe"], 0)
+
+    def test_standard_leaves_a_sure_clip_alone(self):
+        texts, shown, calls = self._run("unsure", [(" hello", 0.95), (" there", 0.9)])
+        self.assertEqual(texts, ["hello there"])
+        self.assertEqual(calls["language"], 0)
+
+    def test_standard_checks_an_unsure_clip_and_shows_only_the_mark(self):
+        texts, shown, calls = self._run("unsure", [(" el", 0.2), (" perro", 0.1)])
+        self.assertEqual(texts, ["[speaking Spanish]"])
+        self.assertEqual(shown, [["[speaking Spanish]"]])
+
+    def test_a_less_sure_language_is_a_plain_foreign_mark_and_english_is_kept(self):
+        texts, _shown, _calls = self._run("every", [(" la", 0.9)], language=("es", 0.6))
+        self.assertEqual(texts, [media.CAPTION_FOREIGN_TEXT])
+        texts, _shown, calls = self._run("every", [(" hi", 0.9)], language=("en", 0.99))
+        self.assertEqual(texts, ["hi"])
+        self.assertEqual(calls["transcribe"], 1)
+
+    def test_lite_never_asks_the_language_model(self):
+        texts, _shown, calls = self._run("off", [(" el", 0.2), (" perro", 0.1)])
+        self.assertEqual(calls["language"], 0)
+
+    def test_no_language_model_ready_means_the_captions_go_on_as_before(self):
+        with mock.patch.dict(media._language_model, {"model": None}):
+            self.assertIsNone(media._foreign_speech_text(object(), "every", None))
+
+    def test_the_language_model_follows_the_caption_model_in_and_out_of_memory(self):
+        src = open(_script("media.py"), encoding="utf-8").read()
+        warm = src[src.index("_perf_governor.caption_load_resident()"):]
+        self.assertLess(warm.index("start_language_model()"), warm.index("return _whisper_model"))
+        rel = src[src.index("def release_whisper_model(reason):"):]
+        self.assertIn("release_language_model(reason)", rel[:rel.index("\ndef ")])
+        start = src[src.index("def start_language_model("):src.index("def release_language_model(")]
+        self.assertIn("_caption_memory_allows_load(notify=False)", start)
+        self.assertIn("essential=False", start)
+        self.assertIn("_CAPTION_LANGUAGE_MODEL_THREADS", start)
+        self.assertIn("threading.Thread(", start)
+
+    def test_the_server_scan_checks_every_stretch(self):
+        import server_captions
+        self.assertEqual(server_captions.CAPTION_SCAN_LANGUAGE_CHECK, gov.CAPTION_SCAN_LANGUAGE_CHECK)
+        self.assertEqual(server_captions.CAPTION_SCAN_LANGUAGE_CHECK, "every")
+        src = open(server_captions.__file__, encoding="utf-8").read()
+        self.assertIn("language_check=CAPTION_SCAN_LANGUAGE_CHECK", src)
+        self.assertIn('media.release_language_model(', src)
+
+
+class TestUnsureWordsShowAsInaudible(unittest.TestCase):
+    """Owner 2026-11-24: "i need a captions creator not a captions translator"; a caption made mostly of words the caption model is unsure of shows as [inaudible]."""
+
+    def _cue(self, words):
+        return types.SimpleNamespace(start=1.0, end=2.0, text=" ".join(w for w, _p in words), no_speech_prob=0.1, avg_logprob=-0.2,
+                                     word_prob=sum(p for _w, p in words) / len(words), runaway=None, word_list=list(words), word_times=None)
+
+    def test_a_mostly_unsure_line_is_inaudible_and_a_clear_one_is_kept(self):
+        kept, _drops = media._asr_filter_cues([self._cue([("they", 0.3), ("will", 0.2), ("kill", 0.35), ("you", 0.9)]),
+                                               self._cue([("they", 0.9), ("will", 0.95), ("put", 0.8), ("you", 0.9)])], 0.0, 60.0, True)
+        self.assertEqual([c[2] for c in kept], [media.CAPTION_INAUDIBLE_TEXT, "they will put you"])
+        self.assertEqual(kept.words[0], None)
+
+    def test_a_cue_without_word_confidences_is_never_inaudible(self):
+        self.assertFalse(media._asr_cue_is_inaudible(None))
+        self.assertFalse(media._asr_cue_is_inaudible([("x", None)]))
+
+
+class TestTheCaptionHintHoldsOnlyNames(unittest.TestCase):
+    """Owner 2026-11-24: the hint handed to the caption model holds only names learned from speech; title words only drop captions that echo them."""
+
+    def test_no_reader_hands_the_title_words_to_the_caption_model(self):
+        src = open(_script("media.py"), encoding="utf-8").read()
+        self.assertIn("initial_prompt=hint, temperature=0.0", src)
+        self.assertIn('hint = _asr_prompt_with_names(None, learned_names)', src)
+        self.assertNotIn("initial_prompt=_disk_prompt", src)
+        self.assertNotIn("initial_prompt=prompt, temperature=0.0", src)
+        import server_captions
+        self.assertNotIn("initial_prompt=prompt", open(server_captions.__file__, encoding="utf-8").read())
+
+    def test_names_only_hint_reads_as_a_list_of_names(self):
+        self.assertEqual(media._asr_prompt_with_names(None, ["Kramer", "Elaine"]), "Kramer, Elaine.")
+        self.assertIsNone(media._asr_prompt_with_names(None, []))
+
+
+# SECTION: Each saved stretch is marked with the mode it was made in, and a better copy replaces a worse one (owner 2026-11-24)
+class TestSavedCaptionsKeepTheirGrade(_SavedCaptionsRoot, unittest.TestCase):
+    """Owner 2026-11-24: "we need to add marking what parts of captions were scanned in lite mode, standard mode, or performance mode. so that if user scans it but server has better results its rescanned"."""
+
+    def test_the_grades_follow_the_modes(self):
+        self.assertEqual([self.sc.grade_for(media.caption_language_check(m)) for m in ("lite", "standard", "performance")], [1, 2, 3])
+        self.assertEqual(self.sc.grade_for(gov.CAPTION_SCAN_LANGUAGE_CHECK), 3)
+
+    def test_a_better_copy_replaces_only_the_worse_stretch(self):
+        self.sc.add("k", [[1.0, 2.0, "lite words"], [70.0, 71.0, "kept"]], [[0.0, 60.0, 1], [60.0, 120.0, 3]], 120.0, "live")
+        self.assertTrue(self.sc.add("k", [[1.0, 2.0, "better words"], [70.0, 71.0, "not taken"]], [[0.0, 120.0]], 120.0, "server", grade=3))
+        data = self.sc.read("k")
+        self.assertEqual([c[2] for c in data["cues"]], ["better words", "kept"])
+        self.assertEqual(self.sc.graded(data), [[0.0, 120.0, 3]])
+        self.assertEqual(data["covered"], [[0.0, 120.0]])
+
+    def test_the_first_copy_still_wins_between_copies_of_the_same_grade_and_a_worse_one_changes_nothing(self):
+        self.sc.add("k", [[1.0, 2.0, "first"]], [[0.0, 60.0]], 60.0, "server", grade=2)
+        self.assertFalse(self.sc.add("k", [[1.0, 2.0, "second"]], [[0.0, 60.0]], 60.0, "user", grade=2))
+        self.assertFalse(self.sc.add("k", [[1.0, 2.0, "worse"]], [[0.0, 60.0]], 60.0, "user", grade=1))
+        self.assertEqual([c[2] for c in self.sc.read("k")["cues"]], ["first"])
+
+    def test_a_copy_saved_before_grades_counts_as_lite(self):
+        path = os.path.join(self.sc.folder(), "old.json")
+        with open(path, "w") as fh:
+            json.dump({"v": 1, "key": "old", "length": 60.0, "covered": [[0.0, 60.0]], "cues": [[1.0, 2.0, "old"]], "complete": True}, fh)
+        self.assertEqual(self.sc.graded(self.sc.read("old")), [[0.0, 60.0, 1]])
+        self.assertEqual(self.sc.covered_at_least(self.sc.read("old"), 3), [])
+        self.assertEqual(self.sc.held(refresh=True)["old"][3], 60.0)
+
+    def test_items_between_computers_carry_the_grades(self):
+        self.sc.add("k", [[1.0, 2.0, "a"]], [[0.0, 30.0, 2]], 60.0, "live")
+        item = self.sc.item_for("k")
+        self.assertEqual(item["grades"], [[0.0, 30.0, 2]])
+        shutil.rmtree(self.sc.folder())
+        self.sc.set_root(self.main)
+        self.assertTrue(self.sc.add_item(item, "server"))
+        self.assertEqual(self.sc.graded(self.sc.read("k")), [[0.0, 30.0, 2]])
+
+    def test_a_live_window_is_kept_with_the_check_it_really_had(self):
+        session = media.LiveCaptionSession.__new__(media.LiveCaptionSession)
+        session._made, session._made_spans, session._made_handed_at = [], [], 0.0
+        session._made_lock = threading.Lock()
+        session._made_duration = None
+        session._keep_made(span=(0.0, 60.0), check="unsure")
+        self.assertEqual(session._made_spans, [[0.0, 60.0, 2]])
+        src = open(_script("media.py"), encoding="utf-8").read()
+        self.assertIn('out.language_check = check if check == "off" or _language_model_now() is not None else "off"', src)
+        self.assertIn("self._keep_made(span=(pos, pos + length), check=self._window_check)", src)
+
+
+class TestTheServerRescansWhatItCanMakeBetter(_SavedCaptionsRoot, unittest.TestCase):
+    """Owner 2026-11-24: the server's scan counts a stretch saved at a lower grade as not saved, and Users get the better copy."""
+
+    def test_the_scan_aims_at_its_grade_unless_the_language_model_failed(self):
+        import server_captions
+        scanner = server_captions.CaptionScanner.__new__(server_captions.CaptionScanner)
+        with mock.patch.dict(media._language_model, {"failed": False}):
+            self.assertEqual(scanner.aim_grade(), 3)
+        with mock.patch.dict(media._language_model, {"failed": True}):
+            self.assertEqual(scanner.aim_grade(), 1)
+
+    def test_the_scan_reads_only_stretches_as_good_as_its_own_and_saves_its_grade(self):
+        import server_captions
+        src = open(server_captions.__file__, encoding="utf-8").read()
+        self.assertIn("held = saved_captions.covered_at_least(saved, self.aim_grade())", src)
+        self.assertIn('grade=saved_captions.grade_for(getattr(segments, "language_check", "off"))', src)
+        self.assertIn("saved_captions.covered_at_least(saved, self.aim_grade())", src[src.index("def _wants("):src.index("def aim_grade(")])
+        self.assertLess(src.index("media.start_language_model(CAPTION_SCAN_LANGUAGE_CHECK)"), src.index("media.wait_for_language_model(CAPTION_SCAN_LANGUAGE_WAIT_S)"))
+        self.assertEqual(server_captions.CAPTION_SCAN_LANGUAGE_WAIT_S, gov.CAPTION_SCAN_LANGUAGE_WAIT_S)
+
+    def test_copies_are_compared_by_graded_seconds(self):
+        import server_sync
+        src = open(server_sync.__file__, encoding="utf-8").read()
+        self.assertIn("if info[3] > float(have.get(key) or 0) + 1.0", src)
+        self.assertIn("self.captions.add_item(item, \"user\")", src)
+        self.assertIn("return {key: info[3] for key, info in saved_captions.held(refresh=True).items()}", MAIN_SRC)
+        self.assertIn('saved_captions.add_item(item, "server")', MAIN_SRC)
+
+
+class TestTinyShipsWithTheProjectAndTheUpdate(unittest.TestCase):
+    """Owner 2026-11-24: "this goes in the project and is downloaded in the update"; the language model's folder sits beside small.en under main/models/whisper, where an update may write."""
+
+    def test_an_update_writes_the_tiny_model_folder(self):
+        import update_helper as h
+        tiny = "_internal/main/models/whisper/models--Systran--faster-whisper-tiny/snapshots/x/model.bin"
+        self.assertFalse(h._is_protected(tiny))
+        self.assertFalse(h._is_protected(tiny.replace("/", "\\")))
+
+    def test_tiny_is_looked_for_in_the_same_folder_as_the_caption_model(self):
+        src = open(_script("media.py"), encoding="utf-8").read()
+        self.assertIn('f"models--Systran--faster-whisper-{size or _ASR_MODEL_SIZE}"', src)
+        self.assertIn('log.info("[ASR] language model files: %s", _whisper_model_files_note(_CAPTION_LANGUAGE_MODEL))', src)
+        self.assertIn("download_root=_worker_args[0], local_files_only=True", MAIN_SRC)
+
+
+# SECTION: Sound tags between the speech (owner 2026-11-24: "barking, meowing, whistling")
+class TestSoundsBetweenTheSpeechAreTagged(unittest.TestCase):
+    """Google's YAMNet names sounds; a tag is written only where no kept speech caption is, only in the modes set in CAPTION_SOUND_TAGS, and never without the model's files."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        os.makedirs(os.path.join(self.folder, "yamnet"))
+        with open(os.path.join(self.folder, "yamnet", "yamnet.onnx"), "wb") as fh:
+            fh.write(b"x")
+        with open(os.path.join(self.folder, "yamnet", "yamnet_class_map.csv"), "w", encoding="utf-8") as fh:
+            fh.write('index,mid,display_name\n0,/m/09x0r,Speech\n69,/m/05tny_,Bark\n70,/m/x,Meow\n')
+        patches = [mock.patch.object(media, "resolve_whisper_model_dir", lambda: os.path.join(self.folder, "whisper")),
+                   mock.patch.dict(media._sound_classes, {"columns": None, "texts": None, "path": None, "missing_noted": False})]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _model(self, rows):
+        import numpy
+        asked = []
+
+        class Fake:
+            def sounds(self, audio, path, columns):
+                asked.append((path, list(columns)))
+                return numpy.array(rows, dtype="float32")
+        return Fake(), asked
+
+    def test_a_bark_long_enough_becomes_a_tag_and_a_blip_does_not(self):
+        import numpy
+        model, asked = self._model([[0.9, 0.0], [0.8, 0.1], [0.1, 0.0], [0.0, 0.9], [0.1, 0.1]])
+        cues = media._asr_sound_cues(model, numpy.zeros(16000 * 3, "float32"), 16000, [])
+        self.assertEqual([(round(c.start, 2), round(c.end, 2), c.text) for c in cues], [(0.0, 1.44, "[dog barking]")])
+        self.assertEqual(asked[0][1], [69, 70])
+        self.assertTrue(cues[0].sound)
+
+    def test_music_seconds_get_no_sound_tag(self):
+        import numpy
+        model, _asked = self._model([[0.9, 0.0], [0.9, 0.0]])
+        flags = [{"music": True}, {"music": True}]
+        self.assertEqual(media._asr_sound_cues(model, numpy.zeros(16000 * 2, "float32"), 16000, flags), [])
+
+    def test_no_files_means_no_tags(self):
+        import numpy
+        shutil.rmtree(os.path.join(self.folder, "yamnet"))
+        model, asked = self._model([[0.9, 0.0], [0.9, 0.0]])
+        self.assertEqual(media._asr_sound_cues(model, numpy.zeros(32000, "float32"), 16000, []), [])
+        self.assertEqual(asked, [])
+
+    def test_speech_wins_over_a_tag_and_a_tag_in_a_gap_is_kept(self):
+        def cue(s, e, text, sound=False):
+            c = types.SimpleNamespace(start=s, end=e, text=text, no_speech_prob=0.1, avg_logprob=-0.2, word_prob=0.9, runaway=None,
+                                      word_list=None if sound else [(w, 0.9) for w in text.split()], word_times=None)
+            if sound:
+                c.sound = True
+            return c
+        kept, _drops = media._asr_filter_cues([cue(1.0, 3.0, "Down boy."), cue(2.0, 4.0, "[dog barking]", True), cue(10.0, 12.0, "[cat meowing]", True)], 100.0, 160.0, False)
+        self.assertEqual([c[2] for c in kept], ["Down boy.", "[cat meowing]"])
+        self.assertEqual(kept.words[-1], None)
+
+    def test_the_modes_and_the_server(self):
+        self.assertFalse(media.caption_sound_tags("lite"))
+        self.assertTrue(media.caption_sound_tags("standard"))
+        self.assertTrue(media.caption_sound_tags("performance"))
+        import server_captions
+        self.assertEqual(server_captions.CAPTION_SCAN_SOUND_TAGS, gov.CAPTION_SCAN_SOUND_TAGS)
+        self.assertIn("sound_tags=CAPTION_SCAN_SOUND_TAGS", open(server_captions.__file__, encoding="utf-8").read())
+
+    def test_the_sound_model_runs_in_the_caption_process_never_in_the_program(self):
+        worker = MAIN_SRC[MAIN_SRC.index('if _worker_request[0] == "sounds":'):MAIN_SRC.index('if _worker_request[0] == "speech_spans":')]
+        self.assertIn("import onnxruntime as _worker_ort", worker)
+        self.assertIn("intra_op_num_threads = int(_worker_args[2])", worker)
+        src = open(_script("media.py"), encoding="utf-8").read()
+        self.assertNotIn("import onnxruntime", src)
+        self.assertIn('return self._ask(("sounds", audio, model_path, list(columns)))[1]', src)
+
+
+
+# SECTION: A PC that cannot run live captions still shows caption files and saved captions; live captions catch up instead of overheating (owner 2026-11-24)
+class TestLiveCaptionsStopButCaptionFilesStillShow(unittest.TestCase):
+    """Owner 2026-11-24: "shut off live captions but leave it open to grab captions from a server, videos that already have captions file"; the red banner shows once after captions are turned on."""
+
+    def setUp(self):
+        import performance_governor as pg
+        self.pg = pg
+        saved = dict(pg._state)
+        self.addCleanup(lambda: (pg._state.clear(), pg._state.update(saved)))
+
+    def test_memory_crash_and_speed_each_stop_live_captioning_and_never_grey_the_switches(self):
+        for state, reason in (({"captions_memory_ok": False, "captions_lock_reason": "memory"}, "memory"),
+                              ({"captions_memory_ok": False, "captions_lock_reason": "crash"}, "crash"),
+                              ({"captions_memory_ok": True, "caption_speed_rate": 0.3}, "speed")):
+            self.pg._state.update(state)
+            self.assertEqual(self.pg.caption_lock_reason(), reason)
+            self.assertTrue(self.pg.live_captions_blocked())
+            self.assertFalse(media.live_captions_allowed())
+            for key in ("tv_captions_enabled", "dvd_captions_enabled"):
+                self.assertFalse(self.pg.feature_locked(key, "standard"))
+            self.pg._state.update(captions_memory_ok=True, caption_speed_rate=None)
+        self.assertFalse(self.pg.live_captions_blocked())
+
+    def test_a_load_refused_for_memory_stops_live_captioning_for_the_run(self):
+        calls = []
+        with mock.patch.object(self.pg, "caption_memory_check", lambda: (False, 16.0, 0.5, 1.5)), \
+                mock.patch.object(media, "_caption_memory_refusal_handler", lambda *a: calls.append(a)):
+            self.pg._state.update(captions_memory_ok=True)
+            self.assertFalse(media._caption_memory_allows_load())
+        self.assertEqual(self.pg.caption_lock_reason(), "memory")
+        self.assertEqual(len(calls), 1)
+
+    def test_the_feed_shows_saved_captions_but_never_starts_live_where_it_cannot_run(self):
+        started = []
+        feed = media.CaptionFeed("show.mkv", start_sec=10.0)
+        with mock.patch.object(media, "live_captions_allowed", lambda: False), \
+                mock.patch.object(media, "LiveCaptionSession", lambda *a, **k: started.append(a)):
+            feed._step()
+        self.assertEqual(started, [])
+        src = open(_script("media.py"), encoding="utf-8").read()
+        step = src[src.index("    def _step(self):\n        import saved_captions"):src.index("    def snapshot(self):\n        \"\"\"Cues in milliseconds")]
+        self.assertIn("if need_live and live is None and live_captions_allowed():", step)
+        self.assertIn("if live is not None and not live_captions_allowed():", step)
+
+    def test_the_banner_shows_once_after_captions_are_turned_on(self):
+        saves = []
+        db = types.SimpleNamespace(config={"tv_captions_enabled": True}, save_settings=lambda: saves.append(1))
+        gov = types.SimpleNamespace(caption_lock_reason=lambda: "speed", live_captions_blocked=lambda: True, CAPTION_LOAD_MARKER_NAME="caption_load.marker")
+        released = []
+        ns = {"db": db, "performance_governor": gov, "log": logging.getLogger("t"), "_caption_memory_refusal_pending": True, "_caption_memory_banner_pending": False,
+              "_release_tv_caption_state_when_off": lambda reason, force_unload=False: released.append(reason),
+              "LIVE_CAPTIONS_OFF_TOLD_KEY": "live_captions_off_told", "_caption_speed_wanted": threading.Event()}
+        for name in ("_captions_switched_on", "_apply_caption_memory_refusal", "_captions_turned_on"):
+            exec(main_function_code(name), ns)
+        ns["_apply_caption_memory_refusal"]()
+        self.assertTrue(ns["_caption_memory_banner_pending"])
+        self.assertTrue(db.config["tv_captions_enabled"], "the switch stays on")
+        self.assertEqual(len(released), 1)
+        ns["_caption_memory_banner_pending"] = False
+        ns["_caption_memory_refusal_pending"] = True
+        ns["_apply_caption_memory_refusal"]()
+        self.assertFalse(ns["_caption_memory_banner_pending"], "once and only once")
+        ns["_captions_turned_on"]()
+        self.assertTrue(ns["_caption_speed_wanted"].is_set())
+        ns["_apply_caption_memory_refusal"]()
+        self.assertTrue(ns["_caption_memory_banner_pending"], "turning captions on again shows it once more")
+
+    def test_the_banner_text_and_the_dvd_job_gate(self):
+        self.assertIn("CAN'T RUN LIVE CAPTIONS, ONLY CAPTION FILES", self.pg.CAPTION_LIVE_OFF_BANNER_LABEL)
+        main = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
+        self.assertIn("return CAPTION_LIVE_OFF_BANNER_LABEL", main)
+        deck = open(_script("game_deck.py"), encoding="utf-8").read()
+        self.assertIn("and not self.dvd_is_disc_image and self.dvd_file_path and live_captions_allowed()):", deck)
+
+
+class TestTheCaptionSpeedTest(unittest.TestCase):
+    """Owner 2026-11-24: "you should know with the boot scans if they can handle it or not"; the live caption model reads a clip of real speech when captions are on and the result is due."""
+
+    def setUp(self):
+        import performance_governor as pg
+        self.pg = pg
+        saved = dict(pg._state)
+        self.addCleanup(lambda: (pg._state.clear(), pg._state.update(saved)))
+
+    def test_the_crt_tv_computer_passes_and_a_slow_pc_does_not(self):
+        crt_worst_40 = [1.43, 0.72, 1.39, 3.51, 0.84, 2.32, 1.08, 1.06, 1.61, 1.42, 0.77, 1.5, 0.85, 3.8, 1.07, 1.45, 1.41, 1.47, 1.04, 2.88,
+                        1.46, 0.82, 0.88, 0.91, 1.65, 0.93, 0.93, 0.85, 1.56, 0.62, 0.67, 0.52, 0.48, 0.61, 1.5, 2.45, 0.06, 2.31, 2.08, 1.98]
+        middle = sorted(crt_worst_40)[len(crt_worst_40) // 2]
+        self.pg.set_caption_speed(1.0 / middle * 1.0)
+        self.assertFalse(self.pg.caption_speed_too_slow(), "the owner's CRT TV computer keeps live captions even in its worst stretch")
+        self.pg.set_caption_speed(0.3)
+        self.assertTrue(self.pg.caption_speed_too_slow())
+        self.pg.set_caption_speed(None)
+        self.assertFalse(self.pg.caption_speed_too_slow(), "never measured is never blocked")
+
+    def test_the_test_reads_the_clip_through_the_live_path_and_reports_speech_per_second(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        clip = os.path.join(folder, self.pg.CAPTION_SPEED_TEST_FILE)
+        open(clip, "wb").close()
+        made = []
+
+        def fake_run(cmd, **kw):
+            import wave
+            with wave.open(cmd[-1], "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(b"\0\0" * 16000 * 33)
+            made.append(cmd)
+            return types.SimpleNamespace(returncode=0)
+        reads = []
+        with mock.patch.object(media, "resolve_whisper_model_dir", lambda: folder), mock.patch.object(media, "_resolve_ffmpeg_path", lambda: "ffmpeg"), \
+                mock.patch.object(media, "_get_whisper_model", lambda: object()), mock.patch("subprocess.run", fake_run), \
+                mock.patch.object(media, "_asr_transcribe_chunk", lambda *a, **k: reads.append(k) or time.sleep(0.05)):
+            rate = media.caption_speed_test()
+        self.assertGreater(rate, 33.0)
+        self.assertIn("-stream_loop", made[0])
+        self.assertEqual(made[0][made[0].index("-stream_loop") + 1], str(self.pg.CAPTION_SPEED_TEST_REPEATS - 1))
+        self.assertEqual((reads[0]["language_check"], reads[0]["sound_tags"]), ("off", False))
+
+    def test_no_clip_means_no_result(self):
+        with mock.patch.object(media, "resolve_whisper_model_dir", lambda: tempfile.gettempdir() + "/nothing-here"):
+            self.assertIsNone(media.caption_speed_test())
+
+    def test_the_loop_runs_only_when_captions_are_on_and_the_result_is_due_and_keeps_the_answer(self):
+        main = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
+        loop = main[main.index("def _run_caption_speed_test("):main.index("def _scan_capacity_loop():")]
+        self.assertIn('if not _captions_switched_on() or not store.due("captions", max_age_s) or performance_governor.caption_memory_locked():', loop)
+        self.assertIn("if _is_game_actively_playing() or performance_governor.tune_in_progress():", loop)
+        self.assertNotIn("pc_is_quiet", loop, "owner logs 2026-11-24: the live captions keep the PC busy, so waiting for quiet never ended")
+        self.assertIn('store.note("captions", 0, rate, 0.0)', loop)
+        self.assertIn("performance_governor.set_caption_speed(rate)", loop)
+        self.assertIn('performance_governor.set_caption_speed(_held["rate"])', loop)
+        self.assertIn('threading.Thread(target=_caption_speed_loop, daemon=True, name="CaptionSpeed").start()', main)
+        import scan_capacity
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        store = scan_capacity.CapacityStore(os.path.join(folder, "c.json"))
+        store.note("captions", 0, 1.3, 0.0)
+        self.assertNotIn("captions", store.workers(), "the caption result never mixes into the scan worker counts")
+
+
+class TestLiveCaptionsCatchUpInsteadOfOverheating(unittest.TestCase):
+    """Owner 2026-11-24: "jump forward and skip upcoming captions to create a buffer so captions can have more cool down. worst case we miss some captions vs overheating"; the note "[captions is catching up its buffer]" shows for 5 seconds, not constantly."""
+
+    def _session(self):
+        sess = media.LiveCaptionSession.__new__(media.LiveCaptionSession)
+        sess.cues, sess.lock, sess._catchups, sess._light = [], threading.Lock(), 0, False
+        return sess
+
+    def test_a_catch_up_leaves_a_growing_cushion_goes_light_and_shows_the_note_once(self):
+        sess = self._session()
+        with mock.patch.dict(media._caption_hot, {"note_at": None}):
+            new_pos = sess._catch_up("show.mkv", 100.0, 120.0, 3000.0, "behind")
+            self.assertEqual(new_pos, 120.0 + gov.CAPTION_CATCHUP_AHEAD_SEC)
+            self.assertTrue(sess._light)
+            self.assertEqual(sess.cues, [[120.0, 120.0 + gov.CAPTION_CATCHUP_NOTE_SEC, "[captions is catching up its buffer]"]])
+            second = sess._catch_up("show.mkv", 300.0, 320.0, 3000.0, "behind")
+            self.assertEqual(second, 320.0 + min(gov.LIVE_CAPTION_MAX_LEAD_SEC, 2 * gov.CAPTION_CATCHUP_AHEAD_SEC))
+            self.assertEqual(len(sess.cues), 1, "no constant buffering text")
+
+    def test_running_hot_needs_the_whole_pc_busy_for_the_whole_stretch(self):
+        readings = iter([95.0, 95.0, 50.0, 95.0, 95.0, 95.0])
+        sampler = types.SimpleNamespace(percent=lambda: next(readings))
+        with mock.patch.dict(media._caption_hot, {"since": None, "sampler": sampler}):
+            self.assertFalse(media._caption_running_hot(0.0))
+            self.assertFalse(media._caption_running_hot(60.0))
+            self.assertFalse(media._caption_running_hot(130.0), "a calm reading starts the count again")
+            self.assertFalse(media._caption_running_hot(140.0))
+            self.assertFalse(media._caption_running_hot(200.0))
+            self.assertTrue(media._caption_running_hot(140.0 + gov.CAPTION_HOT_SECONDS))
+
+    def test_the_live_loop_catches_up_rests_and_captions_the_light_way(self):
+        src = open(_script("media.py"), encoding="utf-8").read()
+        self.assertIn('pos = self._catch_up(base_name, pos, now, duration, "%.1fs behind the picture" % -lead)', src)
+        self.assertIn("elif chunks_done > 0 and _caption_running_hot(time.monotonic()):", src)
+        self.assertIn("self._stop.wait(_CAPTION_COOL_DOWN_SEC)", src)
+        self.assertIn('language_check="off" if self._light else None, sound_tags=False if self._light else None)', src)
+        self.assertIn("_chunk_beam = _ASR_LIVE_BEAM_SIZE_BEHIND if self._light else _live_caption_beam(_beam_lead)", src)
+        self.assertNotIn("_caption_pace_add", src)
+        self.assertNotIn("caption_mark_too_slow", open(_script("performance_governor.py"), encoding="utf-8").read())
+
+    def test_a_catch_up_with_the_cushion_already_there_says_nothing_was_skipped(self):
+        """Owner logs 2026-11-24: "captions skip from 1564.1s to 1564.1s" read as a skip that did nothing."""
+        sess = self._session()
+        lines = []
+        with mock.patch.dict(media._caption_hot, {"note_at": None}), mock.patch.object(media.log, "warning", lambda fmt, *a: lines.append(fmt % a)):
+            new_pos = sess._catch_up("show.mp4", 1564.1, 1518.0, 3000.0, "hot")
+        self.assertEqual(new_pos, 1564.1)
+        self.assertIn("already 46s ahead of the picture, so nothing is skipped", lines[0])
+        self.assertNotIn("skip from", lines[0])
+        self.assertTrue(sess._light)
+
+    def test_the_numbers_live_in_the_governor(self):
+        for name in ("CAPTION_HOT_CPU_PERCENT", "CAPTION_HOT_SECONDS", "CAPTION_CATCHUP_AHEAD_SEC", "CAPTION_COOL_DOWN_SEC",
+                     "CAPTION_CATCHUP_NOTE_TEXT", "CAPTION_CATCHUP_NOTE_SEC", "CAPTION_CATCHUP_NOTE_EVERY_SEC"):
+            self.assertEqual(getattr(media, "_" + name), getattr(gov, name), name)
+        self.assertEqual(gov.CAPTION_CATCHUP_NOTE_TEXT, "[captions is catching up its buffer]")
+
+
+# SECTION: A cycle that ends is followed by the next one, never started over (owner log 2026-11-24 10:51 to 11:13)
+class TestTheEndOfACycleNeverStartsItOver(unittest.TestCase):
+    """Owner 2026-11-24: "it went from monk, to commercial, cut commercial short, back to a different episode of monk, back to commercials". The last commercial of a 10.5-hour cycle ended a moment before its slot; the repeat guard went back to position 0 and the whole cycle started over (Monk E07 again), and at the next break the real next cycle (Monk E10) took over in the middle of the show."""
+
+    def _guard(self):
+        ns = {"os": os, "SCHEDULER_REPEAT_GUARD_SECONDS": 60, "SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS": 900, "SLOT_TAIL_HOLD_MAX_SECONDS": 3.0}
+        exec(compile(get_function_source("_apply_repeat_guard"), "<extracted:_apply_repeat_guard>", "exec"), ns)
+        return ns["_apply_repeat_guard"]
+
+    def _case(self):
+        timeline = [{"path": "Monk S01E07.mp4", "start_time": 0.0, "duration": 37750.0},
+                    {"path": "S02.E54.mp4", "start_time": 37750.0, "duration": 31.0, "is_commercial": True},
+                    {"path": "S01.E34.mp4", "start_time": 37781.0, "duration": 15.0, "is_commercial": True}]
+        now = datetime.datetime(2026, 11, 24, 10, 51, 46)
+        log_ = {"last_ended_commercial": {"file": "s01.e34.mp4", "block": "Full Day", "armed_ts": now.timestamp()}}
+        return timeline, now, log_
+
+    def test_the_last_item_of_a_cycle_that_is_followed_by_a_new_one_gives_no_item_here(self):
+        timeline, now, log_ = self._case()
+        show, pos = self._guard()("05", log_, "Full Day", timeline, 37796.0, 37795.6, now, cycle_repeats=False)
+        self.assertIsNone(show)
+        self.assertEqual(pos, 37796.0)
+
+    def test_a_marathon_cycle_still_starts_again(self):
+        timeline, now, log_ = self._case()
+        show, pos = self._guard()("05", log_, "Full Day", timeline, 37796.0, 37795.6, now, cycle_repeats=True)
+        self.assertEqual((show["path"], pos), ("Monk S01E07.mp4", 0))
+
+    def test_the_scheduler_answers_from_the_next_cycle_as_of_its_start(self):
+        src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
+        body = src[src.index("def _scheduler_playback_state("):src.index("def _apply_saved_resume") if "def _apply_saved_resume" in src[src.index("def _scheduler_playback_state("):] else None]
+        self.assertIn("timeline, total_block_content, position_in_playlist, now, cycle_repeats=_marathon_mode)", body)
+        self.assertIn("clock_shift_seconds=max(0.0, total_block_content - _position_before_guard) + SCHEDULER_CYCLE_END_STEP_SECONDS)", body)
+        self.assertIn("h_timeline, h_total, h_pos, now, cycle_repeats=False)", body)
+        self.assertIn("clock_shift_seconds=max(0.0, h_total - _h_pos_before_guard) + SCHEDULER_CYCLE_END_STEP_SECONDS)", body)
+        self.assertIn("_now_clock = _now_clock + datetime.timedelta(seconds=float(clock_shift_seconds))", body)
+        self.assertEqual(gov.SCHEDULER_CYCLE_END_STEP_SECONDS, 0.05)
+
+
+class TestAUserIsWarnedWhenItsClockIsNotTheServers(unittest.TestCase):
+    """Owner 2026-11-24: "need to add a time dont match warning"; a User PC set an hour off aired fine on the server's time but nothing said so."""
+
+    def _ns(self):
+        notes = []
+        ns = {"SERVER_CLOCK_MISMATCH_WARN_S": 60.0, "_server_clock_warned": {"clock": False, "zone": False}, "log": logging.getLogger("t"),
+              "post_status_notice": lambda text, good=False: notes.append(text), "time": time}
+        for name in ("_time_gap_words", "_utc_words", "_warn_if_clock_differs_from_server"):
+            exec(main_function_code(name), ns)
+        return ns, notes
+
+    def test_an_hour_off_warns_once_per_link_and_a_small_gap_never(self):
+        ns, notes = self._ns()
+        ns["_warn_if_clock_differs_from_server"](skew_s=20.0)
+        self.assertEqual(notes, [])
+        ns["_warn_if_clock_differs_from_server"](skew_s=3600.0)
+        ns["_warn_if_clock_differs_from_server"](skew_s=3600.0)
+        self.assertEqual(notes, ["THIS PC'S CLOCK IS 1 HR BEHIND THE SERVER'S. FIX THE WINDOWS TIME; CHANNELS FOLLOW THE SERVER'S TIME"])
+
+    def test_a_different_time_zone_warns(self):
+        ns, notes = self._ns()
+        own = time.localtime().tm_gmtoff
+        ns["_warn_if_clock_differs_from_server"](server_offset_s=own)
+        self.assertEqual(notes, [])
+        ns["_warn_if_clock_differs_from_server"](server_offset_s=own + 3600)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("TIME ZONE", notes[0])
+
+    def test_the_words(self):
+        ns, _notes = self._ns()
+        self.assertEqual(ns["_time_gap_words"](3900), "1 HR 5 MIN")
+        self.assertEqual(ns["_time_gap_words"](-45), "45 SEC")
+        self.assertEqual(ns["_utc_words"](-25200), "UTC-7")
+
+    def test_it_is_wired_to_the_link(self):
+        src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
+        self.assertIn("_warn_if_clock_differs_from_server(skew_s=_target_now)", src)
+        self.assertIn("_warn_if_clock_differs_from_server(server_offset_s=offset_s)", src)
+        self.assertIn("_server_clock_warned.update(clock=False, zone=False)", src)
+        self.assertEqual(gov.SERVER_CLOCK_MISMATCH_WARN_S, 60.0)

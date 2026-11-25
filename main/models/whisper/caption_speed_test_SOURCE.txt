@@ -1,0 +1,3 @@
+caption_speed_test.flac: 11 seconds of speech from President John F. Kennedy's inaugural address (January 20, 1961), a work of the United States government and in the public domain. It is the same clip faster-whisper and OpenAI Whisper use in their own tests (tests/data/jfk.flac), turned into 16 kHz mono.
+
+Retro TV Emulator uses it for the caption speed test: the live caption model reads it three times over, once when captions are on and the last result is missing or older than 60 days, to learn whether this PC can run live captions.

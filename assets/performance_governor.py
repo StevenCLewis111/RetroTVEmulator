@@ -347,8 +347,8 @@ SCAN_CAPACITY_VIDEO_SECONDS = 45
 SCAN_CAPACITY_STEP_TIMEOUT_SECONDS = 20.0
 SCAN_CAPACITY_MIN_GAIN = 0.15
 SCAN_CAPACITY_CPU_CEILING_PERCENT = 97.0
-# VALUES CHANGE HERE (owner 2026-11-17, the scan capacity test on the very first start: the longest the loading screen waits for it, and the share of the loading bar the test fills after the real loading, so a quick load of a few seconds sits near the first fifth and the test fills the rest)
-BOOT_CAPACITY_MAX_SECONDS = 20.0
+# VALUES CHANGE HERE (owner 2026-11-17, the scan capacity test on the very first start: the longest the loading screen waits for it, and the share of the loading bar the test fills after the real loading, so a quick load of a few seconds sits near the first fifth and the test fills the rest; owner 2026-11-24: "make sure that first boot throttle scan stays in the boot load. not after it loads a channel", so the wait is only a safety limit for a test that is stuck, and a test that reaches it is stopped and finished on the next start's loading screen)
+BOOT_CAPACITY_MAX_SECONDS = 120.0
 BOOT_CAPACITY_BAR_SHARE = 0.8
 # VALUES CHANGE HERE (owner 2026-11-17, the most seconds the first-start capacity test waits for the other loading steps (the media engine and the decks) to finish before it starts, so it never slows them)
 BOOT_CAPACITY_WAIT_FOR_BOOT_SECONDS = 20.0
@@ -467,12 +467,22 @@ STALL_STACK_DEPTH = 14
 # VALUES CHANGE HERE (owner logs 2026-11-20 and 2026-11-21: seconds between the lines that say where a new channel's first-show search is while it takes longer than this)
 NEW_CHANNEL_FIND_STACK_EVERY_S = 3.0
 
+# VALUES CHANGE HERE (owner 2026-11-23: the most seconds a channel whose first media was just added holds its first lineup while the show drawn at random from its whole list is measured; after it, the lineup starts with whatever is measured)
+FIRST_SHOW_LEAD_HOLD_SECONDS = 10.0
+
+# VALUES CHANGE HERE (owner log 2026-11-23 12:05: seconds a new channel's first-show scan keeps asking the scheduler for the show to air when the first answer named none; seconds between the asks)
+NEW_CHANNEL_REASK_SECONDS = 3.0
+NEW_CHANNEL_REASK_EVERY_S = 0.25
+
 # VALUES CHANGE HERE (owner log 2026-11-21: the longest a background scheduler call of a channel waits for the call of that channel already running before it runs beside it)
 SCHED_ONE_BUILD_WAIT_S = 20.0
 
 # VALUES CHANGE HERE (owner 2026-11-21, the playback thread: a channel change or playback step that runs longer than the first number writes one line naming how long it took; one that runs longer than the second is set aside, its call stack is written, and a fresh playback thread takes over so channel changes never stop)
 PLAYBACK_STEP_SLOW_LOG_S = 1.0
 PLAYBACK_STEP_STUCK_S = 10.0
+
+# VALUES CHANGE HERE (owner test 2026-11-23: the longest the channel number keeps showing a channel handed to the playback thread before that tune has run)
+PLAYBACK_TUNE_SHOWN_MAX_MS = 15000
 
 # VALUES CHANGE HERE (owner 2026-11-21: the longest a background database write (the guide's future rows) waits between its turns for the playback thread to finish a step before it takes its next turn anyway)
 PLAYBACK_STEP_ASIDE_MAX_S = 5.0
@@ -564,7 +574,7 @@ HUB_FUTURE_ROWS_PER_TURN = 200
 # VALUES CHANGE HERE (library: how many last-seen answers the library keeps for the screen thread to use while the database is busy)
 SCREEN_LIBRARY_MEMO_MAX = 20000
 
-# VALUES CHANGE HERE (schedule hub future rows: seconds the background step sleeps when every channel is up to date)
+# VALUES CHANGE HERE (schedule hub future rows: seconds the background step waits before looking again while heavy work holds it back; owner 2026-11-24: when every channel is up to date it is woken by countdowns and settings changes, never by this)
 HUB_FUTURE_IDLE_SECONDS = 30.0
 
 # VALUES CHANGE HERE (hub writer tick: seconds between the scheduler's bookkeeping passes for the channel on screen)
@@ -758,6 +768,30 @@ WATERMARK_WIDTH_FRAC = 0.091
 WATERMARK_MARGIN_FRAC = 0.12
 # VALUES CHANGE HERE (Water Mark of a server channel: the biggest image file, in bytes, a server sends with a channel; a bigger one is left out and the server logs it)
 WATERMARK_SERVER_MAX_BYTES = 131072
+# VALUES CHANGE HERE (server_sync.py, saved captions, owner 2026-11-24: the server looks for newly saved captions this often (seconds) and sends them to every User as one batch; one message carries at most this many files' captions)
+SERVER_CAPTIONS_PUSH_S = 300.0
+SERVER_CAPTIONS_PER_MESSAGE = 20
+# VALUES CHANGE HERE (server_captions.py, the server's caption scan, owner 2026-11-24: pieces of audio (seconds), how far ahead it reads the schedule (hours), how often it works its order out again and looks again when idle (seconds))
+CAPTION_SCAN_CHUNK_SEC = 60.0
+CAPTION_SCAN_LOOK_AHEAD_HOURS = 48.0
+CAPTION_SCAN_REORDER_S = 300.0
+CAPTION_SCAN_IDLE_LOOK_S = 60.0
+# VALUES CHANGE HERE (server_captions.py: the rest after each piece as a share of the time it took, with the program closed and, with it open, by its performance mode; streaming to a User multiplies it by SERVER_SCAN_STREAMING_PAUSE_FACTOR)
+CAPTION_SCAN_REST_CLOSED = 0.25
+CAPTION_SCAN_REST_OPEN = {"lite": 8.0, "standard": 3.0, "performance": 1.5}
+# VALUES CHANGE HERE (server_captions.py: the PC struggles when the whole PC is busier than this percent or the open program's throttle level is at least this; each struggling piece doubles the rest up to this many times)
+CAPTION_SCAN_BUSY_CPU_PERCENT = 70.0
+CAPTION_SCAN_STRAIN_LEVEL = 1
+CAPTION_SCAN_BACKOFF_MAX = 16.0
+# VALUES CHANGE HERE (server_captions.py: the scan stops after this many struggling pieces at the slowest pace and starts again once the PC has been calm this many seconds in a row; it checks the PC this often (seconds) while it waits)
+CAPTION_SCAN_STOP_AFTER_STRAINED = 3
+CAPTION_SCAN_CALM_TO_RESUME_S = 600.0
+CAPTION_SCAN_CHECK_S = 5.0
+# VALUES CHANGE HERE (server_captions.py, owner 2026-11-24: the scan stays at least this many seconds ahead of the picture; a stretch the picture reaches sooner is left to live captions, and a scan the schedule caught up with jumps to tomorrow's airings)
+CAPTION_SCAN_MIN_LEAD_SECONDS = 1800.0
+# VALUES CHANGE HERE (server_captions.py: caption model threads while the program is open, and the logical cores left free while it is closed)
+CAPTION_SCAN_THREADS_APP_OPEN = 1
+CAPTION_SCAN_THREADS_CLOSED_RESERVED = 1
 
 # VALUES CHANGE HERE
 GAME_CORE_FPS_FALLBACK = 60.0
@@ -766,7 +800,8 @@ UI_COMPOSITOR_FPS = 60.0
 
 # VALUES CHANGE HERE
 STATUS_BANNER_DURATION_MS = 30000
-CAPTION_MEMORY_BANNER_LABEL = "LIVE CAPTIONS FAILED DUE TO LACK OF MEMORY"
+# VALUES CHANGE HERE (the red banner shown once after captions are turned on when this PC cannot run live captions, for lack of memory, a caption model that crashed, or a speed test it failed; owner 2026-11-24: "Your computer can not use live captions, only caption files. Scans will create saved captions files eventually, try again later or add caption files.")
+CAPTION_LIVE_OFF_BANNER_LABEL = "THIS PC CAN'T RUN LIVE CAPTIONS, ONLY CAPTION FILES. SCANS WILL MAKE SAVED CAPTIONS OVER TIME; TRY AGAIN LATER OR ADD CAPTION FILES"
 # VALUES CHANGE HERE (one-line warnings in the shared banner bar, such as Game Music Not Found: seconds the bar stays up)
 NOTICE_BANNER_SECONDS = 6.0
 # VALUES CHANGE HERE (seconds a green good-news banner stays up)
@@ -782,6 +817,8 @@ WATCHDOG_SPURIOUS_RESUME_WINDOW_MS = 20000
 
 # VALUES CHANGE HERE
 START_TIME_CONFIRM_MS = 800
+# VALUES CHANGE HERE (owner log 2026-11-23 14:05 and 14:25, streaming PC: milliseconds a file streamed from a server's share may report its clock as 0 after it starts playing (VLC fills its network caching, SHARE_RELAY_VLC_CACHING_MS, before its clock starts) before the open is judged to have missed the start asked for; the 800 ms of START_TIME_CONFIRM_MS ran out while VLC was still filling, and the second seek it made was the skip and flicker on every channel change)
+START_TIME_CONFIRM_STREAM_MS = 5000
 
 # VALUES CHANGE HERE (a picture that opens within this many milliseconds of the start asked for is left where it is and never sought again: a file with few keyframes (an .avi) lands a little before the time asked, and a seek only takes it back to the same keyframe, which is a visible skip)
 START_TIME_ACCEPT_MS = 10000
@@ -938,6 +975,8 @@ CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS = 0.3
 # VALUES CHANGE HERE (scheduler repeat guard: seconds after a show ends in which the same show may not start again in the next slot, and seconds the just-ended record is kept)
 SCHEDULER_REPEAT_GUARD_SECONDS = 60
 SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS = 900
+# VALUES CHANGE HERE (owner log 2026-11-24: when the item that just ended is the last of its cycle, the scheduler answers as of the next cycle's start plus this many seconds, so the next cycle is built and its first item opens from its start)
+SCHEDULER_CYCLE_END_STEP_SECONDS = 0.05
 
 # VALUES CHANGE HERE (block rotation caches: most blocks kept in the scheduler's rotation cache and in the saved rotation record)
 BLOCK_ROTATION_CACHE_MAX_BLOCKS = 12
@@ -1026,12 +1065,20 @@ BREAK_MAX_CATCHUP_SECONDS = 180
 BREAK_MIN_GAP_SECONDS = 300
 BREAK_MIN_SECONDS = 120
 
+# VALUES CHANGE HERE (media.py, shorts: longest show in seconds that counts as a short, and fewest seconds of commercials on each side of a lone short placed inside an end-of-show break)
+SHORT_SHOW_MAX_SECONDS = 300
+SHORT_IN_BREAK_MIN_SIDE_SECONDS = 60
+
+# VALUES CHANGE HERE (media.py, intro clips: a video under this many seconds whose name says intro, opening or theme is never scheduled)
+INTRO_CLIP_MAX_SECONDS = 120
+
 # VALUES CHANGE HERE (media.py, file facts: the highest bit rate in Mbps a believable length may give; seconds a bezel style folder listing is reused; seconds and most entries a shared header read is kept; the selection border width in pixels)
 DURATION_SANITY_MAX_PLAUSIBLE_MBPS = 60
 BEZEL_STYLE_DISCOVERY_TTL_SEC = 2.0
 HEADER_PROBE_SHARE_SECONDS = 120.0
 HEADER_PROBE_SHARE_MAX_ENTRIES = 64
-SELECTION_BORDER_WIDTH = 3
+# WARNING: owner 2026-11-23: the highlight was hard to see; it is drawn thicker.
+SELECTION_BORDER_WIDTH = 5
 
 # VALUES CHANGE HERE (media.py, generated captions, speech finding and cues: beam size, speech-finder settings, threshold and shortest speech in ms; join gap and longest clip in seconds; live audio filter; longest cue in seconds and characters, gap that breaks a cue, shortest time a cue shows, hold after the last word)
 ASR_BEAM_SIZE = 5
@@ -1142,7 +1189,6 @@ LIVE_CAPTION_MAX_LEAD_SEC = 150.0
 LIVE_CAPTION_JUMP_BACK_LEAD_SEC = 240.0
 LIVE_CAPTION_PACE_POLL_SEC = 1.0
 LIVE_CAPTION_SKIP_BEHIND_SEC = 10.0
-LIVE_CAPTION_RESUME_AHEAD_SEC = 15.0
 LIVE_CAPTION_KEEP_PAST_SEC = 20.0
 LIVE_CAPTION_MAX_CUES = 500
 # VALUES CHANGE HERE (media.py, live captions, owner 2026-11-15: the first chunks of every file, local or streamed, are short fast-beam chunks of the profile's first-chunk length (CAPTION_CADENCE), so captions are up quickly; this many chunks)
@@ -1151,6 +1197,28 @@ LIVE_CAPTION_FAST_START_CHUNKS = 3
 LIVE_CAPTION_SALVAGE_MAX_AGE_SEC = 600.0
 LIVE_CAPTION_SALVAGE_MIN_AHEAD_SEC = 10.0
 LIVE_CAPTION_SALVAGE_MAX_FILES = 8
+# VALUES CHANGE HERE (media.py, saved captions, owner 2026-11-24: a live session hands what it made over to be saved every this many seconds of newly captioned audio, and when it ends)
+LIVE_CAPTION_SAVE_EVERY_SEC = 300.0
+# VALUES CHANGE HERE (media.py, CaptionFeed: how often (seconds) the feed looks at where the picture is against the saved captions; live captions start this many seconds before the saved captions end; the saved cues handed to the screen reach this many seconds ahead of the picture)
+CAPTION_FEED_CHECK_SEC = 1.0
+CAPTION_FEED_LIVE_BEFORE_END_SEC = 30.0
+CAPTION_FEED_WINDOW_SEC = 120.0
+# VALUES CHANGE HERE (media.py, the language model, owner 2026-11-24: "lite only gets small, standard gets help from tiny, and performance runs tiny straight up"; the model that says which language speech is in, how it helps in each mode ("off", "unsure" = only stretches the caption model is unsure of, "every" = every stretch of speech), its thread count, and how sure it must be to write the language's name or, less sure, [speaking foreign language]; the server's caption scan always checks every stretch)
+CAPTION_LANGUAGE_MODEL = "tiny"
+CAPTION_LANGUAGE_CHECK = {"lite": "off", "standard": "unsure", "performance": "every"}
+CAPTION_LANGUAGE_MODEL_THREADS = 1
+CAPTION_LANGUAGE_NAMED_MIN_PROB = 0.75
+CAPTION_LANGUAGE_FOREIGN_MIN_PROB = 0.5
+CAPTION_SCAN_LANGUAGE_CHECK = "every"
+CAPTION_SCAN_LANGUAGE_WAIT_S = 120.0
+# VALUES CHANGE HERE (media.py, sound tags, owner 2026-11-24: "is there a way to add on sound or something so it recongnizes more sounds like barking, meowing, whistling"; which modes tag sounds between the speech (the server's scan always does), how sure the sound model must be (0 to 1) for a moment, and how many of its moments in a row (each about half a second) make a tag)
+CAPTION_SOUND_TAGS = {"lite": False, "standard": True, "performance": True}
+CAPTION_SCAN_SOUND_TAGS = True
+CAPTION_SOUND_MIN_SCORE = 0.5
+CAPTION_SOUND_MIN_FRAMES = 2
+# VALUES CHANGE HERE (media.py, [inaudible], owner 2026-11-24: "i need a captions creator not a captions translator"; a word under this confidence is one the caption model is unsure of, and a caption where at least this share of the words are unsure shows as [inaudible] instead of guessed words)
+CAPTION_UNSURE_WORD_PROB = 0.4
+CAPTION_INAUDIBLE_SHARE = 0.6
 LIVE_CAPTION_MAX_FAILURES = 3
 # VALUES CHANGE HERE (live captions: after that many failed windows in a row the session waits this long and goes on from where the picture is, this many times, before it gives up)
 LIVE_CAPTION_FAILURE_PAUSE_SECONDS = 60.0
@@ -1235,9 +1303,14 @@ MENU_FIT_SHRINK_FACTOR = 0.94
 MENU_CANVAS_W = 1036
 MENU_CANVAS_H = 680
 
-# VALUES CHANGE HERE (ui.py, TV guide: half hours the guide spans (336 = 7 days) and half hours before now it may scroll back; side padding of a channel name cell; seconds a drawn channel row stays valid and most rows kept)
+# VALUES CHANGE HERE (ui.py, TV guide: half hours the guide spans (336 = 7 days) and half hours before today's midnight it may scroll back; side padding of a channel name cell; seconds a drawn channel row stays valid and most rows kept)
+# WARNING: owner 2026-11-23: "you only see today and 6 future days. the only past you see is the past of today, back to midnight"; the guide never scrolls before today's midnight.
 GUIDE_TOTAL_HALF_HOURS = 336
-GUIDE_PAST_HALF_HOURS = 48
+GUIDE_PAST_HALF_HOURS = 0
+# VALUES CHANGE HERE (main script, the guide's prepared table, owner 2026-11-23: seconds the table worker waits after the hub notes a change so a run of writes is taken in one build; hours back from now whose aired rows are read again when a show starts or ends (older history is kept as built); the longest it sleeps with no change noted, so midnight and a switch of setup are never missed by more)
+GUIDE_TABLE_SETTLE_SECONDS = 1.0
+GUIDE_TABLE_RECENT_HOURS = 6.0
+GUIDE_TABLE_IDLE_WAKE_SECONDS = 60.0
 NAME_CELL_SIDE_PAD = 10
 GUIDE_ROW_CACHE_TTL_S = 20.0
 GUIDE_ROW_CACHE_MAX = 24
@@ -1258,13 +1331,13 @@ VLC_NATIVE_LOG_MAX_BYTES = 8000000
 VLC_GETTER_WAIT_SECONDS = 0.25
 VLC_MAIN_CALL_WAIT_SECONDS = 0.5
 VLC_CALL_WAIT_SECONDS = 5.0
-# VALUES CHANGE HERE (retro_tv_emulator.py, the Send Logs button at the bottom left of Advanced Settings: the Discord webhook address the zipped logs are posted to, which the owner makes in Discord (a private channel, Edit Channel, Integrations, Webhooks, New Webhook, Copy Webhook URL) and pastes between the quotes; empty means the button says Not Set Up and nothing is sent; a send_logs_webhook_url entry in retro_config.json, when present, wins over this one)
+# VALUES CHANGE HERE (retro_tv_emulator.py and server_service.py, the Send Logs button at the bottom left of Advanced Settings and the server tray's Send logs row: the Discord webhook address the zipped logs are posted to, which the owner makes in Discord (a private channel, Edit Channel, Integrations, Webhooks, New Webhook, Copy Webhook URL) and pastes between the quotes; empty means the button says Not Set Up and nothing is sent; a send_logs_webhook_url entry in retro_config.json, when present, wins over this one)
 SEND_LOGS_WEBHOOK_URL = "https://discord.com/api/webhooks/1570101167835455601/QNzkevIeJ82sJA5LqtcE6SNHa6gIzc54WrR32-skg4eGuNKGtsxtOZYPcgf6DWeu2Tg5"
-# VALUES CHANGE HERE (retro_tv_emulator.py, Send Logs: the biggest zip in bytes that is posted, 9 MB because Discord refuses bigger files on a server with no boost; a log longer than the per-file number below keeps only its newest part, and when the zip is still too big the per-file number is halved and the zip is built again, down to the least number below)
+# VALUES CHANGE HERE (retro_tv_emulator.py and server_service.py, Send Logs and the tray's Send logs: the biggest zip in bytes that is posted, 9 MB because Discord refuses bigger files on a server with no boost; a log longer than the per-file number below keeps only its newest part, and when the zip is still too big the per-file number is halved and the zip is built again, down to the least number below)
 SEND_LOGS_MAX_ZIP_BYTES = 9000000
 SEND_LOGS_FILE_TAIL_BYTES = 3000000
 SEND_LOGS_FILE_TAIL_BYTES_LEAST = 60000
-# VALUES CHANGE HERE (retro_tv_emulator.py, Send Logs: the most letters of the tester note, seconds the post may take before it is called failed, seconds after a send before another is allowed, and seconds the button keeps showing Logs Sent or Send Failed before it says Send Logs again)
+# VALUES CHANGE HERE (retro_tv_emulator.py, Send Logs (the post time is also the tray's, server_service.py): the most letters of the tester note, seconds the post may take before it is called failed, seconds after a send before another is allowed, and seconds the button keeps showing Logs Sent or Send Failed before it says Send Logs again)
 SEND_LOGS_NOTE_MAX_CHARS = 120
 SEND_LOGS_TIMEOUT_SECONDS = 60.0
 SEND_LOGS_COOLDOWN_SECONDS = 20.0
@@ -1330,6 +1403,8 @@ TRAY_MENU_CHECKBOX_PX = 12
 # VALUES CHANGE HERE (owner 2026-11-18, a User keeping time with its server; mirrored in retro_tv_emulator.py: seconds the two clocks may differ before anything is corrected, and how many of the server's time stamps are kept to take the middle one, so one slow network moment does not move the clock)
 SERVER_CLOCK_DRIFT_TOLERANCE_S = 2.0
 SERVER_CLOCK_SAMPLES = 5
+# VALUES CHANGE HERE (owner 2026-11-24: "need to add a time dont match warning"; a User whose clock is this many seconds or more from its server's, or whose time zone differs from the server's, gets a red banner once each time it links to the server; channels still air on the server's time)
+SERVER_CLOCK_MISMATCH_WARN_S = 60.0
 # VALUES CHANGE HERE (owner 2026-11-18, a User catching up with its server between commercials; mirrored in retro_tv_emulator.py: the longest flash of the transition screen between two commercials, the most flash time one break may add, and how far back a commercial counts as aired for the one added to a break)
 SERVER_BREAK_FLASH_EACH_S = 0.5
 SERVER_BREAK_FLASH_TOTAL_S = 2.0
@@ -1448,7 +1523,8 @@ NAV_MOVE_MIN_MS = 150
 # VALUES CHANGE HERE (menu_nav.py, sliders: one left or right press moves SLIDER_STEP; each slider is (config key, value when unset, lowest, highest); the Reactive Strength slider on a music channel's editor the same way; the fastest a value control (slider, volume) may step in milliseconds, however fast the key is pressed or held, kept below the held-key repeat intervals in HOLD_RULES so a hold is never dropped)
 # VALUES CHANGE HERE (theme colour, owner 2026-11-21: the border/text colour slider has every hue; the blue, red, green and yellow buttons turn away from that colour instead, so a border or highlight is never the colour of the button it is on; the hue each colour of button sits at, and the fewest degrees kept between the highlight and the buttons: as the highlight comes nearer than that, the buttons of that colour move to keep the gap, and they jump to the far side when the highlight crosses their resting hue)
 THEME_BUTTON_FAMILY_REST = {"blue": 218, "red": 354, "green": 134, "yellow": 47}
-THEME_BUTTON_HUE_SAFE_GAP = 30
+# WARNING: owner 2026-11-23: the highlight must stand well apart from the button it is on, so the buttons keep a wider gap from its hue.
+THEME_BUTTON_HUE_SAFE_GAP = 60
 
 SLIDER_STEP = 5
 SLIDER_SPECS = {
@@ -1767,9 +1843,8 @@ def normalize_mode(value):
 
 
 def feature_locked(config_key, mode=None):
-    """True when `config_key` is greyed out and switched off: by the given (default: current) mode, or for the two Captions switches by the boot memory scan."""
-    if config_key in CAPTION_LOCK_KEYS and caption_memory_locked():
-        return True
+    """True when `config_key` is greyed out and switched off by the given (default: current) mode."""
+    # WARNING: owner 2026-11-24: the Captions switches are never greyed out by memory, a crash or speed; only live captioning stops (live_captions_blocked), and caption files and saved captions still show.
     return config_key in MODE_TABLE[_resolve_mode(mode)].get("locked_config_keys", ())
 
 
@@ -2717,10 +2792,6 @@ CAPTION_FILE_BUILD_TRIES = 2
 CAPTION_WORKER_START_SECONDS = 240
 # VALUES CHANGE HERE (seconds the program waits for a caption process whose link closed without an answer to end, so a crash while loading is told apart from a process that is still running)
 CAPTION_WORKER_EXIT_WAIT_S = 3.0
-# VALUES CHANGE HERE (banner shown when Live Captions are switched off because the caption model crashed; 'CAPTION_MEMORY_BANNER_LABEL' is the one for lack of memory)
-CAPTION_CRASH_BANNER_LABEL = "LIVE CAPTIONS TURNED OFF: THE CAPTION MODEL CRASHED"
-# VALUES CHANGE HERE (banner shown when Live Captions are switched off because this PC decodes them slower than the show plays)
-CAPTION_SPEED_BANNER_LABEL = "LIVE CAPTIONS TURNED OFF: THIS PC CANNOT KEEP UP WITH THEM"
 
 # VALUES CHANGE HERE (main script, start-up: seconds a new start waits for the app already running to close before it gives up as a second copy; seconds it waits instead when Reset All Settings restarted the app, so the old copy can finish closing before its saved data is wiped)
 SINGLE_INSTANCE_WAIT_SECONDS = 3.0
@@ -2840,8 +2911,6 @@ SEEK_GUARD_TAIL_MARGIN_SECONDS = 5.0
 SLOT_TAIL_HOLD_MAX_SECONDS = 3.0
 # VALUES CHANGE HERE (the most seconds into its slot the next item may be found when it starts after another ends; at or under this the item starts at its first second, so no commercial or bumper loses its opening to the open time; owner 2026-11-09; 0 = start where the clock is)
 SLOT_START_GRACE_SECONDS = 0.3
-# VALUES CHANGE HERE (seconds before a slot ends that the next item is opened, about the time VLC needs to open a file and show its first picture, so the next commercial's first picture appears when its slot begins; owner 2026-11-09)
-SLOT_OPEN_LEAD_SECONDS = 0.2
 PLAY_OPEN_ERROR_CHECK_SECONDS = 0.25
 PLAY_OPEN_CONFIRM_WINDOW_SECONDS = 1.5
 PLAY_OPEN_STOPPED_DEBOUNCE_SECONDS = 0.15
@@ -3053,6 +3122,10 @@ KEY_CAPTURE_SECOND_PATH_MS = 600
 
 # VALUES CHANGE HERE (screen fills: the near-black every picture area is filled with (never pure black, which is the game overlay's see-through colour), the grey shown while a channel changes or buffers, and the guide preview's fill when it cannot draw)
 COLOR_SCREEN_BLACK = (1, 1, 1)
+# VALUES CHANGE HERE (game_deck.py, owner 2026-11-23: channel 03's screen with no background picture of its own takes the menus' theme: the menu background colour, and a border round the edges in the border colour this many pixels thick on a 680-pixel-tall screen, scaled with the screen)
+CH03_BACKDROP_BORDER_PX = 3
+# VALUES CHANGE HERE (game_deck.py, channel 03 border, owner 2026-11-23 and 2026-11-24: the gap in pixels at a 680-pixel-high screen between the screen edges and the inner border, the same on all four sides, so some background colour shows evenly outside it; the control hints sit inside it)
+CH03_BACKDROP_EDGE_GAP_PX = 14
 COLOR_TRANSITION_GREY = (15, 15, 15)
 COLOR_GUIDE_PREVIEW_ERROR_FILL = (40, 40, 40)
 
@@ -3383,7 +3456,10 @@ LIVE_CAPTION_STREAM_RATE = 16000
 LIVE_CAPTION_STREAM_SLACK_AHEAD_SEC = 10.0
 PRIME_RECHECK_SECONDS = 600.0
 PRIME_NOT_READY_RETRY_SECONDS = 5.0
-PRIME_KEEPALIVE_SECONDS = 25.0
+# VALUES CHANGE HERE (main script, priming, owner 2026-11-24: a primed file is held open (the relay never closes its share handle) until its channel's countdown runs out plus this many seconds, so no pass has to keep renewing it)
+PRIME_HOLD_MARGIN_SECONDS = 120.0
+# VALUES CHANGE HERE (server_planner.py, owner 2026-11-24: the schedule rows a server sends its Users start this many seconds before now, so the show on air and the ones just before it are in them)
+SERVER_ROWS_BEHIND_S = 10800.0
 # VALUES CHANGE HERE (main script, priming: a held file's share handle and index are renewed when the last renewal is older than this; owner 2026-11-16)
 PRIME_INDEX_RENEW_SECONDS = 20.0
 # VALUES CHANGE HERE (main script, priming: the most files per pass that get a missing picture size or picture box made; owner 2026-11-16)
@@ -3395,8 +3471,8 @@ PRIME_RUSH_BEHIND = 1
 PRIME_RUSH_QUEUE_MAX = 12
 # VALUES CHANGE HERE (main script, channel snapshots: seconds of the airing show kept in memory ahead of the position for a channel the viewer may reach next; a tune that arrives inside it is answered from memory; owner 2026-11-16)
 PRIME_SNAPSHOT_SECONDS = 15.0
-# VALUES CHANGE HERE (main script, channel snapshots: how often the zone's snapshots are extended while the viewer is changing channels; owner 2026-11-16)
-PRIME_SNAPSHOT_REFRESH_SECONDS = 10.0
+# VALUES CHANGE HERE (main script, channel snapshots, owner 2026-11-24: a snapshot is extended on its channel's countdown, when the picture passes its middle or the show ends; a channel whose read gave no snapshot is tried again after this many seconds)
+PRIME_SNAPSHOT_RETRY_SECONDS = 10.0
 # VALUES CHANGE HERE (main script, channel snapshots: how long a channel stays in the zone after the viewer last moved near it, then its snapshot is freed; owner 2026-11-16)
 PRIME_SNAPSHOT_ZONE_SECONDS = 60.0
 # VALUES CHANGE HERE (main script, channel snapshots: the most channels kept as snapshots at once; owner 2026-11-16)
@@ -3529,28 +3605,37 @@ FIRST_START_PRIORITY_DISK_SLOTS = 3
 # ============================================================================
 # SECTION: Caption memory check
 # ============================================================================
-# VALUES CHANGE HERE (live captions: the PC must have at least this much memory in total, and this much free right now, before the caption model may load; seconds the red "no memory" banner stays up)
+# VALUES CHANGE HERE (live captions: the PC must have at least this much memory in total, and this much free right now, before the caption model may load; seconds the red live-captions-off banner stays up)
 CAPTION_MODEL_MIN_TOTAL_RAM_GB = 8.0
 CAPTION_MODEL_MIN_AVAILABLE_RAM_GB = 1.5
-CAPTION_MEMORY_BANNER_SECONDS = 5.0
-# VALUES CHANGE HERE (captions while they run: the memory watch looks every interval; when the free memory, or the room left before Windows runs out of memory to hand out (the commit limit), stays under the numbers below for the strikes in a row, Live Captions are switched off and greyed out for the rest of the run and the model is freed, so the PC is never taken down by captions; the load also needs the commit room in CAPTION_LOAD_MIN_COMMIT_GB; owner 2026-11-09)
+CAPTION_LIVE_OFF_BANNER_SECONDS = 12.0
+# VALUES CHANGE HERE (captions while they run: the memory watch looks every interval; when the free memory, or the room left before Windows runs out of memory to hand out (the commit limit), stays under the numbers below for the strikes in a row, live captioning stops for the rest of the run and the model is freed (caption files and saved captions still show), so the PC is never taken down by captions; the load also needs the commit room in CAPTION_LOAD_MIN_COMMIT_GB; owner 2026-11-09)
 CAPTION_LOAD_MIN_COMMIT_GB = 2.5
 CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB = 0.6
 CAPTION_RUNTIME_MIN_COMMIT_GB = 1.0
 CAPTION_WATCH_INTERVAL_SECONDS = 2.0
 CAPTION_WATCH_STRIKES = 2
-# VALUES CHANGE HERE (media.py, live captions that cannot keep pace: how many of the picture's own caption chunks, across shows, are looked at; when their middle decode time is more than the ratio times their own length Live Captions switch off for the run; the shortest chunk in seconds that counts; owner logs 2026-11-09 to 11-11 on the CRT TV computer peak at 1.24 over 40 chunks, so the ratio stays well above that)
-CAPTION_TOO_SLOW_CHUNKS = 40
-CAPTION_TOO_SLOW_RATIO = 1.6
-CAPTION_TOO_SLOW_MIN_CHUNK_SEC = 8.0
+# VALUES CHANGE HERE (the caption speed test, owner 2026-11-24: "you should know with the boot scans if they can handle it or not": the live caption model reads a clip of real speech (CAPTION_SPEED_TEST_FILE beside the whisper models, played CAPTION_SPEED_TEST_REPEATS times) when captions are on and the last result is missing or older than SCAN_CAPACITY_MAX_AGE_DAYS; below CAPTION_SPEED_MIN_RATE seconds of speech read per second the PC cannot keep a buffer, so live captioning stays off; owner logs 2026-11-09 to 11-11 on the CRT TV computer decoded live chunks (speech and quiet together) in 0.75 of their length, and its worst 40 chunks in a row had a middle of 1.42 (0.70 per second), which it still captioned, so the limit sits well under that)
+CAPTION_SPEED_TEST_FILE = "caption_speed_test.flac"
+CAPTION_SPEED_TEST_REPEATS = 3
+CAPTION_SPEED_MIN_RATE = 0.5
+# VALUES CHANGE HERE (live captions that fall behind or run the PC hot, owner 2026-11-24: "jump forward and skip upcoming captions to create a buffer so captions can have more cool down. worst case we miss some captions vs overheating"; the whole PC's processor at or over CAPTION_HOT_CPU_PERCENT for CAPTION_HOT_SECONDS in a row while live captions run counts as running hot; a catch-up moves the captions to CAPTION_CATCHUP_AHEAD_SEC ahead of the picture (that much more for each catch-up in the same show, never past LIVE_CAPTION_MAX_LEAD_SEC), rests CAPTION_COOL_DOWN_SEC when it was for heat, and the rest of that show is captioned the light way (no language check, no sound tags, the quick beam); the note shows for CAPTION_CATCHUP_NOTE_SEC and at most once every CAPTION_CATCHUP_NOTE_EVERY_SEC, owner: "i dont want constant buffing text")
+CAPTION_HOT_CPU_PERCENT = 90.0
+CAPTION_HOT_SECONDS = 120.0
+CAPTION_CATCHUP_AHEAD_SEC = 45.0
+CAPTION_COOL_DOWN_SEC = 30.0
+CAPTION_CATCHUP_NOTE_TEXT = "[captions is catching up its buffer]"
+CAPTION_CATCHUP_NOTE_SEC = 5.0
+CAPTION_CATCHUP_NOTE_EVERY_SEC = 600.0
 # VALUES CHANGE HERE (the caption model is loaded only when a live transcription needs it, and freed when none has run for this many seconds; the check looks every WHISPER_IDLE_CHECK_SECONDS; owner 2026-11-09; 0 = never free it by idle)
 WHISPER_IDLE_UNLOAD_SECONDS = 60.0
 WHISPER_IDLE_CHECK_SECONDS = 5.0
+# VALUES CHANGE HERE (media.py, owner logs 2026-11-24: with Captions on, a commercial break covered by the server's saved captions let the caption model go after 60 s and the next show loaded it again seconds later, four times in an hour, each load a few seconds of a busy processor; while a channel or a DVD plays with Captions on, the model is freed only after this many seconds with no live transcription; the memory watch still frees it at once when memory runs low)
+WHISPER_IDLE_UNLOAD_WATCHING_SECONDS = 600.0
 # VALUES CHANGE HERE (after a loudness scan could not get the caption model for its voice detector, it waits this many seconds before asking again; owner 2026-11-16)
 SPEECH_LISTENER_RETRY_SECONDS = 60.0
 
 
-CAPTION_LOCK_KEYS = ("tv_captions_enabled", "dvd_captions_enabled")
 CAPTION_LOAD_MARKER_NAME = "caption_load.marker"
 _caption_marker = {"path": None}
 
@@ -3680,7 +3765,7 @@ def caption_watch_stop():
 
 
 def scan_caption_memory():
-    """Boot memory scan for live captions: reads the memory once per run, keeps the answer and logs it; the two Captions switches are greyed out for the whole run when the caption model could not load."""
+    """Boot memory scan for live captions: reads the memory once per run, keeps the answer and logs it; live captioning stays off for the whole run when the caption model could not load."""
     known = _state.get("captions_memory_ok")
     if known is not None:
         return known
@@ -3699,28 +3784,47 @@ def scan_caption_memory():
     if first:
         log.info("[GOVERNOR BOOT SCAN] memory total=%.1fGB available=%.1fGB captions need %.1fGB in total and %.1fGB free -> live captions %s",
                  total_gb, avail_gb, CAPTION_MODEL_MIN_TOTAL_RAM_GB, needed_gb,
-                 "available" if result else "greyed out (%s)" % ("the last caption load never finished, delete %s to try again" % CAPTION_LOAD_MARKER_NAME if interrupted else "not enough memory"))
+                 "available" if result else "off, caption files and saved captions only (%s)" % ("the last caption load never finished, delete %s to try again" % CAPTION_LOAD_MARKER_NAME if interrupted else "not enough memory"))
     return result
 
 
 def caption_mark_crashed():
-    """Switches Live Captions off and greys them out for this run because the caption model crashed, and leaves the marker so they stay locked on the next boot until the marker file is deleted."""
+    """Stops live captioning for this run because the caption model crashed, and leaves the marker so it stays off on the next boot until the marker file is deleted."""
     with _state_lock:
         _state["captions_memory_ok"] = False
         _state["captions_lock_reason"] = "crash"
     _write_caption_marker("loading")
 
 
-def caption_mark_too_slow():
-    """Switches Live Captions off and greys them out for this run because this PC decodes them slower than the show plays; nothing is left on disk, so the next start tries again."""
+def caption_mark_no_memory():
+    """Stops live captioning for this run because the caption model was refused for lack of free memory; the next start looks again."""
     with _state_lock:
         _state["captions_memory_ok"] = False
-        _state["captions_lock_reason"] = "speed"
+        _state["captions_lock_reason"] = "memory"
+
+
+def set_caption_speed(rate):
+    """Takes the caption speed test's result (seconds of speech read per second, or None when never measured)."""
+    with _state_lock:
+        _state["caption_speed_rate"] = None if rate is None else float(rate)
+
+
+def caption_speed_too_slow():
+    """True when the caption speed test says this PC reads speech too slowly to keep a buffer (CAPTION_SPEED_MIN_RATE)."""
+    rate = _state.get("caption_speed_rate")
+    return rate is not None and rate < CAPTION_SPEED_MIN_RATE
 
 
 def caption_lock_reason():
-    """'crash' when the caption model crashed, 'memory' when there is not enough memory, 'speed' when this PC could not keep up, '' when captions are not locked."""
-    return str(_state.get("captions_lock_reason", "")) if _state.get("captions_memory_ok") is False else ""
+    """Why live captioning cannot run on this PC: 'crash' when the caption model crashed, 'memory' when there is not enough memory, 'speed' when the speed test said it is too slow, '' when it can run."""
+    if _state.get("captions_memory_ok") is False:
+        return str(_state.get("captions_lock_reason", ""))
+    return "speed" if caption_speed_too_slow() else ""
+
+
+def live_captions_blocked():
+    """True when live captioning cannot run on this PC (caption_lock_reason); caption files and saved captions still show."""
+    return caption_lock_reason() != ""
 
 
 def caption_memory_locked():
@@ -4209,6 +4313,74 @@ def background_activity(lane):
         yield
     finally:
         _activity.end(lane)
+
+
+# ============================================================================
+# SECTION: The streamed show's buffer (background reads over the share give way to it)
+# ============================================================================
+# VALUES CHANGE HERE (owner 2026-11-23: "use our throttling system to bring those background works down to make sure our streaming buffer stays ahead": seconds of a streamed show the player must hold ahead of the picture; below STREAM_BUFFER_LOW_SECONDS the background reads over the server's share wait, and they go on again once it has held STREAM_BUFFER_OK_SECONDS for STREAM_BUFFER_SETTLE_SECONDS; how often a waiting background read looks again)
+STREAM_BUFFER_LOW_SECONDS = 15.0
+STREAM_BUFFER_OK_SECONDS = 30.0
+STREAM_BUFFER_SETTLE_SECONDS = 3.0
+STREAM_LINK_WAIT_POLL_SECONDS = 0.25
+
+_stream_buffer = {"path": None, "ahead": None, "hold": False, "ok_since": None, "since": None}
+_stream_buffer_lock = threading.Lock()
+
+
+def _stream_key(path):
+    return os.path.normcase(os.path.normpath(str(path or "")))
+
+
+def note_stream_buffer(path, ahead_seconds, left_seconds, now=None):
+    """Called on each governor tick with the streamed file on screen, the seconds of it the player holds ahead of the picture and the seconds left of it (path None when no streamed show is playing). Returns "hold" when this call starts holding the background reads over the share, "release" when it lets them go, else None."""
+    # WARNING: a show nearly over cannot hold more than is left of it, so both marks are cut to what is left; the hold never outlives the show it was for.
+    now = time.monotonic() if now is None else now
+    with _stream_buffer_lock:
+        state = _stream_buffer
+        if path is None or ahead_seconds is None:
+            was = state["hold"]
+            state.update(path=None, ahead=None, hold=False, ok_since=None, since=None)
+            return "release" if was else None
+        if state["path"] != _stream_key(path):
+            was = state["hold"]
+            state.update(path=_stream_key(path), hold=False, ok_since=None, since=None)
+            if was:
+                state["hold"] = True
+                state["since"] = now
+        state["ahead"] = float(ahead_seconds)
+        left = max(0.0, float(left_seconds or 0) - 1.0)
+        low = min(STREAM_BUFFER_LOW_SECONDS, left)
+        ok = min(STREAM_BUFFER_OK_SECONDS, left)
+        if low > 0 and ahead_seconds < low:
+            state["ok_since"] = None
+            if not state["hold"]:
+                state["hold"] = True
+                state["since"] = now
+                return "hold"
+            return None
+        if state["hold"] and ahead_seconds >= ok:
+            if state["ok_since"] is None:
+                state["ok_since"] = now
+            if now - state["ok_since"] >= STREAM_BUFFER_SETTLE_SECONDS:
+                state.update(hold=False, ok_since=None)
+                return "release"
+            return None
+        state["ok_since"] = None
+        return None
+
+
+def stream_needs_the_link(path=None):
+    """True while the streamed show on screen holds less of itself ahead than STREAM_BUFFER_LOW_SECONDS and has not caught up yet; a read of that same file never waits for itself."""
+    with _stream_buffer_lock:
+        state = _stream_buffer
+        return bool(state["hold"] and state["path"] and (path is None or _stream_key(path) != state["path"]))
+
+
+def stream_buffer_state():
+    """A copy of the streamed show's buffer state, for log lines."""
+    with _stream_buffer_lock:
+        return dict(_stream_buffer)
 
 
 def hold_background_for_tune():
@@ -5000,7 +5172,7 @@ __all__ = [
     "register_throttle", "current_level",
     "run_boot_scan", "get_boot_scan", "parse_cpu_class", "rate_gpu", "rate_gpus", "gpu_rating_text", "vlc_hw_decode_allowed", "make_hardware_fingerprint",
     "vlc_decoder_threads", "affordable_threads", "caption_cadence", "cv2_threads", "apply_cv2_threads", "rate_cpu",
-    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "caption_mark_crashed", "caption_mark_too_slow", "caption_lock_reason", "set_caption_load_marker", "set_previous_run_unclean", "caption_load_begin", "caption_load_resident", "caption_load_done", "caption_forgive_if_memory_ok", "caption_load_interrupted", "caption_watch_start", "caption_watch_stop", "read_commit_gb", "read_process_memory_mb", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
+    "set_shell_mode", "is_shell_mode", "is_weak", "has_graphics", "scan_caption_memory", "caption_memory_locked", "caption_mark_crashed", "caption_mark_no_memory", "set_caption_speed", "caption_speed_too_slow", "live_captions_blocked", "caption_lock_reason", "set_caption_load_marker", "set_previous_run_unclean", "caption_load_begin", "caption_load_resident", "caption_load_done", "caption_forgive_if_memory_ok", "caption_load_interrupted", "caption_watch_start", "caption_watch_stop", "read_commit_gb", "read_process_memory_mb", "allowed_modes", "next_mode", "apply_boot_mode", "choose_mode", "log_mode_ceilings",
     "quiet_seconds", "pc_is_quiet", "quiet_lane_bonus", "scan_threads", "scan_thread_slot", "scan_gpu_decode_allowed",
     "music_scan_class", "music_analysis_class", "music_scan_falling_behind",
 ]

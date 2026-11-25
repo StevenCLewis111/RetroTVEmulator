@@ -67,7 +67,7 @@ def _time_critical():
 
 
 # WARNING: the fallback number below must match SELECTION_BORDER_WIDTH in performance_governor.py; it is used only when that module fails to import.
-SELECTION_BORDER_WIDTH = _perf_governor.SELECTION_BORDER_WIDTH if _perf_governor is not None else 3
+SELECTION_BORDER_WIDTH = _perf_governor.SELECTION_BORDER_WIDTH if _perf_governor is not None else 5
 # WARNING: the fallback below must match REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS in performance_governor.py; it is used only when that module fails to import.
 REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS = _perf_governor.REMOTE_SCHEDULE_BLOCKS_NETWORK_PATHS if _perf_governor is not None else True
 # WARNING: the fallback numbers below must match CONFIG_REPLACE_RETRIES, CONFIG_REPLACE_RETRY_DELAY_S in performance_governor.py; they are used only when that module fails to import.
@@ -630,6 +630,9 @@ def guide_pair_title(entry):
     """Build the guide title of a cell that combines two episodes: both episodes by name as 'A + B', the series written once when both belong to it, and never one name standing for two episodes."""
     if not isinstance(entry, dict):
         return clean_video_display_title(entry)
+    if entry.get("shorts"):
+        # WARNING: owner 2026-11-23: two lone shorts aired together are one guide cell named Shorts.
+        return "Shorts"
     parts = []
     for key in ("pair_ep1", "pair_ep2"):
         episode = entry.get(key)
@@ -1284,19 +1287,33 @@ def path_status_generation():
     return _path_status_generation[0]
 
 
+# WARNING: owner 2026-11-24: callables told whenever a path is queued for a re-check, so the channel-ready thread is woken for it instead of looking on a timer; each must return at once (they are called with the path cache lock held).
+PATH_REFRESH_LISTENERS = []
+
+
+def _queue_path_refresh(p):
+    """Queues one path for a re-check on a background thread and tells PATH_REFRESH_LISTENERS."""
+    _path_refresh_queue[p] = True
+    for _listener in list(PATH_REFRESH_LISTENERS):
+        try:
+            _listener()
+        except Exception as _swallowed_error:
+            _log_swallowed("_queue_path_refresh: a listener", _swallowed_error)
+
+
 def _screen_thread_first_look(p, now_ms):
     """The screen thread's first look at a path it holds no status for: a drive that answers within the first-look time gives the true answer; any other gives PATH_UNKNOWN and the check is queued for a background thread."""
     root = _drive_root_of(p) or ""
     if (str(p).startswith("\\\\") or now_ms < _screen_thread_slow_roots.get(root, 0)
             or not _is_drive_responsive(p)):
         with _path_exists_cache_lock:
-            _path_refresh_queue[p] = True
+            _queue_path_refresh(p)
         return PATH_UNKNOWN
     if _path_checkers.submit([p])[p].wait(_SCREEN_THREAD_FIRST_LOOK_MS / 1000.0):
         return _held_path_status(p)
     _screen_thread_slow_roots[root] = now_ms + _SCREEN_THREAD_SLOW_DRIVE_HOLD_MS
     with _path_exists_cache_lock:
-        _path_refresh_queue[p] = True
+        _queue_path_refresh(p)
     return PATH_UNKNOWN
 
 
@@ -1318,17 +1335,17 @@ def _path_status(p):
         if _time_critical():
             # WARNING: the screen thread never waits on a drive for a path it has a status for (owner 2026-11-02, N1: 13.8 s freezes); the re-check runs on the channel-ready thread.
             with _path_exists_cache_lock:
-                _path_refresh_queue[p] = True
+                _queue_path_refresh(p)
             return _cached_status
         if getattr(_path_status_thread, "stale_ok", False) and now_ms - _cached_at < _PATH_STALE_KEEP_MS:
             # WARNING: owner 2026-11-14 (CRT log: the guide build took 18 to 160 s and held the guide lock for 90 s): the guide's background build reads a status held past its time, as the screen thread does, and the re-check runs on the channel-ready thread; a build that probes every file of every channel on the share one after another takes minutes on a slow link.
             with _path_exists_cache_lock:
-                _path_refresh_queue[p] = True
+                _queue_path_refresh(p)
             return _cached_status
     if cached is None and getattr(_path_status_thread, "stale_ok", False):
         # WARNING: owner 2026-11-15 (kids PC log: the guide build held its lock for over 60 s checking one file after another over the share): the guide's background build does not wait on the drive for a path it holds no status for; the path reads as unknown (present) and its check is queued for the channel-ready thread, as on the screen thread.
         with _path_exists_cache_lock:
-            _path_refresh_queue[p] = True
+            _queue_path_refresh(p)
         return PATH_UNKNOWN
 
     if _time_critical():
@@ -1453,7 +1470,7 @@ def _purge_stale_negative_cache_for_root(root):
         for p in missing:
             _path_exists_cache.pop(p, None)
         for p in unknown:
-            _path_refresh_queue[p] = True
+            _queue_path_refresh(p)
     if missing or unknown:
         log.info(
             "[DRIVE HEALTH] %s is responsive again -- cleared %d stale 'not found' cache entries "
@@ -2803,6 +2820,20 @@ def track_build_is_ready(items):
         return any(k[0] == "raw" and k[1:5] == sig for k in _track_build_memo)
 
 
+# WARNING: the fallback number below must match INTRO_CLIP_MAX_SECONDS in performance_governor.py; it is used only when that module fails to import.
+INTRO_CLIP_MAX_SECONDS = _perf_governor.INTRO_CLIP_MAX_SECONDS if _perf_governor is not None else 120
+_INTRO_CLIP_NAME = re.compile(r"(?i)(?:^|[^a-z])(?:intro|opening|theme)(?:[^a-z]|$)")
+
+
+def is_intro_clip(path, duration):
+    """True for a video that is only a show's intro cut out of an episode: under INTRO_CLIP_MAX_SECONDS and named intro, opening or theme; it is never scheduled."""
+    # WARNING: owner 2026-11-23: "make sure short into clips in series folders is not added ... they cut them out and leave them as a video file of just the shows intro"; both tests must hold, so a real short with a plain name is kept, and music is never judged by this.
+    _stem, _ext = os.path.splitext(os.path.basename(str(path or "")))
+    if _ext.lower() in AUDIO_DISPLAY_EXTS:
+        return False
+    return 0 < float(duration or 0) < INTRO_CLIP_MAX_SECONDS and bool(_INTRO_CLIP_NAME.search(_stem))
+
+
 def build_raw_tracks(items, path_exists, keep_gain=False, include_unknown=False):
     """Turns schedule entries into tracks with a resolved duration (kept per inputs, see _memo_track_build)."""
     return _memo_track_build("raw", lambda: _build_raw_tracks_uncached(items, path_exists, keep_gain, include_unknown),
@@ -2825,6 +2856,8 @@ def _build_raw_tracks_uncached(items, path_exists, keep_gain=False, include_unkn
                 resolved_duration = guesses[p]
                 estimated = False
             if estimated and not include_unknown:
+                continue
+            if not estimated and is_intro_clip(p, resolved_duration):
                 continue
             track = {"path": p, "duration": int(resolved_duration or 0)}
             if estimated:
@@ -4818,7 +4851,10 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
         _known = set(show_names)
         order = [sn for sn in fixed_show_order if sn in _known]
         _placed = set(order)
-        order.extend(sorted(sn for sn in show_names if sn not in _placed))
+        # WARNING: owner 2026-11-23: a show that joins a saved order (its files were scanned after the order was saved) goes in at a seeded random place among the other joiners, never in name order, or a new channel's later shows air alphabetically.
+        _joiners = sorted(sn for sn in show_names if sn not in _placed)
+        _random.Random("%s:joiners" % (order_seed if order_seed is not None else day_seed)).shuffle(_joiners)
+        order.extend(_joiners)
     else:
         rng = _random.Random(order_seed if order_seed is not None else day_seed)
         order = list(show_names)
@@ -4885,7 +4921,38 @@ def build_show_rotation(raw_tracks, scheduling_mode, show_pos, day_seed, pair_th
         video_tracks = _place_movies_in_block(video_tracks, picked_movies, day_seed, movie_heavy,
                                                scheduling_mode=scheduling_mode)
 
+    if pair_threshold_seconds > 0:
+        video_tracks = _bring_lone_shorts_together(video_tracks, show_episodes)
     return video_tracks, show_pos, show_order_used
+
+
+def _bring_lone_shorts_together(lineup, show_episodes):
+    """The lineup with each lone short followed by the next lone short of the lineup, so the timeline airs the two together as Shorts; a short is moved up only past entries of other series, so no series airs an episode out of order."""
+    # WARNING: owner 2026-11-23: "any 2 different shorts get paired and played with no commercials between them"; only the order changes, never which entries the lineup holds, so the saved positions and a rebuild from them count the same entries.
+    def _lone(track):
+        return (isinstance(track, dict) and not track.get("is_pair") and not track.get("is_bundle")
+                and 0 < float(track.get("duration", 0) or 0) <= SHORT_SHOW_MAX_SECONDS)
+
+    series_of = {}
+    for show_name, episodes in (show_episodes or {}).items():
+        for episode in episodes:
+            series_of[_episode_path(episode)] = show_name
+    out = list(lineup or [])
+    i = 0
+    while i < len(out):
+        if not _lone(out[i]) or (i + 1 < len(out) and _lone(out[i + 1])):
+            i += 2 if _lone(out[i]) else 1
+            continue
+        for j in range(i + 2, len(out)):
+            if not _lone(out[j]) or out[j].get("path") == out[i].get("path"):
+                continue
+            own = series_of.get(out[j].get("path"))
+            if any(series_of.get(p) == own for k in range(i + 1, j) for p in lineup_paths([out[k]])):
+                continue
+            out.insert(i + 1, out.pop(j))
+            break
+        i += 2
+    return out
 
 
 def build_block_rotation(raw_tracks, ch_info, show_pos, day_seed, block_duration_seconds,
@@ -4903,6 +4970,76 @@ def build_block_rotation(raw_tracks, ch_info, show_pos, day_seed, block_duration
         pending_tracks=pending_tracks,
         entry_limits=entry_limits,
     )
+
+
+# ============================================================================
+# SECTION: First show of a channel's first media
+# ============================================================================
+
+
+def pick_first_show_lead(paths, episode_order_mode, seed):
+    """The file a channel's first lineup opens with, drawn from the whole list whether its lengths are known or not: a series at random and its first episode (a random one when the series airs in random order), or a movie at random when the list holds no series; "" when the list holds nothing to air."""
+    # WARNING: owner 2026-11-23: the first show followed the files whose lengths happened to be known (the alphabetically first ones an earlier scan reached), so every new channel opened on the same series and film.
+    import random as _random
+    rng = _random.Random("%s:lead" % seed)
+    episodes = []
+    others = []
+    for path in sorted(set(str(p) for p in (paths or []) if p)):
+        guess_class = _guess_class(path)[0]
+        if guess_class == "commercial":
+            continue
+        # WARNING: owner log 2026-11-23: films in a folder such as "Family Movies/Cartoons" read as one series named after the folder, so the first film by name always led; only a file with an episode number counts as an episode here.
+        is_episode = guess_class == "episode" and _flex_series_and_season({"path": path})[2] is not None
+        (episodes if is_episode else others).append({"path": path})
+    if episodes:
+        _names, grouped = group_shows_flexible(episodes)
+        names = sorted(name for name, eps in grouped.items() if eps)
+        if names:
+            name = names[rng.randrange(len(names))]
+            eps = sorted(grouped[name], key=_episode_sort_key)
+            if isinstance(episode_order_mode, dict):
+                mode = episode_order_mode.get(name, episode_order_mode.get("__default__", "sequential"))
+            else:
+                mode = episode_order_mode or "sequential"
+            return _episode_path(eps[rng.randrange(len(eps))] if mode == "random" else eps[0])
+    if others:
+        return others[rng.randrange(len(others))]["path"]
+    return ""
+
+
+def seed_first_show_lead(raw_tracks, pending_tracks, show_pos, show_order_by_block, block_name, channel_id, lead_path, order_seed,
+                         movie_threshold_seconds=MOVIE_LENGTH_THRESHOLD_SECONDS):
+    """Puts a channel's first show at the head of its first lineup through the saved state the rotation reads: its series first in the block's show order, or a movie first in the movie bag when that bag is not saved yet. Returns "series", "movie", or None when the lead is in neither."""
+    # WARNING: only saved state is changed, never the rotation itself, so every rebuild of the block from its start positions (guide, re-flavor, cut cycles) deals the same lineup.
+    import random as _random
+    lead_norm = os.path.normcase(os.path.normpath(str(lead_path or "")))
+    if not lead_path:
+        return None
+
+    def _holds_lead(entry):
+        return any(os.path.normcase(os.path.normpath(str(f or ""))) == lead_norm for f in _bag_entry_files(entry))
+
+    raw_tracks = _drop_parts_of_pending_movies(raw_tracks, pending_tracks)
+    movie_pool, show_names, show_episodes = split_movies_and_series(raw_tracks, movie_threshold_seconds, channel_id=channel_id)
+    for show_name in show_names:
+        if any(_holds_lead(ep) for ep in show_episodes.get(show_name) or []):
+            saved = show_order_by_block.get(block_name) or []
+            show_order_by_block[block_name] = [show_name] + [sn for sn in saved if sn != show_name]
+            return "series"
+    pool = sorted(movie_pool, key=lambda t: t.get("path", ""))
+    lead_movie = next((m for m in pool if _holds_lead(m)), None)
+    if lead_movie is None:
+        return None
+    state_key = stable_series_id(MOVIE_ROTATION_KEY, channel_id) if channel_id is not None else MOVIE_ROTATION_KEY
+    if show_pos.get(state_key) is not None or show_pos.get(MOVIE_ROTATION_KEY) is not None:
+        return None
+    keys, _files = _bag_keys_and_files(pool)
+    lead_key = keys[pool.index(lead_movie)]
+    rest = [k for k in keys if k != lead_key]
+    _random.Random("%s:%s:lead" % (order_seed, MOVIE_ROTATION_KEY)).shuffle(rest)
+    show_pos[state_key] = {"v": RANDOM_STATE_VERSION, "bag": [lead_key] + rest, "cycle": 1,
+                           "last": None, "recent": [], "drawn": []}
+    return "movie"
 
 
 # ============================================================================
@@ -4953,8 +5090,11 @@ def positions_after_aired_entries(raw_tracks, ch_info, start_pos, day_seed, bloc
 
 def entries_started_before(timeline, lineup, cutoff_seconds):
     """How many entries of a cycle's lineup start before cutoff_seconds of the cycle; None when the timeline does not hold exactly one first part per lineup entry."""
-    starts = [float(item.get("start_time", 0) or 0) for item in timeline or []
-              if isinstance(item, dict) and not item.get("is_commercial") and not item.get("seek_offset", 0)]
+    starts = []
+    for item in timeline or []:
+        if isinstance(item, dict) and not item.get("is_commercial") and not item.get("seek_offset", 0):
+            # WARNING: a Shorts entry airs two lone shorts of the lineup.
+            starts.extend([float(item.get("start_time", 0) or 0)] * (2 if item.get("shorts") else 1))
     if len(starts) != len(lineup or []):
         return None
     return sum(1 for start in starts if start < cutoff_seconds)
@@ -5525,6 +5665,9 @@ def build_commercial_tracks(items, path_exists, max_seconds=COMMERCIAL_MAX_SECON
 BREAK_MAX_CATCHUP_SECONDS = _perf_governor.BREAK_MAX_CATCHUP_SECONDS if _perf_governor is not None else 180
 BREAK_MIN_GAP_SECONDS = _perf_governor.BREAK_MIN_GAP_SECONDS if _perf_governor is not None else 300
 BREAK_MIN_SECONDS = _perf_governor.BREAK_MIN_SECONDS if _perf_governor is not None else 120
+# WARNING: the fallback numbers below must match SHORT_SHOW_MAX_SECONDS and SHORT_IN_BREAK_MIN_SIDE_SECONDS in performance_governor.py; they are used only when that module fails to import.
+SHORT_SHOW_MAX_SECONDS = _perf_governor.SHORT_SHOW_MAX_SECONDS if _perf_governor is not None else 300
+SHORT_IN_BREAK_MIN_SIDE_SECONDS = _perf_governor.SHORT_IN_BREAK_MIN_SIDE_SECONDS if _perf_governor is not None else 60
 
 
 def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, day_seed,
@@ -5533,7 +5676,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                           max_end_break_seconds=600,
                           commercial_state=None,
                           fade_in_tracks=None,
-                          fade_out_tracks=None):
+                          fade_out_tracks=None,
+                          pair_shorts=False):
     import random as _random
 
     HALF_HOUR         = 1800
@@ -5611,11 +5755,15 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
     _shortest_ad_seconds = min(_ad_lengths) if _ad_lengths else BREAK_MIN_SECONDS
 
     timeline = []
-    total_block_content = 0
+    # WARNING: owner 2026-11-23: "it should just be pausing and adding commercials at the interrupt point ... the show should have picked up where it left off"; a lineup whose first show carries resume_from starts that show part-way in (the part already aired is not laid again), and mark_phase is how far past a half-hour mark the lineup starts, so its breaks still end on the clock's marks.
+    _first_track = video_tracks[0] if video_tracks and isinstance(video_tracks[0], dict) else None
+    _resume_from = max(0.0, float((_first_track or {}).get("resume_from", 0) or 0))
+    _mark_phase = int((_first_track or {}).get("mark_phase", 0) or 0) % HALF_HOUR
+    total_block_content = _mark_phase
 
     # WARNING: modified by the closures below via nonlocal.
     _deferred_fill  = 0
-    _last_break_end = -BREAK_MIN_GAP_SECONDS
+    _last_break_end = _mark_phase - BREAK_MIN_GAP_SECONDS
     _last_played_path = (commercial_state or {}).get("last")
 
     MAX_BREAKS_PER_HALF_HOUR = _perf_governor.BREAK_MAX_PER_HALF_HOUR if _perf_governor is not None else 2
@@ -5722,6 +5870,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             e["bundle_item_paths"]      = lineup_paths([show])
             e["bundle_item_durations"]  = [item.get("duration", 0) if isinstance(item, dict) else 0
                                            for item in show.get("bundle_items") or []]
+        if show.get("shorts"):
+            e["shorts"] = True
         return e
 
     def _pack_break(budget_seconds):
@@ -5735,6 +5885,9 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
             if remaining <= 0:
                 break
             com, ceiling = _pick_one(remaining, break_paths)
+            if com is None and picked:
+                # WARNING: owner 2026-11-23: "in the event they did not add enough commercials for a single break to be filled without reusing them, reuse them"; every commercial that fits airs once in the break first, then a bundle that has run out may repeat, never the commercial just played.
+                com, ceiling = _pick_one(remaining, {picked[-1]["path"]})
             if com is None:
                 break
             picked.append(com)
@@ -5781,22 +5934,31 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         """How many breaks a show of 30 minutes or more gets: one at every 30 minutes of show time that leaves at least 15 minutes after it, plus one at its end, and never fewer than 2 (owner 2026-11-06; before that, one for every half hour it ran into, 2026-11-03)."""
         return max(2, _interior_cut_count(show_dur) + 1)
 
-    def _pack_even_breaks(show, show_dur, num_breaks, t_block_content, next_mark, first_cut=None):
-        """Cuts the show into num_breaks equal parts (a pair at its seam) with a break after each, the last one at its end; the ad time up to next_mark is shared evenly so the next show starts on its mark."""
-        # WARNING: these breaks are held neither to max_interrupt_break_seconds nor to BREAK_MIN_SECONDS; either made a show under an hour get a 3rd break or lose one, or pushed the next show off its mark (owner 2026-11-03: the break count is the rule, a break every half hour and one at the end).
-        gap = max(0, next_mark - (t_block_content + show_dur))
-        per_break = gap / float(num_breaks)
-        seek_offset = 0
-        for i in range(num_breaks):
-            is_last = (i == num_breaks - 1)
-            if is_last:
-                seg = show_dur - seek_offset
-            elif i == 0 and first_cut:
+    def _cut_points(show_dur, num_breaks, first_cut=None):
+        """The show times at which a show with num_breaks breaks is cut (a pair at its seam), every break but the last, which is at its end."""
+        cuts = []
+        at = 0
+        for i in range(num_breaks - 1):
+            if i == 0 and first_cut:
                 seg = int(first_cut)
             elif _interior_cut_count(show_dur) >= 2:
-                seg = (i + 1) * HALF_HOUR - seek_offset
+                seg = (i + 1) * HALF_HOUR - at
             else:
-                seg = (int(show_dur) * (i + 1)) // num_breaks - seek_offset
+                seg = (int(show_dur) * (i + 1)) // num_breaks - at
+            at += seg
+            cuts.append(at)
+        return cuts
+
+    def _pack_even_breaks(show, show_dur, num_breaks, t_block_content, next_mark, first_cut=None, resume_from=0):
+        """Cuts the show into num_breaks equal parts (a pair at its seam) with a break after each, the last one at its end; the ad time up to next_mark is shared evenly so the next show starts on its mark. A show resumed part-way in keeps only the cuts still ahead of it."""
+        # WARNING: these breaks are held neither to max_interrupt_break_seconds nor to BREAK_MIN_SECONDS; either made a show under an hour get a 3rd break or lose one, or pushed the next show off its mark (owner 2026-11-03: the break count is the rule, a break every half hour and one at the end).
+        cuts = [c for c in _cut_points(show_dur, num_breaks, first_cut) if c > resume_from]
+        gap = max(0, next_mark - (t_block_content + show_dur - resume_from))
+        per_break = gap / float(len(cuts) + 1)
+        seek_offset = resume_from
+        for i, part_end in enumerate(cuts + [show_dur]):
+            is_last = (i == len(cuts))
+            seg = part_end - seek_offset
             timeline.append(_show_entry(show, seg, t_block_content, seek_offset,
                                         interior_cut=not is_last))
             t_block_content += seg
@@ -5866,19 +6028,92 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 return int(d1)
         return show_dur // 2
 
+    def _resumed_part(show, show_dur):
+        """How far into the show the lineup starts: resume_from for its first show (or the shorts pair it opens), 0 for every other show."""
+        _first = show is _first_track or (isinstance(show, dict) and show.get("_unit_first") is _first_track)
+        return _resume_from if (_first and 0 < _resume_from < show_dur) else 0
+
+    # WARNING: owner 2026-11-23: "any 2 different shorts get paired and played with no commercials between them"; a show of SHORT_SHOW_MAX_SECONDS or less that is not part of a pair is a lone short. With pairing on, two lone shorts next to each other in the lineup air as one Shorts entry; a lone short left over goes into the middle of the end-of-show break before it, and only when that cannot be done does it air as a show of its own.
+    def _is_lone_short(track):
+        return (isinstance(track, dict) and not track.get("is_pair") and not track.get("is_bundle")
+                and 0 < _resolved_show_duration(track) <= SHORT_SHOW_MAX_SECONDS)
+
+    def _shorts_pair(first, second):
+        d1, d2 = _resolved_show_duration(first), _resolved_show_duration(second)
+        return {"path": first["path"], "duration": d1 + d2, "is_pair": True, "shorts": True,
+                "pair_ep1_path": first["path"], "pair_ep1_duration": d1,
+                "pair_ep2_path": second["path"], "pair_ep2_duration": d2, "_unit_first": first}
+
+    units = []
+    _u = 0
+    while _u < len(video_tracks):
+        _track = video_tracks[_u]
+        if (pair_shorts and _is_lone_short(_track) and _u + 1 < len(video_tracks) and _is_lone_short(video_tracks[_u + 1])
+                and video_tracks[_u + 1].get("path") != _track.get("path")):
+            units.append(_shorts_pair(_track, video_tracks[_u + 1]))
+            _u += 2
+            continue
+        units.append(_track)
+        _u += 1
+
+    def _tuck_lone_shorts():
+        """Moves each lone short that airs between two end-of-show breaks into the break it splits: the commercials before and after it are dealt again around it so it sits at the commercial boundary nearest the middle, with at least SHORT_IN_BREAK_MIN_SIDE_SECONDS on each side; nothing moves in time, so every show keeps its start."""
+        # WARNING: owner 2026-11-23: a lone short is "a small commercial interruption" in the middle of the break between the end of one show and the start of another, only when the break holds 2 minutes or more of commercials; otherwise it airs as a show of its own.
+        index = 0
+        while index < len(timeline):
+            entry = timeline[index]
+            if (entry.get("is_commercial") or entry.get("is_pair") or entry.get("is_bundle") or entry.get("interior_cut")
+                    or entry.get("seek_offset", 0) or not 0 < float(entry.get("duration", 0) or 0) <= SHORT_SHOW_MAX_SECONDS):
+                index += 1
+                continue
+            first = index
+            while first > 0 and timeline[first - 1].get("is_commercial"):
+                first -= 1
+            last = index + 1
+            while last < len(timeline) and timeline[last].get("is_commercial"):
+                last += 1
+            before_show = timeline[first - 1] if first > 0 else None
+            after_show = timeline[last] if last < len(timeline) else None
+            if (before_show is None or after_show is None or before_show.get("interior_cut") or before_show.get("in_break")
+                    or after_show.get("seek_offset", 0)):
+                index += 1
+                continue
+            ads = [e for e in timeline[first:last] if e is not entry]
+            total = sum(float(a.get("duration", 0) or 0) for a in ads)
+            best = None
+            run = 0.0
+            for k in range(1, len(ads)):
+                run += float(ads[k - 1].get("duration", 0) or 0)
+                if run >= SHORT_IN_BREAK_MIN_SIDE_SECONDS and total - run >= SHORT_IN_BREAK_MIN_SIDE_SECONDS:
+                    if best is None or abs(run - total / 2.0) < abs(best[1] - total / 2.0):
+                        best = (k, run)
+            if best is None:
+                index = last
+                continue
+            cursor = timeline[first]["start_time"]
+            arranged = ads[:best[0]] + [entry] + ads[best[0]:]
+            for item in arranged:
+                item["start_time"] = cursor
+                cursor += float(item.get("duration", 0) or 0)
+            entry["in_break"] = True
+            timeline[first:last] = arranged
+            index = last
+
     if commercial_tracks and commercial_placement == "interrupt_half_hour":
-        for show in video_tracks:
+        for show in units:
             show_dur = _resolved_show_duration(show)
             _est = _dur_is_estimated(show)
+            _from = _resumed_part(show, show_dur)
 
-            total_block_content = _snap_to_mark(total_block_content, max_interrupt_break_seconds)
-            total_block_content = _maybe_flush_deferred_fill(total_block_content)
+            if not _from:
+                total_block_content = _snap_to_mark(total_block_content, max_interrupt_break_seconds)
+                total_block_content = _maybe_flush_deferred_fill(total_block_content)
             _register_half_hour(total_block_content)
 
-            natural_end = total_block_content + show_dur
+            natural_end = total_block_content + show_dur - _from
             next_mark = ((natural_end // HALF_HOUR) + (1 if natural_end % HALF_HOUR != 0 else 0)) * HALF_HOUR
             gap = next_mark - natural_end
-            if _est and gap <= 0:
+            if _est and gap <= 0 and not _from:
                 # WARNING: do not turn an estimated placeholder into a long-form program with a full fallback break; the next probe rebuilds it.
                 if show_dur == HALF_HOUR:
                     timeline.append(_show_entry(show, show_dur,
@@ -5888,15 +6123,17 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 next_mark += HALF_HOUR
                 gap = next_mark - natural_end
 
-            if show_dur >= interrupt_floor_seconds:
+            if show_dur >= interrupt_floor_seconds and not show.get("shorts"):
                 _n = 2 if show_dur < HALF_HOUR else _breaks_for_show(show_dur)
-                while gap < _n * _shortest_ad_seconds:
+                _first_cut = _mid_split_point(show, show_dur) if _n == 2 else None
+                _breaks_left = 1 + sum(1 for c in _cut_points(show_dur, _n, _first_cut) if c > _from)
+                while gap < _breaks_left * _shortest_ad_seconds:
                     # WARNING: too little ad time for one commercial in each break; the show runs to the next half-hour mark so it keeps all its breaks and the next show still starts on a mark.
                     next_mark += HALF_HOUR
                     gap = next_mark - natural_end
                 total_block_content = _pack_even_breaks(
                     show, show_dur, _n, total_block_content, next_mark,
-                    first_cut=_mid_split_point(show, show_dur) if _n == 2 else None)
+                    first_cut=_first_cut, resume_from=_from)
                 continue
 
             if 0 < gap < BREAK_MIN_SECONDS:
@@ -5905,8 +6142,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
 
             if gap <= 0:
                 _fallback_break_len = max_interrupt_break_seconds if max_interrupt_break_seconds else BREAK_MIN_SECONDS
-                timeline.append(_show_entry(show, show_dur, total_block_content, 0))
-                total_block_content += show_dur
+                timeline.append(_show_entry(show, show_dur - _from, total_block_content, _from))
+                total_block_content += show_dur - _from
                 if _half_hour_capped(total_block_content):
                     _deferred_fill += _fallback_break_len
                 else:
@@ -5915,8 +6152,8 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                         max_seconds=max_interrupt_break_seconds)
                 continue
 
-            timeline.append(_show_entry(show, show_dur, total_block_content, 0))
-            total_block_content += show_dur
+            timeline.append(_show_entry(show, show_dur - _from, total_block_content, _from))
+            total_block_content += show_dur - _from
             end_budget = next_mark - total_block_content
             if _deferred_fill > 0:
                 end_budget += _deferred_fill
@@ -5929,17 +6166,19 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                     max_seconds=max_interrupt_break_seconds)
 
     elif commercial_tracks and commercial_placement == "end_of_show":
-        for show in video_tracks:
-            total_block_content = _snap_to_mark(total_block_content, max_end_break_seconds)
-            total_block_content = _maybe_flush_deferred_fill(total_block_content)
-
+        for show in units:
             _dur = _resolved_show_duration(show)
-            if _dur_is_estimated(show) and _dur == HALF_HOUR:
+            _from = _resumed_part(show, _dur)
+            if not _from:
+                total_block_content = _snap_to_mark(total_block_content, max_end_break_seconds)
+                total_block_content = _maybe_flush_deferred_fill(total_block_content)
+
+            if _dur_is_estimated(show) and _dur == HALF_HOUR and not _from:
                 timeline.append(_show_entry(show, _dur, total_block_content, 0))
                 total_block_content += _dur
                 continue
-            timeline.append(_show_entry(show, _dur, total_block_content, 0))
-            total_block_content += _dur
+            timeline.append(_show_entry(show, _dur - _from, total_block_content, _from))
+            total_block_content += _dur - _from
 
             next_mark  = (((total_block_content // HALF_HOUR)
                            + (1 if total_block_content % HALF_HOUR != 0 else 0)) * HALF_HOUR)
@@ -5952,10 +6191,19 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
                 max_seconds=max_end_break_seconds)
 
     else:
-        for show in video_tracks:
+        for show in units:
             _dur = _resolved_show_duration(show)
-            timeline.append(_show_entry(show, _dur, total_block_content, 0))
-            total_block_content += _dur
+            _from = _resumed_part(show, _dur)
+            timeline.append(_show_entry(show, _dur - _from, total_block_content, _from))
+            total_block_content += _dur - _from
+
+    if commercial_tracks:
+        _tuck_lone_shorts()
+
+    if _mark_phase:
+        for _entry in timeline:
+            _entry["start_time"] -= _mark_phase
+        total_block_content -= _mark_phase
 
     # WARNING: fade-in and fade-out bumpers stay in the same timeline and extend its duration; they never make a second guide.
     fade_in_tracks = list(fade_in_tracks or [])
@@ -5964,9 +6212,10 @@ def build_block_timeline(video_tracks, commercial_tracks, commercial_placement, 
         _bumper_timeline = []
         _fade_in_pos = 0
         _fade_out_pos = 0
-        _seen_show = False
+        # WARNING: a resumed first show is already under way, so the show after it still gets its fade-out first.
+        _seen_show = _resume_from > 0
         for _index, _entry in enumerate(timeline):
-            _is_show_start = (not _entry.get("is_commercial") and not _entry.get("seek_offset", 0))
+            _is_show_start = (not _entry.get("is_commercial") and not _entry.get("seek_offset", 0) and not _entry.get("in_break"))
             if _is_show_start and _seen_show and fade_out_tracks:
                 _bumper = fade_out_tracks[_fade_out_pos % len(fade_out_tracks)]
                 _fade_out_pos += 1
@@ -6111,9 +6360,10 @@ def build_channel_timeline(video_tracks, commercial_tracks, ch_info, day_seed, c
     fade_in_tracks, fade_out_tracks = bumper_tracks_for_channel(ch_info)
     placement = ch_info.get("commercial_placement", "interrupt_half_hour")
     floor = commercial_interrupt_floor_seconds(ch_info)
+    pair_shorts = int(ch_info.get("pair_threshold_minutes", 15) or 0) > 0
     try:
         key = hashlib.md5(repr((video_tracks, commercial_tracks, placement, day_seed, floor, commercial_state,
-                                fade_in_tracks, fade_out_tracks)).encode("utf-8", "replace")).digest()
+                                fade_in_tracks, fade_out_tracks, pair_shorts)).encode("utf-8", "replace")).digest()
     except Exception as _key_error:
         _log_swallowed("build_channel_timeline: memo key", _key_error)
         key = None
@@ -6130,6 +6380,7 @@ def build_channel_timeline(video_tracks, commercial_tracks, ch_info, day_seed, c
         commercial_state=commercial_state,
         fade_in_tracks=fade_in_tracks,
         fade_out_tracks=fade_out_tracks,
+        pair_shorts=pair_shorts,
     )
     if key is not None:
         with _timeline_memo_lock:
@@ -6172,7 +6423,8 @@ def _bundle_fields(entry, bundles):
 
 
 _GUIDE_ENTRY_KEYS = ("path", "duration", "is_commercial", "seek_offset", "is_pair", "pair_ep1_path", "pair_ep1_duration",
-                     "pair_ep2_path", "pair_ep2_duration", "is_bundle", "bundle_item_paths", "bundle_item_durations")
+                     "pair_ep2_path", "pair_ep2_duration", "is_bundle", "bundle_item_paths", "bundle_item_durations", "shorts", "in_break",
+                     "interior_cut")
 
 
 def guide_entry_facts(entry):
@@ -6806,6 +7058,10 @@ _SIDECAR_LABEL_NOISE = {"sdh", "cc", "hi", "default", "captions", "caption", "su
 _BAKED_NAME_RE = re.compile(
     r"(?<![a-z0-9])(hard[\W_]*sub(?:s|bed)?|hard[\W_]*coded|burn(?:ed|t)?[\W_]*in|open[\W_]*captions?)(?![a-z0-9])",
     re.I)
+# WARNING: owner 2026-11-23: "Annabelle Comes Home.2019.HC.HDRip..." got English captions over its burned-in subtitles; "HC" is the release tag for hard-coded subtitles. It counts only as a word of its own next to a release tag (HDRip, WEBRip, 1080p ...), so a title that merely holds those letters is never taken for it.
+_RELEASE_TAG = r"(?:\d{3,4}p|hd[\W_]*rip|web[\W_]*(?:rip|dl)|br[\W_]*rip|blu[\W_]*ray|dvd[\W_]*rip|hd[\W_]*tv|hd[\W_]*cam|hd[\W_]*ts|cam[\W_]*rip|x26[45]|xvid)"
+_BAKED_HC_TAG_RE = re.compile(
+    r"(?<![a-z0-9])(?:hc[\W_]+" + _RELEASE_TAG + r"|" + _RELEASE_TAG + r"[\W_]+hc)(?![a-z0-9])", re.I)
 
 
 def _sidecar_rank(stem_lower, candidate_name_lower):
@@ -6859,8 +7115,11 @@ def _find_sidecar_caption_file(file_path):
 
 
 def filename_says_captions_baked_in(file_path):
-    """True when the file's own name says the subtitles are part of the picture (hardsub, hardcoded, burned-in, open captions)."""
-    return bool(file_path) and bool(_BAKED_NAME_RE.search(os.path.basename(file_path)))
+    """True when the file's own name says the subtitles are part of the picture (hardsub, hardcoded, burned-in, open captions, or the release tag HC next to another release tag)."""
+    if not file_path:
+        return False
+    name = os.path.basename(file_path)
+    return bool(_BAKED_NAME_RE.search(name) or _BAKED_HC_TAG_RE.search(name))
 
 
 def _caption_file_is_usable(path):
@@ -7298,6 +7557,9 @@ def _caption_memory_allows_load(notify=True):
     if ok:
         return True
     handler = _caption_memory_refusal_handler if notify else None
+    if handler is not None and _perf_governor is not None:
+        # WARNING: owner 2026-11-24: live captioning stops for the rest of the run (caption files and saved captions still show); without this every new show would try the load again.
+        _perf_governor.caption_mark_no_memory()
     if handler is not None:
         try:
             handler(total_gb, avail_gb, needed_gb)
@@ -7313,9 +7575,34 @@ def _caption_memory_shed(total_gb, avail_gb, commit_gb):
         handler(total_gb, avail_gb, float(_perf_governor.CAPTION_RUNTIME_MIN_AVAILABLE_RAM_GB))
 
 
-def _whisper_model_files_note():
-    """One line naming the caption model's files with their sizes and any unfinished download beside them, so a crash while loading can be traced to a missing or cut-short file."""
-    root = os.path.join(resolve_whisper_model_dir(), f"models--Systran--faster-whisper-{_ASR_MODEL_SIZE}")
+def _drop_unfinished_model_downloads(size=None):
+    """Deletes the cut-short downloads (blobs ending in .incomplete) left in the caption model's folder once the model has loaded; returns the megabytes freed."""
+    # WARNING: owner log 2026-11-24: a first download of the model was cut off and left a 128 MB .incomplete file that was never used again; the model loads only from its finished files, and nothing downloads once it is ready, so the leftovers are safe to delete then.
+    blobs = os.path.join(resolve_whisper_model_dir(), f"models--Systran--faster-whisper-{size or _ASR_MODEL_SIZE}", "blobs")
+    freed = 0.0
+    if not os.path.isdir(blobs):
+        return 0.0
+    names = []
+    try:
+        names = [n for n in os.listdir(blobs) if n.endswith(".incomplete")]
+    except OSError as _swallowed_error:
+        _log_swallowed("_drop_unfinished_model_downloads: os.listdir(blobs)", _swallowed_error)
+    for name in names:
+        path = os.path.join(blobs, name)
+        try:
+            size_mb = os.path.getsize(path) / 1048576.0
+            os.remove(path)
+            freed += size_mb
+        except OSError as _swallowed_error:
+            _log_swallowed("_drop_unfinished_model_downloads: os.remove(path)", _swallowed_error)
+    if names:
+        log.info("[ASR] %d unfinished model download(s) removed from the caption model's folder (%.1f MB freed)", len(names), freed)
+    return freed
+
+
+def _whisper_model_files_note(size=None):
+    """One line naming a model's files (the caption model's, or the one of that size) with their sizes and any unfinished download beside them, so a crash while loading can be traced to a missing or cut-short file."""
+    root = os.path.join(resolve_whisper_model_dir(), f"models--Systran--faster-whisper-{size or _ASR_MODEL_SIZE}")
     found = []
     try:
         for folder, _dirs, names in os.walk(root):
@@ -7364,11 +7651,13 @@ def _caption_worker_crash_tail(lines=60):
 class _RemoteWhisperModel:
     """Stands in for the faster-whisper model while the real one lives in a separate copy of the program, so a crash inside the model library cannot take the program down."""
 
-    def __init__(self, process, link):
+    def __init__(self, process, link, essential=True):
         self._process = process
         self._link = link
         self._call_lock = threading.Lock()
         self.dead = False
+        # essential: the caption model itself; a helper (the language model) that dies only stops its own help and never switches Live Captions off.
+        self.essential = essential
 
     def _ask(self, request):
         """Sends one request to the other process and returns its answer; raises RuntimeError when that process failed or died."""
@@ -7384,6 +7673,9 @@ class _RemoteWhisperModel:
             except (EOFError, OSError):
                 self.dead = True
                 code = self._process.wait()
+                if not self.essential:
+                    log.warning("[ASR WORKER] the language model process died with exit code %s; captions go on without the language check", hex(code & 0xFFFFFFFF))
+                    raise RuntimeError("the language model process died")
                 log.warning("[ASR WORKER] the caption model process died with exit code %s (a crash inside the model library); the program keeps running and Live Captions are switched off. Its own crash report:\n%s", hex(code & 0xFFFFFFFF), _caption_worker_crash_tail())
                 _caption_model_process_died()
                 raise RuntimeError("the caption model process died")
@@ -7395,6 +7687,15 @@ class _RemoteWhisperModel:
         """Same call and answer as WhisperModel.transcribe, with the segments already read out; raises RuntimeError when the other process failed or died."""
         reply = self._ask(("transcribe", audio, kwargs))
         return iter(reply[1]), reply[2]
+
+    def language(self, audio):
+        """(language code, probability) the model hears in the audio, worked out in the other process without writing any text."""
+        reply = self._ask(("language", audio))
+        return reply[1], reply[2]
+
+    def sounds(self, audio, model_path, columns):
+        """The sound model's scores (one row per moment of about half a second, one column per class in columns) for 16 kHz audio, worked out in the other process."""
+        return self._ask(("sounds", audio, model_path, list(columns)))[1]
 
     def speech_spans(self, audio, threshold, min_silence_ms, min_speech_ms):
         """Finds the spans of speech in the audio inside the other process, because the voice-activity library (onnxruntime) crashed the program when loaded here."""
@@ -7431,8 +7732,8 @@ def _caption_model_process_died():
         handler(0.0, 0.0, 0.0)
 
 
-def _start_caption_model_process(threads):
-    """Starts the separate process that loads the caption model; returns a _RemoteWhisperModel, or None (reason logged) when it did not come up."""
+def _start_caption_model_process(threads, size=None, essential=True):
+    """Starts the separate process that loads a model (the caption model, or with size the language model, which is not essential); returns a _RemoteWhisperModel, or None (reason logged) when it did not come up."""
     from multiprocessing.connection import Listener
     key = os.urandom(16)
     listener = Listener(("127.0.0.1", 0), authkey=key)
@@ -7441,11 +7742,12 @@ def _start_caption_model_process(threads):
     else:
         here = os.path.dirname(os.path.abspath(__file__))
         command = [sys.executable, next((path for path in (os.path.join(here, "retro_tv_emulator.py"), os.path.join(os.path.dirname(here), "retro_tv_emulator.py")) if os.path.isfile(path)), "retro_tv_emulator.py")]
-    command += ["--caption-model-worker", resolve_whisper_model_dir(), _ASR_MODEL_SIZE, str(threads), str(listener.address[1]), key.hex(), _caption_worker_log_dir()]
+    command += ["--caption-model-worker", resolve_whisper_model_dir(), size or _ASR_MODEL_SIZE, str(threads), str(listener.address[1]), key.hex(), _caption_worker_log_dir()]
     if _native_libraries_reporter is not None:
         log.info("[ASR WORKER] native libraries in the program before the caption process starts: %s", _native_libraries_reporter())
+    # WARNING: owner log 2026-11-23: the caption model ran at normal priority and took the processor (93% busy, a 30 s chunk took 27 s) while a 1080p channel opened, so its first picture came 5.6 s after the change; like every other worker it runs below normal, so the picture and the channel change always come first.
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     link = []
 
     def _accept():
@@ -7469,8 +7771,8 @@ def _start_caption_model_process(threads):
                     reply = None
                 break
     if reply is not None and reply[0] == "ready":
-        log.info("[ASR WORKER] caption model process %d is up: %s", process.pid, reply[1])
-        return _RemoteWhisperModel(process, link[0])
+        log.info("[ASR WORKER] %s model process %d is up: %s", "caption" if essential else "language", process.pid, reply[1])
+        return _RemoteWhisperModel(process, link[0], essential=essential)
     if reply is None and link and time.monotonic() < deadline:
         # WARNING: the link closes a moment before a crashing process has fully ended; it is given CAPTION_WORKER_EXIT_WAIT_S to end, or a crash was taken for a process that did not load in time and Live Captions were not locked.
         try:
@@ -7482,6 +7784,8 @@ def _start_caption_model_process(threads):
         log.warning("[ASR WORKER] the caption model process did not load the model in %ds, so Live Captions stay off. Its own crash report:\n%s", CAPTION_WORKER_START_SECONDS, _caption_worker_crash_tail())
     elif reply is not None:
         log.warning("[ASR WORKER] the caption model process could not load the model: %s", reply[1])
+    elif not essential:
+        log.warning("[ASR WORKER] the language model process died while loading with exit code %s; captions go on without the language check", hex(process.wait() & 0xFFFFFFFF))
     else:
         log.warning("[ASR WORKER] the caption model process died while loading with exit code %s (a crash inside the model library); the program keeps running and Live Captions are switched off. Its own crash report:\n%s", hex(process.wait() & 0xFFFFFFFF), _caption_worker_crash_tail())
         _caption_model_process_died()
@@ -7526,6 +7830,7 @@ def _get_whisper_model(for_scan=False):
         _whisper_model = _loaded
         log.info("[ASR] faster-whisper '%s' model ready in its own process (CPU, int8, %d threads) in %.1fs",
                  _ASR_MODEL_SIZE, _threads, time.monotonic() - _load_started)
+        _drop_unfinished_model_downloads()
         try:
             import numpy as _np
             _silence = _np.zeros(16000, dtype="float32")
@@ -7540,6 +7845,7 @@ def _get_whisper_model(for_scan=False):
             _perf_governor.caption_load_resident()
             _perf_governor.caption_watch_start(_caption_memory_shed)
             _whisper_idle_watch_start()
+        start_language_model()
     return _whisper_model
 
 
@@ -7573,10 +7879,25 @@ def _speech_listener():
     return model
 
 _whisper_idle_thread = None
+_captions_watched_check = None
+
+
+def set_captions_watched_check(fn):
+    """Registers fn() -> True while a channel or a DVD plays with its Captions switch on, so live captions may be wanted again at any moment (the next show after a break the saved captions covered)."""
+    global _captions_watched_check
+    _captions_watched_check = fn
+
+
+def _captions_watched():
+    try:
+        return bool(_captions_watched_check is not None and _captions_watched_check())
+    except Exception as _swallowed_error:
+        _log_swallowed("_captions_watched", _swallowed_error)
+        return False
 
 
 def _whisper_idle_watch_start():
-    """Starts the check that frees the caption model after WHISPER_IDLE_UNLOAD_SECONDS with no live transcription and no transcription holding the slot."""
+    """Starts the check that frees the caption model after WHISPER_IDLE_UNLOAD_SECONDS with no live transcription and no transcription holding the slot (WHISPER_IDLE_UNLOAD_WATCHING_SECONDS while a channel or a DVD plays with Captions on)."""
     global _whisper_idle_thread
     if _perf_governor is None:
         return
@@ -7584,6 +7905,7 @@ def _whisper_idle_watch_start():
     if limit_s <= 0 or (_whisper_idle_thread is not None and _whisper_idle_thread.is_alive()):
         return
     every_s = max(0.5, float(_perf_governor.WHISPER_IDLE_CHECK_SECONDS))
+    watching_s = max(limit_s, float(_perf_governor.WHISPER_IDLE_UNLOAD_WATCHING_SECONDS))
 
     def _job():
         idle_since = None
@@ -7598,12 +7920,136 @@ def _whisper_idle_watch_start():
                 idle_since = None
                 continue
             idle_since = idle_since or time.monotonic()
-            if time.monotonic() - idle_since >= limit_s:
-                release_whisper_model("idle for %d seconds" % int(limit_s))
+            hold_s = watching_s if _captions_watched() else limit_s
+            if time.monotonic() - idle_since >= hold_s:
+                release_whisper_model("idle for %d seconds" % int(hold_s))
                 idle_since = None
 
     _whisper_idle_thread = threading.Thread(target=_job, daemon=True, name="whisper-idle-watch")
     _whisper_idle_thread.start()
+
+
+# ============================================================================
+# SECTION: The language model (tiny), helping the caption model by mode
+# ============================================================================
+# WARNING: owner 2026-11-24: "lite only gets small, standard gets help from tiny, and performance runs tiny straight up"; small.en always writes the words, tiny (a model that knows many languages) only says which language a stretch of speech is in, so speech that is not English shows as [speaking Spanish] or [speaking foreign language] instead of made-up English words.
+# WARNING: the fallback values below must match CAPTION_LANGUAGE_MODEL, CAPTION_LANGUAGE_CHECK, CAPTION_LANGUAGE_MODEL_THREADS, CAPTION_LANGUAGE_NAMED_MIN_PROB and CAPTION_LANGUAGE_FOREIGN_MIN_PROB in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_LANGUAGE_MODEL = _perf_governor.CAPTION_LANGUAGE_MODEL if _perf_governor is not None else "tiny"
+_CAPTION_LANGUAGE_CHECK = _perf_governor.CAPTION_LANGUAGE_CHECK if _perf_governor is not None else {"lite": "off", "standard": "unsure", "performance": "every"}
+_CAPTION_LANGUAGE_MODEL_THREADS = _perf_governor.CAPTION_LANGUAGE_MODEL_THREADS if _perf_governor is not None else 1
+_CAPTION_LANGUAGE_NAMED_MIN_PROB = _perf_governor.CAPTION_LANGUAGE_NAMED_MIN_PROB if _perf_governor is not None else 0.75
+_CAPTION_LANGUAGE_FOREIGN_MIN_PROB = _perf_governor.CAPTION_LANGUAGE_FOREIGN_MIN_PROB if _perf_governor is not None else 0.5
+# WARNING: the fallback values below must match CAPTION_UNSURE_WORD_PROB and CAPTION_INAUDIBLE_SHARE in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_UNSURE_WORD_PROB = _perf_governor.CAPTION_UNSURE_WORD_PROB if _perf_governor is not None else 0.4
+_CAPTION_INAUDIBLE_SHARE = _perf_governor.CAPTION_INAUDIBLE_SHARE if _perf_governor is not None else 0.6
+_language_model = {"model": None, "failed": False, "loading": False}
+_language_model_lock = threading.Lock()
+_LANGUAGE_NAMES = {
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian", "pt": "Portuguese", "ru": "Russian", "ja": "Japanese",
+    "zh": "Chinese", "ko": "Korean", "ar": "Arabic", "hi": "Hindi", "nl": "Dutch", "sv": "Swedish", "no": "Norwegian",
+    "da": "Danish", "fi": "Finnish", "pl": "Polish", "tr": "Turkish", "el": "Greek", "he": "Hebrew", "uk": "Ukrainian",
+    "cs": "Czech", "hu": "Hungarian", "ro": "Romanian", "vi": "Vietnamese", "th": "Thai", "id": "Indonesian",
+    "tl": "Tagalog", "la": "Latin", "ga": "Irish", "cy": "Welsh", "yi": "Yiddish", "fa": "Persian", "ur": "Urdu",
+}
+CAPTION_FOREIGN_TEXT = "[speaking foreign language]"
+CAPTION_INAUDIBLE_TEXT = "[inaudible]"
+
+
+def caption_language_check(mode=None):
+    """How the language model helps on this PC: "off" (Lite), "unsure" (Standard: only stretches the caption model is unsure of) or "every" (Performance: every stretch of speech); mode picks a row by name instead of the PC's own performance mode."""
+    if mode is None:
+        try:
+            mode = _perf_governor.get_mode() if _perf_governor is not None else "lite"
+        except Exception as _swallowed_error:
+            _log_swallowed("caption_language_check: get_mode", _swallowed_error)
+            mode = "lite"
+    return str(_CAPTION_LANGUAGE_CHECK.get(str(mode), "off"))
+
+
+def _language_model_now():
+    """The language model when it is loaded, else None; never waits. It is started beside the caption model (start_language_model) so it is ready before a stretch needs it."""
+    model = _language_model["model"]
+    if model is not None and getattr(model, "dead", False):
+        _language_model["model"] = None
+        return None
+    return model
+
+
+def start_language_model(check=None):
+    """Starts the language model in its own process, on a background thread, when the check this PC uses (or check) is not "off" and it is not loaded, loading or failed already. One thread, below normal priority like every caption process; the memory check comes first."""
+    if (check or caption_language_check()) == "off":
+        return
+    with _language_model_lock:
+        if _language_model["model"] is not None or _language_model["loading"] or _language_model["failed"]:
+            return
+        _language_model["loading"] = True
+
+    def _job():
+        try:
+            if not _caption_memory_allows_load(notify=False):
+                return
+            log.info("[ASR] language model files: %s", _whisper_model_files_note(_CAPTION_LANGUAGE_MODEL))
+            loaded = _start_caption_model_process(int(_CAPTION_LANGUAGE_MODEL_THREADS), size=_CAPTION_LANGUAGE_MODEL, essential=False)
+            if loaded is None:
+                _language_model["failed"] = True
+                log.warning("[ASR] the language model '%s' could not load; captions go on without the language check", _CAPTION_LANGUAGE_MODEL)
+                return
+            _language_model["model"] = loaded
+        except Exception as e:
+            _language_model["failed"] = True
+            log.warning("[ASR] the language model could not start: %s", e)
+        finally:
+            _language_model["loading"] = False
+    threading.Thread(target=_job, daemon=True, name="LanguageModelLoad").start()
+
+
+def language_model_failed():
+    """True once the language model could not load in this program; the server scan then aims no higher than the grade it can make."""
+    return bool(_language_model["failed"])
+
+
+def wait_for_language_model(timeout):
+    """Waits up to timeout seconds while the language model is loading; returns it, or None."""
+    deadline = time.monotonic() + float(timeout)
+    while _language_model["loading"] and time.monotonic() < deadline:
+        time.sleep(0.2)
+    return _language_model_now()
+
+
+def release_language_model(reason):
+    """Frees the language model (it follows the caption model out of memory)."""
+    with _language_model_lock:
+        model, _language_model["model"] = _language_model["model"], None
+    if model is not None:
+        try:
+            model.close()
+            log.info("[ASR] language model unloaded (%s)", reason)
+        except Exception as _swallowed_error:
+            _log_swallowed("release_language_model: model.close()", _swallowed_error)
+
+
+def _foreign_speech_text(clip, check, clip_cues):
+    """The caption for a clip of speech that is not English ("[speaking Spanish]", or CAPTION_FOREIGN_TEXT when the language is less sure or has no name here), or None when the clip is English, was not checked, or no language model is ready. check "unsure" looks only at a clip the caption model was unsure of (or wrote nothing for), "every" at every clip."""
+    if check == "off" or (check == "unsure" and not _asr_clip_is_unsure(clip_cues)):
+        return None
+    model = _language_model_now()
+    if model is None:
+        return None
+    try:
+        code, prob = model.language(clip)
+    except Exception as e:
+        log.info("[ASR] language check skipped: %s", e)
+        return None
+    if not code or code == "en" or prob < _CAPTION_LANGUAGE_FOREIGN_MIN_PROB:
+        return None
+    name = _LANGUAGE_NAMES.get(code)
+    return "[speaking %s]" % name if name and prob >= _CAPTION_LANGUAGE_NAMED_MIN_PROB else CAPTION_FOREIGN_TEXT
+
+
+def _asr_clip_is_unsure(clip_cues):
+    """True when the caption model wrote nothing for a clip of speech, or most of the words it wrote are ones it is unsure of."""
+    words = [wp for c in clip_cues for wp in (getattr(c, "word_list", None) or [])]
+    return not any(p is not None for _w, p in words) or _asr_cue_is_inaudible(words)
 
 
 def release_whisper_model(reason):
@@ -7631,6 +8077,7 @@ def release_whisper_model(reason):
                         return
                     _closing, _whisper_model = _whisper_model, None
                 _closing.close()
+                release_language_model(reason)
                 import gc as _gc
                 _gc.collect()
                 _mem_now = _perf_governor.read_process_memory_mb() if _perf_governor is not None else (0.0, 0.0)
@@ -8111,10 +8558,127 @@ def _asked_to_stop(should_stop):
         return False
 
 
+# ============================================================================
+# SECTION: Sound tags between the speech (YAMNet)
+# ============================================================================
+# WARNING: owner 2026-11-24: "is there a way to add on sound or something so it recongnizes more sounds like barking, meowing, whistling"; Google's YAMNet sound model (main/models/yamnet, converted to ONNX so it runs on the onnxruntime the caption process already has) names the sounds, and a tag is written only where no kept caption of speech is, so speech always wins.
+# WARNING: the fallback values below must match CAPTION_SOUND_TAGS, CAPTION_SOUND_MIN_SCORE and CAPTION_SOUND_MIN_FRAMES in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_SOUND_TAGS = _perf_governor.CAPTION_SOUND_TAGS if _perf_governor is not None else {"lite": False, "standard": True, "performance": True}
+_CAPTION_SOUND_MIN_SCORE = _perf_governor.CAPTION_SOUND_MIN_SCORE if _perf_governor is not None else 0.5
+_CAPTION_SOUND_MIN_FRAMES = _perf_governor.CAPTION_SOUND_MIN_FRAMES if _perf_governor is not None else 2
+SOUND_MODEL_FOLDER = "yamnet"
+SOUND_MODEL_FILE = "yamnet.onnx"
+SOUND_CLASS_FILE = "yamnet_class_map.csv"
+# YAMNet's moments: each covers SOUND_FRAME_SEC seconds of audio and the next starts SOUND_HOP_SEC later (fixed by the model).
+SOUND_FRAME_SEC = 0.96
+SOUND_HOP_SEC = 0.48
+# The caption written for each of YAMNet's class names (its yamnet_class_map.csv), in the usual caption style of a short sound description in square brackets.
+SOUND_TAG_TEXT = {
+    "Bark": "[dog barking]", "Bow-wow": "[dog barking]", "Yip": "[dog yipping]", "Howl": "[dog howling]", "Growling": "[growling]",
+    "Whimper (dog)": "[dog whimpering]", "Meow": "[cat meowing]", "Purr": "[cat purring]", "Hiss": "[hissing]", "Caterwaul": "[cat yowling]",
+    "Whistling": "[whistling]", "Whistle": "[whistle blows]", "Doorbell": "[doorbell rings]", "Ding-dong": "[doorbell rings]",
+    "Knock": "[knocking]", "Telephone bell ringing": "[phone ringing]", "Ringtone": "[phone ringing]", "Alarm clock": "[alarm ringing]",
+    "Smoke detector, smoke alarm": "[alarm beeping]", "Laughter": "[laughter]", "Baby laughter": "[baby laughing]",
+    "Applause": "[applause]", "Clapping": "[applause]", "Cheering": "[cheering]", "Crying, sobbing": "[crying]", "Baby cry, infant cry": "[baby crying]",
+    "Screaming": "[screaming]", "Gunshot, gunfire": "[gunshot]", "Explosion": "[explosion]", "Siren": "[siren wailing]",
+    "Vehicle horn, car horn, honking": "[horn honks]", "Thunder": "[thunder rumbles]", "Glass": "[glass clinks]", "Shatter": "[glass shatters]",
+    "Slam": "[door slams]", "Cough": "[coughing]", "Sneeze": "[sneezes]", "Snoring": "[snoring]", "Crowing, cock-a-doodle-doo": "[rooster crowing]",
+    "Chirp, tweet": "[birds chirping]", "Neigh, whinny": "[horse neighing]", "Moo": "[cow mooing]", "Bleat": "[sheep bleating]",
+    "Oink": "[pig oinking]", "Quack": "[duck quacking]", "Roar": "[roaring]",
+}
+_sound_classes = {"columns": None, "texts": None, "path": None, "missing_noted": False}
+
+
+def caption_sound_tags(mode=None):
+    """True when this PC (or the named performance mode) tags sounds between the speech."""
+    if mode is None:
+        try:
+            mode = _perf_governor.get_mode() if _perf_governor is not None else "lite"
+        except Exception as _swallowed_error:
+            _log_swallowed("caption_sound_tags: get_mode", _swallowed_error)
+            mode = "lite"
+    return bool(_CAPTION_SOUND_TAGS.get(str(mode), False))
+
+
+def _sound_model_files():
+    """(model path, [class columns], [caption text per column]) of the sound model beside the whisper models (main/models/yamnet), or None when its files are not there (noted in the log once)."""
+    if _sound_classes["columns"] is not None:
+        return _sound_classes["path"], _sound_classes["columns"], _sound_classes["texts"]
+    folder = os.path.join(os.path.dirname(resolve_whisper_model_dir()), SOUND_MODEL_FOLDER)
+    path, names = os.path.join(folder, SOUND_MODEL_FILE), os.path.join(folder, SOUND_CLASS_FILE)
+    if not (os.path.isfile(path) and os.path.isfile(names)):
+        if not _sound_classes["missing_noted"]:
+            _sound_classes["missing_noted"] = True
+            log.info("[ASR] no sound model in %s (%s and %s); captions carry no sound tags", folder, SOUND_MODEL_FILE, SOUND_CLASS_FILE)
+        return None
+    import csv
+    columns, texts = [], []
+    try:
+        with open(names, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                text = SOUND_TAG_TEXT.get(row.get("display_name"))
+                if text:
+                    columns.append(int(row["index"]))
+                    texts.append(text)
+    except (OSError, ValueError, KeyError) as e:
+        log.warning("[ASR] the sound model's class list %s could not be read: %s", names, e)
+        return None
+    _sound_classes.update(columns=columns, texts=texts, path=path)
+    log.info("[ASR] sound model %s: %d sound(s) are tagged", path, len(columns))
+    return path, columns, texts
+
+
+def _asr_sound_cues(model, audio, sampling_rate, music_flags):
+    """Sound-tag cues ([dog barking] and the like) for a decoded chunk: a tag where the sound model is at least CAPTION_SOUND_MIN_SCORE sure of one sound for CAPTION_SOUND_MIN_FRAMES moments in a row, never in a second already marked as music. Empty when the model has no sound model or its files are missing."""
+    files = _sound_model_files() if getattr(model, "sounds", None) is not None else None
+    if files is None or len(audio) < int(SOUND_FRAME_SEC * sampling_rate):
+        return []
+    path, columns, texts = files
+    try:
+        scores = model.sounds(audio, path, columns)
+    except Exception as e:
+        log.info("[ASR] sound tags skipped: %s", e)
+        return []
+    music = {i for i, f in enumerate(music_flags or ()) if isinstance(f, dict) and f.get("music")}
+    best, peaks = [], []
+    for i, row in enumerate(scores):
+        per_text = {}
+        for j, score in enumerate(row):
+            per_text[texts[j]] = max(per_text.get(texts[j], 0.0), float(score))
+        text, score = max(per_text.items(), key=lambda kv: kv[1]) if per_text else (None, 0.0)
+        mid = int(i * SOUND_HOP_SEC + SOUND_FRAME_SEC / 2.0)
+        best.append(text if score >= _CAPTION_SOUND_MIN_SCORE and mid not in music else None)
+        peaks.append(score)
+    cues, i = [], 0
+    while i < len(best):
+        j = i
+        while j + 1 < len(best) and best[j + 1] == best[i]:
+            j += 1
+        if best[i] is not None and j - i + 1 >= _CAPTION_SOUND_MIN_FRAMES:
+            cue = _foreign_clip_cue(i * SOUND_HOP_SEC, min(len(audio) / float(sampling_rate), j * SOUND_HOP_SEC + SOUND_FRAME_SEC), best[i])
+            cue.sound = True
+            cues.append(cue)
+            # WARNING: every tag is logged with how sure the model was, so CAPTION_SOUND_MIN_SCORE and CAPTION_SOUND_MIN_FRAMES can be set from real shows.
+            log.info("[ASR SOUND] %s at %.1f-%.1fs into the chunk (%d moments, best %.2f)", best[i], cue.start, cue.end, j - i + 1, max(peaks[i:j + 1]))
+        i = j + 1
+    return cues
+
+
+def _foreign_clip_cue(start, end, text):
+    """One cue covering a clip of speech that is not English, with no word confidences (so it is never turned into [inaudible] or learned from)."""
+    return types.SimpleNamespace(start=start, end=end, text=text, no_speech_prob=None, avg_logprob=None,
+                                 word_prob=None, recovered=False, runaway=None, word_list=None, word_times=None)
+
+
 def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=None,
-                          temperature=None, should_stop=None, own_len=None, recover_budget_sec=0.0, on_clip=None):
-    """Transcribe one extracted chunk WAV; when `own_len` and a positive `recover_budget_sec` are given, re-read missed speech afterwards; on_clip(cues) is called with each speech clip's cues the moment that clip is read, so a caller can show them before the whole chunk is done."""
+                          temperature=None, should_stop=None, own_len=None, recover_budget_sec=0.0, on_clip=None,
+                          language_check=None, sound_tags=None):
+    """Transcribe one extracted chunk WAV; when `own_len` and a positive `recover_budget_sec` are given, re-read missed speech afterwards; on_clip(cues) is called with each speech clip's cues the moment that clip is read, so a caller can show them before the whole chunk is done. language_check ("off", "unsure", "every"; default this PC's mode, caption_language_check) says when the language model checks a clip for speech that is not English; sound_tags (default this PC's mode, caption_sound_tags) adds sound tags between the speech."""
     global _asr_vad_utils_load_failed
+    check = language_check or caption_language_check()
+    # WARNING: the language model is started only beside a real caption model process (the program's or the server scan's), never for a stand-in model.
+    if check != "off" and isinstance(model, _RemoteWhisperModel):
+        start_language_model(check)
 
     temp_kw = {} if temperature is None else {"temperature": temperature}
     if not _asr_vad_utils_load_failed:
@@ -8132,6 +8696,7 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
             initial_prompt=initial_prompt, word_timestamps=True, **temp_kw,
         )
         out = _SegList()
+        out.language_check = "off"
         for seg in segments_iter:
             if _asked_to_stop(should_stop):
                 break
@@ -8143,11 +8708,16 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
     sampling_rate = 16000
     raw_spans = model.speech_spans(audio, _ASR_VAD_THRESHOLD, _ASR_VAD_PARAMETERS["min_silence_duration_ms"], _ASR_VAD_MIN_SPEECH_MS)
     out = _SegList()
+    # WARNING: the check this chunk really had, which grades its saved stretch (saved_captions.GRADES): "off" when the language model was not ready as the chunk began.
+    out.language_check = check if check == "off" or _language_model_now() is not None else "off"
     out.vad_islands = len(raw_spans)
     out.vad_speech_sec = sum((sp["end"] - sp["start"]) for sp in raw_spans) / sampling_rate
     _merged_spans = _asr_merge_spans(raw_spans, sampling_rate)
     out.audio_secs = len(audio) / float(sampling_rate)
     out.music_secs = _asr_music_seconds(audio, sampling_rate)
+    # WARNING: the sound model reads the chunk once, inside the same caption turn as the speech (so it is paced and throttled with it); _asr_filter_cues keeps a tag only where no kept speech caption is.
+    if (caption_sound_tags() if sound_tags is None else sound_tags):
+        out.extend(_asr_sound_cues(model, audio, sampling_rate, out.music_secs))
     for span in _merged_spans:
         if _asked_to_stop(should_stop):
             break
@@ -8155,6 +8725,21 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
         if clip.size == 0:
             continue
         span_start_sec = span["start"] / sampling_rate
+        _clip_end_sec = span["end"] / sampling_rate
+        # WARNING: with "every" (Performance, and the server's scan) the language is checked before the caption model reads the clip, so a clip that is not English costs only the small language check and never gets made-up English words.
+        _foreign = _foreign_speech_text(clip, check, None) if check == "every" else None
+        if _foreign:
+            _foreign_cues = [_foreign_clip_cue(span_start_sec, _clip_end_sec, _foreign)]
+            out.extend(_foreign_cues)
+            if on_clip is not None:
+                try:
+                    on_clip(_foreign_cues)
+                except Exception as _swallowed_error:
+                    _log_swallowed("_asr_transcribe_chunk: on_clip(_foreign_cues)", _swallowed_error)
+            continue
+        # WARNING: with "unsure" (Standard) a clip's cues are held until the clip is read, because the language check needs the caption model's confidence first; a clip that turns out not to be English is then shown as one language mark instead of its guessed words.
+        _hold_clip = check == "unsure"
+        _clip_cues = []
         t_clip = time.monotonic()
         # WARNING: the library's own silence gate (no_speech_threshold, log_prob_threshold) is switched off because it throws away a whole clip of up to 25 seconds of detected speech when the opening is unsure; _asr_filter_cues decides what to drop.
         segments_iter, _info = model.transcribe(
@@ -8173,12 +8758,27 @@ def _asr_transcribe_chunk(model, wav_path, language, beam_size, initial_prompt=N
             _thin_text = (_thin_text + " " + (seg.text or "").strip()).strip()
             out.said_sec += max(0.0, float(seg.end) - float(seg.start))
             _seg_cues = _asr_split_segment(seg, span_start_sec)
+            _clip_cues.extend(_seg_cues)
+            if _hold_clip:
+                continue
             out.extend(_seg_cues)
             if on_clip is not None and _seg_cues:
                 try:
                     on_clip(_seg_cues)
                 except Exception as _swallowed_error:
                     _log_swallowed("_asr_transcribe_chunk: on_clip(_seg_cues)", _swallowed_error)
+        if _hold_clip and not _asked_to_stop(should_stop):
+            _foreign = _foreign_speech_text(clip, check, _clip_cues)
+            if _foreign:
+                log.info("[ASR] %.1fs of speech starting %.1fs into the chunk is %s; %d guessed cue(s) left out",
+                         _clip_end_sec - span_start_sec, span_start_sec, _foreign, len(_clip_cues))
+                _clip_cues = [_foreign_clip_cue(span_start_sec, _clip_end_sec, _foreign)]
+            out.extend(_clip_cues)
+            if on_clip is not None and _clip_cues:
+                try:
+                    on_clip(_clip_cues)
+                except Exception as _swallowed_error:
+                    _log_swallowed("_asr_transcribe_chunk: on_clip(_clip_cues)", _swallowed_error)
         t_clip = time.monotonic() - t_clip
         _clip_sec = clip.size / float(sampling_rate)
         if _n_raw and _clip_sec >= _ASR_THIN_MIN_SEC and _n_words < _ASR_THIN_WORDS_PER_SEC * _clip_sec and not _asked_to_stop(should_stop):
@@ -8368,14 +8968,27 @@ def _asr_carry_is_covered(cue, new_cues):
     return False
 
 
+def _asr_cue_is_inaudible(word_list):
+    """True when at least CAPTION_INAUDIBLE_SHARE of a cue's words are ones the caption model is unsure of (under CAPTION_UNSURE_WORD_PROB), so the cue shows as [inaudible] instead of guessed words; a cue with no word confidences is never inaudible."""
+    probs = [p for _w, p in (word_list or []) if p is not None]
+    if not probs:
+        return False
+    return sum(1 for p in probs if p < _CAPTION_UNSURE_WORD_PROB) / float(len(probs)) >= _CAPTION_INAUDIBLE_SHARE
+
+
 def _asr_filter_cues(cues, chunk_start, chunk_end, at_file_end, prompt=None, music_secs=None):
     """Turn a chunk's cue-like objects into absolute [start, end, text] cues, dropping out-of-chunk, non-speech and hallucinated ones."""
     kept = _CueList()
     drops = {"next_chunk": 0, "empty": 0, "not_speech": 0, "hallucination": 0}
     vocab = _asr_prompt_vocab(prompt)
+    sounds = []
     for c in cues:
         s_abs = chunk_start + float(c.start)
         e_abs = chunk_start + float(c.end)
+        if getattr(c, "sound", False):
+            if at_file_end or s_abs < chunk_end:
+                sounds.append([s_abs, min(e_abs, chunk_end) if not at_file_end else e_abs, c.text])
+            continue
         if not at_file_end and s_abs >= chunk_end:
             drops["next_chunk"] += 1
             _ctext = (c.text or "").strip()
@@ -8408,18 +9021,81 @@ def _asr_filter_cues(cues, chunk_start, chunk_end, at_file_end, prompt=None, mus
                 and _asr_music_fraction(music_secs, s_abs - chunk_start, e_abs - chunk_start) >= _ASR_MUSIC_REPLACE_FRAC):
             text = _ASR_MUSIC_CAPTION_TEXT
             kept.words.append(None)
+        elif _asr_cue_is_inaudible(getattr(c, "word_list", None)):
+            text = CAPTION_INAUDIBLE_TEXT
+            kept.words.append(None)
         else:
             kept.words.append(getattr(c, "word_list", None))
         kept.append([s_abs, e_abs, text])
         _wt = getattr(c, "word_times", None)
         if _wt and text == (c.text or "").strip() and len(_wt) == len(text.split()):
             note_cue_word_starts(s_abs, text, [chunk_start + w for w in _wt])
+    speech = [(s, e) for s, e, _t in kept]
+    for s, e, t in sounds:
+        if e > s and not any(min(e, ke) > max(s, ks) for ks, ke in speech):
+            kept.append([s, e, t])
+            kept.words.append(None)
     return kept, drops
 
 
-def asr_known_unavailable():
-    """True once this run has found faster-whisper missing or its model unloadable."""
-    return bool(_whisper_model_load_failed)
+def live_captions_allowed():
+    """True when this PC may caption live from the audio: the caption model can load and neither memory, a crash nor the speed test stopped live captioning (owner 2026-11-24: caption files and saved captions still show when it may not)."""
+    if _whisper_model_load_failed:
+        return False
+    return not (_perf_governor is not None and _perf_governor.live_captions_blocked())
+
+
+# WARNING: the fallback values below must match CAPTION_SPEED_TEST_FILE and CAPTION_SPEED_TEST_REPEATS in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_SPEED_TEST_FILE = _perf_governor.CAPTION_SPEED_TEST_FILE if _perf_governor is not None else "caption_speed_test.flac"
+_CAPTION_SPEED_TEST_REPEATS = _perf_governor.CAPTION_SPEED_TEST_REPEATS if _perf_governor is not None else 3
+
+
+def caption_speed_test(should_stop=None):
+    """The caption speed test: the live caption model reads CAPTION_SPEED_TEST_FILE (real speech, beside the whisper models) played CAPTION_SPEED_TEST_REPEATS times, the same way live captions read a chunk; returns seconds of speech read per second, or None when it could not run (no clip, no model, ffmpeg failed) or should_stop() turned true while it ran."""
+    import subprocess
+    import tempfile
+    import wave
+    sample = os.path.join(resolve_whisper_model_dir(), _CAPTION_SPEED_TEST_FILE)
+    if not os.path.isfile(sample):
+        log.warning("[CAPTION SPEED] no speech clip at %s; the caption speed test cannot run", sample)
+        return None
+    ffmpeg = _resolve_ffmpeg_path()
+    if not ffmpeg:
+        return None
+    model = _get_whisper_model()
+    if model is None:
+        return None
+    fd, wav_path = tempfile.mkstemp(prefix="asr_speed_", suffix=".wav")
+    os.close(fd)
+    try:
+        flags = (subprocess.BELOW_NORMAL_PRIORITY_CLASS | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0
+        made = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-stream_loop", str(max(0, int(_CAPTION_SPEED_TEST_REPEATS) - 1)),
+                               "-i", sample, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_path],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags, timeout=60)
+        if made.returncode != 0:
+            log.warning("[CAPTION SPEED] ffmpeg could not prepare the speech clip (exit %s)", made.returncode)
+            return None
+        with wave.open(wav_path, "rb") as w:
+            speech_sec = w.getnframes() / float(w.getframerate() or 16000)
+        with _asr_slot("caption_speed_test"):
+            t0 = time.monotonic()
+            _asr_transcribe_chunk(model, wav_path, _ASR_LANGUAGE, _ASR_LIVE_BEAM_SIZE, temperature=0.0, should_stop=should_stop, language_check="off", sound_tags=False)
+            took = time.monotonic() - t0
+        if should_stop is not None and should_stop():
+            log.info("[CAPTION SPEED] the caption speed test was stopped before it finished; it runs again next time")
+            return None
+        rate = speech_sec / max(0.001, took)
+        log.info("[CAPTION SPEED] %.1fs of speech read in %.1fs: %.2f seconds of speech per second (live captions need %.2f)",
+                 speech_sec, took, rate, _perf_governor.CAPTION_SPEED_MIN_RATE if _perf_governor is not None else 0.5)
+        return rate
+    except Exception as e:
+        log.warning("[CAPTION SPEED] the caption speed test failed: %s", e)
+        return None
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError as _swallowed_error:
+            _log_swallowed("caption_speed_test: removing the clip", _swallowed_error)
 
 
 def _srt_timestamp(seconds):
@@ -8947,8 +9623,9 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
                 audio_chunks += 1
                 try:
                     _disk_prompt = _asr_prompt_for(file_path)
+                    # WARNING: owner 2026-11-24: the file's title words are only used to drop captions that echo them; they are not handed to the caption model as a hint, because a hint of ordinary words pulls it toward writing those words instead of what was said.
                     segments = _asr_transcribe_chunk(model, wav_path, lang, _ASR_BEAM_SIZE,
-                                                     initial_prompt=_disk_prompt,
+                                                     initial_prompt=None,
                                                      should_stop=should_stop)
                     if _asked_to_stop(should_stop):
                         return None, ASR_REASON_INTERRUPTED
@@ -9006,6 +9683,16 @@ _LIVE_ATTACHED_SESSIONS = set()
 _LIVE_RUNNING_SESSIONS = set()
 
 
+def live_captions_running():
+    """True while any live caption session of this program is transcribing."""
+    return bool(_LIVE_RUNNING_SESSIONS)
+
+
+def live_caption_paths():
+    """The files the live caption sessions of this program are transcribing now."""
+    return [sess.file_path for sess in list(_LIVE_RUNNING_SESSIONS)]
+
+
 def _live_caption_cadence():
     """First-scan chunk sizes (first chunk, its overlap, startup chunk) for the current performance mode."""
     if _perf_governor is not None:
@@ -9027,7 +9714,7 @@ def _prefetch_may_run():
         if sess._busy or sess._last_lead < _LIVE_CAPTION_PREFETCH_MIN_LEAD_SEC:
             return False
     return True
-# WARNING: the fallback numbers below must match LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC, LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC, LIVE_CAPTION_MAX_LEAD_SEC, LIVE_CAPTION_JUMP_BACK_LEAD_SEC, LIVE_CAPTION_PACE_POLL_SEC, LIVE_CAPTION_SKIP_BEHIND_SEC, LIVE_CAPTION_RESUME_AHEAD_SEC, LIVE_CAPTION_KEEP_PAST_SEC, LIVE_CAPTION_MAX_CUES, LIVE_CAPTION_MAX_FAILURES, ASR_LIVE_BEAM_SIZE, ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC, LIVE_CAPTION_CLOCK_MIN_DT, LIVE_CAPTION_CLOCK_TOLERANCE in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC, LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC, LIVE_CAPTION_MAX_LEAD_SEC, LIVE_CAPTION_JUMP_BACK_LEAD_SEC, LIVE_CAPTION_PACE_POLL_SEC, LIVE_CAPTION_SKIP_BEHIND_SEC, LIVE_CAPTION_KEEP_PAST_SEC, LIVE_CAPTION_MAX_CUES, LIVE_CAPTION_MAX_FAILURES, ASR_LIVE_BEAM_SIZE, ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC, LIVE_CAPTION_CLOCK_MIN_DT, LIVE_CAPTION_CLOCK_TOLERANCE in performance_governor.py; they are used only when that module fails to import.
 _LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC = _perf_governor.LIVE_CAPTION_BIG_CHUNK_SAFETY_MARGIN_SEC if _perf_governor is not None else 3.0
 _LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC = _perf_governor.LIVE_CAPTION_BIG_CHUNK_DEFAULT_ESTIMATE_SEC if _perf_governor is not None else 15.0
 LIVE_CAPTION_MAX_LEAD_SEC = _perf_governor.LIVE_CAPTION_MAX_LEAD_SEC if _perf_governor is not None else 150.0
@@ -9041,6 +9728,14 @@ _LIVE_CAPTION_SALVAGE_MAX_FILES = _perf_governor.LIVE_CAPTION_SALVAGE_MAX_FILES 
 
 _caption_salvage = {}
 _caption_salvage_lock = threading.Lock()
+# WARNING: the fallback number below must match LIVE_CAPTION_SAVE_EVERY_SEC in performance_governor.py; it is used only when that module fails to import.
+_LIVE_CAPTION_SAVE_EVERY_SEC = _perf_governor.LIVE_CAPTION_SAVE_EVERY_SEC if _perf_governor is not None else 300.0
+_live_captions_made_handler = [None]
+
+
+def set_live_captions_made_handler(handler):
+    """handler(file path, cues [[start s, end s, text]], covered stretches [[start s, end s]], file length) takes what a live session made; it must only queue the work. None keeps nothing."""
+    _live_captions_made_handler[0] = handler
 
 
 def _caption_salvage_put(file_path, cues, covered_from, covered_to):
@@ -9079,7 +9774,6 @@ def _live_caption_lead_limits(file_path):
 
 _LIVE_CAPTION_PACE_POLL_SEC = _perf_governor.LIVE_CAPTION_PACE_POLL_SEC if _perf_governor is not None else 1.0
 _LIVE_CAPTION_SKIP_BEHIND_SEC = _perf_governor.LIVE_CAPTION_SKIP_BEHIND_SEC if _perf_governor is not None else 10.0
-_LIVE_CAPTION_RESUME_AHEAD_SEC = _perf_governor.LIVE_CAPTION_RESUME_AHEAD_SEC if _perf_governor is not None else 15.0
 _LIVE_CAPTION_KEEP_PAST_SEC = _perf_governor.LIVE_CAPTION_KEEP_PAST_SEC if _perf_governor is not None else 20.0
 _LIVE_CAPTION_MAX_CUES = _perf_governor.LIVE_CAPTION_MAX_CUES if _perf_governor is not None else 500
 _LIVE_CAPTION_MAX_FAILURES = _perf_governor.LIVE_CAPTION_MAX_FAILURES if _perf_governor is not None else 3
@@ -9135,37 +9829,46 @@ def _live_caption_pace_wait(lead, chunk_sec, spent_sec):
 _ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC = _perf_governor.ASR_LIVE_ACCURATE_SEEK_MARGIN_SEC if _perf_governor is not None else 4.0
 _LIVE_CAPTION_CLOCK_MIN_DT = _perf_governor.LIVE_CAPTION_CLOCK_MIN_DT if _perf_governor is not None else 0.75
 _LIVE_CAPTION_CLOCK_TOLERANCE = _perf_governor.LIVE_CAPTION_CLOCK_TOLERANCE if _perf_governor is not None else 0.4
-# WARNING: the fallback numbers below must match CAPTION_TOO_SLOW_CHUNKS, CAPTION_TOO_SLOW_RATIO and CAPTION_TOO_SLOW_MIN_CHUNK_SEC in performance_governor.py; they are used only when that module fails to import.
-_CAPTION_TOO_SLOW_CHUNKS = _perf_governor.CAPTION_TOO_SLOW_CHUNKS if _perf_governor is not None else 40
-_CAPTION_TOO_SLOW_RATIO = _perf_governor.CAPTION_TOO_SLOW_RATIO if _perf_governor is not None else 1.6
-_CAPTION_TOO_SLOW_MIN_CHUNK_SEC = _perf_governor.CAPTION_TOO_SLOW_MIN_CHUNK_SEC if _perf_governor is not None else 8.0
+# WARNING: the fallback numbers below must match CAPTION_HOT_CPU_PERCENT, CAPTION_HOT_SECONDS, CAPTION_CATCHUP_AHEAD_SEC, CAPTION_COOL_DOWN_SEC, CAPTION_CATCHUP_NOTE_TEXT, CAPTION_CATCHUP_NOTE_SEC and CAPTION_CATCHUP_NOTE_EVERY_SEC in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_HOT_CPU_PERCENT = _perf_governor.CAPTION_HOT_CPU_PERCENT if _perf_governor is not None else 90.0
+_CAPTION_HOT_SECONDS = _perf_governor.CAPTION_HOT_SECONDS if _perf_governor is not None else 120.0
+_CAPTION_CATCHUP_AHEAD_SEC = _perf_governor.CAPTION_CATCHUP_AHEAD_SEC if _perf_governor is not None else 45.0
+_CAPTION_COOL_DOWN_SEC = _perf_governor.CAPTION_COOL_DOWN_SEC if _perf_governor is not None else 30.0
+_CAPTION_CATCHUP_NOTE_TEXT = _perf_governor.CAPTION_CATCHUP_NOTE_TEXT if _perf_governor is not None else "[captions is catching up its buffer]"
+_CAPTION_CATCHUP_NOTE_SEC = _perf_governor.CAPTION_CATCHUP_NOTE_SEC if _perf_governor is not None else 5.0
+_CAPTION_CATCHUP_NOTE_EVERY_SEC = _perf_governor.CAPTION_CATCHUP_NOTE_EVERY_SEC if _perf_governor is not None else 600.0
+_caption_hot = {"since": None, "sampler": None, "note_at": None}
+_caption_hot_lock = threading.Lock()
 
 
-_caption_pace_history = []
-_caption_pace_lock = threading.Lock()
-
-
-def _caption_pace_add(history, took, length, attached):
-    """Adds the picture's own caption chunk to the history (decode seconds per second of the chunk, the newest _CAPTION_TOO_SLOW_CHUNKS kept) and returns True when the history is full and its middle value is above the ratio; prefetch and very short chunks are not counted."""
-    if not attached or took is None or length < _CAPTION_TOO_SLOW_MIN_CHUNK_SEC:
+def _caption_running_hot(now):
+    """True once the whole PC's processor (this program, its scans and every other program) has stayed at or over CAPTION_HOT_CPU_PERCENT for CAPTION_HOT_SECONDS in a row while live captions run; the count starts again after it answers True or the processor drops."""
+    if _perf_governor is None:
         return False
-    history.append(took / length)
-    del history[:-_CAPTION_TOO_SLOW_CHUNKS]
-    return len(history) >= _CAPTION_TOO_SLOW_CHUNKS and sorted(history)[len(history) // 2] > _CAPTION_TOO_SLOW_RATIO
+    with _caption_hot_lock:
+        if _caption_hot["sampler"] is None:
+            _caption_hot["sampler"] = _perf_governor.SystemCpuSampler()
+        busy = _caption_hot["sampler"].percent()
+        if busy is None or busy < _CAPTION_HOT_CPU_PERCENT:
+            _caption_hot["since"] = None
+            return False
+        if _caption_hot["since"] is None:
+            _caption_hot["since"] = now
+            return False
+        if now - _caption_hot["since"] < _CAPTION_HOT_SECONDS:
+            return False
+        _caption_hot["since"] = None
+        return True
 
 
-def _caption_cannot_keep_up(base_name, history):
-    """Called from the live caption thread once the history says the PC decodes slower than the show plays: switches Live Captions off for the run through the same door as the memory shed."""
-    log.warning("[ASR TOO SLOW] %s: the middle of the last %d caption chunks took %.2f times their own length to decode (limit %.2f); this PC cannot keep up, so Live Captions are switched off and greyed out for the rest of this run",
-                base_name, len(history), sorted(history)[len(history) // 2], _CAPTION_TOO_SLOW_RATIO)
-    if _perf_governor is not None:
-        _perf_governor.caption_mark_too_slow()
-    handler = _caption_memory_refusal_handler
-    if handler is not None:
-        try:
-            handler(0.0, 0.0, 0.0)
-        except Exception as _swallowed_error:
-            _log_swallowed("_caption_cannot_keep_up: handler(0.0, 0.0, 0.0)", _swallowed_error)
+def _caption_catchup_note_due(now):
+    """True when the catch-up note may show now: it shows at most once every CAPTION_CATCHUP_NOTE_EVERY_SEC on this PC (owner 2026-11-24: "i dont want constant buffing text")."""
+    with _caption_hot_lock:
+        last = _caption_hot["note_at"]
+        if last is not None and now - last < _CAPTION_CATCHUP_NOTE_EVERY_SEC:
+            return False
+        _caption_hot["note_at"] = now
+        return True
 
 
 class LiveCaptionSession:
@@ -9207,6 +9910,17 @@ class LiveCaptionSession:
         self._salvaged = False
         self._max_lead, self._jump_back_lead = _live_caption_lead_limits(file_path)
         self._audio = None
+        # WARNING: owner 2026-11-24: what a live session makes is kept and saved (saved_captions.py) so the file is never captioned live again; every finished cue and every stretch a finished window covered is kept here, untrimmed, apart from the trimmed list the screen reads.
+        self._made = []
+        self._made_spans = []
+        # WARNING: owner 2026-11-24: after a catch-up the rest of the show is captioned the light way (no language check, no sound tags, the quick beam), so it does not fall behind again; each catch-up in the same show leaves a bigger cushion.
+        self._catchups = 0
+        self._light = False
+        # WARNING: owner 2026-11-24: each kept stretch is marked with the language check its window really had (Lite, Standard, Performance; "off" when the language model was not ready), so the server scans again what it can make better.
+        self._window_check = "off"
+        self._made_duration = None
+        self._made_handed_at = 0.0
+        self._made_lock = threading.Lock()
 
     def _extract_window(self, pos, length, wav_path):
         """Cuts [pos, pos+length] from the session's one audio stream (started on the first window, started again after a jump), falling back to the old per-window extract for this window when the stream cannot serve it."""
@@ -9241,6 +9955,32 @@ class LiveCaptionSession:
             if self._attached and self._covered_from is not None and self._covered_to is not None and self.cues:
                 _caption_salvage_put(self.file_path, self.cues, self._covered_from, self._covered_to)
             self.cues = []
+        self._hand_over_made()
+
+    def _hand_over_made(self):
+        """Gives every cue and covered stretch this session has made so far to the handler set by set_live_captions_made_handler; the handler only queues them, so this never waits on a disk or the network and is safe on any thread."""
+        handler = _live_captions_made_handler[0]
+        with self._made_lock:
+            if handler is None or not self._made_spans or self._made_duration is None:
+                return
+            cues, spans = [list(c) for c in self._made], [list(sp) for sp in self._made_spans]
+            self._made_handed_at = sum(sp[1] - sp[0] for sp in spans)
+        try:
+            handler(self.file_path, cues, spans, self._made_duration)
+        except Exception as _swallowed_error:
+            _log_swallowed("LiveCaptionSession._hand_over_made: handler", _swallowed_error)
+
+    def _keep_made(self, cues=None, span=None, check="off"):
+        """Keeps finished cues and the stretch a finished window covered, with the grade of the language check that window really had (check); hands them over every LIVE_CAPTION_SAVE_EVERY_SEC of newly covered audio, so a long show's captions are saved as it goes."""
+        import saved_captions
+        with self._made_lock:
+            if cues:
+                self._made.extend([float(c[0]), float(c[1]), str(c[2])] for c in cues)
+            if span is not None and span[1] > span[0]:
+                self._made_spans.append([float(span[0]), float(span[1]), saved_captions.grade_for(check)])
+            due = sum(sp[1] - sp[0] for sp in self._made_spans) - self._made_handed_at >= _LIVE_CAPTION_SAVE_EVERY_SEC
+        if due:
+            self._hand_over_made()
 
     def _stamp_new_cues(self):
         """Notes the playback position at which each cue first reached the store, so the [CAPTION LATE] line can say whether a cue was already waiting before its start or came in after it. Call with self.lock held."""
@@ -9333,9 +10073,31 @@ class LiveCaptionSession:
                 self._audio.close()
             _LIVE_ATTACHED_SESSIONS.discard(self)
             _LIVE_RUNNING_SESSIONS.discard(self)
+            self._hand_over_made()
             log.info("[LIVE ASR] %s session ended: status=%s chunks=%d late_cues=%d partial_late_cues=%d",
                      os.path.basename(self.file_path), self.status, self._chunks_done, self._late_cues,
                      self._partial_late)
+
+    def _catch_up(self, base_name, pos, now, duration, reason):
+        """Moves the captions ahead of the picture by a cushion (CAPTION_CATCHUP_AHEAD_SEC, more for each catch-up in this show, at most LIVE_CAPTION_MAX_LEAD_SEC), switches the rest of the show to the light way, and puts the catch-up note at the start of the skipped stretch when it is due; returns the new place to caption from. The skipped stretch is never saved, so the server's scan fills it later."""
+        # WARNING: owner 2026-11-24: "worst case we miss some captions vs overheating"; the note is shown, never saved.
+        self._catchups += 1
+        self._light = True
+        ahead = min(LIVE_CAPTION_MAX_LEAD_SEC, _CAPTION_CATCHUP_AHEAD_SEC * self._catchups)
+        new_pos = min(duration, max(pos, now + ahead))
+        gap_start = max(pos, now)
+        if new_pos > pos:
+            log.warning("[LIVE ASR CATCH-UP] %s: %s; captions skip from %.1fs to %.1fs (%.0fs ahead of the picture, catch-up %d in this show) and the rest of the show is captioned the light way",
+                        base_name, reason, pos, new_pos, new_pos - now, self._catchups)
+        else:
+            # WARNING: owner logs 2026-11-24: "skip from 1564.1s to 1564.1s" read as a skip; when the captions are already the cushion ahead nothing is skipped, they only rest.
+            log.warning("[LIVE ASR CATCH-UP] %s: %s; the captions are already %.0fs ahead of the picture, so nothing is skipped (catch-up %d in this show); they rest and the rest of the show is captioned the light way",
+                        base_name, reason, pos - now, self._catchups)
+        if new_pos > gap_start and _caption_catchup_note_due(time.monotonic()):
+            with self.lock:
+                self.cues.append([gap_start, gap_start + _CAPTION_CATCHUP_NOTE_SEC, _CAPTION_CATCHUP_NOTE_TEXT])
+                self.cues.sort(key=lambda _c: _c[0])
+        return new_pos
 
     def _pause_after_failures(self, base_name, pauses, reason):
         """After _LIVE_CAPTION_MAX_FAILURES windows in a row failed, waits _LIVE_CAPTION_FAILURE_PAUSE_SECONDS and lets the caller go on from where playback is by then, up to _LIVE_CAPTION_FAILURE_RETRIES times; False means give up (owner 2026-11-15: a damaged stretch ended the captions of a whole show at 4,004 s)."""
@@ -9355,6 +10117,11 @@ class LiveCaptionSession:
 
         if self._stopped():
             return
+        # WARNING: owner logs 2026-11-24 14:01: loading the caption model during a channel tune (6.9 s of disk and processor on a 4-core PC) cost 155 lost pictures right after the new channel opened; a model not loaded yet waits until the tune hold ends (the governor ends it after 5 s of steady picture, 15 s at most).
+        while _whisper_model is None and _perf_governor is not None and _perf_governor.tune_in_progress():
+            if self._stopped():
+                return
+            time.sleep(0.25)
         model = _get_whisper_model()
         if model is None:
             self.status = ASR_REASON_UNAVAILABLE
@@ -9368,9 +10135,12 @@ class LiveCaptionSession:
             self.status = ASR_REASON_NO_AUDIO
             return
         duration = probe["duration"]
+        self._made_duration = duration
         base_name = os.path.basename(self.file_path)
         base_prompt = _asr_prompt_for(self.file_path)
         prompt = base_prompt
+        # WARNING: owner 2026-11-24: the hint handed to the caption model holds only names learned from this file's own speech (hint); the file's title words stay in prompt, which is used only to drop captions that echo them.
+        hint = None
         name_stats = {}
         learned_names = []
 
@@ -9398,15 +10168,22 @@ class LiveCaptionSession:
                 lead = pos - now
                 just_attached, self._just_attached = self._just_attached, False
                 if chunks_done > 0 and lead < -_LIVE_CAPTION_SKIP_BEHIND_SEC:
-                    new_pos = min(duration, now + _LIVE_CAPTION_RESUME_AHEAD_SEC)
-                    log.warning("[LIVE ASR] %s behind playback by %.1fs -- skipping ahead to %.1fs; "
-                                "the audio from %.1fs to %.1fs gets no captions",
-                                base_name, -lead, new_pos, pos, new_pos)
-                    pos = new_pos
+                    pos = self._catch_up(base_name, pos, now, duration, "%.1fs behind the picture" % -lead)
                     self._covered_from = pos
                     self._quick_next = True
                     if pos >= duration:
                         break
+                    lead = pos - now
+                elif chunks_done > 0 and _caption_running_hot(time.monotonic()):
+                    pos = self._catch_up(base_name, pos, now, duration, "the PC has run at %.0f%% or more for %.0fs" % (_CAPTION_HOT_CPU_PERCENT, _CAPTION_HOT_SECONDS))
+                    self._covered_from = pos
+                    if pos >= duration:
+                        break
+                    # WARNING: the cool-down rest is safe because the captions are now at least CAPTION_CATCHUP_AHEAD_SEC ahead of the picture.
+                    self._stop.wait(_CAPTION_COOL_DOWN_SEC)
+                    if self._stopped():
+                        break
+                    now = self._playback_sec()
                     lead = pos - now
                 elif chunks_done > 0 and not just_attached and lead > self._jump_back_lead:
                     log.warning("[LIVE ASR] %s playback is %.1fs behind the transcription position -- "
@@ -9565,11 +10342,15 @@ class LiveCaptionSession:
                                     _shown.append(_cue)
                                 self.cues.sort(key=lambda _c: _c[0])
 
+                        # WARNING: owner logs 2026-11-24: the chunk line printed the usual beam after a catch-up while the light one was used; both now use this one number.
+                        _chunk_beam = _ASR_LIVE_BEAM_SIZE_BEHIND if self._light else _live_caption_beam(_beam_lead)
                         try:
                             segments = _asr_transcribe_chunk(
-                                model, wav_path, self.language, _live_caption_beam(_beam_lead),
-                                initial_prompt=prompt, temperature=0.0, should_stop=self._stopped,
-                                own_len=length, recover_budget_sec=_recover_budget, on_clip=_show_clip)
+                                model, wav_path, self.language, _chunk_beam,
+                                initial_prompt=hint, temperature=0.0, should_stop=self._stopped,
+                                own_len=length, recover_budget_sec=_recover_budget, on_clip=_show_clip,
+                                language_check="off" if self._light else None, sound_tags=False if self._light else None)
+                            self._window_check = getattr(segments, "language_check", "off")
                         except Exception as e:
                             log.warning("[LIVE ASR] transcription failed for %s: %s", base_name, e)
                             failures += 1
@@ -9593,7 +10374,8 @@ class LiveCaptionSession:
                         if _names_now != learned_names:
                             learned_names = _names_now
                             prompt = _asr_prompt_with_names(base_prompt, learned_names)
-                            log.info("[LIVE ASR] %s name hint for the next chunks: %s", base_name, prompt)
+                            hint = _asr_prompt_with_names(None, learned_names)
+                            log.info("[LIVE ASR] %s name hint for the next chunks: %s", base_name, hint)
                         _next_carry = list(new_cues.carry)
                         if carry_prev and carry_end is not None and abs(pos - carry_end) < 0.05:
                             _rescued = [c for c in carry_prev if not _asr_carry_is_covered(c, new_cues)]
@@ -9620,12 +10402,14 @@ class LiveCaptionSession:
                             if new_cues:
                                 _asr_merge_cues(self.cues, new_cues)
                             self._stamp_new_cues()
+                        self._keep_made(cues=new_cues)
                         _music_flags = getattr(segments, "music_secs", None)
                         if _music_flags:
                             with self.lock:
                                 _music_new = _asr_music_cues(_music_flags, pos, length, self.cues)
                                 if _music_new:
                                     _asr_merge_cues(self.cues, _music_new)
+                            self._keep_made(cues=_music_new)
                             if _music_new:
                                 log.info("[LIVE ASR] %s music sign added for %.1fs of music-like audio with no speech "
                                          "(%d cue(s)) at %.1f-%.1fs", base_name,
@@ -9638,7 +10422,7 @@ class LiveCaptionSession:
                             "chunk=%s(est_30s=%.1fs) vad=%s islands/%.1fs speech, %.1fs of it came back as text, cues=+%d "
                             "dropped(next=%d empty=%d not_speech=%d hallucination=%d) "
                             "recovered=%d/%d(%.1fs) zone=%s",
-                            base_name, pos, length, (audio_end - pos), took, _extract_sec, max(0.0, took - _extract_sec), _live_caption_beam(_beam_lead), _slot_wait,
+                            base_name, pos, length, (audio_end - pos), took, _extract_sec, max(0.0, took - _extract_sec), _chunk_beam, _slot_wait,
                             ("n/a" if now is None else f"{lead:.1f}s"), self.ready,
                             ("BIG" if use_big_chunk else ("first" if (chunks_done == 0 and self._attached) else "startup")), est_big_chunk_sec,
                             getattr(segments, "vad_islands", "?"), getattr(segments, "vad_speech_sec", 0.0),
@@ -9680,17 +10464,11 @@ class LiveCaptionSession:
                     _measured_ratio if self._chunk_rtf_ema is None
                     else 0.4 * _measured_ratio + 0.6 * self._chunk_rtf_ema)
 
-            if took is not None and chunks_done > 0:
-                with _caption_pace_lock:
-                    _too_slow = _caption_pace_add(_caption_pace_history, took, length, self._attached)
-                    _pace_now = list(_caption_pace_history)
-                if _too_slow:
-                    _caption_cannot_keep_up(base_name, _pace_now)
-                    return
-
             chunks_done += 1
             self._chunks_done = chunks_done
             self._quick_next = False
+            self._keep_made(span=(pos, pos + length), check=self._window_check)
+            self._window_check = "off"
             pos += length
             self._covered_to = pos
             self._trim_cues()
@@ -9707,6 +10485,181 @@ class LiveCaptionSession:
         if not self._stopped():
             self.status = ASR_REASON_SUCCESS
             self.scan_done = True
+
+
+# ============================================================================
+# SECTION: Saved captions with live captions for the gaps
+# ============================================================================
+
+# WARNING: the fallback numbers below must match CAPTION_FEED_CHECK_SEC, CAPTION_FEED_LIVE_BEFORE_END_SEC and CAPTION_FEED_WINDOW_SEC in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_FEED_CHECK_SEC = _perf_governor.CAPTION_FEED_CHECK_SEC if _perf_governor is not None else 1.0
+_CAPTION_FEED_LIVE_BEFORE_END_SEC = _perf_governor.CAPTION_FEED_LIVE_BEFORE_END_SEC if _perf_governor is not None else 30.0
+_CAPTION_FEED_WINDOW_SEC = _perf_governor.CAPTION_FEED_WINDOW_SEC if _perf_governor is not None else 120.0
+_saved_captions_key_finder = [None]
+
+
+def set_saved_captions_key_finder(finder):
+    """finder(file path) -> the file's content key or None; called only on a CaptionFeed's own thread, so it may read the disk."""
+    _saved_captions_key_finder[0] = finder
+
+
+class CaptionFeed:
+    """The captions of one file on the picture's clock: the saved captions (saved_captions.py) wherever they cover the moment the picture is at, and a LiveCaptionSession for the gaps only, started where the saved captions end and stopped when it reaches the next saved stretch. It answers the screen the way a LiveCaptionSession does."""
+    # WARNING: owner 2026-11-24: "it will switch back to live captions if it passes what has been collected", and a show captioned live switches to the saved captions once they cover where the picture is.
+    # WARNING: snapshot() and ready are read by the screen thread every frame; every disk read, key lookup and session start happens on the feed's own thread.
+
+    def __init__(self, file_path, start_sec=0.0, position_fn=None):
+        self.file_path = file_path
+        self.start_sec = max(0.0, float(start_sec or 0.0))
+        self.position_fn = position_fn
+        self._key = None
+        self._saved = None
+        self._saved_stamp = None
+        self._live = None
+        self._window = []
+        self._carry = []
+        self._live_reached = None
+        self._saved_here = False
+        self._anchor_mono = time.monotonic()
+        self._anchor_pos = self.start_sec
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="CaptionFeed")
+        self._thread.start()
+        return self
+
+    @property
+    def ready(self):
+        with self._lock:
+            live = self._live
+            return self._saved_here or bool(live is not None and live.ready)
+
+    def _pos(self):
+        """Where the picture is in the file: the player's clock when it reads, else the time since the feed was anchored; a feed made ahead of its file (no clock yet) stays at its start."""
+        fn = self.position_fn
+        if fn is None:
+            return self._anchor_pos
+        try:
+            p = fn()
+        except Exception as _swallowed_error:
+            _log_swallowed("CaptionFeed._pos: fn()", _swallowed_error)
+            p = None
+        if p is not None and p >= 0:
+            return float(p)
+        return self._anchor_pos + (time.monotonic() - self._anchor_mono)
+
+    def attach_playback(self, position_fn, file_pos=0.0):
+        """Gives the feed (and its live session) the player clock when its file goes live."""
+        self.position_fn = position_fn
+        self._anchor_mono = time.monotonic()
+        self._anchor_pos = max(0.0, float(file_pos or 0.0))
+        live = self._live
+        if live is not None:
+            live.attach_playback(position_fn, file_pos)
+
+    def _run(self):
+        finder = _saved_captions_key_finder[0]
+        if finder is not None:
+            try:
+                self._key = finder(self.file_path)
+            except Exception as _swallowed_error:
+                _log_swallowed("CaptionFeed._run: key finder", _swallowed_error)
+        while not self._stop.is_set():
+            try:
+                self._step()
+            except Exception as _swallowed_error:
+                _log_swallowed("CaptionFeed._step", _swallowed_error)
+            self._stop.wait(_CAPTION_FEED_CHECK_SEC)
+        live = self._live
+        if live is not None:
+            live.stop()
+
+    def _read_saved(self):
+        """Reads the saved copy again when the list of what is held says it changed."""
+        if not self._key:
+            return
+        import saved_captions
+        stamp = saved_captions.held().get(self._key)
+        if stamp != self._saved_stamp:
+            self._saved_stamp = stamp
+            self._saved = saved_captions.read(self._key) if stamp is not None else None
+
+    def _step(self):
+        import saved_captions
+        self._read_saved()
+        pos = self._pos()
+        saved = self._saved
+        end = saved_captions.cover_end(saved, pos) if saved else None
+        length = float((saved or {}).get("length") or 0)
+        live = self._live
+        if live is not None and saved:
+            # WARNING: owner 2026-11-24: only the gaps are captioned, never a stretch already saved again; the live session stops the moment the place it captions next lies inside a saved stretch (another computer's copy, or the saved half of a show), and starts again where that stretch ends once the picture nears it. Its own text is saved up to where it is, so its own copy never stops it.
+            live_at = live._covered_to if live._covered_to is not None else live.start_sec
+            ahead_end = saved_captions.cover_end(saved, live_at)
+            if ahead_end is not None:
+                log.info("[CAPTION FEED] %s: the live captions reached %.0fs, which is saved up to %.0fs; the live captions stop and the saved ones are used",
+                         os.path.basename(self.file_path), live_at, ahead_end)
+                # WARNING: the stopped session's text reaches the saved copy a moment later (through the SavedCaptions thread); until then it is kept here and the stretch it covered is never captioned again.
+                with self._lock:
+                    self._carry = [c for c in live.snapshot() if c[0] >= (pos - _LIVE_CAPTION_KEEP_PAST_SEC) * 1000.0]
+                self._live_reached = max(self._live_reached or 0.0, live_at)
+                live.stop()
+                live = None
+        if end is None and self._live_reached is not None and pos < self._live_reached:
+            end = saved_captions.cover_end(saved, self._live_reached) if saved else None
+            end = end if end is not None else self._live_reached
+        need_live = end is None or (end - pos < _CAPTION_FEED_LIVE_BEFORE_END_SEC and not (length and end >= length - 1.0))
+        if live is not None and not live_captions_allowed():
+            log.info("[CAPTION FEED] %s: live captioning is off on this PC; only caption files and saved captions show", os.path.basename(self.file_path))
+            live.stop()
+            live = None
+        if need_live and live is None and live_captions_allowed():
+            _from = end if end is not None else pos
+            log.info("[CAPTION FEED] %s: %s; live captions start at %.1fs", os.path.basename(self.file_path),
+                     "saved captions end at %.0fs" % end if end is not None else "no saved captions for %.0fs" % pos, _from)
+            live = LiveCaptionSession(self.file_path, start_sec=_from, position_fn=self._pos if self.position_fn is not None else None).start()
+        window = saved_captions.cues_between(saved, pos - _LIVE_CAPTION_KEEP_PAST_SEC, pos + _CAPTION_FEED_WINDOW_SEC) if saved else []
+        with self._lock:
+            self._live = live
+            self._window = window
+            self._saved_here = end is not None and end - pos > 1.0
+
+    def snapshot(self):
+        """Cues in milliseconds as [start_ms, end_ms, text]: the saved ones near the picture and the live ones outside the saved stretches."""
+        import saved_captions
+        with self._lock:
+            out = list(self._window)
+            live = self._live
+            saved = self._saved
+            carry = self._carry
+        out.extend(c for c in carry if saved is None or saved_captions.cover_end(saved, c[0] / 1000.0) is None)
+        if live is not None and live.ready:
+            out.extend(c for c in live.snapshot() if saved is None or saved_captions.cover_end(saved, c[0] / 1000.0) is None)
+        if len(out) > len(self._window):
+            out.sort(key=lambda c: c[0])
+        return out
+
+    def scan_finished(self):
+        """True once the whole file is captioned (saved to its end) or the live session has scanned to the end."""
+        import saved_captions
+        with self._lock:
+            saved, live = self._saved, self._live
+        if saved and saved_captions.is_complete(saved.get("covered") or [], saved.get("length")):
+            return True
+        return bool(live is not None and live.scan_finished())
+
+    def cue_store_lead_ms(self, start_ms):
+        live = self._live
+        return live.cue_store_lead_ms(start_ms) if live is not None else None
+
+    def stop(self):
+        self._stop.set()
+        live = self._live
+        if live is not None:
+            live.stop()
 
 
 # ============================================================================
@@ -9824,6 +10777,12 @@ TRUE_PEAK_CEILING_DBTP = _perf_governor.TRUE_PEAK_CEILING_DBTP if _perf_governor
 # WARNING: the fallback numbers below must match TRUE_PEAK_CONFIRM_MARGIN_DB, TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS in performance_governor.py; they are used only when that module fails to import.
 TRUE_PEAK_CONFIRM_MARGIN_DB = _perf_governor.TRUE_PEAK_CONFIRM_MARGIN_DB if _perf_governor is not None else 3.0
 TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS = _perf_governor.TRUE_PEAK_CONFIRM_TIMEOUT_SECONDS if _perf_governor is not None else 600.0
+
+
+def _peak_cap_applies(music, duration_sec):
+    """True when the true-peak ceiling limits a file's gain: music, and files short enough to be measured whole (commercials, bumpers). Shows and movies, measured in sample windows, are levelled on their speech and their loud moments play as far above it as they were made (owner 2026-11-24: "if the dialogue is the same volume as the tv series, the explosions will be as loud as they are meant to be")."""
+    # WARNING: owner logs 2026-11-24: the ceiling held movies back 8 to 20 dB (their explosions peak near full scale while their speech is quiet) and series only 1 to 3 dB, so movies played far quieter than the series; MediaLibrary._clear_peak_held_content_gains cleared the gains it had held back.
+    return bool(music) or _lufs_sample_windows(duration_sec) is None
 
 
 def _true_peak_limited_gain(gain, clamped_gain, combined_tp):
@@ -10882,7 +11841,7 @@ def _scan_other_audio_tracks(file_path, target_lufs, primary, primary_gain, base
                 continue
             wanted = 10 ** ((target_lufs - measured + gain_offset_db) / 20.0)
             base = max(attenuation_floor, min(wanted, ceiling))
-            gain, _capped = _true_peak_limited_gain(wanted, base, _combine_true_peak_readings(tp_readings))
+            gain, _capped = _true_peak_limited_gain(wanted, base, _combine_true_peak_readings(tp_readings) if _peak_cap_applies(music, duration_sec) else None)
             gains[stream] = gain
             log.info("[LOUDNESS PROBE] %s: audio track %d (%s) measured %.1f LUFS on %s, gain %+.1f dB",
                      os.path.basename(file_path), stream + 1, streams[stream].get("lang") or "?", measured,
@@ -11081,8 +12040,9 @@ def _get_media_loudness_gain_impl(file_path, target_lufs=TARGET_LUFS,
         gain = 10 ** (gain_db / 20.0)
         _base_gain = max(_atten_floor, min(gain, _ceiling))
         combined_tp = _combine_true_peak_readings(tp_readings)
-        _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _base_gain, combined_tp)
-        if (LOUDNESS_WHOLE_FILE_PEAK_CHECK and combined_tp is not None
+        _peak_cap = _peak_cap_applies(music, _dur_info.get("duration_sec"))
+        _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _base_gain, combined_tp if _peak_cap else None)
+        if (LOUDNESS_WHOLE_FILE_PEAK_CHECK and _peak_cap and combined_tp is not None
                 and _lufs_sample_windows(_dur_info.get("duration_sec")) is not None
                 and combined_tp + 20 * math.log10(_clamped_gain) > TRUE_PEAK_CEILING_DBTP - TRUE_PEAK_CONFIRM_MARGIN_DB):
             _whole_tp = _lufs_window_ffmpeg(
@@ -11298,7 +12258,8 @@ def get_pair_loudness_gain(path1, path2, target_lufs=TARGET_LUFS,
         gain = 10 ** (gain_db / 20.0)
         _clamped_gain = max(LOUDNESS_GAIN_FLOOR_STANDARD, min(gain, _ceiling))
         combined_tp = _combine_true_peak_readings(tp_readings)
-        _clamped_gain, _peak_capped = _true_peak_limited_gain(gain, _clamped_gain, combined_tp)
+        # WARNING: a pair is two episodes joined, so it is levelled on its speech like any show (_peak_cap_applies).
+        _peak_capped = False
         _max_lra = max(lra_readings) if lra_readings else None
         if _max_lra is not None and _max_lra >= LOUDNESS_WIDE_LRA_FLAG_LU:
             _media_warning(
@@ -11539,6 +12500,10 @@ def _settings_text_pieces(value, pieces):
         pieces.append("]")
         return
     pieces.append(json.dumps(value))
+
+
+# WARNING: owner 2026-11-24: callables told the moment any setting changes (before it is saved), so work that follows the settings is woken instead of looking on a timer; each must return at once.
+SETTINGS_CHANGE_LISTENERS = []
 
 
 class RetroDatabase:
@@ -12666,7 +13631,12 @@ class RetroDatabase:
     # ========================================================================
 
     def _request_deferred_save(self):
-        """Marks the settings as changed; the SettingsWriter thread writes them SETTINGS_SAVE_DELAY_SECONDS after the first unsaved request, with every change asked for in between."""
+        """Marks the settings as changed; the SettingsWriter thread writes them SETTINGS_SAVE_DELAY_SECONDS after the first unsaved request, with every change asked for in between. Each listener in SETTINGS_CHANGE_LISTENERS is told at once."""
+        for _listener in list(SETTINGS_CHANGE_LISTENERS):
+            try:
+                _listener()
+            except Exception as _swallowed_error:
+                _log_swallowed("_request_deferred_save: a settings listener", _swallowed_error)
         with self._deferred_save_cond:
             self._settings_save_stats["requests"] += 1
             self._settings_change_count = getattr(self, "_settings_change_count", 0) + 1
@@ -12825,7 +13795,7 @@ __all__ = [
     "SELECTION_BORDER_WIDTH", "SHORTCUT_EXTENSIONS", "SHORT_EPISODE_PAIRING_VERSION",
     "SIX_HOUR_BLOCKS", "SIX_HOUR_BLOCK_NAMES", "TARGET_LUFS", "TRUE_PEAK_CEILING_DBTP",
     "UnplayableMediaError", "VIDEO_DISPLAY_EXTS", "apply_video_effects", "vlc_picture_adjust", "vlc_sharpness_filter", "vlc_picture_media_options",
-    "asr_known_unavailable", "bake_compressor_pass", "bezel_style_count",
+    "live_captions_allowed", "caption_speed_test", "bake_compressor_pass", "bezel_style_count",
     "build_block_timeline", "build_ordered_tracks", "build_show_rotation",
     "check_media_truly_ended", "clean_display_title_for_ext", "clean_music_display_title",
     "clean_video_display_title", "commercial_bundle_ceiling", "dedupe_duplicate_episode_files",

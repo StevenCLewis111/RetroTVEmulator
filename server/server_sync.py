@@ -6,8 +6,10 @@ Does not own: discovery (server_discovery.py) or slot file writing.
 
 WARNING: the protocol sends channel/schedule JSON and, in "files" messages,
 the library facts of the scheduled files (length, loudness, letterbox box and
-where each file sits on one of the server's shared folders) and, with a channel
-that has its watermark on, that one small image file. Media files,
+where each file sits on one of the server's shared folders), with a channel
+that has its watermark on, that one small image file, and in "captions"
+messages the saved caption text of files (owner 2026-11-24: captions are made
+once and shared, a User sends back what it captioned live). Media files,
 ROMs, cores, BIOS files, and general application settings must never cross
 this boundary; a User PC plays a file straight from the server's shared
 folder over Windows file sharing.
@@ -28,6 +30,7 @@ import uuid
 import time
 from typing import Callable, Mapping
 
+import station_clock
 from server_diagnostics import breadcrumb as _server_breadcrumb
 
 log = logging.getLogger(__name__)
@@ -62,6 +65,9 @@ WARM_MIN_GAP_S = 10.0
 WARM_REMEMBER_S = 120.0
 # VALUES CHANGE HERE (mirrored in performance_governor.py): the biggest watermark image file, in bytes, the server sends with a channel.
 WATERMARK_SERVER_MAX_BYTES = 131072
+# VALUES CHANGE HERE (mirrored in performance_governor.py): the server looks for newly saved captions this often (seconds) and sends them to every User as one batch; one message carries at most this many files' captions, and the server sends at most one caption message per pass of its loop so pings and clocks are never held up.
+SERVER_CAPTIONS_PUSH_S = 300.0
+SERVER_CAPTIONS_PER_MESSAGE = 20
 try:
     import performance_governor as _gov
     SERVER_KEEPALIVE_S = float(_gov.SERVER_KEEPALIVE_S)
@@ -77,6 +83,8 @@ try:
     WARM_MAX_FILES = int(_gov.SERVER_WARM_MAX_FILES)
     WARM_MIN_GAP_S = float(_gov.SERVER_WARM_MIN_GAP_S)
     WATERMARK_SERVER_MAX_BYTES = int(_gov.WATERMARK_SERVER_MAX_BYTES)
+    SERVER_CAPTIONS_PUSH_S = float(_gov.SERVER_CAPTIONS_PUSH_S)
+    SERVER_CAPTIONS_PER_MESSAGE = int(_gov.SERVER_CAPTIONS_PER_MESSAGE)
 except Exception:
     pass
 
@@ -322,8 +330,20 @@ class ScheduleBroadcaster:
     """Polls slot files and pushes changed schedules to subscribed clients."""
     def __init__(self, slots: Callable[[], Mapping[str, str]], *, host="0.0.0.0",
                  port=47532, poll_interval=0.5, remote_id="", playback_provider=None,
-                 files_provider=None, warm_allowed=None, clock_provider=None):
+                 files_provider=None, warm_allowed=None, clock_provider=None, captions=None, on_slot_changed=None, rows_provider=None):
         self.slots = slots
+        # rows_provider(slot_id, channels) -> (digest, {channel: [row]}): the profile's schedule as this server's HUB holds it, sent to the Users watching the slot (owner 2026-11-24: "everything goes through the HUB").
+        self.rows_provider = rows_provider
+        self._rows_digest_sent = {}
+        self._pending_rows_clients = set()
+        # on_slot_changed(slot_id): told when a profile's file changed on disk (the service plans that profile's schedule again).
+        self.on_slot_changed = on_slot_changed
+        # captions: the saved_captions module of this server (held, read, add); None shares no captions.
+        self.captions = captions
+        self._captions_sent = None
+        self._captions_pushed_at = -1e9
+        self._captions_queue = []
+        self._live_caption_keys = {}
         # The profile each connected computer said it watches (None: every profile); a message about one profile goes only to the computers watching it.
         self._slot_of = {}
         # warm_allowed(path) -> True when the server may read this file for a User's warm ask (it lies in a shared folder); None refuses every ask.
@@ -436,9 +456,17 @@ class ScheduleBroadcaster:
                     self._pending_snapshot_clients.discard(client)
                     self._pending_files_clients.discard(client)
                     self._pending_clock_clients.discard(client)
+                    self._pending_rows_clients.discard(client)
                     self._watching.pop(client, None)
+                    self._live_caption_keys.pop(client, None)
                 try: client.close()
                 except OSError: pass
+                continue
+            if message.get("type") == "captions_have":
+                self._take_captions_have(client, message)
+                continue
+            if message.get("type") == "captions_put":
+                self._take_captions_put(message)
                 continue
             if message.get("type") == "warm":
                 self._take_warm_ask(client, message)
@@ -452,9 +480,87 @@ class ScheduleBroadcaster:
                 slot = message.get("slot_id")
                 files = message.get("next")
                 files = [f for f in files if isinstance(f, str) and f][:WATCHING_NEXT_FILES] if isinstance(files, list) else []
+                live = message.get("live_captions")
                 with self._lock:
                     self._watching[client] = (None if slot in (None, "") else str(slot),
                                               str(message["channel"]).zfill(2), time.monotonic(), files)
+                    self._live_caption_keys[client] = (time.monotonic(), [str(k) for k in live if isinstance(k, str) and k][:WATCHING_NEXT_FILES]
+                                                       if isinstance(live, list) else [])
+
+    def live_caption_keys(self):
+        """The content keys of the files the watching Users are captioning live right now (reported within WATCHING_FRESH_S seconds); the server's caption scan leaves them to those Users."""
+        now = time.monotonic()
+        with self._lock:
+            return {key for at, keys in self._live_caption_keys.values() if now - at <= WATCHING_FRESH_S for key in keys}
+
+    def _take_captions_have(self, client, message):
+        """A User said which saved captions it holds ({content key: seconds covered}) when it connected: every file this server holds more of is queued for that User."""
+        if self.captions is None:
+            return
+        have = message.get("keys")
+        have = have if isinstance(have, dict) else {}
+        try:
+            mine = self.captions.held()
+        except Exception as exc:
+            log.warning("[SERVER CAPTIONS] the saved captions could not be listed: %s", exc)
+            return
+        # WARNING: owner 2026-11-24: copies are compared by graded seconds (saved_captions.graded_seconds), so a User whose copy was made in Lite gets the server's better copy of the same stretch.
+        wanted = [key for key, info in mine.items() if info[3] > float(have.get(key) or 0) + 1.0]
+        with self._lock:
+            self._captions_queue.extend((client, key) for key in wanted)
+        log.info("[SERVER CAPTIONS] a User holds %d saved caption file(s); %d of this server's %d are sent to it", len(have), len(wanted), len(mine))
+
+    def _take_captions_put(self, message):
+        """A User sent what it captioned live: each file is saved where this server holds nothing yet for that stretch or holds it at a lower grade (between copies of the same grade the first wins, a later one changes nothing); the next push passes it on to the other Users."""
+        if self.captions is None:
+            return
+        taken = 0
+        for item in (message.get("items") or [])[:SERVER_CAPTIONS_PER_MESSAGE]:
+            try:
+                if self.captions.add_item(item, "user"):
+                    taken += 1
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("[SERVER CAPTIONS] a User's captions could not be read: %s", exc)
+        if taken:
+            log.info("[SERVER CAPTIONS] kept %d file(s) of captions a User made live", taken)
+
+    def _captions_item(self, key):
+        return self.captions.item_for(key)
+
+    def _send_captions(self):
+        """Once every SERVER_CAPTIONS_PUSH_S seconds the files whose saved captions grew since the last push are queued for every User; one message of at most SERVER_CAPTIONS_PER_MESSAGE files goes out per call, to one User, so a big batch is spread over the loop's passes."""
+        if self.captions is None:
+            return
+        now = time.monotonic()
+        if now - self._captions_pushed_at >= SERVER_CAPTIONS_PUSH_S:
+            self._captions_pushed_at = now
+            try:
+                mine = self.captions.held(refresh=True)
+            except Exception as exc:
+                log.warning("[SERVER CAPTIONS] the saved captions could not be listed: %s", exc)
+                mine = {}
+            # WARNING: the first look only notes what is held: a User gets what it lacks when it connects (captions_have), so only what changed after that look is pushed to everyone.
+            if self._captions_sent is not None:
+                changed = [key for key, info in mine.items() if self._captions_sent.get(key) != info]
+                if changed:
+                    with self._lock:
+                        clients = list(self._clients)
+                        self._captions_queue.extend((client, key) for client in clients for key in changed)
+                    log.info("[SERVER CAPTIONS] %d file(s) of new saved captions are sent to %d User(s)", len(changed), len(clients))
+            self._captions_sent = dict(mine)
+        with self._lock:
+            if not self._captions_queue:
+                return
+            client = self._captions_queue[0][0]
+            keys = [key for c, key in self._captions_queue if c is client][:SERVER_CAPTIONS_PER_MESSAGE]
+            taken = set(keys)
+            self._captions_queue = [(c, key) for c, key in self._captions_queue if not (c is client and key in taken)]
+            alive = client in self._clients
+        if not alive:
+            return
+        items = [item for item in (self._captions_item(key) for key in keys) if item]
+        if items:
+            self._broadcast({"protocol": PROTOCOL, "type": "captions", "items": items}, [client])
 
     def _take_warm_ask(self, client, message):
         """Takes in a User's ask to read the airing part of some channel files into this server's memory: [[path, start byte, length], ...]. Asks closer together than WARM_MIN_GAP_S from one User are ignored; the newest range for a file wins; nothing is read here (the warm thread does it)."""
@@ -558,6 +664,7 @@ class ScheduleBroadcaster:
                     self._pending_snapshot_clients.discard(client)
                     self._pending_files_clients.discard(client)
                     self._pending_clock_clients.discard(client)
+                    self._pending_rows_clients.discard(client)
             for client in dead:
                 client.close()
             _server_breadcrumb(
@@ -591,6 +698,7 @@ class ScheduleBroadcaster:
                 self._pending_snapshot_clients.add(client)
                 self._pending_files_clients.add(client)
                 self._pending_clock_clients.add(client)
+                self._pending_rows_clients.add(client)
             log.info("[SERVER SYNC] a computer connected peer=%s profile=%s", host, slot)
         except (OSError, ConnectionError, ValueError, json.JSONDecodeError):
             try: client.close()
@@ -700,9 +808,38 @@ class ScheduleBroadcaster:
                            "[SERVER SYNC] slot %s clocks sent for %d channel(s)%s", slot_id, len(clocks or {}),
                            "" if clocks else " (the hub holds no show on air for this slot; nothing for a User to count down from)", interval=60.0)
         self._broadcast({"protocol": PROTOCOL, "type": "clocks", "slot_id": str(slot_id),
-                         "sent_at": time.time(), "channels": clocks or {}}, targets)
+                         "sent_at": station_clock.now_epoch(), "channels": clocks or {}}, targets)
         with self._lock:
             self._pending_clock_clients -= {client for client in self._pending_clock_clients if self._may_see(client, slot_id)}
+
+    def _send_rows(self, slot_id, channels):
+        """Sends the profile's schedule rows (the HUB's, rows_provider) to every User watching the slot when they changed, and to a User that just connected; packed with zlib, since 8 days of two channels are thousands of rows."""
+        if self.rows_provider is None:
+            return
+        try:
+            digest, rows = self.rows_provider(slot_id, channels)
+        except Exception as exc:
+            _server_breadcrumb(log, logging.WARNING, f"schedule-rows-provider:{self.port}",
+                               "[SERVER DIAG] Schedule rows provider failed port=%s: %s", self.port, exc)
+            return
+        with self._lock:
+            newcomers = {client for client in self._pending_rows_clients if self._may_see(client, slot_id)}
+        if digest == self._rows_digest_sent.get(slot_id):
+            if not newcomers:
+                return
+            targets = newcomers
+        else:
+            targets = None
+        self._rows_digest_sent[slot_id] = digest
+        import zlib
+        packed = base64.b64encode(zlib.compress(json.dumps(rows, separators=(",", ":")).encode("utf-8"), 6)).decode("ascii")
+        self._broadcast({"protocol": PROTOCOL, "type": "hub_rows", "slot_id": str(slot_id), "digest": digest,
+                         "sent_at": station_clock.now_epoch(), "z": packed}, targets)
+        _server_breadcrumb(log, logging.INFO, f"schedule-rows-sent:{self.port}:{slot_id}",
+                           "[SERVER SYNC] slot %s schedule rows sent: %d channel(s), %d row(s), %d KB packed (digest %s)", slot_id, len(rows),
+                           sum(len(v) for v in rows.values()), len(packed) // 1024, digest[:8], interval=0.0)
+        with self._lock:
+            self._pending_rows_clients -= {client for client in self._pending_rows_clients if self._may_see(client, slot_id)}
 
     def _run(self):
         server = None
@@ -754,10 +891,16 @@ class ScheduleBroadcaster:
                             if changed:
                                 self._last_payloads[slot_id] = payload
                                 self._revisions[slot_id] = self._revisions.get(slot_id, 0) + 1
+                                if self.on_slot_changed is not None:
+                                    try:
+                                        self.on_slot_changed(slot_id)
+                                    except Exception as exc:
+                                        log.warning("[SERVER SYNC] telling the planner that slot %s changed failed: %s", slot_id, exc)
                         if not anyone:
                             continue
                         self._send_files(slot_id, channels)
                         self._send_clocks(slot_id, channels)
+                        self._send_rows(slot_id, channels)
                         with self._lock:
                             pending_now = bool(self._pending_snapshot_clients)
                         if not changed and not pending_now:
@@ -788,10 +931,12 @@ class ScheduleBroadcaster:
                             "path=%s: %s", slot_id, path, exc,
                         )
                 # WARNING: a User reads with a time limit; without a message every few seconds an unchanged schedule looked like a lost server and the link dropped and reconnected over and over.
+                if anyone:
+                    self._send_captions()
                 _now = time.monotonic()
                 if _now - self._last_ping >= SERVER_KEEPALIVE_S:
                     self._last_ping = _now
-                    self._broadcast({"protocol": PROTOCOL, "type": "ping", "utc_offset_s": local_utc_offset_s(), "server_time": time.time()})
+                    self._broadcast({"protocol": PROTOCOL, "type": "ping", "utc_offset_s": local_utc_offset_s(), "server_time": station_clock.now_epoch()})
                 self._stop.wait(self.poll_interval)
         except OSError as exc:
             _server_breadcrumb(
@@ -811,8 +956,15 @@ class ScheduleBroadcaster:
 
 class ScheduleClient:
     def __init__(self, host, *, port=47532, slot_id=None, on_schedule=None,
-                 on_status=None, timeout=4.0, retry_interval=2.0, on_files=None, on_clock=None, on_clocks=None, watching_provider=None, warm_provider=None, on_server_time=None, next_files_provider=None):
+                 on_status=None, timeout=4.0, retry_interval=2.0, on_files=None, on_clock=None, on_clocks=None, watching_provider=None, warm_provider=None, on_server_time=None, next_files_provider=None,
+                 captions_have_provider=None, on_captions=None, live_captions_provider=None, on_rows=None):
         self.host, self.port = host, int(port)
+        # on_rows({"slot_id", "digest", "channels": {channel: [row]}}): the profile's schedule as the server's HUB holds it (owner 2026-11-24).
+        self.on_rows = on_rows
+        # captions_have_provider() -> {content key: seconds covered} of the saved captions this User holds, told to the server once per connection; on_captions([items]) takes a batch the server sent; live_captions_provider() -> [content keys] this User is captioning live, sent with each watching report.
+        self.captions_have_provider = captions_have_provider
+        self.on_captions = on_captions
+        self.live_captions_provider = live_captions_provider
         # watching_provider() -> the channel this User is watching on the picked server ("07") or None; the server scans that channel's files first.
         self.watching_provider = watching_provider
         # warm_provider() -> [[path on the server, start byte, length], ...] of the airing part of the channels this User may tune to, asked of the server every WARM_REPORT_S seconds; None or an empty list asks nothing.
@@ -850,6 +1002,7 @@ class ScheduleClient:
 
     def _take_clock(self, message):
         """Hands the server's zone offset, sent with every schedule and ping, to on_clock, and the server's own time to on_server_time."""
+        # WARNING: this one stays on this computer's own clock: it is how far that clock is from the server's station clock (the skew the station clock then adds), so it must never read the station clock itself.
         arrived = time.time()
         if self.on_server_time:
             # WARNING: only the small ping is timed; a schedule message can take seconds to arrive, which would read as the server's clock being behind.
@@ -948,6 +1101,56 @@ class ScheduleClient:
         except (OSError, ConnectionError, ValueError) as exc:
             log.warning("[SERVER SYNC] the request for the whole file list could not be sent: %s", exc)
 
+    def _tell_captions_held(self, sock):
+        """Tells the server, once per connection, which saved captions this User holds, so the server sends only what it lacks; after that the server sends new captions when it has them and this User never asks."""
+        if self.captions_have_provider is None:
+            return
+        try:
+            have = dict(self.captions_have_provider() or {})
+        except Exception as exc:
+            log.warning("[SERVER CAPTIONS] the saved captions of this PC could not be listed: %s", exc)
+            have = {}
+        try:
+            self._send(sock, {"protocol": PROTOCOL, "type": "captions_have", "keys": {str(k): float(v) for k, v in have.items()}})
+        except (OSError, ConnectionError, ValueError) as exc:
+            log.warning("[SERVER CAPTIONS] could not tell the server which captions this PC holds: %s", exc)
+
+    def _take_captions(self, message):
+        """Hands a batch of saved captions the server sent to on_captions."""
+        if not self.on_captions:
+            return
+        try:
+            self.on_captions([item for item in (message.get("items") or []) if isinstance(item, dict) and item.get("key")])
+        except Exception as exc:
+            _server_breadcrumb(
+                log, logging.WARNING, f"schedule-captions-callback:{self.host}:{self.port}",
+                "[SERVER DIAG] Captions callback failed host=%s port=%s: %s", self.host, self.port, exc)
+
+    def send_captions(self, items):
+        """Sends the server what this User captioned live ([{"key", "length", "covered", "grades", "cues"}]); False when there is no connection to send it over."""
+        sock = self.sock
+        if sock is None or not items:
+            return False
+        try:
+            self._send(sock, {"protocol": PROTOCOL, "type": "captions_put", "items": list(items)[:SERVER_CAPTIONS_PER_MESSAGE]})
+        except (OSError, ConnectionError, ValueError) as exc:
+            log.warning("[SERVER CAPTIONS] could not send this PC's captions to the server: %s", exc)
+            return False
+        return True
+
+    def _take_rows(self, message):
+        """Unpacks the server's schedule rows and hands them to on_rows."""
+        if not self.on_rows or not self._wanted_slot(message):
+            return
+        try:
+            import zlib
+            rows = json.loads(zlib.decompress(base64.b64decode(message.get("z") or "")).decode("utf-8"))
+            self.on_rows({"slot_id": message.get("slot_id"), "digest": message.get("digest"), "channels": rows if isinstance(rows, dict) else {}})
+        except Exception as exc:
+            _server_breadcrumb(
+                log, logging.WARNING, f"schedule-rows-callback:{self.host}:{self.port}",
+                "[SERVER DIAG] Schedule rows from the server could not be taken host=%s port=%s: %s", self.host, self.port, exc)
+
     def _take_clocks(self, message):
         """Hands the server's channel clocks, with the moment this computer received them, to on_clocks."""
         if not self.on_clocks or not self._wanted_slot(message):
@@ -1010,9 +1213,17 @@ class ScheduleClient:
                         _server_breadcrumb(
                             log, logging.WARNING, f"schedule-next-files-provider:{self.host}:{self.port}",
                             "[SERVER DIAG] Next files provider failed host=%s port=%s: %s", self.host, self.port, exc)
+                live = []
+                if self.live_captions_provider is not None:
+                    try:
+                        live = [str(k) for k in (self.live_captions_provider() or []) if k][:WATCHING_NEXT_FILES]
+                    except Exception as exc:
+                        _server_breadcrumb(
+                            log, logging.WARNING, f"schedule-live-captions-provider:{self.host}:{self.port}",
+                            "[SERVER DIAG] Live captions provider failed host=%s port=%s: %s", self.host, self.port, exc)
                 try:
                     self._send(sock, {"protocol": PROTOCOL, "type": "watching",
-                                      "slot_id": self.slot_id, "channel": str(channel).zfill(2), "next": files})
+                                      "slot_id": self.slot_id, "channel": str(channel).zfill(2), "next": files, "live_captions": live})
                 except (OSError, ConnectionError, ValueError):
                     return
             if self.warm_provider is not None and time.monotonic() - warm_sent >= WARM_REPORT_S:
@@ -1050,13 +1261,18 @@ class ScheduleClient:
                              self.host, self.port, self.slot_id)
                 connection_state = "connected"
                 threading.Thread(target=self._report_watching, args=(self.sock,), daemon=True, name="retro-tv-watching-report").start()
+                self._tell_captions_held(self.sock)
                 while not self._stop.is_set():
                     message = recv_message(self.sock)
                     self._take_clock(message)
                     if message.get("type") in ("files", "files_delta"):
                         self._take_files(message)
+                    elif message.get("type") == "captions":
+                        self._take_captions(message)
                     elif message.get("type") == "clocks":
                         self._take_clocks(message)
+                    elif message.get("type") == "hub_rows":
+                        self._take_rows(message)
                     elif (message.get("type") == "schedule"
                             and (self.slot_id is None
                                  or str(message.get("slot_id")) == self.slot_id)

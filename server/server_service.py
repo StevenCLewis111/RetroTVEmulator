@@ -28,8 +28,10 @@ import tempfile
 import threading
 import time
 
+import server_captions
 import server_clock
 import server_discovery
+import server_planner
 import server_files
 import server_scanner
 import server_sync
@@ -67,9 +69,14 @@ def _logs_dir(base_dir):
     return path
 
 
+_service_log_handler = None
+
+
 def _configure_logging(base_dir):
-    """Give the detached process its own small rotating log."""
-    if log.handlers:
+    """Give the detached process its own small rotating log, written by every module in the process (the caption scan, the sound and picture scan, the link to the Users, the tray), not only by this file."""
+    # WARNING: owner logs 2026-11-24: the handler sat on this file's logger alone, so server_captions, server_scanner, server_sync and the others logged into nothing and the caption scan left no line at all; it now sits on the root logger of this process (the service process only; the program never calls this).
+    global _service_log_handler
+    if _service_log_handler is not None:
         return
     try:
         path = os.path.join(_logs_dir(base_dir), "server_service.log")
@@ -77,9 +84,10 @@ def _configure_logging(base_dir):
             path, maxBytes=1 * 1024 * 1024, backupCount=2, encoding="utf-8")
         handler.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-        log.addHandler(handler)
-        log.setLevel(logging.INFO)
-        log.propagate = False
+        root = logging.getLogger()
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+        _service_log_handler = handler
     except Exception:
         logging.basicConfig(level=logging.INFO)
 
@@ -579,48 +587,98 @@ def _open_app(base_dir):
 # ============================================================================
 
 _send_logs_lock = threading.Lock()
-# VALUES CHANGE HERE: folders inside logs that are never packed (downloaded update packages are huge), and the largest single file packed, in bytes.
-SEND_LOGS_SKIP_FOLDERS = (".retro_tv_updates", "__pycache__")
-SEND_LOGS_MAX_FILE_BYTES = 64 * 1024 * 1024
+# VALUES CHANGE HERE (mirrored in performance_governor.py, SEND_LOGS_*): the Discord webhook the tray's Send logs posts to (a send_logs_webhook_url entry in retro_config.json wins), the biggest zip in bytes, the per-log size kept and the least it is halved down to, and the seconds the post may take; these are the program's own Send Logs numbers, so the tray sends exactly what the button sends.
+SEND_LOGS_WEBHOOK_URL = "https://discord.com/api/webhooks/1570101167835455601/QNzkevIeJ82sJA5LqtcE6SNHa6gIzc54WrR32-skg4eGuNKGtsxtOZYPcgf6DWeu2Tg5"
+SEND_LOGS_MAX_ZIP_BYTES = 9000000
+SEND_LOGS_FILE_TAIL_BYTES = 3000000
+SEND_LOGS_FILE_TAIL_BYTES_LEAST = 60000
+SEND_LOGS_TIMEOUT_SECONDS = 60.0
+# VALUES CHANGE HERE: the most seconds the tray spends copying the logs before it zips what it has (the program's button uses the same 6 seconds).
+SEND_LOGS_COPY_SECONDS = 6.0
+try:
+    import performance_governor as _gov_send_logs
+    SEND_LOGS_WEBHOOK_URL = str(_gov_send_logs.SEND_LOGS_WEBHOOK_URL)
+    SEND_LOGS_MAX_ZIP_BYTES = int(_gov_send_logs.SEND_LOGS_MAX_ZIP_BYTES)
+    SEND_LOGS_FILE_TAIL_BYTES = int(_gov_send_logs.SEND_LOGS_FILE_TAIL_BYTES)
+    SEND_LOGS_FILE_TAIL_BYTES_LEAST = int(_gov_send_logs.SEND_LOGS_FILE_TAIL_BYTES_LEAST)
+    SEND_LOGS_TIMEOUT_SECONDS = float(_gov_send_logs.SEND_LOGS_TIMEOUT_SECONDS)
+except Exception:
+    pass
+SEND_LOGS_TRAY_NOTE = "Sent from the server tray (it has no note box)."
 
 
-def pack_logs_zip(base_dir, destination_dir=None, now=None):
-    """Zips the install's logs folder (minus update downloads) into one file and returns its path."""
-    import zipfile
-    logs = _logs_dir(base_dir)
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now or time.time()))
-    target_dir = destination_dir or os.path.join(os.path.expanduser("~"), "Desktop")
-    if not os.path.isdir(target_dir):
-        target_dir = base_dir
-    out = os.path.join(target_dir, "RetroTV_logs_%s.zip" % stamp)
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as bundle:
-        for folder, dirs, files in os.walk(logs):
-            dirs[:] = [d for d in dirs if d not in SEND_LOGS_SKIP_FOLDERS]
-            for name in files:
-                full = os.path.join(folder, name)
-                try:
-                    if os.path.getsize(full) > SEND_LOGS_MAX_FILE_BYTES:
-                        continue
-                    bundle.write(full, os.path.relpath(full, logs))
-                except OSError as exc:
-                    log.warning("[SERVER TRAY] log file skipped %s: %s", full, exc)
-    return out
+def _send_logs_config_url(base_dir):
+    """retro_config.json's send_logs_webhook_url, or empty when it is not set or the file cannot be read."""
+    try:
+        with open(_config_path(base_dir), "r", encoding="utf-8") as fh:
+            config = json.load(fh).get("config", {})
+        return str(config.get("send_logs_webhook_url", "") or "") if isinstance(config, dict) else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _send_logs_machine_text():
+    """This computer's OS and core count for the zip's head, as the program's [BOOT ENV] line names them."""
+    import platform
+    try:
+        os_text = platform.platform()
+    except Exception:
+        os_text = "unknown"
+    return "OS=%s | CPU cores=%s | sent by the server service" % (os_text, os.cpu_count() or "unknown")
 
 
 def send_logs_from_tray(base_dir):
-    """Send logs on the tray menu: packs the logs into one zip on the Desktop, shows it in Explorer and says where it is."""
+    """Send logs on the tray menu: the program's own Send Logs steps (send_logs_finisher): the logs are copied, the personal parts taken out, the zip kept under Discord's size and posted to the Discord webhook; a message then says the logs were sent, or why not."""
     if not _send_logs_lock.acquire(blocking=False):
         return
+    snapshot = ""
+    out = ""
     try:
-        out = pack_logs_zip(base_dir)
-        log.info("[SERVER TRAY] logs packed: %s (%.1f MB)", out, os.path.getsize(out) / 1048576.0)
-        if os.name == "nt":
-            subprocess.Popen(["explorer.exe", "/select,", out])
-        _tray_message("Your logs are packed in one file:\n\n%s\n\nSend that file." % out, base_dir=base_dir)
+        import send_logs_finisher
+        url = send_logs_finisher.pick_webhook_url(_send_logs_config_url(base_dir), SEND_LOGS_WEBHOOK_URL)
+        if not url:
+            log.warning("[SERVER TRAY] Send logs: no Discord webhook is set (SEND_LOGS_WEBHOOK_URL in performance_governor.py or send_logs_webhook_url in retro_config.json)")
+            _tray_message("Send logs is not set up: no Discord webhook is set.", base_dir=base_dir)
+            return
+        auto_updater = _load_auto_updater(base_dir)
+        try:
+            version = str(auto_updater.current_version(base_dir) or "unknown")
+        except Exception as exc:
+            log.warning("[SERVER TRAY] Send logs: the version could not be read: %s", exc)
+            version = "unknown"
+        logs = _logs_dir(base_dir)
+        temp = os.path.join(logs, "temp")
+        os.makedirs(temp, exist_ok=True)
+        # WARNING: the program may be writing its logs while the tray copies them (another process, so its writers cannot be paused from here); copy_logs cuts a line caught half written back to the last whole line.
+        snapshot = tempfile.mkdtemp(prefix="retrotv_tray_logs_")
+        count = send_logs_finisher.copy_logs(logs, snapshot, time.time() + SEND_LOGS_COPY_SECONDS)
+        out = os.path.join(temp, "send_logs_tray.zip")
+        machine = _send_logs_machine_text()
+        size = send_logs_finisher.build_zip(out, SEND_LOGS_TRAY_NOTE, snapshot, SEND_LOGS_MAX_ZIP_BYTES,
+                                            SEND_LOGS_FILE_TAIL_BYTES, SEND_LOGS_FILE_TAIL_BYTES_LEAST, version, machine)
+        if size is None:
+            log.warning("[SERVER TRAY] Send logs: the zip stayed bigger than %d bytes even with the smallest logs", SEND_LOGS_MAX_ZIP_BYTES)
+            _tray_message("The logs could not be sent: they stay too big for Discord even cut down.", base_dir=base_dir)
+            return
+        message = "Retro TV logs V%s (sent from the server tray), %s" % (version, machine[:300])
+        ok, why = send_logs_finisher.post_zip(url, out, message, SEND_LOGS_TIMEOUT_SECONDS, urlopen=auto_updater._urlopen)
+        log.info("[SERVER TRAY] Send logs %s (%d file(s), %d bytes): %s", "sent" if ok else "failed", count, size, why)
+        if ok:
+            _tray_message("Logs sent.", base_dir=base_dir)
+        else:
+            _tray_message("The logs could not be sent (%s).\n\nCheck the internet connection and try again." % why, base_dir=base_dir)
     except Exception as exc:
-        log.exception("[SERVER TRAY] could not pack the logs")
-        _tray_message("The logs could not be packed: %s" % exc, base_dir=base_dir)
+        log.exception("[SERVER TRAY] Send logs failed")
+        _tray_message("The logs could not be sent: %s" % exc, base_dir=base_dir)
     finally:
+        if snapshot:
+            import shutil
+            shutil.rmtree(snapshot, ignore_errors=True)
+        if out:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
         _send_logs_lock.release()
 
 
@@ -815,7 +873,9 @@ def run_service(base_dir):
     announcer = None
     broadcaster = None
     scanner = None
+    caption_scanner = None
     keep_awake = None
+    profile_planner = None
     device_id = server_discovery.get_or_create_device_id(base_dir)
     try:
         tray.start()
@@ -922,14 +982,26 @@ def run_service(base_dir):
                     return _channel_clocks.snapshot(
                         _clock_library["hub"], [ch for ch, info in (channels or {}).items() if isinstance(info, dict) and info.get("active", True)],
                         slot_id=slot_id)
+                # WARNING: owner 2026-11-24: captions are made once and kept in main/saved captions, the same folder the program on this PC uses; the file's library record notes them.
+                import media
+                import saved_captions
+                saved_captions.set_root(media.resolve_main_dir())
+                def _note_saved_captions(key, name, covered, complete):
+                    _probe_library().library.upsert_fields(key, saved_captions_file=name, saved_captions_covered=float(covered),
+                                                           saved_captions_complete=1 if complete else 0)
+                saved_captions.set_library_note(_note_saved_captions)
+                # WARNING: owner 2026-11-24: the service keeps every served profile's schedule in this server's HUB itself, with the program open or closed (server_planner).
+                profile_planner = server_planner.ProfilePlanner(_current_slots, _probe_library)
                 broadcaster = server_sync.ScheduleBroadcaster(
-                    _current_slots, remote_id=device_id,
+                    _current_slots, remote_id=device_id, on_slot_changed=profile_planner.wake, rows_provider=profile_planner.rows_for,
                     playback_provider=_current_playback,
                     files_provider=server_files.make_provider(
                         server_files.library_db_path(base_dir), base_dir),
                     clock_provider=_clock_provider,
-                    warm_allowed=server_files.make_warm_allowed(base_dir))
+                    warm_allowed=server_files.make_warm_allowed(base_dir),
+                    captions=saved_captions)
                 announcer.start()
+                profile_planner.start()
                 broadcaster.start()
                 try:
                     import performance_governor as _scan_gov
@@ -955,6 +1027,22 @@ def run_service(base_dir):
                     next_files_fn=broadcaster.watching_next,
                     cpu_percent_fn=_scan_cpu_percent, streaming_fn=lambda: bool(broadcaster.watching()) or server_scanner.read_local_watching(base_dir) is not None)
                 scanner.start()
+                try:
+                    import performance_governor as _caption_gov
+                    _caption_cpu = _caption_gov.SystemCpuSampler()
+                    _caption_cpu.percent()
+                    _caption_cpu_percent = _caption_cpu.percent
+                except Exception as exc:
+                    log.warning("[CAPTION SCAN] machine load is not readable (%s); the caption scan paces by the program's level only", exc)
+                    _caption_cpu_percent = None
+                caption_scanner = server_captions.CaptionScanner(
+                    _current_slots, _probe_library, scanner,
+                    server_captions.CaptionPacer(
+                        cpu_percent_fn=_caption_cpu_percent, program_open_fn=lambda: _app_is_open(base_dir),
+                        program_state_fn=lambda: server_scanner.read_program_scan_state(base_dir),
+                        streaming_fn=lambda: bool(broadcaster.watching()) or server_scanner.read_local_watching(base_dir) is not None),
+                    live_keys_fn=broadcaster.live_caption_keys)
+                caption_scanner.start()
                 keep_awake = server_scanner.DriveKeepAwake(_current_slots)
                 keep_awake.start()
                 log.info("[SERVER SERVICE] discovery and schedule "
@@ -969,8 +1057,12 @@ def run_service(base_dir):
     finally:
         if scanner is not None:
             scanner.stop()
+        if caption_scanner is not None:
+            caption_scanner.stop()
         if keep_awake is not None:
             keep_awake.stop()
+        if profile_planner is not None:
+            profile_planner.stop()
         if broadcaster is not None:
             try:
                 broadcaster.stop()

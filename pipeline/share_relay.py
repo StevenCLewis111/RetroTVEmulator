@@ -348,6 +348,9 @@ def has_index(path, size=None, mtime_ns=None):
     return True
 
 
+_index_reach_checked = {}   # path key -> (size, mtime_ns) of a kept copy already measured for a cut-off MP4 index
+
+
 def ensure_index(path, source=None, max_seconds=INDEX_FILL_MAX_SECONDS):
     """Keeps a copy of the file's first and last megabytes on this PC's disk when none is current; returns the meta (size, mtime_ns, head_len, tail_len) or None. Runs off the screen thread: the channel warm calls it, and a file's first request calls it when the warm has not."""
     cache_path = _cache_file(path)
@@ -361,18 +364,45 @@ def ensure_index(path, source=None, max_seconds=INDEX_FILL_MAX_SECONDS):
             handle = src.acquire()
             size, mtime_ns = src.size, src.mtime_ns
             meta = _load_meta(cache_path)
-            if meta is not None and meta[0] == size and meta[1] == mtime_ns:
-                try:
-                    os.utime(cache_path, None)
-                except OSError:
-                    pass
-                ok = True
-                return meta
-            deadline = time.monotonic() + max_seconds
             head_len = min(HEAD_CACHE_BYTES, size)
             tail_len = min(TAIL_CACHE_BYTES, max(0, size - head_len))
+            if meta is not None and meta[0] == size and meta[1] == mtime_ns:
+                # WARNING: the kept copy is measured only when its MP4 index could not be read from it; a file whose table is held costs nothing here, as before.
+                _measured = _index_reach_checked.get(_key(path)) == (size, mtime_ns)
+                kept = (_read_kept(path) if not _measured and ntpath.splitext(str(path))[1].lower() in (".mp4", ".m4v", ".mov")
+                        and keyframe_table(path) is None else None)
+                reach = _mp4_index_reach(kept[0], size, path, lambda o, n: _read_exact(handle, o, n, time.monotonic() + max_seconds)) if kept is not None else None
+                _index_reach_checked[_key(path)] = (size, mtime_ns)
+                if len(_index_reach_checked) > 2000:
+                    _index_reach_checked.clear()
+                if reach is None or (reach[0] <= meta[2] and reach[1] <= meta[3]):
+                    try:
+                        os.utime(cache_path, None)
+                    except OSError:
+                        pass
+                    ok = True
+                    return meta
+                # WARNING: owner log 2026-11-24: a long movie's MP4 index was bigger than the kept start, so no time could be found in it and its channel never had its airing part read ahead; the kept copy is made again with the whole index.
+                head_len, tail_len = max(head_len, reach[0]), max(tail_len, reach[1])
+                log.info("[SHARE RELAY] the index of %s is bigger than the part kept on this PC; keeping %d KB from the start and %d KB from the end",
+                         os.path.basename(str(path)), head_len // 1024, tail_len // 1024)
+            deadline = time.monotonic() + max_seconds
             head = _read_exact(handle, 0, head_len, deadline) if head_len else b""
+            reach = None
+            if head is not None and meta is None:
+                reach = _mp4_index_reach(_View(head, b"", size), size, path, lambda o, n: _read_exact(handle, o, n, deadline))
+                if reach is not None and reach[0] > head_len:
+                    more = _read_exact(handle, head_len, reach[0] - head_len, deadline)
+                    head = None if more is None else head + more
+                    head_len = reach[0]
+            tail_len = min(tail_len, max(0, size - head_len))
             tail = _read_exact(handle, size - tail_len, tail_len, deadline) if tail_len else b""
+            if head is not None and tail is not None and reach is not None and tail_len:
+                if reach[1] > tail_len:
+                    extra = min(reach[1], size - head_len) - tail_len
+                    more = _read_exact(handle, size - tail_len - extra, extra, deadline) if extra > 0 else b""
+                    tail = None if more is None else more + tail
+                    tail_len += max(0, extra)
             if head is None or tail is None:
                 ok = True
                 return None
@@ -384,6 +414,8 @@ def ensure_index(path, source=None, max_seconds=INDEX_FILL_MAX_SECONDS):
             os.replace(tmp, cache_path)
             with _lock:
                 _stats["fills"] += 1
+                # WARNING: a table made from the old kept copy (None when its index was cut off) is dropped, or the new copy would never be read for it.
+                _keyframe_tables.pop(_key(path), None)
             _trim_cache()
             ok = True
             return (size, mtime_ns, head_len, tail_len)
@@ -588,6 +620,39 @@ def _mp4_boxes(buf):
             return
         yield kind, pos + header, min(pos + size, len(buf))
         pos += size
+
+
+# VALUES CHANGE HERE (the biggest MP4 index (moov box) kept whole on this PC; a bigger one is not read, as _mp4_keyframes does not read it)
+MP4_INDEX_MAX_BYTES = 24 << 20
+
+
+def _mp4_index_reach(view, size, path, read_at=None):
+    """(bytes needed from the start, bytes needed from the end) to hold an MP4's whole index (moov box) on this PC, worked out from the top-level box headers: from the view where it holds them, else read_at(offset, length) reads the 16 header bytes from the file. None for a file that is not MP4 or MOV, an index bigger than MP4_INDEX_MAX_BYTES, or one whose place cannot be told."""
+    if ntpath.splitext(str(path))[1].lower() not in (".mp4", ".m4v", ".mov"):
+        return None
+    off = 0
+    while off < size:
+        want = 16 if off + 16 <= size else 8
+        raw = view.get(off, want)
+        if raw is None and read_at is not None:
+            raw = read_at(off, want)
+        if raw is None or len(raw) < 8:
+            return None
+        box, kind = struct.unpack_from(">I4s", raw, 0)
+        if box == 1 and len(raw) >= 16:
+            box = struct.unpack_from(">Q", raw, 8)[0]
+        elif box == 0:
+            box = size - off
+        if box < 8:
+            return None
+        if kind == b"moov":
+            if box > MP4_INDEX_MAX_BYTES:
+                return None
+            if off < len(view.head):
+                return (off + box, 0)
+            return (0, size - off)
+        off += box
+    return None
 
 
 def _mp4_keyframes(view):

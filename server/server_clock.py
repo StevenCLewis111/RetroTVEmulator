@@ -4,7 +4,8 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import time
+
+import station_clock
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ def build_clock(hub, channel, now_epoch, next_shows=None, missing_fn=None):
 class ChannelClocks:
     """Reads the clock of every channel of a slot from the schedule hub; the scanner uses it to decide what to read first, and whatever hands the clocks to Users reads the same snapshot."""
 
-    def __init__(self, now_fn=time.time, next_shows=None, keep_s=0.0, missing_fn=None):
+    def __init__(self, now_fn=station_clock.now_epoch, next_shows=None, keep_s=0.0, missing_fn=None):
         self._now = now_fn
         self._next_shows = next_shows
         # keep_s: one reading of a slot's channels is handed out again for this many seconds (0 reads the hub every time); missing_fn: the checklist used when a caller gives none.

@@ -61,7 +61,7 @@ _JOB_STARTS = tuple(_governor.HEALTH_JOB_THREAD_STARTS) if _governor is not None
     "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
 
 _APP_MODULES = frozenset((
-    "retro_tv_emulator", "__main__", "media", "media_library", "ui", "menu_nav", "game_deck", "libretro_core", "visualizers",
+    "retro_tv_emulator", "__main__", "media", "media_library", "ui", "menu_nav", "guide_table", "game_deck", "libretro_core", "visualizers",
     "performance_governor", "broadcast_clock", "audio_analysis", "health_monitor", "d3d11_gpu_frame", "d3d11_gpu_gate",
     "d3d11_gpu_reference", "server_discovery", "server_sync", "server_service", "auto_updater", "update_helper"))
 _WAIT_FILES = frozenset(("threading", "queue", "selectors", "subprocess", "socket", "socketserver", "ssl", "asyncio"))

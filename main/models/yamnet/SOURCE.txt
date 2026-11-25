@@ -1,0 +1,8 @@
+YAMNet sound model, used by Retro TV Emulator for caption sound tags ([dog barking], [whistling] and the like).
+
+Made by Google. From the TensorFlow 2 copy of yamnet (version 1), converted to ONNX (opset 15) with tf2onnx 1.17 so it runs on onnxruntime, which the caption process already uses. The converted model gives the same scores as the original to within 0.00005.
+
+yamnet.onnx: input "waveform", 16 kHz mono float32 audio of any length; first output: scores for 521 sound classes, one row per 0.48 s step (each row covers 0.96 s).
+yamnet_class_map.csv: the 521 class names (AudioSet ontology).
+
+Licences: the YAMNet model is Apache License 2.0 (Google). The AudioSet class names and ontology are CC BY 4.0 (Google).

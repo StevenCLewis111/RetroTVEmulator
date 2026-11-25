@@ -11,6 +11,7 @@ import time
 import media
 import broadcast_clock
 import menu_nav
+import guide_table
 try:
     import performance_governor
 except Exception as _governor_import_error:
@@ -171,7 +172,7 @@ CHANNEL_GRID_LEFT_COL_SHIFT_PX = performance_governor.CHANNEL_GRID_LEFT_COL_SHIF
 # ============================================================================
 # WARNING: the fallback numbers below must match THEME_BUTTON_FAMILY_REST and THEME_BUTTON_HUE_SAFE_GAP in performance_governor.py; they are used only when that module fails to import.
 THEME_BUTTON_FAMILY_REST = performance_governor.THEME_BUTTON_FAMILY_REST if performance_governor is not None else {"blue": 218, "red": 354, "green": 134, "yellow": 47}
-THEME_BUTTON_HUE_SAFE_GAP = performance_governor.THEME_BUTTON_HUE_SAFE_GAP if performance_governor is not None else 30
+THEME_BUTTON_HUE_SAFE_GAP = performance_governor.THEME_BUTTON_HUE_SAFE_GAP if performance_governor is not None else 60
 # WARNING: the fallback colours below must match the same names in performance_governor.py; they are used only when that module fails to import.
 COLOR_GAME_SWITCH_ON = performance_governor.COLOR_GAME_SWITCH_ON if performance_governor is not None else (40, 167, 69)
 COLOR_GAME_SWITCH_OFF = performance_governor.COLOR_GAME_SWITCH_OFF if performance_governor is not None else (45, 65, 100)
@@ -853,7 +854,8 @@ def _guide_merge_cells(timeline_entries):
         if _entry is None:
             _merged_entries.append((_entry, _e_start, _e_end, _e_block))
             continue
-        _is_com = isinstance(_entry, dict) and _entry.get("is_commercial")
+        # WARNING: owner 2026-11-23: a lone short aired inside a break is part of the break and never a cell of its own.
+        _is_com = isinstance(_entry, dict) and (_entry.get("is_commercial") or _entry.get("in_break"))
         if _merged_entries:
             _p_entry, _p_start, _p_end, _p_block = _merged_entries[-1]
             _p_valid = _p_entry is not None
@@ -965,8 +967,27 @@ def _guide_hub_future_signature(ch_str, now_dt, hub=None):
         return None
 
 
+_guide_hub_future_unread = [False]
+
+
+def _guide_table_entries(ch_str, now_dt, view_start, view_end):
+    """The channel's cells from the guide's prepared table that touch the viewport (with the hour after it), as (entry, start, end, block) rows in seconds from today's midnight, the way the row is drawn; None when the channel's table is not built yet."""
+    now_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second + now_dt.microsecond / 1_000_000.0
+    midnight = now_dt.timestamp() - now_secs
+    cells = guide_table.cells_between(ch_str, midnight + view_start, midnight + view_end + 3600)
+    if cells is None:
+        return None
+    return [(entry, start - midnight, end - midnight, "") for start, end, entry in cells]
+
+
+def _ml_busy():
+    """The media library's marker for a read the screen thread could not make because the database was busy."""
+    import media_library as _ml
+    return _ml.LIBRARY_BUSY
+
+
 def _guide_hub_future_cells(ch_str, now_dt, view_start, view_end, hub=None):
-    """The hub's projected future rows that touch the viewport, as (entry, start, end, block) rows built from each row's saved guide facts, commercials included and in start order; a row without readable facts is left out so the guide's own future covers it, and an overlapping row is dropped."""
+    """The hub's projected future rows that touch the viewport, as (entry, start, end, block) rows built from each row's saved guide facts, commercials included and in start order; a row without readable facts is left out so the guide's own future covers it, and an overlapping row is dropped. None when the rows could not be read this time (the database was busy on the screen thread); the build that drew without them is then not kept."""
     # WARNING: only the guide's drawing is read from the hub; a failure must return no rows so the guide draws its own future as before.
     try:
         now_secs = now_dt.hour * 3600 + now_dt.minute * 60 + now_dt.second + now_dt.microsecond / 1_000_000.0
@@ -975,6 +996,9 @@ def _guide_hub_future_cells(ch_str, now_dt, view_start, view_end, hub=None):
             import media_library as _ml
             hub = _ml.shared_schedule_hub()
         found = hub.future_rows_between(ch_str, midnight + view_start, midnight + view_end + 3600)
+        if found is _ml_busy():
+            _guide_hub_future_unread[0] = True
+            return None
         out, last_end = [], None
         for row in found:
             facts = row.get("guide_entry")
@@ -1087,10 +1111,10 @@ def get_guide_num_cols(db):
 
 # WARNING: the fallback numbers below must match GUIDE_TOTAL_HALF_HOURS, GUIDE_PAST_HALF_HOURS in performance_governor.py; they are used only when that module fails to import.
 GUIDE_TOTAL_HALF_HOURS = performance_governor.GUIDE_TOTAL_HALF_HOURS if performance_governor is not None else 336
-GUIDE_PAST_HALF_HOURS = performance_governor.GUIDE_PAST_HALF_HOURS if performance_governor is not None else 48
+GUIDE_PAST_HALF_HOURS = performance_governor.GUIDE_PAST_HALF_HOURS if performance_governor is not None else 0
 
 def clamp_guide_time_idx(raw_idx, num_cols):
-    """Keeps the guide's first column between the previous midnight and the last visible half hour; the 7 visible days run from the previous midnight."""
+    """Keeps the guide's first column between today's midnight and the last visible half hour; the 7 visible days are today and the 6 days after it."""
     return max(-GUIDE_PAST_HALF_HOURS, min(raw_idx, GUIDE_TOTAL_HALF_HOURS - GUIDE_PAST_HALF_HOURS - num_cols))
 
 
@@ -2242,6 +2266,7 @@ def _compute_guide_cache_key(app_state, db, real_w, real_h, tx, ty, tw, th):
         repr(sorted((app_state.get("guide_channel_stamps") or {}).items())),
         _now.date(),
         _now_bucket,
+        guide_table.version(),
     )
 
 
@@ -2268,6 +2293,7 @@ def _build_and_cache_guide_frame(surface, app_state, db, theme, target_rect=None
 
                 return cache_key, cached["canvas"], cached["preview_bounds"]
 
+        _guide_hub_future_unread[0] = False
         _render_tv_guide_impl(surface, app_state, db, theme, target_rect=target_rect, present=False)
         design_canvas = _get_guide_canvas_43() if is_4_3 else _get_guide_canvas()
         canvas_copy = design_canvas.copy()
@@ -2275,7 +2301,8 @@ def _build_and_cache_guide_frame(surface, app_state, db, theme, target_rect=None
         clock_box = app_state.get("_guide_clock_box")
 
         with _guide_cache_lock:
-            _guide_frame_cache["key"] = cache_key
+            # WARNING: a frame drawn without the hub's future rows is shown but kept under no key, so the next build draws it again with them.
+            _guide_frame_cache["key"] = None if _guide_hub_future_unread[0] else cache_key
             _guide_frame_cache["canvas"] = canvas_copy
             _guide_frame_cache["preview_bounds"] = preview_bounds
             _guide_frame_cache["clock_box"] = clock_box
@@ -2864,6 +2891,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     interrupt_floor_seconds=interrupt_floor_seconds,
                     commercial_state=ch_info.get("playback_log", {}).get("commercial_pos"),
                     fade_in_tracks=_fade_in, fade_out_tracks=_fade_out,
+                    pair_shorts=_pair_thresh_min > 0,
                 )
                 return _tl, _tc, _new_sp
 
@@ -2915,27 +2943,32 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     )
                 )
             )
-            _tl_key = (ch_str, now_dt.year, now_dt.timetuple().tm_yday, viewport_start_seconds,
-                       app_state.get("guide_refresh_token", 0),
-                       (app_state.get("guide_channel_stamps") or {}).get(ch_str, 0),
-                       _guide_schedule_signature,
-                       tuple(ch_info.get(_opt) for _opt in ("scheduling_mode", "block_mode", "pair_threshold_minutes", "commercials_enabled",
-                                                            "commercial_placement", "active", "marathon_anchor_epoch")),
-                       _guide_hub_past_signature(ch_str, now_dt),
-                       _guide_hub_future_signature(ch_str, now_dt))
-            _tl_hit = _guide_timeline_cache.get(_tl_key)
-            if _tl_hit is not None:
-                _cached_sources_ok = True
-                for _cached_row in _tl_hit:
-                    _cached_entry = _cached_row[0] if isinstance(_cached_row, tuple) else _cached_row
-                    if (isinstance(_cached_entry, dict)
-                            and not _cached_entry.get("is_commercial")
-                            and _cached_entry.get("path")
-                            and not _guide_path_exists(_cached_entry["path"], app_state)):
-                        _cached_sources_ok = False
-                        break
-                if not _cached_sources_ok:
-                    _tl_hit = None
+            # WARNING: owner 2026-11-23: the guide reads its 7 days from the table the GuideTable thread prepares from the hub; it works a row out itself only for a channel whose table is not built yet (the first moments after boot).
+            _tl_key = None
+            _tl_hit = _guide_table_entries(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end)
+            _from_table = _tl_hit is not None
+            if _tl_hit is None:
+                _tl_key = (ch_str, now_dt.year, now_dt.timetuple().tm_yday, viewport_start_seconds,
+                           app_state.get("guide_refresh_token", 0),
+                           (app_state.get("guide_channel_stamps") or {}).get(ch_str, 0),
+                           _guide_schedule_signature,
+                           tuple(ch_info.get(_opt) for _opt in ("scheduling_mode", "block_mode", "pair_threshold_minutes", "commercials_enabled",
+                                                                "commercial_placement", "active", "marathon_anchor_epoch")),
+                           _guide_hub_past_signature(ch_str, now_dt),
+                           _guide_hub_future_signature(ch_str, now_dt))
+                _tl_hit = _guide_timeline_cache.get(_tl_key)
+                if _tl_hit is not None:
+                    _cached_sources_ok = True
+                    for _cached_row in _tl_hit:
+                        _cached_entry = _cached_row[0] if isinstance(_cached_row, tuple) else _cached_row
+                        if (isinstance(_cached_entry, dict)
+                                and not _cached_entry.get("is_commercial")
+                                and _cached_entry.get("path")
+                                and not _guide_path_exists(_cached_entry["path"], app_state)):
+                            _cached_sources_ok = False
+                            break
+                    if not _cached_sources_ok:
+                        _tl_hit = None
             # WARNING: the cached timeline must never be edited in place; the anchor and live-preview passes below rewrite entries and would move every later render of this row.
             timeline_entries = list(_tl_hit) if _tl_hit is not None else []
             _block_overflow_end = {}
@@ -2981,6 +3014,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             _content, _build_commercial_tracks(), _h_commercial_placement,
                             _h_day_seed + _seed_bump, interrupt_floor_seconds=_h_interrupt_floor,
                             commercial_state=_h_log.get("commercial_pos"),
+                            pair_shorts=int(ch_info.get("pair_threshold_minutes", 15) or 0) > 0,
                         )
                         return _tl, _tc, _new_sp
 
@@ -3020,6 +3054,7 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                     marathon_content, _build_commercial_tracks(), commercial_placement,
                     day_seed=0, interrupt_floor_seconds=_interrupt_floor,
                     commercial_state=ch_info.get("playback_log", {}).get("marathon_commercial_pos"),
+                    pair_shorts=_pair_thresh_min > 0,
                 ) if marathon_content else ([], 0, None)
                 if m_total > 0:
                     view_start_epoch = (now_dt.toordinal() * 86400
@@ -3217,12 +3252,13 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                       _day_start += _real_day_len
                       _day_num += 1
 
+            _future_unread = False
             if _tl_hit is None:
+                _future_cells = _guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end)
+                _future_unread = _future_cells is None
                 timeline_entries = _guide_splice_aired(
                     timeline_entries,
-                    _guide_aired_rows_in_view(
-                        _guide_hub_future_cells(ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end),
-                        viewport_adjusted_start, viewport_adjusted_end))
+                    _guide_aired_rows_in_view(_future_cells or [], viewport_adjusted_start, viewport_adjusted_end))
             if _tl_hit is None and not _is_holiday_guide:
                 timeline_entries = _guide_splice_aired(
                     timeline_entries,
@@ -3232,9 +3268,11 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
 
             if _tl_hit is None:
                 timeline_entries = _guide_merge_cells(timeline_entries)
-                if len(_guide_timeline_cache) > 80:
-                    _guide_timeline_cache.clear()
-                _guide_timeline_cache[_tl_key] = list(timeline_entries)
+                # WARNING: owner log 2026-11-23: a row drawn while the hub's future could not be read shows the guide's own future (OFF AIR past what it knows); it is drawn this once and never kept, so the next build reads the hub's rows.
+                if not _future_unread and _tl_key is not None:
+                    if len(_guide_timeline_cache) > 80:
+                        _guide_timeline_cache.clear()
+                    _guide_timeline_cache[_tl_key] = list(timeline_entries)
 
             _anchor = {} if ch_info.get("is_visualizer", False) else ch_info.get("playback_anchor", {})
             _ch_snaps_grid = bool(
@@ -3470,7 +3508,8 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                             ))
                             timeline_entries.sort(key=lambda _row: _row[1])
 
-            if not ch_info.get("is_visualizer", False):
+            # WARNING: a row from the guide's table already holds the hub's aired, airing and Static rows; only a row the guide worked out itself is filled from the hub.
+            if not _from_table and not ch_info.get("is_visualizer", False):
                 timeline_entries = _guide_fill_from_hub(timeline_entries, ch_str, now_dt, viewport_adjusted_start, viewport_adjusted_end, app_state)
 
             if not ch_info.get("is_visualizer", False):
@@ -3612,7 +3651,12 @@ def _render_tv_guide_impl(surface, app_state, db, theme, target_rect=None, prese
                                 if len(truncated_title) < len(cleaned_title) and max_chars > 3:
                                     truncated_title = truncated_title[:-1] + "."
                                 lbl_cell = font_row_lg.render(truncated_title, True, cell_txt_col)
-                                surface.blit(lbl_cell, (cell_x + 8, start_y + (row_height // 2 - lbl_cell.get_height() // 2)))
+                                # WARNING: owner test 2026-11-23: the character count guesses a small letter width; the Big Text letters are wider and ran into the next cell, so the title is cut until it fits its cell.
+                                while lbl_cell.get_width() > max_txt_w and len(truncated_title) > 1:
+                                    truncated_title = truncated_title[:-1]
+                                    lbl_cell = font_row_lg.render(truncated_title, True, cell_txt_col)
+                                if lbl_cell.get_width() <= max_txt_w:
+                                    surface.blit(lbl_cell, (cell_x + 8, start_y + (row_height // 2 - lbl_cell.get_height() // 2)))
                 
                 last_drawn_pixel_x = cell_x + pixel_cell_width
                 _last_show_end_abs = show_abs_end

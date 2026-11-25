@@ -25,7 +25,7 @@ import media as _media_listing
 
 from media import (SELECTION_BORDER_WIDTH, resolve_main_dir, is_optical_drive_root, get_disc_info, console_splash_file,
                     is_dvd_disc_source,
-                    generate_captions_via_asr_chunked, _asr_slot, resolve_caption_source)
+                    generate_captions_via_asr_chunked, _asr_slot, resolve_caption_source, live_captions_allowed)
 
 
 # ============================================================================
@@ -5752,8 +5752,9 @@ class ExternalGameDeck:
             self._dvd_captions_auto_pending = False
             return
 
+        # WARNING: owner 2026-11-24: a PC that cannot run live captions still uses a disc's own subtitles and caption files; only captioning from the audio is skipped.
         if (self._dvd_captions_asr_state == "idle"
-                and not self.dvd_is_disc_image and self.dvd_file_path):
+                and not self.dvd_is_disc_image and self.dvd_file_path and live_captions_allowed()):
             self._dvd_captions_asr_state = "running"
             self._start_dvd_captions_asr_job(self.dvd_file_path)
 
@@ -7066,7 +7067,9 @@ class ExternalGameDeck:
         key_h = _gov.GAME_LEGEND_KEY_H_PX
         gap   = _gov.GAME_LEGEND_ROW_GAP_PX
         section_gap = _gov.GAME_LEGEND_SECTION_GAP_PX
-        y_title = y + h - (f.get_height() + key_h + gap) - _gov.GAME_LEGEND_BOTTOM_PAD_PX
+        # WARNING: owner 2026-11-24: the inner screen border keeps the same gap on all four sides, so the legend sits inside it, GAME_LEGEND_BOTTOM_PAD_PX above its bottom line.
+        border, edge = self._screen_border_sizes(h)
+        y_title = y + h - edge - border - (f.get_height() + key_h + gap) - _gov.GAME_LEGEND_BOTTOM_PAD_PX
         y_keys  = y_title + f.get_height() + gap + key_h // 2
         tc = self.list_text_color
         title_col = tc
@@ -7101,11 +7104,13 @@ class ExternalGameDeck:
             try:
                 scaled_bg = _scale_to_canvas(bg_surf, w, h)
                 screen.blit(scaled_bg, (x, y))
+                # WARNING: owner 2026-11-23: a background picture still replaces the theme colour, and the border line is drawn over it too.
+                self._draw_screen_border(screen, rect)
             except Exception as _swallowed_error:
                 _log_swallowed("ExternalGameDeck.render: scaled_bg = _scale_to_canvas(bg_surf, w, h)", _swallowed_error)
-                screen.fill((0, 0, 0), rect)
+                self._draw_theme_backdrop(screen, rect)
         else:
-            screen.fill((0, 0, 0), rect)
+            self._draw_theme_backdrop(screen, rect)
 
         if self.mode == "GAME":
             if getattr(self, "emulator_loading", False):
@@ -7570,6 +7575,32 @@ class ExternalGameDeck:
             return None
         self._console_splash_surf_cache[console_key] = (path, surf)
         return surf
+
+    def _draw_theme_backdrop(self, screen, rect):
+        """Channel 03's screen with no background picture of its own: the menus' background colour (the theme's background hue) with the screen border over it."""
+        # WARNING: owner 2026-11-23: "we are changing the black to match background color and add a border around the edges of the screen matching border color".
+        import colorsys
+        x, y, w, h = rect
+        main_module = sys.modules.get("__main__")
+        config = main_module.db.config if main_module is not None and getattr(main_module, "db", None) else {}
+        r, g, b = colorsys.hsv_to_rgb(config.get("theme_bg_hue", 220) / 360.0, 0.6, 0.15)
+        screen.fill((int(r * 255), int(g * 255), int(b * 255)), rect)
+        self._draw_screen_border(screen, rect)
+
+    @staticmethod
+    def _screen_border_sizes(h):
+        """(line thickness, gap from the screen's edges) of channel 03's screen borders on a screen h pixels tall."""
+        k = h / 680.0
+        return max(2, int(round(_gov.CH03_BACKDROP_BORDER_PX * k))), max(4, int(round(_gov.CH03_BACKDROP_EDGE_GAP_PX * k)))
+
+    def _draw_screen_border(self, screen, rect):
+        """The two borders round channel 03's screen in the theme's border colour, over the theme colour or the background picture: one on the screen's edges, and one set in from the edges by the same gap on all four sides, so the background shows evenly between them; the control hints sit inside the inner one."""
+        # WARNING: owner 2026-11-23: "resort the outside border and keep the new one. i think double borders might look cool." The edge border must stay with the inner one.
+        # WARNING: owner 2026-11-24: "keep the same gap on the inner border all the way around. right now its got a huge gap on the bottom and the rest is skinny"; the inner border's bottom no longer stops above the control hints.
+        x, y, w, h = rect
+        border, edge = self._screen_border_sizes(h)
+        pygame.draw.rect(screen, self.ui_color, (x, y, w, h), border)
+        pygame.draw.rect(screen, self.ui_color, (x + edge, y + edge, w - 2 * edge, h - 2 * edge), border)
 
     def _get_menu_bg_surface(self):
         path = self.menu_bg_path

@@ -18,6 +18,7 @@ import drive_profile
 import file_profile
 import server_clock
 import server_files
+import station_clock
 
 log = logging.getLogger(__name__)
 
@@ -235,7 +236,13 @@ def read_program_scan_state(base_dir, now=None):
         return None
     if mode not in ("regular", "profile") or (time.time() if now is None else now) - at > PROGRAM_STATE_FRESH_S:
         return None
-    return {"mode": mode, "caught_up": caught_up}
+    # WARNING: owner 2026-11-24: the caption scan never hurts the program's playback; the program reports its throttle level, its performance mode and whether it is captioning live, and the scan reads them.
+    try:
+        level = int(data.get("level") or 0)
+    except (TypeError, ValueError):
+        level = 0
+    return {"mode": mode, "caught_up": caught_up, "level": level, "perf_mode": str(data.get("perf_mode") or ""),
+            "live_captions": bool(data.get("live_captions"))}
 
 
 def read_local_watching(base_dir, fresh_s=None, now=None):
@@ -442,6 +449,8 @@ class FactsScanner:
         self._stop = threading.Event()
         self._thread = None
         self._tries = {}
+        # True once a whole pass went through every scheduled file and none of them still lacked a fact it has tries left for: the media scan is done (the caption scan waits for it).
+        self.idle = False
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name="ServerFactsScan")
@@ -483,7 +492,7 @@ class FactsScanner:
         def _at(channel):
             try:
                 with server_clock._slot_scope(slot_id):
-                    row = hub.at(str(channel).zfill(2), time.time())
+                    row = hub.at(str(channel).zfill(2), station_clock.now_epoch())
             except Exception as exc:
                 log.warning("[SERVER SCAN] could not read the hub's show on channel %s of slot %s: %s", channel, slot_id, exc)
                 return ""
@@ -631,11 +640,18 @@ class FactsScanner:
         probe = self.probe_library_fn()
         done = 0
         started = time.monotonic()
+        whole_pass = True
+        needed_any = False
         for path, scan_class, watched in self.ordered_items(probe):
             if self._stop.is_set() or self._asked_to_stop():
+                whole_pass = False
                 break
             if time.monotonic() - started >= SERVER_SCAN_REORDER_S:
+                whole_pass = False
                 break
+            if not self._needs(probe, path):
+                continue
+            needed_any = True
             # WARNING: owner 2026-11-14: a file airing now (or on a channel a User watches) is never held back by load; the rest wait while the whole PC is busy.
             if not (watched or scan_class == 0):
                 self._wait_while_busy()
@@ -646,6 +662,7 @@ class FactsScanner:
             if not watched and self._streaming():
                 pause *= SERVER_SCAN_STREAMING_PAUSE_FACTOR
             self._stop.wait(pause)
+        self.idle = whole_pass and not needed_any
         return done
 
     def _asked_to_stop(self):
