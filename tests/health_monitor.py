@@ -29,6 +29,19 @@ except Exception as _psutil_import_error:
     _psutil = None
     log.warning("[HEALTH] psutil is not available, the CPU and memory lines are left out: %s", _psutil_import_error)
 
+
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+
+
+def _log_swallowed(where, error):
+    """The [FAILURE] line through performance_governor, or a plain warning when it did not load."""
+    if _governor is not None:
+        return _governor.log_swallowed(where, error)
+    log.warning("[FAILURE] %s: %s", where, error)
+
+
 # ============================================================================
 # SECTION: Settings
 # ============================================================================
@@ -40,8 +53,7 @@ _REPORT_S = _governor.HEALTH_REPORT_SECONDS if _governor is not None else 60.0
 _RING_S = _governor.HEALTH_RING_SECONDS if _governor is not None else 15.0
 _EXPLAIN_GAP_MS = _governor.HEALTH_EXPLAIN_GAP_MS if _governor is not None else 100
 _EXPLAIN_MAX_PER_MINUTE = _governor.HEALTH_EXPLAIN_MAX_PER_MINUTE if _governor is not None else 20
-# VALUES CHANGE HERE (health monitor: the same thread stuck again within this many seconds of its last full report is only counted)
-_STUCK_REPEAT_S = 600.0
+_STUCK_REPEAT_S = _governor.HEALTH_STUCK_REPEAT_SECONDS if _governor is not None else 600.0
 _STUCK_S = _governor.HEALTH_STUCK_SECONDS if _governor is not None else 10.0
 _SCREEN_STUCK_S = _governor.HEALTH_SCREEN_STUCK_SECONDS if _governor is not None else 3.0
 _JOB_WAIT_WARN_S = _governor.HEALTH_JOB_WAIT_WARN_SECONDS if _governor is not None else 120.0
@@ -54,23 +66,36 @@ _VITALS_TIMEOUT_S = _governor.HEALTH_VITALS_QUERY_TIMEOUT_SECONDS if _governor i
 _VITALS_RETRY_S = _governor.HEALTH_VITALS_RETRY_SECONDS if _governor is not None else 600.0
 _VITALS_TOP_PROGRAMS = _governor.HEALTH_VITALS_TOP_PROGRAMS if _governor is not None else 3
 _SHUTDOWN_EVENTS_READ = _governor.HEALTH_SHUTDOWN_EVENTS_READ if _governor is not None else 6
+_HOT_CELSIUS = _governor.HEALTH_HOT_CELSIUS if _governor is not None else 85.0
+_CPU_SLOWED_PERCENT = _governor.HEALTH_CPU_SLOWED_PERCENT if _governor is not None else 70.0
+_BUSY_PROGRAM_MIN_PERCENT = _governor.HEALTH_BUSY_PROGRAM_MIN_PERCENT if _governor is not None else 3.0
 _NEVER_STUCK = tuple(_governor.HEALTH_NEVER_STUCK_THREADS) if _governor is not None else (
-    "OsKeyHookPump", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep", "_drive_probe_worker", "PathExistsProbe")
+    "OsKeyHookPump", "ScanCapacity", "OsKeyHookWatchdog", "retro-tv-listener", "_readerthread", "_monitor", "VlcLogWriter", "SettingsWriter", "HealthMonitor", "HealthReport", "NextItemPrep", "_drive_probe_worker", "PathExistsProbe")
 _JOB_STARTS = tuple(_governor.HEALTH_JOB_THREAD_STARTS) if _governor is not None else (
     "content-activate", "vlc-open", "vlc-stop", "pre-show-picbox", "first-scan-picbox", "prime-", "HubRowSync",
     "NewChannelFirstShow", "_probe_and_patch_durations", "compressor-bake")
 
+# WARNING: a stall is named by the innermost frame in one of these scripts; a script left out here is passed over and the stall is put on whoever called it. TestHelpersFolderAudit checks that every script of the program is listed.
 _APP_MODULES = frozenset((
-    "retro_tv_emulator", "__main__", "media", "media_library", "ui", "menu_nav", "guide_table", "game_deck", "libretro_core", "visualizers",
-    "performance_governor", "broadcast_clock", "audio_analysis", "health_monitor", "d3d11_gpu_frame", "d3d11_gpu_gate",
-    "d3d11_gpu_reference", "server_discovery", "server_sync", "server_service", "auto_updater", "update_helper"))
+    "retro_tv_emulator", "__main__", "performance_governor", "broadcast_clock", "audio_analysis", "game_deck", "libretro_core", "ui",
+    "visualizers", "station_clock", "schedule_planner", "cache_manager",
+    "d3d11_gpu_core", "d3d11_gpu_frame", "d3d11_gpu_gate", "d3d11_gpu_reference",
+    "media", "media_library", "menu_nav", "guide_table", "saved_captions",
+    "loudness_pipeline", "music_pipeline", "scan_capacity", "scan_pipeline", "share_relay",
+    "drive_profile", "file_profile",
+    "server_boot_cache", "server_captions", "server_checkin", "server_clock", "server_diagnostics", "server_discovery", "server_files",
+    "server_planner", "server_remote_files", "server_scanner", "server_service", "server_sync", "server_tray",
+    "auto_updater", "update_helper", "build_info",
+    "health_monitor", "log_manager", "send_logs_finisher"))
 _WAIT_FILES = frozenset(("threading", "queue", "selectors", "subprocess", "socket", "socketserver", "ssl", "asyncio"))
 _WAIT_NAMES = frozenset(("sleep", "wait", "join", "get", "acquire", "accept", "recv", "recv_into", "recvfrom", "send", "sendall", "select", "readline",
                          "communicate", "tick", "wait_for", "GetMessageW", "GetMessage", "WaitForSingleObject", "WaitForMultipleObjects"))
 
+
 # ============================================================================
 # SECTION: Thread names and code places
 # ============================================================================
+
 
 _GROUP_TARGET = re.compile(r"^Thread-\d+ \((?P<target>[^)]*)\)$")
 _GROUP_NUMBER = re.compile(r"[-_]?\d+$")
@@ -158,9 +183,11 @@ def _stack_text(frame, limit=25):
     """A thread's stack as text, innermost call last."""
     return "".join(traceback.format_stack(frame, limit=limit)).rstrip()
 
+
 # ============================================================================
 # SECTION: Watched locks
 # ============================================================================
+
 
 _LOCK_TYPES = (type(threading.Lock()), type(threading.RLock()))
 _watched_locks = []
@@ -298,9 +325,11 @@ def watch_lock_attr(owner, attr, name):
     _watched_locks.append(wrapped)
     return True
 
+
 # ============================================================================
 # SECTION: Timed jobs and notes
 # ============================================================================
+
 
 _main_ident = threading.main_thread().ident
 # WARNING: every thread counts its jobs in its own table, so a count never waits for a lock; one shared lock here was taken hundreds of thousands of times a minute and on a 4-core PC the scans spent most of their time waiting for it.
@@ -394,9 +423,11 @@ def time_functions(namespace, names, prefix=""):
         count += 1
     return count
 
+
 # ============================================================================
 # SECTION: Watched values and containers
 # ============================================================================
+
 
 _values = []
 _containers = []
@@ -423,23 +454,28 @@ def _read(name, read):
             log.warning("[HEALTH] could not read %s for the report (left out from now on): %s", name, error)
         return None
 
+
 # ============================================================================
 # SECTION: Garbage collection timing
 # ============================================================================
+
 
 _gc_started = [None]
 _gc_events = collections.deque(maxlen=200)
 
 
+_gc_interval = [0, 0.0, 0.0, None]
+
+
 def _snapshot(items):
     """A list copy of a deque that another thread may be changing at the same moment, tried a few times; an empty list when it never settles."""
+    # WARNING: a deque changed during the copy raises RuntimeError; that is the other thread's normal work, so the copy is only tried again.
     for _attempt in range(5):
         try:
             return list(items)
         except RuntimeError:
             continue
     return []
-_gc_interval = [0, 0.0, 0.0, None]
 
 
 def _gc_callback(phase, info):
@@ -456,6 +492,7 @@ def _gc_callback(phase, info):
     if took > _gc_interval[2]:
         _gc_interval[2] = took
         _gc_interval[3] = info.get("generation")
+
 
 # ============================================================================
 # SECTION: The monitor
@@ -495,6 +532,8 @@ class _Monitor:
         self.sensor_retry_at = 0.0
         self.sensor_note_made = False
         self.gpu_tool = shutil.which("nvidia-smi")
+        self.hottest = 0.0
+        self.cpu_load_primed = False
 
     def refresh_names(self):
         threads = threading.enumerate()
@@ -763,7 +802,7 @@ class _Monitor:
         for cpu in data.get("cpu") or []:
             clock = cpu.get("PercentofMaximumFrequency")
             if clock is not None:
-                parts.append("CPU clock %s%% of its maximum%s" % (clock, " (SLOWED DOWN)" if float(clock) < 70.0 else ""))
+                parts.append("CPU clock %s%% of its maximum%s" % (clock, " (SLOWED DOWN)" if float(clock) < _CPU_SLOWED_PERCENT else ""))
         self.hottest = hottest
         return parts
 
@@ -777,10 +816,10 @@ class _Monitor:
         if len(fields) < 5:
             return ""
         try:
-            if float(fields[1]) >= 85.0:
-                self.hottest = max(getattr(self, "hottest", 0.0), float(fields[1]))
-        except ValueError:
-            pass
+            if float(fields[1]) >= _HOT_CELSIUS:
+                self.hottest = max(self.hottest, float(fields[1]))
+        except ValueError as error:
+            _log_swallowed("health_monitor: reading the graphics card temperature", error)
         return "graphics card %s %s C, %s%% busy, %s MHz, %s W" % (fields[0], fields[1], fields[2], fields[3], fields[4])
 
     def busiest_programs(self, span):
@@ -801,7 +840,7 @@ class _Monitor:
         merged = collections.Counter()
         for percent, name in rows:
             merged[name] += percent
-        return ", ".join("%s %.0f%%" % (n, v) for n, v in merged.most_common(_VITALS_TOP_PROGRAMS) if v >= 3.0)
+        return ", ".join("%s %.0f%%" % (n, v) for n, v in merged.most_common(_VITALS_TOP_PROGRAMS) if v >= _BUSY_PROGRAM_MIN_PERCENT)
 
     def report_vitals(self, span):
         """One [HEALTH VITALS] line a minute: the PC's CPU load, clock and temperatures, graphics card, memory, free disk and the busiest other programs; the log is then written through to the disk so the last minutes survive a power cut."""
@@ -815,11 +854,11 @@ class _Monitor:
             swap = _psutil.swap_memory()
             # WARNING: owner 2026-11-15: the average of ALL cores (100% = every core full) since the previous vitals line; the per-program figures below are percent of ONE core. psutil's first call has no earlier call to measure from, so the first line leaves it out.
             _load = _psutil.cpu_percent(interval=None)
-            if getattr(self, "_cpu_load_primed", False):
+            if self.cpu_load_primed:
                 parts.append("PC load %.0f%% of all cores over the last minute" % _load)
-            self._cpu_load_primed = True
+            self.cpu_load_primed = True
             parts.append("memory %.0f%% used, %.1f GB free, page file %.0f%% used" % (memory.percent, memory.available / 1073741824.0, swap.percent))
-            parts.append("busiest other programs: %s" % (self.busiest_programs(span) or "none above 3%"))
+            parts.append("busiest other programs: %s" % (self.busiest_programs(span) or "none above %.0f%%" % _BUSY_PROGRAM_MIN_PERCENT))
             root = os.path.abspath(os.sep) if os.name != "nt" else os.path.splitdrive(os.path.abspath(sys.argv[0]))[0] + "\\"
             disk = _psutil.disk_usage(root)
             parts.append("app drive %.0f%% free" % (100.0 - disk.percent))
@@ -840,7 +879,7 @@ class _Monitor:
             except Exception as error:
                 self.sensor_retry_at = time.monotonic() + _VITALS_RETRY_S
                 log.warning("[HEALTH] reading the temperature and clock failed (asked again in %.0f s): %s", _VITALS_RETRY_S, error)
-        hot = self.hottest >= 85.0
+        hot = self.hottest >= _HOT_CELSIUS
         log.log(logging.WARNING if hot else logging.INFO, "[HEALTH VITALS]%s %s", " HOT:" if hot else "", "; ".join(parts))
         sync_logs()
 
@@ -943,9 +982,11 @@ class _Monitor:
             if failed:
                 time.sleep(1.0)
 
+
 # ============================================================================
 # SECTION: Written through to the disk, and Windows' own shutdown record
 # ============================================================================
+
 
 def sync_logs():
     """Forces every log file to the disk, so the last lines survive a power cut or a freeze."""
@@ -956,12 +997,7 @@ def sync_logs():
             if stream is not None and hasattr(stream, "fileno"):
                 os.fsync(stream.fileno())
         except Exception as error:
-            _sync_failures.append(error)
-            if len(_sync_failures) == 1:
-                log.warning("[HEALTH] writing the log through to the disk failed (not repeated): %s", error)
-
-
-_sync_failures = []
+            _log_swallowed("health_monitor: writing the log through to the disk", error)
 
 
 def log_previous_shutdown_events():
@@ -994,6 +1030,7 @@ def log_previous_shutdown_events():
 # ============================================================================
 # SECTION: Public calls
 # ============================================================================
+
 
 _monitor = None
 

@@ -38,6 +38,7 @@ for _std_name in ("stdout", "stderr"):
         try:
             setattr(sys, _std_name, open(os.devnull, "w", encoding="utf-8"))
         except OSError:
+            # WARNING: the normal end: no console window and no null device either; output is dropped, which is all a windowless build can do.
             pass
 
 # WARNING: the health monitor is imported near the main loop; this name must exist from the start, because VLC's picture callback and the exit path can run before that import and would fail on a missing name.
@@ -205,6 +206,7 @@ def _set_app_folder_icon(root, main_dir):
                     have = _fh.read()
                 break
             except (UnicodeError, LookupError):
+                # WARNING: the normal end: not this text encoding; the next one is tried.
                 continue
         _named = _folder_icon_ini_icon(have)
         _ours = bool(have) and (FOLDER_ICON_INI_MARK in have or os.path.normcase(os.path.basename(_named)) == os.path.normcase(FOLDER_ICON_PARTS[-1]))
@@ -254,6 +256,7 @@ def _early_crash_path():
         os.makedirs(_dir, exist_ok=True)
         return os.path.join(_dir, "crash_log.txt")
     except Exception:
+        # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
         return None
 
 
@@ -265,10 +268,12 @@ def _early_crash_hook(exc_type, exc_value, exc_tb):
                 stream.write("\\n=== EARLY BOOT CRASH ===\\n")
                 traceback.print_exception(exc_type, exc_value, exc_tb, file=stream)
     except Exception:
+        # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
         pass
     try:
         traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
     except Exception:
+        # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
         pass
 
 
@@ -285,25 +290,39 @@ if getattr(sys, "frozen", False):
     _here = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
 else:
     _here = os.path.dirname(os.path.abspath(__file__))
-for _subfolder in ("server", "updater", "assets", "tests", "GPU", "pipeline", "profile", "media"):
-    sys.path.insert(0, os.path.join(_here, _subfolder))
+# WARNING: owner 2026-11-25: "move assets, GPU, media, pipeline, profile, server, and updater folders into a folder called scripts. so i just have to add scripts instead of all those folders"; the scripts folder is searched first, then the old places, so a build or install from before the move still starts.
+SCRIPT_FOLDERS = ("server", "updater", "assets", "GPU", "pipeline", "profile", "media")
+# WARNING: owner 2026-11-26: "i dont want those doubled up in the project"; only tests and the scripts folders are searched, so a copy left in an old folder can never be the one imported.
+sys.path.insert(0, os.path.join(_here, "tests"))
+for _subfolder in SCRIPT_FOLDERS:
+    sys.path.insert(0, os.path.join(_here, "scripts", _subfolder))
 
-# WARNING: scripts now live in pipeline, profile and media; an older copy left in assets or tests would be found second, so it is removed when the new copy is beside it.
-_MOVED_SCRIPTS = {"pipeline": ("share_relay", "scan_capacity", "scan_pipeline", "loudness_pipeline", "music_pipeline"),
-                  "profile": ("drive_profile", "file_profile"), "media": ("media", "media_library", "menu_nav")}
-if not getattr(sys, "frozen", False):
-    for _new_folder, _names in _MOVED_SCRIPTS.items():
-        for _name in _names:
-            if not os.path.isfile(os.path.join(_here, _new_folder, _name + ".py")):
-                continue
-            for _old_folder in ("assets", "tests", ""):
-                _old_copy = os.path.join(_here, _old_folder, _name + ".py")
-                try:
-                    if os.path.isfile(_old_copy):
-                        os.remove(_old_copy)
-                        print(f"[BOOT] removed the older copy {_old_copy}; {_name}.py now lives in {_new_folder}")
-                except OSError as _old_copy_error:
-                    print(f"[BOOT] could not remove the older copy {_old_copy}: {_old_copy_error}")
+# WARNING: owner 2026-11-26: "updates should have deleted the old folders and it did not"; at every start the old folders the scripts move left (their scripts, __pycache__, the old helper exe, then the emptied folder) are removed from this copy, installed or source, by the same function the update helper runs after a swap, because the helper that installs a build is the one from the build before.
+_BOOT_MOVED_FOLDERS_REMOVED, _BOOT_MOVED_FOLDERS_KEPT = [], []
+_BOOT_CLEAN_START_REMOVED, _BOOT_CLEAN_START_BUSY = [], []
+try:
+    import update_helper as _update_helper_for_cleanup
+    # WARNING: owner 2026-11-26: a one-time step: once no old folder is left it is written as done in main/data and never runs again on this copy.
+    # WARNING: owner 2026-11-26 (V2.2.8): the saved folders and files are moved into main/data here, before anything opens them; moving them on first use left loudness and the channel files behind.
+    _data_moved, _data_kept = _update_helper_for_cleanup.move_saved_data_now(_app_root_dir(), _here)
+    _moved_state, _BOOT_MOVED_FOLDERS_REMOVED, _BOOT_MOVED_FOLDERS_KEPT = _update_helper_for_cleanup.remove_moved_folders_once(_here)
+    _BOOT_MOVED_FOLDERS_REMOVED = ["moved into main/data: " + _p for _p in _data_moved] + _BOOT_MOVED_FOLDERS_REMOVED
+    _BOOT_MOVED_FOLDERS_KEPT = ["not moved into main/data: " + _p for _p in _data_kept] + _BOOT_MOVED_FOLDERS_KEPT
+    # WARNING: owner 2026-11-26: "clean start for how that version is working"; the first start of a new version empties the logs folder of the logs, crash logs and temp files written before it (saved files kept). A source copy with no build version is left alone.
+    try:
+        import build_info as _build_info_for_cleanup
+        _clean_version = getattr(_build_info_for_cleanup, "BUILD_VERSION", "") or ""
+    except Exception as _build_info_error:
+        _clean_version = ""
+        _BOOT_CLEAN_START_BUSY = ["the build version could not be read (%s), so the logs were not cleared" % _build_info_error]
+    if _clean_version:
+        _BOOT_CLEAN_START_REMOVED, _BOOT_CLEAN_START_BUSY = _update_helper_for_cleanup.clean_start_for_version(_app_root_dir(), _clean_version)
+except Exception as _moved_folders_error:
+    _BOOT_MOVED_FOLDERS_KEPT = ["%s (the clean-up could not run: %s)" % (_here, _moved_folders_error)]
+for _moved_path in _BOOT_MOVED_FOLDERS_REMOVED:
+    print(f"[BOOT] removed the old copy left by the scripts move: {_moved_path}")
+for _moved_path in _BOOT_MOVED_FOLDERS_KEPT:
+    print(f"[BOOT] kept after the scripts move: {_moved_path}")
 
 import server_discovery
 import server_files
@@ -315,6 +334,8 @@ import server_service
 import send_logs_finisher
 import auto_updater
 import log_manager
+# WARNING: owner 2026-11-26: every cache, memo, log and temp file is kept in check by the cache manager.
+import cache_manager
 
 
 # ============================================================================
@@ -469,12 +490,14 @@ def _clear_stale_logs_on_fresh_boot():
         try:
             os.replace(os.path.join(_dir, _name), os.path.join(_dir, _prev_name))
         except FileNotFoundError:
+            # WARNING: the normal end: there was no earlier log of that name to keep.
             pass
         except Exception as e:
             try:
                 sys.stderr.write(
                     f"[BOOT] could not rotate {_name} to {_prev_name}: {e}\n")
             except Exception:
+                # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
                 pass
 
 _clear_stale_logs_on_fresh_boot()
@@ -499,6 +522,7 @@ def _enable_native_crash_stack():
         try:
             sys.stderr.write(f"[BOOT] native crash stack could not start: {_native_stack_err}\n")
         except Exception:
+            # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
             pass
 
 
@@ -550,6 +574,8 @@ if performance_governor is not None:
     performance_governor.set_shell_mode("--as-shell" in sys.argv)
 # WARNING: the 400 fallback must match MENU_NAV_REPEAT_DELAY_MS in performance_governor.py; it is used only when that module fails to import.
 _MENU_NAV_REPEAT_DELAY_MS = performance_governor.MENU_NAV_REPEAT_DELAY_MS if performance_governor is not None else 400
+# WARNING: the fallback number below must match GUIDE_HOLD_FRAME_GAP_MS in performance_governor.py; it is used only when that module fails to import.
+GUIDE_HOLD_FRAME_GAP_MS = performance_governor.GUIDE_HOLD_FRAME_GAP_MS if performance_governor is not None else 250
 # WARNING: the 400 fallback must match CHANNEL_SURF_HESITATE_MS in performance_governor.py; it is used only when that module fails to import.
 _CHANNEL_SURF_HESITATE_MS = performance_governor.CHANNEL_SURF_HESITATE_MS if performance_governor is not None else 400
 # WARNING: the 5000 fallback must match SCHEDULE_MODE_COMMIT_HOLD_MS in performance_governor.py; it is used only when that module fails to import.
@@ -607,12 +633,14 @@ def _write_crash_log(exc_type, exc_value, exc_tb):
         try:
             log.warning("_write_crash_log: could not write crash_log.txt: %s", e)
         except Exception:
+            # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
             pass
     try:
         import traceback as _tb
         _formatted = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
         log.critical("=== CRASH ===\n%s", _formatted)
     except Exception:
+        # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
         pass
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
@@ -626,11 +654,13 @@ def _write_crash_log_main_thread(exc_type, exc_value, exc_tb):
             # WARNING: once the replacement is started this process must end here; returning lets the built exe show its error window and keep running, which holds the single-instance lock, so the replacement gives up and quits as a duplicate. Without a replacement (crash-loop guard or a failed start) it returns, so the error window shows why the app stopped.
             _hard_exit_process(1)
     except NameError:
+        # WARNING: the normal end: the crash came before the relaunch code was set up, so there is nothing to relaunch.
         pass
     except Exception as _relaunch_err:
         try:
             log.warning("_write_crash_log_main_thread: relaunch attempt failed: %s", _relaunch_err)
         except Exception:
+            # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
             pass
 
 sys.excepthook = _write_crash_log_main_thread
@@ -687,9 +717,19 @@ except Exception as _log_setup_e:
                           f"will not be written this session: {_log_setup_e}\n")
         sys.stderr.flush()
     except Exception:
+        # WARNING: the normal end: a crash writer itself; with this failing there is nowhere left to write (R24 lets crash writers stay quiet).
         pass
 
 log = logging.getLogger(__name__)
+# WARNING: owner 2026-11-26: the boot clean-up of the old folders ran before logging; its lines are written here so the log shows what was removed and what was kept.
+for _moved_path in _BOOT_MOVED_FOLDERS_REMOVED:
+    log.info("[BOOT] removed the old copy left by the scripts move: %s", _moved_path)
+for _moved_path in _BOOT_MOVED_FOLDERS_KEPT:
+    log.info("[BOOT] kept after the scripts move: %s", _moved_path)
+if _BOOT_CLEAN_START_REMOVED:
+    log.info("[BOOT] clean start for this version: removed %d old log, crash and temp item(s) from the logs folder", len(_BOOT_CLEAN_START_REMOVED))
+for _busy_line in _BOOT_CLEAN_START_BUSY:
+    log.info("[BOOT] kept in the logs folder: %s", _busy_line)
 log.info("=== App start %s ===", broadcast_clock.now().replace(tzinfo=None).isoformat())
 for _moved_line in _ROOT_MOVED_INTO_LOGS:
     log.info("[LOGS FOLDER] %s", _moved_line)
@@ -817,6 +857,7 @@ def _log_boot_environment_fingerprint():
 _log_boot_environment_fingerprint()
 
 _SINGLE_INSTANCE_HANDLE = None
+PROGRAM_PID_FILENAME = ".retro_tv_program.pid"
 
 
 # ============================================================================
@@ -833,9 +874,13 @@ _FRESH_START_LOGS_FILES = ("playback_runtime.json", "playback_runtime.json.tmp",
                            os.path.join("controllers", "emulator_config.json.bak"), os.path.join("controllers", "emulator_config.json.tmp"),
                            "drive_profiles.json", "scan_capacity.json", "share_result.txt", "share_result.txt.detail",
                            "share_folders.ps1", "upkeep_result.txt")
-_FRESH_START_MAIN_FILES = (os.path.join("media_library", "library.sqlite3"), os.path.join("media_library", "library.sqlite3-wal"),
-                           os.path.join("media_library", "library.sqlite3-shm"), os.path.join("media_library", "library.sqlite3-journal"))
-_FRESH_START_MAIN_FOLDERS = ("loudness", "captions", "visualizer_analysis")
+# WARNING: owner 2026-11-26: the saved data lives in main/data; the old places in main stay on the lists so a reset also clears a copy not moved yet.
+_FRESH_START_MAIN_FILES = tuple(os.path.join(_place, "media_library", _name)
+                                for _place in ("data", "")
+                                for _name in ("library.sqlite3", "library.sqlite3-wal", "library.sqlite3-shm", "library.sqlite3-journal")) + tuple(
+                                os.path.join("data", _name) for _name in ("playback_runtime.json", "playback_runtime.json.tmp", "drive_profiles.json", "scan_capacity.json"))
+_FRESH_START_MAIN_FOLDERS = tuple(os.path.join(_place, _name) for _place in ("data", "") for _name in ("loudness", "captions", "visualizer_analysis"))
+_FRESH_START_MAIN_DATA_FOLDERS = (os.path.join("data", ".json"),)
 # WARNING: owner 2026-11-12: the server and profile channel files (both places the program has kept them) are saved data like the settings; a reset or a first boot with no settings deletes them too, so an old install's schedules never come back.
 _FRESH_START_ROOT_FOLDERS = (os.path.join("_internal", "server", ".json"), os.path.join("server", ".json"))
 
@@ -903,6 +948,8 @@ def _wipe_saved_data_for_fresh_start(root_dir, logs_dir, main_dir, config_missin
     for name in _FRESH_START_MAIN_FILES:
         _fresh_start_remove(os.path.join(main_dir, name), removed, failed)
     for name in _FRESH_START_MAIN_FOLDERS:
+        _fresh_start_remove(os.path.join(main_dir, name), removed, failed)
+    for name in _FRESH_START_MAIN_DATA_FOLDERS:
         _fresh_start_remove(os.path.join(main_dir, name), removed, failed)
     roms_dir = os.path.join(main_dir, "roms")
     try:
@@ -983,6 +1030,12 @@ if __name__ == "__main__":
         log.info("[FRESH START] deleted %d saved file(s) and folder(s); the user's own files were not touched", len(_fresh_start_result[0]))
         for _fresh_line in _fresh_start_result[1]:
             log.warning("[FRESH START] %s", _fresh_line)
+    # WARNING: owner 2026-11-25: an update from the server tray failed with the program open ("another program still has it open"); the update helper reads this file to close the program first and start it again after the install.
+    try:
+        with open(os.path.join(_app_logs_dir(), PROGRAM_PID_FILENAME), "w", encoding="ascii") as _pid_fh:
+            _pid_fh.write(str(os.getpid()))
+    except OSError as _pid_error:
+        log.warning("[SINGLE INSTANCE] the program's process number could not be written for the update helper: %s", _pid_error)
 
 
 # ============================================================================
@@ -1034,6 +1087,7 @@ def _clear_run_marker():
     try:
         os.remove(_run_marker_path())
     except FileNotFoundError:
+        # WARNING: the normal end: the marker was already gone.
         pass
     except Exception as _swallowed_error:
         _log_swallowed("_clear_run_marker: os.remove(_run_marker_path())", _swallowed_error)
@@ -1054,6 +1108,7 @@ def _tester_report_tail_lines(path, max_bytes):
             _f.seek(max(0, _size - max_bytes))
             _data = _f.read()
     except FileNotFoundError:
+        # WARNING: the normal end: that log has not been written yet.
         return None
     _lines = _data.decode("utf-8", errors="replace").splitlines()
     if _size > max_bytes and _lines:
@@ -1315,7 +1370,6 @@ def _logged_print(*args, **kwargs):
 
 _builtins.print = _logged_print
 
-_throttled_log_last_ts = {}
 # WARNING: the fallback numbers below must match THROTTLED_LOG_INTERVAL_S in performance_governor.py; they are used only when that module fails to import.
 _THROTTLED_LOG_INTERVAL_S = performance_governor.THROTTLED_LOG_INTERVAL_S if performance_governor is not None else 30.0
 
@@ -1340,21 +1394,17 @@ def _time_critical_thread():
     return threading.current_thread() is threading.main_thread()
 
 
-def _on_playback_thread():
-    """True on the playback thread."""
-    return threading.current_thread() is _playback_thread["thread"]
-
-
 def playback_busy():
     """True while a channel change or playback step waits for or runs on the playback thread."""
     return _playback_queue["tune"] is not None or bool(_playback_queue["jobs"]) or _playback_queue["running"] is not None
 
 
 def _log_warn_throttled(_key, msg, *args, **_kwargs):
-    _now = time.monotonic()
-    if _now - _throttled_log_last_ts.get(_key, -1e9) >= _THROTTLED_LOG_INTERVAL_S:
-        _throttled_log_last_ts[_key] = _now
+    """A warning at most once per _THROTTLED_LOG_INTERVAL_S per _key, through performance_governor's one shared copy (every time when it did not import)."""
+    if performance_governor is None:
         log.warning(msg, *args)
+        return
+    performance_governor.log_throttled(log, _key, _THROTTLED_LOG_INTERVAL_S, msg, *args)
 
 
 def _log_probe_failure(_key, _err, msg, *args):
@@ -1366,10 +1416,11 @@ def _log_probe_failure(_key, _err, msg, *args):
 
 
 def _log_info_throttled(_key, msg, *args, **_kwargs):
-    _now = time.monotonic()
-    if _now - _throttled_log_last_ts.get(_key, -1e9) >= _THROTTLED_LOG_INTERVAL_S:
-        _throttled_log_last_ts[_key] = _now
+    """An info line at most once per _THROTTLED_LOG_INTERVAL_S per _key, through performance_governor's one shared copy (every time when it did not import)."""
+    if performance_governor is None:
         log.info(msg, *args)
+        return
+    performance_governor.log_throttled(log, _key, _THROTTLED_LOG_INTERVAL_S, msg, *args, level=logging.INFO)
 
 
 # ============================================================================
@@ -1489,8 +1540,8 @@ def _bootstrap_libvlc():
                                             break
                                         _bytes += len(_chunk)
                                 _count += 1
-                            except OSError:
-                                pass
+                            except OSError as caught_error:
+                                _log_swallowed("send logs: sizing a log file for the list", caught_error)
                 except Exception as _ra_err:
                     _log(f"[VLC] plugin read-ahead stopped: {_ra_err}")
                 _log("[VLC] plugin files read ahead: %d file(s), %.0f MB in %.1f s" % (_count, _bytes / 1048576.0, time.perf_counter() - _t0))
@@ -1933,7 +1984,7 @@ _KIOSK_PIN_TARGETS = ("kiosk_pin_new", "kiosk_pin_confirm", "kiosk_pin_off")
 _KIOSK_PIN_LENGTH = int(performance_governor.KIOSK_PIN_LENGTH if performance_governor is not None else 4)
 _LONG_IDLE_POPUP_TARGETS = ("app_update", "user_choice_clear", "server_reset", "send_logs") + _KIOSK_PIN_TARGETS
 # WARNING: the fallback numbers below must match the SEND_LOGS_* values in performance_governor.py; they are used only when that module fails to import.
-_SEND_LOGS_WEBHOOK_URL = performance_governor.SEND_LOGS_WEBHOOK_URL if performance_governor is not None else "https://discord.com/api/webhooks/1570101167835455601/QNzkevIeJ82sJA5LqtcE6SNHa6gIzc54WrR32-skg4eGuNKGtsxtOZYPcgf6DWeu2Tg5"
+_SEND_LOGS_WEBHOOK_URL = performance_governor.SEND_LOGS_WEBHOOK_URL if performance_governor is not None else "https://discord.com/api/webhooks/1575209056040259675/Bku0BysVpzKK7GtD-QeJBYM47wMhX8x6Y1KI1X_bw5vG48RWoHMtwOuTfKSKs9lkLuTh"
 _SEND_LOGS_MAX_ZIP_BYTES = int(performance_governor.SEND_LOGS_MAX_ZIP_BYTES if performance_governor is not None else 9000000)
 _SEND_LOGS_FILE_TAIL_BYTES = int(performance_governor.SEND_LOGS_FILE_TAIL_BYTES if performance_governor is not None else 3000000)
 _SEND_LOGS_FILE_TAIL_BYTES_LEAST = int(performance_governor.SEND_LOGS_FILE_TAIL_BYTES_LEAST if performance_governor is not None else 60000)
@@ -2968,9 +3019,9 @@ def _load_full_tv_border_surface(win_w=None, win_h=None):
     return _load_bezel_surface_from_path(path)
 
 
-_tv_border_cutout_cache = {}
-_tv_border_led_window_cache = {}
-_tv_border_led_tilt_cache = {}
+_tv_border_cutout_cache = cache_manager.small_memo("TV border cutouts")
+_tv_border_led_window_cache = cache_manager.small_memo("TV border LED windows")
+_tv_border_led_tilt_cache = cache_manager.small_memo("TV border LED tilts")
 _TV_BORDER_DEFAULT_CUTOUT = (0.0, 0.0, 1.0, 1.0)
 
 # WARNING: the fallback numbers must match BEZEL_HOLE_* in performance_governor.py; they are used only when that module fails to import.
@@ -3052,6 +3103,8 @@ CAPTION_PRECACHE_BETWEEN_CHEAP_CHECKS_SECONDS = performance_governor.CAPTION_PRE
 SCHEDULER_REPEAT_GUARD_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_SECONDS if performance_governor is not None else 60
 SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS = performance_governor.SCHEDULER_REPEAT_GUARD_WINDOW_SECONDS if performance_governor is not None else 900
 SLOT_TAIL_HOLD_MAX_SECONDS = performance_governor.SLOT_TAIL_HOLD_MAX_SECONDS if performance_governor is not None else 3.0
+# WARNING: the fallback number below must match SLOT_TAIL_HOLD_REARMS_MAX in performance_governor.py; it is used only when that module fails to import.
+SLOT_TAIL_HOLD_REARMS_MAX = performance_governor.SLOT_TAIL_HOLD_REARMS_MAX if performance_governor is not None else 3
 # WARNING: the fallback number below must match SCHEDULER_CYCLE_END_STEP_SECONDS in performance_governor.py; it is used only when that module fails to import.
 SCHEDULER_CYCLE_END_STEP_SECONDS = performance_governor.SCHEDULER_CYCLE_END_STEP_SECONDS if performance_governor is not None else 0.05
 BLOCK_ROTATION_CACHE_MAX_BLOCKS = performance_governor.BLOCK_ROTATION_CACHE_MAX_BLOCKS if performance_governor is not None else 12
@@ -4053,6 +4106,7 @@ def _file_identity_key(path):
         try:
             _cache.pop(next(iter(_cache)))
         except (RuntimeError, StopIteration, KeyError):
+            # WARNING: the normal end: another thread trimmed the cache first.
             pass
     return _key
 
@@ -4475,9 +4529,7 @@ def _picture_adjust_live_tick():
         _apply_picture_adjust_to_engine(engine, adjust)
 
 
-_replay_scaled_cache = {}
-
-
+_replay_scaled_cache = cache_manager.small_memo("scaled replay pictures", 8)
 def _blit_video_with_screen_mode(screen, surf, rect, mode=None, analysis_surf=None, geom_out=None, pixel_aspect=1.0,
                                   timing_out=None, fit_aspect=None, reuse_key=None):
     """Scale `surf` into `rect` per the active Screen Mode and blit it, handling letterbox bars and cropping; with reuse_key, the same picture drawn again at the same size reuses its scaled copy."""
@@ -6072,7 +6124,8 @@ def _same_file_bytes(a, b):
             return False
         with open(a, "rb") as fa, open(b, "rb") as fb:
             return fa.read() == fb.read()
-    except OSError:
+    except OSError as caught_error:
+        _log_swallowed("comparing two files byte by byte", caught_error)
         return False
 
 
@@ -6324,6 +6377,7 @@ def _read_registry_text(path, name):
             value, _kind = winreg.QueryValueEx(key, name)
         return str(value)
     except FileNotFoundError:
+        # WARNING: the normal end: the value is not in the registry.
         return None
     except Exception as e:
         log.warning("[STARTUP] Could not read registry value %s\\%s: %s", path, name, e)
@@ -6350,8 +6404,10 @@ def _set_start_on_boot(enabled):
                     try:
                         winreg.DeleteValue(legacy_key, _LEGACY_STARTUP_REG_NAME)
                     except FileNotFoundError:
+                        # WARNING: the normal end: there was no old startup value to remove.
                         pass
             except FileNotFoundError:
+                # WARNING: the normal end: there was no old startup key.
                 pass
 
         if _shell_is_ours:
@@ -6494,7 +6550,7 @@ def _resolve_main_loop_tick_fps(game_deck_ref):
         _log_swallowed("_resolve_main_loop_tick_fps: _menu_cap = performance_governor.menu_fps() if performance_governor is not None else 0.0", _swallowed_error)
     return _UI_COMPOSITOR_FPS
 
-_rt_font_cache = {}
+_rt_font_cache = cache_manager.small_memo("fonts (program)", 64)
 def _cached_sys_font(name, size, bold=False):
     k = (name, size, bold)
     if k not in _rt_font_cache:
@@ -7061,8 +7117,12 @@ _tv_caption_prefetch = {"path": None, "session": None, "channel": None}
 _TV_CAPTION_RETRY_SECONDS = performance_governor.TV_CAPTION_RETRY_SECONDS if performance_governor is not None else 8.0
 
 
-# WARNING: the fallback numbers below must match CAPTION_MIN_SHOW_MS, CAPTION_ROW_MARK, CAPTION_NEW_SPEAKER_MARK and CAPTION_NEW_SPEAKER_GAP_MS in performance_governor.py; they are used only when that module fails to import.
-_CAPTION_MIN_SHOW_MS = performance_governor.CAPTION_MIN_SHOW_MS if performance_governor is not None else 1200
+# WARNING: the fallback numbers below must match CAPTION_MIN_SHOW_MS, CAPTION_SHARE_MIN_MS, CAPTION_ROW_MARK, CAPTION_NEW_SPEAKER_MARK and CAPTION_NEW_SPEAKER_GAP_MS in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_MIN_SHOW_MS = performance_governor.CAPTION_MIN_SHOW_MS if performance_governor is not None else 1330
+_CAPTION_SHARE_MIN_MS = performance_governor.CAPTION_SHARE_MIN_MS if performance_governor is not None else 1330
+# WARNING: the fallback numbers below must match CAPTION_TALK_OVER_MS and CAPTION_BLOCK_MAX_CHARS in performance_governor.py; they are used only when that module fails to import.
+_CAPTION_TALK_OVER_MS = performance_governor.CAPTION_TALK_OVER_MS if performance_governor is not None else 300
+_CAPTION_BLOCK_MAX_CHARS = performance_governor.CAPTION_BLOCK_MAX_CHARS if performance_governor is not None else 84
 _CAPTION_ROW_MARK = performance_governor.CAPTION_ROW_MARK if performance_governor is not None else "- "
 _CAPTION_NEW_SPEAKER_MARK = performance_governor.CAPTION_NEW_SPEAKER_MARK if performance_governor is not None else ">> "
 _CAPTION_NEW_SPEAKER_GAP_MS = performance_governor.CAPTION_NEW_SPEAKER_GAP_MS if performance_governor is not None else 1500
@@ -7216,6 +7276,14 @@ def _caption_clock_estimate(clock_ms, unchanged_ms, playing):
     return clock_ms + min(unchanged_ms, _CAPTION_CLOCK_INTERPOLATE_MAX_MS)
 
 
+def _caption_clock_forward_only(now_ms, followed_ms):
+    """The position the captions follow never steps back by the guess added in _caption_clock_estimate: when VLC's clock comes back below the position already followed (the picture had stalled, not just its clock), the captions hold there until the clock catches up; a step back of more than _CAPTION_CLOCK_INTERPOLATE_MAX_MS is a seek and is followed."""
+    # WARNING: owner 2026-11-24 ("captions keeps flashing a second row of text to quick to read"): with VLC's clock stalled up to 902 ms on that log, the guess ran ahead, the next cue came up beside the one on screen, and the clock stepping back took it off again until the clock reached it a second time.
+    if followed_ms is None or now_ms >= followed_ms or followed_ms - now_ms > _CAPTION_CLOCK_INTERPOLATE_MAX_MS:
+        return now_ms
+    return followed_ms
+
+
 def _caption_player_is_playing(vlc):
     """True while the TV player is playing (not paused, stopped or opening)."""
     try:
@@ -7238,11 +7306,12 @@ def _caption_same_words(a, b):
     return len(wa & wb) / float(min(len(wa), len(wb))) >= _CAPTION_SAME_SPEECH_FRAC
 
 
-def _caption_update_items(items, cues, now_ms, min_show_ms=None):
-    """Owner 2026-11-16, the one rule for what is on screen. A cue is shown when the clock reaches its start time stamp and cleared when its end time stamp passes, but never before it has been up min_show_ms when nothing else needs its place. A cue that starts while another is still on (inside its end, or inside its minimum time) or at the same time shares the screen: two rows, the earlier on top. More than two at once keeps the two that started last. Returns the new list of items, each {key, start, end, text, shown_at}; a clock that moved back (a seek) drops what was shown after it."""
+def _caption_update_items(items, cues, now_ms, min_show_ms=None, share_min_ms=None):
+    """Owner 2026-11-16, the one rule for what is on screen. A cue is shown when the clock reaches its start time stamp and cleared when its end time stamp passes, but never before it has been up min_show_ms when nothing else needs its place. A cue that starts while another is still on (inside its end, or inside its minimum time) or at the same time shares the screen: two rows, the earlier on top; a caption that would leave within share_min_ms of the new one starting leaves at once instead, so two rows never flash up for a moment (owner 2026-11-24). More than two at once keeps the two that started last. Returns the new list of items, each {key, start, end, text, shown_at}; a clock that moved back (a seek) drops what was shown after it."""
     min_show_ms = _CAPTION_MIN_SHOW_MS if min_show_ms is None else min_show_ms
+    share_min_ms = _CAPTION_SHARE_MIN_MS if share_min_ms is None else share_min_ms
     kept = [it for it in items if now_ms >= it["shown_at"] - 1 and now_ms < max(it["end"], it["shown_at"] + min_show_ms)]
-    have = {it["key"] for it in kept}
+    have = {it["key"] for it in kept} | {k for it in kept for k in it.get("joined", ())}
     prev_end = None
     for start_ms, end_ms, text in cues:
         if start_ms > now_ms:
@@ -7254,8 +7323,27 @@ def _caption_update_items(items, cues, now_ms, min_show_ms=None):
         key = (start_ms, text)
         if key in have:
             continue
+        # WARNING: a cue that started before one already on screen has been replaced by it; showing it again would bring back the caption that just gave up its place.
+        if any(it["start"] > start_ms for it in kept):
+            continue
         if any(_caption_same_words(text, it["text"]) and start_ms < it["end"] and it["start"] < end_ms for it in kept):
             continue
+        # WARNING: owner 2026-11-25: "second lines popping up and disappearing quickly"; a caption that follows the one on screen (not two people talking at once) never shares the screen with it: it joins it as one block while the old one has been up less than min_show_ms and both fit, otherwise it takes its place.
+        talk_over = [it for it in kept if start_ms <= it["end"] - _CAPTION_TALK_OVER_MS]
+        follows = [it for it in kept if it not in talk_over]
+        joined = False
+        for it in follows:
+            if (not joined and now_ms - it["shown_at"] < min_show_ms and it is follows[-1]
+                    and len(it["text"]) + 1 + len(text) <= _CAPTION_BLOCK_MAX_CHARS):
+                it["text"] = it["text"] + " " + text
+                it["end"] = max(it["end"], end_ms)
+                it.setdefault("joined", []).append(key)
+                joined = True
+        if joined:
+            have.add(key)
+            kept = talk_over + [follows[-1]]
+            continue
+        kept = [it for it in talk_over if max(it["end"], it["shown_at"] + min_show_ms) - now_ms >= share_min_ms]
         have.add(key)
         kept.append({"key": key, "start": start_ms, "end": end_ms, "text": text, "shown_at": now_ms,
                      "new_speaker": gap_ms is not None and gap_ms >= _CAPTION_NEW_SPEAKER_GAP_MS})
@@ -7690,7 +7778,7 @@ def _caption_band_top(screen_h, width=1):
     return _watermark_badge_bottom(pygame.Rect(0, 0, max(1, int(width)), int(screen_h)), whole_screen=True)
 
 
-_caption_clock_seen = {"ms": None, "at": 0, "pass": 0}
+_caption_clock_seen = {"ms": None, "at": 0, "pass": 0, "followed": None}
 
 
 def _caption_cue_arrival_text(start_ms):
@@ -7762,6 +7850,7 @@ def _draw_caption_overlay(screen, content_rect=None):
             _caption_clock_seen["at"] = now_ticks
         if _caption_clock_seen.get("file") != path:
             _caption_clock_seen["file"] = path
+            _caption_clock_seen["followed"] = None
             try:
                 log.info("[CAPTION SYNC CLOCK] %s: VLC audio delay %d us, play rate %.2f, picture clock %.1fs, captions trail it by %d ms",
                          os.path.basename(str(path)), int(vlc.player.audio_get_delay() or 0), float(vlc.player.get_rate() or 0.0), now_ms / 1000.0, _caption_clock_lag_ms())
@@ -7773,6 +7862,8 @@ def _draw_caption_overlay(screen, content_rect=None):
         now_ms = _caption_clock_estimate(now_ms, now_ticks - _caption_clock_seen["at"], _caption_player_is_playing(vlc))
         # WARNING: owner 2026-11-16: the captions follow the clock exactly (CAPTION_CLOCK_LAG_MS is 0); the config key "caption_clock_lag_ms" can still delay them on one PC whose sound reaches the speaker late.
         now_ms -= _caption_clock_lag_ms()
+        now_ms = _caption_clock_forward_only(now_ms, _caption_clock_seen["followed"])
+        _caption_clock_seen["followed"] = now_ms
 
         # WARNING: owner 2026-11-16: what is on screen follows the cues' own start and end time stamps against the clock (see _caption_update_items); nothing else decides when a caption comes or goes.
         if _caption_screen["path"] != path:
@@ -7974,7 +8065,11 @@ _station_dead_since = {}
 _last_vlc_play_exception = {}
 
 
+# WARNING: owner 2026-11-25: "im seeing no error banner for the fall back static so i have no idea why its doing it"; a streamed channel whose server rows hold nothing shows its own reason, not the silent Static of a channel with no media.
+SERVER_SCHEDULE_GAP_REASON = "server_schedule_gap"
+
 STATIC_FALLBACK_BANNER_PREFIX = {
+    SERVER_SCHEDULE_GAP_REASON: "SERVER SCHEDULE GAP",
     "missing_media":        "MEDIA NOT FOUND",
     "channel_config_missing": "CHANNEL CONFIG ERROR",
     "timeline_build_failed": "SCHEDULE BUILD FAILED",
@@ -7993,20 +8088,10 @@ _SCANNING_BANNER_DELAY_S = performance_governor.FIRST_FILE_SCANNING_BANNER_DELAY
 _STATIC_BANNER_DELAY_S = {"first_file_scanning": _SCANNING_BANNER_DELAY_S,
                           "visualizer_scanning": _SCANNING_BANNER_DELAY_S}
 
-# WARNING: the fallback must match STATIC_TO_GREY_MS in performance_governor.py; used only when that module fails to import.
-_STATIC_TO_GREY_S = performance_governor.STATIC_TO_GREY_MS / 1000.0 if performance_governor is not None else 2.0
-_static_visual_seen = {}
-
-
-def _static_visual_is_grey(key):
-    """True once a channel has stayed on Static for _STATIC_TO_GREY_S: the snow gives way to the grey screen, which holds while the channel still cannot play. A gap of over 1.5 s between calls restarts the clock."""
-    now = time.monotonic()
-    record = _static_visual_seen.get(key)
-    if record is None or now - record[1] > 1.5:
-        record = [now, now]
-        _static_visual_seen[key] = record
-    record[1] = now
-    return now - record[0] >= _STATIC_TO_GREY_S
+# WARNING: the fallback must match FIRST_MEDIA_STATIC_MS in performance_governor.py; used only when that module fails to import.
+FIRST_MEDIA_STATIC_MS = performance_governor.FIRST_MEDIA_STATIC_MS if performance_governor is not None else 2000
+# WARNING: owner 2026-11-25: a channel that fell to Static stays on Static until its picture, the viewer's return to it included; these are the channels on that fault Static.
+_channels_on_fault_static = set()
 
 
 def _draw_schedule_pending(screen, rect, target_aspect=None):
@@ -8018,23 +8103,12 @@ def _draw_schedule_pending(screen, rect, target_aspect=None):
 
 
 def _draw_static_channel(screen, rect, key, target_aspect=None, reason=None):
-    """Draws a channel that is on Static, the one look the station and the guide preview share: snow, then the grey screen once it has stayed on Static for _STATIC_TO_GREY_S; the Static noise keeps playing under both. A channel with nothing scheduled (or switched off) keeps its snow for good: Static is its fallback until media is added. A channel whose new media is still being scanned keeps its snow until its picture."""
-    # WARNING: the grey step is for a channel that cannot play YET; a channel with no media never will, so it must not go grey (owner 2026-11-04: static stays until media is added).
-    # WARNING: owner 2026-11-21: a channel whose new media is still being scanned falls from the black wait to Static and stays on Static until its picture, never going grey.
+    """Draws a channel that is on Static, the one look the station and the guide preview share: the snow, with its noise, for as long as the channel is on Static."""
+    # WARNING: owner 2026-11-25: "it stays static until a video is ready again to avoid jumping back and forth to grey screen, static, grey screen static"; "no static noise ever plays on the black screen. static sound always plays when static is up"; there is no grey step after the snow.
     if reason == SCHEDULE_PENDING_REASON:
         _draw_schedule_pending(screen, rect, target_aspect=target_aspect)
         return
-    if reason in SILENT_STATIC_REASONS or reason in _PROFILE_LOADING_REASONS:
-        _render_transition_static(screen, rect, target_aspect=target_aspect)
-        return
-    if _static_visual_is_grey(key):
-        _static_sound_play()
-        fit_rect = _aspect_fit_rect(rect, target_aspect=target_aspect)
-        if fit_rect.width < rect.width or fit_rect.height < rect.height:
-            screen.fill(_video_bar_color(), rect)
-        screen.fill(COLOR_TRANSITION_GREY, fit_rect)
-    else:
-        _render_transition_static(screen, rect, target_aspect=target_aspect)
+    _render_transition_static(screen, rect, target_aspect=target_aspect)
 
 
 def _static_banner_delay_s(key, reason):
@@ -8050,9 +8124,7 @@ def _static_banner_ready(key, reason):
     return _banner_phase((key, reason), _static_banner_delay_s(key, reason)) != "wait"
 
 
-_banner_phase_seen = {}
-
-
+_banner_phase_seen = cache_manager.small_memo("banner phases")
 def _banner_phase(key, wait_s, show_s=None):
     """The one clock every Static banner follows: "wait" (black or grey, silent) for wait_s after the channel came on screen, then "show" for show_s seconds (None = until it leaves), then "gone" while the viewer stays on the channel; leaving the channel for over 1.5 s and coming back starts it again."""
     # WARNING: owner 2026-11-16: the guide preview showed the red banner the moment the viewer arrived; the order everywhere is black wait, then Static, then the banner, and a banner that has had its time stays gone until the viewer leaves and returns.
@@ -8177,6 +8249,11 @@ def _confirm_playback_started(ch_key, attempt_id, file_path, seek_offset, slot_s
     app_state["_live_playback_channel"] = ch_key
     if performance_governor is not None:
         performance_governor.release_tune_hold()
+    # WARNING: owner 2026-11-26: "when a show goes off and a new one goes one, that old cache is deleted"; the file that just left the screen has its cache freed (never the data the cache was built from).
+    _screen_file_changed(file_path)
+    # WARNING: owner logs 2026-11-25 (send_logs68): each item that starts on the channel on screen wakes the commercial cache, so a break that began before its commercials were in memory has the rest of them and the show after it read at once.
+    if str(ch_key).zfill(2) == str(app_state.get("current_channel", "")).zfill(2):
+        _prime_snap_wake.set()
     _clear_channel_playback_failure(ch_key)
     if extra_state:
         app_state.update(extra_state)
@@ -8484,6 +8561,10 @@ SERVER_OFFLINE_BANNER_PICTURE_GRACE_MS = performance_governor.SERVER_OFFLINE_BAN
 # WARNING: the fallback numbers below must match PLAYBACK_STALL_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
 PLAYBACK_STALL_TIMEOUT_MS = performance_governor.PLAYBACK_STALL_TIMEOUT_MS if performance_governor is not None else 10000
 
+# WARNING: the fallback numbers below must match PICTURE_STOPPED_RETUNE_MS and PICTURE_STOPPED_CONFIRM_MS in performance_governor.py; they are used only when that module fails to import.
+PICTURE_STOPPED_RETUNE_MS = performance_governor.PICTURE_STOPPED_RETUNE_MS if performance_governor is not None else 4000
+PICTURE_STOPPED_CONFIRM_MS = performance_governor.PICTURE_STOPPED_CONFIRM_MS if performance_governor is not None else 1500
+
 # WARNING: the fallback numbers below must match PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS in performance_governor.py; they are used only when that module fails to import.
 PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS = performance_governor.PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS if performance_governor is not None else 20000
 
@@ -8495,6 +8576,9 @@ SERVER_CATCHUP_RECOVERY_MS = performance_governor.SERVER_CATCHUP_RECOVERY_MS if 
 
 def _stall_limits_ms(now_ticks, had_first_frame, ch_key=None):
     """(recovery, Static) milliseconds without a new picture; the usual values, except the longer ones for a picture that has played, while a User catches up after the server changed what it shares, and a first load's Static time, which is the server side's or Regular mode's own (_first_load_static_ms)."""
+    if had_first_frame and app_state.get("_vlc_pictures_stopped_ticks"):
+        # WARNING: owner logs 2026-11-25 (send_logs61): ch06's picture stopped while VLC played on with the sound; the re-tune that cured it came only after 10 s of Static. A picture VLC stopped showing is re-tuned sooner.
+        return min(PICTURE_STOPPED_RETUNE_MS, PLAYBACK_STALL_TIMEOUT_MS), STALL_FORCES_STATIC_MS
     if had_first_frame and now_ticks < app_state.get("_server_catchup_until", 0):
         return SERVER_CATCHUP_RECOVERY_MS, SERVER_CATCHUP_STATIC_MS
     if had_first_frame:
@@ -8502,8 +8586,8 @@ def _stall_limits_ms(now_ticks, had_first_frame, ch_key=None):
     return PLAYBACK_INITIAL_BUFFER_TIMEOUT_MS, _first_load_static_ms(ch_key)
 
 
-# WARNING: the 7000 fallback must match STALL_FORCES_STATIC_MS in performance_governor.py; it is used only when that module fails to import.
-STALL_FORCES_STATIC_MS = performance_governor.STALL_FORCES_STATIC_MS if performance_governor is not None else 7000
+# WARNING: the 2000 fallback must match STALL_FORCES_STATIC_MS in performance_governor.py; it is used only when that module fails to import.
+STALL_FORCES_STATIC_MS = performance_governor.STALL_FORCES_STATIC_MS if performance_governor is not None else 2000
 # WARNING: the 10000 fallback must match STALL_FORCES_STATIC_FIRST_LOAD_MS in performance_governor.py; it is used only when that module fails to import.
 STALL_FORCES_STATIC_FIRST_LOAD_MS = performance_governor.STALL_FORCES_STATIC_FIRST_LOAD_MS if performance_governor is not None else 10000
 # WARNING: the 7000 fallback must match REGULAR_FIRST_LOAD_STATIC_MS in performance_governor.py; it is used only when that module fails to import.
@@ -8525,16 +8609,23 @@ def _server_rules_apply(ch_key=None):
 def _first_load_static_ms(ch_key=None):
     """Milliseconds a channel's first load may go without a picture before Static and its banner: STALL_FORCES_STATIC_FIRST_LOAD_MS on the server side, REGULAR_FIRST_LOAD_STATIC_MS in Regular mode."""
     return STALL_FORCES_STATIC_FIRST_LOAD_MS if _server_rules_apply(ch_key) else REGULAR_FIRST_LOAD_STATIC_MS
-# WARNING: the 2000 fallback must match STALL_GREY_AFTER_MS in performance_governor.py; it is used only when that module fails to import.
-STALL_GREY_AFTER_MS = performance_governor.STALL_GREY_AFTER_MS if performance_governor is not None else 2000
 
 # WARNING: the fallback numbers below must match AUDIO_SYNC_HOLD_MS in performance_governor.py; they are used only when that module fails to import.
 AUDIO_SYNC_HOLD_MS = performance_governor.AUDIO_SYNC_HOLD_MS if performance_governor is not None else 500
 # WARNING: the fallback number below must match SAME_CHANNEL_AUDIO_HOLD_MS in performance_governor.py; it is used only when that module fails to import.
 SAME_CHANNEL_AUDIO_HOLD_MS = performance_governor.SAME_CHANNEL_AUDIO_HOLD_MS if performance_governor is not None else 0
 
-# WARNING: the fallback numbers below must match END_PROXIMITY_MS in performance_governor.py; they are used only when that module fails to import.
+# WARNING: the fallback numbers below must match END_PROXIMITY_MS and CLOCK_SWITCH_FINISH_GRACE_MS in performance_governor.py; they are used only when that module fails to import.
 _END_PROXIMITY_MS = performance_governor.END_PROXIMITY_MS if performance_governor is not None else 2000
+_CLOCK_SWITCH_FINISH_GRACE_MS = performance_governor.CLOCK_SWITCH_FINISH_GRACE_MS if performance_governor is not None else 1500
+
+
+def _clock_switch_lets_file_finish(pos_ms, length_ms, grace_ms=None):
+    """True when the file on screen is this close to its own end (at most grace_ms left) as the clock moves to the next item, so it plays to its end instead of being cut; unknown position or length never counts."""
+    grace_ms = _CLOCK_SWITCH_FINISH_GRACE_MS if grace_ms is None else grace_ms
+    if pos_ms is None or length_ms is None or pos_ms < 0 or length_ms <= 0:
+        return False
+    return 0 < length_ms - pos_ms <= grace_ms
 
 # WARNING: the fallback numbers below must match WEDGED_STOP_TIMEOUT_SECONDS in performance_governor.py; they are used only when that module fails to import.
 WEDGED_STOP_TIMEOUT_S = performance_governor.WEDGED_STOP_TIMEOUT_SECONDS if performance_governor is not None else 5
@@ -8561,6 +8652,14 @@ _START_TIME_POLL_MS = performance_governor.START_TIME_POLL_MS if performance_gov
 
 # WARNING: the fallback numbers below must match START_TIME_ACCEPT_MS in performance_governor.py; they are used only when that module fails to import.
 _START_TIME_ACCEPT_MS = performance_governor.START_TIME_ACCEPT_MS if performance_governor is not None else 10000
+# WARNING: the fallback values below must match START_TIME_ACCEPT_INDEXED_MS and START_TIME_INDEXED_EXTENSIONS in performance_governor.py; they are used only when that module fails to import.
+_START_TIME_ACCEPT_INDEXED_MS = performance_governor.START_TIME_ACCEPT_INDEXED_MS if performance_governor is not None else 1500
+_START_TIME_INDEXED_EXTENSIONS = performance_governor.START_TIME_INDEXED_EXTENSIONS if performance_governor is not None else (".mp4", ".m4v", ".mov", ".mkv", ".webm")
+
+
+def _start_time_accept_ms(filepath):
+    """How far from the start asked for an open may land and be left there: START_TIME_ACCEPT_INDEXED_MS for a file with an index (MP4, MKV, MOV), which a seek places exactly; START_TIME_ACCEPT_MS for the rest (an .avi lands on its key frame and a seek only goes back to the same one)."""
+    return _START_TIME_ACCEPT_INDEXED_MS if str(filepath or "").lower().endswith(tuple(_START_TIME_INDEXED_EXTENSIONS)) else _START_TIME_ACCEPT_MS
 
 SEEK_AT_OPEN = True
 
@@ -8750,11 +8849,13 @@ def _get_visualizer_track_analyzer():
     """The one shared visualizer song analyzer, created on first use."""
     global _visualizer_track_analyzer
     if _visualizer_track_analyzer is None:
-        from assets import audio_analysis
+        # WARNING: owner 2026-11-26: audio_analysis lives in scripts/assets, which is on the import path; the old 'from assets import' only worked while an old assets folder was left beside the program.
+        import audio_analysis
         with _visualizer_track_analyzer_lock:
             if _visualizer_track_analyzer is None:
+                # WARNING: owner 2026-11-26: the analysis cache lives in main/data/visualizer_analysis with the other scan results.
                 _visualizer_track_analyzer = audio_analysis.TrackAnalyzer(
-                    media._resolve_ffmpeg_path, resolve_main_dir, log=log)
+                    media._resolve_ffmpeg_path, media.visualizer_cache_root, log=log)
     return _visualizer_track_analyzer
 
 
@@ -8821,7 +8922,8 @@ def _visualizer_reactive_frame(track_file):
         mixer_ms = pygame.mixer.music.get_pos()
         if mixer_ms < 0 or not pygame.mixer.music.get_busy():
             return None
-        from assets import audio_analysis
+        # WARNING: owner 2026-11-26: audio_analysis lives in scripts/assets, which is on the import path; the old 'from assets import' only worked while an old assets folder was left beside the program.
+        import audio_analysis
         analysis = _get_visualizer_track_analyzer().get(app_state["_vis_react_track"])
         position = app_state.get("_vis_react_seek", 0.0) + mixer_ms / 1000.0
         reactive = audio_analysis.reactive_frame(
@@ -9270,7 +9372,7 @@ app_state["shell_takeover_active"] = "--as-shell" in sys.argv
 # ============================================================================
 
 
-_server_time_state = {"samples": collections.deque(maxlen=max(1, int(SERVER_CLOCK_SAMPLES))), "target": None, "applied": None}
+_server_time_state = {"samples": collections.deque(maxlen=max(1, int(SERVER_CLOCK_SAMPLES))), "target": None, "applied": None, "server": None}
 _server_time_lock = threading.Lock()
 # WARNING: owner 2026-11-24: each warning shows once per link to the server; a new link (a restart, a reconnect) shows it again while the clocks still disagree.
 _server_clock_warned = {"clock": False, "zone": False}
@@ -9317,21 +9419,58 @@ def _server_time_reset():
     broadcast_clock.set_server_skew(None)
 
 
+def _server_time_restore_saved(server_key):
+    """As the link to a server is made, before anything of it airs: this computer airs on the gap to that server's clock it saved last time, so the first ping only fine-tunes it and the clock never jumps in the middle of a show."""
+    with _server_time_lock:
+        _server_time_state["server"] = server_key
+    try:
+        _saved = (db.config.get("server_clock_skews") or {}).get(server_key) if db is not None else None
+    except Exception as _swallowed_error:
+        _log_swallowed("_server_time_restore_saved: reading the saved gap", _swallowed_error)
+        _saved = None
+    if _saved is None:
+        return
+    with _server_time_lock:
+        _server_time_state["applied"] = float(_saved)
+    broadcast_clock.set_server_skew(float(_saved))
+    log.info("[SERVER TIME] airing on the gap to %s's clock saved last time: %+.2f s from this computer's", server_key, float(_saved))
+
+
+def _server_time_save(applied):
+    """Saves the gap to the linked server's clock, so the next start airs on it from its first second."""
+    try:
+        _key = _server_time_state.get("server")
+        if not _key or db is None:
+            return
+        _known = db.config.setdefault("server_clock_skews", {})
+        if _known.get(_key) is None or abs(float(_known[_key]) - float(applied)) >= 0.5:
+            _known[_key] = round(float(applied), 2)
+            db.save_settings_async()
+    except Exception as _swallowed_error:
+        _log_swallowed("_server_time_save", _swallowed_error)
+
+
 def _on_server_time(server_epoch, arrived_epoch):
-    """A ping from the server carried its own time: the gap to this computer's clock is kept (the middle of the last SERVER_CLOCK_SAMPLES), and the first one is applied at once, as the link is made."""
+    """A ping from the server carried its own time: the gap to this computer's clock is kept (the middle of the last SERVER_CLOCK_SAMPLES). The first one is applied at once only while no show of the server's is on screen; with one playing the clock stays where it is and the gap is taken up at the next channel change or commercial break, like any later drift."""
+    # WARNING: owner logs 2026-11-25 (send_logs65): the first ping moved the clock back 55 s in the middle of a show; the end of Pokémon 2 aired again and Rock A Doodle started over ("its a tv station. it should never repeat anything").
     with _server_time_lock:
         _server_time_state["samples"].append(float(server_epoch) - float(arrived_epoch))
         _ordered = sorted(_server_time_state["samples"])
         _server_time_state["target"] = _ordered[len(_ordered) // 2]
         _first = _server_time_state["applied"] is None
+        _playing = bool(app_state.get("is_playing_video", False))
         if _first:
-            _server_time_state["applied"] = _server_time_state["target"]
+            _server_time_state["applied"] = 0.0 if _playing else _server_time_state["target"]
         _target_now = _server_time_state["target"]
     if len(_server_time_state["samples"]) >= int(SERVER_CLOCK_SAMPLES):
         _warn_if_clock_differs_from_server(skew_s=_target_now)
+        _server_time_save(_target_now)
     if _first:
         broadcast_clock.set_server_skew(_server_time_state["applied"])
-        log.info("[SERVER TIME] linked to the server's clock: it is %+.2f s from this computer's", _server_time_state["applied"])
+        if _playing and abs(_target_now) >= SERVER_CLOCK_DRIFT_TOLERANCE_S:
+            log.info("[SERVER TIME] linked to the server's clock: it is %+.2f s from this computer's; a show is on screen, so the clock keeps going and the gap is taken up at the next channel change or commercial break", _target_now)
+        else:
+            log.info("[SERVER TIME] linked to the server's clock: it is %+.2f s from this computer's", _server_time_state["applied"])
 
 
 def _server_time_pending():
@@ -9642,16 +9781,52 @@ def _warm_other_server_channels_pass():
 
 _prime_wake = threading.Event()
 _prime_snap_wake = threading.Event()
-_prime_renewed = {}
-_primed_dims = {}
-_primed_picture_box = {}
+_prime_renewed = cache_manager.show_memo("primed files renewed")
+_primed_dims = cache_manager.show_memo("primed picture sizes")
+_primed_picture_box = cache_manager.show_memo("primed picture boxes")
 # WARNING: the fallback number below must match PRIMED_FACTS_LIMIT in performance_governor.py; it is used only when that module fails to import.
 _PRIMED_FACTS_LIMIT = performance_governor.PRIMED_FACTS_LIMIT if performance_governor is not None else 600
 
 
 def _prime_should_wait(path=None):
-    """True while the streamed show on screen is short of its buffer and path is another file (owner 2026-11-23); otherwise priming is channel changing's own work, so a tune, a scan pause, a strained PC or a game never holds it back (owner 2026-11-15, 2026-11-24)."""
-    return bool(performance_governor is not None and performance_governor.stream_needs_the_link(path))
+    """True while the streamed show on screen is short of its buffer and path is another file (owner 2026-11-23), unless the file on screen is held in memory to its end (a commercial the break cache kept); otherwise priming is channel changing's own work, so a tune, a scan pause, a strained PC or a game never holds it back (owner 2026-11-15, 2026-11-24)."""
+    # WARNING: owner logs 2026-11-25 (send_logs69): "channel 05 was killing it ... the rest pass"; each streamed commercial reads as short of its buffer although the break cache holds it whole, so through every break of ch05 the other channels' snapshots were not moved on (ch06 32 passes held back, Jurassic Park never held) and their tunes took 2 to 6 s.
+    if not (performance_governor is not None and performance_governor.stream_needs_the_link(path)):
+        return False
+    return not _screen_file_held_in_memory()
+
+
+def _screen_file_held_in_memory():
+    """True when the file on screen is kept in memory by the relay from where the picture is to its end, so it needs nothing from the share."""
+    try:
+        fp = getattr(vlc_engine, "current_filepath", None) if vlc_engine is not None else None
+        if not fp or share_relay is None:
+            return False
+        span = share_relay.snapshot_span(fp)
+        pos_ms = _vlc_get_time_safe()
+        length_ms = vlc_engine.player.get_length()
+        if span is None or pos_ms is None or not length_ms or length_ms <= 0:
+            return False
+        return span[0] <= pos_ms / 1000.0 + 0.5 and span[1] >= length_ms / 1000.0 - 1.0
+    except Exception as _swallowed_error:
+        _log_swallowed("_screen_file_held_in_memory", _swallowed_error)
+        return False
+
+
+def _cache_turn_waits(path=None):
+    """True while the snapshots must wait: the streamed show on screen is short of its buffer, or the live captions are behind and have the turn (performance_governor.juggle_turn); the header-and-index priming that makes a channel change quick never waits for the captions."""
+    if _prime_should_wait(path):
+        return True
+    return bool(performance_governor is not None and not performance_governor.juggle_turn("cache", path))
+
+
+def _wait_for_cache_turn(max_wait_s=30.0, path=None):
+    """Waits (up to max_wait_s) until it is caching's turn for path; False when the program is closing or the wait ran out."""
+    deadline = time.monotonic() + max_wait_s
+    while _cache_turn_waits(path):
+        if time.monotonic() >= deadline or _app_shutting_down.wait(0.25):
+            return False
+    return not _app_shutting_down.is_set()
 
 
 def _wait_to_prime(max_wait_s=30.0, path=None):
@@ -9766,6 +9941,10 @@ def _prime_channels_pass_inner(only, airing_only, progress_unit):
             _plan, _break_near = _next_item_prep_plan(_ch, _fp)
             _plan = [p for p in _plan if share_relay.wants(p)]
             _files = [_fp] + (_plan if _break_near else _plan[:CHANNEL_PRIME_NEXT_ITEMS])
+            # WARNING: owner 2026-11-25 (send_logs66): "why was it not cached yet"; ch07's next episode came after a commercial break, beyond the items of the channel's own block timeline (which a channel on the server's rows does not even follow), so its header and index were never kept and the tune to it took 3.1 s. The next CHANNEL_PRIME_NEXT_ITEMS items of the schedule the channel really airs are kept too, and the show after them when they are all commercials (owner: "it was 4 shows forward cached ... its a safety for short commercials").
+            for _nf in _prepared_next_files(_ch, station_clock.now_epoch(), CHANNEL_PRIME_NEXT_ITEMS):
+                if _nf not in _files and share_relay.wants(_nf):
+                    _files.append(_nf)
             _left = float(_st.get("duration", 0) or 0) - float(_st.get("seek", 0) or 0)
             _countdown = PRIME_RECHECK_SECONDS
             if _left > 0:
@@ -10069,7 +10248,8 @@ def _prime_snapshot_pass():
     with _prime_zone_lock:
         _order = [c for c in _prime_snapshot_zone if c != _cur][:PRIME_SNAPSHOT_CHANNELS_MAX]
     for _ch in _order:
-        if _ch == _cur or _app_shutting_down.is_set():
+        # WARNING: owner logs 2026-11-25 (send_logs61): a pass that began on ch05 read 8.5 MB of ch06 at its old spot while ch06 was being tuned; a channel that became the one on screen during the pass is left to its own stream.
+        if _ch == _cur or _ch == str(app_state.get("current_channel", "") or "").zfill(2) or _app_shutting_down.is_set():
             continue
         try:
             _st = calculate_slotted_playback_state(_ch) or {}
@@ -10084,8 +10264,11 @@ def _prime_snapshot_pass():
                 _report.append("ch%s held %.0fs-%.0fs (now %.0fs)" % (_ch, _span[0], _span[1], _pos))
                 _soonest = _snapshot_due_sooner(_soonest, _span, _pos, _left)
                 continue
-            if not _wait_to_prime(path=_fp):
-                _report.append("ch%s not tried: priming was held back" % _ch)
+            # WARNING: owner 2026-11-25: a channel with nothing held at all (its show just changed) is channel changing's own work and waits only for the picture's buffer; extending a snapshot it already has waits its turn behind the captions.
+            if not (_wait_to_prime(path=_fp) if _span is None else _wait_for_cache_turn(path=_fp)):
+                _report.append("ch%s not tried: the picture's buffer or the captions had the turn" % _ch)
+                # WARNING: owner logs 2026-11-25 (send_logs60): a pass that stopped here armed no countdown, so no snapshot was kept for 4 minutes and tunes took 3 to 11 s; the pass is tried again soon.
+                _soonest = PRIME_SNAPSHOT_RETRY_SECONDS if _soonest is None else min(_soonest, PRIME_SNAPSHOT_RETRY_SECONDS)
                 break
             _t_ch = time.monotonic()
             _had_index = share_relay.keyframe_table(_fp) is not None
@@ -10100,6 +10283,10 @@ def _prime_snapshot_pass():
             _report.append("ch%s failed: %s" % (_ch, _snap_err))
             _log_swallowed("_prime_snapshot_pass: one channel", _snap_err)
             _soonest = PRIME_SNAPSHOT_RETRY_SECONDS if _soonest is None else min(_soonest, PRIME_SNAPSHOT_RETRY_SECONDS)
+    try:
+        _soonest = _snapshot_next_item_on_screen(_report, _soonest)
+    except Exception as _next_err:
+        _log_swallowed("_prime_snapshot_pass: the next show of the channel on screen", _next_err)
     if _soonest is not None:
         station_clock.arm_in("snapshots", _soonest, lambda _key: _prime_snap_wake.set())
     # WARNING: this line is how a channel with no snapshot is explained: it names every streamed channel, and either that it is held (with the seconds it covers) or what its last read did; it is written when the pass read something or a channel is still not held, at most every PRIME_SNAPSHOT_LOG_EVERY_S seconds.
@@ -10113,6 +10300,239 @@ def _prime_snapshot_pass():
     if _empty:
         share_relay.drop_snapshots(())
     return _read
+
+
+def _prepared_next_files(channel_key, now_epoch, items):
+    """The files of the next `items` items after the one on air in the schedule the channel airs (its prepared items), commercials counted, and when they are all commercials the show after them too, so a long break never leaves the show after it unready; [] when none are prepared."""
+    held = _scheduler_prepared.get(channel_key)
+    if not held:
+        return []
+    out = []
+    shows = 0
+    on_air = None
+    for start, facts in held[1] or []:
+        if start <= now_epoch:
+            on_air = facts.get("file")
+            continue
+        path = facts.get("file")
+        if not path or path == on_air:
+            continue
+        norm = os.path.normpath(str(path))
+        if norm not in out:
+            out.append(norm)
+        if facts.get("mode") != "Commercial":
+            shows += 1
+        if (len(out) >= items and shows >= 1) or len(out) >= PRIME_PREPARED_FILES_MAX:
+            break
+    return out
+
+
+def _next_item_on_channel(channel_key, now_epoch):
+    """(clock start, file, seek) of the next item on a channel after the one on air, from the items the schedule prepared for it, or None."""
+    held = _scheduler_prepared.get(channel_key)
+    if not held:
+        return None
+    records = held[1] or []
+    on_air = None
+    for start, facts in records:
+        if start <= now_epoch:
+            on_air = facts.get("file")
+    for start, facts in records:
+        if start > now_epoch + 0.5 and facts.get("file") and facts.get("file") != on_air:
+            return float(start), os.path.normpath(str(facts["file"])), float(facts.get("seek", 0) or 0)
+    return None
+
+
+def _upcoming_break_and_show(channel_key, now_epoch):
+    """[(clock start, file, seek, length, is a commercial)] of the items after the one on air in the schedule the channel airs: every commercial of the coming break and the show after it (the rest of the break and that show while a break is on air); at most PRIME_PREPARED_FILES_MAX; [] when none are prepared."""
+    held = _scheduler_prepared.get(channel_key)
+    if not held:
+        return []
+    out = []
+    on_air = None
+    seen = set()
+    for start, facts in held[1] or []:
+        if start <= now_epoch:
+            on_air = facts.get("file")
+            continue
+        path = facts.get("file")
+        if not path or path == on_air:
+            continue
+        norm = os.path.normpath(str(path))
+        is_ad = facts.get("mode") == "Commercial"
+        if norm not in seen:
+            seen.add(norm)
+            out.append((float(start), norm, float(facts.get("seek", 0) or 0), float(facts.get("duration", 0) or 0), is_ad))
+        if not is_ad or len(out) >= PRIME_PREPARED_FILES_MAX:
+            break
+    return out
+
+
+def _on_air_is_commercial(channel_key, now_epoch):
+    """True when the item on air on the channel, in the schedule it airs, is a commercial (a break is playing)."""
+    held = _scheduler_prepared.get(channel_key)
+    mode = None
+    for start, facts in (held[1] if held else None) or []:
+        if start > now_epoch:
+            break
+        mode = facts.get("mode")
+    return mode == "Commercial"
+
+
+def _break_add_candidate(channel_key, upcoming_paths):
+    """(file, length) of the commercial the coming break will add to take up this computer being ahead of the server's clock (the pick _server_break_plan makes), or None when no commercial is to be added (on time, behind, not a server channel, or none fits)."""
+    try:
+        _gap = _server_time_pending()
+        if _gap >= 0 or db is None:
+            return None
+        _info = db.channels_db.get(str(channel_key).zfill(2), {})
+        if not _info.get("server_locked", False) or not _info.get("commercials_enabled", False):
+            return None
+        _pool = [(t.get("path"), float(t.get("duration") or 0)) for t in build_commercial_tracks(_info.get("schedules", {}).get("Commercials", []), _cached_path_exists)]
+        _taken = {_server_break_key(p) for p in upcoming_paths}
+        _fits = [(float(_len), p) for p, _len in _pool if p and 0 < float(_len or 0) <= -_gap and _server_break_key(p) not in _taken]
+        if not _fits:
+            return None
+        _len, _path = max(_fits, key=lambda f: (f[0], _server_break_key(f[1])))
+        return os.path.normpath(str(_path)), _len
+    except Exception as _swallowed_error:
+        _log_swallowed("_break_add_candidate", _swallowed_error)
+        return None
+
+
+def _snapshot_next_item_on_screen(report, soonest):
+    """The commercial cache of the channel on screen: once the item on air ends in less than PRIME_NEXT_ITEM_AHEAD_SECONDS, every commercial of the coming break is kept in memory whole and the show after it from its start for PRIME_SNAPSHOT_SECONDS, so the break and the show open from memory however short each clip is; returns the sooner wake time. Background thread only."""
+    # WARNING: owner 2026-11-25: "3 mins before the show ends it should cache the whole commercial break and the next show bc no commercial (or very few) is 3 mins long to begin with"; a 4 s bumper fade and a 7 s commercial come and go faster than any look one item at a time.
+    _ch = str(app_state.get("current_channel", "") or "").zfill(2)
+    _now = station_clock.now_epoch()
+    _items = [it for it in _upcoming_break_and_show(_ch, _now) if share_relay.wants(it[1]) or share_relay.too_long(it[1])]
+    if not _items:
+        return soonest
+    _due = _items[0][0] - _now
+    if _due > PRIME_NEXT_ITEM_AHEAD_SECONDS:
+        _wake = _due - PRIME_NEXT_ITEM_AHEAD_SECONDS
+        return _wake if soonest is None else min(soonest, _wake)
+    # WARNING: owner 2026-11-25: the coming break waits its turn behind the captions only while it is more than JUGGLE_NEXT_SHOW_FIRST_SECONDS away; closer than that it goes first, after the picture's buffer.
+    # WARNING: owner logs 2026-11-25 (send_logs68): while a break is on air each streamed commercial is always short of its buffer, so the rest of the break and the show after it waited the whole break and NCIS opened from the share in 5.8 s; during a break, and in the last JUGGLE_NEXT_SHOW_FIRST_SECONDS before it, the break is the picture's own next work and never waits.
+    _in_break = _on_air_is_commercial(_ch, _now)
+    _urgent = _in_break or _due <= JUGGLE_NEXT_SHOW_FIRST_SECONDS
+    if not _urgent and (_prime_should_wait(_items[0][1]) or _cache_turn_waits(_items[0][1])):
+        report.append("next on ch%s not tried yet: the picture's buffer or the captions have the turn" % _ch)
+        _break_cache_note(_ch, _items, "waits: the picture's buffer or the captions have the turn, first item airs in %.0fs" % _due)
+        return PRIME_SNAPSHOT_RETRY_SECONDS if soonest is None else min(soonest, PRIME_SNAPSHOT_RETRY_SECONDS)
+    _added = _break_add_candidate(_ch, [it[1] for it in _items])
+    if _added is not None:
+        # WARNING: owner 2026-11-25: "thats when it should adjust commercials as needed to keep on schedule or ignore it until the clock is further off"; when this computer is ahead of the server's clock by more than SERVER_CLOCK_DRIFT_TOLERANCE_S the break will add the commercial _server_break_plan picks, so that one is kept whole too.
+        _items = _items[:-1] + [(_items[-1][0], _added[0], 0.0, _added[1], True)] + _items[-1:] if not _items[-1][4] else _items + [(_items[-1][0], _added[0], 0.0, _added[1], True)]
+    _t0 = time.monotonic()
+    _held = 0
+    _missing = 0
+    for _start, _fp, _seek, _len, _is_ad in _items:
+        if _app_shutting_down.is_set():
+            break
+        _to = (_seek + _len) if (_is_ad and _len > 0) else (_seek + PRIME_SNAPSHOT_SECONDS)
+        _span = share_relay.snapshot_span(_fp)
+        if _span is not None and _span[0] <= _seek and _span[1] >= min(_to, _seek + PRIME_SNAPSHOT_SECONDS / 2.0) - 0.5:
+            _held += 1
+            continue
+        if share_relay.keyframe_table(_fp) is None:
+            share_relay.ensure_index(_fp, max_seconds=SERVER_CHANNEL_WARM_MAX_SECONDS)
+        share_relay.snapshot(_fp, _seek, _to, max_seconds=SERVER_CHANNEL_WARM_MAX_SECONDS)
+        if share_relay.snapshot_span(_fp) is not None:
+            _held += 1
+        else:
+            _missing += 1
+    _ads = sum(1 for it in _items if it[4])
+    report.append("next on ch%s: %d commercial(s) and %s, %d of %d in memory, first airs in %.0fs (%.1fs)" % (
+        _ch, _ads, "the show after" if not _items[-1][4] else "no show", _held, len(_items), _due, time.monotonic() - _t0))
+    _break_cache_note(_ch, _items, "%d commercial(s) and %s: %d of %d in memory%s, first airs in %.0fs" % (
+        _ads, "the show after" if not _items[-1][4] else "no show", _held, len(_items),
+        " (a break is on air)" if _in_break else "", _due))
+    _again = PRIME_SNAPSHOT_RETRY_SECONDS if _missing else max(1.0, _due + 1.0)
+    return _again if soonest is None else min(soonest, _again)
+
+
+_break_cache_logged = {}
+
+
+_cache_screen_file = [None]
+
+
+def _screen_file_changed(file_path):
+    """Tells the cache manager the picture moved to a new file, so the cache kept only for the file that went off the air is freed."""
+    previous, _cache_screen_file[0] = _cache_screen_file[0], file_path
+    cache_manager.show_changed(previous, file_path)
+
+
+def _free_aired_file_cache(previous_path, current_path):
+    """The cache manager's show-change hook: drops the file that left the air from the memory copies and the primed facts, unless it is coming up again on the channel on screen (a repeated commercial)."""
+    _ch = str(app_state.get("current_channel", "") or "").zfill(2)
+    try:
+        _coming = {os.path.normpath(str(it[1])) for it in _upcoming_break_and_show(_ch, station_clock.now_epoch())}
+    except Exception as _coming_error:
+        _log_swallowed("_free_aired_file_cache: reading what comes next", _coming_error)
+        _coming = set()
+    _norm = os.path.normpath(str(previous_path))
+    if _norm in _coming or _norm == os.path.normpath(str(current_path)):
+        return
+    if share_relay is not None:
+        share_relay.drop_snapshot(previous_path)
+        share_relay.drop_aged_snapshots()
+    for _memo in (_prime_renewed, _primed_dims, _primed_picture_box, _warm_index_done):
+        _memo.pop(_norm, None)
+        _memo.pop(previous_path, None)
+
+
+cache_manager.on_show_change("memory copies and primed facts", _free_aired_file_cache)
+
+
+def _extracted_rom_folders():
+    """main/roms/<console>/.extracted_cache for every console: copies unpacked from ROM archives, made again on the next play."""
+    _roms = os.path.join(resolve_main_dir(), "roms")
+    try:
+        return [os.path.join(_roms, _c, ".extracted_cache") for _c in os.listdir(_roms)] if os.path.isdir(_roms) else []
+    except OSError as _roms_error:
+        _log_swallowed("_extracted_rom_folders: listing the ROM folders", _roms_error)
+        return []
+
+
+# WARNING: owner 2026-11-26: the ROMs unpacked from archives were never removed; the ones played longest ago go first past CACHE_EXTRACTED_ROMS_MAX_BYTES, and one played in the last day is kept.
+cache_manager.manage_folder("extracted ROMs", _extracted_rom_folders, max_bytes=cache_manager.EXTRACTED_ROMS_MAX_BYTES, depth=2,
+                            in_use_fn=lambda _p: time.time() - os.path.getmtime(_p) < 86400.0)
+
+
+def _ensure_audio_track_selected(player, filepath):
+    """Owner logs 68 (the Chipmunks Valentine Special was silent with a measured -16.8 LUFS track, the volume up and nothing muted): when the file has a sound track but VLC has none selected, the first one is selected; returns the text for the [VOLUME] line."""
+    try:
+        count = player.audio_get_track_count()
+        current = player.audio_get_track()
+    except Exception as _track_error:
+        _log_swallowed("_ensure_audio_track_selected: reading the sound tracks", _track_error)
+        return "sound track unknown"
+    if count is None or count <= 0:
+        return "no sound track reported by the player"
+    if current is not None and current >= 0:
+        return "sound track %s of %s selected" % (current, max(0, count - 1))
+    try:
+        choices = [t for t in (player.audio_get_track_description() or []) if t and t[0] is not None and t[0] >= 0]
+        if not choices:
+            return "sound tracks reported (%s) but none can be selected" % count
+        player.audio_set_track(choices[0][0])
+        log.warning("[AUDIO TRACK] %s: the player had no sound track selected out of %s; selected track %s so the show is heard",
+                    os.path.basename(str(filepath)), max(0, count - 1), choices[0][0])
+        return "sound track %s selected by the app (none was)" % choices[0][0]
+    except Exception as _select_error:
+        _log_swallowed("_ensure_audio_track_selected: selecting a sound track", _select_error)
+        return "no sound track selected and selecting one failed"
+
+
+def _break_cache_note(channel_key, items, text):
+    """Writes one [BREAK CACHE] line when what the commercial cache of the channel on screen did for the coming break changes, so every break says whether it was in memory before it aired."""
+    _sig = (channel_key, tuple(it[1] for it in items), text.split(", first item airs")[0].split(", first airs")[0])
+    if _break_cache_logged.get(channel_key) == _sig:
+        return
+    _break_cache_logged[channel_key] = _sig
+    log.info("[BREAK CACHE] ch%s: %s (%s)", channel_key, text, ", ".join(os.path.basename(it[1])[:32] for it in items[:12]))
 
 
 def _snapshot_due_sooner(soonest, span, pos, left):
@@ -10248,7 +10668,8 @@ def _write_program_scan_state():
             _json.dump({"mode": mode, "caught_up": bool(cache["caught_up"]), "at": time.time(),
                         "level": performance_governor.current_level() if performance_governor is not None else 0,
                         "perf_mode": performance_governor.get_mode() if performance_governor is not None else "lite",
-                        "live_captions": bool(media.live_captions_running())}, fh)
+                        "live_captions": bool(media.live_captions_running()),
+                        "regular_done": bool(mode == "regular" and _regular_scans_all_done())}, fh)
         os.replace(tmp, path)
     except OSError as _swallowed_error:
         _log_swallowed("_write_program_scan_state: writing the report", _swallowed_error)
@@ -10257,6 +10678,42 @@ def _write_program_scan_state():
 
 
 _idle_server_scan_state = {"checked": -1e9, "generation": -1, "regular_done": False}
+# WARNING: the fallback number below must match SERVER_SCAN_STATE_FRESH_S in performance_governor.py; it is used only when that module fails to import.
+SERVER_SCAN_STATE_FRESH_S = performance_governor.SERVER_SCAN_STATE_FRESH_S if performance_governor is not None else 45.0
+_server_scan_state_cache = {"checked": -1e9, "profiles_first": False}
+
+
+def _server_profiles_first():
+    """True while this computer's server tray says a server profile file still needs scanning or captions (owner 2026-11-25: "with server app open it scans in the same way. in priority of the server you created to share"); the program then keeps to its quick scans (what airs now and next) and leaves its future scans for later. False with Server Mode off, with no report, or with one older than SERVER_SCAN_STATE_FRESH_S."""
+    import json as _json
+    cache = _server_scan_state_cache
+    if time.monotonic() - cache["checked"] < 5.0:
+        return cache["profiles_first"]
+    cache["checked"] = time.monotonic()
+    first = False
+    if _server_service_should_run():
+        try:
+            with open(os.path.join(_app_logs_dir(), "temp", "server_scan_state.json"), "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            first = time.time() - float(data.get("at") or 0.0) <= SERVER_SCAN_STATE_FRESH_S and not bool(data.get("profiles_done"))
+        except FileNotFoundError:
+            # WARNING: the normal end: the tray has not written its state yet (or is not running), so nothing holds the program's scans back.
+            first = False
+        except (OSError, ValueError, TypeError, AttributeError) as _swallowed_error:
+            _log_swallowed("_server_profiles_first: reading the tray's scan state", _swallowed_error)
+            first = False
+    if first != cache["profiles_first"]:
+        log.info("[SCAN PIPELINE] %s", "the server profiles are being scanned and captioned first: this program keeps to what airs now and next until they are done"
+                 if first else "the server profiles are scanned and captioned: this program's future scans go on")
+    cache["profiles_first"] = first
+    return first
+
+
+def _regular_deep_backlog():
+    """The regular channels' future scans (the deep backlog), or none while the server profiles come first (_server_profiles_first)."""
+    if _server_profiles_first():
+        return []
+    return _gather_deep_backlog_queue()
 
 
 def _regular_scans_all_done():
@@ -10517,7 +10974,8 @@ def _server_link_test(name, host, file_map):
                 if os.path.getsize(_p) >= 2 * int(float(_boot_bar_const("DRIVE_PROFILE_SAMPLE_MB", 8)) * 1048576):
                     _big = _p
                     break
-            except OSError:
+            except OSError as caught_error:
+                _log_swallowed("boot bar: sizing a file to pick the drive test sample", caught_error)
                 continue
         if _big is None:
             log.info("[SERVER PREP] %s: no mapped file is big enough to measure the link", name)
@@ -10752,6 +11210,7 @@ def _connect_remote_server(_picked, cached=None):
             broadcast_clock.set_server_utc_offset(_cached_offset)
     except Exception as _swallowed_error:
         _log_swallowed("connect: cached server clock", _swallowed_error)
+    _server_time_restore_saved(str(_picked.get("name", "")).strip().lower())
     def _watched_server_channel():
         # WARNING: owner 2026-11-14: the server scans what a User watches first, as it does for its own viewer; only a streamed channel is reported.
         _ch = str(app_state.get("current_channel", "")).zfill(2)
@@ -10999,6 +11458,19 @@ def _remember_server_pick(entry):
     db.config["last_server_pick"] = {"name": str(entry.get("name", "")), "slot_id": str(entry.get("slot_id", "")),
                                      "local": bool(entry.get("local"))}
     db.save_settings()
+
+
+def _leave_local_profile_for_role_change(role):
+    """A role change leaves the server profile of this computer that was being watched: its channels go and the profile is no longer the setup in use, so what airs next is never filed under the profile."""
+    # WARNING: owner logs 2026-11-25 (send_logs_tray4): pressing User while watching profile server1 brought the Regular channels back but left the profile marked in use; Regular's scheduler then wrote its rows under the profile, and the server sent those to its Users ("it is sending me the scheduling for regular channels instead of the profile").
+    _slot = app_state.get("active_local_profile")
+    if _slot is None or db is None:
+        return
+    _remember_channel_on_server()
+    db.leave_server_slot()
+    app_state["active_local_profile"] = None
+    app_state["user_selected_server_name"] = ""
+    log.info("[SERVER MENU] role changed to %s: profile %s is left; the Regular channels are back and nothing is filed under the profile", role, _slot)
 
 
 def _forget_server_pick():
@@ -11301,9 +11773,7 @@ def _awaiting_first_server_schedule():
 
 # WARNING: the fallback must match FIRST_FILE_SCANNING_BANNER_DELAY_MS in performance_governor.py (the blank and the SCANNING banner share one wait); used only when that module fails to import.
 _PROFILE_LOADING_REASONS = ("first_file_scanning", "visualizer_scanning", "not_scanned")
-_profile_loading_seen = {}
-
-
+_profile_loading_seen = cache_manager.small_memo("profile loading banners")
 def _local_profile_still_loading(key, reason):
     """True while a saved server profile on this computer is still loading its first file: the channel is on a loading Static reason (waiting for the first file's length, or nothing scanned yet) for less than the scanning banner delay. WARNING: owner 2026-11-11: that wait is a blank screen with no Static noise; once the delay is over (or the reason is any other) the usual fallback rules apply, snow then grey and the banner."""
     if db is None or app_state.get("active_local_profile") is None:
@@ -11341,9 +11811,16 @@ def _note_media_arrived(ch_key, state, now_ticks):
         return False
     # WARNING: owner log 2026-11-20 15:58: the first show was named 14 s after media arrived, the stall clock still counted from the arrival, and the open went straight to Static and PLAYBACK STALLED with no black wait; the show's open gets its own load wait, the same as a channel change.
     _hold_static = False
-    if _before[2] in SILENT_STATIC_REASONS and not (_seen[1] == "Static" and _seen[2] in SILENT_STATIC_REASONS):
+    _empty = SILENT_STATIC_REASONS | {SERVER_SCHEDULE_GAP_REASON}
+    if _before[2] in _empty and not (_seen[1] == "Static" and _seen[2] in _empty):
         app_state["_load_clock_media_arrived_ticks"] = now_ticks
-        _what = "media arrived while it was on empty Static (%s)" % (_seen[2] or _seen[1])
+        # WARNING: owner 2026-11-25: "it should not go back to black screen, only start when video is ready after static fall back"; a server schedule gap is a fallback, so the show opens under its Static until the first new picture. Media loaded for the first time on an empty channel gets FIRST_MEDIA_STATIC_MS of Static, then the black load wait ("there is a 2 second static before it goes to the black screen").
+        _hold_static = _before[2] == SERVER_SCHEDULE_GAP_REASON and _seen[1] in ("Video", "Commercial")
+        _first_media = _before[2] in ("no_media_scheduled", "channel_inactive") and _seen[1] in ("Video", "Commercial")
+        if _first_media:
+            app_state["_first_media_static_until_ticks"] = now_ticks + FIRST_MEDIA_STATIC_MS
+        _what = "media arrived while it was on empty Static (%s)%s" % (
+            _seen[2] or _seen[1], "; it opens under the Static" if _hold_static else ("; %d s of Static, then the black load wait" % (FIRST_MEDIA_STATIC_MS // 1000) if _first_media else ""))
     elif _before[2] in _PROFILE_LOADING_REASONS and _seen[1] in ("Video", "Commercial"):
         _arrived = app_state.pop("_load_clock_media_arrived_ticks", None)
         # WARNING: owner 2026-11-21: a channel that has already fallen to Static stays on Static until its picture arrives; it never goes back to the black wait.
@@ -11353,9 +11830,11 @@ def _note_media_arrived(ch_key, state, now_ticks):
             "; it opens under the Static it fell to" if _hold_static else "")
     else:
         return False
-    app_state["_last_new_frame_ticks"] = now_ticks
+    app_state["_last_new_frame_ticks"] = now_ticks + (FIRST_MEDIA_STATIC_MS if app_state.get("_first_media_static_until_ticks", 0) > now_ticks else 0)
     app_state["_had_first_frame_this_tune"] = False
     app_state["_static_hold_until_frame"] = _hold_static
+    if _hold_static:
+        _channels_on_fault_static.add(_seen[0])
     app_state["last_vlc_retry_at"] = 0
     log.info("[LOAD CLOCK] ch%s: %s; the %d s load wait starts now",
              _seen[0], _what, int(_first_load_static_ms(_seen[0]) // 1000))
@@ -11866,6 +12345,9 @@ def _fe_context_key(context):
         return None
     # WARNING: owner test 2026-11-23: a server profile's explorer opened in Regular channel 05's last folder; Regular keeps its old keys unchanged.
     setup = _gain_context()
+    # WARNING: owner 2026-11-25: "edit server and profile mode (watching a server profile on the server computer) is bleeding through the file explorer last visited location"; editing a profile in Manage Server keeps its own last folders, apart from watching the same profile.
+    if setup.startswith("profile:") and app_state.get("active_local_profile") is None:
+        setup = "edit:" + setup.split(":", 1)[1]
     return key if setup == "regular" else "%s|%s" % (setup, key)
 
 
@@ -12179,9 +12661,9 @@ def _fe_go_up():
 # WARNING: mixer channel 2 is reserved for ch03 menu music.
 CH03_MUSIC_CHANNEL_ID = 2
 
-_ch03_music_sound_cache = {}
-
-
+# WARNING: owner 2026-11-26: each decoded game-menu track is the whole song in memory (tens of MB); only the last few played are kept. The fallback number must match CACHE_GAME_MUSIC_SOUNDS_KEPT in performance_governor.py; it is used only when that module fails to import.
+CACHE_GAME_MUSIC_SOUNDS_KEPT = performance_governor.CACHE_GAME_MUSIC_SOUNDS_KEPT if performance_governor is not None else 3
+_ch03_music_sound_cache = cache_manager.small_memo("game menu music (decoded)", CACHE_GAME_MUSIC_SOUNDS_KEPT)
 # ============================================================================
 # SECTION: CH 03 menu music, volume & key bindings
 # ============================================================================
@@ -12512,6 +12994,20 @@ def _ch03_track_gain(path, entry):
     return float(base) * 10 ** (_get_manual_audio_gain_db(path) / 20.0)
 
 
+_ch03_pick = {}
+
+
+def _ch03_pick_worker(playlist):
+    """Ch03MusicPick thread: picks the next menu-music track and reads its gain, which both wait on the library, and leaves them for the screen thread's next call of _start_ch03_menu_music."""
+    try:
+        picked = _ch03_next_playlist_entry(playlist)
+        gain = _ch03_track_gain(picked[1], picked[2]) if picked is not None else None
+        _ch03_pick["ready"] = (id(playlist), picked, gain)
+    except Exception as _pick_err:
+        log.warning("[CH03 MUSIC] picking the next track failed: %s", _pick_err)
+        _ch03_pick["ready"] = (id(playlist), None, None)
+
+
 def _start_ch03_menu_music():
     if db is None:
         return
@@ -12525,7 +13021,18 @@ def _start_ch03_menu_music():
         return
     if _ch03_music_is_playing():
         return
-    picked = _ch03_next_playlist_entry(playlist)
+    _gain = None
+    if _time_critical_thread():
+        # WARNING: owner logs 2026-11-25 (send_logs_tray6): picking the next track waits on the library, which the server's rows and the guide hold for seconds at a time; on the screen thread that froze the picture for 6.6 s on the way to channel 03. The pick is made on its own thread and the music starts on a later frame.
+        _ready = _ch03_pick.pop("ready", None)
+        if _ready is None or _ready[0] != id(playlist):
+            if _ch03_pick.get("thread") is None or not _ch03_pick["thread"].is_alive():
+                _ch03_pick["thread"] = threading.Thread(target=_ch03_pick_worker, args=(playlist,), daemon=True, name="Ch03MusicPick")
+                _ch03_pick["thread"].start()
+            return
+        picked, _gain = _ready[1], _ready[2]
+    else:
+        picked = _ch03_next_playlist_entry(playlist)
     if picked is None:
         log.warning("[CH03 MUSIC] No playable tracks found in playlist -- all files missing.")
         # WARNING: with Menu Music on the list never stays silent (owner 2026-11-06): when no track can be found the shipped track plays and the banner bar says so, once per visit.
@@ -12536,7 +13043,7 @@ def _start_ch03_menu_music():
             post_status_notice("GAME MUSIC NOT FOUND, PLAYING DEFAULT")
         picked = (0, _default_track, {"path": _default_track})
     idx, track, candidate = picked
-    track_gain = _ch03_track_gain(track, candidate)
+    track_gain = _gain if _gain is not None and track == picked[1] else _ch03_track_gain(track, candidate)
     sound = _load_ch03_music_sound(track)
     if sound is None:
         return
@@ -14156,9 +14663,8 @@ def _probe_loudness_guarded(norm_p, out_shortfall=None, apply_learned_offset=Tru
 _gain_double_checked_pending = set()
 _gain_windows_pending = {}
 _gain_check_lock = threading.Lock()
-_gain_check_tried = set()
-_gain_check_folder_seen = {}
-
+_gain_check_tried = cache_manager.flags("gain checks tried")
+_gain_check_folder_seen = cache_manager.memo("gain check folders")
 # WARNING: the fallback numbers below must match GAIN_CHECK_FOLDER_REVISIT_S in performance_governor.py; they are used only when that module fails to import.
 _GAIN_CHECK_FOLDER_REVISIT_S = performance_governor.GAIN_CHECK_FOLDER_REVISIT_S if performance_governor is not None else 600
 
@@ -14378,6 +14884,7 @@ def _report_interrupted_probe_marker():
         try:
             os.remove(marker_path)
         except FileNotFoundError:
+            # WARNING: the normal end: the marker was already gone.
             pass
         except Exception as _swallowed_error:
             _log_swallowed("_report_interrupted_probe_marker: os.remove(marker_path)", _swallowed_error)
@@ -14389,6 +14896,7 @@ def _report_interrupted_probe_marker():
     try:
         os.remove(marker_path)
     except FileNotFoundError:
+        # WARNING: the normal end: the marker was already gone.
         pass
     except Exception as _swallowed_error:
         _log_swallowed("_report_interrupted_probe_marker: os.remove(marker_path)", _swallowed_error)
@@ -16135,7 +16643,7 @@ def _carry_config_file_data_into_hub():
         except Exception as e:
             log.warning("[GAIN HUB] saving the settings file after the move into the library failed: %s", e)
 
-_track_gain_memo = {}
+_track_gain_memo = cache_manager.memo("track gains")
 _track_gain_memo_lock = threading.Lock()
 
 
@@ -16298,7 +16806,7 @@ def _bounded_stat(filepath, timeout_ms):
 
     def _worker():
         try:
-            box.append(os.stat(filepath))
+            box.append(os.stat(media.long_form(filepath)))
         except OSError as e:
             box.append(e)
         finally:
@@ -16552,7 +17060,11 @@ def _vlc_native_log_read(path, state):
     """Reads the lines VLC added to its own log file since the last read, stamps each with the time it was read and queues it for the VLC log writer; empties the file once it passes VLC_NATIVE_LOG_MAX_BYTES."""
     try:
         size = os.path.getsize(path)
-    except OSError:
+    except FileNotFoundError:
+        # WARNING: the normal end: VLC has not written its log yet.
+        return
+    except OSError as caught_error:
+        _log_swallowed("reading the size of VLC's own log", caught_error)
         return
     if size < state["offset"]:
         state["offset"], state["rest"] = 0, b""
@@ -16573,6 +17085,7 @@ def _vlc_native_log_read(path, state):
         try:
             _vlc_log_queue.put_nowait(stamp + text)
         except queue.Full:
+            # WARNING: the normal end: the VLC log queue is full; the rest is read on the next pass.
             break
     if state["offset"] >= _VLC_NATIVE_LOG_MAX_BYTES and not state["rest"]:
         try:
@@ -16640,6 +17153,7 @@ class _SerializedVlcPlayer:
                     try:
                         return self._last_answer[(name, args)]
                     except (KeyError, TypeError):
+                        # WARNING: the normal end: there is no earlier answer to hand back (or the call's arguments cannot be remembered).
                         pass
                 # WARNING: owner 2026-11-14 (V1.7.9): the CRT crashed (access violation) when a stop stuck on an unreachable share held this lock past the wait and a crop-geometry call then went into libvlc beside it. A call that cannot get the lock is skipped, never made beside another one; the caller's next call (the wedge check replaces the engine) carries on.
                 _log_warn_throttled("vlc_serial_timeout_" + name,
@@ -16660,6 +17174,7 @@ class _SerializedVlcPlayer:
                     try:
                         self._last_answer[(name, args)] = answer
                     except TypeError:
+                        # WARNING: the normal end: this call's arguments cannot be remembered, so its answer is not kept.
                         pass
                 return answer
             finally:
@@ -16931,6 +17446,7 @@ def _mixer_is_busy():
         if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
             return True
     except pygame.error:
+        # WARNING: the normal end: the sound system is not started, so nothing is playing.
         return False
     return 'static_audio' in globals() and static_audio is not None and static_audio.get_num_channels() != 0
 
@@ -17157,6 +17673,7 @@ def initialize_vlc_on_demand():
                     try:
                         _vlc_log_queue.put_nowait(_boot_marker)
                     except queue.Full:
+                        # WARNING: the normal end: the VLC log queue is full; the marker is left out.
                         pass
                     log.info("VLCEngineWrapper.__init__ (%s): VLC log path = %s",
                              engine_label, _vlc_log_path_status)
@@ -17176,7 +17693,7 @@ def initialize_vlc_on_demand():
                     self._decode_w, self._decode_h = self.width, self.height
                     self._letterbox_offset_x = 0
                     self._letterbox_offset_y = 0
-                    self._dim_probe_cache = {}
+                    self._dim_probe_cache = cache_manager.show_memo("picture sizes probed")
                     self._dim_probe_inflight = set()
                     self._frame_ready = False
                     self._warmup_skip = 0
@@ -17199,8 +17716,6 @@ def initialize_vlc_on_demand():
                     self._dvd_title_menu_flags = None
 
 
-                    self._DVD_ACTIVATE_GRACE_MS = 75000
-                    self._DVD_MENU_SIGNAL_WINDOW_MS = 4000
                     self._dvd_sig_last_active_tick = -10**9
                     self._dvd_sig_last_active_source = None
                     self._dvd_sig_ever_seen = False
@@ -17210,8 +17725,9 @@ def initialize_vlc_on_demand():
                     self._dvd_sig_confirmed_title = None
                     self._dvd_sig_confirmed_title_source = None
 
-                    self._DVD_VETO_OVERRIDE_COUNT = 3
-                    self._DVD_VETO_OVERRIDE_WINDOW_MS = 4000
+                    # WARNING: the fallbacks 3 and 4000 must match DVD_VETO_OVERRIDE_COUNT and DVD_VETO_OVERRIDE_WINDOW_MS in performance_governor.py; they are used only when that module failed to import.
+                    self._DVD_VETO_OVERRIDE_COUNT = performance_governor.DVD_VETO_OVERRIDE_COUNT if performance_governor is not None else 3
+                    self._DVD_VETO_OVERRIDE_WINDOW_MS = performance_governor.DVD_VETO_OVERRIDE_WINDOW_MS if performance_governor is not None else 4000
                     self._dvd_sig_veto_evidence = {}
                     self._dvd_flag_override_titles = set()
 
@@ -17525,6 +18041,9 @@ def initialize_vlc_on_demand():
 
                     log.info("[ATTEMPT %s] play_file_segmented: file=%s seek=%.2fs engine=%s",
                               _attempt_id, filepath, seek_seconds or 0.0, self.engine_label)
+                    # WARNING: owner logs 2026-11-25 (send_logs68): every item the channel on screen opens (a show after a break included) gets the PC to itself until it plays with both buffers built, the same way a channel change does.
+                    if performance_governor is not None and self.engine_label == "main" and str(app_state.get("current_channel", "")).zfill(2) not in ("03", "04"):
+                        performance_governor.hold_background_for_next_item()
                     # WARNING: owner 2026-11-15: the last channel's shutdown starts the moment the play is requested, on its own thread, so it runs while the volume, the file checks and the picture box are done for the next channel; before, it waited behind them.
                     _pending_stop_done = None
                     try:
@@ -17756,6 +18275,16 @@ def initialize_vlc_on_demand():
                             _opened_at_position = False
                             if (SEEK_AT_OPEN and seek_seconds and seek_seconds > 0
                                     and not is_dvd_iso):
+                                _fast_to = _keyframe_start_for(filepath, seek_seconds)
+                                if _fast_to is not None:
+                                    # WARNING: owner logs 2026-11-25 (send_logs66): Die Hard 5's key frames are 7 s apart; VLC decoded from the one before the asked time ("seeking with 7452ms preroll") over the share and the first picture took 24 s. The open starts on a key frame instead, with VLC's fast seek.
+                                    try:
+                                        media.add_option(":input-fast-seek")
+                                        log.info("[ATTEMPT %s][KEY FRAME START] the nearest key frame is %.1fs from %.1fs; opening on it at %.1fs: %s",
+                                                 _attempt_id, _fast_to - seek_seconds, seek_seconds, _fast_to, os.path.basename(str(filepath)))
+                                        seek_seconds = _fast_to
+                                    except Exception as _fs_e:
+                                        log.warning("[ATTEMPT %s][KEY FRAME START] VLC would not take its fast seek, the open decodes up to the asked time: %s", _attempt_id, _fs_e)
                                 try:
                                     media.add_option(":start-time=%.3f" % seek_seconds)
                                     _opened_at_position = True
@@ -17803,6 +18332,7 @@ def initialize_vlc_on_demand():
                                 try:
                                     self.player.set_media(media)
                                     self._media_handed = (_attempt_id, time.monotonic())
+                                    app_state["_vlc_pictures_stopped_ticks"] = 0
                                     self.player.play()
                                     _tune_stage("vlc play called")
                                 except Exception as _e:
@@ -17926,6 +18456,7 @@ def initialize_vlc_on_demand():
                                 try:
                                     self.player.set_media(media)
                                     self._media_handed = (_attempt_id, time.monotonic())
+                                    app_state["_vlc_pictures_stopped_ticks"] = 0
                                     self.player.play()
                                     _tune_stage("vlc play called")
                                 except Exception as _again_err:
@@ -18191,9 +18722,10 @@ def initialize_vlc_on_demand():
                                     if _now_ms >= _settle_hard_deadline or (_now_ms >= _reassert_deadline and _stable_reads >= 8):
                                         break
                                     pygame.time.wait(150)
-                                log.info("[VOLUME] %s: saved volume %s, muted in settings %s; the player reports volume %s, muted %s; held muted for the start-up check %s",
+                                _audio_track_text = _ensure_audio_track_selected(self.player, filepath)
+                                log.info("[VOLUME] %s: saved volume %s, muted in settings %s; the player reports volume %s, muted %s; held muted for the start-up check %s; %s",
                                          os.path.basename(filepath), db.config.get("global_volume", 70) if db else 70, db.config.get("is_muted", False) if db else False,
-                                         self.player.audio_get_volume(), self.player.audio_get_mute(), bool(app_state.get("_video_pending_unmute", False)))
+                                         self.player.audio_get_volume(), self.player.audio_get_mute(), bool(app_state.get("_video_pending_unmute", False)), _audio_track_text)
                                 _tune_audio_note(app_state.get("current_channel", ""), "volume settled")
                                 try:
                                     log.info("%s", _gain_applied_text(app_state.get("current_channel", ""), filepath, self.file_gain,
@@ -18461,7 +18993,7 @@ def initialize_vlc_on_demand():
                                 _cur_at_open = None
                             # WARNING: a picture that opened near the time asked is never sought: a station never shows a seek, and a file with few keyframes lands a little early and only seeks back to that same keyframe.
                             if (_cur_at_open is not None and _cur_at_open >= 0
-                                    and abs(_cur_at_open - target_ms) <= _START_TIME_ACCEPT_MS):
+                                    and abs(_cur_at_open - target_ms) <= _start_time_accept_ms(getattr(self, "current_filepath", ""))):
                                 _opened_there = True
                                 break
                             if _cur_at_open is not None and _cur_at_open > 0:
@@ -18480,6 +19012,10 @@ def initialize_vlc_on_demand():
                         except Exception as _swallowed_error:
                             _log_swallowed("_seek_when_ready: _landed_ms = self.player.get_time()", _swallowed_error)
                             _landed_ms = None
+                        # WARNING: owner logs 2026-11-25 (send_logs69): the clock VLC reports in the first moments of an open can read the time asked before the picture has really landed; the landing is judged again here, so an open that came up seconds early is moved to the schedule instead of running behind for the whole show.
+                        if (_opened_there and _landed_ms is not None and _landed_ms >= 0
+                                and abs(_landed_ms - target_ms) > _start_time_accept_ms(getattr(self, "current_filepath", ""))):
+                            _opened_there = False
                         log.info("[SEEK LANDED] asked %.1fs, the picture opened at %s%s: %s", target_ms / 1000.0,
                                  "an unknown time" if _landed_ms is None or _landed_ms < 0 else "%.1fs (%+.1fs)" % (_landed_ms / 1000.0, (_landed_ms - target_ms) / 1000.0),
                                  "; left where it is" if _opened_there else "; sought to the start asked for",
@@ -19077,6 +19613,46 @@ def _channel_ready_lists(ch_info):
     return out
 
 
+# WARNING: the fallback number below must match CHANNEL_READY_FACTS_NEXT_ITEMS in performance_governor.py; it is used only when that module fails to import.
+CHANNEL_READY_FACTS_NEXT_ITEMS = performance_governor.CHANNEL_READY_FACTS_NEXT_ITEMS if performance_governor is not None else 4
+_channel_facts_warmed = {}
+
+
+def _warm_channel_file_facts(order):
+    """Reads ahead, off the screen thread, what a tune asks the library for each channel's airing file and its next CHANNEL_READY_FACTS_NEXT_ITEMS items: the content key, the library row (picture box, length), the gain in the setup on screen and the saved audio track, so the screen thread finds them in memory; a file is read again only when its gain context changed. Returns how many files were read."""
+    # WARNING: owner logs 2026-11-25 (server PC, profile mode, media on this PC): the channel changes waited 1.7 to 9 s on the database for these, behind the guide table and the profile rows, while VLC opened the file in 30 ms; nothing of the video needs caching there.
+    lib = _get_probe_library()
+    if lib is None:
+        return 0
+    context = _gain_context()
+    now_e = station_clock.now_epoch()
+    read = 0
+    for ch in order:
+        if _app_shutting_down.is_set():
+            break
+        try:
+            state = calculate_slotted_playback_state(ch) or {}
+        except Exception as _state_err:
+            _log_swallowed("_warm_channel_file_facts: the channel's state", _state_err)
+            continue
+        files = ([os.path.normpath(str(state["file"]))] if state.get("file") else []) + _prepared_next_files(ch, now_e, CHANNEL_READY_FACTS_NEXT_ITEMS)
+        for fp in files:
+            if _channel_facts_warmed.get(fp) == context:
+                continue
+            try:
+                lib.get_cached(fp)
+                _lookup_file_gain(ch, fp)
+                _get_saved_audio_track(fp)
+            except Exception as _facts_err:
+                _log_swallowed("_warm_channel_file_facts: one file", _facts_err)
+                continue
+            if len(_channel_facts_warmed) > 4000:
+                _channel_facts_warmed.clear()
+            _channel_facts_warmed[fp] = context
+            read += 1
+    return read
+
+
 def _channel_ready_pass():
     """One pass of the channel-ready thread: re-checks what the screen thread used past its time, then makes each active channel's track build ready so the screen thread only compares the clock with it."""
     stats = _channel_ready_stats
@@ -19091,6 +19667,7 @@ def _channel_ready_pass():
         station_clock.arm_in("channel_ready:rest", CHANNEL_READY_INTERVAL_SECONDS, _channel_ready_wake_up)
     for _ch in _order:
         _channel_ready_arm(_ch)
+    stats["facts"] = stats.get("facts", 0) + _warm_channel_file_facts(_order)
     lists = [items for ch_key in _order for items in _channel_ready_lists(db.channels_db.get(ch_key) or {})]
     # WARNING: every first path check is done before any build; a check made after a build moves the path generation on and the build would be made again.
     for items in lists:
@@ -19156,11 +19733,11 @@ def _channel_ready_worker():
             stats = _channel_ready_stats
             now = time.monotonic()
             if now - stats["last_log"] >= CHANNEL_READY_LOG_SECONDS:
-                if stats["builds"] or stats["paths"] or stats["rechecks"] or stats["warmed"]:
-                    log.info("[CHANNEL READY] last %.0fs: %d lineup build(s) made ready (%.1fs), %d path(s) re-checked and %d first checked, %d length(s) asked again, off the screen thread",
+                if stats["builds"] or stats["paths"] or stats["rechecks"] or stats["warmed"] or stats.get("facts"):
+                    log.info("[CHANNEL READY] last %.0fs: %d lineup build(s) made ready (%.1fs), %d path(s) re-checked and %d first checked, %d length(s) asked again, %d file(s) had their key, row, gain and track read ahead, off the screen thread",
                              now - stats["last_log"] if stats["last_log"] else 0.0, stats["builds"], stats["build_s"],
-                             stats["paths"], stats["warmed"], stats["rechecks"])
-                stats.update(builds=0, build_s=0.0, paths=0, rechecks=0, warmed=0, last_log=now)
+                             stats["paths"], stats["warmed"], stats["rechecks"], stats.get("facts", 0))
+                stats.update(builds=0, build_s=0.0, paths=0, rechecks=0, warmed=0, facts=0, last_log=now)
         _channel_ready_wake.wait(PRIME_RECHECK_SECONDS)
         _channel_ready_wake.clear()
         if _app_shutting_down.is_set():
@@ -19259,6 +19836,86 @@ def _fe_existing_schedule_paths(context):
         if p:
             out.append(os.path.normpath(p))
     return out
+
+
+# ============================================================================
+# SECTION: Add Media: lineup of a block not on air yet
+# ============================================================================
+
+_file_add_precache_lock = threading.Lock()
+_file_add_precache_wanted = {}
+_file_add_precache_wake = threading.Event()
+_file_add_precache_thread = [None]
+
+
+def _request_file_add_precache(channel_key, block_name):
+    """Asks the FileAddPrecache thread to build and store the lineup of a block that was just given files on the watched channel and is not on air yet; a second ask for the same block before it starts is done once."""
+    with _file_add_precache_lock:
+        _file_add_precache_wanted[(str(channel_key).zfill(2), str(block_name))] = True
+        _thread = _file_add_precache_thread[0]
+        if _thread is None or not _thread.is_alive():
+            _thread = threading.Thread(target=_file_add_precache_worker, daemon=True, name="FileAddPrecache")
+            _file_add_precache_thread[0] = _thread
+            _thread.start()
+    _file_add_precache_wake.set()
+
+
+def _file_add_precache_worker():
+    """FileAddPrecache thread: builds each asked-for block lineup, one at a time, in the order asked."""
+    while not _app_shutting_down.is_set():
+        _file_add_precache_wake.wait()
+        _file_add_precache_wake.clear()
+        while not _app_shutting_down.is_set():
+            with _file_add_precache_lock:
+                if not _file_add_precache_wanted:
+                    break
+                _channel_key, _block_name = next(iter(_file_add_precache_wanted))
+                _file_add_precache_wanted.pop((_channel_key, _block_name), None)
+            with _background_activity("file_add_precache"):
+                _precache_added_block_rotation(_channel_key, _block_name)
+
+
+def _precache_added_block_rotation(target_ch, active_b):
+    """Deals the lineup of a block not on air yet from its saved files, the way the scheduler deals it, and stores it in the block rotation cache and as planned hub rows, so the block is ready when it starts."""
+    try:
+        _ch_info_add = db.channels_db.get(target_ch, {})
+        _plog_add = _ch_info_add.setdefault("playback_log", {})
+        _items_add = list(_ch_info_add.get("schedules", {}).get(active_b, []))
+        _raw_add = build_raw_tracks(_items_add, _cached_path_exists)
+        _pend_add = build_pending_tracks(_items_add, _cached_path_exists)
+        if not _raw_add:
+            return
+        _now_add = broadcast_clock.now().replace(tzinfo=None)
+        _boff_add = block_seed_offset(active_b, 0)
+        _seed_add = block_day_seed(block_start_date(_now_add, active_b), target_ch, _boff_add)
+        _order_seed_add = _start_order_seed(_ch_info_add, _boff_add)
+        _sp_snap_add = copy.deepcopy(_plog_add.get("show_pos", {}))
+        _pt_add = max(0, _ch_info_add.get("pair_threshold_minutes", 15)) * 60
+        _so_add = _plog_add.get("show_order", {}).get(active_b)
+        _vt_add, _, _ = build_block_rotation(
+            _raw_add, _ch_info_add, _sp_snap_add,
+            _seed_add, block_length_seconds(active_b), target_ch,
+            _so_add, _order_seed_add,
+            pending_tracks=_pend_add,
+        )
+        if not _vt_add:
+            return
+        _bkey_add = block_key_for(_now_add, active_b)
+        _brc_add = _plog_add.setdefault("block_rotation_cache", {})
+        _brc_add[_bkey_add] = {
+            "tracks": [p for p in lineup_paths(_vt_add) if p],
+            "durations": _snapshot_track_durations(_vt_add),
+            "groups": lineup_groups(_vt_add, _pt_add),
+            "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
+        }
+        _write_prebuilt_block_to_hub(target_ch, _bkey_add, _vt_add, _raw_add)
+        if len(_brc_add) > BLOCK_ROTATION_CACHE_MAX_BLOCKS:
+            for _k_prune in sorted(_brc_add)[:len(_brc_add) - BLOCK_ROTATION_CACHE_MAX_BLOCKS]:
+                _brc_add.pop(_k_prune, None)
+        db.save_settings_async()
+    except Exception as _pre_err:
+        _log_warn_throttled("rtv_L14717", f"[FILE ADD] Warning: pre-cache rotation failed "
+              f"for '{active_b}' ch{target_ch}: {_pre_err}")
 
 
 def _reconcile_schedule_entries(existing_entries, final_paths):
@@ -19843,6 +20500,17 @@ def _prime_channel_block_loudness(ch_key, current_file, current_block):
                 _loudness_priming_inflight.discard(_prime_key)
             log.info("[TUNE PRIME] ch%s: left within %.1fs, its first loudness scan is not started", ch_str, _settle)
             return
+        # WARNING: owner 2026-11-25: "if loudness gain is ready grab it but if its not, scan it after the buffer is there"; the scan waits until the tuned picture is steady with its buffer (the governor's tune hold).
+        while performance_governor is not None and performance_governor.tune_in_progress():
+            if _app_shutting_down.wait(0.25):
+                with _loudness_priming_lock:
+                    _loudness_priming_inflight.discard(_prime_key)
+                return
+            if str(app_state.get("current_channel", "")).zfill(2) != ch_str:
+                with _loudness_priming_lock:
+                    _loudness_priming_inflight.discard(_prime_key)
+                log.info("[TUNE PRIME] ch%s: left before its picture was steady, its first loudness scan is not started", ch_str)
+                return
         # WARNING: tune-in loudness scans run at priority and are never held by the governor, so they take turns: at most _LOUDNESS_PRIME_AT_ONCE at once (the channel on screen plus one it just left), and a scan still waiting its turn when the viewer leaves is dropped. Owner log 2026-11-06 had 8 of them standing at once, 24 ffmpeg windows on a 4-core PC.
         while not _loudness_prime_turns.acquire(timeout=1.0):
             if _app_shutting_down.is_set() or str(app_state.get("current_channel", "")).zfill(2) != ch_str:
@@ -20252,7 +20920,7 @@ SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD = performance_governor.SCAN_PICTURE_BOX_LOOKU
 
 _scan_snapshot_lock = threading.Lock()
 _scan_snapshot = {"built_at": -1e9, "channels": {}}
-_scan_pb_has_box = set()
+_scan_pb_has_box = cache_manager.flags("picture boxes found")
 _scan_progress_complete_logged = {}
 _scan_done_sticky = {}
 
@@ -20360,9 +21028,7 @@ def _scan_picture_box_reported(norm_p, lookups_left):
     return _scan_picture_box_known(norm_p, lookups_left)
 
 
-_scan_burned_in_done = set()
-
-
+_scan_burned_in_done = cache_manager.flags("burned-in caption checks")
 def _scan_burned_in_wanted(norm_p):
     """True when the file's picture should be searched for burned-in captions: captions are on, it is a video, and its own server is not the one deciding it."""
     if os.path.splitext(norm_p)[1].lower() not in media.VIDEO_DISPLAY_EXTS:
@@ -20507,10 +21173,85 @@ def _compute_channel_scan_progress(snap, lookups_left):
     return progress
 
 
+def _prefetch_picture_boxes(snap):
+    """Reads in one go, off the screen thread, the stored picture box of every file of the snapshot not known yet, so the bar counts every file the scans finished (also while this program was closed) on its first build instead of SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD a time."""
+    # WARNING: owner 2026-11-26: "is it old scans finishing, or just catching up that the scans were done ... it needs update that load bar better"; it was the bar catching up: at the start no lookups were allowed while the channel loaded, then 200 a build, so files the tray finished overnight came back onto the bar one by one.
+    try:
+        lib = _get_probe_library()
+        if lib is None:
+            return 0
+        want = {}
+        for rec in (snap or {}).get("channels", {}).values():
+            for _lineup in [rec.get("ordered") or []] + [ob.get("ordered") or [] for ob in rec.get("other_blocks", [])]:
+                for entry in _lineup:
+                    for p in _paths_from_entry(entry):
+                        if p:
+                            norm_p = os.path.normpath(p)
+                            if norm_p not in _picture_box_done and norm_p not in _scan_pb_has_box:
+                                want[os.path.normpath(os.path.abspath(norm_p)).lower()] = norm_p
+        if not want:
+            return 0
+        import media_library as _ml
+        rows = lib.library.path_rows_many(list(want), "l.picture_box, l.picture_box_detector_version")
+        found = 0
+        for key, row in rows.items():
+            if row and row[0] and (row[1] or 0) >= _ml.PICTURE_BOX_DETECTOR_VERSION and key in want:
+                _scan_pb_has_box.add(want[key])
+                found += 1
+        return found
+    except Exception as _swallowed_error:
+        _log_swallowed("_prefetch_picture_boxes", _swallowed_error)
+        return 0
+
+
+def _shared_scan_progress():
+    """{channel: (done, total)} the server's file scan reports for the channels on screen: the tray's own report on this PC while a server profile is viewed (or its regular channels, keyed "regular"), the server's channel clocks on a User PC. {} when there is none."""
+    # WARNING: owner 2026-11-26: "that load bar between server streaming, profile watching on server, and the tray to all show the same load progress and show complete when opened even if it finished when it was closed".
+    out = {}
+    try:
+        clocks = app_state.get("server_channel_clocks") or {}
+        slot = app_state.get("active_local_profile")
+        if slot is not None or _server_service_should_run():
+            import json as _json
+            with open(os.path.join(_app_logs_dir(), "temp", "server_scan_state.json"), "r", encoding="utf-8") as fh:
+                data = _json.load(fh)
+            mine = (data.get("progress") or {}).get("regular" if slot is None else str(slot)) or {}
+            for ch, v in mine.items():
+                out[str(ch).zfill(2)] = (int(v[0]), int(v[1]))
+        elif clocks.get("channels"):
+            for ch, clock in clocks["channels"].items():
+                v = clock.get("scan") if isinstance(clock, dict) else None
+                if v:
+                    out[str(ch).zfill(2)] = (int(v[0]), int(v[1]))
+    except FileNotFoundError:
+        # WARNING: the normal end: the tray on this PC has not written its report yet (or this PC runs no server).
+        return {}
+    except (OSError, ValueError, TypeError, AttributeError, IndexError) as _swallowed_error:
+        _log_swallowed("_shared_scan_progress", _swallowed_error)
+        return {}
+    return out
+
+
+def _merge_shared_scan_progress(progress, shared):
+    """The bar's counts with the server's report laid over them: a server channel shows the server's own count, a regular channel never less than the tray reported done."""
+    out = dict(progress)
+    for ch, (s_done, s_total) in (shared or {}).items():
+        if s_total <= 0:
+            continue
+        locked = bool(db is not None and db.channels_db.get(ch, {}).get("server_locked", False))
+        own = out.get(ch)
+        if locked or own is None:
+            out[ch] = (min(s_done, s_total), s_total)
+        else:
+            out[ch] = (max(own[0], min(s_done, own[1])), own[1])
+    return out
+
+
 def _publish_channel_scan_progress(snap):
     """Writes app_state["_channel_scan_progress"] = {channel: (done, total)}; the Channels tab only reads it."""
+    _prefetch_picture_boxes(snap)
     lookups_left = [0 if _python_heavy_should_pause() else SCAN_PICTURE_BOX_LOOKUPS_PER_BUILD]
-    progress = _compute_channel_scan_progress(snap, lookups_left)
+    progress = _merge_shared_scan_progress(_compute_channel_scan_progress(snap, lookups_left), _shared_scan_progress())
     app_state["_channel_scan_progress"] = progress
     app_state["_channel_scan_progress_ready"] = True
     app_state["_channel_scan_progress_more"] = lookups_left[0] <= 0
@@ -20583,9 +21324,7 @@ def _scan_snapshot_worker():
 
 
 _snapshot_inputs_seen = [None, 0.0]
-_logged_missing_probe_paths = set()
-
-
+_logged_missing_probe_paths = cache_manager.flags("missing files logged")
 def _log_missing_probe_path_once(raw_path, ch_key, block_key):
     if not raw_path or raw_path in _logged_missing_probe_paths:
         return
@@ -20661,9 +21400,7 @@ def _gather_music_probe_queue():
     return [(kind, ch_key, block_key, norm_p, cls) for cls, _distance, kind, ch_key, block_key, norm_p in ranked]
 
 
-_music_duration_scan_attempted = set()
-
-
+_music_duration_scan_attempted = cache_manager.flags("music lengths tried")
 # WARNING: the fallback numbers below must match MUSIC_PRECACHE_IDLE_SLEEP_SECONDS, MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS, MUSIC_PRECACHE_SAVE_THROTTLE_SECONDS in performance_governor.py; they are used only when that module fails to import.
 MUSIC_PRECACHE_IDLE_SLEEP_SECONDS = performance_governor.MUSIC_PRECACHE_IDLE_SLEEP_SECONDS if performance_governor is not None else 20.0
 MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS = performance_governor.MUSIC_PRECACHE_BETWEEN_TRACKS_SECONDS if performance_governor is not None else 0.5
@@ -20881,13 +21618,6 @@ def _hub_future_arm_channel(channel_key):
                 station_clock.arm_in("hub_future:" + channel_key, _end - _now + 2.0, _hub_future_wake_up)
     except Exception as _swallowed_error:
         _log_swallowed("_hub_future_arm_channel", _swallowed_error)
-
-
-def _seconds_to_midnight():
-    """Seconds from now on the station clock until the next midnight."""
-    _now = broadcast_clock.now()
-    _next = (_now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return max(1.0, (_next - _now).total_seconds())
 
 
 def _replan_hub_future_soon(ch_str):
@@ -21465,7 +22195,7 @@ def _probe_upcoming_media():
                 log.warning("[SCAN PIPELINE] chain for %s failed (next file continues): %s", os.path.basename(norm_p), e)
 
         _preempted = False
-        _pipeline_items = _order_scan_pipeline(tiers, _gather_deep_backlog_queue())
+        _pipeline_items = _order_scan_pipeline(tiers, _regular_deep_backlog())
         _attempted = set()
         _last_preempt_check = _time.perf_counter()
         _saved_n = 0
@@ -22031,7 +22761,8 @@ def _drive_sample_file(root):
                                 _drive_sample_files[root] = _e.path
                                 return _e.path
                             _fallback = _fallback or _e.path
-                    except OSError:
+                    except OSError as caught_error:
+                        _log_swallowed("drive test: reading a file while looking for a sample", caught_error)
                         continue
     except Exception as _swallowed_error:
         _log_swallowed("_drive_sample_file: looking through the drive", _swallowed_error)
@@ -22108,7 +22839,8 @@ def _drive_profile_store():
     if drive_profile is None:
         return None
     if _drive_profile_store_box[0] is None:
-        _drive_profile_store_box[0] = drive_profile.DriveProfiles(os.path.join(_app_logs_dir(), drive_profile.PROFILE_FILE_NAME))
+        # WARNING: owner 2026-11-26: measured drive profiles are kept data in main/data, not in the logs folder an update clears.
+        _drive_profile_store_box[0] = drive_profile.DriveProfiles(media.data_file_for_base(_app_root_dir(), drive_profile.PROFILE_FILE_NAME))
     return _drive_profile_store_box[0]
 
 
@@ -22355,7 +23087,8 @@ def _scan_capacity_store():
     if scan_capacity is None:
         return None
     if _scan_capacity_store_box[0] is None:
-        _scan_capacity_store_box[0] = scan_capacity.CapacityStore(os.path.join(_app_logs_dir(), scan_capacity.CAPACITY_FILE_NAME))
+        # WARNING: owner 2026-11-26: the measured scan speed is kept data in main/data, not in the logs folder an update clears.
+        _scan_capacity_store_box[0] = scan_capacity.CapacityStore(media.data_file_for_base(_app_root_dir(), scan_capacity.CAPACITY_FILE_NAME))
     return _scan_capacity_store_box[0]
 
 
@@ -22886,6 +23619,7 @@ def _saved_captions_loop():
         try:
             kind, payload = _saved_captions_queue.get(timeout=1.0)
         except queue.Empty:
+            # WARNING: the normal end: nothing to save in this second; the loop looks again.
             continue
         try:
             if kind == "live":
@@ -22921,6 +23655,39 @@ def _start_saved_captions():
 # ============================================================================
 # SECTION: Caption precache worker
 # ============================================================================
+
+
+def _caption_files_ready(paths, facts_of, key_of, held):
+    """How many of the files have captions for their whole length: a caption file or captions in the picture (facts_of(path)["caption_kind"]), or a complete saved copy (held[key_of(path)] marked complete)."""
+    ready = 0
+    for path in paths:
+        try:
+            if facts_of(path).get("caption_kind"):
+                ready += 1
+                continue
+            info = held.get(key_of(path))
+        except Exception as _swallowed_error:
+            _log_swallowed("_caption_files_ready: reading a file's caption facts", _swallowed_error)
+            continue
+        if info is not None and info[1]:
+            ready += 1
+    return ready
+
+
+def _publish_caption_progress(candidates):
+    """Writes app_state["_caption_scan_progress"] = (files with whole captions, files airing ahead) for the Closed Captions label's fill on the Options tab."""
+    import saved_captions
+    paths = [p for p, _is_now, _seek in candidates]
+    try:
+        held = saved_captions.held()
+    except Exception as _swallowed_error:
+        _log_swallowed("_publish_caption_progress: saved captions list", _swallowed_error)
+        held = {}
+    ready = _caption_files_ready(paths, media.file_facts, _saved_captions_key_for, held)
+    before = app_state.get("_caption_scan_progress")
+    app_state["_caption_scan_progress"] = (ready, len(paths))
+    if before is None or (before[0] >= before[1]) != (ready >= len(paths)):
+        log.info("[CAPTION PROGRESS] %d of %d upcoming file(s) have captions for their whole length", ready, len(paths))
 
 
 def _caption_precache_worker():
@@ -22994,6 +23761,7 @@ def _caption_precache_worker():
                 return
             continue
         candidates = _gather_upcoming_caption_candidates()
+        _publish_caption_progress(candidates)
         if not candidates:
             if _app_shutting_down.wait(IDLE_SLEEP):
                 return
@@ -23406,8 +24174,34 @@ STREAM_BUFFER_LOW_S = performance_governor.STREAM_BUFFER_LOW_SECONDS if performa
 STREAM_LINK_WAIT_POLL_S = performance_governor.STREAM_LINK_WAIT_POLL_SECONDS if performance_governor is not None else 0.25
 
 
+def _note_pictures_stopped(f, engine, key, stats):
+    """Marks the moment VLC stopped showing new pictures of a playing show (its shown-pictures count stands still while it plays), so the stall rules see the picture as stopped even though VLC keeps handing over the last one."""
+    # WARNING: owner log 2026-11-25 (send_logs58): The Walking Dead froze on screen for 7 minutes while the sound and captions went on; VLC kept handing over its last picture again, every hand-over counted as a new picture, and the fall back to Static and the re-tune never came (and a still picture burns in).
+    # WARNING: owner logs 2026-11-25 (send_logs65): VLC refreshes its shown-pictures count only now and then, so two looks a moment apart often read the same number while 25 pictures a second were showing; every such look was taken for a stopped picture and Static flashed. The count must stand still for PICTURE_STOPPED_CONFIRM_MS, and the stall rules then count from the moment it last moved.
+    try:
+        _now_t = pygame.time.get_ticks()
+        fr = f.setdefault("pictures", {"key": None, "shown": -1, "moved_at": _now_t})
+        if fr["key"] != key or stats.displayed_pictures != fr["shown"] or stats.displayed_pictures <= 0:
+            fr.update(key=key, shown=stats.displayed_pictures, moved_at=_now_t)
+            app_state["_vlc_pictures_stopped_ticks"] = 0
+            return
+        import vlc as _vlc
+        if engine.player.get_state() != _vlc.State.Playing:
+            fr["moved_at"] = _now_t
+            app_state["_vlc_pictures_stopped_ticks"] = 0
+            return
+        if not app_state.get("_vlc_pictures_stopped_ticks") and _now_t - fr.get("moved_at", _now_t) >= PICTURE_STOPPED_CONFIRM_MS:
+            app_state["_vlc_pictures_stopped_ticks"] = fr["moved_at"]
+            app_state["_last_new_frame_ticks"] = min(app_state.get("_last_new_frame_ticks", fr["moved_at"]) or fr["moved_at"], fr["moved_at"])
+            log.warning("[PICTURE STOPPED] ch%s: VLC plays but has shown no new picture for %d ms; the stall rules count from when it last moved",
+                        app_state.get("current_channel", "?"), _now_t - fr["moved_at"])
+    except Exception as _swallowed_error:
+        _log_swallowed("_note_pictures_stopped", _swallowed_error)
+
+
 def _note_playback_pulse(f, engine, key, stats, now):
     """Logs one [PLAYBACK PULSE] line every few seconds with VLC's position, state, volume and picture/sound counters, and says FROZEN VIDEO or SILENT AUDIO when a counter did not move since the last line."""
+    _note_pictures_stopped(f, engine, key, stats)
     try:
         pulse = f.setdefault("pulse", {"at": 0.0, "key": None, "shown": -1, "played": -1, "pos": -1.0})
         if pulse["key"] != key:
@@ -23755,7 +24549,9 @@ def _share_relay_on():
 def _share_relay_url(path):
     """The loopback address that plays this share file through the relay, or None when it plays straight from the share."""
     if not _share_relay_on():
-        return None
+        # WARNING: owner 2026-11-25: a path too long for Windows to open directly plays through the relay even when the relay is switched off.
+        if globals().get("share_relay") is None or not share_relay.too_long(path):
+            return None
     return share_relay.url_for(path)
 
 
@@ -24595,6 +25391,8 @@ def _background_subsystem_worker():
     # WARNING: the scheduler is the hub's writer: this thread gives it its bookkeeping beat so readers never have to
     threading.Thread(target=_hub_writer_worker, daemon=True, name="HubWriter").start()
 
+    threading.Thread(target=_local_profile_rows_worker, daemon=True, name="LocalProfileRows").start()
+
     threading.Thread(target=_drive_health_monitor_loop, daemon=True, name="DriveHealthMonitor").start()
 
     threading.Thread(target=_changed_file_sweep_loop, daemon=True, name="ChangedFileSweep").start()
@@ -24641,7 +25439,8 @@ def _gain_context():
     """Which setup is on screen: "regular" (servers off, the original mode), "profile:<slot>" (a server profile viewed or being edited on this computer) or "user:<host>:<slot>" (a server streamed to this computer). Manual gain and the hub's schedule rows are kept per context so one never overwrites another."""
     try:
         local = app_state.get("active_local_profile")
-        if local is not None:
+        # WARNING: owner logs 2026-11-25: a profile marked in use while the Regular channel file is loaded is not the setup on screen; filing Regular's rows under the profile sent them to the server's Users.
+        if local is not None and not (db is not None and getattr(db, "config_path", None) and getattr(db, "channels_path", None) == db.config_path):
             return "profile:%s" % local
         # WARNING: owner 2026-11-18: a server profile being edited shows that profile's channels, so its rows and gains are the profile's; filed as Regular they landed on Regular's channel rows and mixed the two setups.
         editing = db.config.get("active_server_slot") if db is not None else None
@@ -25357,7 +26156,7 @@ def _hub_forget_path(norm_path):
 
 # WARNING: the fallback numbers below must match ONDEMAND_DURATION_PROBE_COOLDOWN_SECONDS in performance_governor.py; they are used only when that module fails to import.
 _ONDEMAND_DURATION_PROBE_COOLDOWN_S = performance_governor.ONDEMAND_DURATION_PROBE_COOLDOWN_SECONDS if performance_governor is not None else 30.0
-_ondemand_duration_probe_next = {}
+_ondemand_duration_probe_next = cache_manager.show_memo("length probes waiting")
 _duration_precache_inflight = media._InFlightGuard()
 
 
@@ -25734,10 +26533,8 @@ def _scan_duration_failed(norm_p):
 # ============================================================================
 # SECTION: Picture-box scan hook-up
 # ============================================================================
-_picture_box_done = set()
-_picture_box_guessed = set()
-
-
+_picture_box_done = cache_manager.flags("picture boxes scanned")
+_picture_box_guessed = cache_manager.flags("picture boxes guessed")
 # ============================================================================
 # SECTION: Smart background pacing
 # ============================================================================
@@ -26478,7 +27275,7 @@ def _duration_scan_worker():
                 return
             continue
         try:
-            _items = _order_scan_pipeline(_gather_probe_priority_queue(), _gather_deep_backlog_queue())
+            _items = _order_scan_pipeline(_gather_probe_priority_queue(), _regular_deep_backlog())
         except Exception as e:
             log.warning("[DURATION SCAN] gather failed: %s", e)
             _items = []
@@ -26599,7 +27396,7 @@ SERVER_CHANNEL_WARM_INDEX_HEAD_MB = performance_governor.SERVER_CHANNEL_WARM_IND
 SERVER_CHANNEL_WARM_INDEX_TAIL_MB = performance_governor.SERVER_CHANNEL_WARM_INDEX_TAIL_MB if performance_governor is not None else 1.5
 SERVER_CHANNEL_WARM_INDEX_REREAD_SECONDS = performance_governor.SERVER_CHANNEL_WARM_INDEX_REREAD_SECONDS if performance_governor is not None else 30.0
 # WARNING: the fallback number below must match CHANNEL_PRIME_NEXT_ITEMS in performance_governor.py; it is used only when that module fails to import.
-CHANNEL_PRIME_NEXT_ITEMS = performance_governor.CHANNEL_PRIME_NEXT_ITEMS if performance_governor is not None else 2
+CHANNEL_PRIME_NEXT_ITEMS = performance_governor.CHANNEL_PRIME_NEXT_ITEMS if performance_governor is not None else 4
 # WARNING: the fallback number below must match PRIME_LEAD_SECONDS in performance_governor.py; it is used only when that module fails to import.
 PRIME_LEAD_SECONDS = performance_governor.PRIME_LEAD_SECONDS if performance_governor is not None else 180.0
 # WARNING: the fallback number below must match PRIME_NOT_READY_RETRY_SECONDS in performance_governor.py; it is used only when that module fails to import.
@@ -26614,8 +27411,16 @@ PRIME_RUSH_AHEAD = performance_governor.PRIME_RUSH_AHEAD if performance_governor
 PRIME_RUSH_BEHIND = performance_governor.PRIME_RUSH_BEHIND if performance_governor is not None else 1
 PRIME_RUSH_QUEUE_MAX = performance_governor.PRIME_RUSH_QUEUE_MAX if performance_governor is not None else 12
 # WARNING: the fallback numbers below must match PRIME_SNAPSHOT_SECONDS, PRIME_SNAPSHOT_RETRY_SECONDS, PRIME_SNAPSHOT_ZONE_SECONDS and PRIME_SNAPSHOT_CHANNELS_MAX in performance_governor.py; they are used only when that module fails to import.
-PRIME_SNAPSHOT_SECONDS = performance_governor.PRIME_SNAPSHOT_SECONDS if performance_governor is not None else 15.0
+PRIME_SNAPSHOT_SECONDS = performance_governor.PRIME_SNAPSHOT_SECONDS if performance_governor is not None else 30.0
 PRIME_SNAPSHOT_RETRY_SECONDS = performance_governor.PRIME_SNAPSHOT_RETRY_SECONDS if performance_governor is not None else 10.0
+# WARNING: the fallback number below must match PRIME_NEXT_ITEM_AHEAD_SECONDS in performance_governor.py; it is used only when that module fails to import.
+PRIME_NEXT_ITEM_AHEAD_SECONDS = performance_governor.PRIME_NEXT_ITEM_AHEAD_SECONDS if performance_governor is not None else 180.0
+# WARNING: the fallback number below must match JUGGLE_NEXT_SHOW_FIRST_SECONDS in performance_governor.py; it is used only when that module fails to import.
+JUGGLE_NEXT_SHOW_FIRST_SECONDS = performance_governor.JUGGLE_NEXT_SHOW_FIRST_SECONDS if performance_governor is not None else 30.0
+# WARNING: the fallback number below must match LOCAL_PROFILE_ROWS_HOURS_AHEAD in performance_governor.py; it is used only when that module fails to import.
+LOCAL_PROFILE_ROWS_HOURS_AHEAD = performance_governor.LOCAL_PROFILE_ROWS_HOURS_AHEAD if performance_governor is not None else 12.0
+# WARNING: the fallback number below must match PRIME_PREPARED_FILES_MAX in performance_governor.py; it is used only when that module fails to import.
+PRIME_PREPARED_FILES_MAX = performance_governor.PRIME_PREPARED_FILES_MAX if performance_governor is not None else 40
 PRIME_SNAPSHOT_ZONE_SECONDS = performance_governor.PRIME_SNAPSHOT_ZONE_SECONDS if performance_governor is not None else 60.0
 PRIME_SNAPSHOT_CHANNELS_MAX = performance_governor.PRIME_SNAPSHOT_CHANNELS_MAX if performance_governor is not None else 40
 PRIME_SNAPSHOT_LOG_EVERY_S = performance_governor.PRIME_SNAPSHOT_LOG_EVERY_SECONDS if performance_governor is not None else 30.0
@@ -26623,7 +27428,7 @@ PRIME_SNAPSHOT_LOG_EVERY_S = performance_governor.PRIME_SNAPSHOT_LOG_EVERY_SECON
 SERVER_WARM_AHEAD_SECONDS = performance_governor.SERVER_WARM_AHEAD_SECONDS if performance_governor is not None else 60.0
 # WARNING: the fallback number below must match PRIME_RECHECK_SECONDS in performance_governor.py; it is used only when that module fails to import.
 PRIME_RECHECK_SECONDS = performance_governor.PRIME_RECHECK_SECONDS if performance_governor is not None else 600.0
-_warm_index_done = {}
+_warm_index_done = cache_manager.show_memo("warmed file indexes")
 # WARNING: only _request_next_item_prep writes "request" and only the NextItemPrep thread takes it; a newer request replaces an older one that has not started.
 _next_item_prep_state = {"lock": threading.Lock(), "wake": threading.Event(), "request": None, "thread": None}
 
@@ -26905,7 +27710,7 @@ def _picture_box_scan_worker():
         if _picture_box_lane_wait():
             return
         try:
-            _items = _order_scan_pipeline(_gather_probe_priority_queue(), _gather_deep_backlog_queue())
+            _items = _order_scan_pipeline(_gather_probe_priority_queue(), _regular_deep_backlog())
         except Exception as e:
             log.warning("[PICTURE BOX] gather failed: %s", e)
             _items = []
@@ -27264,7 +28069,7 @@ def _hub_future_worker():
                 _did += 1
                 if _app_shutting_down.wait(_background_scan_pace_seconds(_HUB_FUTURE_BETWEEN_CHANNELS_SECONDS)):
                     return
-        station_clock.arm_in("hub_future:day", _seconds_to_midnight() + 1.0, _hub_future_wake_up)
+        station_clock.arm_in("hub_future:day", station_clock.seconds_to_midnight() + 1.0, _hub_future_wake_up)
         if _did == 0:
             _hub_future_event.wait(PRIME_RECHECK_SECONDS)
             _hub_future_event.clear()
@@ -27815,7 +28620,8 @@ def _server_row(raw):
         entry["is_commercial"] = bool(entry.get("is_commercial")) or kind == "commercial"
         return {"start": float(start), "length": float(length), "kind": str(kind or "episode"), "slot": str(slot),
                 "position": int(position), "entry": entry}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as caught_error:
+        _log_swallowed("server rows: a row from the server's schedule is not in the expected form", caught_error)
         return None
 
 
@@ -27888,6 +28694,105 @@ def _forget_server_rows():
     _server_rows_ready.clear()
     _server_rows_live.clear()
     _server_rows_place["wanted"].clear()
+    _server_rows_local.clear()
+
+
+# ============================================================================
+# SECTION: The profile's rows on the server's own program
+# ============================================================================
+# WARNING: owner 2026-11-24: "the profile created by the server is one .json, one schedule. all is shared and all is the same. the only time it should be building its own scheduling is if you are not using there server building your own channels with local media, or you build the profile with your local media to share."
+# WARNING: the program on the server showing one of this computer's server profiles plays the rows the server service plans for that profile (server_planner), the same rows it sends to every User, read from this computer's HUB where the service keeps them; they go through the same switch-over as a User's (_take_server_rows), but they are never written back into the HUB (_place_server_rows), because the HUB is where they come from.
+
+# WARNING: the fallback number below must match LOCAL_PROFILE_ROWS_LOOK_SECONDS in performance_governor.py; it is used only when that module fails to import.
+LOCAL_PROFILE_ROWS_LOOK_SECONDS = performance_governor.LOCAL_PROFILE_ROWS_LOOK_SECONDS if performance_governor is not None else 30.0
+_server_rows_local = set()
+_local_profile_rows_seen = {"slot": None, "signature": None, "empty_noted": set()}
+
+
+def _local_profile_raw_rows(hub, slot_id, channel_keys, now_epoch):
+    """{channel: [[start, length, kind, slot key, position, guide entry], ...]} of the rows the HUB keeps for one of this computer's server profiles, the shape a server sends its Users; a channel with no rows is left out."""
+    import media_library as _ml
+    _out = {}
+    # WARNING: owner logs 2026-11-25 (server PC, send_logs67 day): reading all 8 days (7,160 rows, ch05 alone 6,000) every 30 s held the library for 1.2 s at a time and a guide preview waited 6.6 s behind it; playback needs only the next hours, and the guide reads the HUB itself.
+    _end = now_epoch + 3600.0 * LOCAL_PROFILE_ROWS_HOURS_AHEAD
+    with _ml.schedule_scope_for(_ml.schedule_scope_of_slot(slot_id)):
+        for _ch in channel_keys:
+            _held = hub.rows_between(_ch, now_epoch - SERVER_ROWS_BEHIND_S, _end, now_epoch, full=True) + hub.planned_rows_between(_ch, now_epoch - SERVER_ROWS_BEHIND_S, _end)
+            _seen, _rows = set(), []
+            for _r in _held:
+                _mark = (str(_r.get("slot_key")), int(_r.get("position") or 0))
+                if _mark in _seen:
+                    continue
+                _seen.add(_mark)
+                _rows.append([_r["planned_start"], _r.get("used_length"), _r.get("kind"), _r.get("slot_key"), _r.get("position"),
+                              _r.get("guide_entry") or {"path": _r.get("path")}])
+            # WARNING: the service's planner files each block as "<block>@<start>"; rows the program worked out itself before (filed under the plain block name) are left out whenever the planner's are there, so two plans of the same hours never mix.
+            if any("@" in str(_r[3]) for _r in _rows):
+                _rows = [_r for _r in _rows if "@" in str(_r[3])]
+            # WARNING: owner logs 2026-11-25: a block planned again opens a new set ("#g<n>") and keeps the old one's unaired rows; only the newest set of each block is played.
+            _newest = {}
+            for _r in _rows:
+                _base, _sep, _gen = str(_r[3]).partition("#g")
+                _newest[_base] = max(_newest.get(_base, 0), int(_gen) if _gen.isdigit() else 0)
+            _rows = [_r for _r in _rows if (int(str(_r[3]).partition("#g")[2]) if str(_r[3]).partition("#g")[2].isdigit() else 0) == _newest[str(_r[3]).partition("#g")[0]]]
+            if _rows:
+                _out[_ch] = _rows
+    return _out
+
+
+def _forget_local_profile_rows():
+    """Drops the rows of the profile the server's program was showing; a streamed server's rows are left alone."""
+    for _ch in list(_server_rows_local):
+        for _held in (_server_rows, _server_rows_starts, _server_rows_watched_at_last_ask, _server_rows_on_air, _server_rows_placed, _server_rows_marked):
+            _held.pop(_ch, None)
+        _server_rows_ready.discard(_ch)
+        _server_rows_live.discard(_ch)
+    _server_rows_local.clear()
+
+
+def _local_profile_rows_step():
+    """One look: while one of this computer's server profiles is on screen, its channels take the rows the service keeps for it (again whenever they changed); when the profile is left, they are dropped."""
+    import media_library as _ml
+    _seen = _local_profile_rows_seen
+    _slot = app_state.get("active_local_profile")
+    if _slot != _seen["slot"]:
+        if _seen["slot"] is not None:
+            _forget_local_profile_rows()
+            log.info("[SERVER ROWS] profile %s left; its rows are no longer played", _seen["slot"])
+        _seen.update({"slot": _slot, "signature": None, "empty_noted": set()})
+    if _slot is None or db is None:
+        return False
+    _channels = sorted(_ch for _ch, _info in db.channels_db.items()
+                       if isinstance(_info, dict) and _info.get("server_locked", False) and _info.get("active", True) and str(_ch).isdigit() and 5 <= int(_ch) <= 44)
+    _raw = _local_profile_raw_rows(_ml.shared_schedule_hub(), _slot, _channels, station_clock.now_epoch())
+    for _ch in _channels:
+        if _ch not in _raw and _ch not in _seen["empty_noted"]:
+            _seen["empty_noted"].add(_ch)
+            log.warning("[SERVER ROWS] profile %s ch%s: the server service has no rows for it in this computer's HUB yet; this program works it out itself until it does", _slot, _ch)
+    _signature = tuple((_ch, len(_rows), _rows[0][0], _rows[-1][0]) for _ch, _rows in sorted(_raw.items()))
+    if _signature == _seen["signature"]:
+        return False
+    _seen["signature"] = _signature
+    _server_rows_local.update(_raw)
+    _take_server_rows(_raw)
+    log.info("[SERVER ROWS] profile %s: the service's rows for %s taken from this computer's HUB (%d row(s)); the same rows its Users play",
+             _slot, ", ".join("ch" + c for c in sorted(_raw)) or "no channel", sum(len(v) for v in _raw.values()))
+    return True
+
+
+def _local_profile_rows_worker():
+    """LocalProfileRows thread: _local_profile_rows_step every LOCAL_PROFILE_ROWS_LOOK_SECONDS, sooner while a profile was just opened or left."""
+    while not _app_shutting_down.is_set():
+        try:
+            _local_profile_rows_step()
+        except Exception as _rows_error:
+            _log_warn_throttled("local_profile_rows", "[SERVER ROWS] the profile's rows could not be read from this computer's HUB: %s", _rows_error)
+        _wait = 2.0 if app_state.get("active_local_profile") != _local_profile_rows_seen["slot"] else LOCAL_PROFILE_ROWS_LOOK_SECONDS
+        _deadline = time.monotonic() + _wait
+        while time.monotonic() < _deadline and not _app_shutting_down.is_set():
+            if app_state.get("active_local_profile") != _local_profile_rows_seen["slot"]:
+                break
+            _app_shutting_down.wait(1.0)
 
 
 def _server_rows_switch_due(channel_key, snap_internal_advance, epoch):
@@ -27922,11 +28827,34 @@ def _station_playback_state(channel_key, epoch=None, snap_internal_advance=False
     return _scheduler_playback_state(_key, snap_internal_advance, trust_recent_stop, allow_cold_anchor_resume)
 
 
+_rows_wait_noted = {}
+
+
+def _scheduler_rows_wait_note(channel_key, seconds):
+    """One line per channel when it airs its own working-out of the cycle on air while the server's rows begin later."""
+    if _rows_wait_noted.get(channel_key):
+        return
+    _rows_wait_noted[channel_key] = True
+    log.info("[SERVER ROWS] ch%s: the server's rows begin in %.0f min; the cycle on air is worked out here until then", channel_key, max(0.0, seconds) / 60.0)
+
+
+def _scheduler_rows_none_note(channel_key):
+    """One line per channel when the server's rows hold nothing now or later for it, so it airs its own working-out."""
+    if _rows_wait_noted.get(channel_key) == "none":
+        return
+    _rows_wait_noted[channel_key] = "none"
+    log.warning("[SERVER ROWS] ch%s: the server's rows hold nothing for it now or later; it is worked out here until the server plans it", channel_key)
+
+
 def _server_rows_state(channel_key, epoch):
     """The playback facts of what the server's rows have on air at epoch, with the items after it prepared for the hub, the same facts the scheduler gives; the schedule-pending answer while no rows are kept yet, and a silent Static where the rows hold nothing."""
     import bisect
     _rows = _server_rows.get(channel_key)
     if not _rows:
+        if any(_server_rows.values()):
+            # WARNING: owner logs 2026-11-25 (send_logs_tray6): a channel the server could not plan sat on SERVER SCHEDULE GAP Static while the other channels had rows; it is worked out here until the server plans it.
+            _scheduler_rows_none_note(channel_key)
+            return _scheduler_playback_state(channel_key, False, False, False)
         return _schedule_pending_state()
     _kept = _server_rows_starts.get(channel_key)
     if _kept is None or _kept[0] is not _rows:
@@ -27934,9 +28862,13 @@ def _server_rows_state(channel_key, epoch):
     _starts = _kept[1]
     # WARNING: owner test 2026-11-23: the item on air is the one that began last; an earlier row whose length runs past the next one's start never takes its place.
     _at = bisect.bisect_right(_starts, epoch) - 1
+    if (_at < 0 or _rows[_at]["start"] + _rows[_at]["length"] <= epoch) and _at + 1 < len(_rows):
+        # WARNING: owner logs 2026-11-25 (send_logs59, tray5): the server's plan starts after the cycle on air, so both computers went to SERVER SCHEDULE GAP although rows were held for later; until the server's rows begin, the cycle on air is worked out here from the profile's shared positions, the same way on every computer.
+        _scheduler_rows_wait_note(channel_key, _rows[_at + 1]["start"] - epoch)
+        return _scheduler_playback_state(channel_key, False, False, False)
     if _at < 0 or _rows[_at]["start"] + _rows[_at]["length"] <= epoch:
-        return {"mode": "Static", "file": "", "seek": 0, "reason": "no_media_scheduled",
-                "reason_detail": "the server's schedule has nothing on this channel at this moment"}
+        _scheduler_rows_none_note(channel_key)
+        return _scheduler_playback_state(channel_key, False, False, False)
     _visualizer = bool(db is not None and db.channels_db.get(channel_key, {}).get("is_visualizer", False))
     _records = []
     for _row in _rows[_at:]:
@@ -27950,7 +28882,7 @@ def _server_rows_state(channel_key, epoch):
             _records.append((_row["start"] + _part_at, _facts))
     _began = [(_start, _facts) for _start, _facts in _records if _start <= epoch]
     if not _began:
-        return {"mode": "Static", "file": "", "seek": 0, "reason": "no_media_scheduled",
+        return {"mode": "Static", "file": "", "seek": 0, "reason": SERVER_SCHEDULE_GAP_REASON,
                 "reason_detail": "the server's schedule has nothing on this channel at this moment"}
     _start, _facts = _began[-1]
     _state = dict(_facts)
@@ -27991,7 +28923,7 @@ def _server_rows_place_loop():
 def _place_server_rows(channel_key):
     """Writes a live channel's server rows into this computer's hub, block by block, after removing the channel's own old rows the first time; a block whose rows did not change is left alone."""
     import media_library as _ml
-    if channel_key not in _server_rows_live:
+    if channel_key not in _server_rows_live or channel_key in _server_rows_local:
         return
     _hub = _ml.shared_schedule_hub()
     _done = db.config.setdefault("server_rows_switched", {}).setdefault(_server_rows_scope_key(), [])
@@ -28017,6 +28949,13 @@ def _place_server_rows(channel_key):
             {"position": r["position"], "path": r["entry"]["path"], "kind": r["kind"], "planned_start": r["start"], "used_length": r["length"],
              "length_source": "schedule", "guide_entry": r["entry"]} for r in _rows], now_epoch=_now)[1]
         _server_rows_placed[(channel_key, _block)] = _signature
+    if _blocks:
+        # WARNING: owner logs 2026-11-25 (send_logs60): a set the server does not send now is not this computer's plan either, or the guide draws ch07's schedule several times over.
+        _put_aside = _hub.set_aside_other_sets(channel_key, list(_blocks), _now)
+        for _gone in [k for k in _server_rows_placed if k[0] == channel_key and k[1] not in _blocks]:
+            _server_rows_placed.pop(_gone, None)
+        if _put_aside:
+            log.info("[SERVER ROWS] ch%s: %d set(s) the server no longer sends were put aside in this computer's hub", channel_key, _put_aside)
     if _written:
         log.info("[SERVER ROWS] ch%s: %d row(s) of the server's schedule written to this computer's hub", channel_key, _written)
 
@@ -30529,7 +31468,7 @@ def _lift_buffering_mute(ch, reason):
         threading.Thread(target=_verify_mute_landed, daemon=True).start()
 
 
-_missing_diag_last = {}
+_missing_diag_last = cache_manager.memo("missing-file notes")
 MISSING_DIAG_GAP_SECONDS = performance_governor.MISSING_DIAG_GAP_SECONDS if performance_governor is not None else 60.0
 MISSING_DIAG_LEVEL_WAIT_SECONDS = performance_governor.MISSING_DIAG_LEVEL_WAIT_SECONDS if performance_governor is not None else 3.0
 
@@ -30621,7 +31560,7 @@ def _diagnose_missing_file(path, ch_key=""):
 MOVED_FILE_SEARCH_SECONDS = performance_governor.MOVED_FILE_SEARCH_SECONDS if performance_governor is not None else 8.0
 MOVED_FILE_SEARCH_MAX_FOLDERS = performance_governor.MOVED_FILE_SEARCH_MAX_FOLDERS if performance_governor is not None else 4000
 MOVED_FILE_SEARCH_MAX_ROOTS = performance_governor.MOVED_FILE_SEARCH_MAX_ROOTS if performance_governor is not None else 200
-_moved_file_started = {}
+_moved_file_started = cache_manager.memo("moved files started")
 _moved_file_pending_drops = {}
 
 
@@ -30687,9 +31626,11 @@ def _find_moved_file_in(roots, filename, wait_s=MOVED_FILE_SEARCH_SECONDS, max_f
                                 stack.append(item.path)
                             elif item.name.lower() == wanted:
                                 return item.path
-                        except OSError:
+                        except OSError as caught_error:
+                            _log_swallowed("looking through a folder for a file", caught_error)
                             continue
-            except OSError:
+            except OSError as caught_error:
+                _log_swallowed("listing a folder while looking for a file", caught_error)
                 continue
     return None
 
@@ -30902,8 +31843,52 @@ def _guide_exit_old_frame_pending():
     return _stages is not None and "vlc play called" not in _stages
 
 
+def _channel_cover_hold(ch, playback_state):
+    """True while a channel waits for its first picture behind the one channel-change cover: a picked server's first schedule, the guide's leftovers until the channel's own picture (or its failure Static), a profile channel still loading, and with the Black transition a Regular channel's first file being measured or a schedule not yet answered."""
+    # WARNING: owner 2026-11-26: "it looks like you added a black transition to my grey transition ... and they fight each other"; these waits once drew layers of their own, and now only keep the one cover up, drawn at the top of the frame.
+    _chk = str(ch).zfill(2)
+    if _chk in ("03", "04"):
+        return False
+    if _awaiting_first_server_schedule():
+        return True
+    _mode = playback_state.get("mode")
+    _reason = playback_state.get("reason")
+    if (_mode == "Video" and app_state.get("_guide_left_on_screen", False)
+            and (not app_state.get("_had_first_frame_this_tune", False) or _guide_exit_old_frame_pending())
+            and not (_failure_static_is_due(_chk)
+                     and not app_state.get("is_playing_video", False)
+                     and pygame.time.get_ticks() >= app_state.get("_video_audio_hold_until", 0))):
+        return True
+    if _mode in ("Video", "Commercial") and _configured_transition_style() != "static":
+        _now = pygame.time.get_ticks()
+        _failed = _failure_static_is_due(_chk) and not app_state.get("is_playing_video", False)
+        if (_failed and not app_state.get("_had_first_frame_this_tune", False)
+                and _now - app_state.get("_last_new_frame_ticks", 0) < _first_load_static_ms(ch)):
+            return True
+        _static_due = (app_state.get("_stall_is_now_static", False)
+                       or app_state.get("_static_hold_until_frame", False)
+                       or _now < app_state.get("_first_media_static_until_ticks", 0))
+        if (not _failed and not _static_due and _now < app_state.get("_video_audio_hold_until", 0)
+                and not (_loudness_hold_last_frame_active() and _has_last_video_frame(context="fullscreen"))):
+            return True
+        # WARNING: owner 2026-11-26: with no picture of its own yet and none kept (a channel change clears the kept picture, a show-to-commercial change keeps it), the channel is still behind the cover; both video passes once painted their own grey here.
+        if not _failed and not _static_due and not _has_last_video_frame(context="fullscreen"):
+            return True
+    if _mode != "Static":
+        return False
+    if _local_profile_still_loading(("live", str(ch)), _reason):
+        return True
+    if _configured_transition_style() == "static":
+        return False
+    return _reason == SCHEDULE_PENDING_REASON or _regular_channel_still_loading(ch, _reason)
+
+
 def _note_fresh_live_video_frame(ch):
-    """Bookkeeping for a newly decoded live-TV frame, run by the render pass that consumes it."""
+    """Bookkeeping for a newly decoded live-TV frame, run by the render pass that consumes it; while VLC shows no new picture (_note_pictures_stopped) the last-picture time stays where the pictures stopped."""
+    _stopped = app_state.get("_vlc_pictures_stopped_ticks") or 0
+    if _stopped:
+        app_state["_last_new_frame_ticks"] = min(app_state.get("_last_new_frame_ticks", _stopped), _stopped)
+        return
     app_state["_last_new_frame_ticks"] = pygame.time.get_ticks()
     if not app_state.get("_had_first_frame_this_tune", False) and performance_governor is not None:
         performance_governor.note_tune_first_picture()
@@ -30922,6 +31907,8 @@ def _note_fresh_live_video_frame(ch):
         _tune_timeline_report(ch)
     app_state["_had_first_frame_this_tune"] = True
     app_state["_static_hold_until_frame"] = False
+    app_state["_first_media_static_until_ticks"] = 0
+    _channels_on_fault_static.discard(str(ch).zfill(2))
     app_state["_fault_static_on"] = False
     if str(ch) != "04":
         if app_state.get("_guide_left_on_screen", False) and app_state.get("_guide_exit_t0"):
@@ -31355,13 +32342,10 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
     if old_ch == "04" and new_ch != "04":
         global _last_screen_mode_picture_rect
         _last_screen_mode_picture_rect = None
-        # WARNING: owner 2026-11-13: leaving the guide, the guide preview's picture stayed on screen through the channel change; a black layer covers the screen from the guide's exit until the channel's own first picture (at most the first-load wait), so nothing of the preview can show.
-        app_state["_guide_exit_black_until"] = pygame.time.get_ticks() + _first_load_static_ms(new_ch)
+        # WARNING: owner 2026-11-13: leaving the guide, the guide preview's picture stayed on screen through the channel change; the one channel-change cover stays up until the channel's own first picture (_channel_cover_hold). (at most the first-load wait), so nothing of the preview can show.
         # WARNING: owner 2026-11-15: the guide preview's grey/static timers belong to moving between preview rows only; a real channel change leaving the guide drops them so no preview background comes up between channels.
         app_state["guide_preview_black_until"] = 0
         app_state["guide_preview_static_until"] = 0
-    elif new_ch == "04":
-        app_state["_guide_exit_black_until"] = 0
 
     if old_ch == "03" and new_ch != "03" and app_state.get("surf_origin") != "03":
         _run_on_screen_thread(_quiet_game_channel)
@@ -31653,7 +32637,9 @@ def change_channel(new_ch, is_surfing=False, force_reload=False, internal_advanc
     if not internal_advance and not _warm_continue_skip_stop:
         _clear_last_video_frame(context="fullscreen")
     if not internal_advance:
-        app_state["_static_hold_until_frame"] = False
+        # WARNING: owner 2026-11-25: "so even on return to that channel, it should still be static"; a channel left on its fault Static opens under the Static again until its picture comes.
+        app_state["_static_hold_until_frame"] = str(new_ch).zfill(2) in _channels_on_fault_static
+        app_state["_first_media_static_until_ticks"] = 0
 
     _transition_style_now = _configured_transition_style()
     if is_boot:
@@ -32581,7 +33567,7 @@ _wedged_engine_replacement_inflight = False
 _dvd_engine_rebuild_deferred = False
 
 
-_picture_end_checked = set()
+_picture_end_checked = cache_manager.flags("picture ends checked")
 _picture_end_checked_lock = threading.Lock()
 
 
@@ -32618,6 +33604,59 @@ def _start_picture_end_check(stalled_str):
         _picture_end_checked.add(norm_path)
     threading.Thread(target=_check_picture_end_after_stall, args=(stalled_str, norm_path),
                      daemon=True, name="PictureEndCheck").start()
+
+
+# WARNING: the fallback numbers below must match KEYFRAME_START_PREROLL_S and KEYFRAME_START_AHEAD_S in performance_governor.py; they are used only when that module fails to import.
+KEYFRAME_START_PREROLL_S = performance_governor.KEYFRAME_START_PREROLL_S if performance_governor is not None else 2.0
+KEYFRAME_START_AHEAD_S = performance_governor.KEYFRAME_START_AHEAD_S if performance_governor is not None else 4.0
+# WARNING: the fallback numbers below must match OPENING_STALL_MS, OPENING_STALL_MAX_MS and OPENING_RECEIVING_GRACE_S in performance_governor.py; they are used only when that module fails to import.
+OPENING_STALL_MS = performance_governor.OPENING_STALL_MS if performance_governor is not None else 8000
+OPENING_STALL_MAX_MS = performance_governor.OPENING_STALL_MAX_MS if performance_governor is not None else 30000
+OPENING_RECEIVING_GRACE_S = performance_governor.OPENING_RECEIVING_GRACE_S if performance_governor is not None else 3.0
+
+
+def _keyframe_start_for(filepath, seek_seconds):
+    """The key frame an open at seek_seconds should start on when the one before it is more than KEYFRAME_START_PREROLL_S back (VLC would decode everything from it first): the next one when it is at most KEYFRAME_START_AHEAD_S ahead; None when no key frame is that close ahead (the open decodes up to the time asked), when the key frame before is close, or when the file's key frames are not known."""
+    try:
+        if share_relay is None:
+            return None
+        table = share_relay.keyframe_table(filepath)
+        if not table:
+            return None
+        before = None
+        after = None
+        for t, _off in table:
+            if t <= seek_seconds:
+                before = t
+            else:
+                after = t
+                break
+        if before is None or seek_seconds - before <= KEYFRAME_START_PREROLL_S:
+            return None
+        if after is not None and after - seek_seconds <= KEYFRAME_START_AHEAD_S:
+            return float(after)
+        # WARNING: owner logs 2026-11-25 (send_logs69): starting on the key frame before put the picture up to its distance behind the schedule for the whole show (Jurassic Park 4.4 s); with no key frame close ahead the open decodes up to the time asked.
+        return None
+    except Exception as _swallowed_error:
+        _log_swallowed("_keyframe_start_for", _swallowed_error)
+        return None
+
+
+def _open_still_receiving():
+    """True while the player is still opening or buffering a file the relay handed it bytes of in the last OPENING_RECEIVING_GRACE_S seconds, and the open began less than OPENING_STALL_MAX_MS ago: a slow open that is getting somewhere is left to finish."""
+    # WARNING: owner logs 2026-11-25 (send_logs64): Die Hard 5 opened slowly every time; the 8 s opening watchdog and the no-new-picture re-tune threw each open away and started another (two at once at 17:17:20), 15 opens and 98 s of Static before one was left long enough to show its picture.
+    try:
+        if vlc_engine is None or share_relay is None:
+            return False
+        started = app_state.get("last_video_play_started_at", 0)
+        if not started or pygame.time.get_ticks() - started > OPENING_STALL_MAX_MS:
+            return False
+        if vlc_engine.get_playback_state()[0] not in ("opening", "buffering"):
+            return False
+        return share_relay.served_within(getattr(vlc_engine, "current_filepath", "") or "", OPENING_RECEIVING_GRACE_S)
+    except Exception as _swallowed_error:
+        _log_swallowed("_open_still_receiving", _swallowed_error)
+        return False
 
 
 def _recover_from_playback_stall(stalled_ch, stalled_ms):
@@ -33321,6 +34360,9 @@ def _note_vlc_decode_line(line_text):
             _note_cpu_decoding(True)
 
 
+_vlc_log_written = [0]
+
+
 def _vlc_log_writer_loop():
     f = None
     while True:
@@ -33347,8 +34389,15 @@ def _vlc_log_writer_loop():
                 continue
             if f is None:
                 f = open(path, "a", encoding="utf-8", errors="ignore")
+                _vlc_log_written[0] = f.tell()
             f.write(line_text + "\n")
             f.flush()
+            _vlc_log_written[0] += len(line_text) + 1
+            # WARNING: owner 2026-11-26: VLC's debug log grew for as long as the app stayed open; past the cache manager's log cap it is moved to vlc-debug_previous.log and a new one starts.
+            if _vlc_log_written[0] > cache_manager.LOG_FILE_MAX_BYTES:
+                f.close()
+                f = None
+                cache_manager.cap_log_file(path, cache_manager.LOG_FILE_MAX_BYTES)
         except Exception:
             try:
                 if f is not None:
@@ -34338,6 +35387,8 @@ def _trigger_crt_off(action):
 
 app_state["_heartbeat_last_ticks"] = pygame.time.get_ticks()
 threading.Thread(target=_vlc_log_writer_loop, daemon=True, name="VlcLogWriter").start()
+# WARNING: owner 2026-11-26: the cache manager sweeps old memo entries, cache folders, full logs and left-behind temp files from here on.
+cache_manager.start()
 threading.Thread(target=_vlc_native_log_reader_loop, daemon=True, name="VlcLogReader").start()
 
 
@@ -34802,12 +35853,6 @@ while True:
                     _bmode_add   = _ch_info_add.get("block_mode", "full_day")
                     _now_h_add   = broadcast_clock.now().hour
 
-                    _bseed_offsets_add = {
-                        "Morning": 100, "Evening": 200, "Night": 300, "Full Day": 500,
-                    }
-                    for _sbi_add, _sbn_add in enumerate(SIX_HOUR_BLOCK_NAMES):
-                        _bseed_offsets_add[_sbn_add] = 600 + _sbi_add * 100
-
                     if _smode_add == "marathon":
                         _live_block_add = "Marathon"
                     elif _bmode_add == "full_day":
@@ -34833,61 +35878,8 @@ while True:
                         _plog_add["sched_cached_tracks"] = []
                         _plog_add["sched_cached_durations"] = {}
                     else:
-                        
-                        try:
-                            _plog_add   = _ch_info_add.setdefault("playback_log", {})
-                            _scheds_add = _ch_info_add.get("schedules", {})
-                            _items_add  = _scheds_add.get(active_b, [])
-                            _path_exists_add = os.path.exists
-                            _raw_add = build_raw_tracks(
-                                _items_add, _path_exists_add)
-                            _pend_add = build_pending_tracks(
-                                _items_add, _path_exists_add)
-                            if _raw_add:
-                                _now_add = broadcast_clock.now().replace(tzinfo=None)
-                                _boff_add = _bseed_offsets_add.get(active_b, 0)
-                                _seed_date_add = block_start_date(_now_add, active_b)
-                                _seed_add = block_day_seed(
-                                    _seed_date_add, target_ch, _boff_add)
-                                _order_seed_add = _start_order_seed(
-                                    _ch_info_add, _boff_add)
-                                _sp_snap_add = copy.deepcopy(_plog_add.get("show_pos", {}))
-                                _pt_add = max(0, _ch_info_add.get(
-                                    "pair_threshold_minutes", 15)) * 60
-                                _eom_add = _ch_info_add.get(
-                                    "episode_order_mode", "sequential")
-                                _so_add = (_plog_add.get("show_order", {})
-                                           .get(active_b))
-                                _bdur_add = block_length_seconds(active_b)
-
-                                _vt_add, _, _ = build_block_rotation(
-                                    _raw_add, _ch_info_add, _sp_snap_add,
-                                    _seed_add, _bdur_add, target_ch,
-                                    _so_add, _order_seed_add,
-                                    pending_tracks=_pend_add,
-                                )
-                                if _vt_add:
-                                    _bkey_add = block_key_for(_now_add, active_b)
-                                    _cpaths_add = lineup_paths(_vt_add)
-                                    _cdur_add = _snapshot_track_durations(_vt_add)
-                                    _brc_add = _plog_add.setdefault(
-                                        "block_rotation_cache", {})
-                                    _brc_add[_bkey_add] = {
-                                        "tracks": [p for p in _cpaths_add if p],
-                                        "durations": _cdur_add,
-                                        "groups": lineup_groups(_vt_add, _pt_add),
-                                        "pairing_rule_version": SHORT_EPISODE_PAIRING_VERSION,
-                                    }
-                                    _write_prebuilt_block_to_hub(target_ch, _bkey_add, _vt_add, _raw_add)
-                                    if len(_brc_add) > BLOCK_ROTATION_CACHE_MAX_BLOCKS:
-                                        for _k_prune in sorted(_brc_add)[
-                                                :len(_brc_add) - BLOCK_ROTATION_CACHE_MAX_BLOCKS]:
-                                            _brc_add.pop(_k_prune, None)
-                                    db.save_settings_async()
-                                    
-                        except Exception as _pre_err:
-                            _log_warn_throttled("rtv_L14717", f"[FILE ADD] Warning: pre-cache rotation failed "
-                                  f"for '{active_b}' ch{target_ch}: {_pre_err}")
+                        # WARNING: owner report 2026-11-02 (weaker PC, menus lagged while media loaded): the lineup of a block that is not on air yet is built on the FileAddPrecache thread; built here it checked every file and dealt the whole block on the screen thread.
+                        _request_file_add_precache(target_ch, active_b)
 
                 # WARNING: no separate scanner for the files just added (removed 2026-11-02, it measured every added file in folder order outside the scan order, the pause and games); the ordered scans are told below and pick them up at once.
                 _note_scan_work_added()
@@ -36432,6 +37424,7 @@ while True:
                         if srv_sel == 0:
                             if app_state.get("active_remote_server") is not None:
                                 _disconnect_remote_server("role changed to Server")
+                            _leave_local_profile_for_role_change("Server")
                             _forget_server_pick()
                             if _srv_role_now != "server":
                                 # WARNING: owner 2026-11-10: coming back to Server from User must not land on a profile that looks still open for editing; a profile viewed as a User on this computer is left, and the viewer picks a profile and presses Manage Server again.
@@ -36445,6 +37438,7 @@ while True:
                         elif srv_sel == 1:
                             if app_state.get("active_remote_server") is not None:
                                 _disconnect_remote_server("role changed to User")
+                            _leave_local_profile_for_role_change("User")
                             _forget_server_pick()
                             if db.config.get("active_server_slot") is not None:
                                 db.leave_server_slot()
@@ -37903,7 +38897,7 @@ while True:
             vlc_state, _len_ms = vlc_engine.get_playback_state()
             if vlc_state in ("opening", "buffering"):
                 last_play_at = app_state.get("last_video_play_started_at", 0)
-                if last_play_at > 0 and pygame.time.get_ticks() - last_play_at > 8000:
+                if last_play_at > 0 and pygame.time.get_ticks() - last_play_at > OPENING_STALL_MS and not _open_still_receiving():
                     _stall_attempt_id = getattr(vlc_engine, "_current_attempt_id", None)
                     log.warning(f"[WATCHDOG][ATTEMPT {_stall_attempt_id}] Video stalled in Opening/Buffering on ch{ch} for 8s+, treating as failed.")
                     is_video_finished = True
@@ -38000,12 +38994,16 @@ while True:
                 app_state["is_playing_video"] = False
 
                 _peek_left = None
+                _rearm_ok = _tail_hold_done and int(app_state.get("_slot_tail_hold_rearms", 0) or 0) < SLOT_TAIL_HOLD_REARMS_MAX
+                if not _tail_hold_done:
+                    app_state["_slot_tail_hold_rearms"] = 0
                 if _finish_reason != "error" and not _tail_hold_done and current_playback_state.get("mode") == "Commercial":
                     # WARNING: owner 2026-11-18: a server channel that drifted from the server's time catches up here, between two commercial clips, and nowhere inside a show.
                     _break_hold = _server_time_settle_in_break(ch, current_playback_state)
                     if _break_hold is not None:
                         _break_hold["block"] = current_playback_state.get("block")
-                if _finish_reason != "error" and not _tail_hold_done and _break_hold is None and SLOT_TAIL_HOLD_MAX_SECONDS > 0 and current_playback_state.get("file"):
+                # WARNING: owner log 2026-11-24 18:21 (send_logs52, 90s Commercials S02.E5): the hold ran out 0.4 s before the schedule's own clock left the clip, so the clip was opened again 0.3 s from its end and the next one started 1.7 s in; at the end of a hold the schedule is asked again and a clip it still has on air is held again for what is left.
+                if _finish_reason != "error" and (not _tail_hold_done or _rearm_ok) and _break_hold is None and SLOT_TAIL_HOLD_MAX_SECONDS > 0 and current_playback_state.get("file"):
                     # WARNING: the schedule is asked here, before the repeat guard is armed for the clip that just ended, so the answer is where the clock is in that clip's slot.
                     try:
                         _peek = calculate_slotted_playback_state(ch, snap_internal_advance=True)
@@ -38016,6 +39014,10 @@ while True:
                             # WARNING: owner logs 2026-11-23 11:54 and 13:51 to 14:25 (streaming PC): a hold that ended 0.2 s before the slot's end, to open the next item early, asked the clock while the same commercial was still on it; it was opened again at its very end and every next commercial started 1 to 1.4 s late. The last picture is held to the slot's end, so the next answer is always the next item.
                             _tail_hold_left = _peek_left + 0.02
                             _tail_hold_file = str(_peek["file"])
+                            if _tail_hold_done:
+                                app_state["_slot_tail_hold_rearms"] = int(app_state.get("_slot_tail_hold_rearms", 0) or 0) + 1
+                                log.info("[TAIL HOLD] ch%s: the hold ran out but the schedule still has %s on air for %.2fs more; the last picture is held again (%d of %d) instead of reopening it at its end",
+                                         ch, os.path.basename(_tail_hold_file), _peek_left, app_state["_slot_tail_hold_rearms"], SLOT_TAIL_HOLD_REARMS_MAX)
                     except Exception as _swallowed_error:
                         _log_swallowed("main script: tail hold schedule check", _swallowed_error)
 
@@ -38240,7 +39242,8 @@ while True:
                 app_state["_hold_last_frame_until"] = max(app_state.get("_hold_last_frame_until", 0), _hold_until_ms)
                 app_state["_video_audio_hold_until"] = max(app_state.get("_video_audio_hold_until", 0), _hold_until_ms)
                 _skip_advance_this_frame = True
-                log.info("[TAIL HOLD] ch%s: %s reached its end before its slot does -- the last picture stays up for %.2fs more, then the next item opens so it starts at its first second", ch, os.path.basename(str(_tail_hold_file)), _tail_hold_left)
+                if not _tail_hold_done:
+                    log.info("[TAIL HOLD] ch%s: %s reached its end before its slot does -- the last picture stays up for %.2fs more, then the next item opens so it starts at its first second", ch, os.path.basename(str(_tail_hold_file)), _tail_hold_left)
             if _skip_advance_this_frame:
                 pass
             elif is_video_finished and _watchdog_consecutive_errors.get(_wd_ch_key, 0) >= _WATCHDOG_ERROR_BAIL_AFTER:
@@ -38278,7 +39281,22 @@ while True:
             if current_media:
                 loaded_path = os.path.normpath(_vlc_mrl_path(current_media.get_mrl())).lower()
             sched_path = os.path.normpath(current_playback_state["file"]).lower()
+            _finish_first = False
             if loaded_path and loaded_path != sched_path:
+                try:
+                    _cs_pos_ms = vlc_engine.player.get_time()
+                    _cs_len_ms = vlc_engine.player.get_length()
+                except Exception as _swallowed_error:
+                    _log_swallowed("main script: clock switch, reading the position of the file on screen", _swallowed_error)
+                    _cs_pos_ms = _cs_len_ms = None
+                # WARNING: owner 2026-11-24 (send_logs51, 90s Commercials S02.E66): a 15.6 s clip that opened half a second into its 16 s slot was muted and cut by the clock about 0.2 s before its end; a file this close to its own end plays out, and the natural end opens the next item from its first second.
+                _finish_first = vlc_engine.player.get_state() == vlc.State.Playing and _clock_switch_lets_file_finish(_cs_pos_ms, _cs_len_ms)
+                if app_state.get("_clock_switch_logged") != (loaded_path, sched_path):
+                    app_state["_clock_switch_logged"] = (loaded_path, sched_path)
+                    log.info("[CLOCK SWITCH] ch%s: the clock has moved from %s (at %s of %s ms) to %s -> %s",
+                             ch, os.path.basename(loaded_path), _cs_pos_ms, _cs_len_ms, os.path.basename(sched_path),
+                             "it plays to its own end first" if _finish_first else "the file on screen is cut and the next one opens now")
+            if loaded_path and loaded_path != sched_path and not _finish_first:
 
                 _resume_seek = current_playback_state.get("seek", 0)
                 if db is not None:
@@ -38420,24 +39438,16 @@ while True:
 
     app_state["_transition_cover_whole_window"] = False
 
-    # WARNING: owner 2026-11-16: the screen keeps the last frame's pixels, so a channel tuned from the guide starts from the transition cover; whatever its branch paints goes over it, and a branch that paints nothing cannot leave the guide and its preview box on screen.
-    if ch not in ("03", "04") and app_state.get("_guide_left_on_screen", False):
-        screen.fill(COLOR_TRANSITION_GREY)
-        app_state["_guide_exit_cover_frames"] = app_state.get("_guide_exit_cover_frames", 0) + 1
-    # WARNING: owner 2026-11-12: while a picked server loads, the screen is plain black; the picture of the channel left was held on screen and looked frozen.
-    if ch not in ("03", "04") and _awaiting_first_server_schedule():
-        screen.fill(COLOR_SCREEN_BLACK)
-    elif (ch not in ("03", "04")
-            and (not app_state.get("_had_first_frame_this_tune", False) or _guide_exit_old_frame_pending())
-            and pygame.time.get_ticks() < app_state.get("_guide_exit_black_until", 0)
-            and pygame.time.get_ticks() >= app_state.get("channel_switch_static_until", 0)):
-        # WARNING: owner 2026-11-13: the black layer over whatever the guide left, until the channel's own picture is up.
-        screen.fill(COLOR_SCREEN_BLACK)
-    elif _surf_quiet and ch not in ("03", "04"):
-        if _configured_transition_style() == "static":
-            _render_transition_static(screen, _full_window_rect)
-        else:
-            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+    # WARNING: owner 2026-11-26: one channel-change cover, drawn once at the top of the frame (SECTION: Transition cover); a channel waiting behind it draws nothing of its own here.
+    _cover_hold = _channel_cover_hold(ch, current_playback_state)
+    if _cover_hold or (_surf_quiet and ch not in ("03", "04")):
+        if app_state.get("_guide_left_on_screen", False):
+            app_state["_guide_exit_cover_frames"] = app_state.get("_guide_exit_cover_frames", 0) + 1
+        if _cover_hold and current_playback_state.get("mode") == "Static":
+            # WARNING: owner log 2026-11-21 05:31: a Regular channel's reason banner clock runs through the cover, so the reason shows when the Static comes.
+            _static_banner_ready(("live", str(ch)), current_playback_state.get("reason"))
+            # WARNING: owner 2026-11-25: "no static noise ever plays on the black screen"; the Static sound section leaves the cover silent, so stopping the noise here does not fight it.
+            _static_sound_stop("channel ch%s waits behind the channel-change cover" % str(ch).zfill(2))
     elif ch != "04":
         if ch == "03":
             # WARNING: a file picker left open by an earlier settings action must not paint over this frame or consume DVD navigation keys on the next one.
@@ -38504,22 +39514,15 @@ while True:
                 screen.blit(lbl, (content_rect.centerx - lbl.get_width() // 2, content_rect.centery - 12))
         elif current_playback_state["mode"] == "Video":
             _transition_now = pygame.time.get_ticks()
-            if _transition_now < app_state.get("channel_switch_static_until", 0):
-                _render_transition_static(screen, _full_window_rect)
-            elif _transition_now < app_state.get("channel_switch_black_until", 0):
-                # WARNING: owner 2026-11-13: this branch drew nothing, so with the Black transition the guide (and its preview window) left behind on the screen stayed visible and lagging through the whole black time; the black is drawn over the full window.
-                screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+            if (_transition_now < app_state.get("channel_switch_static_until", 0)
+                    or _transition_now < app_state.get("channel_switch_black_until", 0)):
+                # WARNING: the cover is drawn once at the top of the frame (SECTION: Transition cover); no frame is taken from VLC under it, so the first picture is the one shown when it lifts.
+                app_state["_transition_cover_whole_window"] = True
             elif pygame.time.get_ticks() < app_state.get("_video_audio_hold_until", 0):
                 if _loudness_hold_last_frame_active():
                     _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
                     if app_state.get("_guide_left_on_screen", False):
                         app_state["_guide_exit_held_frames"] = app_state.get("_guide_exit_held_frames", 0) + 1
-                elif app_state.get("_guide_left_on_screen", False):
-                    # WARNING: owner 2026-11-16: this branch painted nothing, so a channel tuned from the guide showed the guide's last frame, preview box included, until its first picture; the window shows the transition cover until then.
-                    if _configured_transition_style() == "static":
-                        _render_transition_static(screen, _full_window_rect)
-                    else:
-                        screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
             elif (not app_state.get("is_playing_video", False)
                     and _failure_static_is_due(str(ch).zfill(2))):
                 _render_transition_static(screen, _full_window_rect)
@@ -38528,10 +39531,6 @@ while True:
             elif vlc_engine is not None:
                 try:
                     vlc_bytes = vlc_engine.get_display_frame()
-                    if vlc_bytes is not None and len(vlc_bytes) >= vlc_engine.buf_size:
-                        if (pygame.time.get_ticks() < app_state.get("_guide_exit_black_until", 0)
-                                and _guide_exit_old_frame_pending()):
-                            vlc_bytes = None
                     if vlc_bytes is not None and len(vlc_bytes) >= vlc_engine.buf_size:
                         _note_fresh_live_video_frame(ch)
                         video_surf = pygame.image.frombuffer(vlc_bytes, (vlc_engine.width, vlc_engine.height), "BGRA")
@@ -38557,33 +39556,21 @@ while True:
                             _store_last_video_frame(effected_surf, raw_surf=video_surf, context="fullscreen", fit_aspect=_video_sa)
                             app_state["_video_painted_this_frame"] = True
                         else:
-                            if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
-                                screen.fill(COLOR_TRANSITION_GREY)
+                            _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
                     else:
-                        if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
-                            screen.fill(COLOR_TRANSITION_GREY)
+                        # WARNING: owner 2026-11-26: with no kept picture the channel is behind the one cover (_channel_cover_hold), so this pass paints no grey of its own.
+                        _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
                 except Exception as _swallowed_error:
                     _log_swallowed("module: vlc_bytes = vlc_engine.get_display_frame()", _swallowed_error)
-                    if not _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
-                        screen.fill(COLOR_TRANSITION_GREY)
+                    _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
 
             else:
-                screen.fill(COLOR_TRANSITION_GREY)
+                _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
                 
-        elif current_playback_state["mode"] == "Static" and (_awaiting_first_server_schedule()
-                or _local_profile_still_loading(("live", str(ch)), current_playback_state.get("reason"))):
-            screen.fill(COLOR_SCREEN_BLACK)
-        elif current_playback_state["mode"] == "Static" and current_playback_state.get("reason") == SCHEDULE_PENDING_REASON:
-            _draw_schedule_pending(screen, _full_window_rect)
         elif current_playback_state["mode"] == "Static" and _regular_channel_still_loading(ch, current_playback_state.get("reason")):
             # WARNING: owner log 2026-11-21 05:31: the banner's own wait only started when the Static came, so after the 7 s black wait the reason took 7 s more and never showed; its clock runs through the black wait, so the reason shows with the Static.
             _static_banner_ready(("live", str(ch)), current_playback_state.get("reason"))
-            if _configured_transition_style() == "static":
-                _render_transition_static(screen, _full_window_rect)
-            else:
-                # WARNING: the Static sound section leaves this wait silent, so stopping the noise here does not fight it.
-                _static_sound_stop("a Regular channel's first file is still being measured; the loading background shows")
-                screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+            _render_transition_static(screen, _full_window_rect)
         elif current_playback_state["mode"] == "Static":
             # WARNING: the grey screen is still Static on air, so its noise keeps playing; stopping it here fought the play in the Static sound section every frame and cut the sound.
             _draw_static_channel(screen, _full_window_rect, ("live", str(ch)), reason=current_playback_state.get("reason"))
@@ -38668,9 +39655,8 @@ while True:
         px, py, pw, ph = app_state.get("guide_preview_bounds", (w_w // 2 - 400, 15, 800, 450))
 
         _guide_transition_style = _configured_transition_style()
-        # WARNING: owner 2026-11-13: with the Black transition the preview window is the same TV grey as the transition, never pure black.
-        _preview_base_color = COLOR_TRANSITION_GREY if _guide_transition_style == "black" else COLOR_SCREEN_BLACK
-        pygame.draw.rect(screen, _preview_base_color, (px, py, pw, ph))
+        # WARNING: owner 2026-11-13: the preview window is the same TV grey as the transition, never pure black; owner 2026-11-26: this is the preview's only grey, painted once a frame under everything, and no branch below paints its own grey or black wait.
+        pygame.draw.rect(screen, COLOR_TRANSITION_GREY, (px, py, pw, ph))
 
         _now_ch04 = pygame.time.get_ticks()
         _ch04_shield_active = (
@@ -38769,23 +39755,15 @@ while True:
                             )
                             if _guide_load_gave_up:
                                 _lift_buffering_mute(hl_ch, "guide-preview-shield-end")
-                            _guide_transition_style = _configured_transition_style()
                             _hl_ch_confirmed_failed = (
                                 hl_ch in _channel_playback_failures
                                 or hl_ch in _station_confirmed_dead_drive
                             )
                             _hl_failure_phase = _guide_failure_phase(hl_ch) if _hl_ch_confirmed_failed else None
-                            if _hl_failure_phase == "wait":
-                                _stop_transition_static()
-                                screen.fill(COLOR_TRANSITION_GREY, (px, py, pw, ph))
-                            elif _hl_ch_confirmed_failed:
+                            if _hl_failure_phase != "wait" and (_hl_ch_confirmed_failed or _guide_transition_style == "static"):
                                 _render_transition_static(screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
-                            elif _guide_transition_style == "static":
-                                _render_transition_static(
-                                    screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
                             else:
                                 _stop_transition_static()
-                                screen.fill(COLOR_TRANSITION_GREY, (px, py, pw, ph))
 
                             if _hl_failure_phase == "show":
                                 _draw_channel_failure_message(
@@ -38803,11 +39781,8 @@ while True:
                 _log_swallowed("module: if _ch04_preview_static_visual_active and _guide_transition_style =...", _swallowed_error)
                 if not _ch04_shield_active:
                     _stop_transition_static()
-                    if not (app_state.get("_guide_preview_real_for") == hl_state["file"]
-                            and _blit_last_video_frame(screen, px, py, pw, ph, apply_screen_mode=True, context="preview")):
-                        _guide_transition_style = _configured_transition_style()
-                        _fallback_color = COLOR_SCREEN_BLACK if _guide_transition_style == "static" else COLOR_TRANSITION_GREY
-                        screen.fill(_fallback_color, (px, py, pw, ph))
+                    if app_state.get("_guide_preview_real_for") == hl_state["file"]:
+                        _blit_last_video_frame(screen, px, py, pw, ph, apply_screen_mode=True, context="preview")
 
         elif hl_state["mode"] == "Visualizer" and visualizer_deck is not None and not _ch04_shield_active:
             try:
@@ -38888,7 +39863,6 @@ while True:
                     _gp_failure_phase = _guide_failure_phase(hl_ch)
                     if _gp_failure_phase == "wait":
                         _stop_transition_static()
-                        screen.fill(COLOR_TRANSITION_GREY, (px, py, pw, ph))
                     else:
                         _render_transition_static(screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
                     if _gp_failure_phase == "show":
@@ -39001,7 +39975,8 @@ while True:
             app_state["music_owner"] = ""
             app_state["guide_preview_music_track"] = ""
             app_state["loaded_preview_path_cache"] = ""
-            pygame.draw.rect(screen, (0, 0, 0), (px, py, pw, ph))
+            # WARNING: owner 2026-11-26: this drew a pure (0, 0, 0) black box; the preview shows what the channel shows full screen (owner 2026-11-02, N8: one look from the same source), and a Visualizer channel with no music is on Static.
+            _render_transition_static(screen, pygame.Rect(px, py, pw, ph), target_aspect=16.0 / 9.0)
         else:
             if pygame.mixer.music.get_busy():
                 pygame.mixer.music.stop()
@@ -39023,68 +39998,6 @@ while True:
                         screen, pygame.Rect(px, py, pw, ph),
                         hl_state.get("reason"), hl_state.get("reason_detail"),
                         scale=0.5)
-
-    # WARNING: owner 2026-11-16 (the grey preview-sized square between channels 03, 04 and 05): the screen keeps the last frame's pixels and every frame must paint all of it; a guide whose picture is not ready yet (it is being built in the background) drew nothing, yet the preview window's grey box was still drawn at its old place on top of the channel left behind, and a guide being left by a typed number or Up/Down stayed on screen (with its emptied preview window) until the new channel was tuned. In both cases the whole window shows the transition cover instead, the same as any channel change.
-    if ch == "04" and (_guide_not_ready_this_frame or _surf_quiet):
-        app_state["_transition_cover_whole_window"] = True
-        if _configured_transition_style() == "static":
-            _render_transition_static(screen, _full_window_rect)
-        else:
-            _stop_transition_static()
-            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
-
-    elif pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0):
-        app_state["_transition_cover_whole_window"] = True
-        _transition_style = _configured_transition_style()
-        if _transition_style == "static":
-            _render_transition_static(screen, _full_window_rect)
-        else:
-            _stop_transition_static()
-            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
-
-    elif (pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
-            and _configured_transition_style() != "static"
-            and str(app_state.get("current_channel", "")).zfill(2) not in ("03", "04")):
-        # WARNING: owner 2026-11-14: the grey transition is the top layer of the frame whatever mode the channel is in, so a guide preview or a held picture left behind never shows through it.
-        app_state["_transition_cover_whole_window"] = True
-        screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
-
-    else:
-        if app_state.get("_warm_static_mute_active", False):
-            app_state["_warm_static_mute_active"] = False
-            if vlc_engine is not None:
-                _still_muted = db.config.get("is_muted", False) if db is not None else False
-                if not _still_muted:
-                    try: vlc_engine.player.audio_set_mute(False)
-                    except Exception as _swallowed_error:
-                        _log_swallowed("main script: vlc_engine.player.audio_set_mute(False)", _swallowed_error)
-
-        if app_state.get("_visualizer_audio_duck_active", False):
-            app_state["_visualizer_audio_duck_active"] = False
-            _pending_vol = app_state.pop("_visualizer_pending_music_vol", None)
-            if _pending_vol is not None:
-                try:
-                    pygame.mixer.music.set_volume(_pending_vol)
-                except Exception as _swallowed_error:
-                    _log_swallowed("main script: pygame.mixer.music.set_volume(_pending_vol)", _swallowed_error)
-
-        if app_state.get("_ch03_static_mute_active", False):
-            app_state["_ch03_static_mute_active"] = False
-            _still_muted_mm = db.config.get("is_muted", False) if db is not None else False
-            try:
-                if _ch03_music_is_playing():
-                    _set_ch03_menu_music_volume(
-                        db.config.get("global_volume", 70) if db else 70, _still_muted_mm)
-            except Exception as _mm_restore_err:
-                log.warning(f"[CH03 MUSIC] static-burst volume restore failed: {_mm_restore_err}")
-            if game_deck is not None:
-                _still_muted = db.config.get("is_muted", False) if db is not None else False
-                try:
-                    if getattr(game_deck, "_libretro_core", None) is not None and game_deck._libretro_core.is_loaded:
-                        game_deck.set_libretro_volume(
-                            db.config.get("global_volume", 70) if db else 70, _still_muted)
-                except Exception as _ch03_restore_err:
-                    log.warning(f"[CH03 AUDIO] static-burst restore failed: {_ch03_restore_err}")
 
     # ========================================================================
     # SECTION: Game deck render (CH 03)
@@ -39131,7 +40044,8 @@ while True:
             if (vlc_engine is not None and _stalled_ms >= _stall_threshold
                     and not app_state.get("_stall_recovery_inflight", False)
                     and not _open_confirm_pending and not _load_in_flight_for(ch)
-                    and now_ticks >= app_state.get("_stall_retune_next_ticks", 0)):
+                    and now_ticks >= app_state.get("_stall_retune_next_ticks", 0)
+                    and not _open_still_receiving()):
                 app_state["_stall_recovery_inflight"] = True
                 app_state["_stall_retune_next_ticks"] = now_ticks + STALL_RETUNE_GAP_MS
                 _recover_from_playback_stall(ch, _stalled_ms)
@@ -39146,10 +40060,13 @@ while True:
             # WARNING: owner 2026-11-13: once the picture has failed to Static, the retries go on under the Static (no black screen between tries) until a real picture arrives; a channel change by the viewer clears it.
             if _stall_is_now_static:
                 app_state["_static_hold_until_frame"] = True
+                _channels_on_fault_static.add(str(ch).zfill(2))
             # WARNING: owner 2026-11-16: with the frozen last picture kept, the retry after a stall dropped back to that frozen picture (and the banner went with it) for a few seconds before the Static came again; once a channel has fallen to Static it stays on Static until a real new picture arrives or the viewer changes channel.
             _static_hold = bool(app_state.get("_static_hold_until_frame", False))
             if _stall_is_now_static or _static_hold:
                 _mark_fault_static()
+            if now_ticks < app_state.get("_first_media_static_until_ticks", 0):
+                _static_hold = True
             if _stall_is_now_static:
                 # WARNING: the stall Static is the fallback static of owner 2026-11-05 (14.2): it carries the same red banner so the viewer knows the picture is not frozen, only not ready, and the retry goes on under it.
                 _report_missing_media((str(ch).zfill(2), "picture_stalled", "stall"),
@@ -39165,20 +40082,28 @@ while True:
                         pygame.time.get_ticks()
                         < app_state.get("_video_audio_hold_until", 0)
                     ) or _static_transition_active
+                    _switch_cover_up = (_transition_style_wait != "static"
+                                        and pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0))
                     vlc_bytes = (
-                        None if _audio_sync_hold_active
+                        None if (_audio_sync_hold_active or _switch_cover_up)
                         else vlc_engine.get_display_frame()
                     )
+                    # WARNING: owner 2026-11-16: an old guide preview frame set the first-picture flag and the cover lifted onto it; a frame taken before the new channel reached VLC is dropped.
+                    if vlc_bytes and app_state.get("_guide_left_on_screen", False) and _guide_exit_old_frame_pending():
+                        vlc_bytes = None
                     if (_audio_sync_hold_active and _loudness_hold_last_frame_active()
                             and _has_last_video_frame(context="fullscreen")):
                         _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
+                    elif _static_transition_active or _switch_cover_up:
+                        # WARNING: owner 2026-11-26: the channel-change cover is painted once, on top (SECTION: Transition cover); this pass took frames under it and drew the old picture or the new one over the grey, and drew the Static transition a second time.
+                        app_state["_transition_cover_whole_window"] = True
                     elif _audio_sync_hold_active:
                         # WARNING: do not consume the first decoded frame while the replacement audio output settles.
                         if _transition_style_wait == "static" or _stall_is_now_static or _static_hold:
                             _render_transition_static(screen, _full_window_rect)
                         else:
+                            # WARNING: owner 2026-11-26: the grey of this wait is the one cover at the top of the frame (_channel_cover_hold); painting it here again was a second grey layer.
                             _stop_transition_static()
-                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
                     elif vlc_bytes:
                         _note_fresh_live_video_frame(ch)
 
@@ -39212,16 +40137,11 @@ while True:
                             _static_sound_stop("fullscreen video: a frame is drawn and no Static is due")
                         if _stall_is_now_static or _static_hold:
                             _render_transition_static(screen, _full_window_rect)
-                        elif _has_last_video_frame(context="fullscreen") and _stalled_ms < STALL_GREY_AFTER_MS:
-                            _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
                         elif _has_last_video_frame(context="fullscreen"):
-                            # WARNING: owner 2026-11-16: a picture that has stopped for more than a short hitch goes grey and silent until the Static comes, the same order as a channel that never loads (black, Static, banner), not a frozen picture.
-                            _static_sound_stop("a picture has stopped; grey until the Static is due")
-                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+                            # WARNING: owner 2026-11-25: "if you are playing video and it fails or drops out... it falls straight to static with an error when the video stops"; the last picture holds only through the short hitch (STALL_FORCES_STATIC_MS), never a grey screen.
+                            _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect)
                         elif _transition_style_wait == "static":
                             _render_transition_static(screen, _full_window_rect)
-                        else:
-                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
                 except Exception as _swallowed_error:
                     # WARNING: do not stop static_audio on a tick that is about to restart it via _render_transition_static(), or the noise never plays long enough to be heard.
                     _log_swallowed("module: _static_transition_active = _transition_style_wait == 'static' and ...", _swallowed_error)
@@ -39235,11 +40155,8 @@ while True:
                         _render_transition_static(screen, _full_window_rect)
                     elif _blit_last_video_frame(screen, *_screen_mode_boxed_last_frame_rect(content_rect, w_w, w_h), context="fullscreen", outer_rect=content_rect):
                         pass
-                    else:
-                        if _transition_style_wait == "static":
-                            _render_transition_static(screen, _full_window_rect)
-                        else:
-                            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+                    elif _transition_style_wait == "static":
+                        _render_transition_static(screen, _full_window_rect)
 
         elif current_state["mode"] in ("Video", "Commercial"):
             if pygame.mixer.music.get_busy():
@@ -39247,8 +40164,7 @@ while True:
             # WARNING: owner 2026-11-13: at the start and on a channel load the screen stays black for the first-load wait (_first_load_static_ms) while the app works on getting the picture up; Static and the failure message come only after that, never at once.
             if (not app_state.get("_had_first_frame_this_tune", False)
                     and pygame.time.get_ticks() - app_state.get("_last_new_frame_ticks", 0) < _first_load_static_ms(ch)):
-                _static_sound_stop("a channel is still loading; black until the first-load wait is over")
-                screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+                _static_sound_stop("a channel is still loading; the one cover (_channel_cover_hold) stays up until the first-load wait is over")
             else:
                 _render_transition_static(screen, _full_window_rect)
                 _mark_fault_static()
@@ -39468,12 +40384,8 @@ while True:
 
     else:
         if pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0):
-            _transition_style = _configured_transition_style()
-            if _transition_style == "static":
-                _render_transition_static(screen, _full_window_rect)
-            else:
-                _stop_transition_static()
-                screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+            # WARNING: owner 2026-11-26: the guide's channel-change cover is painted once, in SECTION: Transition cover; painting it again here was a second layer over the guide.
+            pass
         elif (db is not None and db.config.get("transition_type", "black") == "static"
               and pygame.time.get_ticks() < app_state.get("guide_preview_static_until", 0)):
             if app_state.get("_warm_static_mute_active", False):
@@ -39498,7 +40410,8 @@ while True:
             preview_ch_info = db.channels_db.get(preview_ch_num, {}) if db is not None else {}
             p_state = _get_guide_hl_playback_state(preview_ch_num)
 
-            if p_state.get("mode") == "Static":
+            if p_state.get("mode") in ("Static", "Visualizer_Empty"):
+                # WARNING: a previewed channel on Static, an empty Visualizer channel included, keeps its noise; stopping it here fought the preview's Static every frame.
                 pass
             elif preview_ch_info.get("is_visualizer", False):
                 if not (preview_ch_num in _channel_playback_failures
@@ -39509,13 +40422,83 @@ while True:
                         or preview_ch_num in _station_confirmed_dead_drive):
                     _stop_transition_static()
 
+    # ========================================================================
+    # SECTION: Transition cover
+    # ========================================================================
+
+    # WARNING: owner 2026-11-26: painted after both video passes so it really is the top layer; the hold is asked again here, so the frame that brings the first picture shows it.
+    _cover_hold = _channel_cover_hold(ch, current_playback_state)
+    # WARNING: owner 2026-11-16 (the grey preview-sized square between channels 03, 04 and 05): the screen keeps the last frame's pixels and every frame must paint all of it; a guide whose picture is not ready yet (it is being built in the background) drew nothing, yet the preview window's grey box was still drawn at its old place on top of the channel left behind, and a guide being left by a typed number or Up/Down stayed on screen (with its emptied preview window) until the new channel was tuned. In both cases the whole window shows the transition cover instead, the same as any channel change.
+    if ch == "04" and (_guide_not_ready_this_frame or _surf_quiet):
+        app_state["_transition_cover_whole_window"] = True
+        if _configured_transition_style() == "static":
+            _render_transition_static(screen, _full_window_rect)
+        else:
+            _stop_transition_static()
+            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+
+    elif pygame.time.get_ticks() < app_state.get("channel_switch_static_until", 0):
+        app_state["_transition_cover_whole_window"] = True
+        _transition_style = _configured_transition_style()
+        if _transition_style == "static":
+            _render_transition_static(screen, _full_window_rect)
+        else:
+            _stop_transition_static()
+            screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+
+    elif _surf_quiet and ch not in ("03", "04") and _configured_transition_style() == "static":
+        app_state["_transition_cover_whole_window"] = True
+        _render_transition_static(screen, _full_window_rect)
+
+    elif (ch not in ("03", "04")
+            and (_cover_hold or _surf_quiet
+                 or (pygame.time.get_ticks() < app_state.get("channel_switch_black_until", 0)
+                     and _configured_transition_style() != "static"))):
+        # WARNING: owner 2026-11-14: the grey transition is the top layer of the frame whatever mode the channel is in, so a guide preview or a held picture left behind never shows through it; owner 2026-11-26: it is the only grey layer, and every wait for a first picture keeps this one up.
+        app_state["_transition_cover_whole_window"] = True
+        screen.fill(COLOR_TRANSITION_GREY, _full_window_rect)
+
+    else:
+        if app_state.get("_warm_static_mute_active", False):
+            app_state["_warm_static_mute_active"] = False
+            if vlc_engine is not None:
+                _still_muted = db.config.get("is_muted", False) if db is not None else False
+                if not _still_muted:
+                    try: vlc_engine.player.audio_set_mute(False)
+                    except Exception as _swallowed_error:
+                        _log_swallowed("main script: vlc_engine.player.audio_set_mute(False)", _swallowed_error)
+
+        if app_state.get("_visualizer_audio_duck_active", False):
+            app_state["_visualizer_audio_duck_active"] = False
+            _pending_vol = app_state.pop("_visualizer_pending_music_vol", None)
+            if _pending_vol is not None:
+                try:
+                    pygame.mixer.music.set_volume(_pending_vol)
+                except Exception as _swallowed_error:
+                    _log_swallowed("main script: pygame.mixer.music.set_volume(_pending_vol)", _swallowed_error)
+
+        if app_state.get("_ch03_static_mute_active", False):
+            app_state["_ch03_static_mute_active"] = False
+            _still_muted_mm = db.config.get("is_muted", False) if db is not None else False
+            try:
+                if _ch03_music_is_playing():
+                    _set_ch03_menu_music_volume(
+                        db.config.get("global_volume", 70) if db else 70, _still_muted_mm)
+            except Exception as _mm_restore_err:
+                log.warning(f"[CH03 MUSIC] static-burst volume restore failed: {_mm_restore_err}")
+            if game_deck is not None:
+                _still_muted = db.config.get("is_muted", False) if db is not None else False
+                try:
+                    if getattr(game_deck, "_libretro_core", None) is not None and game_deck._libretro_core.is_loaded:
+                        game_deck.set_libretro_volume(
+                            db.config.get("global_volume", 70) if db else 70, _still_muted)
+                except Exception as _ch03_restore_err:
+                    log.warning(f"[CH03 AUDIO] static-burst restore failed: {_ch03_restore_err}")
+
     # WARNING: a channel airing Static keeps its noise under menus, the file explorer and popups, as a TV does; the black shield of a non-Static transition stays silent.
     if (ch not in ("03", "04") and not _surf_quiet
             and current_playback_state.get("mode") == "Static"
-            and not _awaiting_first_server_schedule()
-            and not _local_profile_still_loading(("live", str(ch)), current_playback_state.get("reason"))
-            and not (_regular_channel_still_loading(ch, current_playback_state.get("reason")) and _configured_transition_style() != "static")
-            and not (current_playback_state.get("reason") == SCHEDULE_PENDING_REASON and _configured_transition_style() != "static")
+            and not _cover_hold
             and pygame.time.get_ticks() >= app_state.get("channel_switch_black_until", 0)):
         _static_sound_play()
 
@@ -39699,6 +40682,12 @@ while True:
 
         _gh_any = False
         _gh_hold = app_state["_hold_guide"]
+        # WARNING: owner 2026-11-25 (send_logs66): "in the tv guide sometimes one down press equals 2 down presses"; the press started a channel preview, the next frame came a second later, and the key, not yet seen coming up, counted as held past the repeat delay, so a second row move came without a second press. After a frame gap longer than GUIDE_HOLD_FRAME_GAP_MS the hold's timing starts again.
+        _gh_gap = now_ticks_ms - app_state.get("_gh_prev_frame_ms", now_ticks_ms)
+        app_state["_gh_prev_frame_ms"] = now_ticks_ms
+        if _gh_gap > GUIDE_HOLD_FRAME_GAP_MS and _gh_hold.key is not None:
+            _gh_hold.start = now_ticks_ms
+            _gh_hold.last = now_ticks_ms
         for _gh_key in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d):
             if _key_is_held(_gh_key):
                 _gh_any = True

@@ -6,23 +6,17 @@ import datetime
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
 import zipfile
 
-JOB_FILE_NAME = "send_logs_job.json"
-# WARNING: a job older than this is thrown away instead of sent; a zip from yesterday is not what the tester meant to send.
-JOB_MAX_AGE_SECONDS = 24 * 3600
 
-
-# WARNING: these decide which files a Send Logs carries; config files and their backups hold the webhook address and the owner's folders, so they never go.
-SKIP_NAMES = ("emulator_config.json", "retro.config.json", "staged_update.json")
-KEEP_EXTENSIONS = (".txt", ".log", ".marker", ".json")
-SKIP_FOLDERS = ("share_index",)
-WEBHOOK_STARTS = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
-                  "https://canary.discord.com/api/webhooks/", "https://ptb.discord.com/api/webhooks/")
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
 
 
 def _log_swallowed(where, error):
@@ -32,6 +26,38 @@ def _log_swallowed(where, error):
     except Exception:
         return None
     return log_swallowed(where, error)
+
+
+# ============================================================================
+# SECTION: Settings
+# ============================================================================
+
+
+def _governor_value(name, fallback):
+    """A value from performance_governor when the program has it loaded already (the app and the server service), else the fallback; the finisher process never loads it, so this module stays standard library only."""
+    governor = sys.modules.get("performance_governor")
+    return getattr(governor, name, fallback) if governor is not None else fallback
+
+
+JOB_FILE_NAME = "send_logs_job.json"
+# WARNING: the fallback numbers below must match SEND_LOGS_JOB_MAX_AGE_HOURS, SEND_LOGS_COPY_CHUNK_BYTES, SEND_LOGS_COPY_PAUSE_SECONDS, SEND_LOGS_SCRUB_PIECE_CHARS and SEND_LOGS_SCRUB_PAUSE_SECONDS in performance_governor.py; the finisher process always uses them.
+JOB_MAX_AGE_SECONDS = float(_governor_value("SEND_LOGS_JOB_MAX_AGE_HOURS", 24.0)) * 3600.0
+COPY_CHUNK_BYTES = int(_governor_value("SEND_LOGS_COPY_CHUNK_BYTES", 262144))
+COPY_PAUSE_SECONDS = float(_governor_value("SEND_LOGS_COPY_PAUSE_SECONDS", 0.002))
+SCRUB_PIECE_CHARS = int(_governor_value("SEND_LOGS_SCRUB_PIECE_CHARS", 48000))
+SCRUB_PAUSE_SECONDS = float(_governor_value("SEND_LOGS_SCRUB_PAUSE_SECONDS", 0.003))
+
+# WARNING: these decide which files a Send Logs carries; config files and their backups hold the webhook address and the owner's folders, so they never go.
+SKIP_NAMES = ("emulator_config.json", "retro.config.json", "staged_update.json")
+KEEP_EXTENSIONS = (".txt", ".log", ".marker", ".json")
+SKIP_FOLDERS = ("share_index",)
+WEBHOOK_STARTS = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/",
+                  "https://canary.discord.com/api/webhooks/", "https://ptb.discord.com/api/webhooks/")
+
+
+# ============================================================================
+# SECTION: Picking and copying the logs
+# ============================================================================
 
 
 def pick_webhook_url(config_url, default_url):
@@ -52,12 +78,12 @@ def copy_logs(logs_dir, snapshot_dir, deadline):
             last = b""
             with open(full, "rb") as src, open(dest, "wb") as dst:
                 while True:
-                    chunk = src.read(256 * 1024)
+                    chunk = src.read(COPY_CHUNK_BYTES)
                     if not chunk:
                         break
                     dst.write(chunk)
                     last = chunk
-                    time.sleep(0.002)
+                    time.sleep(COPY_PAUSE_SECONDS)
             if last and not last.endswith(b"\n") and arc.lower().endswith((".txt", ".log")):
                 cut_back_to_whole_line(dest)
             copied += 1
@@ -120,6 +146,11 @@ def cut_back_to_whole_line(path):
                 _fh.truncate(_size - _back + _nl + 1)
     except OSError as _swallowed_error:
         _log_swallowed("cut_back_to_whole_line", _swallowed_error)
+
+
+# ============================================================================
+# SECTION: Taking the personal parts out
+# ============================================================================
 
 
 class LogScrubber:
@@ -192,9 +223,10 @@ class LogScrubber:
         return text
 
 
-def in_pieces(text, work, piece_chars=48000):
+def in_pieces(text, work, piece_chars=None):
     """Runs work(piece) on about piece_chars of whole lines at a time and yields to the other threads between pieces (owner 2026-11-16: Send Logs still made the picture stutter; one regex pass over several megabytes holds the interpreter for a few hundred milliseconds at a time). Returns the pieces' results joined."""
     # WARNING: pieces end on a line end, so a label swap never straddles two pieces; the short sleep is what lets the picture thread run.
+    piece_chars = SCRUB_PIECE_CHARS if piece_chars is None else piece_chars
     out = []
     _at = 0
     _n = len(text)
@@ -207,8 +239,13 @@ def in_pieces(text, work, piece_chars=48000):
         if _result is not None:
             out.append(_result)
         _at = _stop
-        time.sleep(0.003)
+        time.sleep(SCRUB_PAUSE_SECONDS)
     return "".join(out)
+
+
+# ============================================================================
+# SECTION: Building the zip
+# ============================================================================
 
 
 def build_zip(out_path, note, logs_dir, max_bytes, tail_bytes, least_tail_bytes, version_text, machine_text):
@@ -248,13 +285,21 @@ def build_zip(out_path, note, logs_dir, max_bytes, tail_bytes, least_tail_bytes,
         _tail = max(int(least_tail_bytes), _tail // 2)
 
 
+# ============================================================================
+# SECTION: The job file
+# ============================================================================
+
+
 def read_job(job_path):
     """The job as a dict, or None when the file is missing or not readable."""
     try:
         with open(job_path, "r", encoding="utf-8") as fh:
             job = json.load(fh)
         return job if isinstance(job, dict) else None
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        _log_swallowed("send_logs_finisher: reading the Send Logs job", error)
         return None
 
 
@@ -268,16 +313,25 @@ def write_job(job_path, job):
             json.dump(job, fh)
         os.replace(tmp, job_path)
         return True
-    except OSError:
+    except OSError as error:
+        _log_swallowed("send_logs_finisher: writing the Send Logs job", error)
         return False
 
 
 def remove_job(job_path):
+    """Removes the job and its half-written copy; one that is not there is already gone."""
     for path in (job_path, job_path + ".tmp"):
         try:
             os.remove(path)
-        except OSError:
-            pass
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            _log_swallowed("send_logs_finisher: removing the Send Logs job", error)
+
+
+# ============================================================================
+# SECTION: Posting to Discord
+# ============================================================================
 
 
 def post_zip(url, zip_path, message, timeout, urlopen=None):
@@ -328,6 +382,6 @@ def run(job_path):
         remove_job(job_path)
         try:
             os.remove(zip_path)
-        except OSError:
-            pass
+        except OSError as error:
+            _log_swallowed("send_logs_finisher: removing the sent zip", error)
     return ok

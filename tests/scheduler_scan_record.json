@@ -3485,11 +3485,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "fbe71d70e3bf95aa"
+   "state_sha": "df29ee5185da6176"
   },
   {
    "at": "2026-10-13T00:37:05",
@@ -3526,11 +3530,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "f68ee01a817c9eb4"
+   "state_sha": "184010fddfa961e2"
   },
   {
    "at": "2026-10-13T01:14:05",
@@ -3567,11 +3575,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "f68ee01a817c9eb4"
+   "state_sha": "184010fddfa961e2"
   },
   {
    "at": "2026-10-13T01:51:05",
@@ -3608,11 +3620,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "f68ee01a817c9eb4"
+   "state_sha": "184010fddfa961e2"
   },
   {
    "at": "2026-10-13T02:28:05",
@@ -3649,11 +3665,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "11e34cb24b8a0aee"
+   "state_sha": "509cd26bcc7c43f8"
   },
   {
    "at": "2026-10-13T03:05:05",
@@ -3690,11 +3710,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "11e34cb24b8a0aee"
+   "state_sha": "509cd26bcc7c43f8"
   },
   {
    "at": "2026-10-13T03:42:05",
@@ -3731,11 +3755,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "11e34cb24b8a0aee"
+   "state_sha": "509cd26bcc7c43f8"
   },
   {
    "at": "2026-10-13T03:59:30",
@@ -3772,11 +3800,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "11e34cb24b8a0aee"
+   "state_sha": "509cd26bcc7c43f8"
   },
   {
    "at": "2026-10-13T04:00:05",
@@ -3811,11 +3843,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 2,
      "used": {}
     }
    },
-   "state_sha": "b6e9883d423d288b"
+   "state_sha": "a25a6d998d5c2081"
   },
   {
    "at": "2026-10-13T04:19:05",
@@ -3850,11 +3886,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 3,
      "used": {}
     }
    },
-   "state_sha": "ead49c93f009c6f1"
+   "state_sha": "f5688a97da6e3068"
   },
   {
    "at": "2026-10-13T04:56:05",
@@ -3889,11 +3929,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 4,
      "used": {}
     }
    },
-   "state_sha": "f955532ea63ea1fa"
+   "state_sha": "f6dccca434bc50e9"
   },
   {
    "at": "2026-10-13T05:33:05",
@@ -3928,11 +3972,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 5,
      "used": {}
     }
    },
-   "state_sha": "ffead9440c8f47ff"
+   "state_sha": "80e77dea17e586f8"
   },
   {
    "at": "2026-10-13T06:10:05",
@@ -3967,11 +4015,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 6,
      "used": {}
     }
    },
-   "state_sha": "a799aa8449ea2a4b"
+   "state_sha": "931d5c413c40ee33"
   },
   {
    "at": "2026-10-13T06:47:05",
@@ -4006,11 +4058,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 7,
      "used": {}
     }
    },
-   "state_sha": "0ee8d0e893c07fb3"
+   "state_sha": "ba35dd11a8857b67"
   },
   {
    "at": "2026-10-13T07:24:05",
@@ -4045,11 +4101,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 8,
      "used": {}
     }
    },
-   "state_sha": "fd3a46079317c11b"
+   "state_sha": "bf1e56cf004f80ff"
   },
   {
    "at": "2026-10-13T08:01:05",
@@ -4084,11 +4144,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 9,
      "used": {}
     }
    },
-   "state_sha": "0dc38dee13668235"
+   "state_sha": "32609cf45824fa03"
   },
   {
    "at": "2026-10-13T08:38:05",
@@ -4123,11 +4187,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 10,
      "used": {}
     }
    },
-   "state_sha": "66d2f476b59a4744"
+   "state_sha": "311a6f43a9947a93"
   },
   {
    "at": "2026-10-13T09:15:05",
@@ -4162,11 +4230,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 11,
      "used": {}
     }
    },
-   "state_sha": "3159a0287998d2b0"
+   "state_sha": "2fc636aab051424b"
   },
   {
    "at": "2026-10-13T09:52:05",
@@ -4201,11 +4273,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 12,
      "used": {}
     }
    },
-   "state_sha": "d3655788363a3234"
+   "state_sha": "534f18a629d8e9fb"
   },
   {
    "at": "2026-10-13T10:29:05",
@@ -4240,11 +4316,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 13,
      "used": {}
     }
    },
-   "state_sha": "e79ecdf0596c4cc3"
+   "state_sha": "9daea394094b4b0d"
   },
   {
    "at": "2026-10-13T11:06:05",
@@ -4279,11 +4359,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 14,
      "used": {}
     }
    },
-   "state_sha": "74a0db72d45f2b88"
+   "state_sha": "02a39222cf988c5c"
   },
   {
    "at": "2026-10-13T11:43:05",
@@ -4318,11 +4402,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 15,
      "used": {}
     }
    },
-   "state_sha": "cb3182022edfe4eb"
+   "state_sha": "f1ab76d00e4fac3a"
   },
   {
    "at": "2026-10-13T12:20:05",
@@ -4362,11 +4450,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 18,
      "used": {}
     }
    },
-   "state_sha": "800664efbc6e312c"
+   "state_sha": "b1e4f237cb98a5cb"
   },
   {
    "at": "2026-10-13T12:57:05",
@@ -4410,11 +4502,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 21,
      "used": {}
     }
    },
-   "state_sha": "a98b2e9379f6d95b"
+   "state_sha": "209dc45d95591ff4"
   },
   {
    "at": "2026-10-13T13:34:05",
@@ -4458,11 +4554,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 24,
      "used": {}
     }
    },
-   "state_sha": "960d9583f0d81dca"
+   "state_sha": "4786f00f7c136e94"
   },
   {
    "at": "2026-10-13T14:11:05",
@@ -4506,11 +4606,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 27,
      "used": {}
     }
    },
-   "state_sha": "da3af226bd4c2f84"
+   "state_sha": "914ec2ccea02851d"
   },
   {
    "at": "2026-10-13T14:48:05",
@@ -4554,11 +4658,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 30,
      "used": {}
     }
    },
-   "state_sha": "c8e16cc19f1e3e07"
+   "state_sha": "a704f1f351be8032"
   },
   {
    "at": "2026-10-13T15:25:05",
@@ -4602,11 +4710,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 33,
      "used": {}
     }
    },
-   "state_sha": "10d0c765439e99a8"
+   "state_sha": "fcc50b7be9e92979"
   },
   {
    "at": "2026-10-13T16:02:05",
@@ -4650,11 +4762,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 36,
      "used": {}
     }
    },
-   "state_sha": "2b653b8afb23f3de"
+   "state_sha": "172a68b5d021bb03"
   },
   {
    "at": "2026-10-13T16:39:05",
@@ -4698,11 +4814,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 39,
      "used": {}
     }
    },
-   "state_sha": "3967400a94ca63fe"
+   "state_sha": "5f9ca10624cc83be"
   },
   {
    "at": "2026-10-13T17:16:05",
@@ -4746,11 +4866,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 42,
      "used": {}
     }
    },
-   "state_sha": "cf0d8dbacfb3cf0c"
+   "state_sha": "97db17d8d33f3582"
   },
   {
    "at": "2026-10-13T17:53:05",
@@ -4794,11 +4918,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 45,
      "used": {}
     }
    },
-   "state_sha": "0e51bae996790c9a"
+   "state_sha": "1d9357a6a1571360"
   },
   {
    "at": "2026-10-13T18:30:05",
@@ -4842,11 +4970,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 48,
      "used": {}
     }
    },
-   "state_sha": "e501645234581677"
+   "state_sha": "d4c9592826cfd22c"
   },
   {
    "at": "2026-10-13T19:07:05",
@@ -4890,11 +5022,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 51,
      "used": {}
     }
    },
-   "state_sha": "bc003a62ab2d724a"
+   "state_sha": "9ea2b82cc57e6afc"
   },
   {
    "at": "2026-10-13T19:44:05",
@@ -4938,11 +5074,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 54,
      "used": {}
     }
    },
-   "state_sha": "bb903b6253a552fe"
+   "state_sha": "6e2da8ea49ec4140"
   },
   {
    "at": "2026-10-13T19:59:50",
@@ -4986,11 +5126,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 57,
      "used": {}
     }
    },
-   "state_sha": "26bd0f6419e5dd82"
+   "state_sha": "08c3a1c2e30fe533"
   },
   {
    "at": "2026-10-13T20:00:05",
@@ -5035,11 +5179,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 62,
      "used": {}
     }
    },
-   "state_sha": "2209cc2ce7cd5466"
+   "state_sha": "444b0a3539f28489"
   },
   {
    "at": "2026-10-13T20:21:05",
@@ -5084,11 +5232,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 67,
      "used": {}
     }
    },
-   "state_sha": "f39c39963894e7c1"
+   "state_sha": "b7318bbf5f0b03a4"
   },
   {
    "at": "2026-10-13T20:58:05",
@@ -5133,11 +5285,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 72,
      "used": {}
     }
    },
-   "state_sha": "8371aca3484eead7"
+   "state_sha": "4dfaea702f042762"
   },
   {
    "at": "2026-10-13T21:35:05",
@@ -5182,11 +5338,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 77,
      "used": {}
     }
    },
-   "state_sha": "3c05b516bdb00339"
+   "state_sha": "206c43503bebee99"
   },
   {
    "at": "2026-10-13T22:12:05",
@@ -5231,11 +5391,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 82,
      "used": {}
     }
    },
-   "state_sha": "9faa862aec5702a9"
+   "state_sha": "af900262baf30577"
   },
   {
    "at": "2026-10-13T22:49:05",
@@ -5280,11 +5444,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 87,
      "used": {}
     }
    },
-   "state_sha": "3b38f8ac78cdb930"
+   "state_sha": "d93398cb375f073d"
   },
   {
    "at": "2026-10-13T23:26:05",
@@ -5329,11 +5497,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 92,
      "used": {}
     }
    },
-   "state_sha": "cc180264dbc1d08d"
+   "state_sha": "7b382b5fc77ae248"
   },
   {
    "at": "2026-10-13T23:59:59",
@@ -5378,11 +5550,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 97,
      "used": {}
     }
    },
-   "state_sha": "46cf8cabf32b3e8b"
+   "state_sha": "c3590ab007269d92"
   },
   {
    "at": "2026-10-14T00:00:05",
@@ -5427,11 +5603,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 102,
      "used": {}
     }
    },
-   "state_sha": "64895051e58dcd10"
+   "state_sha": "8ea88f8aff23b337"
   },
   {
    "at": "2026-10-14T00:03:05",
@@ -5476,11 +5656,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 107,
      "used": {}
     }
    },
-   "state_sha": "08ef3af1675f20b6"
+   "state_sha": "79e7f9f8ae8d3773"
   },
   {
    "at": "2026-10-14T00:40:05",
@@ -5525,11 +5709,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 112,
      "used": {}
     }
    },
-   "state_sha": "65aa8db5d5f14fd0"
+   "state_sha": "89254ebfd2ba22b9"
   },
   {
    "at": "2026-10-14T01:17:05",
@@ -5574,11 +5762,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 117,
      "used": {}
     }
    },
-   "state_sha": "643b79e3f9a32da5"
+   "state_sha": "582e8721961cc07b"
   },
   {
    "at": "2026-10-14T01:54:05",
@@ -5623,11 +5815,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 122,
      "used": {}
     }
    },
-   "state_sha": "75c8c1595e64f85f"
+   "state_sha": "d140098f2d968a02"
   },
   {
    "at": "2026-10-14T02:31:05",
@@ -5672,11 +5868,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 127,
      "used": {}
     }
    },
-   "state_sha": "91180c4d9d4dd7a4"
+   "state_sha": "073204d3251d853a"
   },
   {
    "at": "2026-10-14T03:08:05",
@@ -5721,11 +5921,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 132,
      "used": {}
     }
    },
-   "state_sha": "99376bf90424466b"
+   "state_sha": "250f03035b639e7e"
   },
   {
    "at": "2026-10-14T03:45:05",
@@ -5770,11 +5974,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 137,
      "used": {}
     }
    },
-   "state_sha": "ae688e00953cd84a"
+   "state_sha": "65daaa18ad0ee0af"
   },
   {
    "at": "2026-10-14T03:59:30",
@@ -5819,11 +6027,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 142,
      "used": {}
     }
    },
-   "state_sha": "066b6bc1609ffa30"
+   "state_sha": "9f9f4bdc12385626"
   },
   {
    "at": "2026-10-14T04:00:05",
@@ -5868,11 +6080,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 149,
      "used": {}
     }
    },
-   "state_sha": "9b4a139872c2d3f6"
+   "state_sha": "dca41072a7df4058"
   },
   {
    "at": "2026-10-14T04:22:05",
@@ -5917,11 +6133,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 156,
      "used": {}
     }
    },
-   "state_sha": "be85f789d1d86faf"
+   "state_sha": "7a094d13cd43679a"
   },
   {
    "at": "2026-10-14T04:59:05",
@@ -5966,11 +6186,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 163,
      "used": {}
     }
    },
-   "state_sha": "b7a856013a899fa3"
+   "state_sha": "389ddffdb11f7272"
   },
   {
    "at": "2026-10-14T05:36:05",
@@ -6015,11 +6239,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 170,
      "used": {}
     }
    },
-   "state_sha": "db90b263a54ad73d"
+   "state_sha": "759ce993ee121138"
   },
   {
    "at": "2026-10-14T06:13:05",
@@ -6064,11 +6292,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 177,
      "used": {}
     }
    },
-   "state_sha": "9eaba18fc8fae73b"
+   "state_sha": "d0e52f2f77b84d2c"
   },
   {
    "at": "2026-10-14T06:50:05",
@@ -6113,11 +6345,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 184,
      "used": {}
     }
    },
-   "state_sha": "7822ba5acb1ca238"
+   "state_sha": "4bca64a13e7710ed"
   },
   {
    "at": "2026-10-14T07:27:05",
@@ -6162,11 +6398,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 191,
      "used": {}
     }
    },
-   "state_sha": "e5156e60021fd886"
+   "state_sha": "a4447ef582b977ac"
   },
   {
    "at": "2026-10-14T08:04:05",
@@ -6211,11 +6451,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 198,
      "used": {}
     }
    },
-   "state_sha": "effa0690691e8e51"
+   "state_sha": "54e29c3d898dc1ed"
   },
   {
    "at": "2026-10-14T08:41:05",
@@ -6260,11 +6504,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 205,
      "used": {}
     }
    },
-   "state_sha": "b94c099ddd775f76"
+   "state_sha": "8bc6ed94df1423ac"
   },
   {
    "at": "2026-10-14T09:18:05",
@@ -6309,11 +6557,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 212,
      "used": {}
     }
    },
-   "state_sha": "ff8612d15a0769f1"
+   "state_sha": "47397bf09b15dc5f"
   },
   {
    "at": "2026-10-14T09:55:05",
@@ -6358,11 +6610,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 219,
      "used": {}
     }
    },
-   "state_sha": "da11953356cf0e89"
+   "state_sha": "dc7af9b68fa02568"
   },
   {
    "at": "2026-10-14T10:32:05",
@@ -6407,11 +6663,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 226,
      "used": {}
     }
    },
-   "state_sha": "7d8fd2bc35a0af84"
+   "state_sha": "4cc64b8ff3fae5fd"
   },
   {
    "at": "2026-10-14T11:09:05",
@@ -6456,11 +6716,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 233,
      "used": {}
     }
    },
-   "state_sha": "650fbd2876aaff83"
+   "state_sha": "77dedd900604ca32"
   },
   {
    "at": "2026-10-14T19:59:50",
@@ -6505,11 +6769,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 242,
      "used": {}
     }
    },
-   "state_sha": "393e3d063db318d1"
+   "state_sha": "9d3c40b1df3d5c3d"
   },
   {
    "at": "2026-10-14T20:00:05",
@@ -6554,11 +6822,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 253,
      "used": {}
     }
    },
-   "state_sha": "39be5fe9698ce371"
+   "state_sha": "159633a06e61ca9c"
   },
   {
    "at": "2026-10-14T23:59:59",
@@ -6603,11 +6875,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 264,
      "used": {}
     }
    },
-   "state_sha": "b81cad4cb8b450ca"
+   "state_sha": "847e15766f311e20"
   }
  ],
  "scan_eight_hour_two_slots": [
@@ -17405,11 +17681,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "8e6cc5e97f8f2754"
+   "state_sha": "521a404d80a2b018"
   },
   {
    "at": "2026-10-13T00:37:05",
@@ -17446,11 +17726,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "b8a07781deca38f1"
+   "state_sha": "2328e5c7246a94b6"
   },
   {
    "at": "2026-10-13T01:14:05",
@@ -17487,11 +17771,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "b8a07781deca38f1"
+   "state_sha": "2328e5c7246a94b6"
   },
   {
    "at": "2026-10-13T01:51:05",
@@ -17528,11 +17816,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "b8a07781deca38f1"
+   "state_sha": "2328e5c7246a94b6"
   },
   {
    "at": "2026-10-13T02:28:05",
@@ -17569,11 +17861,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "33c862ffca9fb108"
+   "state_sha": "a1061831d911a4df"
   },
   {
    "at": "2026-10-13T03:05:05",
@@ -17610,11 +17906,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "33c862ffca9fb108"
+   "state_sha": "a1061831d911a4df"
   },
   {
    "at": "2026-10-13T03:42:05",
@@ -17651,11 +17951,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "33c862ffca9fb108"
+   "state_sha": "a1061831d911a4df"
   },
   {
    "at": "2026-10-13T03:59:30",
@@ -17692,11 +17996,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 1,
      "used": {}
     }
    },
-   "state_sha": "33c862ffca9fb108"
+   "state_sha": "a1061831d911a4df"
   },
   {
    "at": "2026-10-13T04:00:05",
@@ -17731,11 +18039,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 2,
      "used": {}
     }
    },
-   "state_sha": "dc780d191990f023"
+   "state_sha": "73435b177e671f2f"
   },
   {
    "at": "2026-10-13T04:19:05",
@@ -17770,11 +18082,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 3,
      "used": {}
     }
    },
-   "state_sha": "c19322c3ca71138a"
+   "state_sha": "7a0882571234f722"
   },
   {
    "at": "2026-10-13T04:56:05",
@@ -17809,11 +18125,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 4,
      "used": {}
     }
    },
-   "state_sha": "a794fae2a92d13f0"
+   "state_sha": "c4430b4f69ef7d62"
   },
   {
    "at": "2026-10-13T05:33:05",
@@ -17848,11 +18168,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 5,
      "used": {}
     }
    },
-   "state_sha": "1d89ae7b3070488f"
+   "state_sha": "257d5fd56109d60a"
   },
   {
    "at": "2026-10-13T06:10:05",
@@ -17887,11 +18211,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 6,
      "used": {}
     }
    },
-   "state_sha": "0885646b07b044ec"
+   "state_sha": "2ff4ada9c676a6d7"
   },
   {
    "at": "2026-10-13T06:47:05",
@@ -17926,11 +18254,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 7,
      "used": {}
     }
    },
-   "state_sha": "93b83eb9d697e752"
+   "state_sha": "f23c9345315bad74"
   },
   {
    "at": "2026-10-13T07:24:05",
@@ -17965,11 +18297,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 8,
      "used": {}
     }
    },
-   "state_sha": "98e5af93af924c0f"
+   "state_sha": "b0a6fc5a53f93802"
   },
   {
    "at": "2026-10-13T08:01:05",
@@ -18007,11 +18343,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 10,
      "used": {}
     }
    },
-   "state_sha": "9252343bf6a34012"
+   "state_sha": "0aeeb7a24e1c82dc"
   },
   {
    "at": "2026-10-13T08:38:05",
@@ -18051,11 +18391,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 12,
      "used": {}
     }
    },
-   "state_sha": "7f8c61beda48afd9"
+   "state_sha": "20b503df3170278a"
   },
   {
    "at": "2026-10-13T09:15:05",
@@ -18097,11 +18441,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 14,
      "used": {}
     }
    },
-   "state_sha": "02714e31a4d9481f"
+   "state_sha": "748c02a23be66bad"
   },
   {
    "at": "2026-10-13T09:52:05",
@@ -18145,11 +18493,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 16,
      "used": {}
     }
    },
-   "state_sha": "8e4d0f8bfa99d65e"
+   "state_sha": "72e40e9e80dfcfae"
   },
   {
    "at": "2026-10-13T10:29:05",
@@ -18193,11 +18545,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 18,
      "used": {}
     }
    },
-   "state_sha": "6f126430a2167367"
+   "state_sha": "12d2178a2fc2140d"
   },
   {
    "at": "2026-10-13T11:06:05",
@@ -18241,11 +18597,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 20,
      "used": {}
     }
    },
-   "state_sha": "84e900cd7267285e"
+   "state_sha": "7248ddfdf9e50b90"
   },
   {
    "at": "2026-10-13T11:43:05",
@@ -18289,11 +18649,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 22,
      "used": {}
     }
    },
-   "state_sha": "5d6e170424fa3f33"
+   "state_sha": "62f1595e6bd34d04"
   },
   {
    "at": "2026-10-13T12:20:05",
@@ -18338,11 +18702,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 25,
      "used": {}
     }
    },
-   "state_sha": "e2e400c111722934"
+   "state_sha": "9033280bab9e35f0"
   },
   {
    "at": "2026-10-13T12:57:05",
@@ -18387,11 +18755,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 28,
      "used": {}
     }
    },
-   "state_sha": "906928491a001f43"
+   "state_sha": "0b19778c52c59969"
   },
   {
    "at": "2026-10-13T13:34:05",
@@ -18436,11 +18808,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 31,
      "used": {}
     }
    },
-   "state_sha": "65ccc274b0d3ec33"
+   "state_sha": "81493f88e762e252"
   },
   {
    "at": "2026-10-13T14:11:05",
@@ -18485,11 +18861,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 34,
      "used": {}
     }
    },
-   "state_sha": "d8b73041ca075cdb"
+   "state_sha": "1c8329f2f1d68378"
   },
   {
    "at": "2026-10-13T14:48:05",
@@ -18534,11 +18914,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 37,
      "used": {}
     }
    },
-   "state_sha": "4cb5ebdf930fca74"
+   "state_sha": "d5f8dbc5d65bc567"
   },
   {
    "at": "2026-10-13T15:25:05",
@@ -18583,11 +18967,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 40,
      "used": {}
     }
    },
-   "state_sha": "b415886be7d1f0ff"
+   "state_sha": "0ccb2f6eb9f44100"
   },
   {
    "at": "2026-10-13T16:02:05",
@@ -18633,11 +19021,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 44,
      "used": {}
     }
    },
-   "state_sha": "671475698dd97831"
+   "state_sha": "b1cd3d1c40fae8ac"
   },
   {
    "at": "2026-10-13T16:39:05",
@@ -18683,11 +19075,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 48,
      "used": {}
     }
    },
-   "state_sha": "0df862c181557825"
+   "state_sha": "d3749ed765cb5a43"
   },
   {
    "at": "2026-10-13T17:16:05",
@@ -18733,11 +19129,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 52,
      "used": {}
     }
    },
-   "state_sha": "0c8610f6894f3670"
+   "state_sha": "e6f0cf52d46f2657"
   },
   {
    "at": "2026-10-13T17:53:05",
@@ -18783,11 +19183,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 56,
      "used": {}
     }
    },
-   "state_sha": "b1f6c96ce7b58406"
+   "state_sha": "b31747fc457cc929"
   },
   {
    "at": "2026-10-13T18:30:05",
@@ -18833,11 +19237,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 60,
      "used": {}
     }
    },
-   "state_sha": "e685b8ca4ca4b004"
+   "state_sha": "40967112d12f41be"
   },
   {
    "at": "2026-10-13T19:07:05",
@@ -18883,11 +19291,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 64,
      "used": {}
     }
    },
-   "state_sha": "cd842a39c252b05b"
+   "state_sha": "49a7ea1711f6e358"
   },
   {
    "at": "2026-10-13T19:44:05",
@@ -18933,11 +19345,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 68,
      "used": {}
     }
    },
-   "state_sha": "e59e4fa78956611f"
+   "state_sha": "355c6bea6438e60a"
   },
   {
    "at": "2026-10-13T19:59:50",
@@ -18983,11 +19399,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 72,
      "used": {}
     }
    },
-   "state_sha": "74e99cedc753c198"
+   "state_sha": "0e2665931c73058e"
   },
   {
    "at": "2026-10-13T20:00:05",
@@ -19034,11 +19454,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 77,
      "used": {}
     }
    },
-   "state_sha": "6975141f669174eb"
+   "state_sha": "0e315e768053064d"
   },
   {
    "at": "2026-10-13T20:21:05",
@@ -19085,11 +19509,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 82,
      "used": {}
     }
    },
-   "state_sha": "c7dba4329a36307f"
+   "state_sha": "97126156ef712ff6"
   },
   {
    "at": "2026-10-13T20:58:05",
@@ -19136,11 +19564,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 87,
      "used": {}
     }
    },
-   "state_sha": "88d16abe2175e62e"
+   "state_sha": "04c41a9e07a6e42f"
   },
   {
    "at": "2026-10-13T21:35:05",
@@ -19187,11 +19619,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 92,
      "used": {}
     }
    },
-   "state_sha": "fdc5f341bba43798"
+   "state_sha": "f2a28586bb77819e"
   },
   {
    "at": "2026-10-13T22:12:05",
@@ -19238,11 +19674,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 97,
      "used": {}
     }
    },
-   "state_sha": "b34f440e82af8ae9"
+   "state_sha": "1d5a7289c049337c"
   },
   {
    "at": "2026-10-13T22:49:05",
@@ -19289,11 +19729,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 102,
      "used": {}
     }
    },
-   "state_sha": "2a051d515492f972"
+   "state_sha": "9ec21cb9229dabf3"
   },
   {
    "at": "2026-10-13T23:26:05",
@@ -19340,11 +19784,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 107,
      "used": {}
     }
    },
-   "state_sha": "1e1887a41029f802"
+   "state_sha": "4f9f1e3efd05fb84"
   },
   {
    "at": "2026-10-13T23:59:59",
@@ -19391,11 +19839,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 112,
      "used": {}
     }
    },
-   "state_sha": "47fcf85dfef365b2"
+   "state_sha": "18c1afc62a8a9eb9"
   },
   {
    "at": "2026-10-14T00:00:05",
@@ -19443,11 +19895,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 118,
      "used": {}
     }
    },
-   "state_sha": "3db8b6d6e764abe6"
+   "state_sha": "e392f4e646e87701"
   },
   {
    "at": "2026-10-14T00:03:05",
@@ -19495,11 +19951,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 124,
      "used": {}
     }
    },
-   "state_sha": "8af91c2589ac1704"
+   "state_sha": "5fa5892a225891be"
   },
   {
    "at": "2026-10-14T00:40:05",
@@ -19547,11 +20007,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 130,
      "used": {}
     }
    },
-   "state_sha": "8f5e04b5b5af36d2"
+   "state_sha": "81296d35980f1f18"
   },
   {
    "at": "2026-10-14T01:17:05",
@@ -19599,11 +20063,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 136,
      "used": {}
     }
    },
-   "state_sha": "45b274f0663830fa"
+   "state_sha": "470e79a81a6a042c"
   },
   {
    "at": "2026-10-14T01:54:05",
@@ -19651,11 +20119,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 142,
      "used": {}
     }
    },
-   "state_sha": "18ab0e0691f2f62c"
+   "state_sha": "43f2c43579010d7c"
   },
   {
    "at": "2026-10-14T02:31:05",
@@ -19703,11 +20175,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 148,
      "used": {}
     }
    },
-   "state_sha": "37cf93118f2ec099"
+   "state_sha": "0cfba7f92c1be289"
   },
   {
    "at": "2026-10-14T03:08:05",
@@ -19755,11 +20231,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 154,
      "used": {}
     }
    },
-   "state_sha": "6ac0e9257232e447"
+   "state_sha": "401e0f0be3746751"
   },
   {
    "at": "2026-10-14T03:45:05",
@@ -19807,11 +20287,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 160,
      "used": {}
     }
    },
-   "state_sha": "51bc3a4af3fe7cb2"
+   "state_sha": "1a7fa3775f59f91f"
   },
   {
    "at": "2026-10-14T03:59:30",
@@ -19859,11 +20343,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 166,
      "used": {}
     }
    },
-   "state_sha": "df5a86eaf2b76d1f"
+   "state_sha": "2f14563c1c7388a5"
   },
   {
    "at": "2026-10-14T04:00:05",
@@ -19911,11 +20399,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 173,
      "used": {}
     }
    },
-   "state_sha": "cb43478f8eea4285"
+   "state_sha": "09250c93eed02eaf"
   },
   {
    "at": "2026-10-14T04:22:05",
@@ -19963,11 +20455,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 180,
      "used": {}
     }
    },
-   "state_sha": "e02efbeff116170d"
+   "state_sha": "3418b0e92fc09982"
   },
   {
    "at": "2026-10-14T04:59:05",
@@ -20015,11 +20511,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 187,
      "used": {}
     }
    },
-   "state_sha": "e08c8e2aad9167cc"
+   "state_sha": "97b39705dc087f05"
   },
   {
    "at": "2026-10-14T05:36:05",
@@ -20067,11 +20567,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 194,
      "used": {}
     }
    },
-   "state_sha": "85c59b8c3acb0ba4"
+   "state_sha": "d97020f434f7d7ed"
   },
   {
    "at": "2026-10-14T06:13:05",
@@ -20119,11 +20623,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 201,
      "used": {}
     }
    },
-   "state_sha": "f0c61087c51d4555"
+   "state_sha": "209f420ecc9d03eb"
   },
   {
    "at": "2026-10-14T06:50:05",
@@ -20171,11 +20679,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 208,
      "used": {}
     }
    },
-   "state_sha": "5bdcbd04ca7bf481"
+   "state_sha": "27e50239b6db683d"
   },
   {
    "at": "2026-10-14T07:27:05",
@@ -20223,11 +20735,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 215,
      "used": {}
     }
    },
-   "state_sha": "da7caa46f69288e8"
+   "state_sha": "d586f93c7508251a"
   },
   {
    "at": "2026-10-14T08:04:05",
@@ -20275,11 +20791,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 223,
      "used": {}
     }
    },
-   "state_sha": "5d5df47d0dbc4579"
+   "state_sha": "c444ce5e574535e7"
   },
   {
    "at": "2026-10-14T08:41:05",
@@ -20327,11 +20847,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 231,
      "used": {}
     }
    },
-   "state_sha": "9defa8235632a029"
+   "state_sha": "176d0adfc8fc5e0b"
   },
   {
    "at": "2026-10-14T09:18:05",
@@ -20379,11 +20903,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 239,
      "used": {}
     }
    },
-   "state_sha": "cada2757e1328732"
+   "state_sha": "7bcd04814fe1856f"
   },
   {
    "at": "2026-10-14T09:55:05",
@@ -20431,11 +20959,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 247,
      "used": {}
     }
    },
-   "state_sha": "0da3da62f1c7cbea"
+   "state_sha": "730c4deeca5facf1"
   },
   {
    "at": "2026-10-14T10:32:05",
@@ -20483,11 +21015,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 255,
      "used": {}
     }
    },
-   "state_sha": "2abc60f57b216509"
+   "state_sha": "4a9f59cd709ea641"
   },
   {
    "at": "2026-10-14T11:09:05",
@@ -20535,11 +21071,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 263,
      "used": {}
     }
    },
-   "state_sha": "789c460b56957228"
+   "state_sha": "666080e47ac3c50f"
   },
   {
    "at": "2026-10-14T19:59:50",
@@ -20587,11 +21127,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 273,
      "used": {}
     }
    },
-   "state_sha": "d631ab4285c5f782"
+   "state_sha": "34de33d5e23e81f4"
   },
   {
    "at": "2026-10-14T20:00:05",
@@ -20639,11 +21183,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 284,
      "used": {}
     }
    },
-   "state_sha": "880793b84ee3a956"
+   "state_sha": "b6c1690f87c53b8f"
   },
   {
    "at": "2026-10-14T23:59:59",
@@ -20691,11 +21239,15 @@
      "v": 2
     },
     "__FAIRNESS__": {
+     "last_run": {
+      "episodes": 0,
+      "show": null
+     },
      "run": 295,
      "used": {}
     }
    },
-   "state_sha": "40d4ef628edf16d9"
+   "state_sha": "0f21f4d672eb276c"
   }
  ]
 }

@@ -15,8 +15,26 @@ log = logging.getLogger("retro_tv.log_manager")
 
 try:
     import performance_governor as _perf_governor
-except Exception:
+except Exception as _governor_import_error:
     _perf_governor = None
+    log.warning("[LOG FOLDER] could not import performance_governor, using the fallback values written in log_manager.py: %s", _governor_import_error)
+
+
+# ============================================================================
+# SECTION: Swallowed-failure lines
+# ============================================================================
+
+
+def _log_swallowed(where, error):
+    """The [FAILURE] line through performance_governor, or a plain warning when it did not load."""
+    if _perf_governor is not None:
+        return _perf_governor.log_swallowed(where, error)
+    log.warning("[FAILURE] %s: %s", where, error)
+
+
+# ============================================================================
+# SECTION: Tunables
+# ============================================================================
 
 # WARNING: the fallback numbers below must match LOGS_ROTATED_APP_LOGS_KEPT, LOGS_TEMP_FILE_MAX_AGE_DAYS in performance_governor.py; they are used only when that module fails to import.
 LOGS_ROTATED_APP_LOGS_KEPT = _perf_governor.LOGS_ROTATED_APP_LOGS_KEPT if _perf_governor is not None else 2
@@ -25,20 +43,26 @@ LOGS_TEMP_FILE_MAX_AGE_DAYS = _perf_governor.LOGS_TEMP_FILE_MAX_AGE_DAYS if _per
 _ROTATED_APP_LOG = re.compile(r"^app_log\d+\.txt$", re.IGNORECASE)
 
 
+# ============================================================================
+# SECTION: Folder report
+# ============================================================================
+
+
 def _entry_size(path):
-    """Bytes in a file, or in every file under a folder; 0 when unreadable."""
+    """Bytes in a file, or in every file under a folder; a file that cannot be read counts as 0."""
     try:
         if os.path.isfile(path):
             return os.path.getsize(path)
-    except OSError:
+    except OSError as error:
+        _log_swallowed("log_manager: reading the size of a log", error)
         return 0
     total = 0
     for root, _dirs, files in os.walk(path):
         for name in files:
             try:
                 total += os.path.getsize(os.path.join(root, name))
-            except OSError:
-                pass
+            except OSError as error:
+                _log_swallowed("log_manager: reading the size of a file in a logs subfolder", error)
     return total
 
 
@@ -54,6 +78,11 @@ def folder_report(logs_dir, top=6):
     return "[LOG FOLDER] %.1f MB in %d entries: %s" % (total / 1048576.0, len(sizes), parts or "empty")
 
 
+# ============================================================================
+# SECTION: Pruning
+# ============================================================================
+
+
 def prune_logs(logs_dir, now=None):
     """Removes rotated app logs beyond the newest LOGS_ROTATED_APP_LOGS_KEPT and files in logs/temp older than LOGS_TEMP_FILE_MAX_AGE_DAYS. Returns (files removed, bytes freed)."""
     now = time.time() if now is None else now
@@ -64,14 +93,16 @@ def prune_logs(logs_dir, now=None):
         try:
             size = os.path.getsize(path)
             os.remove(path)
-        except OSError:
+        except OSError as error:
+            _log_swallowed("log_manager: removing an old log", error)
             return
         removed += 1
         freed += size
 
     try:
         names = os.listdir(logs_dir)
-    except OSError:
+    except OSError as error:
+        _log_swallowed("log_manager: listing the logs folder", error)
         return 0, 0
     rotated = []
     for name in names:
@@ -79,8 +110,8 @@ def prune_logs(logs_dir, now=None):
         if _ROTATED_APP_LOG.match(name) and os.path.isfile(full):
             try:
                 rotated.append((os.path.getmtime(full), full))
-            except OSError:
-                pass
+            except OSError as error:
+                _log_swallowed("log_manager: reading the date of a rotated app log", error)
     rotated.sort(reverse=True)
     for _mtime, full in rotated[max(0, LOGS_ROTATED_APP_LOGS_KEPT):]:
         remove(full)
@@ -92,11 +123,16 @@ def prune_logs(logs_dir, now=None):
             try:
                 if os.path.getmtime(full) < cutoff:
                     remove(full)
-            except OSError:
-                pass
+            except OSError as error:
+                _log_swallowed("log_manager: reading the date of a file in logs/temp", error)
     if removed:
         log.info("[LOG FOLDER] removed %d old file(s), %.1f MB freed", removed, freed / 1048576.0)
     return removed, freed
+
+
+# ============================================================================
+# SECTION: One tidy pass
+# ============================================================================
 
 
 def tidy(base_dir):
