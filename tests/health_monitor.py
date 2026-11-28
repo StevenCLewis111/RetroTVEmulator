@@ -53,6 +53,10 @@ _REPORT_S = _governor.HEALTH_REPORT_SECONDS if _governor is not None else 60.0
 _RING_S = _governor.HEALTH_RING_SECONDS if _governor is not None else 15.0
 _EXPLAIN_GAP_MS = _governor.HEALTH_EXPLAIN_GAP_MS if _governor is not None else 100
 _EXPLAIN_MAX_PER_MINUTE = _governor.HEALTH_EXPLAIN_MAX_PER_MINUTE if _governor is not None else 20
+# WARNING: the fallback values below must match HEALTH_STALL_LOUD_MS, HEALTH_STALL_LOUD_MAX_PER_MINUTE and HEALTH_STALL_CPU_EVERY_SECONDS in performance_governor.py; they are used only when that module fails to import.
+_STALL_LOUD_MS = getattr(_governor, "HEALTH_STALL_LOUD_MS", 1000) if _governor is not None else 1000
+_STALL_LOUD_MAX_PER_MINUTE = getattr(_governor, "HEALTH_STALL_LOUD_MAX_PER_MINUTE", 6) if _governor is not None else 6
+_STALL_CPU_EVERY_S = getattr(_governor, "HEALTH_STALL_CPU_EVERY_SECONDS", 1.0) if _governor is not None else 1.0
 _STUCK_REPEAT_S = _governor.HEALTH_STUCK_REPEAT_SECONDS if _governor is not None else 600.0
 _STUCK_S = _governor.HEALTH_STUCK_SECONDS if _governor is not None else 10.0
 _SCREEN_STUCK_S = _governor.HEALTH_SCREEN_STUCK_SECONDS if _governor is not None else 3.0
@@ -527,13 +531,15 @@ class _Monitor:
         self.thread_cpu_last = {}
         self.process = _psutil.Process() if _psutil is not None else None
         self.rss_last = None
-        self.sys_times_last = None
+        self.sys_times_last = {}
+        self.cpu_ring = collections.deque()
+        self.cpu_ring_at = 0.0
+        self.loud_at = collections.deque()
         self.program_times_last = {}
         self.sensor_retry_at = 0.0
         self.sensor_note_made = False
         self.gpu_tool = shutil.which("nvidia-smi")
         self.hottest = 0.0
-        self.cpu_load_primed = False
 
     def refresh_names(self):
         threads = threading.enumerate()
@@ -677,14 +683,71 @@ class _Monitor:
             frames.clear()
         log.warning("[HEALTH DUMP] %s; every thread's stack follows:\n%s", reason, "\n".join(parts))
 
+    def keep_cpu_reading(self, now):
+        """Every HEALTH_STALL_CPU_EVERY_SECONDS: each thread's CPU seconds and the whole program's, kept HEALTH_RING_SECONDS, so a long screen gap can say which thread used the processor through it."""
+        if self.process is None or now - self.cpu_ring_at < _STALL_CPU_EVERY_S:
+            return
+        self.cpu_ring_at = now
+        try:
+            times = self.process.cpu_times()
+            per_thread = self.thread_cpu() or {}
+        except Exception as error:
+            _log_swallowed("health_monitor.keep_cpu_reading", error)
+            return
+        self.cpu_ring.append((now, per_thread, times.user + times.system))
+        while self.cpu_ring and now - self.cpu_ring[0][0] > _RING_S:
+            self.cpu_ring.popleft()
+
+    def gap_cpu_text(self, start, end):
+        """Which threads used the processor from the last CPU reading before start until now: the busiest Python threads in ms, the program's other threads (VLC's decoders, the graphics driver, the caption model's helpers inside this process) together, and the whole program; empty without readings."""
+        if self.process is None or not self.cpu_ring:
+            return ""
+        base = None
+        for reading in self.cpu_ring:
+            if reading[0] <= start:
+                base = reading
+        if base is None:
+            base = self.cpu_ring[0]
+        try:
+            times = self.process.cpu_times()
+            now_threads = self.thread_cpu() or {}
+        except Exception as error:
+            _log_swallowed("health_monitor.gap_cpu_text", error)
+            return ""
+        span = max(0.001, time.monotonic() - base[0])
+        used = []
+        python_total = 0.0
+        for ident, cpu in now_threads.items():
+            before = base[1].get(ident)
+            if cpu is None or before is None:
+                continue
+            delta = max(0.0, cpu - before)
+            python_total += delta
+            used.append((delta, self.names.get(ident, "?")))
+        used.sort(reverse=True)
+        program = max(0.0, (times.user + times.system) - base[2])
+        top = ", ".join("%s %d ms" % (name, delta * 1000) for delta, name in used[:_PROFILE_TOP] if delta >= 0.01) or "no Python thread used 10 ms"
+        return ("; CPU over the last %.1fs (%d cores): %s; the program's other threads (VLC, graphics driver, helpers) %d ms; the whole program %d ms (%.0f%% of one core)"
+                % (span, _psutil.cpu_count() or 0, top, max(0.0, program - python_total) * 1000, program * 1000, 100.0 * program / span))
+
     def explain(self, end, gap_ms, label):
         if gap_ms > self.worst_gap[0]:
             self.worst_gap = (gap_ms, label)
-        while self.explained_at and end - self.explained_at[0] > 60.0:
-            self.explained_at.popleft()
-        if len(self.explained_at) >= _EXPLAIN_MAX_PER_MINUTE:
-            return
-        self.explained_at.append(end)
+        # WARNING: owner 2026-11-26, "add what logs you need to find the freeze": a gap of HEALTH_STALL_LOUD_MS or more is always written, as a WARNING with each thread's CPU, outside the per-minute count of the short ones; [HEALTH STALL] INFO lines stay quiet in app_log.txt.
+        loud = gap_ms >= _STALL_LOUD_MS
+        if loud:
+            while self.loud_at and end - self.loud_at[0] > 60.0:
+                self.loud_at.popleft()
+            if len(self.loud_at) >= _STALL_LOUD_MAX_PER_MINUTE:
+                loud = False
+            else:
+                self.loud_at.append(end)
+        if not loud:
+            while self.explained_at and end - self.explained_at[0] > 60.0:
+                self.explained_at.popleft()
+            if len(self.explained_at) >= _EXPLAIN_MAX_PER_MINUTE:
+                return
+            self.explained_at.append(end)
         start = end - gap_ms / 1000.0
         looks = [s for s in _snapshot(self.ring) if start - _SAMPLE_S <= s[0] <= end]
         screen = collections.Counter(s[1][0] for s in looks if s[1] is not None)
@@ -695,8 +758,10 @@ class _Monitor:
         gc_text = ("; garbage collection ran %s" % ", ".join("%.0f ms (generation %s, on %s)" % (e[1] * 1000, e[2], e[3]) for e in gcs)) if gcs else ""
         expected = max(1, int(gap_ms / 1000.0 / _SAMPLE_S))
         few_text = ("; only %d of about %d looks could be taken, so one thread held Python without a break for most of the gap (one long step, most likely the place named first)" % (len(looks), expected)) if len(looks) * 3 < expected else ""
-        log.info("[HEALTH STALL] %d ms screen gap%s: of %d looks the screen thread was in %s; other threads running app code then: %s%s%s",
-                 gap_ms, (" (%s)" % label) if label else "", len(looks), screen_text, others_text, gc_text, few_text)
+        cpu_text = self.gap_cpu_text(start, end) if loud else ""
+        (log.warning if loud else log.info)(
+            "[HEALTH STALL] %d ms screen gap%s: of %d looks the screen thread was in %s; other threads running app code then: %s%s%s%s",
+            gap_ms, (" (%s)" % label) if label else "", len(looks), screen_text, others_text, gc_text, few_text, cpu_text)
 
     def take_snapshot(self, now=None):
         """What the report needs from the looks, taken on the monitor thread so the looks can go on while the report is written."""
@@ -743,7 +808,7 @@ class _Monitor:
             times = self.process.cpu_times()
             used = times.user + times.system
             per_thread = {t.id: t.user_time + t.system_time for t in self.process.threads()}
-            system = self.system_cpu_pct()
+            system = self.system_cpu_pct() or 0.0
         except Exception as error:
             log.warning("[HEALTH] reading the CPU use failed: %s", error)
             return
@@ -761,15 +826,16 @@ class _Monitor:
                      app, _psutil.cpu_count() or 0, system, top or "nothing measurable")
         self.cpu_last = used
 
-    def system_cpu_pct(self):
-        """The whole PC's busy percent since the last call, from this monitor's own counters, so another caller of psutil.cpu_percent can not reset what this reads."""
-        # WARNING: psutil.cpu_percent(None) measures since the last call by anyone, and the governor calls it too, so this line read 0% in 946 of 960 reports; the counters are kept here instead.
+    def system_cpu_pct(self, slot="cpu"):
+        """The whole PC's busy percent since the last call for the same slot, from this monitor's own counters, so another caller of psutil.cpu_percent (or another line of this monitor) can not reset what this reads; None on a slot's first call."""
+        # WARNING: psutil.cpu_percent(None) measures since the last call by anyone, and the governor calls it too, so this line read 0% in 946 of 960 reports; the counters are kept here instead, one pair per line that reads them (owner logs 2026-11-26: [HEALTH VITALS] still used psutil.cpu_percent and read 0% on every line).
         times = _psutil.cpu_times()
         total = sum(times)
         idle = times.idle
-        before, self.sys_times_last = self.sys_times_last, (total, idle)
+        before = self.sys_times_last.get(slot)
+        self.sys_times_last[slot] = (total, idle)
         if before is None or total <= before[0]:
-            return 0.0
+            return None
         return max(0.0, min(100.0, 100.0 * (1.0 - (idle - before[1]) / (total - before[0]))))
 
     def read_windows_sensors(self):
@@ -853,10 +919,9 @@ class _Monitor:
             memory = _psutil.virtual_memory()
             swap = _psutil.swap_memory()
             # WARNING: owner 2026-11-15: the average of ALL cores (100% = every core full) since the previous vitals line; the per-program figures below are percent of ONE core. psutil's first call has no earlier call to measure from, so the first line leaves it out.
-            _load = _psutil.cpu_percent(interval=None)
-            if self.cpu_load_primed:
+            _load = self.system_cpu_pct("vitals")
+            if _load is not None:
                 parts.append("PC load %.0f%% of all cores over the last minute" % _load)
-            self.cpu_load_primed = True
             parts.append("memory %.0f%% used, %.1f GB free, page file %.0f%% used" % (memory.percent, memory.available / 1073741824.0, swap.percent))
             parts.append("busiest other programs: %s" % (self.busiest_programs(span) or "none above %.0f%%" % _BUSY_PROGRAM_MIN_PERCENT))
             root = os.path.abspath(os.sep) if os.name != "nt" else os.path.splitdrive(os.path.abspath(sys.argv[0]))[0] + "\\"
@@ -965,6 +1030,7 @@ class _Monitor:
                     self.last_names = now
                 checks_due = now - self.last_slow_checks >= 1.0
                 looks = self.sample(now, keep=checks_due)
+                self.keep_cpu_reading(now)
                 while self.gap_requests:
                     end, gap_ms, label = self.gap_requests.popleft()
                     self.explain(end, gap_ms, label)

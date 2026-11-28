@@ -82,15 +82,28 @@ _drive_slow_strikes = {}
 CONFIG_REPLACE_RETRY_DELAY_S = _perf_governor.CONFIG_REPLACE_RETRY_DELAY_S if _perf_governor is not None else 0.05
 
 
+def _server_data_places(base_dir):
+    """(main/data/.json, [the places earlier versions kept the channel files: <install>/_internal/server/.json, <base>/server/.json])."""
+    return (os.path.join(main_dir_for_base(base_dir), SCAN_DATA_FOLDER_NAME, SERVER_DATA_FOLDER_NAME),
+            [os.path.join(base_dir, "_internal", "server", SERVER_DATA_FOLDER_NAME), os.path.join(base_dir, "server", SERVER_DATA_FOLDER_NAME)])
+
+
 def server_data_dir(base_dir):
-    """The folder holding every server's and user's channel files: main/data/.json (owner 2026-11-26). The places earlier versions used (<install>/_internal/server/.json, <base>/server/.json) are moved in on first use; while Windows will not let one move, that old folder is used."""
-    # WARNING: owner 2026-11-11 / 2026-11-26: server_service.py reads the same place in _server_data_dir and both must agree.
-    new_dir = os.path.join(main_dir_for_base(base_dir), SCAN_DATA_FOLDER_NAME, SERVER_DATA_FOLDER_NAME)
+    """The folder holding every server's and user's channel files: main/data/.json (owner 2026-11-26). The places earlier versions used are moved in on first use; while Windows will not let one move, that old folder is used."""
+    new_dir, old_dirs = _server_data_places(base_dir)
     use = new_dir
-    for old_dir in (os.path.join(base_dir, "_internal", "server", SERVER_DATA_FOLDER_NAME), os.path.join(base_dir, "server", SERVER_DATA_FOLDER_NAME)):
+    for old_dir in old_dirs:
         if adopt_into_data_folder(old_dir, new_dir, "server and user channel files") == old_dir:
             use = old_dir
     return use
+
+
+def server_data_dir_in_use(base_dir):
+    """The same folder as server_data_dir without moving anything, for the server service, which only reads: main/data/.json, or an old place while the program has not moved it yet."""
+    new_dir, old_dirs = _server_data_places(base_dir)
+    if os.path.isdir(new_dir):
+        return new_dir
+    return next((old_dir for old_dir in old_dirs if os.path.isdir(old_dir)), new_dir)
 
 
 def _folder_safe_name(name, fallback):
@@ -6514,7 +6527,7 @@ def _duration_looks_implausible(file_path, duration_sec):
     try:
         if not duration_sec or duration_sec <= 0:
             return False
-        size_bytes = os.path.getsize(file_path)
+        size_bytes = os.path.getsize(long_form(file_path))
         implied_mbps = (size_bytes * 8 / 1_000_000) / duration_sec
         return implied_mbps > _DURATION_SANITY_MAX_PLAUSIBLE_MBPS
     except Exception as _swallowed_error:
@@ -6751,6 +6764,12 @@ def _project_root():
     return up
 
 
+def ffmpeg_found():
+    """True when an ffmpeg program was found (bundled or on PATH); False when every call to it can only fail."""
+    path = _resolve_ffmpeg_path()
+    return bool(path) and os.path.isfile(path)
+
+
 def _resolve_ffmpeg_path():
     global _ffmpeg_exe_path, _ffmpeg_resolved
     if _ffmpeg_resolved:
@@ -6763,19 +6782,17 @@ def _resolve_ffmpeg_path():
     exe_dir = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else None
     src_dir = _project_root()
 
+    # WARNING: owner 2026-11-26: the app's own tools live in tools (tools/vlc, tools/7zip, tools/ffmpeg); ffmpeg.exe at the top of a copy is the place builds before 2.2.9 had it.
+    # WARNING: owner logs 2026-11-27 (send_logs71, tray11): the 2.2.9 build has ffmpeg.exe straight in _internal/tools, not in tools/ffmpeg; it was found nowhere, so loudness, live captions and the server's caption scan all failed. tools/ffmpeg.exe is looked for too.
     for base_dir in (meipass, exe_dir, src_dir):
         if not base_dir:
             continue
-        candidate = os.path.join(base_dir, exe_name)
-        if os.path.exists(candidate):
-            _ffmpeg_exe_path = candidate
-            log.info("[FFMPEG] Using bundled binary: %s", candidate)
-            return _ffmpeg_exe_path
-        candidate = os.path.join(base_dir, "ffmpeg", exe_name)
-        if os.path.exists(candidate):
-            _ffmpeg_exe_path = candidate
-            log.info("[FFMPEG] Using bundled binary: %s", candidate)
-            return _ffmpeg_exe_path
+        for candidate in (os.path.join(base_dir, "tools", "ffmpeg", exe_name), os.path.join(base_dir, "tools", exe_name),
+                          os.path.join(base_dir, exe_name)):
+            if os.path.exists(candidate):
+                _ffmpeg_exe_path = candidate
+                log.info("[FFMPEG] Using bundled binary: %s", candidate)
+                return _ffmpeg_exe_path
 
     found_on_path = shutil.which(exe_name)
     if found_on_path:
@@ -6825,7 +6842,7 @@ def resolve_main_dir():
 
 # VALUES CHANGE HERE: the data folder's name inside main, the scan-result folders that live in it, the channel-file folder, and the saved files that once lived in the logs folder.
 SCAN_DATA_FOLDER_NAME = "data"
-SCAN_DATA_FOLDERS = ("media_library", "loudness", "captions", "visualizer_analysis")
+SCAN_DATA_FOLDERS = ("media_library", "loudness", "captions", "visualizer_analysis", "saved captions")
 SERVER_DATA_FOLDER_NAME = ".json"
 DATA_FILES_FROM_LOGS = ("playback_runtime.json", "drive_profiles.json", "scan_capacity.json")
 
@@ -6884,7 +6901,7 @@ def resolve_data_dir():
 
 
 def resolve_scan_folder(name, main_dir=None):
-    """The folder of one kind of scan result (media_library, loudness, captions, visualizer_analysis) in main/data, moving the old main/<name> folder in on first use."""
+    """The folder of one kind of scan result (media_library, loudness, captions, visualizer_analysis, saved captions) in main/data, moving the old main/<name> folder in on first use."""
     main = main_dir or resolve_main_dir()
     new_dir = os.path.join(main, SCAN_DATA_FOLDER_NAME, name)
     old_dir = os.path.join(main, name)
@@ -6901,6 +6918,11 @@ def data_file_for_base(base_dir, name):
     """One saved file that once lived in <base>/logs (station positions, drive profiles, scan speed): its place in main/data, moving the old copy in on first use; the old copy while Windows will not let it move."""
     new_path = os.path.join(main_dir_for_base(base_dir), SCAN_DATA_FOLDER_NAME, name)
     return adopt_into_data_folder(os.path.join(base_dir, "logs", name), new_path, name)
+
+
+def saved_captions_root():
+    """The folder that holds the saved captions folder (saved_captions joins "saved captions" on): main/data, with the old main/saved captions moved in first (owner 2026-11-26: every folder of scan results lives in main/data)."""
+    return os.path.dirname(resolve_scan_folder("saved captions"))
 
 
 def visualizer_cache_root():
@@ -7147,7 +7169,7 @@ def _shared_header_probe(file_path, timeout):
     """combined_header_probe(), reusing a successful result for the same unchanged file for a short time."""
     import media_library as _ml
     try:
-        st = os.stat(file_path)
+        st = os.stat(long_form(file_path))
         key = (os.path.normpath(file_path).lower(), st.st_mtime, st.st_size)
     except OSError as _swallowed_error:
         _log_swallowed("_shared_header_probe: st = os.stat(file_path)", _swallowed_error)
@@ -7427,7 +7449,7 @@ def resolve_caption_source(file_path):
     if not file_path or not _cached_path_exists(file_path):
         return result
     try:
-        st = os.stat(file_path)
+        st = os.stat(long_form(file_path))
         result["mtime"], result["size"] = st.st_mtime, st.st_size
     except OSError as _swallowed_error:
         _log_swallowed("resolve_caption_source: st = os.stat(file_path)", _swallowed_error)
@@ -7472,7 +7494,7 @@ def _convert_sidecar_to_srt(sidecar_path, timeout=30):
     """Convert an .ass/.ssa/.smi/.sub text sidecar to a cached .srt with ffmpeg, checked before it is used; None when it cannot be converted (for example a bitmap VobSub .sub)."""
     try:
         import hashlib
-        st = os.stat(sidecar_path)
+        st = os.stat(long_form(sidecar_path))
         digest = hashlib.sha1(f"{os.path.normpath(sidecar_path).lower()}|{st.st_size}|{st.st_mtime}".encode("utf-8", "replace")).hexdigest()[:16]
         out_path = os.path.join(resolve_captions_dir(), f"sidecar_{digest}.srt")
         if _caption_file_is_usable(out_path):
@@ -7571,21 +7593,17 @@ def _whisper_dir_has_model(path):
 
 
 def resolve_whisper_model_dir():
-    """Return the folder holding the faster-whisper model weights; in a packaged build it looks beside the .exe first, because the bundle's temp folder is thrown away on exit."""
+    """Return the folder holding the faster-whisper model weights: main/models/whisper (inside _internal in a build)."""
     global _asr_model_dir_ready, _asr_model_dir_choice
     if _asr_model_dir_choice is not None:
         return _asr_model_dir_choice
     candidates = []
     if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
         meipass = getattr(sys, "_MEIPASS", None)
-        candidates.append(os.path.join(exe_dir, "models", "whisper"))
-        candidates.append(os.path.join(exe_dir, "main", "models", "whisper"))
-        candidates.append(os.path.join(exe_dir, "_internal", "models", "whisper"))
         if meipass:
-            candidates.append(os.path.join(meipass, "models", "whisper"))
             candidates.append(os.path.join(meipass, "main", "models", "whisper"))
     candidates.append(os.path.join(resolve_main_dir(), "models", "whisper"))
+    candidates = list(dict.fromkeys(candidates))
     chosen = next((c for c in candidates if _whisper_dir_has_model(c)), None)
     if chosen is None:
         chosen = candidates[0]
@@ -7650,22 +7668,22 @@ def _live_caption_yields_to_picture(lead):
     return lead is not None and lead > _LIVE_CAPTION_TIGHT_LEAD_SEC and _governor_is_tight()
 
 
-def _wait_out_tune_hold():
+def _wait_out_tune_hold(stream_too=True):
     """Owner 2026-11-15: a caption chunk does not start while a channel is being tuned: from the channel button until TUNE_CAPTION_START_DELAY_SECONDS after the new channel's first picture (the other background work follows 4 s later); the governor's own limit ends the hold if no picture ever comes."""
     if _perf_governor is None:
         return
     try:
-        while _perf_governor.caption_tune_hold():
+        while _perf_governor.caption_tune_hold(stream_too=stream_too):
             time.sleep(0.1)
     except Exception as _swallowed_error:
         _log_swallowed("_wait_out_tune_hold", _swallowed_error)
 
 
 @contextlib.contextmanager
-def _asr_slot(label="", hold_sec=0.0, skip_if_held=False):
-    """Context manager like `with _ASR_SEMAPHORE:` that yields to live playback, then asks the governor's whisper lane to admit the job; yields True when the job may run, False when skip_if_held is set and the hold expired."""
+def _asr_slot(label="", hold_sec=0.0, skip_if_held=False, juggled=False):
+    """Context manager like `with _ASR_SEMAPHORE:` that yields to live playback, then asks the governor's whisper lane to admit the job; yields True when the job may run, False when skip_if_held is set and the hold expired. juggled: the caller already took its turn with the streamed show's buffer (performance_governor.juggle_turn), so only the channel-change hold applies."""
     _yield_to_live_playback(label)
-    _wait_out_tune_hold()
+    _wait_out_tune_hold(stream_too=not juggled)
     _hold = max(0.0, float(hold_sec or 0.0))
     with _gov_gate("whisper_slots", priority=(_hold <= 0.0), timeout=(_hold if _hold > 0.0 else None),
                    label=label) as _admitted:
@@ -7993,9 +8011,7 @@ def _start_caption_model_process(threads, size=None, essential=True):
     if getattr(sys, "frozen", False):
         command = [sys.executable]
     else:
-        here = os.path.dirname(os.path.abspath(__file__))
-        command = [sys.executable, next((path for path in (os.path.join(here, "retro_tv_emulator.py"), os.path.join(os.path.dirname(here), "retro_tv_emulator.py"),
-                                                          os.path.join(_project_root(), "retro_tv_emulator.py")) if os.path.isfile(path)), "retro_tv_emulator.py")]
+        command = [sys.executable, os.path.join(_project_root(), "retro_tv_emulator.py")]
     command += ["--caption-model-worker", resolve_whisper_model_dir(), size or caption_word_model(), str(threads), str(listener.address[1]), key.hex(), _caption_worker_log_dir()]
     if _native_libraries_reporter is not None:
         log.info("[ASR WORKER] native libraries in the program before the caption process starts: %s", _native_libraries_reporter())
@@ -9957,7 +9973,7 @@ def generate_captions_via_asr_chunked(file_path, start_sec=0.0, language=None,
     if not file_path or not _cached_path_exists(file_path):
         return None, ASR_REASON_EXTRACT_FAILED
     try:
-        st = os.stat(file_path)
+        st = os.stat(long_form(file_path))
     except OSError as _swallowed_error:
         _log_swallowed("generate_captions_via_asr_chunked: st = os.stat(file_path)", _swallowed_error)
         return None, ASR_REASON_EXTRACT_FAILED
@@ -10734,7 +10750,8 @@ class LiveCaptionSession:
             else:
                 _gate_hold, _gate_skip = 0.0, False
             try:
-                with _asr_slot(f"live_caption({base_name})", hold_sec=_gate_hold, skip_if_held=_gate_skip) as _may_run:
+                with _asr_slot(f"live_caption({base_name})", hold_sec=_gate_hold, skip_if_held=_gate_skip,
+                               juggled=(self.ready and self._attached)) as _may_run:
                     if not _may_run:
                         continue
                     if self._stopped():
@@ -11334,7 +11351,7 @@ def set_audio_track_resolver(fn):
 def _scan_header_text(file_path):
     """ffmpeg's stream listing for the file, cached by size and time; "" when it cannot be read."""
     try:
-        _st = os.stat(file_path)
+        _st = os.stat(long_form(file_path))
         key = (os.path.normpath(file_path), _st.st_size, _st.st_mtime_ns)
     except OSError as e:
         _media_warning("loudness_header_stat", "[LOUDNESS PROBE] could not read %s to list its audio tracks: %s",
@@ -12024,7 +12041,7 @@ def _resolve_dialogue_basis(file_path, duration_sec=None, semaphore=None, semaph
             if duration_sec and _duration_looks_implausible(file_path, duration_sec):
                 duration_sec = None
         try:
-            _stat = os.stat(file_path)
+            _stat = os.stat(long_form(file_path))
             _key = (os.path.normpath(os.path.abspath(file_path)), _stat.st_mtime_ns, _stat.st_size)
         except OSError as _swallowed_error:
             _log_swallowed("_resolve_dialogue_basis: _stat = os.stat(file_path)", _swallowed_error)

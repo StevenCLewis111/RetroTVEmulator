@@ -39,13 +39,13 @@ import zipfile
 # ============================================================================
 # SECTION: Server-path bootstrap
 # ============================================================================
-# WARNING: server_diagnostics.py sits beside this file (server/) or one folder up (../server) by build; its import must stay after _add_server_path().
+# WARNING: server_diagnostics.py is in scripts/server: one folder up from this file in a source copy (../server), under scripts/server beside a build; its import must stay after _add_server_path().
 def _add_server_path():
     if getattr(sys, "frozen", False):
         _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     else:
         _base = os.path.dirname(os.path.abspath(__file__))
-    for _candidate in (os.path.join(_base, "scripts", "server"), os.path.join(_base, "server"), os.path.join(_base, "..", "server")):
+    for _candidate in (os.path.join(_base, "scripts", "server"), os.path.join(_base, "..", "server")):
         if os.path.isdir(_candidate):
             sys.path.insert(0, _candidate)
             return

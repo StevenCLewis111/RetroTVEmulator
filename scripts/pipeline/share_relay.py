@@ -73,6 +73,8 @@ SNAPSHOT_TOTAL_BYTES = _governor.SHARE_RELAY_SNAPSHOT_TOTAL_BYTES if _governor i
 SNAPSHOT_FILE_BYTES = _governor.SHARE_RELAY_SNAPSHOT_FILE_BYTES if _governor is not None else 25165824
 LONG_PATH_CHARS = _governor.LONG_PATH_CHARS if _governor is not None else 260
 SERVED_AT_KEPT_FILES = _governor.SHARE_RELAY_SERVED_AT_KEPT_FILES if _governor is not None else 1024
+# WARNING: the fallback below must match SHARE_RELAY_STREAM_MIN_BYTES in performance_governor.py; it is used only when that module fails to import.
+STREAM_MIN_BYTES = getattr(_governor, "SHARE_RELAY_STREAM_MIN_BYTES", 2097152) if _governor is not None else 2097152
 OTHER_TRACK_NEAR_BYTES = _governor.SHARE_RELAY_OTHER_TRACK_NEAR_BYTES if _governor is not None else 8388608
 SNAPSHOT_MAX_AGE_SECONDS = _governor.SHARE_RELAY_SNAPSHOT_MAX_AGE_SECONDS if _governor is not None else 600.0
 SNAPSHOT_BACK_SECONDS = _governor.SHARE_RELAY_SNAPSHOT_BACK_SECONDS if _governor is not None else 2.0
@@ -109,6 +111,7 @@ _failed = {}
 _sources = {}
 _held = {}
 _served_at = {}
+_sent_upto = {}
 
 
 # ============================================================================
@@ -161,6 +164,29 @@ def served_within(path, seconds):
     """True when the relay handed the player bytes of this file in the last `seconds` seconds: an open that is slow but still receiving."""
     at = _served_at.get(_key(path))
     return at is not None and time.monotonic() - at <= float(seconds)
+
+
+def sent_upto(path):
+    """The byte offset up to which the relay has handed the player this file in its longest-running request (the show playing on; an index or end read does not count), or None."""
+    held = _sent_upto.get(_key(path))
+    return None if held is None else held[0]
+
+
+def seconds_at(path, offset):
+    """The play time of a byte offset, from the file's keyframe table already in memory (the keyframe at or before the offset), or None when no table is held; never reads the disk, so the screen thread may call it."""
+    with _lock:
+        held = _keyframe_tables.get(_key(path))
+    table = held[2] if held is not None else None
+    if not table:
+        return None
+    lo, hi = 0, len(table)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if table[mid][1] <= offset:
+            lo = mid + 1
+        else:
+            hi = mid
+    return float(table[max(0, lo - 1)][0])
 
 
 def wants(path):
@@ -1507,6 +1533,7 @@ def _serve(conn, head_only, target, request_headers):
                                 daemon=True, name="ShareRelayRead")
     producer.start()
     conn.settimeout(STALL_SECONDS)
+    _upto = start
     try:
         while True:
             try:
@@ -1523,7 +1550,12 @@ def _serve(conn, head_only, target, request_headers):
             conn.sendall(chunk)
             if len(_served_at) > SERVED_AT_KEPT_FILES:
                 _served_at.clear()
+                _sent_upto.clear()
             _served_at[_key(path)] = time.monotonic()
+            _upto += len(chunk)
+            # WARNING: owner logs 2026-11-26 (send_logs70): the program counted only what the player read after its first picture, so the read-ahead it filled before it was lost and a streamed show read 2 s ahead for 16 minutes; the relay's own count of what it handed over is the show's real place.
+            if _upto - start >= STREAM_MIN_BYTES:
+                _sent_upto[_key(path)] = (_upto, time.monotonic())
             if from_share:
                 permits.release()
                 if widened[0] < READ_AHEAD_BLOCKS - RAMP_START_BLOCKS:

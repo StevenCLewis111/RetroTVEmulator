@@ -27,13 +27,13 @@ import time
 # ============================================================================
 # SECTION: Server-path bootstrap & constants
 # ============================================================================
-# WARNING: server_diagnostics.py sits beside this file (server/) or one folder up (../server) by build; its import must stay after _add_server_path().
+# WARNING: server_diagnostics.py is in scripts/server: one folder up from this file in a source copy (../server), under scripts/server beside a build; its import must stay after _add_server_path().
 def _add_server_path():
     if getattr(sys, "frozen", False):
         _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     else:
         _base = os.path.dirname(os.path.abspath(__file__))
-    for _candidate in (os.path.join(_base, "scripts", "server"), os.path.join(_base, "server"), os.path.join(_base, "..", "server")):
+    for _candidate in (os.path.join(_base, "scripts", "server"), os.path.join(_base, "..", "server")):
         if os.path.isdir(_candidate):
             sys.path.insert(0, _candidate)
             return
@@ -554,9 +554,9 @@ def remove_moved_folders(code_root):
 # WARNING: owner 2026-11-26: "if we are adding stuff to the update helper that deletes specific files or folders on boot or when updating we need to make sure we are removing those so they dont later delete something we need. if the update happened, those things are gone ...". A one-time step runs until it has nothing left to do, is then written in main/data/upgrade_steps.json and never runs again on that copy; the README lists each step and the version its code is taken out in.
 
 UPGRADE_RECORD_NAME = "upgrade_steps.json"
-# VALUES CHANGE HERE: the one-time steps of this build and the version whose build takes each one's code out again (README "One-time steps").
+# VALUES CHANGE HERE: the one-time steps of this build (README 507h, "One-time steps").
+# WARNING: owner 2026-11-26: "if we need it there until everyone is been updated then just leave them bc its online and i cant control ppl updating"; no step's code is taken out while a copy from before it may still update, so none has a version it leaves in.
 STEP_SCRIPTS_MOVE = "2.2.7 old script folders removed"
-ONE_TIME_STEPS_REMOVED_IN = {STEP_SCRIPTS_MOVE: "2.2.8"}
 # VALUES CHANGE HERE: what a new version's clean start keeps in the logs folder: the updater's own list and this update's log, the computer's identity, the controller setup, the server's start-with-Windows choice, a pending Reset All Settings, the running copies' pid files, and the saved files the program moves to main/data on its first start (kept here until they are moved). Everything else there (logs, crash logs, temp files, caches written before this version) goes.
 CLEAN_START_KEEP = ("installed_files.json", "update_helper.log", "update_helper.log.1", ".retro_tv_updates", ".retro_tv_device_id",
                     "controllers", "server_launch_on_boot.json", "fresh_start_pending.json", ".retro_tv_program.pid",
@@ -669,7 +669,7 @@ def clean_start_for_version(install_root, version):
 
 
 # VALUES CHANGE HERE: the saved folders and files moved into main/data at start (owner 2026-11-26, V2.2.8: "loudness was not moved to data ... .json/server and user ... was not moved").
-DATA_FOLDERS_FROM_MAIN = ("media_library", "loudness", "captions", "visualizer_analysis")
+DATA_FOLDERS_FROM_MAIN = ("media_library", "loudness", "captions", "visualizer_analysis", "saved captions")
 DATA_FILES_FROM_LOGS = ("playback_runtime.json", "drive_profiles.json", "scan_capacity.json")
 
 

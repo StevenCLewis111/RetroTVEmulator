@@ -1492,6 +1492,7 @@ def _make_ns(get_cached_return=None, get_cached_raises=None):
             return get_cached_return
 
     ns = {
+        "media": types.SimpleNamespace(long_form=lambda p: p),
         "pygame": pygame, "os": os, "time": __import__("time"), "log": log,
         "_get_probe_library": lambda: _FakeLib(),
         "_PICTURE_BOX_FIT_REASONS": {"letterbox", "pillarbox", "windowbox"},
@@ -11094,7 +11095,7 @@ class TestTheHcReleaseTagMeansBurnedInSubtitles(unittest.TestCase):
             self.assertEqual(media.resolve_caption_source("C:\\m\\Annabelle Comes Home.2019.HC.HDRip.XviD.AC3-EVO.avi")["kind"], "baked")
         src = get_function_source("_caption_cues_for")
         self.assertIn('if info.get("kind") == "baked":', src)
-        self.assertIn('elif (info.get("kind") is None or info.get("kind") == "embedded")', src)
+        self.assertIn('(info.get("kind") in (None, "embedded") or _empty_file)', src)
 
 
 class TestChannel03BackdropFollowsTheTheme(unittest.TestCase):
@@ -13396,7 +13397,7 @@ class TestVlcWritesItsOwnLogAndAThreadReadsIt(unittest.TestCase):
         self.assertNotIn("log_set(", MAIN_SRC)
         self.assertNotIn("vsnprintf", MAIN_SRC)
         self.assertIn('_vlc_base_args_dvd = [a for a in vlc_args if not a.startswith("--avcodec-hw")] + ["--avcodec-hw=none"] + _vlc_native_log_args("dvd")', MAIN_SRC)
-        self.assertIn('vlc_args = vlc_args + _vlc_native_log_args("main")', MAIN_SRC)
+        self.assertIn('vlc_args = vlc_args + ["--no-spu"] + _vlc_native_log_args("main")', MAIN_SRC)
         self.assertIn("_new_main_args = list(_vlc_base_args_main or [])", MAIN_SRC, "an engine rebuilt for a setting keeps its log")
         self.assertIn('threading.Thread(target=_vlc_native_log_reader_loop, daemon=True, name="VlcLogReader").start()', MAIN_SRC)
         import performance_governor as _pg
@@ -13942,6 +13943,7 @@ class TestV365FixesFromTheTesterLogs(unittest.TestCase):
                                         path=types.SimpleNamespace(abspath=lambda p: p, normpath=lambda p: p))
         ns = {"os": fake_os, "time": types.SimpleNamespace(monotonic=lambda: clock[0]), "_log_swallowed": lambda *a: None, "OSError": OSError,
               "FILE_IDENTITY_KEY_RETRY_SECONDS": gov.FILE_IDENTITY_KEY_RETRY_SECONDS, "_file_identity_key_cache": {}, "FILE_IDENTITY_KEY_CACHE_MAX": 32}
+        ns.setdefault("media", types.SimpleNamespace(long_form=lambda p: p))
         exec(compile(get_function_source("_file_identity_key"), "k", "exec"), ns)
         for _i in range(300):
             self.assertEqual(ns["_file_identity_key"]("a.mp4"), "a.mp4|5|7")
@@ -13976,6 +13978,7 @@ class TestV365FixesFromTheTesterLogs(unittest.TestCase):
                                         path=types.SimpleNamespace(abspath=lambda p: p, normpath=lambda p: p.replace("/", "\\")))
         ns = {"os": fake_os, "time": types.SimpleNamespace(monotonic=lambda: 1.0), "_log_swallowed": lambda *a: None, "OSError": OSError,
               "FILE_IDENTITY_KEY_RETRY_SECONDS": 2.0, "_file_identity_key_cache": {}, "FILE_IDENTITY_KEY_CACHE_MAX": 4}
+        ns.setdefault("media", types.SimpleNamespace(long_form=lambda p: p))
         exec(compile(get_function_source("_file_identity_key"), "k", "exec"), ns)
         ns["_file_identity_key"]("D:/a/x.mp4")
         ns["_file_identity_key"]("D:\\a\\x.mp4")
@@ -16051,8 +16054,8 @@ class TestPortableTools(unittest.TestCase):
                     sys._MEIPASS = old_meipass
             self.assertEqual(found, exe)
             self.assertEqual(ran[0][0], exe, "the app's own copy is tried first, before any installed 7-Zip")
-        self.assertIn(os.path.join(os.path.dirname(os.path.abspath(gd.__file__)), "tools", "7zip", "7z.exe"),
-                      gd._bundled_7zip_candidates(), "tools\\7zip beside game_deck.py is one of the places")
+        self.assertNotIn(os.path.join(os.path.dirname(os.path.abspath(gd.__file__)), "tools", "7zip", "7z.exe"),
+                         gd._bundled_7zip_candidates(), "owner 2026-11-26: tools sit in the app's own tools folder, never beside game_deck.py in scripts/assets")
 
     def test_7za_from_7zip_extra_is_used_but_never_for_rar(self):
         import game_deck as gd
@@ -18551,7 +18554,7 @@ class TestBootDriveWake(unittest.TestCase):
         db = types.SimpleNamespace(ready_flag=ready, config={"last_channel": "05"}, channels_db=channels)
         ns = {"os": os, "time": time, "threading": threading, "log": log, "db": db, "media": media,
               "_log_swallowed": lambda *a: None, "_app_shutting_down": threading.Event(),
-              "_boot_drive_wake_done": threading.Event(),
+              "_boot_drive_wake_done": threading.Event(), "_keep_awake_round": [0], "_drives_profiled": set(),
               "_boot_bar_const": lambda name, fallback: 3.0 if name == "BOOT_DRIVE_WAKE_SECONDS" else fallback}
         for name in ("_boot_wake_candidates_by_drive", "_wake_drive_with_read", "_wake_media_drives"):
             exec(compile(get_function_source(name), "<extracted:%s>" % name, "exec"), ns)
@@ -21157,7 +21160,7 @@ def suite_governor_own_load():
 def suite_build_number():
     tree = ast.parse(read(os.path.join(SCRIPTS, "updater", "build_info.py")))
     vals = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets}
-    check(vals.get("BUILD_VERSION") == "2.2.8", "build_info.py says 2.2.8 (%s)" % vals)
+    check(vals.get("BUILD_VERSION") == "2.3.0", "build_info.py says 2.3.0 (%s)" % vals)
 
 
 def suite_interior_cut_ends_on_clock():
@@ -26105,7 +26108,7 @@ class TestBootPictureAndGuideGrey(unittest.TestCase):
 class TestStallRetuneIsNotEveryFrame(unittest.TestCase):
     def test_retune_waits_between_tries(self):
         src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
-        i = src.index("_recover_from_playback_stall(ch, _stalled_ms)")
+        i = src.index("_recover_from_playback_stall(ch, _stalled_ms, _stall_threshold)")
         block = src[i - 700:i]
         self.assertIn('now_ticks >= app_state.get("_stall_retune_next_ticks", 0)', block)
         self.assertIn("STALL_RETUNE_GAP_MS", block)
@@ -26439,7 +26442,7 @@ class TestGuideRowsAndSpotsAreNeverLost(unittest.TestCase):
 
     def test_a_picture_that_opens_near_the_start_asked_for_is_never_sought_again(self):
         text = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
-        self.assertIn("abs(_cur_at_open - target_ms) <= _start_time_accept_ms(", text)
+        self.assertIn("abs(_cur_at_open - _target_now()) <= _start_time_accept_ms(", text)
         self.assertIn("_verify_tol = _START_TIME_ACCEPT_MS if", text)
         self.assertEqual(gov.START_TIME_ACCEPT_MS, 10000)
 
@@ -26612,14 +26615,23 @@ class TestVitalsLineShowsTheWholePcLoad(unittest.TestCase):
         mon = hm._Monitor.__new__(hm._Monitor)
         mon.sensor_retry_at = float("inf")
         mon.hottest = 0.0
-        mon.cpu_load_primed = False
+        mon.sys_times_last = {}
         mon.busiest_programs = lambda span: ""
         lines = []
         real_log, real_sync, real_psutil = hm.log.log, hm.sync_logs, hm._psutil
         hm.log.log = lambda level, fmt, *a: lines.append(fmt % a)
         hm.sync_logs = lambda: None
+        _ticks = iter([(1000.0, 500.0), (1100.0, 514.0)])
+
+        class _Times(tuple):
+            idle = property(lambda self: self[1])
+
+        def _cpu_times():
+            total, idle = next(_ticks)
+            return _Times((total - idle, idle))
         hm._psutil = types.SimpleNamespace(
-            cpu_percent=lambda interval=None: 86.0,
+            cpu_percent=lambda interval=None: 0.0,
+            cpu_times=_cpu_times,
             virtual_memory=lambda: types.SimpleNamespace(percent=35.0, available=10 * 1073741824),
             swap_memory=lambda: types.SimpleNamespace(percent=2.0),
             disk_usage=lambda root: types.SimpleNamespace(percent=40.0))
@@ -26630,6 +26642,13 @@ class TestVitalsLineShowsTheWholePcLoad(unittest.TestCase):
             hm.log.log, hm.sync_logs, hm._psutil = real_log, real_sync, real_psutil
         self.assertNotIn("PC load", lines[0])
         self.assertIn("PC load 86% of all cores over the last minute", lines[1])
+
+    def test_the_load_comes_from_the_monitors_own_counters_not_the_shared_psutil_call(self):
+        """Owner logs 2026-11-26: psutil.cpu_percent is reset by the governor's own calls, so every line read 0%"""
+        from tests import health_monitor as hm
+        src = inspect.getsource(hm._Monitor.report_vitals)
+        self.assertNotIn("cpu_percent", src)
+        self.assertIn('system_cpu_pct("vitals")', src)
 
 
 class TestTuneHoldPausesEverythingUntilTheChannelHasPlayed(unittest.TestCase):
@@ -26688,7 +26707,7 @@ class TestTuneHoldPausesEverythingUntilTheChannelHasPlayed(unittest.TestCase):
     def test_a_caption_chunk_waits_out_the_tune_hold_then_goes(self):
         calls = {"n": 0}
 
-        def _in_progress():
+        def _in_progress(stream_too=True):
             calls["n"] += 1
             return calls["n"] < 4
 
@@ -26700,7 +26719,7 @@ class TestTuneHoldPausesEverythingUntilTheChannelHasPlayed(unittest.TestCase):
             media._perf_governor = old
         self.assertEqual(calls["n"], 4, "it looked again every 0.1 s until the hold ended")
         import inspect
-        self.assertIn("_wait_out_tune_hold()", inspect.getsource(media._asr_slot))
+        self.assertIn("_wait_out_tune_hold(stream_too=not juggled)", inspect.getsource(media._asr_slot))
 
     def test_the_hold_starts_at_the_channel_change_and_ends_with_the_steady_picture(self):
         self.assertIn("performance_governor.hold_background_for_tune()", get_function_source("change_channel"))
@@ -26892,7 +26911,7 @@ class TestShareRelayReapsIdleHandles(unittest.TestCase):
 
     def test_the_warm_worker_primes_every_interval_and_when_woken(self):
         src = open(_script("retro_tv_emulator.py"), encoding="utf-8").read()
-        worker = src[src.index("def _server_channel_warm_worker(stop):"):][:2600]
+        worker = src[src.index("def _channel_primer_worker():"):][:2600]
         self.assertIn("_prime_channels_pass()", worker)
         self.assertIn("_prime_wake.wait(", worker)
         self.assertIn("_prime_wake.set()", src[src.index("def _start_airing_warm("):][:600])
@@ -27667,6 +27686,59 @@ class TestRainbowAndThemeStaticMatchTheWhiteStatic(unittest.TestCase):
         self.assertIn("np.random.randint(100, 155", body)
 
 
+class TestTheStructureLooksOnlyWhereThingsAre(unittest.TestCase):
+    """Owner 2026-11-26: "do a full look over of the structure, we moved scripts, logs, temp files, scans, and more" and "plz fix this stuff": the saved captions live in main/data with the other scan results, each rule about a place is written once, and nothing looks in the places the move left behind."""
+
+    def _src(self, *parts):
+        with open(os.path.join(ROOT, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_saved_captions_move_into_main_data(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            main = os.path.join(tmp, "main")
+            os.makedirs(os.path.join(main, "saved captions"))
+            with open(os.path.join(main, "saved captions", "abc.json"), "w") as fh:
+                fh.write("{}")
+            with patch.object(media, "resolve_main_dir", lambda: main), patch.object(media, "_scan_data_adopted", set()):
+                root = media.saved_captions_root()
+            self.assertEqual(root, os.path.join(main, "data"))
+            self.assertTrue(os.path.isfile(os.path.join(main, "data", "saved captions", "abc.json")))
+            self.assertFalse(os.path.exists(os.path.join(main, "saved captions")))
+        self.assertIn("saved_captions.set_root(media.saved_captions_root())", MAIN_SRC)
+        self.assertIn("saved_captions.set_root(media.saved_captions_root())", self._src("scripts", "server", "server_service.py"))
+
+    def test_the_update_helper_moves_the_same_names_the_program_reads(self):
+        import update_helper
+        self.assertEqual(tuple(update_helper.DATA_FOLDERS_FROM_MAIN), tuple(media.SCAN_DATA_FOLDERS))
+        self.assertEqual(tuple(update_helper.DATA_FILES_FROM_LOGS), tuple(media.DATA_FILES_FROM_LOGS))
+        self.assertIn("saved captions", media.SCAN_DATA_FOLDERS)
+
+    def test_the_service_uses_the_programs_rules(self):
+        sys.path.insert(0, os.path.join(SCRIPTS, "server"))
+        import server_service
+        self.assertIn("return _data_media.server_data_dir_in_use(base_dir)", self._src("scripts", "server", "server_service.py"))
+        for name in ("Den", "a<b>:c", "  trailing. ", ""):
+            self.assertEqual(server_service._folder_safe_name(name, "server1"), media._folder_safe_name(name, "server1"))
+        self.assertEqual(server_service._project_root(), media._project_root())
+
+    def test_nothing_looks_in_the_old_places(self):
+        for parts in (("scripts", "updater", "auto_updater.py"), ("scripts", "updater", "update_helper.py")):
+            self.assertNotIn('os.path.join(_base, "server"), ', self._src(*parts))
+        self.assertNotIn('os.path.join(root, "updater")', self._src("scripts", "server", "server_service.py"))
+        deck = self._src("scripts", "assets", "game_deck.py")
+        self.assertNotIn('"main", "image", "bezel"', deck)
+        self.assertNotIn("roots.append(os.path.dirname(os.path.abspath(__file__)))", deck)
+        src = self._src("scripts", "media", "media.py")
+        self.assertIn('command = [sys.executable, os.path.join(_project_root(), "retro_tv_emulator.py")]', src)
+        self.assertNotIn('os.path.join(exe_dir, "models", "whisper")', src)
+        self.assertNotIn("then the old places", MAIN_SRC)
+
+    def test_ffmpeg_is_found_in_tools_first(self):
+        src = self._src("scripts", "media", "media.py")
+        self.assertIn('for candidate in (os.path.join(base_dir, "tools", "ffmpeg", exe_name), os.path.join(base_dir, "tools", exe_name),', src)
+
+
 class TestServerDataLivesInsideInternal(unittest.TestCase):
     """Owner 2026-11-26: the server and user channel files, the scan results and the saved station, drive and scan-speed files live in main/data; the places earlier builds used are moved in by the program, nothing is lost."""
 
@@ -27917,7 +27989,7 @@ class TestTheServersOwnProgramPlaysTheProfilesOneSchedule(unittest.TestCase):
         fake_ml.shared_schedule_hub = lambda: hub
         fake_ml.schedule_scope_of_slot = media_library.schedule_scope_of_slot
         fake_ml.schedule_scope_for = lambda prefix: contextlib.nullcontext()
-        for name in ("_local_profile_raw_rows", "_forget_local_profile_rows", "_local_profile_rows_step"):
+        for name in ("_local_profile_raw_rows", "_hub_server_raw_rows", "_forget_local_profile_rows", "_local_profile_rows_step"):
             exec(get_function_source(name), ns)
         return ns, taken, logged, fake_ml
 
@@ -27936,7 +28008,7 @@ class TestTheServersOwnProgramPlaysTheProfilesOneSchedule(unittest.TestCase):
         self.assertEqual(ns["_server_rows_local"], {"05", "06"})
         self.assertTrue(any("the same rows its Users play" in line for line in logged))
 
-    def test_a_channel_the_service_has_not_planned_says_so_and_plays_its_own(self):
+    def test_a_channel_the_service_has_not_planned_says_so_and_waits_for_it(self):
         hub = self._Hub({"05": [self._row(1000.0, 0)]})
         ns, taken, logged, fake_ml = self._ns(hub)
         with patch.dict(sys.modules, {"media_library": fake_ml}):
@@ -28140,14 +28212,14 @@ class TestTheServerKeepsEveryProfilesScheduleInItsHub(unittest.TestCase):
 class TestUsersPlayTheServersHubRows(unittest.TestCase):
     """Owner 2026-11-24: "when it updates and restarts, it starts downloading the servers schedule, when its done, after the channel changes or next show plays, its ready to switch over and the old schedule is removed. one time removal of the old style of user schedule"."""
 
-    NAMES = ("_server_row", "_block_name_of_slot", "_take_server_rows", "_server_rows_switch_due", "_switch_to_server_rows", "_station_playback_state",
+    NAMES = ("_server_row", "_block_name_of_slot", "_take_server_rows", "_is_server_channel", "_server_rows_from_hub", "_hub_server_raw_rows", "_switch_to_server_rows", "_station_playback_state",
              "_server_rows_state", "_place_server_rows", "_mark_server_rows_progress", "_entry_parts", "_schedule_pending_state", "_forget_server_rows",
              "_scheduler_rows_wait_note", "_scheduler_rows_none_note")
 
     def _ns(self, now, watched="05", hub=None):
         asked = []
         saved = []
-        hub = hub or types.SimpleNamespace(forget_show_facts=lambda ch: None)
+        hub = hub or types.SimpleNamespace(forget_show_facts=lambda ch: None, rows_between=lambda *a, **k: [], planned_rows_between=lambda *a, **k: [])
         ns = {"os": os, "media": media, "log": logging.getLogger("test"), "threading": threading, "time": time,
               "station_clock": types.SimpleNamespace(now_epoch=lambda: now[0]),
               "app_state": {"current_channel": watched}, "SCHEDULE_PENDING_REASON": "schedule_pending", "SERVER_SCHEDULE_GAP_REASON": "server_schedule_gap",
@@ -28157,6 +28229,8 @@ class TestUsersPlayTheServersHubRows(unittest.TestCase):
               "_scheduler_playback_state": lambda ch, *a: (asked.append(ch), {"mode": "Video", "file": "own.mkv", "seek": 0, "duration": 100})[1],
               "_server_rows_scope_key": lambda: "user:srv:1:", "_queue_server_rows_place": lambda ch: None,
               "_log_warn_throttled": lambda *a: None, "_HUB_FUTURE_HOURS_AHEAD": 192.0,
+              "_log_info_throttled": lambda *a, **k: None, "_log_swallowed": lambda *a: None, "_server_rows_hub_tried": {},
+              "SERVER_ROWS_HUB_RETRY_S": 15.0, "LOCAL_PROFILE_ROWS_HOURS_AHEAD": 24.0, "SERVER_ROWS_BEHIND_S": 10800.0,
               "media_library": None}
         for held in ("_server_rows", "_server_rows_starts", "_server_rows_watched_at_last_ask", "_server_rows_on_air", "_server_rows_placed", "_server_rows_marked",
                      "_hub_writer_item_ends", "_screen_scheduler_answers", "_scheduler_prepared", "_probe_block_timeline_cache", "_rows_wait_noted"):
@@ -28174,39 +28248,42 @@ class TestUsersPlayTheServersHubRows(unittest.TestCase):
                 [base + 1800.0, 30.0, "commercial", "2026_328_Morning@1", 1, {"path": "\\\\srv\\ads\\c.mp4", "duration": 30.0, "is_commercial": True}],
                 [base + 1830.0, 1500.0, "episode", "2026_328_Morning@1", 2, {"path": "\\\\srv\\tv\\b.mkv", "duration": 1500.0}]]
 
-    def test_the_watched_channel_switches_only_when_its_show_ends_and_then_plays_the_server_rows(self):
+    def test_the_watched_channel_airs_the_server_rows_at_once_and_its_own_schedule_is_never_asked(self):
+        """Owner 2026-11-27: "the user ... NEVER BUILDS ITS OWN VERSION OF THE SCHEDULE" """
         base = 1_800_000_000.0
         now = [base + 600.0]
         ns, asked, _saved, fake_ml = self._ns(now)
         with patch.dict(sys.modules, {"media_library": fake_ml}):
             ns["_server_rows_watched_at_last_ask"]["05"] = True
-            ns["_hub_writer_item_ends"]["05"] = base + 900.0
             ns["_take_server_rows"]({"05": self._rows(base), "07": self._rows(base)})
-            self.assertEqual(ns["_server_rows_ready"], {"05"}, "a channel that is not streamed keeps nothing")
-            self.assertEqual(ns["_station_playback_state"]("05", now[0])["file"], "own.mkv", "the show on screen plays on until it ends")
+            self.assertEqual(ns["_server_rows_live"], {"05"}, "a channel that is not streamed keeps nothing")
+            self.assertEqual(ns["_station_playback_state"]("05", now[0])["file"], "\\\\srv\\tv\\a.mkv", "the show on screen comes from the server's rows at once")
             now[0] = base + 1810.0
             state = ns["_station_playback_state"]("05", now[0])
-        self.assertIn("05", ns["_server_rows_live"])
         self.assertEqual((state["mode"], state["file"], state["block"]), ("Commercial", "\\\\srv\\ads\\c.mp4", "Morning"))
         self.assertAlmostEqual(state["seek"], 10.0)
         records = ns["_scheduler_prepared"]["05"]
         self.assertEqual(records[0], id(state))
         self.assertEqual([round(start - base) for start, _f in records[1]], [1800, 1830], "the items after it are prepared from the rows")
         self.assertEqual(ns["_probe_block_timeline_cache"]["05"]["now"][1], base + 1800.0)
-        self.assertEqual(asked, ["05"], "the scheduler is not asked again once the channel is on the server's rows")
+        self.assertEqual(asked, [], "this computer's scheduler is never asked for a server's channel")
 
-    def test_a_channel_off_screen_or_just_tuned_switches_at_once_and_past_the_rows_it_is_worked_out_here(self):
+    def test_a_server_channel_reads_the_hub_waits_with_none_and_past_the_rows_is_a_gap_never_its_own(self):
         base = 1_800_000_000.0
         now = [base + 100.0]
-        ns, asked, _saved, fake_ml = self._ns(now, watched="06")
+        kept = [{"planned_start": r[0], "used_length": r[1], "kind": r[2], "slot_key": r[3], "position": r[4], "guide_entry": r[5]} for r in self._rows(base)]
+        own = {"planned_start": base, "used_length": 5000.0, "kind": "episode", "slot_key": "2026_328_Morning", "position": 0, "guide_entry": {"path": "own.mkv"}}
+        hub = types.SimpleNamespace(forget_show_facts=lambda ch: None, rows_between=lambda ch, *a, **k: ([own] + kept) if ch == "05" else [],
+                                    planned_rows_between=lambda *a, **k: [])
+        ns, asked, _saved, fake_ml = self._ns(now, watched="06", hub=hub)
         with patch.dict(sys.modules, {"media_library": fake_ml}):
-            ns["_take_server_rows"]({"05": self._rows(base), "06": self._rows(base)})
-            self.assertEqual(ns["_station_playback_state"]("05", now[0])["file"], "\\\\srv\\tv\\a.mkv")
-            self.assertEqual(ns["_station_playback_state"]("06", now[0])["file"], "\\\\srv\\tv\\a.mkv", "a channel tuned to just now switches")
-            self.assertEqual(asked, [])
+            self.assertEqual(ns["_station_playback_state"]("05", now[0])["file"], "\\\\srv\\tv\\a.mkv", "after a start the rows kept in the HUB are aired, the program's own rows are left out")
+            self.assertIn("05", ns["_server_rows_live"])
+            self.assertEqual(ns["_station_playback_state"]("06", now[0])["reason"], "schedule_pending", "no rows anywhere: it waits on the cover")
             past = ns["_station_playback_state"]("05", base + 4000.0)
-        self.assertEqual(past["file"], "own.mkv", "owner logs 2026-11-25 (tray6): past the server's rows the channel is worked out here, not left on Static")
-        self.assertEqual(asked, ["05"])
+        self.assertEqual((past["mode"], past["reason"]), ("Static", "server_schedule_gap"))
+        self.assertEqual(asked, [], "never worked out here")
+        self.assertEqual(ns["_station_playback_state"]("07", now[0])["file"], "own.mkv", "a Regular channel keeps its own scheduler")
 
     def test_a_visualizer_channel_gets_the_song_with_its_whole_length(self):
         base = 1_800_000_000.0
@@ -33090,7 +33167,12 @@ class TestSharesGetLiveCaptionsNotPulledOnes(unittest.TestCase):
 
     def test_a_failed_pull_falls_through_to_live_captions(self):
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
-        self.assertIn('(info.get("kind") is None or info.get("kind") == "embedded") and info.get("mtime") is not None:', src)
+        self.assertIn('if (not srt_path or _empty_file) and (info.get("kind") in (None, "embedded") or _empty_file) and info.get("mtime") is not None:', src)
+
+    def test_an_empty_caption_file_counts_as_none(self):
+        """Owner logs 2026-11-26 (send_logs70): Guts found a caption file with nothing in it and showed no captions"""
+        src = get_function_source("_caption_cues_for")
+        self.assertIn('_empty_file = not cues and info.get("kind") in (None, "embedded", "sidecar")', src)
 
 
 class TestCaptionClockFollowsBetweenVlcSteps(unittest.TestCase):
@@ -33235,7 +33317,7 @@ class TestPrimingFollowsTheViewer(unittest.TestCase):
         self.assertIn("_prime_note_viewer_at(new_ch, old_ch)", change)
         step = src[src.index("def _guide_step_row("):][:1500]
         self.assertIn("_prime_note_viewer_at(_target[0], _prime_old_hl)", step)
-        worker = src[src.index("def _server_channel_warm_worker(stop):"):][:1800]
+        worker = src[src.index("def _channel_primer_worker():"):][:2600]
         self.assertLess(worker.index("_prime_rush_pass()"), worker.index("_prime_channels_pass()"))
 
     def test_a_rush_never_moves_the_clock_of_the_full_pass(self):
@@ -38370,6 +38452,8 @@ class TestTheStreamedShowKeepsItsBufferAhead(unittest.TestCase):
               "_log_swallowed": lambda *a: None, "STREAM_BUFFER_LOW_S": 15.0, "SHARE_RELAY_VLC_CACHING_MS": 2000}
         exec(main_function_code("_note_stream_buffer"), ns)
         exec(main_function_code("_log_stream_buffer_change"), ns)
+        exec(main_function_code("_stream_held_ahead_from_relay"), ns)
+        ns["share_relay"].sent_upto = lambda p: None
         f, engine, media_obj = {}, types.SimpleNamespace(player=player), types.SimpleNamespace(get_mrl=lambda: "http://127.0.0.1/f/x/Show.mkv")
         ns["_note_stream_buffer"](f, engine, "k1", types.SimpleNamespace(read_bytes=3000000, displayed_pictures=0), media_obj)
         self.assertTrue(gov.stream_needs_the_link(), "while the show opens the open has the link")
@@ -40231,7 +40315,7 @@ class TestRandomNeverAirsMoreThanThreeInARow(unittest.TestCase):
 
     def test_a_server_schedule_gap_has_its_own_banner_and_keeps_its_snow(self):
         body = get_function_source("_server_rows_state")
-        self.assertEqual(body.count('"reason": SERVER_SCHEDULE_GAP_REASON'), 1, "owner logs 2026-11-25 (tray6): only a moment the rows hold but nothing has begun is a gap")
+        self.assertEqual(body.count('"reason": SERVER_SCHEDULE_GAP_REASON'), 3, "owner 2026-11-27: a moment the server's rows do not cover is a gap, never worked out here")
         self.assertNotIn('"no_media_scheduled"', body)
         src = open(os.path.join(ROOT, "retro_tv_emulator.py"), encoding="utf-8").read()
         self.assertIn('SERVER_SCHEDULE_GAP_REASON: "SERVER SCHEDULE GAP"', src)
@@ -40363,7 +40447,8 @@ class TestVersion222Fixes(unittest.TestCase):
         rows = [{"slot_key": "2026_329_Full Day@100", "position": 0}, {"slot_key": "2026_329_Full Day@100#g2", "position": 0},
                 {"slot_key": "2026_329_Full Day@100#g3", "position": 0}, {"slot_key": "2026_330_Full Day@200", "position": 0}]
         self.assertEqual([r["slot_key"] for r in server_planner.planners_rows(rows)], ["2026_329_Full Day@100#g3", "2026_330_Full Day@200"])
-        self.assertIn('_newest[_base] = max(_newest.get(_base, 0)', get_function_source("_local_profile_raw_rows"), "the server's program plays the newest set too")
+        self.assertIn('_newest[_base] = max(_newest.get(_base, 0)', get_function_source("_hub_server_raw_rows"), "the server's program plays the newest set too")
+        self.assertIn("return _hub_server_raw_rows(hub, channel_keys, now_epoch)", get_function_source("_local_profile_raw_rows"))
 
     def test_a_retry_plans_only_the_channels_left_empty(self):
         import server_planner
@@ -40380,8 +40465,8 @@ class TestVersion222Fixes(unittest.TestCase):
     def test_before_the_servers_rows_begin_the_cycle_on_air_is_worked_out_here(self):
         body = get_function_source("_server_rows_state")
         i = body.index("and _at + 1 < len(_rows):")
-        self.assertIn("return _scheduler_playback_state(channel_key, False, False, False)", body[i:i + 700])
-        self.assertLess(i, body.index('"reason": SERVER_SCHEDULE_GAP_REASON'), "a gap only when no row of the server's comes later")
+        self.assertNotIn("_scheduler_playback_state(", body, "owner 2026-11-27: the user never builds its own version of the schedule")
+        self.assertIn('"reason": SERVER_SCHEDULE_GAP_REASON', body[i:i + 900])
 
 
 
@@ -40437,7 +40522,8 @@ class TestVersion223Fixes(unittest.TestCase):
     def test_a_channel_the_server_has_no_rows_for_is_worked_out_here(self):
         body = get_function_source("_server_rows_state")
         i = body.index("if not _rows:")
-        self.assertIn("return _scheduler_playback_state(channel_key, False, False, False)", body[i:i + 600])
+        self.assertIn("return _schedule_pending_state()", body[i:i + 600], "owner 2026-11-27: with no rows it waits, it never works one out")
+        self.assertIn("_server_rows_from_hub(channel_key)", body)
         self.assertIn("_scheduler_rows_none_note(channel_key)", body)
 
     def test_the_relay_opens_share_paths_past_260_characters(self):
@@ -40719,7 +40805,7 @@ class TestVersion223Fixes(unittest.TestCase):
         gap[0] = 0.0
         self.assertIsNone(f("05", []))
         self.assertIn("_break_add_candidate(_ch, [it[1] for it in _items])", get_function_source("_snapshot_next_item_on_screen"))
-        self.assertIn("LOCAL_PROFILE_ROWS_HOURS_AHEAD", get_function_source("_local_profile_raw_rows"))
+        self.assertIn("LOCAL_PROFILE_ROWS_HOURS_AHEAD", get_function_source("_hub_server_raw_rows"))
 
     def test_channel_03_music_is_picked_off_the_screen_thread(self):
         body = get_function_source("_start_ch03_menu_music")
@@ -40958,7 +41044,7 @@ class TestVersion228Fixes(unittest.TestCase):
         exec(get_function_source("_start_time_accept_ms"), ns)
         self.assertEqual(ns["_start_time_accept_ms"]("\\\\s\\Bones.mp4"), 1500, "Bones landed 9.8 s early and was left there")
         self.assertEqual(ns["_start_time_accept_ms"]("x.avi"), 10000, "an .avi still lands on its key frame and is left there")
-        self.assertIn("abs(_landed_ms - target_ms) > _start_time_accept_ms(", MAIN_SRC, "the landing is judged again once the picture has really landed")
+        self.assertIn("abs(_landed_ms - _clock_ms) > _start_time_accept_ms(", MAIN_SRC, "the landing is judged again once the picture has really landed, against where the clock is now")
 
     def test_the_other_channels_keep_their_snapshots_through_a_break(self):
         body = get_function_source("_prime_should_wait")
@@ -41091,6 +41177,185 @@ class TestOneLoadBarEverywhere(unittest.TestCase):
         self.assertEqual(merged["02"], (9, 10), "a regular channel never shows less than the tray finished")
         body = get_function_source("_publish_channel_scan_progress")
         self.assertLess(body.index("_prefetch_picture_boxes(snap)"), body.index("_compute_channel_scan_progress("), "every stored picture box is read in one go before the bar is counted")
+
+class TestSendLogs70StaticCaptionsAndCaching(unittest.TestCase):
+    """Owner logs 2026-11-26 (send_logs70, tray10): 1-2 s program freezes turned into 7 s of Static, live captions waited 16 minutes on a buffer that read short, long file names lost their captions, and only streamed channels were kept ready"""
+
+    def test_a_program_freeze_is_not_counted_as_a_stopped_picture(self):
+        ns = {"_governor_feed": {"pictures": {"moved_at": 1000}}, "app_state": {"_vlc_pictures_stopped_ticks": 0, "current_channel": "09"},
+              "FRAME_GAP_LOG_GAP_MS": 10000, "log": MagicMock(), "_log_swallowed": lambda *a: None}
+        exec(main_function_code("_excuse_program_freeze_from_picture_watch"), ns)
+        ns["_excuse_program_freeze_from_picture_watch"](3000, 1800)
+        self.assertEqual(ns["_governor_feed"]["pictures"]["moved_at"], 2800, "the 1.8 s the program stood still are not counted")
+        ns["_excuse_program_freeze_from_picture_watch"](3100, 5000)
+        self.assertEqual(ns["_governor_feed"]["pictures"]["moved_at"], 3100, "never later than now")
+        loop = MAIN_SRC[MAIN_SRC.index("    if _loop_gap_ms >= _LOOP_BLOCKED_GAP_MS:"):][:400]
+        self.assertIn("_excuse_program_freeze_from_picture_watch(now_ticks, _loop_gap_ms)", loop)
+        import performance_governor as pg
+        self.assertLessEqual(pg.LOOP_BLOCKED_GAP_MS, 500)
+
+    def test_the_retune_line_names_the_rule_that_fired(self):
+        self.assertIn("_recover_from_playback_stall(ch, _stalled_ms, _stall_threshold)", MAIN_SRC)
+        self.assertIn("threshold_ms if threshold_ms is not None else PLAYBACK_STALL_TIMEOUT_MS", get_function_source("_recover_from_playback_stall"))
+
+    def test_the_tv_player_never_draws_subtitles_and_the_dvd_player_still_can(self):
+        block = MAIN_SRC[MAIN_SRC.index("_vlc_base_args_dvd = [a for a in vlc_args"):][:900]
+        self.assertIn('vlc_args = vlc_args + ["--no-spu"] + _vlc_native_log_args("main")', block)
+        self.assertLess(block.index("_vlc_base_args_dvd ="), block.index('"--no-spu"'), "the DVD player's arguments are made before")
+
+    def test_a_running_caption_session_is_not_held_by_the_streamed_buffer(self):
+        import performance_governor as pg
+        saved = dict(pg._gate_state)
+        try:
+            pg._gate_state.update(caption_until=0.0, tune_began=100.0)
+            with mock.patch.object(pg, "stream_needs_the_link", lambda path=None: True):
+                self.assertTrue(pg.caption_tune_hold(now=110.0), "a session starting while the show buffers waits")
+                self.assertFalse(pg.caption_tune_hold(now=110.0, stream_too=False), "a session that took its juggle turn goes")
+                self.assertFalse(pg.caption_tune_hold(now=100.0 + pg.TUNE_BUFFERS_MAX_SECONDS + 1), "the buffer never holds captions past the tune's limit")
+        finally:
+            pg._gate_state.clear()
+            pg._gate_state.update(saved)
+        import inspect
+        self.assertIn("juggled=(self.ready and self._attached)", inspect.getsource(media.LiveCaptionSession._run_locked))
+
+    def test_the_streamed_buffer_is_read_from_what_the_relay_handed_over(self):
+        import share_relay
+        key = share_relay._key(r"\\srv\a.mkv")
+        with share_relay._lock:
+            share_relay._keyframe_tables[key] = (1, 1, [(0.0, 0), (10.0, 1000), (20.0, 2000), (30.0, 3000)])
+        try:
+            self.assertEqual(share_relay.seconds_at(r"\\srv\a.mkv", 2500), 20.0)
+        finally:
+            with share_relay._lock:
+                share_relay._keyframe_tables.pop(key, None)
+        ns = {"share_relay": types.SimpleNamespace(sent_upto=lambda p: 50000000, seconds_at=lambda p, o: None), "_log_swallowed": lambda *a: None}
+        exec(main_function_code("_stream_held_ahead_from_relay"), ns)
+        self.assertAlmostEqual(ns["_stream_held_ahead_from_relay"]("x", 100000000.0, 1000.0, 400.0), 100.0)
+        import inspect
+        self.assertIn("_sent_upto[_key(path)] = (_upto, time.monotonic())", inspect.getsource(share_relay._serve))
+
+    def test_long_names_are_opened_in_the_long_form_where_they_failed(self):
+        import media_library
+        import inspect
+        for fn in (media.resolve_caption_source, media._duration_looks_implausible, media._resolve_dialogue_basis):
+            self.assertIn("long_form(", inspect.getsource(fn), fn.__name__)
+        self.assertIn("os.stat(_long_form(file_path))", inspect.getsource(media_library.PathKeyResolver.resolve))
+        self.assertIn("os.stat(_long_form(file_path))", inspect.getsource(media_library.ProbeLibrary.file_changed_on_disk))
+        self.assertIn("os.stat(media.long_form(path))", get_function_source("_file_identity_key"))
+
+    def test_long_stalls_are_written_loud_with_each_threads_cpu(self):
+        from tests import health_monitor as hm
+        import inspect
+        src = inspect.getsource(hm._Monitor.explain)
+        self.assertIn("(log.warning if loud else log.info)(", src)
+        self.assertIn("self.gap_cpu_text(start, end) if loud else", src)
+        self.assertIn("self.keep_cpu_reading(now)", inspect.getsource(hm._Monitor.run))
+
+    def test_every_channel_in_every_mode_goes_through_one_priming_pipeline(self):
+        body = get_function_source("_prime_channels_pass_inner")
+        self.assertNotIn('if not db.channels_db.get(_ch, {}).get("server_locked", False):\n            continue', body)
+        self.assertIn("if not share_relay.wants(_fp):", body, "each file is decided by where it is")
+        self.assertIn('threading.Thread(target=_channel_primer_worker, daemon=True, name="ChannelPrimer").start()', MAIN_SRC)
+        self.assertNotIn("_prime_channels_pass()", get_function_source("_server_channel_warm_worker"), "the server worker no longer primes on its own")
+        self.assertIn("_prime_facts(fp, _facts_budget)", get_function_source("_warm_channel_file_facts"))
+
+
+class TestTheTrayReadsTheSavedPerformanceMode(unittest.TestCase):
+    """Owner 2026-11-26 (tray10): "server pc was and is set to performance mode"; the caption scan said standard, because the mode was looked for at the top of the settings file instead of in its config tree"""
+
+    def test_the_mode_comes_from_the_config_tree_and_the_trays_governor_follows(self):
+        import server_service as ss
+        import performance_governor as pg
+        folder = tempfile.mkdtemp()
+        before = pg.get_mode()
+        try:
+            with open(os.path.join(folder, "retro_config.json"), "w", encoding="utf-8") as fh:
+                json.dump({"config": {pg.MODE_CONFIG_KEY: "performance"}, "channels": {}}, fh)
+            ss._saved_mode_seen["mode"] = None
+            self.assertEqual(ss._saved_performance_mode(folder), "performance")
+            self.assertEqual(pg.get_mode(), "performance")
+            self.assertIsNone(ss._saved_performance_mode(os.path.join(folder, "none")), "no settings yet: the governor's own")
+        finally:
+            pg.set_mode(before)
+            ss._saved_mode_seen["mode"] = None
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+class TestSendLogs71ScheduleFfmpegAndFreezes(unittest.TestCase):
+    """Owner 2026-11-27 (send_logs71, tray11): after the update ch09 aired episodes already seen, ffmpeg was found nowhere, and Static still came after a freeze"""
+
+    def test_the_resume_reads_under_the_servers_scope_after_the_server_is_in_use(self):
+        body = get_function_source("_resume_server_rows")
+        self.assertIn("with _ml.schedule_scope_for(_scope):", body)
+        self.assertIn("_server_rows_scope_of_pick(pick)", body)
+        connect = MAIN_SRC[MAIN_SRC.index('    app_state["active_remote_server"] = _picked\n'):][:300]
+        self.assertIn('threading.Thread(target=_resume_server_rows, args=(_picked,), daemon=True, name="ServerRowsResume").start()', connect)
+        self.assertEqual(MAIN_SRC.count('name="ServerRowsResume"'), 1)
+        ns = {}
+        exec(main_function_code("_server_rows_scope_of_pick"), ns)
+        gain = get_function_source("_gain_context")
+        self.assertIn('"user:%s:%s" % (remote.get("host", ""), remote.get("slot_id", ""))', gain, "the same text _gain_context gives")
+        self.assertEqual(ns["_server_rows_scope_of_pick"]({"host": "pc", "slot_id": "server1"}), "user:pc:server1:")
+
+    def test_ffmpeg_straight_in_tools_is_found(self):
+        src = open(os.path.join(SCRIPTS, "media", "media.py"), encoding="utf-8").read()
+        body = src[src.index("def _resolve_ffmpeg_path():"):src.index("def _resolve_ffmpeg_path():") + 2500]
+        self.assertIn('os.path.join(base_dir, "tools", exe_name)', body, "the 2.2.9 build has ffmpeg.exe straight in _internal/tools")
+        self.assertIn("def ffmpeg_found():", src)
+
+    def test_the_caption_scan_passes_nothing_over_without_ffmpeg(self):
+        import server_captions
+        import inspect
+        src = inspect.getsource(server_captions.CaptionScanner)
+        self.assertIn('if status == "failed" and not media.ffmpeg_found():', src)
+        self.assertLess(src.index("not media.ffmpeg_found()"), src.index("could not be read; the file is passed over"))
+
+    def test_no_stopped_picture_is_called_just_after_a_freeze(self):
+        import performance_governor as pg
+        self.assertGreaterEqual(pg.PICTURE_STOPPED_AFTER_FREEZE_MS, 3000)
+        self.assertIn('app_state["_picture_watch_grace_until"] = now_ticks + PICTURE_STOPPED_AFTER_FREEZE_MS', get_function_source("_excuse_program_freeze_from_picture_watch"))
+        body = get_function_source("_note_pictures_stopped")
+        self.assertLess(body.index('_picture_watch_grace_until'), body.index("[PICTURE STOPPED]"))
+
+    def test_a_slow_open_is_sought_to_where_the_clock_is_now(self):
+        """Owner 2026-11-27: "when it comes back it needs to come back on schedule ... not ... repeat a few seconds before the stall" """
+        src = MAIN_SRC[MAIN_SRC.index("                def _seek_when_ready("):][:9000]
+        self.assertIn("return target_ms + int(max(0.0, time.monotonic() - asked_at) * 1000)", src)
+        self.assertIn("self.player.set_time(_target_now())", src)
+        self.assertNotIn("self.player.set_time(target_ms)", src)
+        self.assertIn('"follow_clock": bool(follow_clock and not is_dvd_iso)', MAIN_SRC)
+
+    def test_a_channel_tuned_onto_an_empty_or_waiting_static_shows_the_grey_cover_first(self):
+        """Owner 2026-11-27: "static on start up of the channel after boot should not be starting on a static image with a banner" """
+        body = get_function_source("_channel_cover_hold")
+        i = body.index('_reason in (SILENT_STATIC_REASONS | {SERVER_SCHEDULE_GAP_REASON})')
+        self.assertLess(i, body.index('if _configured_transition_style() == "static":\n        return False'), "whatever the transition style")
+        self.assertIn("pygame.time.get_ticks() - _tuned_at < _first_load_static_ms(ch)", body)
+
+    def test_freezes_write_every_threads_stack_from_the_native_watchdog(self):
+        body = get_function_source("_freeze_stacks_arm")
+        self.assertIn("faulthandler.dump_traceback_later(FREEZE_STACKS_AFTER_S, repeat=False, file=st[\"fh\"], exit=False)", body)
+        self.assertIn("freeze_stacks.txt", body)
+        loop = MAIN_SRC[MAIN_SRC.index('    _main_frame_clock["n"] += 1\n'):][:120]
+        self.assertIn("_freeze_stacks_arm()", loop)
+        self.assertIn("cancel_dump_traceback_later()", get_function_source("_exit_program"))
+        folder = tempfile.mkdtemp()
+        calls = []
+        ns = {"_freeze_stacks": {"fh": None, "armed_at": -1e9, "size": 0, "dumps": 0, "off": False}, "FREEZE_STACKS_AFTER_S": 1.25,
+              "FREEZE_STACKS_REARM_S": 0.25, "FREEZE_STACKS_MAX_BYTES": 100, "time": __import__("time"), "os": os, "_app_log_dir": folder,
+              "log": MagicMock(), "_log_swallowed": lambda *a: calls.append(a)}
+        exec(main_function_code("_freeze_stacks_arm"), ns)
+        import faulthandler
+        try:
+            with mock.patch.object(faulthandler, "dump_traceback_later", lambda *a, **k: calls.append(("armed", k.get("repeat")))):
+                ns["_freeze_stacks_arm"]()
+                ns["_freeze_stacks_arm"]()
+            self.assertEqual(calls, [("armed", False)], "armed once per re-arm gap")
+            self.assertTrue(os.path.isfile(os.path.join(folder, "freeze_stacks.txt")))
+        finally:
+            ns["_freeze_stacks"]["fh"].close()
+            shutil.rmtree(folder, ignore_errors=True)
+
 
 def _run_with_one_temp_folder(main):
     """Runs the suite with every temporary file and folder the tests make inside one folder, removed when the run ends; a full run left about 2 GB of test folders in the system temp folder each time (owner 2026-11-26)."""

@@ -1,6 +1,6 @@
 """Saved captions: the caption text of each media file, made once (by the server's caption scan or by a PC's live captions) and kept in the app's own folder, so a file that airs again never has its captions worked out again.
 
-Owns: the folder main/saved captions (one file per media file, named by the file's content key, so the same file on the server and on a User share one name), merging a new copy into a saved one, and the list of what is held.
+Owns: the folder main/data/saved captions (one file per media file, named by the file's content key, so the same file on the server and on a User share one name), merging a new copy into a saved one, and the list of what is held.
 Does not own: making captions (media.py), sending them between computers (server_sync.py) or the library record (media_library.py; the hook set by set_library_note writes it).
 
 WARNING: owner 2026-11-24: "the server accepts what ever copy it receives first and ignores the second"; every computer merges the same way: a stretch of a file that is already saved keeps its saved text, and only stretches not yet saved are taken from a new copy.
@@ -60,7 +60,7 @@ _library_note = [None]
 
 
 def set_root(folder):
-    """Sets the main folder the saved captions live under (main/saved captions)."""
+    """Sets the folder the saved captions folder lives in (main/data, from media.saved_captions_root, so they are in main/data/saved captions)."""
     with _lock:
         _root[0] = os.path.join(str(folder), FOLDER_NAME)
         _index.clear()

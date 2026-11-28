@@ -260,24 +260,35 @@ def _config_path(base_dir):
     return os.path.join(base_dir, "retro_config.json")
 
 
+_saved_mode_seen = {"mode": None}
+
+
 def _saved_performance_mode(base_dir):
     """The performance mode (lite, standard or performance) saved in the program's settings on this PC, or None when it cannot be read."""
+    # WARNING: owner 2026-11-26 (tray10: "server pc was and is set to performance mode"): the settings file is {"config": {...}, "channels": {...}} and the mode was looked for at its top level, where it never is, so the caption scan always fell back to the governor's default (standard). The mode is read from the config tree, through the same cached reader as the slots (the file holds every channel's lists and is parsed again only when it changed).
     try:
         import performance_governor
-        with open(_config_path(base_dir), "r", encoding="utf-8") as fh:
-            saved = json.load(fh).get(performance_governor.MODE_CONFIG_KEY)
-        return performance_governor.normalize_mode(saved) if saved else None
+        config = _read_runtime_config(base_dir)[0]
+        saved = config.get(performance_governor.MODE_CONFIG_KEY)
+        mode = performance_governor.normalize_mode(saved) if saved else None
     except FileNotFoundError:
         # WARNING: the normal end: the program has not saved its settings on this PC yet, so the caption scan uses the governor's own mode.
         return None
     except Exception as mode_error:
         log.warning("[CAPTION SCAN] the performance mode could not be read from the program's settings: %s", mode_error)
         return None
+    if mode != _saved_mode_seen["mode"]:
+        _saved_mode_seen["mode"] = mode
+        if mode:
+            # WARNING: the tray's own governor follows the saved mode too, so everything in this process that asks the governor for the mode (the caption grades, thread counts) gets the same answer as the scan.
+            performance_governor.set_mode(mode)
+        log.info("[CAPTION SCAN] this PC's performance mode from the program's settings: %s", mode or "not saved (the governor's own is used)")
+    return mode
 
 
 def _project_root():
     """The project's root folder in a source copy (the one holding retro_tv_emulator.py): the folder above this script's folder, or above scripts when the script folders sit in scripts."""
-    # WARNING: owner 2026-11-25: the script folders moved into scripts, so a script is two folders below the root instead of one.
+    # WARNING: the same rule as media._project_root (a test compares them); it is kept here because the service finds its base folder from it before media can be imported.
     up = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if os.path.basename(up).lower() == "scripts":
         up = os.path.dirname(up)
@@ -285,25 +296,15 @@ def _project_root():
 
 
 def _folder_safe_name(name, fallback):
-    """A server name as a folder name: Windows-forbidden characters removed, trailing dots and spaces trimmed; the fallback when nothing is left."""
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(name or "")).strip().rstrip(". ")
-    return cleaned or str(fallback)
+    """A server name as a folder name, by the program's own rule (media._folder_safe_name)."""
+    import media as _name_media
+    return _name_media._folder_safe_name(name, fallback)
 
 
 def _server_data_dir(base_dir):
-    """Where the server and user channel files are: <install>/_internal/server/.json in an installed build, <base>/server/.json otherwise; the older <install>/server/.json is used when it is the only one that exists."""
-    # WARNING: owner 2026-11-11: must agree with server_data_dir in media.py (the program moves the old folder into _internal; the service only reads).
-    internal = os.path.join(base_dir, "_internal")
-    new_dir = os.path.join(internal if os.path.isdir(internal) else base_dir, "server", ".json")
-    old_dir = os.path.join(base_dir, "server", ".json")
-    # WARNING: owner 2026-11-26: the channel files live in main/data/.json; the program moves the old folders in, and until it has, the service reads whichever old folder still holds them.
+    """Where the server and user channel files are: media.server_data_dir_in_use, the program's own rule (main/data/.json, or an old place until the program has moved it); the service only reads."""
     import media as _data_media
-    data_dir = os.path.join(_data_media.main_dir_for_base(base_dir), _data_media.SCAN_DATA_FOLDER_NAME, _data_media.SERVER_DATA_FOLDER_NAME)
-    if os.path.isdir(data_dir) or not (os.path.isdir(new_dir) or os.path.isdir(old_dir)):
-        return data_dir
-    if not os.path.isdir(new_dir) and os.path.isdir(old_dir):
-        return old_dir
-    return new_dir
+    return _data_media.server_data_dir_in_use(base_dir)
 
 
 def _slot_folder_name(names, slot_id):
@@ -789,15 +790,15 @@ def _ask_yes_no(auto_updater, base_dir, text):
 
 
 def _load_auto_updater(base_dir):
-    """auto_updater lives in the updater folder; the packaged program already has it on its path, a source run adds it."""
+    """auto_updater lives in scripts/updater; the packaged program already has it on its path, a source run adds it."""
     try:
         import auto_updater
         return auto_updater
     except ImportError:
         for root in (base_dir, _project_root()):
-            for folder in (os.path.join(root, "scripts", "updater"), os.path.join(root, "updater")):
-                if os.path.isdir(folder) and folder not in sys.path:
-                    sys.path.insert(0, folder)
+            folder = os.path.join(root, "scripts", "updater")
+            if os.path.isdir(folder) and folder not in sys.path:
+                sys.path.insert(0, folder)
         import auto_updater
         return auto_updater
 
@@ -1050,10 +1051,10 @@ def run_service(base_dir):
                         if isinstance(_clock, dict) and str(_ch).zfill(2) in _slot_progress:
                             _clock["scan"] = list(_slot_progress[str(_ch).zfill(2)])
                     return _clocks_now
-                # WARNING: owner 2026-11-24: captions are made once and kept in main/saved captions, the same folder the program on this PC uses; the file's library record notes them.
+                # WARNING: owner 2026-11-24: captions are made once and kept in main/data/saved captions, the same folder the program on this PC uses; the file's library record notes them.
                 import media
                 import saved_captions
-                saved_captions.set_root(media.resolve_main_dir())
+                saved_captions.set_root(media.saved_captions_root())
                 def _note_saved_captions(key, name, covered, complete):
                     _probe_library().library.upsert_fields(key, saved_captions_file=name, saved_captions_covered=float(covered),
                                                            saved_captions_complete=1 if complete else 0)

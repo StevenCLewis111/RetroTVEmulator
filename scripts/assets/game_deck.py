@@ -57,7 +57,7 @@ _SEVENZIP_RUN_KW = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x0
 
 
 def _bundled_7zip_candidates():
-    """The app's own 7-Zip places, nearest first: 7z.exe (opens .7z, .zip and .rar) before 7za.exe (7-Zip Extra: .7z and .zip, no .rar), each in _internal\\tools\\7zip in the built app, then tools\\7zip beside the main script and beside this file in the project (owner 2026-11-03: portable, no install needed)."""
+    """The app's own 7-Zip places, nearest first: 7z.exe (opens .7z, .zip and .rar) before 7za.exe (7-Zip Extra: .7z and .zip, no .rar), each in _internal\\tools\\7zip in the built app, then tools\\7zip beside the main script in the project (owner 2026-11-03: portable, no install needed)."""
     roots = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
@@ -65,7 +65,6 @@ def _bundled_7zip_candidates():
     main_file = getattr(sys.modules.get("__main__"), "__file__", None)
     if main_file:
         roots.append(os.path.dirname(os.path.abspath(main_file)))
-    roots.append(os.path.dirname(os.path.abspath(__file__)))
     out = []
     for name in ("7z.exe", "7za.exe"):
         for root in roots:
@@ -3490,11 +3489,7 @@ class ExternalGameDeck:
 
     def _console_bezel_dir(self, console):
         if console in BORDER_CONSOLES_HOME:
-            _shared_singular = os.path.join(self.base_dir, "main", "image", "bezel")
-            _shared_plural    = os.path.join(self.base_dir, "main", "images", "bezel")
-            if os.path.isdir(_shared_singular):
-                return _shared_singular
-            return _shared_plural
+            return os.path.join(self.base_dir, "main", "images", "bezel")
         rom_dir = self._get_console_rom_dir(console)
         bezel_dir = os.path.join(rom_dir, "bezel")
         if not os.path.isdir(bezel_dir):

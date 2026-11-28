@@ -325,8 +325,8 @@ BOOT_BAR_MAX_BEFORE_DONE = 99.0
 BOOT_BAR_CATCHUP_RATE_PER_SECOND = 12.0
 BOOT_BAR_FINISH_RATE_PER_SECOND = 60.0
 BOOT_BAR_CONFIG_KEY = "_boot_bar_costs"
-# VALUES CHANGE HERE (playback stall watchdog: a main-loop pass longer than this many ms is a blocked loop, and the blocked time is never counted as a playback stall)
-LOOP_BLOCKED_GAP_MS = 1000
+# VALUES CHANGE HERE (playback stall watchdog: a main-loop pass longer than this many ms is a blocked loop, and the blocked time is never counted as a playback stall or a stopped picture; owner logs 2026-11-26: 1000 let a 0.9 s freeze plus VLC's slow picture count reach the stopped-picture rule)
+LOOP_BLOCKED_GAP_MS = 500
 # VALUES CHANGE HERE (milliseconds between retries when a wedged playback engine is replaced)
 WEDGED_ENGINE_REPLACE_RETRY_MS = 5000
 # VALUES CHANGE HERE (tester report: bytes read from the end of app_log.txt and of each crash file; the most warning, error and failure lines of app_log.txt kept; the most health report lines kept; the most lines kept from each crash file)
@@ -1575,6 +1575,8 @@ SHARE_RELAY_STALE_TEMP_SECONDS = 3600.0
 LONG_PATH_CHARS = 260
 # VALUES CHANGE HERE (share relay: how many files it remembers the last hand-over time of, for the opening watchdog)
 SHARE_RELAY_SERVED_AT_KEPT_FILES = 1024
+# VALUES CHANGE HERE (owner logs 2026-11-26: how far the player has been handed the streamed show on screen is taken from the relay's request that has sent at least this many bytes; the short reads of an index or a file's end never count as the show's place)
+SHARE_RELAY_STREAM_MIN_BYTES = 2097152
 # VALUES CHANGE HERE (share relay snapshots: a sound track whose bytes for the snapshot's time start more than this many bytes from the picture's bytes is kept in memory as well)
 SHARE_RELAY_OTHER_TRACK_NEAR_BYTES = 8388608
 # VALUES CHANGE HERE (share relay, channel snapshots kept in memory: the most memory all snapshots may use, the most one file's snapshot may hold, seconds a snapshot is trusted, seconds before the asked time a snapshot starts (audio read ahead of its key frame), the longest one snapshot read may take)
@@ -3017,6 +3019,16 @@ HEALTH_REPORT_SECONDS = 60.0
 HEALTH_RING_SECONDS = 15.0
 HEALTH_EXPLAIN_GAP_MS = 100
 HEALTH_EXPLAIN_MAX_PER_MINUTE = 20
+# VALUES CHANGE HERE (owner 2026-11-26, "add what logs you need to find the freeze": a screen gap this many ms or longer is written as a WARNING (always kept, never quieted) with the CPU each thread used over the gap; how many of those per minute at most; seconds between the CPU readings they are measured from)
+HEALTH_STALL_LOUD_MS = 1000
+# VALUES CHANGE HERE (server_captions.py: seconds the server's caption scan waits before it looks again when ffmpeg is not found on the PC; owner logs 2026-11-27, tray11)
+CAPTION_SCAN_FFMPEG_WAIT_S = 300.0
+HEALTH_STALL_LOUD_MAX_PER_MINUTE = 6
+HEALTH_STALL_CPU_EVERY_SECONDS = 1.0
+# VALUES CHANGE HERE (owner logs 2026-11-27, send_logs71: the freezes used little processor and the monitor could take almost no looks, so one thread held Python while it waited inside a call; Python's own watchdog writes every thread's stack to logs/temp/freeze_stacks.txt when the screen has not come round for this many seconds (0 turns it off); seconds between re-arms; the file is emptied past this size)
+FREEZE_STACKS_AFTER_SECONDS = 1.25
+FREEZE_STACKS_REARM_SECONDS = 0.25
+FREEZE_STACKS_MAX_BYTES = 4194304
 
 # VALUES CHANGE HERE (health_monitor.py, stuck threads: seconds a thread may sit on one line of code before it is reported stuck; the shorter limit for the screen thread; seconds a short job thread may wait before it is reported; seconds between full dumps of every thread; ms a watched lock may be held before it is reported; how many places each busy thread lists)
 HEALTH_STUCK_SECONDS = 10.0
@@ -3058,6 +3070,10 @@ PLAYBACK_STALL_TIMEOUT_MS = 10000
 PICTURE_STOPPED_RETUNE_MS = 4000
 # VALUES CHANGE HERE (owner logs 2026-11-25, send_logs65: milliseconds VLC's shown-pictures count must stand still, while it plays, before the picture counts as stopped; VLC refreshes the count only now and then)
 PICTURE_STOPPED_CONFIRM_MS = 1500
+# VALUES CHANGE HERE (owner logs 2026-11-27, send_logs71: after the program itself stood still, VLC's shown-pictures count stood still another 2 s while 148 new pictures showed in those 10 s, and the rule put up Static; milliseconds after such a freeze in which a stopped picture is not called)
+PICTURE_STOPPED_AFTER_FREEZE_MS = 5000
+# VALUES CHANGE HERE (owner 2026-11-27: seconds between looks in this computer's HUB for a server's channel that has no rows of the server's schedule in memory yet)
+SERVER_ROWS_HUB_RETRY_SECONDS = 15.0
 # VALUES CHANGE HERE (owner logs 2026-11-25, send_logs65: a player clock under this many seconds is not trusted by a caption feed anchored more than twice as far into its file; the seek has not landed yet)
 CAPTION_FEED_UNLANDED_SEC = 2.0
 # VALUES CHANGE HERE (owner logs 2026-11-25, send_logs62: the governor level from which live captions stop their extra recovery passes and wait while they are more than LIVE_CAPTION_TIGHT_LEAD_SEC seconds ahead of the picture)
@@ -4707,6 +4723,7 @@ def hold_background_for_tune():
     now = time.monotonic()
     _gate_state["tune_until"] = now + TUNE_BACKGROUND_HOLD_SECONDS
     _gate_state["caption_until"] = now + TUNE_BACKGROUND_HOLD_SECONDS
+    _gate_state["tune_began"] = now
     _gate_state["tune_settling_since"] = None
     _gate_state["tune_picture_at"] = None
 
@@ -4731,12 +4748,17 @@ def note_tune_first_picture(now=None):
         _gate_state["tune_steady_since"] = None
 
 
-def caption_tune_hold(now=None):
+def caption_tune_hold(now=None, stream_too=True):
     """True from the channel button until TUNE_CAPTION_START_DELAY_SECONDS after the new channel's first picture: live caption chunks wait. After that, once a streamed show holds its buffer, the live captions ride along with the tune (the rest of the background work stays held until both buffers are built) and take turns with the picture's buffer through juggle_turn. Captions from a file, baked in or saved need no live work and are not held."""
     # WARNING: owner logs 2026-11-25 (send_logs68): "letting live captions piggy back on the throttle to quick start them if needed and after building up both buffers throttles down and juggles"; the captions no longer wait for the whole tune hold, only for the first picture and the picture's buffer.
     # WARNING: owner 2026-11-25: "if captions are not just available in a file form or baked in, hold them until video buffers"; a streamed show short of its buffer still holds them.
+    # WARNING: owner logs 2026-11-26 (send_logs70): the streamed show's buffer read short for 7 to 16 minutes at a time after a re-tune and the live captions waited here the whole time with nothing on screen; the buffer holds captions for TUNE_BUFFERS_MAX_SECONDS after the channel button at most, and a running caption session that already took its turn through juggle_turn (which lets captions about to run out go first) passes stream_too=False.
     now = time.monotonic() if now is None else now
-    return now < _gate_state.get("caption_until", 0.0) or stream_needs_the_link()
+    if now < _gate_state.get("caption_until", 0.0):
+        return True
+    if not stream_too or now - _gate_state.get("tune_began", 0.0) >= TUNE_BUFFERS_MAX_SECONDS:
+        return False
+    return stream_needs_the_link()
 
 
 def note_tune_steady(steady, now=None):

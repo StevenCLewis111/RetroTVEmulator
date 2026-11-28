@@ -247,7 +247,7 @@ def reactive_frame(analysis, position_seconds, state, full):
 
 
 def _cache_file(cache_dir, path):
-    stat = os.stat(path)
+    stat = os.stat(_long_form(path))
     key = "%s|%d|%d|%d" % (os.path.normpath(path), stat.st_size, stat.st_mtime_ns, ANALYSIS_VERSION)
     return os.path.join(cache_dir, "viz_%s.npz" % hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24])
 

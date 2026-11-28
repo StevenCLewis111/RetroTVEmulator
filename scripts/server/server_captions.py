@@ -1,4 +1,4 @@
-"""The server's caption scan: once the media scan is done, the server captions the files its channels air soonest (today, then tomorrow), each file once, and saves the text in main/saved captions, where the program's live captions and every User find it.
+"""The server's caption scan: once the media scan is done, the server captions the files its channels air soonest (today, then tomorrow), each file once, and saves the text in main/data/saved captions, where the program's live captions and every User find it.
 
 Owns: the order of files to caption, captioning one file in short pieces, and the pacing that keeps the scan from ever hurting playback on this computer.
 Does not own: the caption model and its helpers (media.py), the saved text (saved_captions.py) or sending it to Users (server_sync.py).
@@ -61,8 +61,16 @@ CAPTION_SCAN_LANGUAGE_CHECK = _gov.CAPTION_SCAN_LANGUAGE_CHECK if _gov is not No
 CAPTION_SCAN_LANGUAGE_WAIT_S = _gov.CAPTION_SCAN_LANGUAGE_WAIT_S if _gov is not None else 120.0
 CAPTION_SCAN_SOUND_TAGS = _gov.CAPTION_SCAN_SOUND_TAGS if _gov is not None else True
 CAPTION_SCAN_THIN_RECHECK = _gov.CAPTION_SCAN_THIN_RECHECK if _gov is not None else True
+# WARNING: the fallback number below must match CAPTION_SCAN_FFMPEG_WAIT_S in performance_governor.py; it is used only when that module fails to import.
+CAPTION_SCAN_FFMPEG_WAIT_S = getattr(_gov, "CAPTION_SCAN_FFMPEG_WAIT_S", 300.0) if _gov is not None else 300.0
 # WARNING: the fallback number below must match CAPTION_UNSURE_PAD_SEC in performance_governor.py; it is used only when that module fails to import.
 CAPTION_UNSURE_PAD_SEC = _gov.CAPTION_UNSURE_PAD_SEC if _gov is not None else 1.0
+
+
+def _long_form(path):
+    """media.long_form: the path in the form Windows opens past 260 characters."""
+    import media
+    return media.long_form(path)
 
 
 def saved_captions_lowest_mode_grade():
@@ -296,13 +304,13 @@ class CaptionScanner:
         """(content key, saved copy or None) when the file still needs captions from this scan, else None."""
         import media
         import saved_captions
-        if not os.path.isfile(path):
+        if not os.path.isfile(_long_form(path)):
             return None
-        if self._passed_over.get(path) == os.path.getmtime(path):
+        if self._passed_over.get(path) == os.path.getmtime(_long_form(path)):
             return None
         info = media.resolve_caption_source(path)
         if info.get("kind") is not None:
-            self._passed_over[path] = os.path.getmtime(path)
+            self._passed_over[path] = os.path.getmtime(_long_form(path))
             return None
         if path.lower().endswith(server_scanner.AUDIO_SUFFIXES):
             return None
@@ -311,7 +319,7 @@ class CaptionScanner:
         except Exception:
             verdict = None
         if verdict:
-            self._passed_over[path] = os.path.getmtime(path)
+            self._passed_over[path] = os.path.getmtime(_long_form(path))
             return None
         key = probe.keys.resolve(path)
         if not key or key in live_keys:
@@ -370,10 +378,10 @@ class CaptionScanner:
         import saved_captions
         probe = media._asr_probe_media(path)
         if probe is None or not probe.get("duration"):
-            self._passed_over[path] = os.path.getmtime(path)
+            self._passed_over[path] = os.path.getmtime(_long_form(path))
             return 0
         if not probe.get("has_audio"):
-            self._passed_over[path] = os.path.getmtime(path)
+            self._passed_over[path] = os.path.getmtime(_long_form(path))
             return 0
         duration = float(probe["duration"])
         # WARNING: owner 2026-11-24: "if user scans it but server has better results its rescanned"; a stretch a User saved in Lite or Standard counts as not saved here, and the better copy replaces it on every computer.
@@ -409,9 +417,16 @@ class CaptionScanner:
                 cues = []
                 try:
                     status = media._asr_extract_chunk(path, pos, audio_end - pos, wav_path)
+                    if status == "failed" and not media.ffmpeg_found():
+                        # WARNING: owner logs 2026-11-27 (tray11): with ffmpeg missing every file "could not be read" and was passed over, and the scan called itself finished; a missing ffmpeg passes nothing over, the scan waits for it.
+                        if not getattr(self, "_ffmpeg_missing_said", False):
+                            self._ffmpeg_missing_said = True
+                            log.warning("[CAPTION SCAN] ffmpeg was not found on this PC (tools/ffmpeg, tools, the program's folder or PATH); no file is passed over, the scan waits for it")
+                        self._stop.wait(CAPTION_SCAN_FFMPEG_WAIT_S)
+                        return done
                     if status == "failed":
                         log.info("[CAPTION SCAN] the audio of %s at %.0fs could not be read; the file is passed over", name, pos)
-                        self._passed_over[path] = os.path.getmtime(path)
+                        self._passed_over[path] = os.path.getmtime(_long_form(path))
                         return done
                     if status == "ok":
                         # WARNING: a piece in progress is given up the moment the program opens (its thread count changes), so the scan never holds the cores the program's start and playback need.

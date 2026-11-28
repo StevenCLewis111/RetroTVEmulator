@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS library (
 
     caption_kind        TEXT,       -- where the overlay captions come from: "embedded" | "sidecar"
     caption_srt_path    TEXT,       -- the .srt file those captions are read from
-    saved_captions_file TEXT,       -- the file in main/saved captions holding this file's saved captions (saved_captions.py)
+    saved_captions_file TEXT,       -- the file in main/data/saved captions holding this file's saved captions (saved_captions.py)
     saved_captions_covered REAL,    -- seconds of the file those saved captions cover
     saved_captions_complete INTEGER, -- 1 once they cover the whole file
     unplayable_strikes  INTEGER,    -- playability probe failures so far
@@ -756,7 +756,7 @@ def stat_for_screen_thread(path):
     root = _share_root_of(path) if _is_screen_critical_thread() else None
     _on_share = str(path or "").startswith("\\\\")
     if root is None:
-        st = os.stat(path)
+        st = os.stat(_long_form(path))
         if _on_share:
             _stat_cache_put(path, st)
         return st
@@ -771,7 +771,7 @@ def stat_for_screen_thread(path):
 
     def _ask():
         try:
-            box["st"] = os.stat(path)
+            box["st"] = os.stat(_long_form(path))
             _stat_cache_put(path, box["st"])
             with _share_down_lock:
                 _share_down_until.pop(root, None)
@@ -802,14 +802,14 @@ def _sample_offsets(size: int):
 def compute_identity_key(file_path: str, growing_check_delay: float = _GROWING_FILE_CHECK_DELAY_S) -> Optional[str]:
     """File size plus a SHA-1 of up to three 64 KB samples (start, middle, end)."""
     try:
-        size_before = os.path.getsize(file_path)
+        size_before = os.path.getsize(_long_form(file_path))
     except OSError as _swallowed_error:
         _log_swallowed("compute_identity_key: size_before = os.path.getsize(file_path)", _swallowed_error)
         return None
     if growing_check_delay > 0:
         time.sleep(growing_check_delay)
         try:
-            size_after = os.path.getsize(file_path)
+            size_after = os.path.getsize(_long_form(file_path))
         except OSError as _swallowed_error:
             _log_swallowed("compute_identity_key: size_after = os.path.getsize(file_path)", _swallowed_error)
             return None
@@ -872,7 +872,7 @@ class PathKeyResolver:
         if content_key is None:
             return None
         try:
-            st = os.stat(file_path)
+            st = os.stat(_long_form(file_path))
         except OSError as _swallowed_error:
             _log_swallowed("PathKeyResolver.resolve: st = os.stat(file_path)", _swallowed_error)
             return None
@@ -1897,7 +1897,7 @@ class ProbeLibrary:
                         os.path.basename(file_path), result.error)
             return
         try:
-            size = os.path.getsize(file_path)
+            size = os.path.getsize(_long_form(file_path))
         except OSError as _swallowed_error:
             _log_swallowed("ProbeLibrary._probe_header_into: size = os.path.getsize(file_path)", _swallowed_error)
             size = None
@@ -2105,7 +2105,7 @@ class ProbeLibrary:
     def file_changed_on_disk(self, file_path: str) -> bool:
         """True when the library keyed this path before and the file's size or modified time no longer match what was recorded."""
         try:
-            st = os.stat(file_path)
+            st = os.stat(_long_form(file_path))
         except OSError as _swallowed_error:
             _log_swallowed("ProbeLibrary.file_changed_on_disk: st = os.stat(file_path)", _swallowed_error)
             return False
